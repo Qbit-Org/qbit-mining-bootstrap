@@ -472,8 +472,9 @@ impl AuditBundle {
 /// between the two forms by moving the window, never copying it.
 ///
 /// `reward_manifest` still carries its own `Vec<CountedShare>`, the counted
-/// records derived from the window; normalizing that copy away is a separate
-/// change (#267).
+/// records derived from the window. A stored native audit row drops that copy
+/// too and keeps only a [`PrismRewardManifestHeader`]; see
+/// [`restore_reward_manifest`].
 ///
 /// The body's own serde form is not an audit artifact. It omits `shares`, so
 /// it has no canonical bytes and no published sha256. Produce those with
@@ -945,6 +946,145 @@ pub fn write_canonical_audit_bundle_from_parts<W: std::io::Write>(
     shares: &[AcceptedShare],
 ) -> Result<(), serde_json::Error> {
     AuditBundleRef::from_parts(body, shares).write_canonical(writer)
+}
+
+/// Every [`PrismRewardManifest`] field except `shares`, in the same
+/// declaration order and with the same serde attributes. This is what a
+/// normalized native audit row stores under `reward_manifest`: the counted
+/// window is a pure fold over `(shares, found_block)`, so the row keeps only
+/// the header and [`restore_reward_manifest`] rebuilds the window on read.
+///
+/// The serde form is not an audit artifact and has no canonical bytes.
+/// Decoding rejects unknown fields, so a full manifest (which has `shares`)
+/// cannot be read as a header and silently lose its window; a stored body
+/// that still carries `reward_manifest.shares` is decoded as
+/// [`PrismRewardManifest`] instead.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrismRewardManifestHeader {
+    pub schema: String,
+    pub block_height: u64,
+    pub coinbase_value_sats: u64,
+    pub network_difficulty: u128,
+    pub window_multiplier: u128,
+    pub requested_window_weight: u128,
+    pub counted_window_weight: u128,
+    pub anchor_job_issued_at_ms: i64,
+    pub anchor_share_seq: u64,
+    pub newest_share_seq: u64,
+    pub oldest_share_seq: u64,
+    pub included_share_count: usize,
+    pub share_slice_digest_hex: String,
+    pub entitlements: Vec<WeightedEntitlement>,
+}
+
+impl PrismRewardManifest {
+    /// Split the manifest into its header and its counted window. The window
+    /// is moved out, never copied.
+    pub fn into_parts(self) -> (PrismRewardManifestHeader, Vec<CountedShare>) {
+        let PrismRewardManifest {
+            schema,
+            block_height,
+            coinbase_value_sats,
+            network_difficulty,
+            window_multiplier,
+            requested_window_weight,
+            counted_window_weight,
+            anchor_job_issued_at_ms,
+            anchor_share_seq,
+            newest_share_seq,
+            oldest_share_seq,
+            included_share_count,
+            share_slice_digest_hex,
+            shares,
+            entitlements,
+        } = self;
+        (
+            PrismRewardManifestHeader {
+                schema,
+                block_height,
+                coinbase_value_sats,
+                network_difficulty,
+                window_multiplier,
+                requested_window_weight,
+                counted_window_weight,
+                anchor_job_issued_at_ms,
+                anchor_share_seq,
+                newest_share_seq,
+                oldest_share_seq,
+                included_share_count,
+                share_slice_digest_hex,
+                entitlements,
+            },
+            shares,
+        )
+    }
+}
+
+impl PrismRewardManifestHeader {
+    /// Reassemble a manifest around `shares`. The window is moved in, not
+    /// copied, and not checked: pair a header only with the window
+    /// [`restore_reward_manifest`] rebuilt for it, or with the window
+    /// [`PrismRewardManifest::into_parts`] split off it.
+    pub fn into_manifest(self, shares: Vec<CountedShare>) -> PrismRewardManifest {
+        let PrismRewardManifestHeader {
+            schema,
+            block_height,
+            coinbase_value_sats,
+            network_difficulty,
+            window_multiplier,
+            requested_window_weight,
+            counted_window_weight,
+            anchor_job_issued_at_ms,
+            anchor_share_seq,
+            newest_share_seq,
+            oldest_share_seq,
+            included_share_count,
+            share_slice_digest_hex,
+            entitlements,
+        } = self;
+        PrismRewardManifest {
+            schema,
+            block_height,
+            coinbase_value_sats,
+            network_difficulty,
+            window_multiplier,
+            requested_window_weight,
+            counted_window_weight,
+            anchor_job_issued_at_ms,
+            anchor_share_seq,
+            newest_share_seq,
+            oldest_share_seq,
+            included_share_count,
+            share_slice_digest_hex,
+            shares,
+            entitlements,
+        }
+    }
+}
+
+/// Rebuild the counted-share window [`build_prism_reward_manifest`] folded
+/// out of `shares`, and prove the rebuilt header is identical to `header`.
+///
+/// The fold is deterministic, so a header that matches field for field,
+/// `share_slice_digest_hex` and `counted_window_weight` included, can only
+/// have come from this window. A header that differs is refused as
+/// [`PrismError::AuditMismatch`] in `reward_manifest`, the same error
+/// [`verify_audit_bundle`] raises for a bundle whose manifest does not match
+/// its shares. There is no way to obtain the rebuilt window without this
+/// check: the fold's own output is returned only once the header has matched.
+pub fn restore_reward_manifest(
+    header: PrismRewardManifestHeader,
+    shares: &[AcceptedShare],
+    found_block: &FoundBlock,
+) -> Result<PrismRewardManifest, PrismError> {
+    let (rebuilt, window) = build_prism_reward_manifest(shares, found_block)?.into_parts();
+    if rebuilt != header {
+        return Err(PrismError::AuditMismatch {
+            artifact: "reward_manifest",
+        });
+    }
+    Ok(rebuilt.into_manifest(window))
 }
 
 pub fn prism_audit_commitment_leaf_hex(
