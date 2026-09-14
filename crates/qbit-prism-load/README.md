@@ -210,6 +210,14 @@ frontend returned between the landing and the earliest new-revision work on any
 of its sessions. It is `null`, with a reason, when there was no bump or no such
 job.
 
+The label travels with the numbers: every object that carries a new-revision
+figure carries `new_revision_work_approximation` beside it — the per-landing,
+per-frontend tables, `summaries.overall` and each `summaries.per_frontend[]`.
+The summaries are the numbers people quote, and their keys
+(`time_to_new_revision_work_max_millis`,
+`rejected_before_new_revision_work_per_landing`) are not the keys `definitions`
+is indexed on, so a reader looking either one up there would find nothing.
+
 ### Lost valid work
 
 Every rebuild-pending rejection is a share the client had already proven

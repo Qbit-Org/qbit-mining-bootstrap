@@ -665,6 +665,12 @@ impl Distribution {
             "lost_valid_shares_per_landing": measure::summarize(self.lost.clone(), COUNT_CLOCK),
             "time_to_new_tip_work_max_millis": measure::summarize(self.tip_work_max.clone(), CLOCK),
             "time_to_new_revision_work_max_millis": measure::summarize(self.revision_work_max.clone(), CLOCK),
+            // The label travels with the summarised numbers, because these are
+            // the ones a reader quotes. The per-landing tables carry the same
+            // sibling; the summaries used to carry nothing, and the
+            // definitions block is keyed on the unsuffixed field names, so a
+            // reader looking either summary key up found nothing.
+            "new_revision_work_approximation": NEW_REVISION_APPROXIMATION,
         })
     }
 }

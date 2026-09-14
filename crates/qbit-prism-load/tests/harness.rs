@@ -2205,6 +2205,22 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
         json!(format!("pload1abc.s{:05}:{}", 2, "1".repeat(64))),
         "the share is named, not just counted"
     );
+    // The approximation label travels with the summarised numbers too: those
+    // are the ones a reader quotes.
+    for summary in [
+        &document["summaries"]["overall"],
+        &document["summaries"]["per_frontend"][0],
+    ] {
+        assert!(summary["time_to_new_revision_work_max_millis"]["max"].is_number());
+        assert!(
+            summary["new_revision_work_approximation"]
+                .as_str()
+                .expect("the summaries label the approximation")
+                .contains("clean_jobs"),
+            "summaries.* must carry the same label the landing tables carry"
+        );
+    }
+
     assert!(document["proposed_budget_for_issue_291"]["window_p99_millis"].is_number());
     assert!(document["definitions"]["combined_rebuild_pending_window"].is_string());
 }
