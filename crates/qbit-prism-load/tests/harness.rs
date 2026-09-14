@@ -543,12 +543,20 @@ fn the_frontend_environment_carries_every_configuration_key() -> Result<()> {
     assert_eq!(env["PRISM_MIN_PEERS"], "1");
     assert_eq!(env["RUST_LOG"], "info");
     assert_ne!(env["PRISM_AUDIT_PORT"], "0", "port 0 disables /metrics");
-    for key in frontend::UNREAD_CONFIGURATION_KEYS {
-        assert!(block.contains_key(*key), "{key} still has to be recorded");
+    // The server retired these in #361, and the v3 validator refuses evidence
+    // that names one. So they must be absent from both the frontend environment
+    // and the configuration block -- not merely annotated as unread, which is
+    // what v2 asked for (#288).
+    for key in frontend::RETIRED_CONFIGURATION_KEYS {
+        assert!(
+            !block.contains_key(*key),
+            "{key} is retired and must not reach the evidence"
+        );
+        assert!(
+            !env.contains_key(*key),
+            "{key} is retired and must not be set on a frontend"
+        );
     }
-    assert_eq!(env["PRISM_SHARE_COMMIT_BATCH_SIZE"], "1");
-    assert_eq!(env["PRISM_SHARE_COMMIT_LINGER_MILLISECONDS"], "0");
-    assert_eq!(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "0");
     Ok(())
 }
 

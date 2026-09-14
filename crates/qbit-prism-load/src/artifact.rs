@@ -1,4 +1,4 @@
-//! The `qbit-prism-capacity-evidence/v2` artifact.
+//! The `qbit-prism-capacity-evidence/v3` artifact.
 //!
 //! Every field is traced to its reader in
 //! `crates/qbit-prism-server/src/capacity.rs` (EP-COMPAT). Decimals are written

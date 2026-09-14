@@ -23,14 +23,14 @@ pub const SECRET_KEYS: &[&str] = &[
     "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX",
 ];
 
-/// The three keys `capacity-evidence` requires that the native runtime does
-/// not read (#288). They are recorded with the values the frontends really
-/// carry, and the side report says they are unread.
-pub const UNREAD_CONFIGURATION_KEYS: &[&str] = &[
-    "PRISM_SHARE_COMMIT_BATCH_SIZE",
-    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
-    "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
-];
+/// The keys the native server has formally retired (#361). Evidence naming any
+/// of them is refused by the `v3` validator as not having measured the native
+/// binary, so the harness neither sets them on a frontend nor records them.
+///
+/// Under `v2` these were carried with the values the frontends really used and
+/// annotated as unread (#288). The server has since answered that question, so
+/// the honest thing is now to leave them out rather than to explain them.
+pub use qbit_prism_server::capacity::RETIRED_CONFIGURATION_KEYS;
 
 /// Everything identical across frontends.
 #[derive(Clone, Debug)]
@@ -122,9 +122,6 @@ pub fn frontend_environment(
     set("PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE", "0.25".into());
     // Read only by `capacity-evidence` (#288); recorded, never claimed as a
     // native tuning control.
-    set("PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS", "0".into());
-    set("PRISM_SHARE_COMMIT_BATCH_SIZE", "1".into());
-    set("PRISM_SHARE_COMMIT_LINGER_MILLISECONDS", "0".into());
     // Share commit and Stratum transport.
     set(
         "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS",

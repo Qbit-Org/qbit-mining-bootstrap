@@ -1419,7 +1419,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "stderr_log": child.stderr_path.display().to_string(),
             "environment": frontend::redacted(&child.environment),
         })).collect::<Vec<_>>(),
-        "unread_configuration_keys": frontend::UNREAD_CONFIGURATION_KEYS,
+        "retired_configuration_keys": frontend::RETIRED_CONFIGURATION_KEYS,
         "window": {
             "template_bits": window::TEMPLATE_BITS,
             "scaled_network_difficulty": solution.scaled_network_difficulty.to_string(),

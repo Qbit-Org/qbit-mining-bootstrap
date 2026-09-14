@@ -19,20 +19,11 @@ pub fn honest_value_notes() -> Value {
                      correctly reject this artifact."
         },
         {
-            "field": "configuration.PRISM_SHARE_COMMIT_BATCH_SIZE",
-            "note": "Not read by the native runtime (#288). The value 1 describes the behaviour \
-                     that actually happens: one share per transaction."
-        },
-        {
-            "field": "configuration.PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
-            "note": "Not read by the native runtime (#288). The value 0 describes the behaviour \
-                     that actually happens: no batching delay exists to configure."
-        },
-        {
-            "field": "configuration.PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
-            "note": "Not read by the native runtime (#288). The value 0 is valid to the \
-                     validator and truthfully means there is no such native control; it should \
-                     not be read as 'the sweep is disabled'."
+            "field": "retired_configuration_keys",
+            "note": "The keys the native server has retired (#361). The harness does not set \
+                     them on a frontend and does not record them in the evidence, because a v3 \
+                     artifact naming one is refused as not having measured the native binary. \
+                     Under v2 they were carried and annotated as unread (#288)."
         },
         {
             "field": "phases.*.offered_valid_shares",

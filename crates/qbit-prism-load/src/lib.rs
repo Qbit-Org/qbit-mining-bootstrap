@@ -2,7 +2,7 @@
 //!
 //! The harness drives real `qbit-prism-server run` child processes over real
 //! Stratum sockets against a real PostgreSQL primary (optionally with one
-//! streaming standby), and produces the `qbit-prism-capacity-evidence/v2`
+//! streaming standby), and produces the `qbit-prism-capacity-evidence/v3`
 //! artifact plus a side report that carries everything the artifact's schema
 //! cannot express.
 //!

@@ -1,7 +1,7 @@
 # `qbit-prism-load`
 
 A Stratum-to-PostgreSQL load harness for PRISM, and the only thing that
-produces a `qbit-prism-capacity-evidence/v2` artifact (#303).
+produces a `qbit-prism-capacity-evidence/v3` artifact (#303).
 
 It launches real `qbit-prism-server run` child processes, drives them over real
 Stratum sockets with real proof of work, and reports what the cluster did:
@@ -386,10 +386,12 @@ directory.
 
 ### 1. `capacity-evidence.json`
 
-Schema `qbit-prism-capacity-evidence/v2`, exactly the shape
+Schema `qbit-prism-capacity-evidence/v3`, exactly the shape
 `crates/qbit-prism-server/src/capacity.rs` validates: `TOP_KEYS`,
-`SUBJECT_KEYS`, `durability`, the 16 `CONFIGURATION_KEYS` read out of the exact
-environment the frontends were launched with, and each phase's extra keys.
+`SUBJECT_KEYS`, `durability`, the `CONFIGURATION_KEYS` read out of the exact
+environment the frontends were launched with, and each phase's extra keys. The
+key list is taken from that module rather than copied, so a server that adds or
+retires one moves this artifact with it.
 
 `durability` is read back from PostgreSQL on a connection carrying the ledger's
 own session settings. If any of `fsync`, `full_page_writes` or
@@ -512,12 +514,16 @@ The side report repeats all of this under `honest_value_notes`.
   executable's bytes. A validator run with `--expect-coordinator-image-digest`
   set to a real image digest will correctly reject it. Never fabricate a value
   that looks like an image digest.
-- **Three configuration keys are not read by the native runtime** (#288):
+- **Retired configuration keys are left out, not explained** (#361).
   `PRISM_SHARE_COMMIT_BATCH_SIZE`, `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS` and
-  `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS`. The harness sets them to `1`, `0`
-  and `0`, which describe the behaviour that actually happens — one share per
-  transaction, no batching delay, and no such native sweep — and records them
-  as unread. A value like `64`/`5` would suggest batching that does not exist.
+  `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` are retired: the native server does
+  not read them, and the `v3` validator refuses evidence that names one as not
+  having measured the native binary. So the harness neither sets them on a
+  frontend nor records them, and lists them under `retired_configuration_keys`
+  in the side report. Under `v2` it carried them with the values the frontends
+  really used and annotated them as unread (#288); the server has since answered
+  that question, so leaving them out is now the honest answer rather than the
+  lossy one.
 - **An ACK/commit divergence is counted, never smoothed over.** A share
   PostgreSQL holds after the server refused it is in `ack_commit_divergence`,
   in `unexpected_committed_share_ids` and in `rejected_valid_shares`, and it
