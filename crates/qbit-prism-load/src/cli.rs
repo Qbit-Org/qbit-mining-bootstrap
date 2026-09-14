@@ -50,6 +50,12 @@ pub struct Args {
     /// Run with modified tracked files. Forces `artifact_kind: example`.
     #[arg(long)]
     pub allow_dirty_tree: bool,
+    /// Run a server binary that cannot be tied to this checkout's HEAD:
+    /// no Cargo dep-info beside it, or a source newer than it. Forces
+    /// `artifact_kind: example`, because the artifact would otherwise name
+    /// a revision that did not produce the measurements.
+    #[arg(long)]
+    pub allow_unverified_server_revision: bool,
     /// Emit `artifact_kind: example` even from a clean tree.
     #[arg(long)]
     pub example_artifact: bool,

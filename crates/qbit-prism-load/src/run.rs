@@ -15,7 +15,7 @@ use crate::{
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     measure::{self, LockSampler, ProcessSampler},
     node::FakeNode,
-    profile, proxy, report, window,
+    profile, provenance, proxy, report, window,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -188,6 +188,20 @@ pub async fn execute(args: Args) -> Result<i32> {
         );
     }
     let server_bin = resolve_server_bin(args.server_bin.clone())?;
+    // The revision above is the checkout's; the binary has to be shown to be
+    // what that checkout builds, or the artifact would name a commit that did
+    // not produce its measurements (EP-OBSERVABILITY).
+    let repo_root = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?.trim());
+    let revision_evidence = provenance::server_revision_evidence(&server_bin, &repo_root);
+    if let provenance::RevisionEvidence::Unestablished { reason } = &revision_evidence {
+        ensure!(
+            args.allow_unverified_server_revision,
+            "{} cannot be tied to {revision}: {reason}. Rebuild it from this checkout \
+             (cargo build --locked --release -p qbit-prism-server) or pass \
+             --allow-unverified-server-revision, which forces artifact_kind example",
+            server_bin.display()
+        );
+    }
     let server_profile = frontend::build_profile(&server_bin);
     let harness_profile = if cfg!(debug_assertions) {
         "debug"
@@ -198,7 +212,7 @@ pub async fn execute(args: Args) -> Result<i32> {
     let server_bytes =
         std::fs::read(&server_bin).with_context(|| format!("reading {}", server_bin.display()))?;
     let server_digest = format!("sha256:{}", hex::encode(Sha256::digest(&server_bytes)));
-    let artifact_kind = if dirty || args.example_artifact {
+    let artifact_kind = if dirty || args.example_artifact || !revision_evidence.is_established() {
         artifact::ARTIFACT_EXAMPLE
     } else {
         artifact::ARTIFACT_QUALIFICATION
@@ -238,6 +252,7 @@ pub async fn execute(args: Args) -> Result<i32> {
             payout_address,
             share_prefix,
             revision,
+            revision_evidence,
             dirty,
             server_bin,
             server_digest,
@@ -274,6 +289,8 @@ struct RunContext {
     payout_address: String,
     share_prefix: String,
     revision: String,
+    /// Whether the server binary was shown to be what `revision` builds.
+    revision_evidence: provenance::RevisionEvidence,
     dirty: bool,
     server_bin: PathBuf,
     server_digest: String,
@@ -959,6 +976,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "server_build_profile": ctx.server_profile.as_str(),
             "server_binary_sha256": ctx.server_digest,
             "coordinator_revision": ctx.revision,
+            "server_revision_evidence": ctx.revision_evidence,
             "postgres_server_version": postgres_version,
             "rustc_target": std::env::consts::ARCH,
         },

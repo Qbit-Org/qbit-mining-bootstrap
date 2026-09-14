@@ -45,6 +45,19 @@ measure.
   `--allow-dirty-tree` is given, and that flag forces `artifact_kind:
   "example"` and marks the side report `dirty: true`.
 
+- **A server binary built from that tree.** The revision comes from the
+  harness's checkout, so the binary has to be shown to be what that checkout
+  builds. The server embeds no revision; the harness reads the Cargo dep-info
+  file beside the binary (`qbit-prism-server.d`), which lists every workspace
+  source it was compiled from, and requires that every listed source -- plus
+  `Cargo.lock` and the workspace `Cargo.toml`, which Cargo's list omits --
+  belongs to this checkout and is no newer than the binary. That is the test
+  Cargo itself applies before it decides not to rebuild. A binary with no
+  dep-info beside it (copied, installed) or with a newer source is refused
+  with the reason, unless `--allow-unverified-server-revision` is given, and
+  that flag forces `artifact_kind: "example"`. The side report records the
+  outcome under `versions.server_revision_evidence`.
+
 - **File descriptors.** The harness raises its own soft `RLIMIT_NOFILE` to what
   the session count needs and the child frontends inherit it.
 
@@ -68,6 +81,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--server-bin` | the `qbit-prism-server` beside this binary | Frontend executable |
 | `--allow-debug-server` | off | Run a server whose build profile is debug, or cannot be determined from its location, anyway |
 | `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
+| `--allow-unverified-server-revision` | off | Run a server binary that cannot be tied to this checkout's HEAD (no Cargo dep-info beside it, or a source newer than it); forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
 | `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block |

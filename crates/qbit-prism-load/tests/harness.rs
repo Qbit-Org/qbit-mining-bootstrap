@@ -961,6 +961,135 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
     Ok(())
 }
 
+// --- server revision evidence --------------------------------------------
+
+/// `coordinator_revision` is the checkout's HEAD; the binary has to be shown
+/// to be what that checkout builds, or the artifact attributes measurements
+/// to a commit that did not produce them. The evidence is Cargo's own: the
+/// dep-info file beside the binary, every source it lists no newer than the
+/// binary, and the server crate's root among those sources.
+#[test]
+fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Result<()> {
+    use qbit_prism_load::provenance::{
+        dep_info_path, parse_dep_info, server_revision_evidence, RevisionEvidence,
+        SERVER_CRATE_ROOT,
+    };
+    use std::time::{Duration, SystemTime};
+
+    let dir = ScratchDir::new("provenance");
+    let root = dir.path().join("checkout");
+    let sources = [
+        root.join(SERVER_CRATE_ROOT),
+        root.join("crates/qbit-prism-server/src/coordinator.rs"),
+        root.join("crates/qbit-prism/src/lib.rs"),
+    ];
+    for source in &sources {
+        std::fs::create_dir_all(source.parent().unwrap())?;
+        std::fs::write(source, b"fn main() {}")?;
+    }
+    std::fs::write(root.join("Cargo.lock"), b"# lock")?;
+    std::fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+    let release = root.join("target/release");
+    std::fs::create_dir_all(&release)?;
+    let binary = release.join("qbit-prism-server");
+    std::fs::write(&binary, b"ELF")?;
+    let listed = sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        dep_info_path(&binary),
+        format!("{}: {listed}\n", binary.display()),
+    )?;
+    let set_modified = |path: &std::path::Path, at: SystemTime| -> Result<()> {
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(at)?;
+        Ok(())
+    };
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for source in &sources {
+        set_modified(source, base)?;
+    }
+    set_modified(&root.join("Cargo.lock"), base)?;
+    set_modified(&root.join("Cargo.toml"), base)?;
+    set_modified(&binary, base + Duration::from_secs(60))?;
+
+    // Every source is older than the binary and the server crate root is
+    // listed: this binary is what the tree builds.
+    match server_revision_evidence(&binary, &root) {
+        RevisionEvidence::Established {
+            sources_checked, ..
+        } => assert_eq!(
+            sources_checked,
+            sources.len() + 2,
+            "sources plus lock and manifest"
+        ),
+        RevisionEvidence::Unestablished { reason } => panic!("should be established: {reason}"),
+    }
+
+    // A checkout that touched one server source after the build: the binary
+    // is older than what the tree now says, and the revision would be wrong.
+    set_modified(&sources[1], base + Duration::from_secs(120))?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a newer source must leave the revision unestablished");
+    };
+    assert!(reason.contains("coordinator.rs"), "{reason}");
+    assert!(reason.contains("newer than the binary"), "{reason}");
+    set_modified(&sources[1], base)?;
+
+    // A dependency bump changes what the tree builds without touching any
+    // listed source; the lock file is checked explicitly.
+    set_modified(&root.join("Cargo.lock"), base + Duration::from_secs(120))?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a newer Cargo.lock must leave the revision unestablished");
+    };
+    assert!(reason.contains("Cargo.lock"), "{reason}");
+    set_modified(&root.join("Cargo.lock"), base)?;
+
+    // A binary built in another checkout lists that checkout's sources.
+    let elsewhere = dir.path().join("elsewhere");
+    let foreign_root = elsewhere.join(SERVER_CRATE_ROOT);
+    std::fs::create_dir_all(foreign_root.parent().unwrap())?;
+    std::fs::write(&foreign_root, b"fn main() {}")?;
+    set_modified(&foreign_root, base)?;
+    std::fs::write(
+        dep_info_path(&binary),
+        format!("{}: {}\n", binary.display(), foreign_root.display()),
+    )?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a binary from another checkout must leave the revision unestablished");
+    };
+    assert!(reason.contains("different checkout"), "{reason}");
+
+    // A copied or installed binary has no dep-info at all.
+    let copied = dir.path().join("qbit-prism-server");
+    std::fs::copy(&binary, &copied)?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&copied, &root)
+    else {
+        panic!("a binary without dep-info must leave the revision unestablished");
+    };
+    assert!(reason.contains("no Cargo dep-info"), "{reason}");
+
+    // The parser handles Cargo's escaped spaces and a rule with no sources.
+    let parsed = parse_dep_info("/t/bin: /a/b.rs /c\\ d/e.rs\n")?;
+    assert_eq!(
+        parsed,
+        vec![
+            std::path::PathBuf::from("/a/b.rs"),
+            std::path::PathBuf::from("/c d/e.rs")
+        ]
+    );
+    assert!(parse_dep_info("/t/bin:\n")?.is_empty());
+    assert!(parse_dep_info("\n").is_err());
+    Ok(())
+}
+
 // --- artifact -------------------------------------------------------------
 
 fn sample_inputs() -> ArtifactInputs {

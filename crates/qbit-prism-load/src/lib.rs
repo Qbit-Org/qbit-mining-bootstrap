@@ -24,6 +24,7 @@ pub mod frontend;
 pub mod measure;
 pub mod node;
 pub mod profile;
+pub mod provenance;
 pub mod proxy;
 pub mod report;
 pub mod run;
