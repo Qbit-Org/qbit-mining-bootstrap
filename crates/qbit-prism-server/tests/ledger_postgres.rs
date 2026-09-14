@@ -3,10 +3,13 @@
 use anyhow::{Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
-    build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, FoundBlock,
-    PayoutPolicy,
+    build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, AuditBundle,
+    FoundBlock, PayoutPolicy,
 };
-use qbit_prism_server::ledger::{BlockObservation, Candidate, Ledger, Snapshot};
+use qbit_prism_server::ledger::{
+    BlockObservation, Candidate, CandidateClaim, CandidateCtv, Ledger, SignerKeys, Snapshot,
+    WindowRef,
+};
 use qbit_prism_test_gate as gate;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -83,7 +86,49 @@ fn keys() -> (ManifestSigningKey, ManifestSigningKey) {
     )
 }
 
-fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
+/// The CTV settlement inputs the CTV fixtures below build their bundles with.
+fn test_ctv() -> CandidateCtv {
+    CandidateCtv {
+        direct_floor_sats: u64::MAX,
+        settlement_config: qbit_prism::SettlementModeConfig {
+            max_fanout_recipients_per_transaction: 1,
+            ..Default::default()
+        },
+        fanout_fee_policy: Some(qbit_prism::FanoutFeeRatePolicy::new(1000, 12000)),
+    }
+}
+
+/// A slim candidate beside the bundle it was found on. The ledger tests land
+/// through `Ledger::land_candidate` directly, without the coordinator's
+/// rebuild, so [`TestCandidate::claim`] hands a claim the bundle's parts where
+/// that rebuild would put them; the bundle is also what the audit assertions
+/// compare against.
+#[derive(Clone)]
+struct TestCandidate {
+    candidate: Candidate,
+    bundle: AuditBundle,
+}
+
+impl std::ops::Deref for TestCandidate {
+    type Target = Candidate;
+    fn deref(&self) -> &Candidate {
+        &self.candidate
+    }
+}
+
+impl std::ops::DerefMut for TestCandidate {
+    fn deref_mut(&mut self) -> &mut Candidate {
+        &mut self.candidate
+    }
+}
+
+impl TestCandidate {
+    fn claim(&self, claim: CandidateClaim) -> CandidateClaim {
+        claim.with_bundle(self.bundle.clone())
+    }
+}
+
+fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<TestCandidate> {
     let (coinbase_key, ledger_key) = keys();
     let bundle = build_audit_bundle(
         snapshot.shares.clone(),
@@ -98,15 +143,27 @@ fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
         &coinbase_key,
         &ledger_key,
     )?;
-    candidate_with_bundle(bundle, snapshot.payout_revision, nonce)
+    candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(snapshot)?,
+        snapshot.payout_revision,
+        None,
+        nonce,
+    )
 }
 
+/// The slim candidate for `bundle`, found on the window `window` names, with
+/// an 80-byte header whose double SHA-256 is the candidate's `block_hash` and
+/// the verified coinbase as the block's first transaction. `ctv` is the
+/// settlement input the bundle was built with, stored verbatim.
 fn candidate_with_bundle(
-    bundle: qbit_prism::AuditBundle,
+    bundle: AuditBundle,
+    window: WindowRef,
     payout_revision: i64,
+    ctv: Option<CandidateCtv>,
     nonce: u32,
-) -> Result<Candidate> {
-    let (_, ledger_key) = keys();
+) -> Result<TestCandidate> {
+    let (coinbase_key, ledger_key) = keys();
     let report = verify_audit_bundle_with_ledger_public_key(&bundle, &ledger_key.public_key_hex())?;
     let mut block = vec![0u8; 80];
     block[..4].copy_from_slice(&0x20000000u32.to_le_bytes());
@@ -121,15 +178,28 @@ fn candidate_with_bundle(
     hash.reverse();
     block.push(1);
     block.extend(hex::decode(&report.coinbase_tx_hex)?);
-    Ok(Candidate {
+    let candidate = Candidate {
         block_hash: hex::encode(hash),
-        block_hex: hex::encode(block),
+        block_sha256: Candidate::block_digest_hex(&block),
         job_id: "job".into(),
         payout_revision,
-        bundle,
+        window,
+        bootstrap_share: None,
+        found_block: bundle.found_block.clone(),
+        payout_policy: bundle.payout_policy.clone(),
+        ctv,
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        signer_keys: SignerKeys::of(&coinbase_key, &ledger_key),
+        leased: false,
+        coinbase_suffix_hex: bundle
+            .coinbase_script_sig_suffix_hex
+            .clone()
+            .unwrap_or_else(|| "00".repeat(12)),
         deferred_share: None,
-        coinbase_suffix_hex: None,
-    })
+        block_bytes: block,
+        as_issued_balances: Vec::new(),
+    };
+    Ok(TestCandidate { candidate, bundle })
 }
 
 #[tokio::test]
@@ -141,7 +211,7 @@ async fn candidate_renewal_requires_a_live_pending_token() -> Result<()> {
     let b = db.ledger("b").await?;
     a.append(share(1), None).await?;
     let block = candidate(&a.snapshot(100).await?, 401)?;
-    a.enqueue_candidate(block).await?;
+    a.enqueue_candidate(block.candidate).await?;
     let owner = a.claim_candidate(1).await?.context("candidate missing")?;
     a.renew_candidate_claim(&owner, 60).await?;
     let (remaining, attempts): (bool, i32) = sqlx::query_as("SELECT claim_expires_at>clock_timestamp()+interval '50 seconds',attempt_count FROM qbit_block_candidate_outbox")
@@ -213,8 +283,8 @@ async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() 
     for (index, operation) in ["renew", "retry", "land", "finish"].into_iter().enumerate() {
         let block = candidate(&snapshot, 402 + index as u32)?;
         let hash = block.block_hash.clone();
-        a.enqueue_candidate(block).await?;
-        let claim = a.claim_candidate(60).await?.unwrap();
+        a.enqueue_candidate(block.candidate.clone()).await?;
+        let claim = block.claim(a.claim_candidate(60).await?.unwrap());
         assert_eq!(claim.candidate.block_hash, hash);
         sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+interval '400 milliseconds' WHERE block_hash=$1")
             .bind(&hash).execute(&a.pool).await?;
@@ -274,7 +344,7 @@ async fn candidate_processing_lock_allows_renewal_and_blocks_expired_takeover() 
     let a = db.ledger("a").await?;
     let b = db.ledger("b").await?;
     a.append(share(1), None).await?;
-    a.enqueue_candidate(candidate(&a.snapshot(100).await?, 403)?)
+    a.enqueue_candidate(candidate(&a.snapshot(100).await?, 403)?.candidate)
         .await?;
     let owner = a.claim_candidate(60).await?.unwrap();
     let mut processing = a.pool.begin().await?;
@@ -324,15 +394,16 @@ async fn candidate_dispatch_prioritizes_fresh_work_and_services_oldest_due_fairl
     let snapshot = a.snapshot(100).await?;
     let recovery = candidate(&snapshot, 410)?;
     let old_unattempted = candidate(&snapshot, 411)?;
-    a.enqueue_candidate(recovery.clone()).await?;
-    a.enqueue_candidate(old_unattempted.clone()).await?;
+    a.enqueue_candidate(recovery.candidate.clone()).await?;
+    a.enqueue_candidate(old_unattempted.candidate.clone())
+        .await?;
     sqlx::query("UPDATE qbit_block_candidate_outbox SET attempt_count=3,created_at=clock_timestamp()-interval '1 hour',next_attempt_at=clock_timestamp()-interval '1 hour' WHERE block_hash=$1")
         .bind(&recovery.block_hash).execute(&a.pool).await?;
     sqlx::query("UPDATE qbit_block_candidate_outbox SET created_at=clock_timestamp()-interval '2 hours',next_attempt_at=clock_timestamp()-interval '2 hours' WHERE block_hash=$1")
         .bind(&old_unattempted.block_hash).execute(&a.pool).await?;
     for slot in 1..=7 {
         let fresh = candidate(&snapshot, 420 + slot)?;
-        a.enqueue_candidate(fresh.clone()).await?;
+        a.enqueue_candidate(fresh.candidate.clone()).await?;
         let ledger = if slot % 2 == 0 { &a } else { &b };
         let claim = ledger.claim_candidate(60).await?.unwrap();
         assert_eq!(
@@ -342,7 +413,7 @@ async fn candidate_dispatch_prioritizes_fresh_work_and_services_oldest_due_fairl
         ledger.finish_candidate(&claim, false, None).await?;
     }
     let latest = candidate(&snapshot, 428)?;
-    a.enqueue_candidate(latest.clone()).await?;
+    a.enqueue_candidate(latest.candidate.clone()).await?;
     let fair = b.claim_candidate(60).await?.unwrap();
     assert_eq!(
         fair.candidate.block_hash, old_unattempted.block_hash,
@@ -354,12 +425,13 @@ async fn candidate_dispatch_prioritizes_fresh_work_and_services_oldest_due_fairl
     a.finish_candidate(&fresh, false, None).await?;
     for slot in 10..=15 {
         let fresh = candidate(&snapshot, 420 + slot)?;
-        a.enqueue_candidate(fresh.clone()).await?;
+        a.enqueue_candidate(fresh.candidate.clone()).await?;
         let claim = a.claim_candidate(60).await?.unwrap();
         assert_eq!(claim.candidate.block_hash, fresh.block_hash);
         a.finish_candidate(&claim, false, None).await?;
     }
-    a.enqueue_candidate(candidate(&snapshot, 436)?).await?;
+    a.enqueue_candidate(candidate(&snapshot, 436)?.candidate)
+        .await?;
     let fair = b.claim_candidate(60).await?.unwrap();
     assert_eq!(
         fair.candidate.block_hash, recovery.block_hash,
@@ -424,9 +496,11 @@ async fn global_duplicates_idempotence_and_config_fencing() -> Result<()> {
     };
     let a = db.ledger("a").await?;
     let b = db.ledger("b").await?;
-    a.configure("same").await?;
-    b.configure("same").await?;
-    assert!(b.configure("different").await.is_err());
+    let (manifest_key, ledger_key) = keys();
+    let signer_keys = SignerKeys::of(&manifest_key, &ledger_key);
+    a.configure("same", &signer_keys).await?;
+    b.configure("same", &signer_keys).await?;
+    assert!(b.configure("different", &signer_keys).await.is_err());
     let inserted = a.append(share(1), None).await?;
     assert!(inserted.inserted);
     let replay = b.append(share(1), None).await?;
@@ -515,8 +589,8 @@ async fn active_candidate_can_land_at_proven_new_chain_revision() -> Result<()> 
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 987)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     let revision = a.observe_chain_view(&hash, 101, "1234").await?;
     assert!(a
         .land_candidate(&claim, &keys().1.public_key_hex())
@@ -554,11 +628,11 @@ async fn candidate_outbox_is_atomic_and_claims_recover_after_owner_loss() -> Res
     let block = candidate(&snapshot, 1)?;
     let mut invalid = block.clone();
     invalid.block_hash = "00".repeat(32);
-    assert!(a.append(share(2), Some(invalid)).await.is_err());
+    assert!(a.append(share(2), Some(invalid.candidate)).await.is_err());
     assert_eq!(a.snapshot(100).await?.shares.len(), 1);
-    a.append(share(2), Some(block.clone())).await?;
+    a.append(share(2), Some(block.candidate.clone())).await?;
     assert!(
-        !b.enqueue_candidate_once(block.clone()).await?,
+        !b.enqueue_candidate_once(block.candidate.clone()).await?,
         "block already credited through the ordinary share path was enqueued again"
     );
     let owner = a
@@ -626,8 +700,8 @@ async fn simultaneous_block_only_enqueue_has_one_winner() -> Result<()> {
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 99)?;
     let (first, second) = tokio::join!(
-        a.enqueue_candidate_once(block.clone()),
-        b.enqueue_candidate_once(block)
+        a.enqueue_candidate_once(block.candidate.clone()),
+        b.enqueue_candidate_once(block.candidate)
     );
     assert_ne!(
         first?, second?,
@@ -653,8 +727,8 @@ async fn verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced() ->
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 7)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block.clone()).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     assert!(a
         .land_candidate(&claim, &keys().0.public_key_hex())
         .await
@@ -728,8 +802,8 @@ async fn legacy_audit_import_validates_envelope_hash_and_pinned_key() -> Result<
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 31)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block.clone()).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     let report = a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("legacy-audit.json");
@@ -787,8 +861,8 @@ async fn deferred_share_survives_confirmation_crash_and_is_credited_once() -> Re
     let mut block = candidate(&snapshot, 9)?;
     block.deferred_share = Some(share(2));
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     assert_eq!(a.snapshot(100).await?.shares.len(), 1);
     b.reconcile_blocks_at_revision(
@@ -895,8 +969,8 @@ async fn late_acceptance_after_abandoned_claim_recovers_deferred_credit() -> Res
     let mut block = candidate(&snapshot, 43)?;
     block.deferred_share = Some(share(2));
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let expired = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let expired = block.claim(a.claim_candidate(60).await?.unwrap());
     a.land_candidate(&expired, &keys().1.public_key_hex())
         .await?;
     sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'").execute(&a.pool).await?;
@@ -952,8 +1026,8 @@ async fn stale_candidate_active_proof_cannot_overwrite_a_newer_reorg() -> Result
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 47)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     b.reconcile_blocks_at_revision(
         &[BlockObservation {
@@ -1029,10 +1103,16 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
             .fanout_count,
         2
     );
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 11)?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        11,
+    )?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     a.land_candidate(&claim, &ledger_key.public_key_hex())
         .await?;
     a.finish_candidate(&claim, true, None).await?;
@@ -1232,10 +1312,16 @@ async fn prepare_mature_cpfp_fanouts(ledger: &Ledger, count: u8) -> Result<()> {
             .fanout_count,
         u32::from(count)
     );
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 31)?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        31,
+    )?;
     let hash = block.block_hash.clone();
-    ledger.enqueue_candidate(block).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &ledger_key.public_key_hex())
         .await?;

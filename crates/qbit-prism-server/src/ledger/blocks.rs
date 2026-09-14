@@ -1,6 +1,8 @@
-use super::audit::{persist_audit_snapshot, verify_durable_range};
+use super::audit::{persist_audit_snapshot, verify_durable_range, AuditSnapshotWrite};
+use super::candidates::{header_bits_hex, ClaimParts};
 use super::*;
-use qbit_prism::{verify_audit_bundle_with_ledger_public_key, AuditVerificationReport};
+use qbit_prism::{verify_audit_parts, AuditVerificationReport};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockObservation {
@@ -58,40 +60,50 @@ impl Ledger {
         ledger_public_key: &str,
         expected_revision: Option<i64>,
     ) -> Result<AuditVerificationReport> {
-        let bundle = claim.candidate.bundle.clone();
-        let public_key = ledger_public_key.to_owned();
-        let report =
-            tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
-                verify_audit_bundle_with_ledger_public_key(&bundle, &public_key)
-            }))
-            .await??;
-        let block = hex::decode(&claim.candidate.block_hex)?;
+        let parts = claim.parts.clone().context(
+            "candidate claim carries no rebuilt audit parts; rebuild its window before landing",
+        )?;
+        let candidate = &claim.candidate;
+        let block = &candidate.block_bytes;
         ensure!(block.len() > 80, "candidate block is truncated");
-        // The durable serialized candidate already authenticates its header.
+        // The durable row already authenticates its header and block bytes.
         // Compact bits belong to block metadata; adding them to FoundBlock
         // would change the signed canonical audit format and historical hashes.
-        let bits = format!(
-            "{:08x}",
-            u32::from_le_bytes(block[72..76].try_into().expect("validated header length"))
-        );
+        let bits = header_bits_hex(block)?;
         let (tx_count, count_bytes) = compact_size(&block[80..])?;
         ensure!(tx_count > 0, "candidate has no coinbase");
+        let mut parent = block[4..36].to_vec();
+        parent.reverse();
+        let parent_hash = hex::encode(parent);
+        // Every step that walks the window runs in this one blocking task,
+        // before the transaction opens: verification, the stored body, the
+        // canonical byte count, the serialized leaves and accounts, and the
+        // share snapshot's ordering check and digest. The transaction below
+        // binds only what it produced.
+        let landing = tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking({
+            let parts = parts.clone();
+            let public_key = ledger_public_key.to_owned();
+            let window = candidate.window;
+            let bootstrap = candidate.bootstrap_share.clone();
+            move || landing_from_parts(&parts, window, bootstrap.as_ref(), &public_key)
+        }))
+        .await??;
+        let report = &landing.report;
         let coinbase = hex::decode(&report.coinbase_tx_hex)?;
         ensure!(
             block.get(80 + count_bytes..80 + count_bytes + coinbase.len())
                 == Some(coinbase.as_slice()),
             "candidate coinbase differs from verified audit"
         );
-        let mut parent = block[4..36].to_vec();
-        parent.reverse();
-        let parent_hash = hex::encode(parent);
         // The proof that the window is the ledger's own history reads the
         // whole range, so it runs before the settlement lock; under the lock
         // the range is only counted. It is needed exactly where the snapshot
         // is persisted: audit rows are never deleted, so a block that already
         // has one takes the existing-row digest path below instead. A row
         // that appears between this probe and the transaction lands on that
-        // same path.
+        // same path. The read is paged and each page is compared on the
+        // blocking thread that mapped it, so it is off the runtime as well as
+        // outside the lock.
         let landed: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
         )
@@ -99,7 +111,7 @@ impl Ledger {
         .fetch_one(&self.pool)
         .await?;
         if !landed {
-            verify_durable_range(&self.pool, &claim.candidate.bundle).await?;
+            verify_durable_range(&self.pool, &landing.snapshot).await?;
         }
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
@@ -111,7 +123,7 @@ impl Ledger {
         let existing: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT audit_bundle_sha256,found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1",
         )
-        .bind(&claim.candidate.block_hash)
+        .bind(&candidate.block_hash)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((digest, stored_bits)) = existing {
@@ -126,58 +138,50 @@ impl Ledger {
                 );
             } else {
                 // Older prepared rows can be recovered with their original
-                // serialized candidate even though no extra bits field existed.
+                // durable block even though no extra bits field existed.
                 sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1 AND found_block_bits IS NULL")
-                    .bind(&claim.candidate.block_hash).bind(&bits).execute(&mut *tx).await?;
+                    .bind(&candidate.block_hash).bind(&bits).execute(&mut *tx).await?;
             }
             tx.commit().await?;
-            return Ok(report);
+            return Ok(landing.report);
         }
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
                 .fetch_one(&mut *tx)
                 .await?;
         ensure!(
-            revision == expected_revision.unwrap_or(claim.candidate.payout_revision),
+            revision == expected_revision.unwrap_or(candidate.payout_revision),
             "candidate payout revision was superseded"
         );
+        // The current canonical balances must still be the set the parts were
+        // built on. Both sides are compared through the semantic digest, which
+        // sorts internally, so the comparison does not depend on the order a
+        // read returned them in: the current read keeps its SQL order, and an
+        // as-issued set decodes in the writer's canonical order.
         let prior = read_prior_balances(&mut tx).await?;
+        let current =
+            tokio::task::spawn_blocking(move || qbit_prism::prior_balances_digest(&prior)).await?;
         ensure!(
-            prior == claim.candidate.bundle.prior_balances,
+            current == landing.prior_balances_digest,
             "candidate prior balances differ from current canonical balances"
         );
         sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,$2,$3,$4,$5)")
-            .bind(&claim.candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).execute(&mut *tx).await?;
-        let snapshot_digest = persist_audit_snapshot(&mut tx, &claim.candidate.bundle).await?;
-        // The stored body is the logical bundle minus both copies of the
-        // window: the top-level `shares` and the counted `reward_manifest.shares`,
-        // which is a pure fold over them. Reads rebuild the fold from the
-        // snapshot and prove the result against `audit_bundle_sha256`.
-        let mut bundle_value = serde_json::to_value(&claim.candidate.bundle)?;
-        let body = bundle_value
-            .as_object_mut()
-            .context("audit bundle is not an object")?;
-        body.remove("shares");
-        body.get_mut("reward_manifest")
-            .and_then(Value::as_object_mut)
-            .context("audit reward manifest is not an object")?
-            .remove("shares");
+            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).execute(&mut *tx).await?;
+        let snapshot_digest = persist_audit_snapshot(&mut tx, &landing.snapshot).await?;
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")
-            .bind(&claim.candidate.block_hash).bind(&bundle_value).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
-            .bind(i64::try_from(qbit_prism::canonical_audit_bundle_bytes(&claim.candidate.bundle)?.len())?).bind(&claim.candidate.bundle.schema)
-            .bind(claim.candidate.bundle.found_block.network_difficulty.to_string()).bind(i64::try_from(report.coinbase_value_sats)?)
-            .bind(serde_json::to_value(&claim.candidate.bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&claim.candidate.bundle.witness_merkle_leaves_hex)?).bind(snapshot_digest).bind(&bits).execute(&mut *tx).await?;
-        let accounts =
-            serde_json::to_value(&claim.candidate.bundle.payout_policy_manifest.accounts)?;
+            .bind(&candidate.block_hash).bind(sqlx::types::Json(&*landing.body)).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
+            .bind(landing.audit_body_byte_len).bind(&parts.body.schema)
+            .bind(parts.body.found_block.network_difficulty.to_string()).bind(i64::try_from(report.coinbase_value_sats)?)
+            .bind(&landing.audit_commitment_leaves).bind(&landing.witness_merkle_leaves).bind(snapshot_digest).bind(&bits).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'onchain_amount_sats')::bigint,(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a")
-            .bind(&claim.candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(&accounts).execute(&mut *tx).await?;
+            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(&landing.accounts).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO qbit_payout_carry_forward(block_hash,block_height,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,settlement_fee_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'gross_amount_sats')::bigint,(a->>'prior_balance_sats')::numeric,(a->>'candidate_balance_sats')::numeric,(a->>'onchain_amount_sats')::bigint,COALESCE((a->>'settlement_fee_sats')::bigint,0),(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a WHERE COALESCE(a->>'account_type','miner')='miner'")
-            .bind(&claim.candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(&accounts).execute(&mut *tx).await?;
-        if let Some(set) = &claim.candidate.bundle.ctv_fanout_manifest_set {
-            persist_fanouts(&mut tx, &claim.candidate.block_hash, set).await?;
+            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(&landing.accounts).execute(&mut *tx).await?;
+        if let Some(set) = &parts.body.ctv_fanout_manifest_set {
+            persist_fanouts(&mut tx, &candidate.block_hash, set).await?;
         }
         tx.commit().await?;
-        Ok(report)
+        Ok(landing.report)
     }
 
     /// `submitted` means the caller proved this block is on the active chain.
@@ -235,7 +239,11 @@ impl Ledger {
                 bump_revision(&mut tx).await?;
             }
         }
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET state=$3,candidate=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2")
+        // The terminal row is "no window": the six window columns, the block
+        // and the document go NULL in one statement, so retention's
+        // `window_anchor_ms IS NOT NULL` predicate is exactly the live set and
+        // the outbox does not keep every submitted or abandoned block forever.
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET state=$3,candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2")
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -434,6 +442,129 @@ impl Ledger {
     }
 }
 
+/// What one landing binds, produced off the runtime from the claim's parts.
+struct Landing {
+    report: AuditVerificationReport,
+    /// The stored body: the parts' body, minus the counted window inside
+    /// `reward_manifest.shares`, serialized once and copied into the bind as
+    /// bytes rather than serialized again on the runtime.
+    body: Box<serde_json::value::RawValue>,
+    audit_body_byte_len: i64,
+    audit_commitment_leaves: Value,
+    witness_merkle_leaves: Value,
+    accounts: Value,
+    prior_balances_digest: [u8; 32],
+    snapshot: AuditSnapshotWrite,
+}
+
+/// A writer that only counts: the canonical byte length without the bytes.
+struct CountingWriter(u64);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// All of landing's whole-window work, in one blocking call over the parts.
+///
+/// For a non-empty window the share snapshot digest **must equal the
+/// reference's `snapshot_sha256`**: the parts landing stores are the window
+/// the candidate names, or nothing lands.
+fn landing_from_parts(
+    parts: &ClaimParts,
+    window: WindowRef,
+    bootstrap: Option<&AcceptedShare>,
+    ledger_public_key: &str,
+) -> Result<Landing> {
+    let body = &parts.body;
+    let shares = &parts.shares;
+    let report = verify_audit_parts(body, shares, ledger_public_key)?;
+    // The stored body drops the one copy of the window it still carries:
+    // `reward_manifest.shares`, a pure fold over the snapshot. #267 removes it
+    // so stored bodies stop growing with the window, and reads rebuild the
+    // fold from the snapshot and prove the result against
+    // `audit_bundle_sha256`. The parts' body has no top-level `shares` array
+    // to begin with, so this is the only copy left to drop. The canonical
+    // bytes below are unaffected: they are written from `body` and `shares`
+    // directly, not from this value.
+    let mut stored = serde_json::to_value(&**body)?;
+    stored
+        .as_object_mut()
+        .context("audit bundle body is not an object")?
+        .get_mut("reward_manifest")
+        .and_then(Value::as_object_mut)
+        .context("audit reward manifest is not an object")?
+        .remove("shares");
+    let raw = serde_json::value::to_raw_value(&stored)?;
+    let mut counter = CountingWriter(0);
+    qbit_prism::write_canonical_audit_bundle_from_parts(&mut counter, body, shares)?;
+    ensure!(!shares.is_empty(), "audit share snapshot cannot be empty");
+    ensure!(
+        shares.windows(2).all(|s| s[0].share_seq < s[1].share_seq),
+        "audit share snapshot must be ordered canonically"
+    );
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&**shares)?));
+    let (first, last, inline) = match (window.shares, bootstrap) {
+        (Some(range), _) => {
+            ensure!(
+                digest == hex::encode(range.snapshot_sha256),
+                "rebuilt share snapshot {digest} differs from the candidate's window reference {}",
+                hex::encode(range.snapshot_sha256)
+            );
+            ensure!(
+                shares[0].share_seq == range.first_share_seq
+                    && shares[shares.len() - 1].share_seq == range.last_share_seq
+                    && u64::try_from(shares.len())? == range.share_count,
+                "rebuilt share snapshot bounds differ from the candidate's window reference"
+            );
+            (
+                i64::try_from(range.first_share_seq)?,
+                i64::try_from(range.last_share_seq)?,
+                None,
+            )
+        }
+        (None, Some(bootstrap)) => {
+            ensure!(
+                shares.len() == 1 && &shares[0] == bootstrap,
+                "empty-window audit parts do not hold the candidate's bootstrap share"
+            );
+            (
+                i64::try_from(bootstrap.share_seq)?,
+                i64::try_from(bootstrap.share_seq)?,
+                Some(serde_json::to_value(&**shares)?),
+            )
+        }
+        (None, None) => bail!("candidate bootstrap share disagrees with its window reference"),
+    };
+    ensure!(
+        body.found_block.anchor_job_issued_at_ms == window.anchor_ms,
+        "audit parts anchor differs from the candidate's window reference"
+    );
+    Ok(Landing {
+        report,
+        body: raw,
+        audit_body_byte_len: i64::try_from(counter.0)?,
+        audit_commitment_leaves: serde_json::to_value(&body.audit_commitment_leaves_hex)?,
+        witness_merkle_leaves: serde_json::to_value(&body.witness_merkle_leaves_hex)?,
+        accounts: serde_json::to_value(&body.payout_policy_manifest.accounts)?,
+        prior_balances_digest: qbit_prism::prior_balances_digest(&body.prior_balances),
+        snapshot: AuditSnapshotWrite {
+            digest,
+            first_share_seq: first,
+            last_share_seq: last,
+            anchor_ms: window.anchor_ms,
+            share_count: i64::try_from(shares.len())?,
+            inline,
+            shares: Arc::clone(shares),
+        },
+    })
+}
+
 async fn require_claim(tx: &mut Transaction<'_, Postgres>, claim: &CandidateClaim) -> Result<()> {
     // Block takeover (FOR UPDATE), while allowing the owner to renew the
     // non-key lease columns throughout a long audit-persistence transaction.
@@ -493,7 +624,7 @@ pub(super) async fn persist_fanouts(
     Ok(())
 }
 
-fn compact_size(bytes: &[u8]) -> Result<(u64, usize)> {
+pub(super) fn compact_size(bytes: &[u8]) -> Result<(u64, usize)> {
     let Some(&tag) = bytes.first() else {
         bail!("truncated compact size")
     };
