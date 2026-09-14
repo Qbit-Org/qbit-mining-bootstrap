@@ -626,6 +626,104 @@ fn a_password_inside_any_url_valued_variable_never_reaches_a_report() {
     );
 }
 
+/// A scratch directory under the system temp dir, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "prism-load-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A stand-in for `qbit-prism-server run`: a shell script that logs one line
+/// to stderr and stays up until it is killed. It lets the process lifecycle
+/// be exercised without a database or a real server.
+fn stand_in_server(dir: &std::path::Path, stderr_line: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("stand-in-server");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\necho '{stderr_line}' >&2\nexec sleep 60\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn wait_for_log(path: &std::path::Path, needle: &str, count: usize) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.matches(needle).count() >= count {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never showed {count} x {needle:?}; it holds {text:?}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Reusing an `--out` directory must not carry an earlier invocation's stderr
+/// into this run's blocked-log classification: the first launch truncates.
+/// A restart inside the invocation appends, because what the killed process
+/// logged is this run's evidence.
+#[tokio::test]
+async fn a_stale_frontend_log_is_truncated_on_launch_and_kept_across_a_restart() -> Result<()> {
+    let dir = ScratchDir::new("stale-log");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let stale = "JSONB container ceiling reached in an earlier run\n";
+    std::fs::write(log_dir.join("load-fe-7.stderr.log"), stale)?;
+    std::fs::write(log_dir.join("load-fe-7.stdout.log"), "stale stdout\n")?;
+    let spec = FrontendSpec {
+        index: 7,
+        instance_id: "load-fe-7".into(),
+        stratum_port: 1,
+        audit_port: 1,
+        database_url: "postgresql://u@127.0.0.1:1/x".into(),
+    };
+    let mut child = frontend::Frontend::launch(server, spec, BTreeMap::new(), &log_dir)?;
+    let text = wait_for_log(&child.stderr_path, "stand-in", 1);
+    assert!(
+        !text.contains("earlier run"),
+        "the first launch must truncate the stale log, but it holds {text:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&child.stdout_path)?,
+        "",
+        "stdout is truncated too"
+    );
+    child.restart()?;
+    let text = wait_for_log(&child.stderr_path, "stand-in", 2);
+    assert_eq!(child.restarts, 1);
+    assert!(
+        !text.contains("earlier run"),
+        "a restart appends to this invocation's log only"
+    );
+    child.kill();
+    Ok(())
+}
+
 // --- artifact -------------------------------------------------------------
 
 fn sample_inputs() -> ArtifactInputs {

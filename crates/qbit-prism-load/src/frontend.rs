@@ -283,6 +283,30 @@ pub fn build_profile(path: &Path) -> BuildProfile {
     }
 }
 
+/// How a frontend's log files are opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogMode {
+    /// The first launch of an invocation: whatever an earlier invocation
+    /// left in the same `--out` is discarded.
+    Truncate,
+    /// A restart within the invocation: the previous process's lines stay.
+    Append,
+}
+
+impl LogMode {
+    fn open(self, path: &Path) -> Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true);
+        match self {
+            Self::Truncate => options.write(true).truncate(true),
+            Self::Append => options.append(true),
+        };
+        options
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+}
+
 /// A running frontend.
 pub struct Frontend {
     pub spec: FrontendSpec,
@@ -328,19 +352,16 @@ impl Frontend {
             server_bin,
             child: None,
         };
-        frontend.spawn()?;
+        // A fresh invocation starts its logs empty. The blocked-run classifier
+        // reads the whole stderr file, so a refusal an earlier run in the same
+        // `--out` logged would otherwise make this healthy run exit 3.
+        frontend.spawn(LogMode::Truncate)?;
         Ok(frontend)
     }
 
-    fn spawn(&mut self) -> Result<()> {
-        let stdout = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.stdout_path)?;
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.stderr_path)?;
+    fn spawn(&mut self, logs: LogMode) -> Result<()> {
+        let stdout = logs.open(&self.stdout_path)?;
+        let stderr = logs.open(&self.stderr_path)?;
         let mut command = Command::new(&self.server_bin);
         command.arg("run");
         command.env_clear();
@@ -375,11 +396,12 @@ impl Frontend {
         Ok(())
     }
 
-    /// Restart after a kill, keeping the same ports and instance id.
+    /// Restart after a kill, keeping the same ports, instance id and logs:
+    /// what the previous process logged in this invocation is evidence.
     pub fn restart(&mut self) -> Result<()> {
         self.kill();
         self.restarts += 1;
-        self.spawn()
+        self.spawn(LogMode::Append)
     }
 
     /// SIGKILL the whole process group, then reap.

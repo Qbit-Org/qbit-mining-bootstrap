@@ -362,7 +362,10 @@ URL the harness records.
 ### 4. Logs
 
 `logs/load-fe-<i>.stdout.log` and `logs/load-fe-<i>.stderr.log` per frontend,
-plus the fake node's submission log inside the side report.
+plus the fake node's submission log inside the side report. Each invocation
+starts these files empty: reusing an `--out` directory does not carry an
+earlier run's refusal into this run's blocked-log classification. A frontend
+restarted within the run appends, so what the killed process logged stays.
 
 ## Validating the artifact
 
