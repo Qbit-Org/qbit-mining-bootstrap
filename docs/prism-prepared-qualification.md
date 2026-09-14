@@ -67,6 +67,11 @@ refresh, or collector loops during the measurement bracket.
    construction and save through the existing coordinator test boundary: the
    save must fail without publishing replacement work. A cached run is not a
    substitute for the measured non-cached refresh budget.
+   Cached no-write reuse may legitimately observe zero WAL; report it separately
+   with unchanged prepared identity/payload and no observed writes. Do not pass
+   it to `assert_refresh_measurements`, which requires a logged prepared write
+   and a positive WAL delta. Neither missing measurements nor a zero delta
+   alongside an observed logged write can qualify the non-cached refresh.
 6. Reuse the issued-dependency/compact-storage race tests for retention: both
    GC-before-repair and repair-before-GC must preserve referenced template,
    balance and share data through the original issued deadline. A pending

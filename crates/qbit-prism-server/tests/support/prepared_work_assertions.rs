@@ -38,6 +38,8 @@ pub fn assert_no_shares_key(payload: &Value) -> Result<()> {
 /// `max_jsonb_bytes` is the maximum observed uncompressed refresh write,
 /// not pg_column_size of a possibly compressed/TOASTed stored row.
 /// `wal_bytes` is the server-wide insert-LSN delta bracketing just refresh.
+/// This qualifies a non-cached refresh that writes logged prepared work.
+/// Cached no-write reuse must be measured and checked separately.
 pub fn assert_refresh_measurements(
     expected_shares: u64,
     published_shares: u64,
@@ -50,13 +52,14 @@ pub fn assert_refresh_measurements(
         "published window count differs"
     );
     let jsonb = max_jsonb_bytes.context("refresh JSONB measurement unavailable")?;
-    // A successful nonempty refresh must persist a prepared record.
+    // A non-cached refresh must persist a prepared record.
     ensure!(jsonb > 0, "no refresh JSONB write was observed");
     ensure!(
         jsonb < JSONB_LIMIT_BYTES,
         "refresh JSONB value is not under 1 MB"
     );
     let wal = wal_bytes.context("refresh WAL measurement unavailable")?;
+    ensure!(wal > 0, "no WAL was observed for the logged refresh write");
     ensure!(wal < WAL_LIMIT_BYTES, "refresh WAL is not under 5 MB");
     Ok(())
 }

@@ -78,8 +78,14 @@ fn unknown_measurements_and_budget_boundaries_never_pass() {
         Some(WAL_LIMIT_BYTES - 1),
     )
     .unwrap();
-    // A successfully observed zero is distinct from a missing measurement.
-    assert_refresh_measurements(400_000, 400_000, Some(1), Some(0)).unwrap();
+}
+
+#[test]
+fn a_logged_refresh_write_requires_positive_wal() {
+    let error = assert_refresh_measurements(400_000, 400_000, Some(1), Some(0))
+        .expect_err("a logged prepared write cannot qualify with zero WAL");
+    assert!(error.to_string().contains("no WAL"));
+    assert_refresh_measurements(400_000, 400_000, Some(1), Some(1)).unwrap();
 }
 
 #[test]
