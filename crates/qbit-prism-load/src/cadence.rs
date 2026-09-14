@@ -1039,7 +1039,12 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         "landing_budget": inputs.landing_budget,
         "schedule_slots_over_budget": inputs.slots_over_budget,
         "landings": landed,
-        "bumps": attributed_bumps,
+        // Every observed change of payout_revision, which is what
+        // definitions.bump calls a bump. The split between the ones a
+        // landing's span owns and the rest is in bump_attribution, two keys
+        // below; publishing the attributed subset under the bare word made the
+        // headline number mean something other than its own definition.
+        "bumps": revisions.changes.len(),
         "landing_attempts": resolved.len(),
         "windows_available": landed > 0,
         "reason": no_landing_reason,
@@ -1078,11 +1083,13 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         },
         "bump_records": bump_records,
         "bump_attribution": {
+            "observed": revisions.changes.len(),
             "attributed": attributed_bumps,
             "unattributed": unattributed_bumps,
             "note": "a bump is attributed to the landing whose pool tip change it follows and \
                      which the next landing has not yet replaced; anything else is unattributed \
-                     with its cause unknown",
+                     with its cause unknown. observed is the top-level bumps count, and \
+                     attributed + unattributed equals it.",
         },
         "rejection_attribution": {
             "rebuild_pending_rejections_in_phase": rejections.len(),
@@ -1254,7 +1261,10 @@ pub fn definitions() -> Value {
                               checked over all of them.",
         "bump": "an observed change of qbit_prism_cluster.payout_revision. Two bumps inside one \
                  sampling interval appear as one change with revision_delta above 1, so the delta \
-                 is reported rather than assumed to be 1.",
+                 is reported rather than assumed to be 1. The top-level bumps key is this count, \
+                 whatever caused the change; bump_attribution splits it into the ones a landing's \
+                 span owns and the rest, and the per-landing bumps field counts only that \
+                 landing's.",
         "advisory_locks_sampled": {
             "note": "database-side queueing for this phase is reported in the phase's own entry \
                      under phases[] in this report, not here. Two PRISM advisory locks are \
@@ -1273,7 +1283,11 @@ pub fn definitions() -> Value {
                                same instants and share a samples count and a sampler cost."
         },
         "unknown_is_not_zero": "a measurement that could not be taken is null with a reason. A \
-                                run with no landing reports landings 0 and bumps 0 and no windows."
+                                run with no landing reports landings 0 and no windows, and bumps \
+                                only as many payout-revision changes as were actually observed -- \
+                                all of them unattributed, since there is no span to own them. A \
+                                sampler that saw nothing says so through blind and coverage \
+                                rather than through a zero."
     })
 }
 

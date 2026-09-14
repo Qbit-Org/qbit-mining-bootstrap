@@ -170,6 +170,13 @@ A bump is attributed to the landing whose pool tip change it follows and which
 the next landing has not yet replaced. Anything else is `unattributed`, with
 its cause recorded as unknown.
 
+The top-level `bumps` key is every observed change — the same number as
+`revision_sampler.changes_observed`, which is what the section's own
+`definitions.bump` defines a bump to be. `bump_attribution` carries the split
+(`observed`, `attributed`, `unattributed`), and the per-landing `bumps` field
+counts only that landing's. So a run in which nothing landed but the revision
+moved anyway reports the changes it saw rather than a zero.
+
 ### The two windows are reported apart
 
 `coordinator.rs` checks the observed tip before it checks the payout revision,
@@ -249,9 +256,10 @@ found by name.
 ### Honest output
 
 - No landing — `--scheduled-blocks 0`, a pattern that places none, or every
-  scheduled block failing — reports `landings: 0` and `bumps: 0` with the
-  reason and no windows. No percentile is invented; the budget proposal is
-  `null`.
+  scheduled block failing — reports `landings: 0` with the reason and no
+  windows. No percentile is invented; the budget proposal is `null`. `bumps` is
+  whatever the sampler actually observed, all of it `unattributed`: if the
+  revision moved with nothing landing, the report says so.
 - A sampler that could not read the revision reports its error count and its
   first error, and marks itself `blind`, so an empty bump list is never read as
   "no bumps happened". `blind` covers partial blindness too: a sampler whose

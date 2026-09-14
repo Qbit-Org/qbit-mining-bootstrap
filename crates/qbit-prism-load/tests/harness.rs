@@ -2091,17 +2091,44 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
     assert_eq!(document["landing_attempts"], json!(3));
     assert_eq!(document["landing_outcomes"]["landed"], json!(2));
     assert_eq!(document["landing_outcomes"]["never_produced"], json!(1));
+    // definitions.bump is "an observed change of payout_revision", so the
+    // top-level key is every change the sampler saw; the split is one key
+    // away. Publishing the attributed subset under the bare word made the
+    // headline number mean something other than its own definition.
     assert_eq!(
         document["bumps"],
-        json!(3),
-        "three bumps followed a landing"
+        json!(4),
+        "every observed change of payout_revision"
     );
-    assert_eq!(document["bump_attribution"]["attributed"], json!(3));
+    assert_eq!(
+        document["bumps"], document["revision_sampler"]["changes_observed"],
+        "bumps is changes_observed, exactly as definitions.bump says"
+    );
+    assert_eq!(document["bump_attribution"]["observed"], json!(4));
+    assert_eq!(
+        document["bump_attribution"]["attributed"],
+        json!(3),
+        "three of the four followed a landing"
+    );
     assert_eq!(
         document["bump_attribution"]["unattributed"],
         json!(1),
         "the bump before the first landing is unattributed, never dropped"
     );
+    assert_eq!(
+        document["bump_attribution"]["attributed"]
+            .as_u64()
+            .expect("attributed")
+            + document["bump_attribution"]["unattributed"]
+                .as_u64()
+                .expect("unattributed"),
+        document["bumps"].as_u64().expect("bumps"),
+        "the split reconciles with the headline"
+    );
+    assert!(document["definitions"]["bump"]
+        .as_str()
+        .expect("the definition")
+        .contains("The top-level bumps key is this count"));
     let bumps = document["bump_records"].as_array().expect("bump records");
     assert_eq!(bumps.len(), 4);
     assert_eq!(bumps[0]["attributed_to_landing"], Value::Null);
@@ -2441,4 +2468,36 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
         .as_str()
         .expect("a reason")
         .contains("--cadence dense"));
+
+    // Nothing landed, but the revision moved anyway -- an operator touching
+    // the cluster, a migration, a second harness. bumps is every observed
+    // change, so it says 2 rather than hiding them behind an attribution the
+    // word "bump" never promised.
+    let moved = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: vec![
+            bump(5, Some(4), at(base, 30_000)),
+            bump(6, Some(5), at(base, 60_000)),
+        ],
+    };
+    let drifted = cadence::build(&cadence::ReportInputs {
+        revisions: Some(&moved),
+        ..inputs
+    });
+    assert_eq!(drifted["landings"], json!(0));
+    assert_eq!(
+        drifted["bumps"],
+        json!(2),
+        "a revision that moved with no landing is still two observed bumps"
+    );
+    assert_eq!(drifted["bump_attribution"]["attributed"], json!(0));
+    assert_eq!(drifted["bump_attribution"]["unattributed"], json!(2));
+    assert_eq!(
+        drifted["bumps"],
+        drifted["revision_sampler"]["changes_observed"]
+    );
 }
