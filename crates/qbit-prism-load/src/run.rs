@@ -70,7 +70,7 @@ struct PhaseRun {
     tokens: u64,
     dispatched: u64,
     shortfall: u64,
-    lock: measure::LockSummary,
+    locks: measure::PhaseLocks,
     processes: Vec<measure::ProcessSummary>,
     ack_deltas: Vec<measure::ServerAckDelta>,
     replication_start: cluster::ReplicationObservation,
@@ -408,7 +408,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         (
             Vec::new(),
             format!(
-                "every ORDER_LOCK waiter in this database is counted: the driver carried                  application_name for {} of {} frontends ({:?} seen). A foreign holder of the                  same advisory lock would distort these numbers.",
+                "every PRISM advisory-lock waiter in this database is counted: the driver                  carried application_name for {} of {} frontends ({:?} seen). A foreign holder                  of the same advisory lock would distort these numbers.",
                 attributed.len(),
                 frontend_names.len(),
                 live_names
@@ -598,8 +598,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 .push(measure::scrape_metrics(&child.spec.instance_id, &child.metrics_url()).await);
         }
         let replication_end = cluster::observe_replication(&side, &plan.name).await?;
-        let mut lock = lock_sampler.summarize(started, ended);
-        lock.advisory_lock_statement = measure::advisory_lock_statement(&side).await;
+        let mut locks = lock_sampler.summarize(started, ended);
+        // All three PRISM locks share one normalized query text, so the same
+        // aggregate belongs to both blocks and its own note says so.
+        let statement = measure::advisory_lock_statement(&side).await;
+        locks.order.advisory_lock_statement = statement.clone();
+        locks.settlement.advisory_lock_statement = statement;
         let processes = process_samplers
             .iter()
             .map(|sampler| {
@@ -614,7 +618,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             tokens: outcome.tokens,
             dispatched: outcome.dispatched,
             shortfall: outcome.shortfall,
-            lock,
+            locks,
             processes,
             ack_deltas: before_scrapes
                 .iter()
@@ -1896,7 +1900,8 @@ fn phase_report(
         "offered_rate_shares_per_second": phase.dispatched as f64 / seconds.max(f64::MIN_POSITIVE),
         "client_ack_latency": latency,
         "server_share_ack_seconds": phase.ack_deltas,
-        "order_lock": phase.lock,
+        "order_lock": phase.locks.order,
+        "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
         "database_delay_milliseconds_configured": phase.proxy_delay_configured_ms,
         "min_mem_available_kib": phase.min_mem_available_kib,
@@ -2076,7 +2081,8 @@ fn summary_text(report: &Value, verdict: &artifact::Verdict, command: &str) -> S
     for phase in report["phases"].as_array().into_iter().flatten() {
         text.push_str(&format!(
             "phase {:<16} {:>8.1}s target={:<8} offered={:<8} acked={:<8} rate={:.1}/s \
-             ack p50={:?} p99={:?} lock_waiters_max={} shortfall={}\n",
+             ack p50={:?} p99={:?} order_waiters_max={} settlement_waiters_max={} \
+             shortfall={}\n",
             phase["name"].as_str().unwrap_or_default(),
             phase["duration_seconds"].as_f64().unwrap_or_default(),
             phase["target_rate_shares_per_second"]
@@ -2092,6 +2098,9 @@ fn summary_text(report: &Value, verdict: &artifact::Verdict, command: &str) -> S
             phase["client_ack_latency"]["p50"].as_f64(),
             phase["client_ack_latency"]["p99"].as_f64(),
             phase["order_lock"]["max_waiters"]
+                .as_u64()
+                .unwrap_or_default(),
+            phase["settlement_lock"]["max_waiters"]
                 .as_u64()
                 .unwrap_or_default(),
             phase["shortfall"].as_u64().unwrap_or_default(),

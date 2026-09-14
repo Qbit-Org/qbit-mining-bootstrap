@@ -1,5 +1,5 @@
-//! Measurement: latency summaries, per-frontend CPU and RSS, ORDER_LOCK wait
-//! sampling, server histogram scrapes and host facts.
+//! Measurement: latency summaries, per-frontend CPU and RSS, PRISM
+//! advisory-lock wait sampling, server histogram scrapes and host facts.
 //!
 //! EP-OBSERVABILITY: every quantity records its units and its clock, and an
 //! unknown or failed measurement is `None` with a reason, never 0.
@@ -17,17 +17,61 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// `ORDER_LOCK` is `0x505249534d000002` in
+/// Every PRISM advisory lock is `0x505249534d0000xx` in
 /// `crates/qbit-prism-server/src/ledger.rs`. `pg_advisory_xact_lock(bigint)`
-/// stores the high 32 bits as `classid` and the low 32 as `objid`.
-pub const ORDER_LOCK_CLASSID: i64 = 0x5052_4953;
+/// stores the high 32 bits as `classid` and the low 32 as `objid`, so the three
+/// locks share one `classid` and differ only in `objid`.
+pub const PRISM_LOCK_CLASSID: i64 = 0x5052_4953;
+/// Kept under its old name because `order_lock.classid` publishes it.
+pub const ORDER_LOCK_CLASSID: i64 = PRISM_LOCK_CLASSID;
 pub const ORDER_LOCK_OBJID: i64 = 0x4d00_0002;
+pub const SETTLEMENT_LOCK_OBJID: i64 = 0x4d00_0003;
 /// The predicate is derived from the hex key, not typed in decimal: the high
 /// half of `0x505249534d000002` is `0x50524953`, which is 1347570003, and the
 /// low half `0x4d000002` is 1291845634.
 pub const ORDER_LOCK_KEY_NOTE: &str =
     "classid is the high 32 bits of 0x505249534d000002 (0x50524953 = 1347570003) and objid the \
      low 32 bits (0x4d000002 = 1291845634), with objsubid = 1";
+/// The same derivation for `0x505249534d000003`: the low half `0x4d000003` is
+/// 1291845635.
+pub const SETTLEMENT_LOCK_KEY_NOTE: &str =
+    "classid is the high 32 bits of 0x505249534d000003 (0x50524953 = 1347570003) and objid the \
+     low 32 bits (0x4d000003 = 1291845635), with objsubid = 1";
+
+/// One advisory lock the sampler watches, and which server path takes it, so
+/// each reported block names its own source (EP-OBSERVABILITY).
+#[derive(Clone, Copy, Debug)]
+pub struct SampledLock {
+    pub lock: &'static str,
+    pub key: &'static str,
+    pub objid: i64,
+    pub key_note: &'static str,
+    pub taken_by: &'static str,
+}
+
+pub const ORDER_LOCK: SampledLock = SampledLock {
+    lock: "ORDER_LOCK",
+    key: "0x505249534d000002",
+    objid: ORDER_LOCK_OBJID,
+    key_note: ORDER_LOCK_KEY_NOTE,
+    taken_by: "the share append. Window::append_checked (ledger/window.rs) takes this lock and \
+               no other, so this block is the queueing a share pays for. The rebuild paths take \
+               it too, but second, after SETTLEMENT_LOCK.",
+};
+
+pub const SETTLEMENT_LOCK: SampledLock = SampledLock {
+    lock: "SETTLEMENT_LOCK",
+    key: "0x505249534d000003",
+    objid: SETTLEMENT_LOCK_OBJID,
+    key_note: SETTLEMENT_LOCK_KEY_NOTE,
+    taken_by: "the rebuild after a landing. observe_chain_view (ledger/window.rs), the job build \
+               (ledger/jobs.rs) and candidate confirmation or abandonment (ledger/blocks.rs) take \
+               this lock first and ORDER_LOCK second, so a landing's rebuild queues here before \
+               it queues on ORDER_LOCK.",
+};
+
+/// Both locks the sampler watches, in the order they are taken.
+pub const SAMPLED_LOCKS: [SampledLock; 2] = [SETTLEMENT_LOCK, ORDER_LOCK];
 
 /// Raise this process's file-descriptor soft limit to what the session count
 /// needs. Child frontends inherit it.
@@ -377,17 +421,20 @@ impl ProcessSampler {
     }
 }
 
-/// One backend's ORDER_LOCK row at one instant: waiting when `granted` is
-/// false, holding when it is true.
+/// One backend's PRISM advisory-lock row at one instant: waiting when
+/// `granted` is false, holding when it is true.
 ///
 /// The holder matters as much as the waiter. A foreign process that *holds*
-/// ORDER_LOCK stalls every frontend, and the frontends then queue up as
+/// one of these locks stalls every frontend, and the frontends then queue up as
 /// waiters and are correctly recognised as this run's own -- so a sampler that
 /// only selected ungranted rows billed the whole stall to them and reported
 /// that nothing foreign was involved.
 #[derive(Clone, Debug)]
 pub struct LockRow {
     pub pid: i32,
+    /// Which PRISM lock this row is on. Every sample carries rows for both
+    /// sampled locks, and each summary reads only its own.
+    pub objid: i64,
     pub granted: bool,
     pub waitstart: Option<chrono::DateTime<chrono::Utc>>,
     pub application_name: String,
@@ -403,7 +450,9 @@ pub struct LockRow {
 /// `application_name`.
 pub const UNREADABLE_ACTIVITY: &str = "(activity row not visible to the sampler's role)";
 
-/// One `pg_locks` sample of every ORDER_LOCK row in this database.
+/// One `pg_locks` sample of every sampled PRISM advisory-lock row in this
+/// database. One poll covers both locks, so the two summaries share a sample
+/// count and a sampler cost.
 #[derive(Clone, Debug)]
 pub struct LockSample {
     pub monotonic: Instant,
@@ -412,7 +461,7 @@ pub struct LockSample {
     pub query_millis: f64,
 }
 
-/// The ORDER_LOCK picture over a phase.
+/// One sampled lock's picture over a phase.
 #[derive(Clone, Debug, Serialize)]
 pub struct LockSummary {
     pub lock: &'static str,
@@ -420,6 +469,9 @@ pub struct LockSummary {
     pub classid: i64,
     pub objid: i64,
     pub key_note: &'static str,
+    /// Which server path takes this lock, so the block says what it measures
+    /// rather than leaving a reader to infer it from the name.
+    pub taken_by: &'static str,
     pub sample_interval_milliseconds: f64,
     /// How waiters were attributed to this run's frontends.
     pub attribution: String,
@@ -429,9 +481,9 @@ pub struct LockSummary {
     pub samples_with_waiters: usize,
     pub max_waiters: usize,
     pub mean_waiters: Option<f64>,
-    /// ORDER_LOCK is database-wide, so anything else holding or waiting on it
-    /// in the same database would distort every number here. These are the
-    /// waiters that were not this run's frontends.
+    /// A PRISM advisory lock is database-wide, so anything else holding or
+    /// waiting on it in the same database would distort every number here.
+    /// These are the waiters that were not this run's frontends.
     pub foreign_waiter_samples: usize,
     pub foreign_application_names: Vec<String>,
     pub foreign_waiter_seconds_estimate: Option<f64>,
@@ -505,6 +557,24 @@ pub fn row_label(row: &LockRow) -> String {
 /// Split one sample's rows. Pure, so the attribution it decides is testable
 /// without a database.
 pub fn split_lock_rows<'a>(rows: &'a [LockRow], frontends: &[String]) -> LockRowSplit<'a> {
+    split_rows(rows.iter(), frontends)
+}
+
+/// The same split, restricted to one lock. A sample carries rows for every
+/// sampled lock, and a summary must never mix two locks' queues: they are
+/// different queues, taken by different server paths.
+pub fn split_lock_rows_for<'a>(
+    rows: &'a [LockRow],
+    objid: i64,
+    frontends: &[String],
+) -> LockRowSplit<'a> {
+    split_rows(rows.iter().filter(move |row| row.objid == objid), frontends)
+}
+
+fn split_rows<'a>(
+    rows: impl Iterator<Item = &'a LockRow>,
+    frontends: &[String],
+) -> LockRowSplit<'a> {
     let mut split = LockRowSplit {
         own_waiting: Vec::new(),
         own_holding: Vec::new(),
@@ -522,7 +592,19 @@ pub fn split_lock_rows<'a>(rows: &'a [LockRow], frontends: &[String]) -> LockRow
     split
 }
 
-/// Side-connection sampler for ORDER_LOCK waits.
+/// Both sampled locks over one phase, reported side by side.
+///
+/// The dense-cadence scenario measures the rebuild after a landing, and the
+/// rebuild queues on `SETTLEMENT_LOCK` before it queues on `ORDER_LOCK`; a
+/// harness that watched only `ORDER_LOCK` reported part of the queueing and
+/// gave a reader no way to tell (EP-OBSERVABILITY).
+#[derive(Clone, Debug, Serialize)]
+pub struct PhaseLocks {
+    pub order: LockSummary,
+    pub settlement: LockSummary,
+}
+
+/// Side-connection sampler for PRISM advisory-lock waits.
 pub struct LockSampler {
     samples: Arc<std::sync::Mutex<Vec<LockSample>>>,
     stop: Arc<AtomicBool>,
@@ -554,9 +636,12 @@ impl LockSampler {
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                // Granted rows are selected too: the holder of ORDER_LOCK is
-                // what a foreign stall looks like, and filtering it out made
-                // one invisible.
+                // Granted rows are selected too: the holder of one of these
+                // locks is what a foreign stall looks like, and filtering it
+                // out made one invisible.
+                // Both sampled locks come back from one poll, tagged with
+                // their objid, so the two summaries cover exactly the same
+                // instants and can be compared without an alignment argument.
                 // `pg_stat_activity` is joined on the left, so a lock row
                 // whose backend the sampler's role cannot read still appears
                 // and is counted as foreign rather than disappearing. The
@@ -566,21 +651,24 @@ impl LockSampler {
                 // clock with the server's.
                 let query = sqlx::query(
                     "WITH locks AS ( \
-                       SELECT l.pid AS lock_pid, l.granted, l.waitstart, a.pid AS activity_pid, \
+                       SELECT l.pid AS lock_pid, l.objid::bigint AS lock_objid, l.granted, \
+                              l.waitstart, a.pid AS activity_pid, \
                               COALESCE(a.application_name,'') AS application_name \
                        FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
                        WHERE l.locktype = 'advisory' \
                          AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
-                         AND l.classid = $1::bigint::oid AND l.objid = $2::bigint::oid \
+                         AND l.classid = $1::bigint::oid \
+                         AND l.objid IN ($2::bigint::oid, $3::bigint::oid) \
                          AND l.objsubid = 1 \
                      ) \
-                     SELECT stamp.sampled_at, locks.lock_pid, locks.granted, locks.waitstart, \
-                            locks.activity_pid, locks.application_name \
+                     SELECT stamp.sampled_at, locks.lock_pid, locks.lock_objid, locks.granted, \
+                            locks.waitstart, locks.activity_pid, locks.application_name \
                      FROM (SELECT clock_timestamp() AS sampled_at) stamp \
                      LEFT JOIN locks ON true",
                 )
-                .bind(ORDER_LOCK_CLASSID)
+                .bind(PRISM_LOCK_CLASSID)
                 .bind(ORDER_LOCK_OBJID)
+                .bind(SETTLEMENT_LOCK_OBJID)
                 .fetch_all(&pool)
                 .await;
                 match query {
@@ -605,8 +693,11 @@ impl LockSampler {
                                     // one row, with a null lock pid.
                                     .filter_map(|row| {
                                         let pid = row.try_get::<Option<i32>, _>("lock_pid").ok()??;
+                                        let objid =
+                                            row.try_get::<Option<i64>, _>("lock_objid").ok()??;
                                         Some(LockRow {
                                             pid,
+                                            objid,
                                             granted: row
                                                 .try_get::<Option<bool>, _>("granted")
                                                 .ok()
@@ -651,20 +742,35 @@ impl LockSampler {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    pub fn summarize(&self, since: Instant, until: Instant) -> LockSummary {
+    /// Both sampled locks over the same window, from the same polls.
+    pub fn summarize(&self, since: Instant, until: Instant) -> PhaseLocks {
         let all = self.samples.lock().expect("lock sampler").clone();
         let failure = self.failure.lock().expect("lock sampler failure").clone();
         let window: Vec<LockSample> = all
             .into_iter()
             .filter(|s| s.monotonic >= since && s.monotonic <= until)
             .collect();
+        PhaseLocks {
+            order: self.summarize_lock(ORDER_LOCK, &window, failure.clone()),
+            settlement: self.summarize_lock(SETTLEMENT_LOCK, &window, failure),
+        }
+    }
+
+    /// One lock's picture, over rows already restricted to that lock.
+    fn summarize_lock(
+        &self,
+        lock: SampledLock,
+        window: &[LockSample],
+        failure: Option<String>,
+    ) -> LockSummary {
         let attributing = !self.frontends.is_empty();
         let mut summary = LockSummary {
-            lock: "ORDER_LOCK",
-            key: "0x505249534d000002",
-            classid: ORDER_LOCK_CLASSID,
-            objid: ORDER_LOCK_OBJID,
-            key_note: ORDER_LOCK_KEY_NOTE,
+            lock: lock.lock,
+            key: lock.key,
+            classid: PRISM_LOCK_CLASSID,
+            objid: lock.objid,
+            key_note: lock.key_note,
+            taken_by: lock.taken_by,
             sample_interval_milliseconds: self.interval.as_secs_f64() * 1000.0,
             attribution: self.attribution.clone(),
             attributed_application_names: self.frontends.clone(),
@@ -705,9 +811,9 @@ impl LockSampler {
         let mut total_waiters = 0usize;
         let mut previous: Option<Instant> = None;
         let mut query_millis = Vec::with_capacity(window.len());
-        for sample in &window {
+        for sample in window {
             query_millis.push(sample.query_millis);
-            let split = split_lock_rows(&sample.rows, &self.frontends);
+            let split = split_lock_rows_for(&sample.rows, lock.objid, &self.frontends);
             // Every waiter number stays over ungranted rows belonging to this
             // run, exactly as before; the granted rows are new information
             // beside them, never folded into them.

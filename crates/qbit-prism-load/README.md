@@ -5,7 +5,7 @@ produces a `qbit-prism-capacity-evidence/v2` artifact (#303).
 
 It launches real `qbit-prism-server run` child processes, drives them over real
 Stratum sockets with real proof of work, and reports what the cluster did:
-client ACK latency, ORDER_LOCK waits, per-frontend CPU and RSS, reconnect
+client ACK latency, PRISM advisory-lock waits, per-frontend CPU and RSS, reconnect
 behaviour, time to usable work after a new tip, and rejections by reason.
 
 Nothing in the harness changes production code, adds a metric, or bypasses a
@@ -97,7 +97,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--runtime-workers` | 2 | `PRISM_RUNTIME_WORKERS` per frontend |
 | `--blockpoll-seconds` | 2 | `PRISM_BLOCKPOLL_SECONDS` per frontend |
 | `--share-commit-timeout-seconds` | 15 | `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` per frontend |
-| `--lock-sample-interval-ms` | 10 | ORDER_LOCK sampling cadence, 1..1000 ms |
+| `--lock-sample-interval-ms` | 10 | PRISM advisory-lock sampling cadence, 1..1000 ms. One poll covers both sampled locks |
 | `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence, 50..60000 ms |
 | `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this |
 | `--out` | `load-out` | Output directory |
@@ -217,6 +217,16 @@ against the share target, so each one is miner work the pool discarded. None of
 them is persisted, so none is a durability finding — and the report checks that
 against this run's committed share identifiers rather than asserting it
 (`lost_valid_shares_found_in_postgres`, which must be 0).
+
+### Where the rebuild queues
+
+The rebuild a landing triggers takes `SETTLEMENT_LOCK` first and `ORDER_LOCK`
+second, so the database-side queueing this phase is read for is split across
+two locks. Both are sampled and both are reported, in the phase's own
+`phases[]` entry, as `order_lock` and `settlement_lock`. The dense section's
+`definitions.advisory_locks_sampled` says which locks are sampled, which server
+path takes each and which are not sampled, so the two blocks are not left to be
+found by name.
 
 ### Honest output
 
@@ -399,8 +409,22 @@ The side report repeats all of this under `honest_value_notes`.
 - **`database_delay_milliseconds` is the one-way per-chunk proxy delay.** A
   round trip pays it twice. The configured delay and the measured added
   round-trip time are both recorded under `delay_proxy`.
-- **ORDER_LOCK is database-wide.** Anything else in the same database taking
-  the same advisory lock would distort every number in that section, so each
+- **Two advisory locks are sampled, and reported apart.** Each phase carries an
+  `order_lock` block and a `settlement_lock` block, same shape, same own/foreign
+  split, from the same polls. `ORDER_LOCK` (`0x505249534d000002`) is what a
+  share append takes: `Window::append_checked` takes it and no other.
+  `SETTLEMENT_LOCK` (`0x505249534d000003`) is what the rebuild after a landing
+  queues on first — `observe_chain_view`, the job build and candidate
+  confirmation or abandonment all take it *before* `ORDER_LOCK` — so in the
+  dense-cadence phase a large share of the frontends' ungranted advisory-lock
+  rows are on it, and a harness watching `ORDER_LOCK` alone reported part of
+  the queueing with no way for a reader to tell which part. Each block names
+  the path that takes its lock in `taken_by`. `MIGRATION_LOCK` and
+  `CPFP_FUNDING_LOCK` are not sampled: neither is on the append or rebuild
+  path. Because one poll carries both, the two blocks share a `samples` count
+  and a sampler cost, and cover exactly the same instants.
+- **A PRISM advisory lock is database-wide.** Anything else in the same database
+  taking the same advisory lock would distort every number in that block, so each
   frontend connects with `application_name=load-fe-<i>` and the sampler
   attributes rows by it. Whether the driver really carried the name is
   verified against `pg_stat_activity` rather than assumed: when it did not, the
@@ -416,11 +440,14 @@ The side report repeats all of this under `honest_value_notes`.
   `foreign_contention_observed` covering both — `null` rather than `false`
   when the sampler could not attribute rows at all. A frontend holding the
   lock is the normal case and is in none of them.
-- **ORDER_LOCK waits are sampled**, not instrumented. The metric family
+- **Advisory-lock waits are sampled**, not instrumented. The metric family
   `qbit_prism_database_advisory_lock_wait_seconds` exists but has no producer,
-  so the harness samples every ORDER_LOCK row in `pg_locks`, left-joined to
-  `pg_stat_activity`, every 10 ms, and reports a waiter-count summary over the
-  ungranted rows belonging to this run. The join is on the left so a lock row
+  so the harness samples every `ORDER_LOCK` and `SETTLEMENT_LOCK` row in
+  `pg_locks`, left-joined to `pg_stat_activity`, every 10 ms, tags each row with
+  its `objid` and reports a waiter-count summary per lock over the ungranted
+  rows belonging to this run. The two locks are summarized apart: they are
+  different queues taken by different server paths, and mixing them would
+  report a rebuild's queue as a share append's. The join is on the left so a lock row
   whose backend the sampler's role cannot read still appears, and such a row
   counts as foreign — it cannot be shown to be one of this run's frontends, and
   that is the safe direction. Every poll carries the server's

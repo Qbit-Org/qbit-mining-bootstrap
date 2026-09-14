@@ -1186,6 +1186,23 @@ pub fn definitions() -> Value {
         "bump": "an observed change of qbit_prism_cluster.payout_revision. Two bumps inside one \
                  sampling interval appear as one change with revision_delta above 1, so the delta \
                  is reported rather than assumed to be 1.",
+        "advisory_locks_sampled": {
+            "note": "database-side queueing for this phase is reported in the phase's own entry \
+                     under phases[] in this report, not here. Two PRISM advisory locks are \
+                     sampled, from the same polls, and each is reported in its own block with \
+                     the same shape and the same own/foreign split.",
+            "phases_order_lock": measure::ORDER_LOCK.taken_by,
+            "phases_settlement_lock": measure::SETTLEMENT_LOCK.taken_by,
+            "why_both": "the dense-cadence scenario measures the rebuild after a landing, and the \
+                         rebuild takes SETTLEMENT_LOCK first and ORDER_LOCK second. A run that \
+                         sampled ORDER_LOCK alone reported part of the queueing the rebuild pays \
+                         for and gave a reader no way to tell which part.",
+            "not_sampled": "MIGRATION_LOCK (0x505249534d000001) and CPFP_FUNDING_LOCK \
+                            (0x505249534d000006). Neither is on the share-append or rebuild path \
+                            this phase measures.",
+            "shared_sampler": "one poll carries both locks, so the two blocks cover exactly the \
+                               same instants and share a samples count and a sampler cost."
+        },
         "unknown_is_not_zero": "a measurement that could not be taken is null with a reason. A \
                                 run with no landing reports landings 0 and bumps 0 and no windows."
     })

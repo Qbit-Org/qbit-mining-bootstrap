@@ -1135,9 +1135,10 @@ fn the_harness_reads_its_own_postgres_binary_variable() {
 
 #[test]
 fn a_foreign_order_lock_holder_is_not_billed_to_the_frontends() {
-    use qbit_prism_load::measure::{is_own_row, split_lock_rows, LockRow};
+    use qbit_prism_load::measure::{is_own_row, split_lock_rows, LockRow, ORDER_LOCK};
     let row = |pid: i32, granted: bool, name: &str| LockRow {
         pid,
+        objid: ORDER_LOCK.objid,
         granted,
         waitstart: None,
         application_name: name.to_owned(),
@@ -1197,6 +1198,81 @@ fn a_foreign_order_lock_holder_is_not_billed_to_the_frontends() {
         qbit_prism_load::measure::row_label(&row(7, false, "load-fe-0")),
         "load-fe-0"
     );
+}
+
+#[test]
+fn the_two_sampled_locks_are_summarized_apart() {
+    // The rebuild after a landing takes SETTLEMENT_LOCK first and ORDER_LOCK
+    // second. One poll carries both, so a summary must read only its own lock:
+    // mixing them would report a rebuild's queue as a share append's.
+    use qbit_prism_load::measure::{
+        split_lock_rows_for, LockRow, ORDER_LOCK, PRISM_LOCK_CLASSID, SAMPLED_LOCKS,
+        SETTLEMENT_LOCK,
+    };
+    assert_eq!(ORDER_LOCK.key, "0x505249534d000002");
+    assert_eq!(SETTLEMENT_LOCK.key, "0x505249534d000003");
+    assert_ne!(ORDER_LOCK.objid, SETTLEMENT_LOCK.objid);
+    assert_eq!(SAMPLED_LOCKS.len(), 2);
+    // The predicate is the hex key split in half, not a decimal typed in.
+    assert_eq!(PRISM_LOCK_CLASSID, 0x5052_4953);
+    assert_eq!(
+        (PRISM_LOCK_CLASSID << 32) | SETTLEMENT_LOCK.objid,
+        0x5052_4953_4d00_0003
+    );
+    assert!(SETTLEMENT_LOCK.taken_by.contains("rebuild"));
+    assert!(ORDER_LOCK.taken_by.contains("append"));
+
+    let row = |pid: i32, objid: i64, granted: bool, name: &str| LockRow {
+        pid,
+        objid,
+        granted,
+        waitstart: None,
+        application_name: name.to_owned(),
+        activity_visible: true,
+    };
+    let rows = vec![
+        row(1, ORDER_LOCK.objid, true, "load-fe-0"),
+        row(2, ORDER_LOCK.objid, false, "load-fe-1"),
+        row(3, SETTLEMENT_LOCK.objid, true, "load-fe-0"),
+        row(4, SETTLEMENT_LOCK.objid, false, "load-fe-1"),
+        row(5, SETTLEMENT_LOCK.objid, false, "load-fe-2"),
+        row(6, SETTLEMENT_LOCK.objid, true, "adversarial-foreign-holder"),
+    ];
+    let frontends = vec![
+        "load-fe-0".to_owned(),
+        "load-fe-1".to_owned(),
+        "load-fe-2".to_owned(),
+    ];
+    let order = split_lock_rows_for(&rows, ORDER_LOCK.objid, &frontends);
+    assert_eq!(order.own_waiting.len(), 1, "one waiter on ORDER_LOCK");
+    assert_eq!(order.own_holding.len(), 1);
+    assert!(
+        order.foreign_holding.is_empty(),
+        "the foreign holder is on the other lock"
+    );
+
+    let settlement = split_lock_rows_for(&rows, SETTLEMENT_LOCK.objid, &frontends);
+    assert_eq!(
+        settlement.own_waiting.len(),
+        2,
+        "the rebuild's queue is its own number, not folded into ORDER_LOCK's"
+    );
+    assert_eq!(settlement.own_holding.len(), 1);
+    assert_eq!(settlement.foreign_holding.len(), 1);
+    assert_eq!(
+        settlement.foreign_holding[0].application_name,
+        "adversarial-foreign-holder"
+    );
+
+    // Every row belongs to exactly one block: nothing is counted twice and
+    // nothing disappears between the two.
+    let total = |split: &qbit_prism_load::measure::LockRowSplit<'_>| {
+        split.own_waiting.len()
+            + split.own_holding.len()
+            + split.foreign_waiting.len()
+            + split.foreign_holding.len()
+    };
+    assert_eq!(total(&order) + total(&settlement), rows.len());
 }
 
 #[test]
