@@ -4606,6 +4606,220 @@ async fn a_drained_restart_never_stalls_the_scheduler() -> Result<()> {
     Ok(())
 }
 
+/// The mid-flight kill was awaited inside the 1 ms scheduling loop: across
+/// the wait for work, the kill, the relaunch, the readiness wait, a three
+/// second settle, the re-offers and another three seconds no other frontend
+/// was offered anything, and the next tick turned the gap into a burst plus
+/// a shortfall -- the defect the drained restart had been fixed for twice,
+/// in the one place it had not been. It is driven the same way now: every
+/// poll returns within a few milliseconds while the whole kill takes
+/// seconds; the killed frontend's sessions are retargeted once it answers
+/// and then sent a re-offer for each no-response the kill produced; the
+/// other frontend's sessions are never touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::{KillDriver, RELAUNCH_DELAY, SETTLE};
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("kill");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let first_pid = frontends[1].pid().expect("the stand-in is running");
+    let (healthy, mut healthy_control) = detached_session(0, 0, 1);
+    let (victim, mut victim_control) = detached_session(1, 1, 2);
+    let sessions = vec![healthy, victim];
+    // One submit was already recorded before the kill began; it is not the
+    // kill's, whatever its outcome.
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let earlier = client::SubmitRecord {
+        session: 1,
+        frontend: 1,
+        ..submit_record(
+            "mid_flight_kill",
+            Outcome::NoResponse {
+                reason: "before the kill".into(),
+            },
+        )
+    };
+    collected
+        .lock()
+        .unwrap()
+        .apply(client::Event::Submit(Box::new(earlier)));
+
+    let mut driver = KillDriver::start(1, Duration::from_secs(20), &collected);
+    let started = Instant::now();
+    let mut longest_poll = Duration::ZERO;
+    let mut polls = 0usize;
+    let mut reported = false;
+    let record = loop {
+        let poll_started = Instant::now();
+        let progress = driver.poll(&sessions, &mut frontends, &[], &collected)?;
+        longest_poll = longest_poll.max(poll_started.elapsed());
+        polls += 1;
+        if let Some(record) = progress {
+            break record;
+        }
+        // Once the process is gone, the victim's session reports the
+        // no-response the kill produced, as the real session's reader would
+        // on end of stream; a session on the other frontend closing its
+        // own socket in the same window is not the kill's.
+        if !reported && frontends[1].restarts >= 1 {
+            reported = true;
+            let mut state = collected.lock().unwrap();
+            let lost = client::SubmitRecord {
+                share_id: "pload1abc.s00001:lost".into(),
+                session: 1,
+                frontend: 1,
+                ..submit_record(
+                    "mid_flight_kill",
+                    Outcome::NoResponse {
+                        reason: "socket closed: end of stream".into(),
+                    },
+                )
+            };
+            let other = client::SubmitRecord {
+                share_id: "pload1abc.s00000:other".into(),
+                session: 0,
+                frontend: 0,
+                ..submit_record(
+                    "mid_flight_kill",
+                    Outcome::NoResponse {
+                        reason: "socket closed: end of stream".into(),
+                    },
+                )
+            };
+            state.apply(client::Event::Submit(Box::new(lost)));
+            state.apply(client::Event::Submit(Box::new(other)));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    let total = started.elapsed();
+    assert!(
+        total >= RELAUNCH_DELAY + SETTLE,
+        "the kill paused before the relaunch and settled after the retarget: {total:?}"
+    );
+    assert!(
+        longest_poll < Duration::from_millis(100),
+        "no single poll may stall the scheduler; the longest took {longest_poll:?} over \
+         {polls} polls while the kill took {total:?}"
+    );
+    assert!(
+        polls > 100,
+        "the scheduler kept running during the kill: {polls} polls"
+    );
+    assert_eq!(record.index, 1);
+    assert_eq!(
+        record.outstanding_at_kill, 2,
+        "the victim held work when it was killed"
+    );
+    assert_eq!(
+        record
+            .indeterminate
+            .iter()
+            .map(|r| r.share_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pload1abc.s00001:lost"],
+        "the census is the killed frontend's own no-responses since the kill"
+    );
+    assert_eq!(frontends[1].restarts, 1);
+    assert_ne!(
+        frontends[1].pid(),
+        Some(first_pid),
+        "a new process is running"
+    );
+    assert!(frontends[1].exited().is_none(), "and it is up");
+    assert_eq!(frontends[0].restarts, 0);
+    match victim_control.try_recv() {
+        Ok(client::Control::Retarget {
+            frontend: 1,
+            reconnect: false,
+            ..
+        }) => {}
+        other => panic!("the victim's session is retargeted once the relaunch answers: {other:?}"),
+    }
+    match victim_control.try_recv() {
+        Ok(client::Control::Reoffer { share_id, .. }) => {
+            assert_eq!(share_id, "pload1abc.s00001:lost");
+        }
+        other => panic!("then sent the re-offer for its lost share: {other:?}"),
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "nothing else is sent to it"
+    );
+    assert!(
+        healthy_control.try_recv().is_err(),
+        "the healthy frontend's sessions are never retargeted or re-offered"
+    );
+    assert_eq!(
+        sessions[0].outstanding.load(Ordering::Relaxed),
+        1,
+        "the driver never touches a counter"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// A kill whose relaunch never answers is reported as a failure the phase
+/// aborts on, not waited for past its limit, and the scheduler is not
+/// stalled while the limit runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_whose_relaunch_never_answers_is_reported_within_its_limit() -> Result<()> {
+    use qbit_prism_load::kill::KillDriver;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("kill-unready");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    // No audit port answers: the relaunch never becomes ready.
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, 1),
+        stand_in_frontend(&server, dir.path(), 1, 1),
+    ];
+    let (victim, _victim_control) = detached_session(1, 1, 1);
+    let sessions = vec![victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let mut driver = KillDriver::start(1, Duration::from_millis(800), &collected);
+    let started = Instant::now();
+    let mut longest_poll = Duration::ZERO;
+    let error = loop {
+        let poll_started = Instant::now();
+        match driver.poll(&sessions, &mut frontends, &[], &collected) {
+            Ok(None) => {}
+            Ok(Some(record)) => panic!("an unready relaunch must not complete: {record:?}"),
+            Err(error) => break format!("{error:#}"),
+        }
+        longest_poll = longest_poll.max(poll_started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the limit was not applied"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert!(error.contains("did not become ready"), "{error}");
+    assert!(error.contains("mid-flight kill"), "{error}");
+    assert!(
+        longest_poll < Duration::from_millis(100),
+        "the longest poll took {longest_poll:?}"
+    );
+    assert_eq!(frontends[1].restarts, 1, "the relaunch was attempted");
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
 /// Submits still outstanding after the drain limit -- reachable with the
 /// default 15 s commit timeout and likely with a longer one or a contended
 /// database -- mean the drained restart cannot be performed. Killing the

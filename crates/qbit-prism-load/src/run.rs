@@ -13,6 +13,7 @@ use crate::{
     cluster::{self, ManagedPostgres, ObservedReplication, Replication},
     digest,
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
+    kill::KillDriver,
     measure::{self, LockSampler, ProcessSampler},
     node::FakeNode,
     profile, provenance, proxy, report,
@@ -1909,6 +1910,12 @@ async fn drive_phase(
     };
     let mut tip_cursor = 0usize;
     let mut kill_done = !plan.mid_flight_kill;
+    // The mid-flight kill in flight, if any: polled from this loop and
+    // never awaited, for the same reason the drained restart is. Awaiting
+    // it stalled the scheduler across the kill, the relaunch, the readiness
+    // wait and two settles, so the healthy frontends got no traffic and the
+    // next tick turned the gap into a burst plus shortfall (EP-STATE).
+    let mut kill: Option<KillDriver> = None;
     // The dense-cadence schedule: one own-block landing per offset, each paid
     // for out of the landing budget. A slot the budget cannot pay for is
     // counted, never silently dropped (EP-ERRORS).
@@ -2019,11 +2026,26 @@ async fn drive_phase(
         }
         if !kill_done && seconds >= duration.as_secs_f64() / 3.0 {
             kill_done = true;
-            let (indeterminate, outstanding) =
-                mid_flight_kill(args, sessions, frontends, samplers, collected).await?;
-            outcome.indeterminate = indeterminate;
-            outcome.outstanding_at_kill = Some(outstanding);
-            outcome.frontend_restarts += 1;
+            let index = if frontends.len() >= 2 { 1 } else { 0 };
+            kill = Some(KillDriver::start(index, restart_ready_limit, collected));
+        }
+        if let Some(driver) = kill.as_mut() {
+            match driver.poll(sessions, frontends, samplers, collected) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    outcome.indeterminate = record.indeterminate;
+                    outcome.outstanding_at_kill = Some(record.outstanding_at_kill);
+                    outcome.frontend_restarts += 1;
+                    kill = None;
+                }
+                Err(error) => {
+                    outcome.aborted = Some(format!(
+                        "the mid-flight kill of load-fe-{} could not be completed: {error:#}",
+                        driver.index()
+                    ));
+                    break;
+                }
+            }
         }
         if mem_check.elapsed() >= Duration::from_secs(1) {
             mem_check = Instant::now();
@@ -2057,28 +2079,48 @@ async fn drive_phase(
             }
         }
     }
-    // A restart still in flight at the phase boundary is seen through, so
-    // its sessions are retargeted before the next phase offers to them. Its
-    // own deadlines bound the wait, and a failure aborts as it would inside
-    // the phase. Nothing is offered meanwhile.
-    while outcome.aborted.is_none() {
-        let Some(driver) = restart.as_mut() else {
-            break;
-        };
-        match driver.poll(sessions, frontends, samplers) {
-            Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
-            Ok(Some(record)) => {
-                outcome.frontend_restarts += 1;
-                outcome.restart_records.push(record);
-                restart = None;
-            }
-            Err(error) => {
-                outcome.aborted = Some(format!(
-                    "the drained restart of load-fe-{} could not be performed: {error:#}",
-                    driver.index()
-                ));
+    // A restart or a kill still in flight at the phase boundary is seen
+    // through, so its sessions are retargeted -- and, for the kill, its
+    // re-offers sent -- before the next phase offers to them. Their own
+    // deadlines bound the wait, and a failure aborts as it would inside the
+    // phase. Nothing is offered meanwhile.
+    while outcome.aborted.is_none() && (restart.is_some() || kill.is_some()) {
+        if let Some(driver) = restart.as_mut() {
+            match driver.poll(sessions, frontends, samplers) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    outcome.frontend_restarts += 1;
+                    outcome.restart_records.push(record);
+                    restart = None;
+                }
+                Err(error) => {
+                    outcome.aborted = Some(format!(
+                        "the drained restart of load-fe-{} could not be performed: {error:#}",
+                        driver.index()
+                    ));
+                    break;
+                }
             }
         }
+        if let Some(driver) = kill.as_mut() {
+            match driver.poll(sessions, frontends, samplers, collected) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    outcome.indeterminate = record.indeterminate;
+                    outcome.outstanding_at_kill = Some(record.outstanding_at_kill);
+                    outcome.frontend_restarts += 1;
+                    kill = None;
+                }
+                Err(error) => {
+                    outcome.aborted = Some(format!(
+                        "the mid-flight kill of load-fe-{} could not be completed: {error:#}",
+                        driver.index()
+                    ));
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     Ok(outcome)
 }
@@ -2097,73 +2139,6 @@ fn offer_round_robin(
         }
     }
     false
-}
-
-/// SIGKILL a frontend with submits outstanding, then re-offer every share whose
-/// answer was lost, with exactly the header it carried.
-async fn mid_flight_kill(
-    args: &Args,
-    sessions: &[SessionHandle],
-    frontends: &mut [Frontend],
-    samplers: &[ProcessSampler],
-    collected: &Arc<Mutex<Collected>>,
-) -> Result<(Vec<SubmitRecord>, usize)> {
-    let index = if frontends.len() >= 2 { 1 } else { 0 };
-    let before = collected.lock().expect("collector lock").submits.len();
-    // Wait for the frontend to actually be holding work. A kill with nothing
-    // in flight tears down an idle socket and proves nothing, so the harness
-    // reports what it found rather than assuming the scenario happened.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let outstanding_on = |sessions: &[SessionHandle]| -> usize {
-        sessions
-            .iter()
-            .filter(|session| session.frontend.load(Ordering::Relaxed) == index)
-            .map(|session| session.outstanding.load(Ordering::Relaxed))
-            .sum()
-    };
-    let mut outstanding = outstanding_on(sessions);
-    while outstanding == 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        outstanding = outstanding_on(sessions);
-    }
-    frontends[index].kill();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    frontends[index].restart()?;
-    frontends[index]
-        .wait_ready(Duration::from_secs(args.work_timeout))
-        .await?;
-    if let Some(sampler) = samplers.get(index) {
-        sampler.set_pid(frontends[index].pid());
-    }
-    let address = frontends[index].stratum_address();
-    for session in sessions {
-        if session.frontend.load(Ordering::Relaxed) == index {
-            let _ = session.control.send(client::Control::Retarget {
-                frontend: index,
-                address: address.clone(),
-                reconnect: false,
-            });
-        }
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let indeterminate = {
-        let state = collected.lock().expect("collector lock");
-        indeterminate_after_kill(&state.submits, before, index)
-    };
-    for record in &indeterminate {
-        if let Some(session) = sessions.get(record.session) {
-            let _ = session.control.send(client::Control::Reoffer {
-                share_id: record.share_id.clone(),
-                job_id: record.job_id.clone(),
-                extranonce2_hex: record.extranonce2_hex.clone(),
-                ntime_hex: record.ntime_hex.clone(),
-                nonce_hex: record.nonce_hex.clone(),
-                header_hex: record.header_hex.clone(),
-            });
-        }
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    Ok((indeterminate, outstanding))
 }
 
 /// The submits whose answer the kill destroyed: every no-response recorded

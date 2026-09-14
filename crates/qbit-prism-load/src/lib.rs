@@ -21,6 +21,7 @@ pub mod client;
 pub mod cluster;
 pub mod digest;
 pub mod frontend;
+pub mod kill;
 pub mod measure;
 pub mod node;
 pub mod profile;

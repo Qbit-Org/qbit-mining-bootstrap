@@ -40,7 +40,7 @@ use std::{
 use tokio::sync::oneshot::{self, error::TryRecvError};
 
 /// How often the readiness probe is retried while the new process starts.
-const READY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const READY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// What a completed restart produced.
 #[derive(Clone, Debug)]
@@ -58,10 +58,7 @@ pub struct RestartRecord {
 enum Stage {
     Draining,
     ScrapingBeforeKill(oneshot::Receiver<MetricsScrape>),
-    WaitingReady {
-        next_probe: Instant,
-        probe: Option<oneshot::Receiver<bool>>,
-    },
+    WaitingReady(ReadyWait),
     ScrapingAfterRestart(oneshot::Receiver<MetricsScrape>),
     Done,
 }
@@ -73,10 +70,76 @@ pub struct RestartDriver {
     drain_limit: Duration,
     drain_deadline: Instant,
     ready_limit: Duration,
-    ready_deadline: Instant,
     drained_at: Option<Instant>,
     killed_at: Option<Instant>,
     end_of_previous: Option<MetricsScrape>,
+}
+
+/// The wait for a relaunched process to answer `/healthz`, polled without
+/// blocking: one probe in flight at a time, retried every
+/// [`READY_PROBE_INTERVAL`], bounded by a limit from the relaunch. Shared by
+/// the drained restart and the mid-flight kill, so the two relaunches the
+/// harness performs wait the same way and neither stalls the scheduler.
+pub(crate) struct ReadyWait {
+    limit: Duration,
+    deadline: Instant,
+    next_probe: Instant,
+    probe: Option<oneshot::Receiver<bool>>,
+    /// What the process is doing, for the two failure messages: "its
+    /// restart", say.
+    what: &'static str,
+}
+
+impl ReadyWait {
+    pub(crate) fn start(limit: Duration, what: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            limit,
+            deadline: now + limit,
+            next_probe: now,
+            probe: None,
+            what,
+        }
+    }
+
+    /// `Ok(true)` once the process answered, `Ok(false)` while it has not
+    /// yet, and an error when it exited or the limit passed.
+    pub(crate) fn poll(&mut self, frontend: &mut Frontend) -> Result<bool> {
+        if let Some(status) = frontend.exited() {
+            bail!(
+                "{} exited with {status} during {}; see {}",
+                frontend.spec.instance_id,
+                self.what,
+                frontend.stderr_path.display()
+            );
+        }
+        match &mut self.probe {
+            Some(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => Ok(false),
+                Ok(true) => Ok(true),
+                Ok(false) | Err(TryRecvError::Closed) => {
+                    self.probe = None;
+                    self.next_probe = Instant::now() + READY_PROBE_INTERVAL;
+                    Ok(false)
+                }
+            },
+            None => {
+                if Instant::now() >= self.deadline {
+                    bail!(
+                        "{} did not become ready within {:?} after {}; see {}",
+                        frontend.spec.instance_id,
+                        self.limit,
+                        self.what,
+                        frontend.stderr_path.display()
+                    );
+                }
+                if Instant::now() >= self.next_probe {
+                    self.probe = Some(spawn_probe(frontend));
+                }
+                Ok(false)
+            }
+        }
+    }
 }
 
 fn outstanding_on(sessions: &[SessionHandle], index: usize) -> usize {
@@ -97,7 +160,7 @@ fn spawn_scrape(frontend: &Frontend) -> oneshot::Receiver<MetricsScrape> {
     rx
 }
 
-fn spawn_probe(frontend: &Frontend) -> oneshot::Receiver<bool> {
+pub(crate) fn spawn_probe(frontend: &Frontend) -> oneshot::Receiver<bool> {
     let (tx, rx) = oneshot::channel();
     let url = frontend.health_url();
     tokio::spawn(async move {
@@ -156,7 +219,6 @@ impl RestartDriver {
             drain_limit,
             drain_deadline: now + drain_limit,
             ready_limit,
-            ready_deadline: now + ready_limit,
             drained_at: None,
             killed_at: None,
             end_of_previous: None,
@@ -208,52 +270,18 @@ impl RestartDriver {
                     // the process group gets SIGKILL and is reaped, and the
                     // new one is forked.
                     frontends[index].restart()?;
-                    let now = Instant::now();
-                    self.killed_at = Some(now);
-                    self.ready_deadline = now + self.ready_limit;
+                    self.killed_at = Some(Instant::now());
                     if let Some(sampler) = samplers.get(index) {
                         sampler.set_pid(frontends[index].pid());
                     }
-                    self.stage = Stage::WaitingReady {
-                        next_probe: now,
-                        probe: None,
-                    };
+                    self.stage =
+                        Stage::WaitingReady(ReadyWait::start(self.ready_limit, "its restart"));
                     continue;
                 }
-                Stage::WaitingReady { next_probe, probe } => {
-                    if let Some(status) = frontends[index].exited() {
-                        bail!(
-                            "{} exited with {status} while restarting; see {}",
-                            frontends[index].spec.instance_id,
-                            frontends[index].stderr_path.display()
-                        );
-                    }
-                    match probe {
-                        Some(rx) => match rx.try_recv() {
-                            Err(TryRecvError::Empty) => return Ok(None),
-                            Ok(true) => {
-                                self.stage =
-                                    Stage::ScrapingAfterRestart(spawn_scrape(&frontends[index]));
-                                continue;
-                            }
-                            Ok(false) | Err(TryRecvError::Closed) => {
-                                *probe = None;
-                                *next_probe = Instant::now() + READY_PROBE_INTERVAL;
-                            }
-                        },
-                        None => {
-                            if Instant::now() >= self.ready_deadline {
-                                bail!(
-                                    "{} did not become ready within {:?} after its restart; see {}",
-                                    frontends[index].spec.instance_id,
-                                    self.ready_limit,
-                                    frontends[index].stderr_path.display()
-                                );
-                            }
-                            if Instant::now() >= *next_probe {
-                                *probe = Some(spawn_probe(&frontends[index]));
-                            }
-                        }
+                Stage::WaitingReady(wait) => {
+                    if wait.poll(&mut frontends[index])? {
+                        self.stage = Stage::ScrapingAfterRestart(spawn_scrape(&frontends[index]));
+                        continue;
                     }
                     return Ok(None);
                 }
