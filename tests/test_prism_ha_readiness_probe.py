@@ -68,6 +68,11 @@ class ReadinessProbeTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "scripts/prism_ha_readiness_probe.py"], input=rows, text=True, capture_output=True, check=True)
         self.assertEqual([json.loads(line)["state"] for line in result.stdout.splitlines()], ["unknown", "up"])
 
+    def test_cli_malformed_duration_is_a_failed_probe(self):
+        row = json.dumps({"response": OK, "elapsed_s": None}) + "\n"
+        result = subprocess.run([sys.executable, "scripts/prism_ha_readiness_probe.py"], input=row, text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout)["state"], "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import argparse
 import json
 import math
+import numbers
 from typing import Any
 
 
@@ -37,7 +38,14 @@ class ReadinessProbe:
 
     @staticmethod
     def classify(response: Any, elapsed_s: float, timeout_s: float) -> bool:
-        if not math.isfinite(elapsed_s) or elapsed_s < 0 or elapsed_s > timeout_s or not isinstance(response, dict):
+        if (
+            isinstance(elapsed_s, bool)
+            or not isinstance(elapsed_s, numbers.Real)
+            or not math.isfinite(elapsed_s)
+            or elapsed_s < 0
+            or elapsed_s > timeout_s
+            or not isinstance(response, dict)
+        ):
             return False
         return response.get("status") == 200 and response.get("ok") is True
 
