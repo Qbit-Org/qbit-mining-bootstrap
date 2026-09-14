@@ -6,6 +6,16 @@ use qbit_prism_server::{
     metrics::{collectors, Metrics},
 };
 use qbit_prism_test_gate as gate;
+
+/// The signing keys `configure` pins alongside the fingerprint since #265.
+/// This suite exercises connection deadlines rather than signing, so one fixed
+/// pair is enough.
+fn signer_keys() -> qbit_prism_server::ledger::SignerKeys {
+    qbit_prism_server::ledger::SignerKeys {
+        manifest_key_hex: "11".repeat(32),
+        ledger_key_hex: "22".repeat(32),
+    }
+}
 use sqlx::PgPool;
 use std::{
     sync::Arc,
@@ -88,7 +98,7 @@ async fn check_live_pool_scrapes(ledger: &Ledger, metrics: Arc<Metrics>) -> Resu
         // Real collector deadlines and cancelled instrumented ledger waits
         // continue for >30 seconds, across a cached-body stale boundary.
         for attempt in 1..=9 {
-            ensure!(tokio::time::timeout(Duration::from_millis(750), ledger.configure("live-pool-test")).await.is_err(),
+            ensure!(tokio::time::timeout(Duration::from_millis(750), ledger.configure("live-pool-test", &signer_keys())).await.is_err(),
                 "held pool must block the instrumented ledger acquisition");
             let collection = metrics.begin_collection(qbit_prism_server::metrics::Collector::Database);
             ensure!(collectors::database(&ledger.pool, &metrics).await.is_err(), "held pool must fail collection");
