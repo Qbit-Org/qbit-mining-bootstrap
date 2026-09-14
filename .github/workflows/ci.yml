@@ -307,20 +307,30 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # The pinned qbit tarball is cached under a key tied to the install
+      # script (which holds the version and digest), so a run after the first
+      # needs no release download at all. The script verifies the digest of
+      # whatever it uses, cached or downloaded, before extracting, and falls
+      # back from the github.com release route to the release-asset API route
+      # when the first is unavailable. A cache-service error only logs a
+      # warning here; it never fails the job.
+      - name: Restore the pinned qbit release from the cache
+        id: prism-qbit-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
       - name: Install pinned qbit for native mining and CTV integration
         run: |
           set -euo pipefail
-          prism_qbit_dir="${RUNNER_TEMP}/prism-qbit"
-          mkdir -p "${prism_qbit_dir}"
-          cd "${prism_qbit_dir}"
-          curl --fail --location --retry 3 \
-            --output qbit-1.0.0-x86_64-linux-gnu.tar.gz \
-            https://github.com/Qbit-Org/qbit/releases/download/v1.0.0/qbit-1.0.0-x86_64-linux-gnu.tar.gz
-          printf '%s  %s\n' \
-            ae121af03263b55d530e3f3e8719a71362d0950cba82f54a2bc2d6c437a029b5 \
-            qbit-1.0.0-x86_64-linux-gnu.tar.gz | sha256sum --check
-          tar -xzf qbit-1.0.0-x86_64-linux-gnu.tar.gz
-          printf 'QBITD_BIN=%s/qbit-1.0.0/bin/qbitd\n' "${prism_qbit_dir}" >> "${GITHUB_ENV}"
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Save the pinned qbit release to the cache
+        if: steps.prism-qbit-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
       - name: Run workspace test shard in required integration mode
         env:
           SHARD_INDEX: ${{ matrix.shard }}
