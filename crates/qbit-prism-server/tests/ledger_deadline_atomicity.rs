@@ -933,10 +933,33 @@ async fn database_deadline(pool: &PgPool, after_ms: i64) -> Result<i64> {
 
 #[tokio::test]
 async fn issued_job_late_expiry_rolls_back() -> Result<()> {
-    let Some(db) = Database::open().await? else {
+    let Some(mut db) = Database::open().await? else {
         return Ok(());
     };
-    let result = issued_job_late_expiry(&db.ledger).await;
+    // This test holds a row lock across the absolute job deadline. Remove
+    // competing server timeouts on every connection in this fixture pool;
+    // WAIT still bounds the barriers and task join. Other tests keep defaults.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(WAIT)
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('lock_timeout','0',false),set_config('statement_timeout','0',false)")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(db.ledger.pool.connect_options().as_ref().clone())
+        .await;
+    let result = match pool {
+        Ok(pool) => {
+            db.ledger.pool.close().await;
+            db.ledger.pool = pool;
+            issued_job_late_expiry(&db.ledger).await
+        }
+        Err(error) => Err(error.into()),
+    };
     db.close(result).await
 }
 

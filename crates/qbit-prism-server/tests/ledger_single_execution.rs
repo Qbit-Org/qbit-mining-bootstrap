@@ -1104,6 +1104,16 @@ async fn fanout_journal_timeout_body(db: &Database) -> Result<()> {
     );
     assert_rejected_only(&proxy.rejections_since(control)?, &[]);
     assert_eq!(fanout(&fixture, &txid).await?, after);
+    // The claim query considers every fanout. Freeze all completed attempts
+    // after their durable-state checks, including the earlier controls whose
+    // real backoffs may already have elapsed while this test was descheduled.
+    let txids: Vec<_> = claims
+        .iter()
+        .map(|claim| claim.fanout_txid.clone())
+        .collect();
+    let frozen = sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at='infinity'::timestamptz WHERE fanout_txid=ANY($1)")
+        .bind(&txids).execute(&fixture).await?.rows_affected();
+    assert_eq!(frozen, claims.len() as u64);
     assert!(
         ledger.claim_fanout(120).await?.is_none(),
         "a fanout inside its backoff was claimable"
