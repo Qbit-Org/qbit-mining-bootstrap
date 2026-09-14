@@ -2386,17 +2386,35 @@ fn detached_session(
     client::SessionHandle,
     tokio::sync::mpsc::UnboundedReceiver<client::Control>,
 ) {
-    let (work, _work_rx) = tokio::sync::mpsc::channel(1);
+    let (handle, control_rx, _work_rx) = queued_session(index, frontend, outstanding, 1);
+    (handle, control_rx)
+}
+
+/// A session handle with no task behind it, whose work queue stays open with
+/// room for `queue` offers and is never consumed: an accepted offer stays
+/// visible in `outstanding`, which is what a scheduler test needs.
+fn queued_session(
+    index: usize,
+    frontend: usize,
+    outstanding: usize,
+    queue: usize,
+) -> (
+    client::SessionHandle,
+    tokio::sync::mpsc::UnboundedReceiver<client::Control>,
+    tokio::sync::mpsc::Receiver<client::Work>,
+) {
+    let (work, work_rx) = tokio::sync::mpsc::channel(queue);
     let (control, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = client::SessionHandle {
         index,
         frontend: Arc::new(std::sync::atomic::AtomicUsize::new(frontend)),
         outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(outstanding)),
+        paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         work,
         control,
         task: tokio::spawn(async {}),
     };
-    (handle, control_rx)
+    (handle, control_rx, work_rx)
 }
 
 fn stand_in_frontend(
@@ -2559,6 +2577,108 @@ async fn a_restart_whose_drain_never_completes_is_refused_not_forced() -> Result
     assert_eq!(frontends[1].restarts, 0, "the process was left alone");
     assert_eq!(frontends[1].pid(), pid);
     assert!(frontends[1].exited().is_none(), "it is still running");
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The scheduler keeps offering during the restart, and a paused session
+/// must be ineligible rather than a place for offers to pile up: an offer it
+/// accepted would count as outstanding, hold the drain open until its
+/// deadline, take the token from the frontends that are up, and go out as a
+/// burst on resume. The flag the scheduler reads goes up when the pause is
+/// decided and comes down with the retarget that ends the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_session_is_not_offered_work_until_it_is_retargeted() -> Result<()> {
+    use qbit_prism_load::restart::RestartDriver;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("paused-offers");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let (healthy, _healthy_control, _healthy_queue) = queued_session(0, 0, 0, 8);
+    let (draining, mut draining_control, _draining_queue) = queued_session(1, 1, 2, 8);
+    let sessions = vec![healthy, draining];
+    let phase: Arc<str> = Arc::from("reconnect");
+    let limit = 8;
+    // Two submits are in flight on the frontend about to be restarted; they
+    // settle 200 ms in. Nothing consumes either session's work queue, so an
+    // accepted offer stays visible in `outstanding`.
+    let settle = sessions[1].outstanding.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle.fetch_sub(2, Ordering::SeqCst);
+    });
+
+    let mut driver = RestartDriver::start(
+        1,
+        &sessions,
+        Duration::from_secs(5),
+        Duration::from_secs(20),
+    );
+    // The scheduler's next offer already sees the pause, before the session
+    // task has read its control channel.
+    assert!(matches!(
+        draining_control.try_recv(),
+        Ok(client::Control::Pause)
+    ));
+    assert!(
+        !sessions[1].try_offer(limit, &phase),
+        "a paused session refuses the offer it has room for"
+    );
+    assert_eq!(sessions[1].outstanding.load(Ordering::SeqCst), 2);
+    assert!(
+        sessions[0].try_offer(limit, &phase),
+        "the healthy frontend's session takes the token instead"
+    );
+
+    // Keep offering, as the reconnect phase's scheduler does, for the whole
+    // restart. The drain can only complete because none of these land.
+    let started = Instant::now();
+    let mut refused = 0usize;
+    let record = loop {
+        assert!(
+            !sessions[1].try_offer(limit, &phase),
+            "no offer may land on the paused session while it is restarting"
+        );
+        refused += 1;
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[])? {
+            break record;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the restart did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert!(
+        refused > 10,
+        "the scheduler kept offering: {refused} offers"
+    );
+    assert_eq!(record.index, 1);
+    assert!(
+        record.drain_seconds >= 0.2 && record.drain_seconds < 4.0,
+        "the drain waited for the in-flight submits and nothing else: {}",
+        record.drain_seconds
+    );
+    match draining_control.try_recv() {
+        Ok(client::Control::Retarget { frontend: 1, .. }) => {}
+        other => panic!("the session is retargeted at the end: {other:?}"),
+    }
+    assert!(
+        sessions[1].try_offer(limit, &phase),
+        "the retarget makes the session eligible again"
+    );
+    assert_eq!(
+        sessions[1].outstanding.load(Ordering::SeqCst),
+        1,
+        "only the offer made after the retarget was accepted"
+    );
     for child in frontends.iter_mut() {
         child.kill();
     }

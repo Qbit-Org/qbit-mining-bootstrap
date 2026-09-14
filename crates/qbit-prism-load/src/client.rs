@@ -283,9 +283,10 @@ pub enum Control {
     Reconnect {
         reason: String,
     },
-    /// Stop submitting but stay connected until told otherwise.
+    /// Stop submitting but stay connected until retargeted. The sender sets
+    /// `SessionHandle::paused` first, so the scheduler stops offering at once.
     Pause,
-    /// Point at a frontend and resume.
+    /// Point at a frontend and resume: the only message that lifts a pause.
     Retarget {
         frontend: usize,
         address: String,
@@ -341,15 +342,32 @@ pub struct SessionHandle {
     pub index: usize,
     pub frontend: Arc<AtomicUsize>,
     pub outstanding: Arc<AtomicUsize>,
+    /// Whether the session is paused: told to stop submitting and stay
+    /// connected until it is retargeted. The session task reads it to decide
+    /// whether it may send, and the scheduler reads it to decide whether to
+    /// offer, so both decisions see the one state (EP-STATE). Whoever sends
+    /// `Control::Pause` sets it before sending, so the scheduler stops
+    /// offering the instant the pause is decided rather than when the task
+    /// gets round to the message; the task sets it again on receipt, which is
+    /// harmless, and clears it on `Control::Retarget`.
+    pub paused: Arc<AtomicBool>,
     pub work: mpsc::Sender<Work>,
     pub control: mpsc::UnboundedSender<Control>,
     pub task: tokio::task::JoinHandle<()>,
 }
 
 impl SessionHandle {
-    /// Offer one share to this session if it is under its outstanding limit.
-    /// `phase` is the phase making the offer; the record the session
-    /// eventually reports carries it whatever the phase is by then.
+    /// Offer one share to this session if it is under its outstanding limit
+    /// and not paused. `phase` is the phase making the offer; the record the
+    /// session eventually reports carries it whatever the phase is by then.
+    ///
+    /// A paused session is ineligible, not merely slow: an offer it accepted
+    /// would sit in its queue, counted as outstanding, until it is retargeted.
+    /// That takes the token away from the frontends that are up, holds the
+    /// drain that waits for `outstanding` to reach zero open until its
+    /// deadline, and then sends the queue as one burst on resume; the
+    /// reconnect phase would measure that burst instead of steady traffic
+    /// while one frontend is away.
     ///
     /// This must stay synchronous, and the counter must stay private to the run
     /// task. The session task can receive and finish the work between the
@@ -363,7 +381,8 @@ impl SessionHandle {
     /// Making this `async`, or reading `outstanding` from a spawned task, breaks
     /// that and lets a session sit permanently over its limit.
     pub fn try_offer(&self, limit: usize, phase: &Arc<str>) -> bool {
-        if self.outstanding.load(Ordering::Relaxed) >= limit {
+        if self.paused.load(Ordering::Relaxed) || self.outstanding.load(Ordering::Relaxed) >= limit
+        {
             return false;
         }
         if self
@@ -431,6 +450,7 @@ pub fn spawn_session(
     let (work_tx, work_rx) = mpsc::channel(max_outstanding.max(1));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let outstanding = Arc::new(AtomicUsize::new(0));
+    let paused = Arc::new(AtomicBool::new(false));
     let frontend_slot = Arc::new(AtomicUsize::new(frontend));
     let task = tokio::spawn(run_session(
         config.clone(),
@@ -440,12 +460,14 @@ pub fn spawn_session(
         work_rx,
         control_rx,
         outstanding.clone(),
+        paused.clone(),
         max_outstanding,
     ));
     SessionHandle {
         index: config.index,
         frontend: frontend_slot,
         outstanding,
+        paused,
         work: work_tx,
         control: control_tx,
         task,
@@ -461,9 +483,9 @@ async fn run_session(
     mut work: mpsc::Receiver<Work>,
     mut control: mpsc::UnboundedReceiver<Control>,
     outstanding: Arc<AtomicUsize>,
+    paused: Arc<AtomicBool>,
     max_outstanding: usize,
 ) {
-    let mut paused = false;
     let mut stopping = false;
     let mut connection: Option<Connection> = None;
     let mut reconnect_reason = String::from("initial");
@@ -508,9 +530,9 @@ async fn run_session(
                                 Some(Control::Retarget { frontend: index, address: next, .. }) => {
                                     frontend.store(index, Ordering::Relaxed);
                                     address = next;
-                                    paused = false;
+                                    paused.store(false, Ordering::Relaxed);
                                 }
-                                Some(Control::Pause) => paused = true,
+                                Some(Control::Pause) => paused.store(true, Ordering::Relaxed),
                                 Some(_) => {}
                             }
                         }
@@ -521,7 +543,7 @@ async fn run_session(
             }
         }
         let active = connection.as_mut().expect("connection present");
-        let can_submit = !paused && active.pending.len() < max_outstanding;
+        let can_submit = !paused.load(Ordering::Relaxed) && active.pending.len() < max_outstanding;
         tokio::select! {
             biased;
             message = control.recv() => {
@@ -531,16 +553,16 @@ async fn run_session(
                         drain_work(&mut work, &outstanding, &shared, config.index);
                     }
                     Some(Control::Pause) => {
-                        paused = true;
-                        // Queued offers this session will now never send must
-                        // release their slot, or the run's drain would wait
-                        // for work that is not coming.
+                        paused.store(true, Ordering::Relaxed);
+                        // Offers queued before the sender set the flag will
+                        // now never send and must release their slot, or the
+                        // run's drain would wait for work that is not coming.
                         drain_work(&mut work, &outstanding, &shared, config.index);
                     }
                     Some(Control::Retarget { frontend: index, address: next, reconnect }) => {
                         frontend.store(index, Ordering::Relaxed);
                         address = next;
-                        paused = false;
+                        paused.store(false, Ordering::Relaxed);
                         if reconnect {
                             quiesce(active, &shared, &config, &frontend, &outstanding).await;
                             active.drop_reader();
@@ -549,11 +571,15 @@ async fn run_session(
                         }
                     }
                     Some(Control::Reconnect { reason }) => {
+                        // A pause outlives a reconnect that lands during it:
+                        // the pause was decided for the frontend being
+                        // restarted, and only the retarget that ends the
+                        // restart lifts it. Lifting it here would let the
+                        // scheduler offer to a session whose frontend is down.
                         quiesce(active, &shared, &config, &frontend, &outstanding).await;
                         active.drop_reader();
                         connection = None;
                         reconnect_reason = reason;
-                        paused = false;
                     }
                     Some(Control::ScheduledBlock) => {
                         // A scheduled block occupies an outstanding slot like

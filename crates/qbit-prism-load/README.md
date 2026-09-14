@@ -132,9 +132,14 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
    relaunched, and the sessions are pointed back at it once `/healthz`
    answers. The restart is driven from the scheduler loop without stalling
    it, so the other frontends keep receiving their scheduled load during the
-   outage, which is what the phase measures. If the submits never settle the
-   frontend is not killed and the run aborts (exit 6) rather than turning
-   the harness's own in-flight submits into lost acknowledgements.
+   outage, which is what the phase measures. A paused session is ineligible
+   for offers until it is retargeted: the scheduler's tokens go to the
+   frontends that are up, nothing queues behind the pause to count as
+   outstanding or to go out as a burst on resume, and a client-initiated
+   reconnect that lands on a paused session does not lift the pause. If the
+   submits never settle the frontend is not killed and the run aborts
+   (exit 6) rather than turning the harness's own in-flight submits into
+   lost acknowledgements.
 5. **`slow_database`**, at least 60 s at a delay of at least 10 ms.
 6. **`dense_cadence`**, only with `--cadence dense`. Side report only.
 7. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.

@@ -726,6 +726,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // indeterminate share that no phase asked for, and the run would then
     // report a durability finding it created itself.
     for session in &sessions {
+        session.paused.store(true, Ordering::Relaxed);
         let _ = session.control.send(client::Control::Pause);
     }
     let drain_deadline = Instant::now() + Duration::from_secs(90);

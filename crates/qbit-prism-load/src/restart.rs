@@ -10,6 +10,13 @@
 //! after bounded, synchronous work (a counter read, a channel `try_recv`, a
 //! kill-and-spawn) and the slow parts run in spawned tasks.
 //!
+//! A paused session is ineligible for offers: `SessionHandle::paused` is
+//! set here before the pause is sent, `SessionHandle::try_offer` refuses
+//! while it is set, and the retarget at the end clears it. Without that the
+//! scheduler would keep filling each paused session's queue, the queued
+//! offers would count as outstanding and hold the drain open to its deadline,
+//! and the queue would go out as one burst on resume.
+//!
 //! The drain waits at least the configured share-commit timeout, and a
 //! frontend whose sessions still have submits outstanding after that is not
 //! restarted: killing it then would turn the harness's own in-flight requests
@@ -131,6 +138,13 @@ impl RestartDriver {
     ) -> Self {
         for session in sessions {
             if session.frontend.load(Ordering::Relaxed) == index {
+                // The flag goes up before the message goes out: the scheduler
+                // reads it on the very next offer, while the session task
+                // reads the message whenever it next polls its control
+                // channel. Between those two moments nothing is queued into
+                // the session, so the drain below waits only for submits that
+                // are genuinely in flight.
+                session.paused.store(true, Ordering::Relaxed);
                 let _ = session.control.send(client::Control::Pause);
             }
         }
@@ -256,6 +270,10 @@ impl RestartDriver {
                                 address: address.clone(),
                                 reconnect: false,
                             });
+                            // Eligible again from this offer on; anything
+                            // queued before the task handles the retarget is
+                            // sent to the new process, as the queue is for.
+                            session.paused.store(false, Ordering::Relaxed);
                         }
                     }
                     let now = Instant::now();
