@@ -333,6 +333,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
 
         assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
         assert_candidate_payload_fingerprints(raw, pg_bin, &artifacts[0]).await?;
+        assert_share_hash_fingerprints(raw, pg_bin).await?;
 
         // Restore a native database containing both an active halt and a prior
         // clear event; their exact evidence must survive the backup roundtrip.
@@ -432,6 +433,97 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    source.close().await?;
+    restored.close().await?;
+    result
+}
+
+async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let source = recovery::Database::open(raw).await?;
+    let restored = recovery::Database::open(raw).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        // Migration keeps the first accepted identity for a hex suffix,
+        // ignoring case, rejected shares and legacy non-hex identifiers.
+        sqlx::raw_sql(r#"
+            INSERT INTO qbit_share_ledger(
+                share_seq,share_id,miner_id,payout_order_key,p2mr_program,
+                share_difficulty,network_difficulty,template_height,job_id,
+                job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch)
+            SELECT v.seq,v.id,s.miner_id,s.payout_order_key,s.p2mr_program,
+                s.share_difficulty,s.network_difficulty,s.template_height,s.job_id,
+                s.job_issued_at,s.ntime,s.accepted_at,v.accepted,
+                CASE WHEN v.accepted THEN NULL ELSE 'duplicate-share' END,s.writer_id,s.writer_epoch
+            FROM qbit_share_ledger s CROSS JOIN (VALUES
+                (2,'rejected-first:'||repeat('AB',32),false),
+                (3,'first:'||repeat('AB',32),true),
+                (4,'later:'||repeat('ab',32),true),
+                (6,'invalid-header',true),
+                (7,'rejected-only:'||repeat('cd',32),false)
+            ) v(seq,id,accepted) WHERE s.share_seq=1;
+        "#).execute(&source.pool).await?;
+        let baseline = recovery::evidence(&source, pg_bin).await?;
+        let ledger = Ledger::connect_operator(&source.url, true).await?;
+        let result = async {
+            recovery::import_cli(&source, artifacts_dir.path()).await?;
+            ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
+            let first: String = sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=repeat('ab',32)")
+                .fetch_one(&source.pool).await?;
+            ensure!(first == format!("first:{}", "AB".repeat(32)));
+            for (mutation, count) in [
+                ("DELETE FROM qbit_prism_share_hashes WHERE header_hash=repeat('ab',32)", 3),
+                ("UPDATE qbit_prism_share_hashes SET header_hash=repeat('ef',32) WHERE header_hash=repeat('ab',32)", 4),
+                ("UPDATE qbit_prism_share_hashes SET share_id='later:'||repeat('ab',32) WHERE header_hash=repeat('ab',32)", 4),
+            ] {
+                sqlx::query(mutation).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                ensure!(current != baseline, "share-hash replay protection change was invisible: {mutation}");
+                ensure!(current["records"]["share_hashes"]["count"] == count);
+                ensure!(current["records"]["share_hashes"]["sha256"] != baseline["records"]["share_hashes"]["sha256"]);
+                let mut unchanged = current;
+                unchanged["records"]["share_hashes"] = baseline["records"]["share_hashes"].clone();
+                ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
+                sqlx::query("DELETE FROM qbit_prism_share_hashes WHERE header_hash IN (repeat('ab',32),repeat('ef',32))")
+                    .execute(&source.pool).await?;
+                sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES(repeat('ab',32),$1)")
+                    .bind(&first).execute(&source.pool).await?;
+                ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
+            }
+            ensure!(baseline["records"]["share_hashes"]["count"] == 4);
+            // Native identifiers without a hex suffix use a SHA-256 fallback,
+            // unlike migration's legacy backfill. Export the actual mapping.
+            let mut share = recovery::share(9);
+            share.share_seq = 0;
+            share.share_id = "native-nonhex-id".into();
+            share.job_issued_at_ms = 1;
+            let expected = hex::encode(Sha256::digest(share.share_id.as_bytes()));
+            ensure!(ledger.append(share, None).await?.inserted);
+            let actual: String = sqlx::query_scalar("SELECT header_hash FROM qbit_prism_share_hashes WHERE share_id='native-nonhex-id'")
+                .fetch_one(&source.pool).await?;
+            ensure!(actual == expected);
+            let native = recovery::evidence(&source, pg_bin).await?;
+            ensure!(native["records"]["share_hashes"]["count"] == 5);
+            let archive = recovery::backup(&source, pg_bin).await?;
+            recovery::restore(&archive, &source, &restored, pg_bin).await?;
+            ensure!(recovery::evidence(&restored, pg_bin).await? == native);
+            // Losing the whole native table must fail closed, never fall back
+            // to synthesizing the protection rows from the accepted ledger.
+            sqlx::query("ALTER TABLE qbit_prism_share_hashes RENAME TO missing_share_hashes")
+                .execute(&source.pool).await?;
+            let missing = recovery::evidence(&source, pg_bin).await
+                .expect_err("missing native replay table must fail export");
+            ensure!(missing.to_string().contains("qbit_prism_share_hashes"));
+            sqlx::query("ALTER TABLE missing_share_hashes RENAME TO qbit_prism_share_hashes")
+                .execute(&source.pool).await?;
+            ensure!(recovery::evidence(&source, pg_bin).await? == native);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        ledger.pool.close().await;
+        result
+    }.await;
     source.close().await?;
     restored.close().await?;
     result

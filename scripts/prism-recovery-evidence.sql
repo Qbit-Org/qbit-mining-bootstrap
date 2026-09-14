@@ -86,9 +86,29 @@ SELECT to_regclass('qbit_prism_cpfp_packages') IS NOT NULL AS has_cpfp_packages,
        to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL AS has_cpfp_retired_funding,
        to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares,
        to_regclass('qbit_prism_audit_snapshots') IS NOT NULL AS has_audit_snapshots,
+       (to_regclass('qbit_prism_share_hashes') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_native_share_hashes,
        to_regclass('qbit_prism_cluster') IS NOT NULL AS has_cluster,
        to_regclass('qbit_prism_fatal_state_events') IS NOT NULL AS has_fatal_state_events
 \gset
+-- Native replay protection must survive recovery. Frozen 2.x exports the
+-- exact mapping migration 002 will backfill, including its duplicate rule.
+-- Native migration history prevents a missing table from being synthesized.
+\if :has_native_share_hashes
+SELECT jsonb_build_object('kind', 'share_hashes', 'row', jsonb_build_object(
+    'header_hash', header_hash, 'share_id', share_id))
+FROM qbit_prism_share_hashes ORDER BY header_hash COLLATE "C";
+\else
+SELECT jsonb_build_object('kind', 'share_hashes', 'row', jsonb_build_object(
+    'header_hash', header_hash, 'share_id', share_id))
+FROM (
+    SELECT DISTINCT ON (lower(right(share_id,64)))
+        lower(right(share_id,64)) AS header_hash, share_id
+    FROM qbit_share_ledger
+    WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$'
+    ORDER BY lower(right(share_id,64)), share_seq
+) legacy_hashes ORDER BY header_hash COLLATE "C";
+\endif
 \if :has_audit_snapshots
 -- Imported legacy rows gain canonical bytes and normalized metadata, but no
 -- snapshot reference. Fingerprint native reconstruction inputs separately.
