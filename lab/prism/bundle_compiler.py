@@ -360,7 +360,7 @@ def _iter_build_input_chunks(
         ):
             yield from push(prefix + "[")
             pieces: Iterable[str | bytes]
-            if key == "shares":
+            if key in ("shares", "records"):
                 pieces = _iter_share_window_items(
                     value,
                     batch_records=batch_records,
@@ -394,11 +394,11 @@ def _iter_prepare_window_request_chunks(
     plus the terminating newline: the envelope members are each one small
     ``json.dumps`` and the ``records`` array is encoded batch by batch.
     """
-    for chunk in iter_json_object_text_chunks(
+    for chunk in _iter_build_input_chunks(
         request_fields,
         array_keys=("records",),
     ):
-        yield chunk.encode("utf-8")
+        yield chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
     yield b"\n"
 
 

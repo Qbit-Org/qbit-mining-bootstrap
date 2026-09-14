@@ -94,7 +94,9 @@ from lab.prism.share_ledger import (
     ShareReplayConflict,
     SingleWriterShareLedger,
 )
-from tests.prism_window_rows_reference import assert_rows_match_aggregate
+from tests.prism_window_rows_reference import (
+    assert_rows_match_aggregate, assert_isolated_oracle_matches_snapshot,
+)
 
 
 def pending(
@@ -2239,6 +2241,7 @@ for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)
 # empty window, and the delta's disjoint eligibility branches.
 assert_equal(replacement.execution_backend, "psql-subprocess", "oracle check runs on the psql backend")
 for weight, expected_len in [(4095, 4095), (4096, 4096), (4097, 4097), (8192, 8192), (9000, 9000), (12000, 9000)]:
+    assert_isolated_oracle_matches_snapshot(replacement, bulk_anchor_ms, weight)
     assert_rows_match_aggregate(
         replacement,
         lambda: replacement.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),

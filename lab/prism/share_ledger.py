@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from lab.prism.window_ownership import track_window, note_parsed_window
+
 import json
 import codecs
 import copy
@@ -380,6 +382,9 @@ class _IncrementalShareWindowPage:
     total_difficulty: int
     prism_json_records: tuple[dict[str, object], ...]
     canonical_json_items: bytes
+
+    def __post_init__(self) -> None:
+        track_window(self, self.canonical_json_items, kind="page", records=len(self.records))
 
     @classmethod
     def from_records(
@@ -852,13 +857,14 @@ class DaemonShareJsonSequence(Sequence):
     to learn of a divergence.
     """
 
-    __slots__ = ("canonical_items", "record_count", "_parse_lock", "_parsed")
+    __slots__ = ("canonical_items", "record_count", "_parse_lock", "_parsed", "__weakref__")
 
     def __init__(self, canonical_items: bytes, record_count: int) -> None:
         self.canonical_items = bytes(canonical_items)
         self.record_count = int(record_count)
         self._parse_lock = Lock()
         self._parsed: tuple[dict[str, object], ...] | None = None
+        track_window(self, self.canonical_items, kind="sequence")
 
     def __len__(self) -> int:
         return self.record_count
@@ -891,6 +897,7 @@ class DaemonShareJsonSequence(Sequence):
                         " were declared"
                     )
                 self._parsed = tuple(parsed)
+                note_parsed_window(self, len(self._parsed))
             return self._parsed
 
     def __iter__(self) -> Iterator[dict[str, object]]:
@@ -929,6 +936,9 @@ class DaemonShareWindowMirror:
     record_count: int
     canonical_items: bytes = field(repr=False)
     share_snapshot_sha256: str
+
+    def __post_init__(self) -> None:
+        track_window(self, self.canonical_items, kind="mirror")
 
     @staticmethod
     def _verified_items_digest(canonical_items: bytes, declared_digest: str) -> None:
@@ -2791,6 +2801,7 @@ class LedgerSqlPort(Protocol):
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
         on_statement_start: Callable[[], None] | None = None,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None = None,
         batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
         on_batch: Callable[[], None] | None = None,
@@ -3117,6 +3128,7 @@ class _NativePostgresClient:
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
         on_statement_start: Callable[[], None] | None = None,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None = None,
         batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
         on_batch: Callable[[], None] | None = None,
@@ -3169,6 +3181,8 @@ class _NativePostgresClient:
             else self._monotonic() + max(0.0, timeout_seconds)
         )
         for attempt in range(attempts):
+            if row_sink is not None:
+                row_sink.reset()
             try:
                 remaining = (
                     None
@@ -3214,6 +3228,7 @@ class _NativePostgresClient:
                             cursor,
                             deadline=deadline,
                             row_converter=row_converter,
+                            row_sink=row_sink,
                             batch_size=batch_size,
                             on_batch=on_batch,
                         )
@@ -3233,6 +3248,7 @@ class _NativePostgresClient:
         cursor: Any,
         *,
         deadline: float | None,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None,
         batch_size: int,
         on_batch: Callable[[], None] | None,
@@ -3243,7 +3259,7 @@ class _NativePostgresClient:
         a text row (a ``::text``-cast projection) is decoded here so both
         column types produce the same Python objects.
         """
-        results: list[Any] = []
+        results = [] if row_sink is None else row_sink
         while True:
             if deadline is not None and self._monotonic() >= deadline:
                 raise LedgerOperationTimeout(
@@ -6296,6 +6312,7 @@ END;
         anchor_job_issued_at_ms: int,
         *,
         window_weight: int | None = None,
+        _row_sink: Any = None,
     ) -> list[AcceptedShareRecord]:
         anchor = (
             f"to_timestamp(({int(anchor_job_issued_at_ms)}::double precision / 1000.0))"
@@ -6419,7 +6436,20 @@ ORDER BY share_seq ASC;
             operation="payout_window_snapshot",
             gate=self._read_semaphore,
             gate_name="read slot",
-            row_converter=self._record_from_json,
+            row_converter=self._record_from_json if _row_sink is None else None,
+            **({"row_sink": _row_sink} if _row_sink is not None else {}),
+        )
+
+    def spool_snapshot_at_job_issue(
+        self, anchor_job_issued_at_ms: int, *, window_weight: int, sink: Any,
+    ) -> None:
+        """Spool exactly one MVCC snapshot without retaining converted rows.
+
+        The sink is reset on a retry, so rows from distinct snapshots cannot
+        be mixed. No partial spool is used unless this read returns normally.
+        """
+        self.snapshot_at_job_issue(
+            anchor_job_issued_at_ms, window_weight=window_weight, _row_sink=sink,
         )
 
     def snapshot_between_job_issues(
@@ -10935,6 +10965,7 @@ END;
         operation: str,
         gate: Any,
         gate_name: str,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None = None,
     ) -> list[Any]:
         """Run one gated row-result read, timing admission apart from execution.
@@ -10955,6 +10986,7 @@ END;
             return self._run_retry_safe_read_json_rows(
                 statement,
                 row_converter=row_converter,
+                row_sink=row_sink,
                 on_statement_start=on_statement_start,
             )
 
@@ -11195,6 +11227,7 @@ END;
         self,
         sql: str,
         *,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None = None,
         on_statement_start: Callable[[], None] | None = None,
     ) -> list[Any]:
@@ -11233,6 +11266,8 @@ END;
                 "batch_size": self._json_row_batch_size,
                 "on_batch": self._note_json_row_batch,
             }
+            if row_sink is not None:
+                run_kwargs["row_sink"] = row_sink
             if on_statement_start is not None:
                 run_kwargs["on_statement_start"] = on_statement_start
             if timeout_seconds is not None:
@@ -11257,6 +11292,7 @@ END;
             return self._convert_json_rows(
                 rows,
                 row_converter=row_converter,
+                row_sink=row_sink,
                 deadline=deadline,
             )
         run_sql = self._run_sql
@@ -11273,11 +11309,13 @@ END;
             return self._decode_json_lines(
                 output.splitlines(),
                 row_converter=row_converter,
+                row_sink=row_sink,
                 deadline=deadline,
             )
         return self._run_psql_json_rows(
             sql,
             row_converter=row_converter,
+            row_sink=row_sink,
             on_statement_start=on_statement_start,
         )
 
@@ -11317,6 +11355,7 @@ END;
         self,
         rows: Sequence[Any],
         *,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None,
         deadline: float | None,
     ) -> list[Any]:
@@ -11326,7 +11365,9 @@ END;
         liveness is also stamped) and before the result is returned.
         """
         batch_size = max(1, int(self._json_row_batch_size))
-        results: list[Any] = []
+        results = [] if row_sink is None else row_sink
+        if row_sink is not None:
+            row_sink.reset()
         self._check_json_row_deadline(deadline)
         for start in range(0, len(rows), batch_size):
             if start:
@@ -11344,6 +11385,7 @@ END;
         self,
         lines: Iterable[bytes | str],
         *,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None,
         deadline: float | None,
     ) -> list[Any]:
@@ -11362,7 +11404,9 @@ END;
         native client keeps the same cadence.
         """
         batch_size = max(1, int(self._json_row_batch_size))
-        results: list[Any] = []
+        results = [] if row_sink is None else row_sink
+        if row_sink is not None:
+            row_sink.reset()
         in_batch = 0
         line_number = 0
         self._check_json_row_deadline(deadline)
@@ -12481,6 +12525,7 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         self,
         sql: str,
         *,
+        row_sink: Any = None,
         row_converter: Callable[[Any], Any] | None,
         on_statement_start: Callable[[], None] | None,
     ) -> list[Any]:
@@ -12543,6 +12588,7 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             return self._decode_json_lines(
                 spool,
                 row_converter=row_converter,
+                row_sink=row_sink,
                 deadline=decode_deadline,
             )
 

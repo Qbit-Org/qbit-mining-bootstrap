@@ -16,6 +16,8 @@ suite) keep intercepting exactly as before the extraction.
 
 from __future__ import annotations
 
+from lab.prism.window_oracle import snapshot_window
+
 from collections import OrderedDict
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -3276,11 +3278,24 @@ class JobBundleService:
                     build_request.inflight_scan_anchor_token = (
                         inflight_scan_anchor_token
                     )
+                    isolated_shares = None
                     try:
-                        records = runtime.ledger.snapshot_at_job_issue(
-                            issued_at_ms,
-                            window_weight=snapshot_window_weight,
-                        )
+                        if callable(getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)):
+                            verified = snapshot_window(
+                                runtime.ledger, anchor=issued_at_ms,
+                                weight=snapshot_window_weight,
+                                append_epoch=build_request.key.payout_append_invalidation_epoch,
+                                check=lambda: runtime._job_build_checkpoint(
+                                    "ledger_snapshot_oracle", cancellation,
+                                ),
+                            )
+                            isolated_shares = verified.window.json_records()
+                            records = ()
+                        else:
+                            records = runtime.ledger.snapshot_at_job_issue(
+                                issued_at_ms,
+                                window_weight=snapshot_window_weight,
+                            )
                     except BaseException:
                         runtime._retire_inflight_scan_anchor(
                             inflight_scan_anchor_token
@@ -3288,6 +3303,7 @@ class JobBundleService:
                         raise
                 else:
                     records = []
+                    isolated_shares = None
                 # An accepted parent's prospective carry state supersedes the
                 # published artifact for children built on that parent; the
                 # published balances remain the fallback for ordinary tips.
@@ -3297,7 +3313,7 @@ class JobBundleService:
                     fallback_balances=build_request.payout_artifact.prior_balances(),
                 )
             runtime._job_build_checkpoint("ledger_snapshot_complete", cancellation)
-            shares = []
+            shares = isolated_shares if isolated_shares is not None else []
             for index, record in enumerate(records):
                 if index % 256 == 0:
                     runtime._job_build_checkpoint(
@@ -3364,7 +3380,7 @@ class JobBundleService:
                 payout_state_generation=payout_state_generation,
                 network_difficulty=int(build_request.key.network_difficulty),
                 accepted_share_count=snapshot_accepted_count,
-                shares_json=tuple(shares),
+                shares_json=shares if isinstance(shares, DaemonShareJsonSequence) else tuple(shares),
                 prior_balances=seed_prior_balances,
                 prepared_monotonic=time.monotonic(),
                 snapshot_anchor_ms=issued_at_ms,

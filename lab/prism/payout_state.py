@@ -40,8 +40,10 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from lab.prism.accepted_preview_telemetry import (
     FULL_RESCAN_PATH_DAEMON,
     FULL_RESCAN_PATH_IN_PROCESS,
+    FULL_RESCAN_PATH_HELPER,
     ensure_accepted_preview_telemetry,
 )
+from lab.prism.window_oracle import snapshot_window
 from lab.prism.candidate_window import disk_window_covers, recorded_share_ids
 from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
@@ -431,8 +433,8 @@ class PayoutLedgerArtifact:
 class _IncrementalPayoutArtifactWindow:
     """Coordinator-owned exact window plus its canonical materialization."""
 
-    window: IncrementalShareWindow
-    shares_json: IncrementalShareJsonSequence = field(repr=False)
+    window: IncrementalShareWindow | DaemonShareWindowMirror
+    shares_json: Sequence[dict[str, object]] = field(repr=False)
     share_snapshot_sha256: str
     refreshed_monotonic: float
     full_rescan_monotonic: float
@@ -1095,13 +1097,17 @@ class PayoutStateService:
         append_invalidation_epoch: int,
         bypass_build_interval: bool = False,
     ) -> _PayoutWindowMaterialization:
-        """Run the exact ledger oracle and atomically replace cached pages."""
+        """Run the exact ledger oracle and replace the verified window cache."""
         rescan_started = time.monotonic()
         # The path is chosen by which pipeline folded the window; the ledger
         # read and any daemon decline that degrades to the in-process fold
         # belong to the rescan either way. Recorded on every exit so a
         # rescan that dies with the ledger still owns its wall-clock.
-        rescan_path = FULL_RESCAN_PATH_IN_PROCESS
+        rescan_path = (
+            FULL_RESCAN_PATH_HELPER
+            if callable(getattr(self._runtime.ledger, "spool_snapshot_at_job_issue", None))
+            else FULL_RESCAN_PATH_IN_PROCESS
+        )
         try:
             materialized, rescan_path = self._full_payout_window_oracle(
                 snapshot_anchor_ms=snapshot_anchor_ms,
@@ -1119,6 +1125,27 @@ class PayoutStateService:
             )
         return materialized
 
+    def _window_oracle_checkpoint(self, append_epoch: int, generation: int) -> None:
+        runtime = self._runtime
+        remaining = getattr(runtime.ledger, "_remaining_operation_timeout", None)
+        if callable(remaining):
+            remaining()
+        if runtime.stop_event.is_set():
+            raise TemplateRefreshSuperseded("window oracle stopped during shutdown")
+        with runtime._job_cache_lock:
+            if (runtime._payout_ledger_append_invalidation_epoch != append_epoch
+                    or runtime._payout_state_generation != generation):
+                raise TemplateRefreshSuperseded("window oracle snapshot was invalidated")
+
+    def _isolated_window_oracle(self, anchor: int, weight: int, append_epoch: int,
+                                comparison_weight: int | None = None) -> Any:
+        generation = self._runtime._payout_state_generation
+        return snapshot_window(
+            self._runtime.ledger, anchor=anchor, weight=weight,
+            comparison_weight=comparison_weight, append_epoch=append_epoch,
+            check=lambda: self._window_oracle_checkpoint(append_epoch, generation),
+        )
+
     def _full_payout_window_oracle(
         self,
         *,
@@ -1131,6 +1158,45 @@ class PayoutStateService:
     ) -> tuple[_PayoutWindowMaterialization, str]:
         """The oracle read plus fold; returns the window and the fold path."""
         runtime = self._runtime
+
+        if callable(getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)):
+            started = time.monotonic()
+            generation = runtime._payout_state_generation
+            oracle = self._isolated_window_oracle(
+                snapshot_anchor_ms, snapshot_window_weight, append_invalidation_epoch,
+            )
+            self._note_window_build_phase("ledger_read", time.monotonic() - started)
+            mirror = oracle.window
+            unprepared_reason = None
+            if self._window_pipeline_rust_enabled():
+                mirror, unprepared_reason = self._daemon_adopted_window(
+                    full_window=mirror, shares_json=mirror.json_records(),
+                    digest=mirror.share_snapshot_sha256, advanced_window=None,
+                    snapshot_anchor_ms=snapshot_anchor_ms,
+                    append_invalidation_epoch=append_invalidation_epoch,
+                    wait_for_daemon=not bypass_build_interval,
+                )
+            shares_json = mirror.json_records()
+            self._window_oracle_checkpoint(append_invalidation_epoch, generation)
+            with runtime._job_cache_lock:
+                if (runtime._payout_ledger_append_invalidation_epoch != append_invalidation_epoch
+                        or runtime._payout_state_generation != generation):
+                    raise TemplateRefreshSuperseded("window oracle snapshot was invalidated")
+                runtime._incremental_payout_artifact_window = _IncrementalPayoutArtifactWindow(
+                    window=mirror, shares_json=shares_json,
+                    share_snapshot_sha256=mirror.share_snapshot_sha256,
+                    refreshed_monotonic=observed_monotonic,
+                    full_rescan_monotonic=observed_monotonic,
+                    full_rescan_attempt_monotonic=observed_monotonic,
+                    append_invalidation_epoch=append_invalidation_epoch,
+                    daemon_unprepared_reason=unprepared_reason,
+                )
+            return _PayoutWindowMaterialization(
+                shares_json=shares_json, share_snapshot_sha256=mirror.share_snapshot_sha256,
+                snapshot_anchor_ms=snapshot_anchor_ms, mode="full_rescan",
+                record_count=mirror.record_count, stats=IncrementalWindowAdvanceStats(0, 0, 0),
+                full_rescan_reason=reason,
+            ), FULL_RESCAN_PATH_HELPER
 
         # Timed in a finally: a read that dies with the ledger is exactly
         # the slow read the phase family exists to attribute.
@@ -1492,12 +1558,13 @@ class PayoutStateService:
     def _daemon_adopted_window(
         self,
         *,
-        full_window: IncrementalShareWindow,
-        shares_json: IncrementalShareJsonSequence,
+        full_window: IncrementalShareWindow | DaemonShareWindowMirror,
+        shares_json: Sequence[dict[str, object]],
         digest: str,
-        advanced_window: IncrementalShareWindow | DaemonShareWindowMirror,
+        advanced_window: IncrementalShareWindow | DaemonShareWindowMirror | None,
         snapshot_anchor_ms: int,
         append_invalidation_epoch: int,
+        wait_for_daemon: bool = True,
     ) -> tuple[DaemonShareWindowMirror, str | None]:
         """Adopt the self-check oracle's window as a mirror the daemon holds.
 
@@ -1507,8 +1574,8 @@ class PayoutStateService:
         next advance answered ``needs_full`` and paid a second full
         ``snapshot_at_job_issue`` under the writer lock, recorded as
         ``window_daemon_state_lost``. When the daemon already holds the
-        adopted digest (its own advance produced it) the mirror is taken
-        from the oracle pages as before. Otherwise the daemon is prepared
+        adopted digest (its own advance produced it), reuse its existing
+        canonical bytes after verification. Otherwise the daemon is prepared
         for the adopted window here, once, so the next build advances
         incrementally. If that preparation is declined -- busy, unavailable,
         out of range, or a digest the in-process oracle refutes -- the
@@ -1522,6 +1589,8 @@ class PayoutStateService:
         runtime = self._runtime
 
         def mirror_from_oracle_pages() -> DaemonShareWindowMirror:
+            if isinstance(full_window, DaemonShareWindowMirror):
+                return full_window
             # The bytes come from the oracle's own pages (already encoded);
             # the digest is a function of exactly the retained records.
             return DaemonShareWindowMirror(
@@ -1541,12 +1610,15 @@ class PayoutStateService:
             isinstance(advanced_window, DaemonShareWindowMirror)
             and advanced_window.share_snapshot_sha256 == digest
         ):
-            return mirror_from_oracle_pages(), None
+            return dataclass_replace(
+                advanced_window, anchor_job_issued_at_ms=snapshot_anchor_ms,
+                window_weight=full_window.window_weight,
+            ), None
         prepare = getattr(runtime, "prepare_payout_window", None)
         if not callable(prepare):
             return mirror_from_oracle_pages(), "window_daemon_unavailable"
         conversion_started = time.monotonic()
-        records_json = [record.to_prism_json() for record in full_window.records()]
+        records_json = full_window.json_records()
         self._note_window_build_phase(
             "record_conversion",
             time.monotonic() - conversion_started,
@@ -1561,14 +1633,13 @@ class PayoutStateService:
                 window_weight=int(full_window.window_weight),
                 page_size=int(full_window.page_size),
                 # The self-check only runs off the found-block critical path.
-                wait_for_daemon=True,
+                wait_for_daemon=wait_for_daemon,
             )
         finally:
             self._note_window_build_phase(
                 "daemon_prepare",
                 time.monotonic() - daemon_started,
             )
-            release_share_list_incrementally(records_json)
         if outcome is None:
             return mirror_from_oracle_pages(), "window_daemon_unavailable"
         if outcome.status == "busy":
@@ -1601,7 +1672,7 @@ class PayoutStateService:
                 "record_conversion",
                 time.monotonic() - conversion_started,
             )
-        return mirror, None
+        return mirror_from_oracle_pages(), None
 
     def _incremental_payout_window_materialization(
         self,
@@ -1625,6 +1696,7 @@ class PayoutStateService:
         runtime = self._runtime
 
         observed = time.monotonic()
+        oracle_generation = runtime._payout_state_generation
         cached = runtime._incremental_payout_artifact_window
         full_reason: str | None = None
         if force_full_rescan:
@@ -1858,8 +1930,11 @@ class PayoutStateService:
         if run_self_check:
             # The self-check is a whole-window oracle read at the cached
             # weight; it is recorded as a full rescan under its check reason
-            # (the periodic family) and always folds in-process.
+            # (the periodic family). Production folds in the isolated helper;
+            # legacy custom ledgers without the spool contract retain their
+            # compatibility implementation.
             self_check_started = time.monotonic()
+            isolated = False
             try:
                 # Within the tolerance band the cached and live snapshot
                 # weights legitimately differ. The match verdict must
@@ -1884,59 +1959,77 @@ class PayoutStateService:
                 recenter_oversized = (
                     cached_window_weight * 4 > live_window_weight * 5
                 )
-                oracle_started = time.monotonic()
-                try:
-                    full_records = list(
-                        runtime.ledger.snapshot_at_job_issue(
-                            snapshot_anchor_ms,
-                            window_weight=cached_window_weight,
-                        )
-                    )
-                finally:
-                    self._note_window_build_phase(
-                        "ledger_read",
-                        time.monotonic() - oracle_started,
-                    )
-                conversion_started = time.monotonic()
-                comparison_window = IncrementalShareWindow.from_full_snapshot(
-                    full_records,
-                    anchor_job_issued_at_ms=snapshot_anchor_ms,
-                    window_weight=cached_window_weight,
+                isolated = isinstance(advanced_window, DaemonShareWindowMirror) or callable(
+                    getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)
                 )
-                if recenter_oversized:
-                    full_window = IncrementalShareWindow.from_full_snapshot(
+                if isolated:
+                    checked = self._isolated_window_oracle(
+                        snapshot_anchor_ms,
+                        live_window_weight if recenter_oversized else cached_window_weight,
+                        append_invalidation_epoch, comparison_weight=cached_window_weight,
+                    )
+                    full_window = checked.window
+                    shares_json = full_window.json_records()
+                    digest = full_window.share_snapshot_sha256
+                    matched = checked.comparison_digest == self._canonical_json_sha256(
+                        advanced_window.json_records()
+                    )
+                else:
+                    oracle_started = time.monotonic()
+                    try:
+                        full_records = list(
+                            runtime.ledger.snapshot_at_job_issue(
+                                snapshot_anchor_ms,
+                                window_weight=cached_window_weight,
+                            )
+                        )
+                    finally:
+                        self._note_window_build_phase(
+                            "ledger_read",
+                            time.monotonic() - oracle_started,
+                        )
+                    conversion_started = time.monotonic()
+                    comparison_window = IncrementalShareWindow.from_full_snapshot(
                         full_records,
                         anchor_job_issued_at_ms=snapshot_anchor_ms,
-                        window_weight=live_window_weight,
+                        window_weight=cached_window_weight,
                     )
-                else:
-                    full_window = comparison_window
-                shares_json = full_window.json_records()
-                digest = self._canonical_json_sha256(shares_json)
-                if isinstance(advanced_window, DaemonShareWindowMirror):
-                    # The mirror holds canonical bytes, not records; digest
-                    # equality is the same comparison, since the canonical
-                    # digest is a function of exactly the retained records.
-                    comparison_digest = (
-                        digest
-                        if full_window is comparison_window
-                        else self._canonical_json_sha256(
-                            comparison_window.json_records()
+                    if recenter_oversized:
+                        full_window = IncrementalShareWindow.from_full_snapshot(
+                            full_records,
+                            anchor_job_issued_at_ms=snapshot_anchor_ms,
+                            window_weight=live_window_weight,
                         )
+                    else:
+                        full_window = comparison_window
+                    shares_json = full_window.json_records()
+                    digest = self._canonical_json_sha256(shares_json)
+                    if isinstance(advanced_window, DaemonShareWindowMirror):
+                        # The mirror holds canonical bytes, not records; digest
+                        # equality is the same comparison, since the canonical
+                        # digest is a function of exactly the retained records.
+                        comparison_digest = (
+                            digest
+                            if full_window is comparison_window
+                            else self._canonical_json_sha256(
+                                comparison_window.json_records()
+                            )
+                        )
+                        matched = (
+                            comparison_digest
+                            == advanced_window.share_snapshot_sha256
+                        )
+                    else:
+                        matched = (
+                            comparison_window.records()
+                            == advanced_window.records()
+                        )
+                    self._note_window_build_phase(
+                        "record_conversion",
+                        time.monotonic() - conversion_started,
                     )
-                    matched = (
-                        comparison_digest
-                        == advanced_window.share_snapshot_sha256
-                    )
-                else:
-                    matched = (
-                        comparison_window.records()
-                        == advanced_window.records()
-                    )
-                self._note_window_build_phase(
-                    "record_conversion",
-                    time.monotonic() - conversion_started,
-                )
+            except TemplateRefreshSuperseded:
+                raise
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured runtime-check interval so a
@@ -1973,6 +2066,9 @@ class PayoutStateService:
                             append_invalidation_epoch=append_invalidation_epoch,
                         )
                     )
+                # The installed view must own the adopted bytes, never the
+                # temporary oracle's page and record graphs as a second copy.
+                shares_json = oracle_window.json_records()
                 advanced = _IncrementalPayoutArtifactWindow(
                     window=oracle_window,
                     shares_json=shares_json,
@@ -2046,11 +2142,16 @@ class PayoutStateService:
             if check_reason is not None:
                 self._observe_payout_window_full_rescan(
                     check_reason,
-                    FULL_RESCAN_PATH_IN_PROCESS,
+                    FULL_RESCAN_PATH_HELPER if isolated else FULL_RESCAN_PATH_IN_PROCESS,
                     time.monotonic() - self_check_started,
                 )
 
-        runtime._incremental_payout_artifact_window = advanced
+        self._window_oracle_checkpoint(append_invalidation_epoch, oracle_generation)
+        with runtime._job_cache_lock:
+            if (runtime._payout_ledger_append_invalidation_epoch != append_invalidation_epoch
+                    or runtime._payout_state_generation != oracle_generation):
+                raise TemplateRefreshSuperseded("window snapshot was invalidated before install")
+            runtime._incremental_payout_artifact_window = advanced
         return _PayoutWindowMaterialization(
             shares_json=advanced.shares_json,
             share_snapshot_sha256=advanced.share_snapshot_sha256,
