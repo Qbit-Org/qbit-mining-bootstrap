@@ -806,7 +806,13 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 // Time to new-tip work, by the same definition
                 // `run::time_to_usable_work` uses: the first mining.notify
                 // whose prevhash resolves to the new tip, measured from the
-                // node's tip stamp.
+                // node's tip stamp. The search ends at the span's end, as
+                // the new-revision search below does: a notify for this tip
+                // that arrives after the next landing's tip change is a late
+                // job for a tip that is no longer the tip, and crediting it
+                // here reported new-tip work inside a span that had none.
+                // A frontend with no such job inside the span is its own
+                // outcome, with its own reason (EP-STATE).
                 let tip_hash = entry.tip.map(|tip| tip.hash.as_str()).unwrap_or_default();
                 let mut tip_work: Vec<f64> = Vec::new();
                 for session in &sessions {
@@ -817,6 +823,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                             sighting.session == *session
                                 && sighting.tip == tip_hash
                                 && sighting.at >= start
+                                && sighting.at < end
                         })
                         .map(|sighting| sighting.at)
                         .min()
@@ -824,6 +831,8 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                         tip_work.push(millis_since(start, at));
                     }
                 }
+                let new_tip_work_unavailable_reason =
+                    tip_work.is_empty().then_some(NO_NEW_TIP_WORK_IN_SPAN);
 
                 // Time to new-revision work. The wire carries no payout
                 // revision, so the first clean_jobs=true notify at or after
@@ -929,6 +938,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     })),
                     "time_to_new_tip_work_millis": millis_summary(&tip_work),
                     "sessions_with_new_tip_work": tip_work.len(),
+                    "new_tip_work_unavailable_reason": new_tip_work_unavailable_reason,
                     "time_to_new_revision_work_millis": millis_summary(&revision_work),
                     "sessions_with_new_revision_work": revision_work.len(),
                     "new_revision_work_unavailable_reason": new_revision_work_unavailable_reason,
@@ -1217,6 +1227,16 @@ pub const NEW_REVISION_APPROXIMATION: &str =
      revision. A clean_jobs notify after the span is the next landing's work and is never \
      counted for this one.";
 
+/// Why a frontend's new-tip figures are absent: no session on the frontend
+/// saw a job built on the landing's tip before the span ended. A notify for
+/// that tip after the span is a late job for a tip that has already been
+/// replaced, and is not borrowed.
+pub const NO_NEW_TIP_WORK_IN_SPAN: &str =
+    "no session on this frontend received a job built on the landing's tip between the tip \
+     change and the end of the landing's span: the frontend had not served the new tip before \
+     the next landing's tip change (or the phase's end), and a notify for this tip that arrived \
+     after the span is a late job for a replaced tip, not counted for it";
+
 /// Why a frontend's new-revision figures are absent: no bump to measure from.
 pub const NO_REFERENCE_BUMP: &str = "no bump was attributed to this landing";
 /// Why a frontend's new-revision figures are absent: the bump happened, but
@@ -1279,8 +1299,13 @@ pub fn definitions() -> Value {
                                             counts. This is the window #291 should budget against.",
         "time_to_new_tip_work": "t1 - t0 per session, where t0 is the landing's tip change on the \
                                  node and t1 is the first mining.notify whose prevhash resolves to \
-                                 that tip. Same definition as the run's time_to_usable_work \
-                                 section, restricted to one frontend's sessions.",
+                                 that tip and arrives before the end of the landing's span. Same \
+                                 definition as the run's time_to_usable_work section, restricted \
+                                 to one frontend's sessions. A notify for the tip after the span \
+                                 is a late job for a tip the next landing has already replaced; \
+                                 it is never counted, and a frontend with no such job inside the \
+                                 span reports sessions_with_new_tip_work 0 with \
+                                 new_tip_work_unavailable_reason rather than a borrowed time.",
         "time_to_new_revision_work": NEW_REVISION_APPROXIMATION,
         "reference_bump": "the last bump attributed to the landing: the revision a frontend has to \
                            reach before it stops answering `new payout work is pending`. \

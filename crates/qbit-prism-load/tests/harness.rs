@@ -4705,6 +4705,187 @@ fn new_revision_work_is_never_borrowed_from_the_next_landing() {
     );
 }
 
+/// The new-tip search is bounded by the landing's span, as the new-revision
+/// search beside it has been since H4. It was not: a session's first notify
+/// for a landing's tip that arrived after the next landing's tip change --
+/// a late job for a tip already replaced -- satisfied the search, and the
+/// earlier landing reported a session with new-tip work at a time that was
+/// really inside the next landing's span. A frontend with no such job inside
+/// the span is now its own outcome, with its own reason.
+#[test]
+fn new_tip_work_is_never_borrowed_from_the_next_landing() {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let landings = vec![
+        cadence::Landing {
+            index: 0,
+            scheduled_offset_seconds: 5.0,
+            requested_monotonic: at(base, 5_000),
+            requested_wall: chrono::Utc::now(),
+            session: 0,
+            frontend: 0,
+        },
+        cadence::Landing {
+            index: 1,
+            scheduled_offset_seconds: 14.0,
+            requested_monotonic: at(base, 14_000),
+            requested_wall: chrono::Utc::now(),
+            session: 1,
+            frontend: 0,
+        },
+    ];
+    let submits = vec![
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            HASH_ONE,
+            1,
+            0,
+            at(base, 14_100),
+            at(base, 14_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+    ];
+    let node_submissions = vec![
+        node_submission(HASH_ZERO, 104, true),
+        node_submission(HASH_ONE, 105, true),
+    ];
+    // Landing 0's span is 7.0 s to 16.0 s; landing 1's runs from 16.0 s.
+    let tip_changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 7_000)),
+        pool_tip(HASH_ONE, 105, at(base, 16_000)),
+    ];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: Vec::new(),
+    };
+    // Sessions 0..=2 are on frontend 0, session 3 on frontend 1.
+    let sighting = |session: usize, frontend: usize, tip: &str, millis: u64| client::TipSighting {
+        session,
+        frontend,
+        tip: tip.to_owned(),
+        at: at(base, millis),
+    };
+    let tips = vec![
+        // Frontend 0 served landing 0's tip to session 1 inside the span.
+        sighting(1, 0, HASH_ZERO, 7_400),
+        // Session 2's first job on landing 0's tip arrives after landing 1's
+        // tip change: a late job for a replaced tip.
+        sighting(2, 0, HASH_ZERO, 16_500),
+        // Frontend 1 never served landing 0's tip inside the span; its only
+        // job on it is the same kind of late arrival.
+        sighting(3, 1, HASH_ZERO, 16_500),
+        // Landing 1's own work, on both frontends.
+        sighting(0, 0, HASH_ONE, 16_300),
+        sighting(3, 1, HASH_ONE, 16_600),
+    ];
+    let notifies = Vec::new();
+    let failures = Vec::new();
+    let frontends = vec![health(0), health(1)];
+    let session_frontend = vec![0usize, 0, 0, 1];
+    let gaps = vec![9.0];
+    let offsets = vec![5.0, 14.0];
+    let committed = std::collections::BTreeSet::new();
+    let document = cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 2,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &notifies,
+        tips: &tips,
+        node_submissions: &node_submissions,
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &failures,
+        committed: &committed,
+        aborted: None,
+    });
+    assert_eq!(document["landings"], json!(2));
+
+    // Landing 0, frontend 0: one session saw the tip inside the span, at
+    // 400 ms. Session 2's late job is not a second one at 9.5 s.
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["frontend"], json!(0));
+    assert_eq!(first["sessions_with_new_tip_work"], json!(1));
+    assert_eq!(first["time_to_new_tip_work_millis"]["samples"], json!(1));
+    assert_eq!(first["time_to_new_tip_work_millis"]["max"], json!(400.0));
+    assert!(first["new_tip_work_unavailable_reason"].is_null());
+
+    // Landing 0, frontend 1: nothing inside the span. That is the outcome,
+    // with its reason -- not one session at 9.5 s borrowed from the next
+    // landing's span.
+    let other = &document["landing_records"][0]["frontends"][1];
+    assert_eq!(other["frontend"], json!(1));
+    assert_eq!(other["sessions_with_new_tip_work"], json!(0));
+    assert_eq!(other["time_to_new_tip_work_millis"]["samples"], json!(0));
+    assert!(other["time_to_new_tip_work_millis"]["max"].is_null());
+    assert_eq!(
+        other["new_tip_work_unavailable_reason"],
+        json!(cadence::NO_NEW_TIP_WORK_IN_SPAN)
+    );
+
+    // Landing 1: its own work on both frontends, 300 ms and 600 ms.
+    let second = &document["landing_records"][1]["frontends"];
+    assert_eq!(second[0]["sessions_with_new_tip_work"], json!(1));
+    assert_eq!(
+        second[0]["time_to_new_tip_work_millis"]["max"],
+        json!(300.0)
+    );
+    assert_eq!(second[1]["sessions_with_new_tip_work"], json!(1));
+    assert_eq!(
+        second[1]["time_to_new_tip_work_millis"]["max"],
+        json!(600.0)
+    );
+    assert!(second[1]["new_tip_work_unavailable_reason"].is_null());
+
+    // The summaries hold the three in-span figures and nothing borrowed:
+    // three samples, worst 600 ms, not four with a worst of 9.5 s.
+    let overall = &document["summaries"]["overall"]["time_to_new_tip_work_max_millis"];
+    assert_eq!(overall["samples"], json!(3));
+    assert_eq!(overall["max"], json!(600.0));
+    let frontend_one = document["summaries"]["per_frontend"]
+        .as_array()
+        .expect("per-frontend summaries")
+        .iter()
+        .find(|summary| summary["frontend"] == json!(1))
+        .expect("frontend 1 is summarised");
+    assert_eq!(
+        frontend_one["time_to_new_tip_work_max_millis"]["samples"],
+        json!(1),
+        "frontend 1 contributes landing 1's figure only"
+    );
+    assert!(
+        document["definitions"]["time_to_new_tip_work"]
+            .as_str()
+            .expect("a definition")
+            .contains("before the end of the landing's span"),
+        "the definition says where the search stops"
+    );
+}
+
 #[test]
 fn a_landing_with_a_window_is_counted_as_having_one() {
     // A span -- and therefore a window -- is granted on the landing's own pool

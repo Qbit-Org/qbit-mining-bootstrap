@@ -245,9 +245,15 @@ only instant the harness observed directly.
 
 **Time to new-tip work** is the run's usual definition, restricted to one
 frontend's sessions: the first `mining.notify` whose prevhash resolves to the
-landing's tip, measured from the fake node's tip stamp. The whole-phase view
-over every session is in the same section, through the harness's own
-`time_to_usable_work`.
+landing's tip, measured from the fake node's tip stamp. The search stops at
+the span's end, as the new-revision search below does. A notify for the tip
+that arrives after the next landing's tip change is a late job for a tip
+that has already been replaced; counting it reported new-tip work inside a
+span that had none, at a time that was really the next landing's. A frontend
+with no such job inside the span reports `sessions_with_new_tip_work: 0`,
+the time `null`, and `new_tip_work_unavailable_reason` saying so. The
+whole-phase view over every session is in the same section, through the
+harness's own `time_to_usable_work`.
 
 **Time to new-revision work is an approximation, and is labelled as one.**
 `mining.notify` carries no payout revision, so the first notify with
