@@ -15,7 +15,8 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    interpreter names, option words and targets (plain, ANSI-C ``$'…'`` or
    locale ``$"…"`` quotes), shell word concatenation of the interpreter, of
    an option word and of the target (``"python"3``, ``'pyth'on3``, ``"-"O``,
-   ``"-m"lab.prism.deleted``, ``"lab.prism."deleted``) and ``./`` prefixes,
+   ``"-m"lab.prism.deleted``, ``"lab.prism."deleted``) and equivalent POSIX
+   script paths (``./``, ``..`` and repeated slashes),
    and does not follow ``cd``, ``PYTHONPATH`` or other environment
    indirection, aliases, shell variables, or backslash escapes. A shell
    comment runs nothing, so a command inside one is not read.
@@ -31,6 +32,7 @@ every other tracked file under ``docs/`` is in scope, whatever its suffix.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import subprocess
 import unittest
@@ -226,8 +228,8 @@ INTERPRETER_CANDIDATE = re.compile(rf"(?=(?<![^{WORD_BREAK}'\"])(?P<interpreter>
 # bash hands `-m "lab.prism."deleted`, `-m lab."prism".deleted` and
 # `"./lab/prism/"deleted.py` over exactly as their bare spellings (verified
 # with `python3 -m "json."tool` on bash 3.2 and CPython 3.14).
-# ``command_target`` strips the matching quotes and ``dead_commands`` any
-# `./` prefixes, which CPython resolves on a script path, and only then reads
+# ``command_target`` strips the matching quotes and ``dead_commands`` normalizes
+# POSIX script path components without following filesystem links, then reads
 # the word against the target grammar: a word that then names no `lab`
 # module or script (`$VAR`, `json.tool`, `lab.prism.` with nothing after the
 # dot) is not a `lab` command.
@@ -240,7 +242,6 @@ MODULE_TARGET = re.compile(r"lab(?:\.[^./\x00]+)+")
 # Script filenames may also contain literal spaces, dollars, backslashes or
 # glob characters when quoted. Expansion checks happen before this grammar.
 SCRIPT_TARGET = re.compile(r"lab/[^\x00]+\.py")
-DOT_SEGMENTS = re.compile(r"^(?:\./)+")
 MATCHING_QUOTES = re.compile(QUOTED_STRING)
 WORD_PART = re.compile(rf"{QUOTED_STRING}|(?:{UNQUOTED_CHARACTER})+")
 # A `#` opens a shell comment only where a word starts: at the start of the
@@ -526,7 +527,9 @@ def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, st
                 if not any(candidate in tracked for candidate in candidates):
                     found.append((number, command, " or ".join(candidates)))
             else:
-                script = DOT_SEGMENTS.sub("", word)
+                if not word.endswith(".py"):
+                    continue
+                script = posixpath.normpath(word)
                 if SCRIPT_TARGET.fullmatch(script) and script not in tracked:
                     found.append((number, command, script))
     return found
@@ -542,10 +545,14 @@ def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, s
             reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
             if match.group("bare") and URL_REFERENCE_PREFIX.search(line[: match.start()]):
                 reference = re.split(r"[?#]", reference, maxsplit=1)[0]
-            if reference.endswith("/") and any(path.startswith(reference) for path in tracked):
-                continue
-            if reference not in tracked:
-                found.append((number, reference))
+            normalized = posixpath.normpath(reference)
+            if normalized == "lab" or normalized.startswith("lab/"):
+                if reference.endswith("/"):
+                    if any(path.startswith(normalized + "/") for path in tracked):
+                        continue
+                elif normalized in tracked:
+                    continue
+            found.append((number, reference))
         for match in MODULE_REFERENCE.finditer(line):
             reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
             if not any(c in tracked for c in module_candidates(reference)):
@@ -1101,6 +1108,53 @@ class ScannerTests(unittest.TestCase):
         for script in ("./lab/prism/storm.py", '"./lab/prism/storm.py"', "././lab/prism/storm.py"):
             with self.subTest(script=script):
                 self.assertEqual(self.commands(f"python3 {script} --decide"), ["lab/prism/storm.py"])
+
+    def test_equivalent_script_paths_resolve_to_tracked_files(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for script in (
+            "lab/prism/../prism/tool.py", "lab/./prism/tool.py", "lab//prism/tool.py",
+            "././lab/prism/../prism//./tool.py", ".//lab/prism/tool.py",
+        ):
+            for word in (script, f"'{script}'", f'"{script}"'):
+                with self.subTest(word=word):
+                    command = f"python3 -O -- {word} --help"
+                    self.assertEqual(dead_commands(command, tracked), [])
+                    self.assertEqual(dangling_references(command, tracked), [])
+
+    def test_equivalent_missing_script_paths_keep_command_and_line(self) -> None:
+        for script in (
+            "lab/prism/../prism/deleted.py", "lab/./prism/deleted.py",
+            "lab//prism/deleted.py", "./lab/prism/../prism//./deleted.py",
+        ):
+            with self.subTest(script=script):
+                text = f"```sh\npython3 -- \\\n  '{script}' --help\n```"
+                self.assertEqual(
+                    dead_commands(text, self.TRACKED),
+                    [(2, f"python3 --   '{script}'", "lab/prism/deleted.py")],
+                )
+
+    def test_normalized_script_paths_outside_lab_are_not_lab_commands(self) -> None:
+        for script in (
+            "lab/../scripts/tool.py", "lab/prism/../../scripts/tool.py",
+            "lab/../../lab/prism/tool.py", "/lab/prism/tool.py",
+            "lab/../lab-old/tool.py",
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(self.commands(f"python3 '{script}'"), [])
+
+    def test_equivalent_prose_paths_preserve_directory_and_lab_boundaries(self) -> None:
+        for reference in ("lab/prism/./Dockerfile", "lab/prism/../prism//Dockerfile", "lab/prism/../prism/"):
+            with self.subTest(reference=reference):
+                self.assertEqual(self.references(f"See `{reference}`."), [])
+        for reference in (
+            "lab/prism/../prism/deleted.py", "lab/prism/../prism/Dockerfile/",
+            "lab/prism/../../scripts/tool.py", "lab/prism/../../../lab/prism/Dockerfile",
+        ):
+            with self.subTest(reference=reference):
+                self.assertEqual(
+                    dangling_references(f"See `{reference}`.", self.TRACKED | {"scripts/tool.py"}),
+                    [(1, reference)],
+                )
 
     # Every `-m` spelling here ran `json.tool` on CPython 3.12 (`-Rm` on 3.14);
     # `-Wm json.tool` and `-Xm json.tool` did not, opening `json.tool` as a
