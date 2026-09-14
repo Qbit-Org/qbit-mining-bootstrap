@@ -280,8 +280,10 @@ and `qbit_prism_runtime_task_stalled`. Refresh impact uses
 count retain their names. Guard body-based rules with #277's
 `qbit_prism_metrics_snapshot_available` / `qbit_prism_metrics_snapshot_stale`
 and candidate count/age and RSS rules with `qbit_prism_collector_available` so
-unknown -1 is never healthy zero. The pool-wait histogram rule retains snapshot
-availability/freshness guards but does not require collector availability. The first-offer histogram is declared without samples
+unknown -1 is never healthy zero. The pool-wait histogram is read live at scrape
+time; its rule requires `up == 1` and sufficient per-instance observations instead
+of cached-body or collector availability. Deploy that producer on every target
+before activating this rule. The first-offer histogram is declared without samples
 (A/#266); advisory-lock waits are recorded since #328; rules for both remain
 deferred. D3's dedicated standby alerts require the
 primary's deployment-provided PostgreSQL exporter, not public read replica data.

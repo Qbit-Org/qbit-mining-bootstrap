@@ -2,7 +2,8 @@
 
 The coordinator (`run`) owns one process-local registry shared by Stratum,
 background collectors, and the runtime monitor. `/metrics` renders cached
-observations, with #277 freshness, collector age/availability, and runtime state evaluated at scrape time.
+observations, with the pool-acquisition histogram, collector measurements,
+#277 freshness, collector age/availability, and runtime state read at scrape time.
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
@@ -55,7 +56,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
 | `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`. | none |
-| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by instrumented coordinator ledger transactions; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. | none |
+| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by instrumented coordinator ledger transactions; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
 | `qbit_prism_grace_credited_shares_total` | counter | none | run | Durably accepted shares credited by stale grace. | `qbit_prism_grace_credited_shares_total` |
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
@@ -196,12 +197,19 @@ attaches no firing rule to first-offer or advisory-lock timing.
 `PrismDatabasePoolWaitHigh` describes both collector and instrumented ledger
 acquisitions, including cancellation observations from #328 and #345. The collector
 acquires from the same pool as the ledger, so pool exhaustion can fail collection
-while the histogram records valid waits. #351 removes this rule's collector
-availability gate: the pool histogram in the last complete publication remains
-usable, while the existing snapshot availability/freshness gates and per-instance
-minimum of ten observations in five minutes remain required. Stale or missing
-snapshots retain their separate unknown-data alerts; unpublished observations
-are not exposed. The landing order for #336 is #334, then #343, then #351.
+while the histogram records valid waits. The health publisher also awaits this
+pool, so #351 overlays the live pool histogram on every scrape, including before
+the first publication and while the cached body is stale. All buckets, count and
+sum come from one registry read; rendering does not create observations or renew
+the cached-body timestamp. This rule requires a successful scrape (`up == 1`)
+and the existing per-instance minimum of ten observations in five minutes,
+independently of collector or cached-body availability. Failed or missing scrapes
+suppress it, and frozen counts age out of the sample window. Cached gauges retain
+their freshness gates and stale/missing snapshots retain their unknown-data alerts.
+Deploy the live-histogram producer to every coordinator target before activating
+this expression: older producers still cache pool observations, so their successful
+scrapes alone cannot establish this contract. The landing order for #336 is #334,
+then #343, then #351; the first two have landed.
 #328 references #278 rather than closing it.
 
 The #280 rebase must preserve the narrow hooks in `stratum::request` (complete
@@ -216,7 +224,7 @@ Its native observed boundary is authorized clients holding current-generation
 work (semantic coverage); it is a metrics-only timer and does not change health
 readiness decisions. This preserves the legacy alert threshold/reset semantics.
 
-Collector gauges are refreshed together from their in-memory measurements at
+Collector gauges and the pool histogram are refreshed from one registry read at
 scrape time, including when the health publisher stalls. This does not renew
 #277's cached-body publication timestamp or the collector's last-success time.
 
