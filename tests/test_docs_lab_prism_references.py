@@ -448,9 +448,14 @@ def executable_word(words: list[str]) -> int | None:
             option = unquote(words[index])
             if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
                 return None
-            if program == "sudo" and (option == "--edit" or re.match(r"-[ABbEHkNnPSis]*e", option)):
-                # Edit mode takes filenames. Only no-argument flags may precede
-                # e in a cluster: -ne edits, while -pe gives p the prompt "e".
+            if program == "sudo" and (
+                option in {"--edit", "--remove-timestamp", "--validate"}
+                or re.match(r"-[ABbEHkNnPSis]*[eKv]", option)
+            ):
+                # Edit and credential-only modes run no command. Only flags
+                # without arguments may precede the mode letter in a cluster:
+                # -nv validates, while -pv gives p the prompt "v". Lowercase
+                # -k resets credentials but still permits a command to run.
                 return None
             if program == "command" and option in {"-v", "-V"}:
                 return None  # executable lookup prints information; it runs nothing
@@ -2150,6 +2155,41 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.commands("env sudo -ne -- python3 lab/prism/deleted.py"), [])
         text = "```sh\nsudo -e \\\n  -- python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
         self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_sudo_credential_modes_do_not_run_commands(self) -> None:
+        for options in (
+            "-K", "--remove-timestamp", "'-K'", "-nK", "-Kn", "-HnK",
+            "-v", "--validate", "'-v'", "-nv", "-vn", "-Hnv", "-vuprism",
+            "-n -u prism --validate", "-p Prompt -v",
+        ):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py",
+                "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                for delimiter in ("", "-- "):
+                    with self.subTest(options=options, argument=argument, delimiter=delimiter):
+                        text = f"sudo {options} {delimiter}{argument}"
+                        self.assertEqual(self.commands(text), [])
+                        self.assertEqual(len(self.references(text)), 1)
+                        self.assertEqual(
+                            self.commands(text + "; python3 lab/prism/storm.py"),
+                            ["lab/prism/storm.py"],
+                        )
+        self.assertEqual(self.commands("env sudo -nv -- python3 lab/prism/deleted.py"), [])
+        text = "```sh\nsudo --validate \\\n  -- python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_sudo_timestamp_reset_and_mode_option_arguments_preserve_commands(self) -> None:
+        for options in (
+            "-k", "--reset-timestamp", "-nk", "-kn", "-kuprism", "-k -u prism",
+            "-p K", "-pK", "-p -K", "--prompt=K", "-p v", "-pv", "-p -v",
+            "-u v", "-uv", "--user=v", "--prompt=validate", "-u remove-timestamp",
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"sudo {options} python3 lab/prism/storm.py"),
+                    ["lab/prism/storm.py"],
+                )
 
     def test_sudo_option_arguments_containing_edit_flags_preserve_commands(self) -> None:
         for options in (
