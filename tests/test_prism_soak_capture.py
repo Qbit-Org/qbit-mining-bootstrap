@@ -91,7 +91,9 @@ docker() {
         echo 'running 2026-09-13T00:00:00.000000000Z 0'
       fi ;;
     'exec cat')
-      printf 'Name:\tqbit-prism-server\nVmRSS:\t  %s kB\nThreads:\t8\n' "$STUB_RSS_KB" ;;
+      stub_read clock
+      printf 'Name:\tqbit-prism-server\nVmRSS:\t  %s kB\nThreads:\t8\n' "$STUB_RSS_KB"
+      if [ "$stub_value" = "$STUB_RSS_FAULT_AT" ]; then return 1; fi ;;
     'exec curl')
       stub_state=fresh
       if [ "$4" = -fsS ]; then
@@ -489,6 +491,27 @@ class SoakCaptureTests(unittest.TestCase):
                         self.assertEqual((gate.returncode, gate.stdout), (1, ""))
                         self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
                         self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_failed_rss_read_with_valid_output_invalidates_the_run(self) -> None:
+        for shell in ("sh", "bash"):
+            for now in (0, 86400):
+                with self.subTest(shell=shell, now=now):
+                    soak = SoakRun(shell, STUB_RSS_FAULT_AT=str(now))
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                    self.assertIn(f"no RSS sample at {now}", result.stderr)
+                    self.assertIn("docker exec exited 1", result.stderr)
+                    self.assertIn(f"VmRSS:\t  {RSS_KB} kB", result.stderr)
+                    for name, lines_per_sample in (("soak-rss.csv", 1), ("soak-metrics.log", METRICS_LINES_PER_SAMPLE)):
+                        path = soak.run / name
+                        lines = path.read_text().splitlines() if path.exists() else []
+                        self.assertEqual(len(lines), now // 300 * lines_per_sample)
+                    self.assert_no_marker_at_all(soak)
+                    gate = soak.gate()
+                    self.assertEqual((gate.returncode, gate.stdout), (1, ""))
+                    self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     def test_final_sample_whose_reads_stall_for_an_hour_is_invalid(self) -> None:
         # Codex's case: the 289th sample's pre-read inspect (call 578) stalls

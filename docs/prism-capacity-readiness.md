@@ -511,8 +511,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        rss=$(printf '%s\n' "$body" | awk -v now="$now" '
          /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
          END { if (n == 1) print row }')
-       case $rss in
-         "$now",[0-9]*)
+       case $rc:$rss in
+         0:"$now",[0-9]*)
            echo "$rss" >> "$run/soak-rss.csv" || {
              echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-rss.csv" | invalid
              return 1
