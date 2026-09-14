@@ -127,6 +127,7 @@ CAPTURE = fence_containing("capture() {")
 GATE = fence_containing("completed() {")
 JUDGE = fence_containing("min_span=82800")
 SHARE_ACK = fence_containing('"$run/share-ack-h01.txt"')
+FULL_METRICS = fence_containing("full_metrics_snapshot() (")
 assert CAPTURE.count(PLACEHOLDER) == 1
 assert GATE.endswith("}\ncompleted\n")
 
@@ -241,6 +242,88 @@ run=.
                     result, snapshot = self.snapshot(shell, "fresh", status=status, histogram=histogram)
                     self.assertNotEqual(result.returncode, 0, result)
                     self.assertIsNone(snapshot)
+
+
+class FullMetricsSnapshotTests(unittest.TestCase):
+    RESPONSE = (
+        b"HTTP/1.1 200 OK\r\nx-prism-metrics-state: fresh\r\ncontent-type: text/plain\r\n\r\n"
+        b"# HELP qbit_prism_connections Active connections\nqbit_prism_connections 3\n"
+        b'qbit_prism_share_ack_seconds_count{result="accepted"} 5\n'
+    )
+
+    def snapshot(self, shell: str, response: bytes, *, status: int = 0, fault: str = "", existing: bool = False):
+        with tempfile.TemporaryDirectory(prefix="full-metrics-snapshot-") as directory:
+            work = Path(directory)
+            (work / "response").write_bytes(response)
+            target = work / "metrics-h01.txt"
+            temporary = work / "metrics-h01.txt.tmp"
+            if existing:
+                target.write_bytes(b"previous snapshot\n")
+            if fault == "write":
+                temporary.mkdir()
+            script = r'''
+docker() {
+  if [ "$*" != "exec stub-container curl -fsS --max-time 5 -D - http://127.0.0.1:3341/metrics" ]; then
+    echo "unexpected docker invocation: $*" >&2
+    return 99
+  fi
+  cat response
+  return "$SCRAPE_STATUS"
+}
+case $PUBLISH_FAULT in
+  rename) mv() { return 1; } ;;
+  interrupt) mv() { kill -s TERM $$; } ;;
+esac
+c=stub-container
+run=.
+''' + FULL_METRICS
+            result = subprocess.run(
+                [shell, "-c", script], cwd=work, capture_output=True, text=True,
+                env={**os.environ, "SCRAPE_STATUS": str(status), "PUBLISH_FAULT": fault}, timeout=10,
+            )
+            return result, target.read_bytes() if target.exists() else None, temporary.is_file()
+
+    def test_fresh_snapshot_preserves_the_entire_response(self) -> None:
+        for shell in ("sh", "bash"):
+            for response in (self.RESPONSE, self.RESPONSE.replace(b"x-prism-metrics-state", b"X-Prism-Metrics-State")):
+                with self.subTest(shell=shell, response=response):
+                    result, snapshot, temporary = self.snapshot(shell, response)
+                    self.assertEqual((result.returncode, result.stderr), (0, ""))
+                    self.assertEqual(snapshot, response)
+                    self.assertFalse(temporary)
+
+    def test_cached_or_missing_fresh_header_publishes_nothing(self) -> None:
+        for shell in ("sh", "bash"):
+            for state in (b"stale", b"unavailable", None):
+                response = (self.RESPONSE.replace(b"fresh", state) if state is not None
+                            else self.RESPONSE.replace(b"x-prism-metrics-state: fresh\r\n", b""))
+                # A fresh-looking line in the body cannot substitute for the header.
+                response += b"x-prism-metrics-state: fresh\n"
+                with self.subTest(shell=shell, state=state):
+                    result, snapshot, _ = self.snapshot(shell, response)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("fresh state header required", result.stderr)
+                    self.assertIsNone(snapshot)
+
+    def test_http_and_partial_transport_failures_preserve_existing_evidence(self) -> None:
+        for shell in ("sh", "bash"):
+            for status, response in ((22, b"HTTP/1.1 500 Internal Server Error\r\n\r\nerror"), (28, self.RESPONSE[:-10])):
+                for existing in (False, True):
+                    with self.subTest(shell=shell, status=status, existing=existing):
+                        result, snapshot, _ = self.snapshot(shell, response, status=status, existing=existing)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("metrics scrape or temporary-file write failed", result.stderr)
+                        self.assertEqual(snapshot, b"previous snapshot\n" if existing else None)
+
+    def test_failed_or_interrupted_publication_leaves_no_final_snapshot(self) -> None:
+        for shell in ("sh", "bash"):
+            for fault in ("write", "rename", "interrupt"):
+                with self.subTest(shell=shell, fault=fault):
+                    result, snapshot, temporary = self.snapshot(shell, self.RESPONSE, fault=fault)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIsNone(snapshot)
+                    if fault != "write":
+                        self.assertTrue(temporary)
 
 
 class SoakCaptureTests(unittest.TestCase):

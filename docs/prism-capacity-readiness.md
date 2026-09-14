@@ -840,8 +840,38 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    baseline), hour 24, and at any breach:
 
    ```sh
-   docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics > "$run/metrics-h01.txt"
+   full_metrics_snapshot() (
+     snapshot=$1
+     if ! docker exec "$c" curl -fsS --max-time 5 -D - http://127.0.0.1:3341/metrics > "$snapshot.tmp"; then
+       echo "full metrics snapshot failed: metrics scrape or temporary-file write failed" >&2
+       exit 1
+     fi
+     if ! awk '
+       { sub(/\r$/, "") }
+       $0 == "" { exit }
+       tolower($0) == "x-prism-metrics-state: fresh" { fresh = 1 }
+       END { exit !fresh }
+     ' "$snapshot.tmp"; then
+       echo "full metrics snapshot failed: fresh state header required" >&2
+       exit 1
+     fi
+     if ! mv "$snapshot.tmp" "$snapshot"; then
+       echo "full metrics snapshot failed: could not publish $snapshot" >&2
+       exit 1
+     fi
+   )
+   full_metrics_snapshot "$run/metrics-h01.txt"
    ```
+
+   At hour 24 call `full_metrics_snapshot "$run/metrics-h24.txt"`; at each
+   breach use a distinct name such as `"$run/metrics-breach-$(date +%s).txt"`.
+   The function requires a successful scrape and a `fresh` response header,
+   then renames the temporary file to publish the complete headers and body
+   unchanged. HTTP errors, transport failures, cached responses and failed
+   writes or renames return nonzero and publish no new final snapshot. Use
+   only the final `.txt` files as evidence; a `.tmp` file may be partial or
+   stale. If a required snapshot fails, keep the run directory and repeat
+   the soak from step 2.
 
    This replaces the census step: there is no heap walk on the native server,
    and the body at the breach is what the correlated reading works from.
