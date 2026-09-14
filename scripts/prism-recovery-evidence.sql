@@ -336,6 +336,31 @@ FROM (
 WHERE checkpoint <> '{"confirmed_block_hash":null,"confirmed_block_height":null,"confirmed_depth":0,"spend_scan_next_height":null,"spend_scan_anchor_height":null,"spend_scan_anchor_hash":null}'::jsonb
 ORDER BY fanout_txid COLLATE "C";
 
+-- Durable retry progress survives journal pruning (latest 32 attempts), so it
+-- is evidence in its own right. Claim ownership and updated_at are not.
+-- Missing legacy columns and freshly migrated defaults are equivalent;
+-- timestamps are normalized to UTC so the session time zone cannot matter.
+SELECT jsonb_build_object('kind', 'ctv_retry_progress', 'row',
+    progress || jsonb_build_object('fanout_txid', fanout_txid))
+FROM (
+    SELECT fanout_txid, jsonb_build_object(
+        'broadcast_attempt_count', COALESCE(r->'broadcast_attempt_count', '0'::jsonb),
+        'broadcast_attempt_detail_count', COALESCE(r->'broadcast_attempt_detail_count', '0'::jsonb),
+        'first_broadcast_attempt_at', to_jsonb((r->>'first_broadcast_attempt_at')::timestamptz AT TIME ZONE 'UTC'),
+        'last_broadcast_attempt_at', to_jsonb((r->>'last_broadcast_attempt_at')::timestamptz AT TIME ZONE 'UTC'),
+        'last_broadcast_attempt_status', r->'last_broadcast_attempt_status',
+        'last_broadcast_package_tx_hexes', COALESCE(r->'last_broadcast_package_tx_hexes', '[]'::jsonb),
+        'last_broadcast_package_txids', COALESCE(r->'last_broadcast_package_txids', '[]'::jsonb),
+        'last_broadcast_submit_result', r->'last_broadcast_submit_result',
+        'last_broadcast_error', r->'last_broadcast_error',
+        'broadcast_attempt_status_counts', COALESCE(r->'broadcast_attempt_status_counts', '{}'::jsonb),
+        'next_broadcast_attempt_at', to_jsonb((r->>'next_broadcast_attempt_at')::timestamptz AT TIME ZONE 'UTC'),
+        'broadcast_retry_backoff_seconds', COALESCE(r->'broadcast_retry_backoff_seconds', '0'::jsonb)) AS progress
+    FROM (SELECT fanout_txid, to_jsonb(a) AS r FROM qbit_ctv_fanout_artifacts a) rows
+) retry
+WHERE progress <> '{"broadcast_attempt_count":0,"broadcast_attempt_detail_count":0,"first_broadcast_attempt_at":null,"last_broadcast_attempt_at":null,"last_broadcast_attempt_status":null,"last_broadcast_package_tx_hexes":[],"last_broadcast_package_txids":[],"last_broadcast_submit_result":null,"last_broadcast_error":null,"broadcast_attempt_status_counts":{},"next_broadcast_attempt_at":null,"broadcast_retry_backoff_seconds":0}'::jsonb
+ORDER BY fanout_txid COLLATE "C";
+
 SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 

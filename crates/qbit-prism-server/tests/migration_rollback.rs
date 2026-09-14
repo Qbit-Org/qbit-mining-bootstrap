@@ -297,6 +297,46 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         let mut unchanged = prior.clone();
         unchanged["records"]["ctv_checkpoints"] = before_checkpoints["records"]["ctv_checkpoints"].clone();
         ensure!(unchanged == before_checkpoints);
+        // Retry progress outlives the pruned attempt journal, so schedule and
+        // counters alone must create evidence, and resetting them must remove it.
+        ensure!(prior["records"]["ctv_retry_progress"]["count"] == 0);
+        let before_retry = prior.clone();
+        for (column, first, next, default) in [
+            ("broadcast_attempt_count", "40", "41", "0"),
+            ("broadcast_attempt_detail_count", "32", "33", "0"),
+            ("first_broadcast_attempt_at", "'2026-09-14T20:00:00Z'", "'2026-09-14T20:00:01Z'", "NULL"),
+            ("last_broadcast_attempt_at", "'2026-09-14T21:00:00Z'", "'2026-09-14T21:00:01Z'", "NULL"),
+            ("last_broadcast_attempt_status", "'failed'", "'rejected'", "NULL"),
+            ("last_broadcast_package_tx_hexes", "'[\"00\"]'", "'[\"01\"]'", "'[]'"),
+            ("last_broadcast_package_txids", "'[\"aa\"]'", "'[\"bb\"]'", "'[]'"),
+            ("last_broadcast_submit_result", "'{\"ok\":false}'", "'{\"ok\":true}'", "NULL"),
+            ("last_broadcast_error", "'boom'", "'bang'", "NULL"),
+            ("broadcast_attempt_status_counts", "'{\"failed\":40}'", "'{\"failed\":41}'", "'{}'"),
+            ("next_broadcast_attempt_at", "'2026-09-14T22:00:00Z'", "'infinity'", "NULL"),
+            ("broadcast_retry_backoff_seconds", "60", "120", "0"),
+        ] {
+            for value in [first, next, default] {
+                sqlx::query(&format!(
+                    "UPDATE qbit_ctv_fanout_artifacts SET {column}={value} WHERE fanout_txid=repeat('33',32)"
+                )).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                ensure!(current["records"]["ctv_retry_progress"]["count"].as_u64()
+                    == Some(u64::from(value != default)));
+                ensure!(current["records"]["ctv_retry_progress"]["sha256"]
+                    != prior["records"]["ctv_retry_progress"]["sha256"],
+                    "CTV retry progress change was invisible to recovery evidence: {column}={value}");
+                let mut unchanged = current.clone();
+                unchanged["records"]["ctv_retry_progress"] = prior["records"]["ctv_retry_progress"].clone();
+                ensure!(unchanged == prior, "unrelated accounting changed with {column}={value}");
+                prior = current;
+            }
+        }
+        ensure!(prior == before_retry);
+        // Leave populated retry progress for the native backup roundtrip below.
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET broadcast_attempt_count=40,broadcast_attempt_detail_count=32,broadcast_attempt_status_counts='{\"failed\":40}',last_broadcast_attempt_status='failed',next_broadcast_attempt_at='2026-09-14T22:00:00Z',broadcast_retry_backoff_seconds=60 WHERE fanout_txid=repeat('33',32)")
+            .execute(&source.pool).await?;
+        prior = recovery::evidence(&source, pg_bin).await?;
+        ensure!(prior["records"]["ctv_retry_progress"]["count"] == 1);
         // Acquiring or renewing ownership must not alter durable evidence.
         sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_token='recovery-claim',claim_instance_id='recovery-owner',claim_expires_at=clock_timestamp()+interval '1 minute' WHERE fanout_txid=repeat('33',32)")
             .execute(&source.pool).await?;

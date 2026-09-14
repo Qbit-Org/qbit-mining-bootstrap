@@ -16,7 +16,8 @@ def summarize(lines):
     kinds = (
         "shares", "share_sequence", "sequences", "share_hashes", "blocks", "audits", "audit_bodies", "audit_snapshots",
         "carry", "payouts", "candidates", "candidate_balances",
-        "ctv_sets", "ctv_artifacts", "ctv_checkpoints", "ctv_broadcast_attempts",
+        "ctv_sets", "ctv_artifacts", "ctv_checkpoints", "ctv_retry_progress",
+        "ctv_broadcast_attempts",
         "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
         "fatal_state", "fatal_state_events", "chain_checkpoint", "active_carry",
     )

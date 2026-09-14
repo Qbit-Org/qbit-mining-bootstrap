@@ -88,6 +88,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
              {"share_count": 2}),
             ("ctv_checkpoints", {"fanout_txid": "ab", "confirmed_depth": 999},
              {"confirmed_depth": 1000}),
+            ("ctv_retry_progress", {"fanout_txid": "ab", "broadcast_attempt_count": 40},
+             {"next_broadcast_attempt_at": "2026-09-14T21:00:00"}),
             ("cpfp_packages", {"fanout_txid": "ab", "signed_child_hex": None},
              {"signed_child_hex": "deadbeef"}),
             ("cpfp_retired_funding", {"funding_txid": "cd", "wallet_lock_released": False},
