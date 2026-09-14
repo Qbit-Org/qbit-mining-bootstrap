@@ -1311,6 +1311,82 @@ async fn release_constraint_left_not_valid_is_refused_naming_it_and_rolls_back()
     db.close(vec![ledger]).await
 }
 
+/// Enable or disable the internal triggers that enforce one constraint, on
+/// every table they are on, as a superuser's `ALTER TABLE ... DISABLE
+/// TRIGGER` does during a bulk load.
+async fn set_enforcement(pool: &PgPool, constraint: &str, enable: bool) -> Result<()> {
+    sqlx::raw_sql(&format!(
+        "DO $$ DECLARE item record; BEGIN
+           FOR item IN SELECT t.tgname, t.tgrelid::regclass AS rel FROM pg_trigger t JOIN pg_constraint k ON k.oid=t.tgconstraint WHERE t.tgisinternal AND k.conname='{constraint}' AND k.connamespace=current_schema()::regnamespace LOOP
+             EXECUTE format('ALTER TABLE %s {} TRIGGER %I', item.rel, item.tgname);
+           END LOOP;
+         END $$",
+        if enable { "ENABLE" } else { "DISABLE" }
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The `tgenabled` state of each internal trigger enforcing a constraint,
+/// concatenated in order.
+async fn enforcement_states(pool: &PgPool, constraint: &str) -> Result<String> {
+    Ok(sqlx::query_scalar("SELECT string_agg(t.tgenabled::text,'' ORDER BY t.tgenabled) FROM pg_trigger t JOIN pg_constraint k ON k.oid=t.tgconstraint WHERE t.tgisinternal AND k.conname=$1 AND k.connamespace=current_schema()::regnamespace")
+        .bind(constraint).fetch_one(pool).await?)
+}
+
+/// A release foreign key whose enforcement triggers a superuser disabled:
+/// its definition and validation state are as the release made them, but
+/// no new row is checked against it, and 001 never re-enables a trigger it
+/// did not create. Refused naming the constraint, rolled back whole;
+/// enabled again, the same source migrates.
+#[tokio::test]
+async fn release_foreign_key_with_disabled_enforcement_triggers_is_refused_naming_it_and_rolls_back(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    insert_v1_terminal(&pool, &legacy_hash(0x36), "submitted").await?;
+    let fkey = "qbit_block_candidate_outbox_share_id_fkey";
+    assert_eq!(enforcement_states(&pool, fkey).await?, "OOOO");
+    // Only that key's four referential triggers, on the outbox and on the
+    // ledger it references; every user trigger stays enabled.
+    set_enforcement(&pool, fkey, false).await?;
+    assert_eq!(enforcement_states(&pool, fkey).await?, "DDDD");
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a release foreign key with its enforcement triggers disabled")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("1 object(s) differ"), "{error}");
+    assert!(
+        error.contains("constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 4 disabled"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was changed"), "{error}");
+    // Rolled back whole: no native table, and the triggers as they were.
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(enforcement_states(&pool, fkey).await?, "DDDD");
+    // Enabled again, the same source migrates and is recorded as v2.0.1.
+    set_enforcement(&pool, fkey, true).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    exercise_native_writers(&ledger, 1, 6301).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
 #[tokio::test]
 async fn row_level_security_on_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
     let Some(db) = Database::open().await? else {

@@ -841,12 +841,36 @@ fn constraint_key(definition: &str) -> String {
         .to_owned()
 }
 
-/// A constraint's name and whether PostgreSQL has checked every existing
-/// row against it (`convalidated`).
+/// A constraint's name, whether PostgreSQL has checked every existing row
+/// against it (`convalidated`), and the enabled state (`pg_trigger.tgenabled`,
+/// sorted) of each internal trigger that enforces it: the four referential
+/// triggers of a foreign key, on both of its tables, or the recheck trigger
+/// of a deferrable unique constraint; none for a CHECK or an ordinary
+/// primary key. `ALTER TABLE ... DISABLE TRIGGER` leaves the definition and
+/// `convalidated` as they were while no new row is checked against the
+/// constraint, so those states are part of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConstraintDefinition {
     name: String,
     validated: bool,
+    enforcement: Vec<String>,
+}
+
+/// The enabled states of a constraint's enforcement triggers, counted:
+/// `4 enabled`, `2 disabled, 2 enabled`, or `none`.
+fn enforcement_summary(states: &[String]) -> String {
+    if states.is_empty() {
+        return "none".to_owned();
+    }
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for state in states {
+        *counts.entry(trigger_state(state)).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(state, count)| format!("{count} {state}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Read the catalog for every object in `namespace`. The `pg_get_*`
@@ -894,7 +918,7 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition,k.convalidated AS validated FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition,k.convalidated AS validated,(SELECT coalesce(array_agg(t.tgenabled::text ORDER BY t.tgenabled),'{}') FROM pg_trigger t WHERE t.tgconstraint=k.oid AND t.tgisinternal) AS enforcement FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
@@ -910,6 +934,7 @@ async fn fingerprint_schema(
             .or_insert(ConstraintDefinition {
                 name: row.try_get("name")?,
                 validated: row.try_get("validated")?,
+                enforcement: row.try_get("enforcement")?,
             });
     }
     let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
@@ -1374,25 +1399,35 @@ fn compare_fingerprints(
         }
         let found_constraints = found.constraints.get(table).unwrap_or(&empty);
         for (definition, constraint) in constraints {
-            match found_constraints.get(definition) {
-                None => comparison.drift.push(format!(
+            let Some(actual) = found_constraints.get(definition) else {
+                comparison.drift.push(format!(
                     "missing constraint {} on {table}: {definition}",
                     constraint.name
-                )),
-                // The release validates it; the source never checked its
-                // rows against it. Only the pinned release exemptions are
-                // accepted in either state.
-                Some(actual)
-                    if constraint.validated
-                        && !actual.validated
-                        && !not_valid_exempt(table, &constraint.name) =>
-                {
-                    comparison.drift.push(format!(
-                        "constraint {} on {table} is NOT VALID; the release validates it",
-                        actual.name
-                    ))
-                }
-                Some(_) => {}
+                ));
+                continue;
+            };
+            // The release validates it; the source never checked its rows
+            // against it. Only the pinned release exemptions are accepted
+            // in either state.
+            if constraint.validated
+                && !actual.validated
+                && !not_valid_exempt(table, &constraint.name)
+            {
+                comparison.drift.push(format!(
+                    "constraint {} on {table} is NOT VALID; the release validates it",
+                    actual.name
+                ));
+            }
+            // The release enforces it; a disabled enforcement trigger
+            // checks no new row against it, whatever the definition and
+            // `convalidated` say, and 001 never re-enables one.
+            if actual.enforcement != constraint.enforcement {
+                comparison.drift.push(format!(
+                    "constraint {} on {table} differs: enforcement triggers expected {}, found {}",
+                    actual.name,
+                    enforcement_summary(&constraint.enforcement),
+                    enforcement_summary(&actual.enforcement)
+                ));
             }
         }
     }
@@ -2567,7 +2602,107 @@ mod tests {
         ConstraintDefinition {
             name: name.to_owned(),
             validated,
+            enforcement: Vec::new(),
         }
+    }
+
+    /// A foreign key with its four referential triggers in `states`.
+    fn foreign_key(name: &str, states: &str) -> ConstraintDefinition {
+        ConstraintDefinition {
+            name: name.to_owned(),
+            validated: true,
+            enforcement: states.chars().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn disabled_enforcement_triggers_are_drift_for_a_release_constraint() {
+        let definition = "FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)";
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[("share_id", column("text", false))]),
+        );
+        expected
+            .constraints
+            .entry("qbit_block_candidate_outbox".into())
+            .or_default()
+            .insert(
+                definition.into(),
+                foreign_key("qbit_block_candidate_outbox_share_id_fkey", "OOOO"),
+            );
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        let outbox = found
+            .constraints
+            .entry("qbit_block_candidate_outbox".into())
+            .or_default();
+        // The same definition, validated, under the source's name, with
+        // every referential trigger disabled: drift, counted by state.
+        outbox.insert(definition.into(), foreign_key("outbox_share_fk", "DDDD"));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec!["constraint outbox_share_fk on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 4 disabled"]
+        );
+        // Half of them, on one of its tables; and one set to fire on
+        // replicas only, which never fires on a primary.
+        let outbox = found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap();
+        outbox.insert(definition.into(), foreign_key("outbox_share_fk", "DDOO"));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec!["constraint outbox_share_fk on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 2 disabled, 2 enabled"]
+        );
+        let outbox = found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap();
+        outbox.insert(definition.into(), foreign_key("outbox_share_fk", "OOOR"));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec!["constraint outbox_share_fk on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 3 enabled, 1 enabled on replicas only"]
+        );
+        // Disabled and NOT VALID at once: both are named.
+        let outbox = found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap();
+        let mut both = foreign_key("outbox_share_fk", "DDDD");
+        both.validated = false;
+        outbox.insert(definition.into(), both);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "constraint outbox_share_fk on qbit_block_candidate_outbox is NOT VALID; the release validates it",
+                "constraint outbox_share_fk on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 4 disabled",
+            ]
+        );
+        // Enabled again, nothing to report; an extra constraint with
+        // disabled triggers is the operator's own and stays an extra.
+        let outbox = found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap();
+        outbox.insert(definition.into(), foreign_key("outbox_share_fk", "OOOO"));
+        outbox.insert(
+            "FOREIGN KEY (share_id) REFERENCES operator_shares(share_id)".into(),
+            foreign_key("operator_fk", "DDDD"),
+        );
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        assert_eq!(
+            comparison.extra,
+            vec!["constraint operator_fk on qbit_block_candidate_outbox: FOREIGN KEY (share_id) REFERENCES operator_shares(share_id)"]
+        );
+        assert_eq!(enforcement_summary(&[]), "none");
     }
 
     #[test]

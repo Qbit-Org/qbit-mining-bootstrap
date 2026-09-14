@@ -78,10 +78,12 @@
 -- compared: a release constraint left NOT VALID in the source is drift,
 -- except qbit_share_ledger_credit_policy_check, which 001 itself adds NOT
 -- VALID on an upgraded table (NOT_VALID_EXEMPT in ledger/migration.rs, pinned
--- to the frozen release by a test). Column order, comments and
--- auto-generated constraint names are ignored; extra objects are kept and
--- logged; a missing or different one fails the migration, which rolls back
--- whole.
+-- to the frozen release by a test). The enabled state of the internal
+-- triggers that enforce a foreign key is compared too: disabled by a
+-- superuser, the constraint keeps its definition and validation while no
+-- new row is checked against it. Column order, comments and auto-generated
+-- constraint names are ignored; extra objects are kept and logged; a
+-- missing or different one fails the migration, which rolls back whole.
 
 -- What the database came from, written once by the migration that accepted
 -- it. Later starts and operators read it; a repeated migrate never rewrites it.
