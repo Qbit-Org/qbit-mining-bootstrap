@@ -443,8 +443,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    defines `capture`, which takes the samples in a loop, and then calls it.
    Before every sample it checks that no more than 360 s have passed since
    the previous one and that it is still reading the process the run
-   started with, and it stops the run as invalid when either check fails or
-   when one of its appends to the run's files does:
+   started with, after the sample's reads it reads the identity again, and
+   it stops the run as invalid when any of these checks fails or when one
+   of its appends to the run's files does:
 
    ```sh
    c=<prism-coordinator-container>
@@ -529,6 +530,15 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
          return 1
        }
+       after=$(process)
+       if [ "$after" != "$first" ]; then
+         {
+           echo "$(date -u +%FT%TZ): soak invalid, the coordinator changed while the sample at $now was read"
+           echo "  at start:   $first"
+           echo "  after read: $after"
+         } | invalid
+         return 1
+       fi
        sleep 300
      done
    }
@@ -546,10 +556,20 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    probe: `StartedAt` moves on any restart, `RestartCount` counts the ones the
    policy made, and `Status` catches a process that exited and was not
    restarted. `soak-process.log` keeps one reading per sample, so a later
-   reader can show the run was one process. Any change during the soak
-   invalidates the run: keep the run directory, whose `soak-invalid` holds
-   the message, attach `docker logs "$c"` (the container keeps the exited
-   process's output), and start over from step 2.
+   reader can show the run was one process. That reading is taken before the
+   sample's two reads, so it catches a restart since the previous sample; a
+   restart between the check and the reads would record the replacement's
+   RSS and metrics under the original identity in `soak-process.log`. Every
+   later iteration's check would catch that, but the last iteration of a
+   valid run has no later iteration, because the operator ends the run after
+   24 h, so a restart in that window on the last sample would leave a
+   directory with no `soak-invalid` that reads as a single-process run. So
+   the identity is read again after the two reads, and a change ends the run
+   as invalid; that sample's rows are already in the files, which is fine,
+   because the marker keeps the directory from being judged, as step 6 says.
+   Any change during the soak invalidates the run: keep the run directory,
+   whose `soak-invalid` holds the message, attach `docker logs "$c"` (the
+   container keeps the exited process's output), and start over from step 2.
 
    A run that starts over must not write into the files of the run it
    replaces. The judge sorts the samples by timestamp before it reads them,
