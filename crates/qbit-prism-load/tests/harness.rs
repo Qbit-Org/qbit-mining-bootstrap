@@ -1507,6 +1507,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         harness_bug_rejections: 0,
         divergences: 0,
         unknown_outcome_commits: 0,
+        no_response_commits: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     assert_ne!(run::EXIT_PREMISE_CONTRADICTED, run::EXIT_OK);
@@ -1690,6 +1691,7 @@ async fn a_replication_mode_other_than_the_declared_one_refuses_qualification() 
         harness_bug_rejections: 0,
         divergences: 0,
         unknown_outcome_commits: 0,
+        no_response_commits: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     Ok(())
@@ -2155,6 +2157,7 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
         harness_bug_rejections: 0,
         divergences: 0,
         unknown_outcome_commits: 0,
+        no_response_commits: 0,
     };
     assert_eq!(clean.exit_code(), run::EXIT_OK);
     assert_eq!(clean.explanation(std::path::Path::new("r.json")), None);
@@ -2164,6 +2167,7 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
         harness_bug_rejections: 1,
         divergences: 1,
         unknown_outcome_commits: 1,
+        no_response_commits: 1,
     };
     assert_eq!(late.exit_code(), run::EXIT_BLOCKED);
     let explanation = late
@@ -2900,12 +2904,10 @@ fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_i
         run::classify_committed_gap(Some(&divergence)),
         GapKind::AckCommitDivergence
     );
-    // Every other explanation, and no explanation at all, is a loss.
+    // Every other explanation, and no explanation at all, is a loss. A
+    // submit with no response is neither: it has its own kind, below.
     for outcome in [
         Outcome::Accepted,
-        Outcome::NoResponse {
-            reason: "socket closed".into(),
-        },
         Outcome::Rejected(rejection(
             20,
             Some("backend-rpc-unavailable"),
@@ -2962,6 +2964,99 @@ fn an_unknown_outcome_commit_is_neither_a_divergence_nor_a_loss() {
     );
 }
 
+/// A socket that closes after PostgreSQL commits a submit but before the
+/// client reads the response leaves a `NoResponse` record; reconciliation
+/// then finds the row, and the fallback called it a durability loss, exit 4.
+/// Nothing was lost: the share is present, only its acknowledgement is, and
+/// whether the server sent one cannot be known from this side. A false
+/// data-loss alarm is a stop-and-ask for whoever reads the report, so the
+/// transport-indeterminate case has its own kind, its own report bucket and
+/// the divergence family's exit code -- never 0, because "we do not know" is
+/// not "it was fine", and never 4, because it is not "it was lost".
+#[test]
+fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{classify_gaps, GapKind, RunOutcome};
+    use std::collections::BTreeSet;
+    let record = submit_record(
+        "steady_state",
+        Outcome::NoResponse {
+            reason: "socket closed: end of stream".into(),
+        },
+    );
+    assert_eq!(
+        run::classify_committed_gap(Some(&record)),
+        GapKind::NoResponseCommitted
+    );
+    // Through the whole classification: the share was offered in
+    // steady_state, never acknowledged, and PostgreSQL holds it.
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    let committed = set(&[record.share_id.as_str()]);
+    let reconciliation = digest::reconcile(committed.clone(), set(&[]), &committed);
+    let attribution =
+        digest::attribute_unexpected(&committed, &[("steady_state".to_owned(), &reconciliation)]);
+    let gaps = classify_gaps(
+        &[("steady_state".to_owned(), false)],
+        &[("steady_state".to_owned(), reconciliation)],
+        &attribution,
+        std::slice::from_ref(&record),
+        15.0,
+    );
+    assert_eq!(gaps.findings, json!([]), "not a loss");
+    assert!(gaps.divergences.is_empty() && gaps.unknown_outcome_commits.is_empty());
+    assert_eq!(gaps.no_response_commits.len(), 1, "{gaps:?}");
+    let detail = &gaps.no_response_commits[0];
+    assert_eq!(detail["share_id"], json!(record.share_id));
+    assert_eq!(detail["phase"], json!("steady_state"));
+    assert_eq!(
+        detail["no_response_reason"],
+        json!("socket closed: end of stream")
+    );
+    assert_eq!(detail["classification"], json!("transport-indeterminate"));
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: gaps.no_response_commits.len(),
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_ACK_COMMIT_DIVERGENCE);
+    assert_ne!(
+        outcome.exit_code(),
+        run::EXIT_OK,
+        "we do not know is not it was fine"
+    );
+    assert_ne!(
+        outcome.exit_code(),
+        run::EXIT_DURABILITY,
+        "we do not know is not it was lost"
+    );
+    let explanation = outcome
+        .explanation(std::path::Path::new("r.json"))
+        .expect("a no-response commit is explained");
+    assert!(explanation.contains("no response"), "{explanation}");
+    assert!(explanation.contains("nothing lost"), "{explanation}");
+    // The mid-flight kill's own indeterminate shares are still its own
+    // business: the exemption is unchanged.
+    let committed = set(&[record.share_id.as_str()]);
+    let reconciliation = digest::reconcile(committed.clone(), set(&[]), &committed);
+    let attribution = digest::attribute_unexpected(
+        &committed,
+        &[("mid_flight_kill".to_owned(), &reconciliation)],
+    );
+    let gaps = classify_gaps(
+        &[("mid_flight_kill".to_owned(), true)],
+        &[("mid_flight_kill".to_owned(), reconciliation)],
+        &attribution,
+        std::slice::from_ref(&record),
+        15.0,
+    );
+    assert_eq!(gaps.findings, json!([]));
+    assert!(gaps.no_response_commits.is_empty());
+}
+
 /// `reconciliation.unexpected_outside_phases` counted the run-prefixed rows
 /// PostgreSQL holds that no phase claims, and nothing read the count: a run
 /// holding such a row reconciled clean and exited 0. Every share the harness
@@ -2993,9 +3088,11 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
     let attribution =
         digest::attribute_unexpected(&committed, &[("steady_state".to_owned(), &reconciliation)]);
     assert_eq!(attribution.outside_phases, vec!["z".to_owned()]);
-    let (findings, divergences, unknown_outcomes) =
-        classify_gaps(&phases, &reconciliations, &attribution, &[], 15.0);
-    let findings = findings.as_array().expect("durability_findings is a list");
+    let gaps = classify_gaps(&phases, &reconciliations, &attribution, &[], 15.0);
+    let findings = gaps
+        .findings
+        .as_array()
+        .expect("durability_findings is a list");
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0]["kind"], json!(OUTSIDE_PHASES_KIND));
     assert_eq!(findings[0]["count"], json!(1));
@@ -3004,13 +3101,18 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
         findings[0]["phase"].is_null(),
         "the row belongs to no phase, and the finding says so rather than naming one"
     );
-    assert!(divergences.is_empty() && unknown_outcomes.is_empty());
+    assert!(
+        gaps.divergences.is_empty()
+            && gaps.unknown_outcome_commits.is_empty()
+            && gaps.no_response_commits.is_empty()
+    );
     let outcome = RunOutcome {
         withhold: None,
         durability_findings: findings.len(),
         harness_bug_rejections: 0,
         divergences: 0,
         unknown_outcome_commits: 0,
+        no_response_commits: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_DURABILITY);
 
@@ -3020,14 +3122,14 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
     let reconciliation = digest::reconcile(set(&["a"]), set(&["a"]), &clean);
     let attribution =
         digest::attribute_unexpected(&clean, &[("steady_state".to_owned(), &reconciliation)]);
-    let (findings, _, _) = classify_gaps(
+    let gaps = classify_gaps(
         &phases,
         &[("steady_state".to_owned(), reconciliation)],
         &attribution,
         &[],
         15.0,
     );
-    assert_eq!(findings, json!([]));
+    assert_eq!(gaps.findings, json!([]));
 }
 
 /// A rejection whose `reason_id` the classifier does not recognise already
@@ -3172,6 +3274,7 @@ fn an_unrecognised_rejection_reason_is_named_in_the_summary_and_the_refusal() {
         harness_bug_rejections: 0,
         divergences: 0,
         unknown_outcome_commits: 0,
+        no_response_commits: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_OK);
 }

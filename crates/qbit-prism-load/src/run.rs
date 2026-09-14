@@ -41,8 +41,10 @@ pub const EXIT_ERROR: i32 = 2;
 pub const EXIT_BLOCKED: i32 = 3;
 /// An acknowledged share that PostgreSQL does not hold: a loss.
 pub const EXIT_DURABILITY: i32 = 4;
-/// A share PostgreSQL holds that the server told the client it had not
-/// confirmed. Nothing was lost, but an acknowledgement and a commit diverged.
+/// A share PostgreSQL holds whose acknowledgement never reached the client:
+/// the server refused it (`ledger-confirmation-failed`), said it did not
+/// know (`ledger-outcome-unknown`), or the socket closed before its answer
+/// was read. Nothing was lost, but an acknowledgement and a commit diverged.
 pub const EXIT_ACK_COMMIT_DIVERGENCE: i32 = 5;
 pub const EXIT_ABORTED: i32 = 6;
 /// Rejections that can only happen if the harness offered bad work.
@@ -301,13 +303,16 @@ pub struct RunOutcome<'a> {
     pub harness_bug_rejections: usize,
     pub divergences: usize,
     pub unknown_outcome_commits: usize,
+    /// Committed shares whose submit got no response: the share is there,
+    /// only its acknowledgement is missing.
+    pub no_response_commits: usize,
 }
 
 impl RunOutcome<'_> {
     /// The exit code, in order of precedence: a withheld artifact first
     /// (blocked, then a contradicted premise, then aborted), then the
     /// reconciliation findings, then the harness-bug rejections, then the
-    /// two divergence buckets.
+    /// three divergence buckets.
     pub fn exit_code(&self) -> i32 {
         match self.withhold {
             Some(Withhold::Blocked(_)) => return EXIT_BLOCKED,
@@ -321,7 +326,8 @@ impl RunOutcome<'_> {
         if self.harness_bug_rejections > 0 {
             return EXIT_HARNESS_BUG_REJECTIONS;
         }
-        if self.divergences > 0 || self.unknown_outcome_commits > 0 {
+        if self.divergences > 0 || self.unknown_outcome_commits > 0 || self.no_response_commits > 0
+        {
             return EXIT_ACK_COMMIT_DIVERGENCE;
         }
         EXIT_OK
@@ -353,6 +359,11 @@ impl RunOutcome<'_> {
                 "{} shares committed after the server answered ledger-outcome-unknown; see \
                  {report}",
                 self.unknown_outcome_commits
+            ),
+            None if self.no_response_commits > 0 => format!(
+                "{} shares committed whose submit got no response: present in PostgreSQL, \
+                 acknowledgement lost in transit, nothing lost; see {report}",
+                self.no_response_commits
             ),
             None => return None,
         })
@@ -1569,13 +1580,19 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .map(|phase| (phase.plan.name.clone(), phase.plan.mid_flight_kill))
         .collect();
-    let (durability_findings, divergences, unknown_outcome_commits) = classify_gaps(
+    let gaps = classify_gaps(
         &driven,
         &phase_reconciliations,
         &attribution,
         &collected.submits,
         args.share_commit_timeout_seconds,
     );
+    let GapReport {
+        findings: durability_findings,
+        divergences,
+        unknown_outcome_commits,
+        no_response_commits,
+    } = gaps;
     let node_submissions = ctx.node_state.submissions();
     let tip_changes = ctx.node_state.tip_changes();
     let dense_cadence = dense_cadence_report(
@@ -1754,6 +1771,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "count": unknown_outcome_commits.len(),
             "shares": unknown_outcome_commits,
         },
+        "no_response_commits": {
+            "definition": NO_RESPONSE_COMMIT_DEFINITION,
+            "count": no_response_commits.len(),
+            "shares": no_response_commits,
+        },
         "honest_value_notes": report::honest_value_notes(),
         "drain": {
             "note": "sessions quiesce before the run closes their sockets, for up to the \
@@ -1783,6 +1805,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         harness_bug_rejections: harness_bugs.len(),
         divergences: divergences.len(),
         unknown_outcome_commits: unknown_outcome_commits.len(),
+        no_response_commits: no_response_commits.len(),
     };
     if let Some(line) = outcome.explanation(&report_path) {
         eprintln!("{line}");
@@ -3003,14 +3026,17 @@ fn phase_report(
 }
 
 /// Split the gaps between what was acknowledged and what PostgreSQL holds into
-/// the two failures they really are.
+/// the failures they really are.
 ///
 /// An acknowledged share the database does not hold is a loss. A share the
-/// database holds that the server refused with `ledger-confirmation-failed` is
-/// not a loss: the append committed after the commit deadline had already
-/// answered the miner. They are reported separately because only the first
-/// means a miner's credited work disappeared.
-/// Which of the two failures a committed-but-unacknowledged share is.
+/// database holds that the server refused with `ledger-confirmation-failed`
+/// is not a loss: the append committed after the commit deadline had already
+/// answered the miner. Neither is one whose submit got no response: the
+/// socket closed before an answer was read, and whether the server ever
+/// sent one cannot be known from this side. They are reported separately
+/// because only the first means a miner's credited work disappeared.
+///
+/// Which of the failures a committed-but-unacknowledged share is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GapKind {
     /// PostgreSQL holds it, and the server had already refused it with
@@ -3021,26 +3047,52 @@ pub enum GapKind {
     /// landed. Nothing was lost, and the answer was honest, but the miner was
     /// still refused a share the database holds.
     UnknownOutcomeCommitted,
+    /// PostgreSQL holds it, and the submit got no response: the socket
+    /// closed, or the run ended, before an answer was read. The share is
+    /// present; only its acknowledgement is missing, and the harness cannot
+    /// tell whether the server sent one. Nothing was lost. It used to be
+    /// read as a durability loss, the most expensive wrong answer the
+    /// harness can give, because a loss is a stop-and-ask (EP-ERRORS).
+    NoResponseCommitted,
     /// PostgreSQL holds it and nothing explains why no acknowledgement
     /// covers it.
     DurabilityLoss,
 }
 
+/// What the side report says a no-response commit is.
+pub const NO_RESPONSE_COMMIT_DEFINITION: &str =
+    "a share PostgreSQL holds whose submit got no response: the socket closed, or the run \
+     ended, before the client read an answer. The share is present and only its \
+     acknowledgement is missing; whether the server ever sent one cannot be known from this \
+     side, so this is transport-indeterminate, neither a loss nor a refusal. It is kept apart \
+     from durability_findings, whose shares are missing or unexplained, and from the two \
+     refusal buckets, whose shares the server answered.";
+
 /// Decide from the submit record the harness has, if any.
 pub fn classify_committed_gap(record: Option<&SubmitRecord>) -> GapKind {
-    let rejection = record.and_then(|record| match &record.outcome {
-        Outcome::Rejected(rejection) => Some(rejection),
-        _ => None,
-    });
-    match rejection {
-        Some(rejection) if classify::is_confirmation_failure(rejection) => {
+    match record.map(|record| &record.outcome) {
+        Some(Outcome::Rejected(rejection)) if classify::is_confirmation_failure(rejection) => {
             GapKind::AckCommitDivergence
         }
-        Some(rejection) if classify::is_outcome_unknown(rejection) => {
+        Some(Outcome::Rejected(rejection)) if classify::is_outcome_unknown(rejection) => {
             GapKind::UnknownOutcomeCommitted
         }
+        Some(Outcome::NoResponse { .. }) => GapKind::NoResponseCommitted,
         _ => GapKind::DurabilityLoss,
     }
+}
+
+/// The reconciliation gaps of a run, each kind in its own bucket.
+#[derive(Clone, Debug, Default)]
+pub struct GapReport {
+    /// The `durability_findings` list: the losses.
+    pub findings: Value,
+    /// Committed after `ledger-confirmation-failed`.
+    pub divergences: Vec<Value>,
+    /// Committed after `ledger-outcome-unknown`.
+    pub unknown_outcome_commits: Vec<Value>,
+    /// Committed with no response read.
+    pub no_response_commits: Vec<Value>,
 }
 
 /// The kind a committed row that no phase offered is reported under.
@@ -3080,10 +3132,11 @@ pub fn classify_gaps(
     attribution: &digest::UnexpectedAttribution,
     submits: &[SubmitRecord],
     share_commit_timeout_seconds: f64,
-) -> (Value, Vec<Value>, Vec<Value>) {
+) -> GapReport {
     let mut findings = Vec::new();
     let mut divergences = Vec::new();
     let mut unknown_outcomes = Vec::new();
+    let mut no_responses = Vec::new();
     let by_share: HashMap<&str, &SubmitRecord> = submits
         .iter()
         .filter(|record| !record.reoffer)
@@ -3121,33 +3174,45 @@ pub fn classify_gaps(
                 Outcome::Rejected(rejection) => Some(rejection),
                 _ => None,
             });
-            let kind = classify_committed_gap(record);
-            if matches!(
-                kind,
-                GapKind::AckCommitDivergence | GapKind::UnknownOutcomeCommitted
-            ) {
-                let detail = json!({
-                    "share_id": share,
-                    "phase": phase_name,
-                    "frontend": record.map(|record| record.frontend),
-                    "session": record.map(|record| record.session),
-                    "job_id": record.map(|record| record.job_id.clone()),
-                    "code": rejection.map(|r| r.code),
-                    "reason_id": rejection.and_then(|r| r.reason_id.clone()),
-                    "message": rejection.map(|r| r.message.clone()),
-                    "send_to_response_milliseconds": record.and_then(|r| r.latency_millis),
-                    "share_commit_timeout_milliseconds": share_commit_timeout_seconds * 1000.0,
-                    "response_after_commit_deadline": record
-                        .and_then(|r| r.latency_millis)
-                        .map(|latency| latency >= share_commit_timeout_seconds * 1000.0),
-                });
-                if kind == GapKind::AckCommitDivergence {
-                    divergences.push(detail);
-                } else {
-                    unknown_outcomes.push(detail);
+            match classify_committed_gap(record) {
+                kind @ (GapKind::AckCommitDivergence | GapKind::UnknownOutcomeCommitted) => {
+                    let detail = json!({
+                        "share_id": share,
+                        "phase": phase_name,
+                        "frontend": record.map(|record| record.frontend),
+                        "session": record.map(|record| record.session),
+                        "job_id": record.map(|record| record.job_id.clone()),
+                        "code": rejection.map(|r| r.code),
+                        "reason_id": rejection.and_then(|r| r.reason_id.clone()),
+                        "message": rejection.map(|r| r.message.clone()),
+                        "send_to_response_milliseconds": record.and_then(|r| r.latency_millis),
+                        "share_commit_timeout_milliseconds": share_commit_timeout_seconds * 1000.0,
+                        "response_after_commit_deadline": record
+                            .and_then(|r| r.latency_millis)
+                            .map(|latency| latency >= share_commit_timeout_seconds * 1000.0),
+                    });
+                    if kind == GapKind::AckCommitDivergence {
+                        divergences.push(detail);
+                    } else {
+                        unknown_outcomes.push(detail);
+                    }
                 }
-            } else {
-                unexplained.push(share.clone());
+                GapKind::NoResponseCommitted => {
+                    let reason = record.and_then(|record| match &record.outcome {
+                        Outcome::NoResponse { reason } => Some(reason.clone()),
+                        _ => None,
+                    });
+                    no_responses.push(json!({
+                        "share_id": share,
+                        "phase": phase_name,
+                        "frontend": record.map(|record| record.frontend),
+                        "session": record.map(|record| record.session),
+                        "job_id": record.map(|record| record.job_id.clone()),
+                        "no_response_reason": reason,
+                        "classification": "transport-indeterminate",
+                    }));
+                }
+                GapKind::DurabilityLoss => unexplained.push(share.clone()),
             }
         }
         if !unexplained.is_empty() {
@@ -3162,7 +3227,12 @@ pub fn classify_gaps(
     // The rows no phase claims are not any phase's, so the mid-flight
     // exemption above cannot cover them: they are findings in every run.
     findings.extend(outside_phases_finding(&attribution.outside_phases));
-    (json!(findings), divergences, unknown_outcomes)
+    GapReport {
+        findings: json!(findings),
+        divergences,
+        unknown_outcome_commits: unknown_outcomes,
+        no_response_commits: no_responses,
+    }
 }
 
 /// How a run ends before its first phase, with only the reduced side report
