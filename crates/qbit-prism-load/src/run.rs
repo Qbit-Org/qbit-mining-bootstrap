@@ -15,7 +15,9 @@ use crate::{
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     measure::{self, LockSampler, ProcessSampler},
     node::FakeNode,
-    profile, provenance, proxy, report, window,
+    profile, provenance, proxy, report,
+    restart::{RestartDriver, RestartRecord},
+    window,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -45,6 +47,20 @@ pub const EXIT_ACK_COMMIT_DIVERGENCE: i32 = 5;
 pub const EXIT_ABORTED: i32 = 6;
 /// Rejections that can only happen if the harness offered bad work.
 pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
+
+/// Added to the configured share-commit timeout to bound a drained restart's
+/// wait: the server answers a submit within the timeout, and its answer still
+/// has to cross the socket and be read.
+pub const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long a drained restart waits for a frontend's sessions to have no
+/// submit outstanding. At least the commit timeout the frontends were
+/// configured with (EP-ERRORS: one deadline through dependent work), so a
+/// submit the server is still allowed to be working on is not declared
+/// stuck.
+pub fn drain_limit(share_commit_timeout_seconds: f64) -> Duration {
+    Duration::from_secs_f64(share_commit_timeout_seconds.max(0.0)) + DRAIN_MARGIN
+}
 
 /// Everything the sessions reported, folded by the collector task.
 #[derive(Default)]
@@ -127,6 +143,9 @@ struct PhaseRun {
     min_mem_available_kib: Option<u64>,
     scheduled_blocks: usize,
     frontend_restarts: usize,
+    /// Every drained restart this phase completed, with its timings and the
+    /// scrapes bracketing the counter reset.
+    restart_records: Vec<RestartRecord>,
     mid_flight_indeterminate: Vec<SubmitRecord>,
     /// Submits outstanding on the killed frontend at the instant of the kill.
     outstanding_at_kill: Option<usize>,
@@ -673,6 +692,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             min_mem_available_kib: outcome.min_mem_available_kib,
             scheduled_blocks: outcome.scheduled_blocks,
             frontend_restarts: outcome.frontend_restarts,
+            restart_records: outcome.restart_records,
             mid_flight_indeterminate: outcome.indeterminate,
             outstanding_at_kill: outcome.outstanding_at_kill,
             started,
@@ -1180,6 +1200,8 @@ struct PhaseOutcome {
     aborted: Option<String>,
     scheduled_blocks: usize,
     frontend_restarts: usize,
+    /// Completed drained restarts, with the scrapes bracketing each reset.
+    restart_records: Vec<RestartRecord>,
     indeterminate: Vec<SubmitRecord>,
     /// Submits outstanding on the killed frontend at the instant of the kill.
     outstanding_at_kill: Option<usize>,
@@ -1217,6 +1239,7 @@ async fn drive_phase(
         aborted: None,
         scheduled_blocks: 0,
         frontend_restarts: 0,
+        restart_records: Vec::new(),
         indeterminate: Vec::new(),
         outstanding_at_kill: None,
         dense_offsets: Vec::new(),
@@ -1233,6 +1256,12 @@ async fn drive_phase(
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;
     let mut restart_done = restart_at.is_none();
+    // The drained restart in flight, if any. It is polled from this loop and
+    // never awaited, so the other frontends keep receiving scheduled load
+    // while one is away: that outage is what the phase measures.
+    let mut restart: Option<RestartDriver> = None;
+    let restart_drain_limit = drain_limit(args.share_commit_timeout_seconds);
+    let restart_ready_limit = Duration::from_secs(args.work_timeout);
     // With `--cadence dense`, `--scheduled-blocks` is the dense phase's
     // landing budget and `steady_state` schedules none, so the budget is not
     // spent before the phase that measures it. Without it, nothing changes.
@@ -1302,8 +1331,30 @@ async fn drive_phase(
         if let Some(at) = restart_at {
             if !restart_done && seconds >= at {
                 restart_done = true;
-                outcome.frontend_restarts += 1;
-                drained_restart(args, sessions, frontends, samplers, 1).await?;
+                let index = 1.min(frontends.len() - 1);
+                restart = Some(RestartDriver::start(
+                    index,
+                    sessions,
+                    restart_drain_limit,
+                    restart_ready_limit,
+                ));
+            }
+        }
+        if let Some(driver) = restart.as_mut() {
+            match driver.poll(sessions, frontends, samplers) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    outcome.frontend_restarts += 1;
+                    outcome.restart_records.push(record);
+                    restart = None;
+                }
+                Err(error) => {
+                    outcome.aborted = Some(format!(
+                        "the drained restart of load-fe-{} could not be performed: {error:#}",
+                        driver.index()
+                    ));
+                    break;
+                }
             }
         }
         if block_cursor < block_times.len() && seconds >= block_times[block_cursor] {
@@ -1382,6 +1433,29 @@ async fn drive_phase(
             }
         }
     }
+    // A restart still in flight at the phase boundary is seen through, so
+    // its sessions are retargeted before the next phase offers to them. Its
+    // own deadlines bound the wait, and a failure aborts as it would inside
+    // the phase. Nothing is offered meanwhile.
+    while outcome.aborted.is_none() {
+        let Some(driver) = restart.as_mut() else {
+            break;
+        };
+        match driver.poll(sessions, frontends, samplers) {
+            Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
+            Ok(Some(record)) => {
+                outcome.frontend_restarts += 1;
+                outcome.restart_records.push(record);
+                restart = None;
+            }
+            Err(error) => {
+                outcome.aborted = Some(format!(
+                    "the drained restart of load-fe-{} could not be performed: {error:#}",
+                    driver.index()
+                ));
+            }
+        }
+    }
     Ok(outcome)
 }
 
@@ -1399,51 +1473,6 @@ fn offer_round_robin(
         }
     }
     false
-}
-
-/// Quiesce one frontend's sessions, kill it, restart it and let them reconnect.
-async fn drained_restart(
-    args: &Args,
-    sessions: &[SessionHandle],
-    frontends: &mut [Frontend],
-    samplers: &[ProcessSampler],
-    index: usize,
-) -> Result<()> {
-    let index = index.min(frontends.len() - 1);
-    for session in sessions {
-        if session.frontend.load(Ordering::Relaxed) == index {
-            let _ = session.control.send(client::Control::Pause);
-        }
-    }
-    // Let outstanding submits settle before the process goes away, so the
-    // drained restart produces no indeterminate shares.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline
-        && sessions.iter().any(|session| {
-            session.frontend.load(Ordering::Relaxed) == index
-                && session.outstanding.load(Ordering::Relaxed) > 0
-        })
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    frontends[index].restart()?;
-    frontends[index]
-        .wait_ready(Duration::from_secs(args.work_timeout))
-        .await?;
-    if let Some(sampler) = samplers.get(index) {
-        sampler.set_pid(frontends[index].pid());
-    }
-    let address = frontends[index].stratum_address();
-    for session in sessions {
-        if session.frontend.load(Ordering::Relaxed) == index {
-            let _ = session.control.send(client::Control::Retarget {
-                frontend: index,
-                address: address.clone(),
-                reconnect: false,
-            });
-        }
-    }
-    Ok(())
 }
 
 /// SIGKILL a frontend with submits outstanding, then re-offer every share whose
@@ -1976,6 +2005,13 @@ fn phase_report(
         "min_mem_available_kib": phase.min_mem_available_kib,
         "scheduled_blocks": phase.scheduled_blocks,
         "frontend_restarts": phase.frontend_restarts,
+        "drained_restarts": phase.restart_records.iter().map(|record| json!({
+            "frontend": record.index,
+            "drain_seconds": record.drain_seconds,
+            "outage_seconds": record.outage_seconds,
+            "scraped_before_kill": record.split.end_of_previous.ok,
+            "scraped_after_restart": record.split.start_of_next.ok,
+        })).collect::<Vec<_>>(),
         "rejected_valid_shares": rejected_valid_count(&collected.submits, &phase.plan.name),
         "harness_bug_rejections": harness_bug_count(&collected.submits, &phase.plan.name),
         "reconciliation": reconciliation.map(|rec| json!({

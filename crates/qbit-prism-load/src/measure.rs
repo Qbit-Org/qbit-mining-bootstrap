@@ -1002,6 +1002,15 @@ pub fn parse_share_ack(body: &str, scrape: &mut MetricsScrape) {
     }
 }
 
+/// The two scrapes that bracket a frontend restart: the old process's last
+/// counters and the new process's first. The counters between them are a
+/// reset, not traffic.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AckSplit {
+    pub end_of_previous: MetricsScrape,
+    pub start_of_next: MetricsScrape,
+}
+
 /// Bucket deltas between two scrapes of the same frontend.
 #[derive(Clone, Debug, Serialize)]
 pub struct ServerAckDelta {

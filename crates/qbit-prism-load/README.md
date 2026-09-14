@@ -125,7 +125,16 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 1. **warm-up**, not in the artifact. External tips are minted here.
 2. **`steady_state`**, 500 shares/s for 300 s.
 3. **`burst`**, 2,000 shares/s for 60 s. Side report only.
-4. **`reconnect`**, at least 60 s with at least 10 completed reconnects.
+4. **`reconnect`**, at least 60 s with at least 10 completed reconnects. With
+   two or more frontends, one of them is restarted a third of the way in:
+   its sessions are paused, their outstanding submits are allowed to settle
+   for up to the share-commit timeout plus 5 s, the process is killed and
+   relaunched, and the sessions are pointed back at it once `/healthz`
+   answers. The restart is driven from the scheduler loop without stalling
+   it, so the other frontends keep receiving their scheduled load during the
+   outage, which is what the phase measures. If the submits never settle the
+   frontend is not killed and the run aborts (exit 6) rather than turning
+   the harness's own in-flight submits into lost acknowledgements.
 5. **`slow_database`**, at least 60 s at a delay of at least 10 ms.
 6. **`dense_cadence`**, only with `--cadence dense`. Side report only.
 7. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.
@@ -323,7 +332,7 @@ target/release/qbit-prism-load \
 | 3 | Blocked: no frontend served work, or a log showed a refusal |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
-| 6 | The run was aborted: the memory floor was crossed, or a frontend exited. No `capacity-evidence.json` is written, and one left by an earlier run in the same `--out` is removed, so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
+| 6 | The run was aborted: the memory floor was crossed, a frontend exited, or the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin. No `capacity-evidence.json` is written, and one left by an earlier run in the same `--out` is removed, so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 
 ## Outputs

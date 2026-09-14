@@ -27,5 +27,6 @@ pub mod profile;
 pub mod provenance;
 pub mod proxy;
 pub mod report;
+pub mod restart;
 pub mod run;
 pub mod window;

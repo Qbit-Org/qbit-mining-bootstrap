@@ -2242,6 +2242,237 @@ qbit_prism_share_ack_seconds_count{result=\"accepted\"} 9
     assert!(delta.counts.is_empty());
 }
 
+// --- the drained restart --------------------------------------------------
+
+/// The smallest HTTP server the restart driver's readiness probe and metrics
+/// scrapes can talk to: every request gets a 200 and a one-bucket histogram.
+async fn stand_in_audit_port() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = vec![0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let body = "qbit_prism_share_ack_seconds_count{result=\"accepted\"} 5\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (port, task)
+}
+
+/// A session handle with no session task behind it, so a test can hold the
+/// control receiver and set the outstanding counter directly.
+fn detached_session(
+    index: usize,
+    frontend: usize,
+    outstanding: usize,
+) -> (
+    client::SessionHandle,
+    tokio::sync::mpsc::UnboundedReceiver<client::Control>,
+) {
+    let (work, _work_rx) = tokio::sync::mpsc::channel(1);
+    let (control, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = client::SessionHandle {
+        index,
+        frontend: Arc::new(std::sync::atomic::AtomicUsize::new(frontend)),
+        outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(outstanding)),
+        work,
+        control,
+        task: tokio::spawn(async {}),
+    };
+    (handle, control_rx)
+}
+
+fn stand_in_frontend(
+    server: &std::path::Path,
+    log_dir: &std::path::Path,
+    index: usize,
+    audit_port: u16,
+) -> frontend::Frontend {
+    frontend::Frontend::launch(
+        server.to_path_buf(),
+        FrontendSpec {
+            index,
+            instance_id: format!("load-fe-{index}"),
+            stratum_port: 1,
+            audit_port,
+            database_url: "postgresql://u@127.0.0.1:1/x".into(),
+        },
+        BTreeMap::new(),
+        log_dir,
+    )
+    .unwrap()
+}
+
+/// The reconnect phase measures the offered rate while one frontend is
+/// unavailable, so the restart must not stall the scheduler that offers to
+/// the others: every poll returns within a few milliseconds while the whole
+/// restart -- drain, kill, relaunch, readiness -- takes far longer. The
+/// restarted frontend's sessions are paused first and retargeted at the end;
+/// the other frontend's sessions are never touched; and both sides of the
+/// reset are scraped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_restart_never_stalls_the_scheduler() -> Result<()> {
+    use qbit_prism_load::restart::RestartDriver;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("restart");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let first_pid = frontends[1].pid().expect("the stand-in is running");
+    let (healthy, mut healthy_control) = detached_session(0, 0, 0);
+    let (draining, mut draining_control) = detached_session(1, 1, 3);
+    let sessions = vec![healthy, draining];
+    // The outstanding submits settle 300 ms into the drain.
+    let settle = sessions[1].outstanding.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        settle.store(0, Ordering::SeqCst);
+    });
+
+    let mut driver = RestartDriver::start(
+        1,
+        &sessions,
+        Duration::from_secs(5),
+        Duration::from_secs(20),
+    );
+    assert!(matches!(
+        draining_control.try_recv(),
+        Ok(client::Control::Pause)
+    ));
+    let started = Instant::now();
+    let mut longest_poll = Duration::ZERO;
+    let mut polls = 0usize;
+    let record = loop {
+        let poll_started = Instant::now();
+        let progress = driver.poll(&sessions, &mut frontends, &[])?;
+        longest_poll = longest_poll.max(poll_started.elapsed());
+        polls += 1;
+        if let Some(record) = progress {
+            break record;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the restart did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    let total = started.elapsed();
+    assert!(
+        total >= Duration::from_millis(300),
+        "the drain waited for the outstanding submits: {total:?}"
+    );
+    assert!(
+        longest_poll < Duration::from_millis(100),
+        "no single poll may stall the scheduler; the longest took {longest_poll:?} over \
+         {polls} polls while the restart took {total:?}"
+    );
+    assert!(
+        polls > 10,
+        "the scheduler kept running during the restart: {polls} polls"
+    );
+    assert_eq!(record.index, 1);
+    assert!(record.drain_seconds >= 0.3, "{}", record.drain_seconds);
+    assert!(record.outage_seconds > 0.0);
+    assert!(record.split.end_of_previous.ok && record.split.start_of_next.ok);
+    assert_eq!(record.split.end_of_previous.ack_counts["accepted"], 5.0);
+    assert_eq!(frontends[1].restarts, 1);
+    assert_ne!(
+        frontends[1].pid(),
+        Some(first_pid),
+        "a new process is running"
+    );
+    assert_eq!(frontends[0].restarts, 0);
+    match draining_control.try_recv() {
+        Ok(client::Control::Retarget {
+            frontend: 1,
+            reconnect: false,
+            ..
+        }) => {}
+        other => panic!("the drained session is retargeted at the end: {other:?}"),
+    }
+    assert!(
+        healthy_control.try_recv().is_err(),
+        "the healthy frontend's sessions are never paused or retargeted"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// Submits still outstanding after the drain limit -- reachable with the
+/// default 15 s commit timeout and likely with a longer one or a contended
+/// database -- mean the drained restart cannot be performed. Killing the
+/// process anyway would convert the harness's own in-flight requests into
+/// `NoResponse` records inside the phase. The driver reports the failure and
+/// leaves the frontend running; the run aborts on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_whose_drain_never_completes_is_refused_not_forced() -> Result<()> {
+    use qbit_prism_load::restart::RestartDriver;
+    use std::time::Duration;
+    let dir = ScratchDir::new("undrained");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let pid = frontends[1].pid();
+    let (stuck, _stuck_control) = detached_session(1, 1, 2);
+    let sessions = vec![stuck];
+    let mut driver = RestartDriver::start(
+        1,
+        &sessions,
+        Duration::from_millis(300),
+        Duration::from_secs(20),
+    );
+    let error = loop {
+        match driver.poll(&sessions, &mut frontends, &[]) {
+            Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
+            Ok(Some(record)) => panic!("an undrained frontend must not be restarted: {record:?}"),
+            Err(error) => break format!("{error:#}"),
+        }
+    };
+    assert!(error.contains("2 submits outstanding"), "{error}");
+    assert!(error.contains("was not performed"), "{error}");
+    assert_eq!(frontends[1].restarts, 0, "the process was left alone");
+    assert_eq!(frontends[1].pid(), pid);
+    assert!(frontends[1].exited().is_none(), "it is still running");
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The drain waits at least the configured commit timeout.
+#[test]
+fn the_drain_limit_covers_the_configured_commit_timeout() {
+    use std::time::Duration;
+    assert_eq!(
+        run::drain_limit(15.0),
+        Duration::from_secs(15) + run::DRAIN_MARGIN
+    );
+    assert!(run::drain_limit(60.0) >= Duration::from_secs(60));
+    assert!(run::drain_limit(0.5) > Duration::from_millis(500));
+}
+
 #[test]
 fn command_line_validation_rejects_impossible_runs() {
     use clap::Parser;
