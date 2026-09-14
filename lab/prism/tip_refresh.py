@@ -21,6 +21,7 @@ call-time runtime ports.
 
 from __future__ import annotations
 
+from functools import partial
 from lab.prism.detached_failure import DetachedFailure, capture_failure, detached_future_result
 
 from concurrent.futures import (
@@ -2059,8 +2060,7 @@ class TipRefreshService:
                     priority = self._delivery_priority_same_tip
                 future = runtime._submit_delivery_task(
                     executor,
-                    capture_failure,
-                    runtime.send_prepared_job,
+                    partial(capture_failure, runtime.send_prepared_job),
                     client,
                     bundle,
                     snapshot,
