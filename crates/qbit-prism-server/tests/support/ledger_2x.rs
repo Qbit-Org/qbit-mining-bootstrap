@@ -3010,6 +3010,111 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
     db.close(vec![earlier, migrated]).await
 }
 
+/// 006 must not preserve a malformed column that breaks future native candidates.
+#[tokio::test]
+async fn pre_006_native_schema_refuses_a_malformed_storage_version_column() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for alteration in [
+            "ALTER COLUMN storage_version DROP NOT NULL, ALTER COLUMN storage_version DROP DEFAULT",
+            "ALTER COLUMN storage_version DROP NOT NULL",
+            "ALTER COLUMN storage_version DROP DEFAULT",
+            "ALTER COLUMN storage_version SET DEFAULT 2",
+            "ALTER COLUMN storage_version TYPE bigint",
+        ] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            let earlier = db.ledger("earlier-build").await?;
+            earlier.append(share(1), None).await?;
+            let block = candidate(&earlier.snapshot(100).await?, 7001)?;
+            earlier.enqueue_candidate(block.clone()).await?;
+            undo_006(&pool, state).await?;
+            if state == SourceState::Pre258 {
+                sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD COLUMN storage_version integer NOT NULL DEFAULT 1").execute(&pool).await?;
+            }
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_block_candidate_outbox {alteration}"
+            ))
+            .execute(&pool)
+            .await?;
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT bool_and(storage_version=1) FROM qbit_block_candidate_outbox"
+                )
+                .fetch_one(&pool)
+                .await?
+            );
+            let versions = schema_versions(&pool).await?;
+            let objects = schema_objects(&pool).await?;
+            let columns_sql = "SELECT format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(d.adbin,d.adrelid) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='qbit_block_candidate_outbox'::regclass AND a.attname='storage_version' AND NOT a.attisdropped";
+            let column: (String, bool, Option<String>) =
+                sqlx::query_as(columns_sql).fetch_one(&pool).await?;
+            let rows: Vec<Value> =
+                sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+                    .fetch_all(&pool)
+                    .await?;
+            let error = db
+                .ledger("this-build")
+                .await
+                .err()
+                .context("006 accepted a malformed storage_version column")?
+                .to_string();
+            assert!(
+                error.contains("refusing to migrate a native database"),
+                "{error}"
+            );
+            assert!(
+                error.contains(
+                    "before any DDL: column qbit_block_candidate_outbox.storage_version differs"
+                ),
+                "{error}"
+            );
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert_eq!(schema_versions(&pool).await?, versions);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_as::<_, (String, bool, Option<String>)>(columns_sql)
+                    .fetch_one(&pool)
+                    .await?,
+                column
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o"
+                )
+                .fetch_all(&pool)
+                .await?,
+                rows
+            );
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT to_regclass('qbit_prism_migration_source') IS NULL"
+                )
+                .fetch_one(&pool)
+                .await?
+            );
+            sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ALTER COLUMN storage_version TYPE integer, ALTER COLUMN storage_version SET NOT NULL, ALTER COLUMN storage_version SET DEFAULT 1").execute(&pool).await?;
+            let migrated = db.ledger("this-build").await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            let claim = migrated
+                .claim_candidate(60)
+                .await?
+                .context("existing native candidate was stranded")?;
+            assert_eq!(claim.candidate.block_hash, block.block_hash);
+            migrated
+                .land_candidate(&claim, &keys().1.public_key_hex())
+                .await?;
+            migrated.finish_candidate(&claim, true, None).await?;
+            exercise_native_writers(&migrated, 2, 7002).await?;
+            pool.close().await;
+            db.close(vec![earlier, migrated]).await?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_keeps_them_claimable(
 ) -> Result<()> {

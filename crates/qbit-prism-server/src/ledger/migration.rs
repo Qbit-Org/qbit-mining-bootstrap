@@ -558,6 +558,42 @@ fn refuse_inconsistent_native_record(versions: &[i32]) -> Result<()> {
     Ok(())
 }
 
+/// 006 adds this column only when absent. A pre-006 native database may
+/// already have it from 002 or a partial/manual installation; accepting a
+/// nullable or defaultless copy would strand later candidates, since native
+/// inserts omit it and the claim lane decodes it as a non-null i32.
+async fn require_pre_006_storage_version(
+    tx: &mut Transaction<'_, Postgres>,
+    versions: &[i32],
+) -> Result<()> {
+    let row = sqlx::query("SELECT format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=to_regclass('qbit_block_candidate_outbox') AND a.attname='storage_version' AND a.attnum>0 AND NOT a.attisdropped")
+        .fetch_optional(&mut **tx).await?;
+    let Some(row) = row else {
+        // The unmodified pre-258 native path: 006 creates the definition.
+        return Ok(());
+    };
+    let expected = ColumnDefinition {
+        data_type: "integer".into(),
+        not_null: true,
+        default: Some("1".into()),
+        identity: String::new(),
+        generated: String::new(),
+        collation: None,
+    };
+    let actual = ColumnDefinition {
+        data_type: row.try_get("data_type")?,
+        not_null: row.try_get("not_null")?,
+        default: row.try_get("default_expr")?,
+        identity: row.try_get("identity")?,
+        generated: row.try_get("generated")?,
+        collation: None,
+    };
+    ensure!(actual == expected,
+        "refusing to migrate a native database at schema migrations {} before any DDL: column qbit_block_candidate_outbox.storage_version differs: {}; migration 006 preserves an existing column, while native inserts require integer NOT NULL DEFAULT 1 without an identity or generated expression. Nothing was changed. Restore the full pre-migration backup or bring this column to that definition after checking its data, then migrate again",
+        schema_version_list(versions), column_differences(&expected, &actual));
+    Ok(())
+}
+
 /// Refuse a pending 2.x.x row the native claim lane cannot replay, with the
 /// predicate built from the outbox columns that exist. The capability row is
 /// not consulted: 002 upserts it whatever the writer stored, so only rows say
@@ -2371,6 +2407,7 @@ pub(super) async fn migrate_schema(
             // so a pending v2 candidate can still be there. The column-aware
             // check runs here, before 004, 005 or 006 touch anything, so a
             // refusal on this path is before any DDL too.
+            require_pre_006_storage_version(tx, &versions).await?;
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }

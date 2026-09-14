@@ -347,6 +347,13 @@ storage_version=2 ...). Nothing was changed. Restore the pre-migration 2.x.x bac
 the pinned 2.x.x release ...
 ```
 
+Before the drain check or native DDL, an existing outbox `storage_version`
+column must match `integer NOT NULL DEFAULT 1`, with no identity or generated
+expression. Migration 006 uses `ADD COLUMN IF NOT EXISTS`, so it would keep a
+malformed column that breaks subsequent native candidate inserts or claims.
+A mismatch refuses the upgrade, names the differing properties, and leaves
+the database unchanged. An absent column is accepted and created by 006.
+
 Native pending rows the earlier build wrote carry the native fields and are
 not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a
 v1 body without the native fields is. The remedy is the one in the recovery
