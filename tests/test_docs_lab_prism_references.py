@@ -464,6 +464,32 @@ def executable_word(words: list[str]) -> int | None:
     return None
 
 
+def shell_command_argument(words: list[str], shell: str) -> int | None:
+    """Locate a literal shell's command string after consuming its option arguments."""
+    index = 0
+    command_string = False
+    argument_flags = "oO" if shell in {"bash", "sh"} else "o"
+    while index < len(words):
+        option = unquote(words[index])
+        if option in {"--help", "--version"}:
+            return None
+        if option == "--":
+            index += 1
+            break
+        if shell in {"bash", "sh"} and option in {"--rcfile", "--init-file"}:
+            index += 2
+            continue
+        if option.startswith("--"):
+            index += 1
+            continue
+        if re.fullmatch(r"[+-][A-Za-z]+", option) is None:
+            break
+        flags = option[1:]
+        command_string |= "c" in flags
+        index += 1 + sum(flag in argument_flags for flag in flags)
+    return index if command_string and index < len(words) else None
+
+
 def python_commands(line: str):
     """``(line offset, source, match)`` for Python in executable positions, including shell ``-c``.
 
@@ -495,20 +521,17 @@ def python_commands(line: str):
             if runs_python(interpreter) and match is not None and match.end("interpreter") == last:
                 yield line[:first].count("\n"), line, match
             elif unquote(interpreter).rsplit("/", 1)[-1] in SHELLS:
-                for option_index in range(index + 1, len(words)):
-                    a, b = words[option_index]
-                    option = unquote(line[a:b])
-                    if not option.startswith("-") or option == "--":
-                        break
-                    if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", option):
-                        if option_index + 1 < len(words):
-                            a, b = words[option_index + 1]
-                            source = literal_word(line[a:b])
-                            if source is not None:
-                                for number, nested in shell_lines(source, shell_source=True):
-                                    for offset, source_line, match in python_commands(nested):
-                                        yield line[:a].count("\n") + number - 1 + offset, source_line, match
-                        break
+                arguments = words[index + 1:]
+                argument = shell_command_argument(
+                    [line[a:b] for a, b in arguments], unquote(interpreter).rsplit("/", 1)[-1]
+                )
+                if argument is not None:
+                    a, b = arguments[argument]
+                    source = literal_word(line[a:b])
+                    if source is not None:
+                        for number, nested in shell_lines(source, shell_source=True):
+                            for offset, source_line, match in python_commands(nested):
+                                yield line[:a].count("\n") + number - 1 + offset, source_line, match
         words = []
         redirect = False
 
@@ -2156,6 +2179,41 @@ class ScannerTests(unittest.TestCase):
         text = "sh -c 'true\npython3 lab/prism/storm.py'"
         self.assertEqual(self.located(text), [(2, "lab/prism/storm.py")])
         self.assertEqual(self.commands("sh -c python3 -m lab.example.deleted"), [])
+
+    def test_shell_option_arguments_before_command_strings_are_consumed(self) -> None:
+        for options in (
+            "-o pipefail -c", "-O extglob -c", "+o pipefail -c", "+O extglob -c",
+            "-eo pipefail -c", "-co pipefail", "-oc pipefail", "-cO extglob",
+            "-o pipefail -O extglob -c", "'-o' 'pipefail' '-c'",
+            "--rcfile /dev/null -c", "--init-file /dev/null -c", "-c -e", "-c --",
+        ):
+            for command, missing in (
+                ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+                ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+            ):
+                with self.subTest(options=options, command=command):
+                    text = f"bash {options} '{command}'"
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(list(dead_commands(text, {"lab/example/deleted.py"})), [])
+        text = 'docker exec "$c" bash -o pipefail -c \'true\npython3 lab/example/deleted.py\''
+        self.assertEqual(self.located(text), [(2, "lab/example/deleted.py")])
+        self.assertEqual(self.commands("sh -o errexit -c 'python3 lab/prism/storm.py'"), ["lab/prism/storm.py"])
+
+    def test_shell_option_arguments_are_not_command_strings(self) -> None:
+        command = "python3 -m lab.example.deleted"
+        for text in (
+            f"bash -o '{command}' -c true",
+            f"bash -O '{command}' -c true",
+            f"bash --rcfile '{command}' -c true",
+            f"bash -o -c '{command}'",
+            f"bash -o pipefail -- -c '{command}'",
+            f"bash -o pipefail script.sh -c '{command}'",
+            f"bash --help -c '{command}'",
+            f"bash -o pipefail -c \"echo '{command}'\"",
+            "bash -o", "bash -O extglob -c", "bash --rcfile",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
 
     def test_shell_data_still_counts_as_dangling_prose(self) -> None:
         for text in (
