@@ -21,6 +21,8 @@ call-time runtime ports.
 
 from __future__ import annotations
 
+from lab.prism.detached_failure import DetachedFailure, capture_failure, detached_future_result
+
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError as FuturesCancelledError,
@@ -2057,6 +2059,7 @@ class TipRefreshService:
                     priority = self._delivery_priority_same_tip
                 future = runtime._submit_delivery_task(
                     executor,
+                    capture_failure,
                     runtime.send_prepared_job,
                     client,
                     bundle,
@@ -2080,7 +2083,7 @@ class TipRefreshService:
             failed = 0
             first_delivery: float | None = None
             last_delivery: float | None = None
-            invalidation: TemplateRefreshBlocked | None = None
+            invalidation: DetachedFailure | None = None
             last_live_trust_check = time.monotonic()
             try:
                 submit_available(pending)
@@ -2109,14 +2112,14 @@ class TipRefreshService:
                         runtime._record_tip_refresh_client_result("skipped")
                         continue
                     try:
-                        result = future.result()
+                        result = detached_future_result(future)
                     except OSError:
                         runtime._record_tip_refresh_client_result("disconnected")
                         runtime.disconnect_client(client)
                         continue
                     except TemplateRefreshBlocked as exc:
                         runtime._record_tip_refresh_client_result("skipped")
-                        invalidation = exc
+                        invalidation = DetachedFailure(exc)
                         cancel_pending_futures(pending)
                         continue
                     except Exception:
@@ -2175,12 +2178,14 @@ class TipRefreshService:
                         cancel_pending_futures(pending)
                         raise
                     except TemplateRefreshBlocked as exc:
-                        invalidation = exc
+                        invalidation = DetachedFailure(exc)
                     except Exception as exc:
-                        invalidation = _TipRefreshTrustBlocked(
+                        blocked = _TipRefreshTrustBlocked(
                             "qbit chain trust check failed during prepared fanout"
                         )
-                        invalidation.__cause__ = exc
+                        blocked.__cause__ = exc
+                        invalidation = DetachedFailure(blocked)
+                        del blocked
                     if invalidation is not None:
                         cancel_pending_futures(pending)
                 if invalidation is None:
@@ -2197,7 +2202,7 @@ class TipRefreshService:
             if invalidation is not None:
                 cancel_event.set()
                 runtime._schedule_tip_refresh_retry()
-                raise invalidation
+                invalidation.raise_error()
             with runtime.lock:
                 token_current = runtime._tip_refresh_token_current_locked(
                     validation_token,

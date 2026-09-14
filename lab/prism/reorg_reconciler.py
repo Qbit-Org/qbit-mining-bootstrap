@@ -41,6 +41,7 @@ from lab.prism.coordinator_config import (
     TESTNET_QBIT_CHAINS,
 )
 from lab.prism.payout_state import PayoutStateCandidate, TemplateRefreshSuperseded
+from lab.prism.detached_failure import capture_failure, detached_future_result
 
 
 # Bounded number of tips whose trusted reconcile outcome is memoized. Reorg
@@ -581,7 +582,7 @@ class ReorgReconcilerService:
                 self._reconcile_prefetch_executor = executor
             try:
                 future = executor.submit(
-                    self.prefetch_pass, tip_hash, prove
+                    capture_failure, self.prefetch_pass, tip_hash, prove
                 )
                 self._reconcile_prefetch_pending = (tip_hash, future, prove)
             except RuntimeError:
@@ -643,13 +644,8 @@ class ReorgReconcilerService:
             ),
         )
         try:
-            return prefetch.result(timeout=join_timeout)
+            prefetch.exception(timeout=join_timeout)
         except TimeoutError:
-            if prefetch.done():
-                # The pass itself raised TimeoutError (socket.timeout is
-                # TimeoutError here): not a join expiry. Propagate silently
-                # so diagnosis points at the pass, not the join.
-                raise
             print(
                 "prism coordinator: reconcile prefetch join exceeded "
                 f"{join_timeout:g}s; retrying refresh pass while it "
@@ -657,6 +653,7 @@ class ReorgReconcilerService:
                 flush=True,
             )
             raise
+        return detached_future_result(prefetch)
 
     def snapshot_tip_bounded(self, tip_hash: str) -> bool:
         """Run a snapshot-tip re-prove off-thread with the bounded join.
