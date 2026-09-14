@@ -679,12 +679,21 @@ struct FunctionDefinition {
 /// (FORCE ROW LEVEL SECURITY, applying it to the owner too) decide which
 /// rows a role that does not bypass row-level security sees and may write;
 /// the release creates none, and on the outbox they would decide what the
-/// drain check and the native claim lane see.
+/// drain check and the native claim lane see. `parents` and `children` are
+/// the table's `pg_inherits` relations, by name (schema-qualified when in
+/// another schema): the release creates none either. A child created with
+/// `INHERITS (qbit_share_ledger)` has its rows included in every query of
+/// the ledger, the share reads included, without the release constraints
+/// ever checking them, and a release table attached as a partition of or
+/// inheriting from another table is no longer the relation the release
+/// defined.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableDefinition {
     persistence: String,
     row_security: bool,
     force_row_security: bool,
+    parents: Vec<String>,
+    children: Vec<String>,
     columns: BTreeMap<String, ColumnDefinition>,
 }
 
@@ -883,15 +892,25 @@ async fn fingerprint_schema(
     namespace: &str,
 ) -> Result<SchemaFingerprint> {
     let mut fingerprint = SchemaFingerprint::default();
-    let tables: Vec<(String, String, bool, bool)> = sqlx::query_as("SELECT c.relname::text,c.relpersistence::text,c.relrowsecurity,c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,c.relpersistence::text AS persistence,c.relrowsecurity AS row_security,c.relforcerowsecurity AS force_row_security,(SELECT coalesce(array_agg(i.inhparent::regclass::text ORDER BY i.inhseqno),'{}') FROM pg_inherits i WHERE i.inhrelid=c.oid) AS parents,(SELECT coalesce(array_agg(i.inhrelid::regclass::text ORDER BY i.inhrelid::regclass::text),'{}') FROM pg_inherits i WHERE i.inhparent=c.oid) AS children FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
-    for (table, persistence, row_security, force_row_security) in tables {
+    for row in &rows {
+        let parents: Vec<String> = row.try_get("parents")?;
+        let children: Vec<String> = row.try_get("children")?;
         fingerprint.tables.insert(
-            table,
+            row.try_get("table_name")?,
             TableDefinition {
-                persistence,
-                row_security,
-                force_row_security,
+                persistence: row.try_get("persistence")?,
+                row_security: row.try_get("row_security")?,
+                force_row_security: row.try_get("force_row_security")?,
+                parents: parents
+                    .iter()
+                    .map(|name| strip_schema_qualification(name, namespace))
+                    .collect(),
+                children: children
+                    .iter()
+                    .map(|name| strip_schema_qualification(name, namespace))
+                    .collect(),
                 columns: BTreeMap::new(),
             },
         );
@@ -1228,8 +1247,18 @@ fn row_security_state(table: &TableDefinition) -> &'static str {
     }
 }
 
-/// What differs between two tables apart from their columns: persistence
-/// and row-level security.
+/// A table's inheritance relations, one way: `no parent table`, or
+/// `parent table(s) a, b`.
+fn inheritance(kind: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        format!("no {kind} table")
+    } else {
+        format!("{kind} table(s) {}", names.join(", "))
+    }
+}
+
+/// What differs between two tables apart from their columns: persistence,
+/// row-level security and inheritance.
 fn table_differences(expected: &TableDefinition, found: &TableDefinition) -> String {
     let mut parts = Vec::new();
     if expected.persistence != found.persistence {
@@ -1247,6 +1276,18 @@ fn table_differences(expected: &TableDefinition, found: &TableDefinition) -> Str
             row_security_state(expected),
             row_security_state(found)
         ));
+    }
+    for (kind, expected_names, found_names) in [
+        ("parent", &expected.parents, &found.parents),
+        ("child", &expected.children, &found.children),
+    ] {
+        if expected_names != found_names {
+            parts.push(format!(
+                "expected {}, found {}",
+                inheritance(kind, expected_names),
+                inheritance(kind, found_names)
+            ));
+        }
     }
     parts.join(", ")
 }
@@ -2528,6 +2569,8 @@ mod tests {
             persistence: "p".into(),
             row_security: false,
             force_row_security: false,
+            parents: Vec::new(),
+            children: Vec::new(),
             columns: columns
                 .iter()
                 .map(|(name, definition)| ((*name).to_owned(), definition.clone()))
@@ -2613,6 +2656,63 @@ mod tests {
             validated: true,
             enforcement: states.chars().map(String::from).collect(),
         }
+    }
+
+    #[test]
+    fn inheritance_involving_a_release_table_is_drift_and_among_extras_is_not() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("bigint", true))]),
+        );
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        // A child created with INHERITS: an extra table on its own, and
+        // the release table it changes is drift, naming it.
+        let mut child = table(&[("share_id", column("bigint", true))]);
+        child.parents = vec!["qbit_share_ledger".into()];
+        found.tables.insert("qbit_share_ledger_2025".into(), child);
+        found.tables.get_mut("qbit_share_ledger").unwrap().children =
+            vec!["qbit_share_ledger_2025".into()];
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec!["table qbit_share_ledger differs: expected no child table, found child table(s) qbit_share_ledger_2025"]
+        );
+        assert_eq!(comparison.extra, vec!["table qbit_share_ledger_2025"]);
+        // The release table made to inherit from, or attached as a
+        // partition of, a table in another schema.
+        found.tables.remove("qbit_share_ledger_2025");
+        let ledger = found.tables.get_mut("qbit_share_ledger").unwrap();
+        ledger.children.clear();
+        ledger.parents = vec!["archive.ledgers".into()];
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec!["table qbit_share_ledger differs: expected no parent table, found parent table(s) archive.ledgers"]
+        );
+        assert!(comparison.extra.is_empty(), "{:?}", comparison.extra);
+        // Inheritance among the operator's own tables is theirs to keep.
+        found
+            .tables
+            .get_mut("qbit_share_ledger")
+            .unwrap()
+            .parents
+            .clear();
+        let mut parent = table(&[("note", column("text", true))]);
+        parent.children = vec!["operator_notes_2025".into()];
+        let mut child = table(&[("note", column("text", true))]);
+        child.parents = vec!["operator_notes".into()];
+        found.tables.insert("operator_notes".into(), parent);
+        found.tables.insert("operator_notes_2025".into(), child);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        assert_eq!(
+            comparison.extra,
+            vec!["table operator_notes", "table operator_notes_2025"]
+        );
     }
 
     #[test]

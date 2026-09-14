@@ -1311,6 +1311,68 @@ async fn release_constraint_left_not_valid_is_refused_naming_it_and_rolls_back()
     db.close(vec![ledger]).await
 }
 
+/// A table created with `INHERITS (qbit_share_ledger)`: PostgreSQL includes
+/// its rows in every query of the ledger, the unqualified share reads
+/// included, so rows the release constraints never checked would enter the
+/// accounting. The child is an extra table; the release table it changes is
+/// drift, named. The release table made to inherit from another table is
+/// drift the same way. Refused and rolled back, nothing dropped; detached,
+/// the same source migrates and keeps the extra tables.
+#[tokio::test]
+async fn inheritance_involving_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    sqlx::raw_sql("CREATE TABLE qbit_share_ledger_2025 () INHERITS (qbit_share_ledger)")
+        .execute(&pool)
+        .await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a child table of the share ledger")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("1 object(s) differ"), "{error}");
+    assert!(
+        error.contains("table qbit_share_ledger differs: expected no child table, found child table(s) qbit_share_ledger_2025"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was changed"), "{error}");
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    // The release table made a child of an operator table instead.
+    sqlx::raw_sql("ALTER TABLE qbit_share_ledger_2025 NO INHERIT qbit_share_ledger; CREATE TABLE ledger_archive (LIKE qbit_share_ledger); ALTER TABLE qbit_share_ledger INHERIT ledger_archive")
+        .execute(&pool).await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted the share ledger inheriting from another table")?
+        .to_string();
+    assert!(error.contains("1 object(s) differ"), "{error}");
+    assert!(
+        error.contains("table qbit_share_ledger differs: expected no parent table, found parent table(s) ledger_archive"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    // Detached, the same source migrates; both extra tables are kept.
+    sqlx::raw_sql("ALTER TABLE qbit_share_ledger NO INHERIT ledger_archive")
+        .execute(&pool)
+        .await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert!(sqlx::query_scalar::<_, bool>("SELECT to_regclass('qbit_share_ledger_2025') IS NOT NULL AND to_regclass('ledger_archive') IS NOT NULL")
+        .fetch_one(&pool).await?);
+    exercise_native_writers(&ledger, 1, 6401).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
 /// Enable or disable the internal triggers that enforce one constraint, on
 /// every table they are on, as a superuser's `ALTER TABLE ... DISABLE
 /// TRIGGER` does during a bulk load.

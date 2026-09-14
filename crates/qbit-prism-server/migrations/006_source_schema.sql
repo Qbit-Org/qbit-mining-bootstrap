@@ -72,7 +72,9 @@
 -- and WITH CHECK: a policy that hides rows from the migrate role, or forced
 -- security with no policy, would make the drain check see an empty outbox
 -- and the native claim lane never see the legacy rows, so a policy on a
--- release table is drift, not an extra. A sequence is
+-- release table is drift, not an extra. A release table must have no child
+-- table and no parent: a child created with INHERITS has its rows read with
+-- the parent's, unchecked by the release constraints. A sequence is
 -- compared by its structure (type, start, increment, bounds, cache, cycle),
 -- never by the value it has reached. A constraint's validation state is
 -- compared: a release constraint left NOT VALID in the source is drift,
