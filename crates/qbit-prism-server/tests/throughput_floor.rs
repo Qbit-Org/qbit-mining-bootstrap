@@ -877,7 +877,9 @@ async fn read_lock_statements(pool: &PgPool) -> Value {
             "pg_stat_statements normalizes MIGRATION_LOCK, ORDER_LOCK and SETTLEMENT_LOCK to one \
              statement; a level's figures are the difference of two reads taken around it, so \
              they cover whatever that level's appends took, and the other two keys contribute \
-             only if something else took them meanwhile",
+             only if something else took them meanwhile. The rows are filtered to this database, \
+             so advisory locks taken elsewhere on the same server are excluded; an advisory lock \
+             is scoped to its database and cannot contend with this run",
         ),
     );
     let unavailable = |object: &mut Map<String, Value>, reason: String| {
@@ -903,10 +905,18 @@ async fn read_lock_statements(pool: &PgPool) -> Value {
             return Value::Object(object);
         }
     };
+    // `pg_stat_statements` is server-wide. Without the `dbid` filter an advisory
+    // lock taken in any other database on the same server lands in this sum, and
+    // so in the difference the level reports, even though a lock in another
+    // database cannot contend with this one. The level would then be marked
+    // uncontaminated, correctly, while its lock figures described someone else's
+    // work.
     let row = sqlx::query(&format!(
         "SELECT coalesce(sum(calls),0)::bigint AS calls, \
          coalesce(sum(total_exec_time),0)::double precision AS total_exec_time \
-         FROM {namespace}.pg_stat_statements WHERE query LIKE $1"
+         FROM {namespace}.pg_stat_statements \
+         WHERE query LIKE $1 \
+           AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
     ))
     .bind(QUERY_MATCH)
     .fetch_one(pool)

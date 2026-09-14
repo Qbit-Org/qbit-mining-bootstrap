@@ -81,6 +81,21 @@ cargo_args=(
 # the floor still leaves the evidence behind. `set -e` is suspended around the
 # test for exactly that reason: the path is worth printing on a red run, and the
 # status is re-raised immediately afterwards.
+# A report from an earlier run must not be announced as this run's evidence.
+# Timestamps cannot tell the two apart reliably -- a warm build and a small
+# window can finish inside one filesystem timestamp tick, and then a fresh
+# report looks no newer than the moment the run started -- so the earlier file
+# is moved aside instead, and the presence of the report afterwards is proof
+# that this run wrote it. It is put back if this run writes nothing, so a run
+# that dies during compilation or cluster setup does not destroy the evidence
+# the previous one produced.
+report="${QBIT_PRISM_THROUGHPUT_REPORT:-$(pwd)/target/prism-postgres-throughput-${test_name}.json}"
+previous="${report}.previous"
+rm -f "${previous}"
+if [[ -f "${report}" ]]; then
+  mv "${report}" "${previous}"
+fi
+
 status=0
 if [[ -n "${PRISM_TEST_DATABASE_URL:-}" ]]; then
   cargo test "${cargo_args[@]}" || status=$?
@@ -91,13 +106,17 @@ else
   test/prism-native-tests.sh cargo-args "${cargo_args[@]}" || status=$?
 fi
 
-# Announce the report only if there is one. A run that died before the test
-# started — no database, no server binaries, a rejected variable — writes
+# Announce the report only if this run wrote one. A run that died before the
+# test started — no database, no server binaries, a rejected variable — writes
 # nothing, and printing a path to a file that does not exist sends the reader
-# looking for evidence that was never produced.
-report="${QBIT_PRISM_THROUGHPUT_REPORT:-$(pwd)/target/prism-postgres-throughput-${test_name}.json}"
+# looking for evidence that was never produced. A file left by an earlier run is
+# worse than nothing: it is evidence, just not of this run.
 if [[ -f "${report}" ]]; then
   echo "PRISM share-append throughput report: ${report}"
+  rm -f "${previous}"
+elif [[ -f "${previous}" ]]; then
+  mv "${previous}" "${report}"
+  echo "PRISM share-append throughput: this run wrote no report; the file at ${report} is from an earlier run"
 else
   echo "PRISM share-append throughput: no report was written (expected it at ${report})"
 fi
