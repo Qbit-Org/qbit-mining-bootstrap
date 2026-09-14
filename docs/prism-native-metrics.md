@@ -55,7 +55,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
 | `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Declared, rule deferred to #283 and A/C accounting-lock owners; no production observations yet. | none |
-| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Collector acquisitions only; ledger hot paths remain unwired. | none |
+| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Collector acquisition attempts, including cancellations as failure with elapsed pool wait (excluding subsequent transaction work). Ledger hot paths remain unwired. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
 | `qbit_prism_grace_credited_shares_total` | counter | none | run | Durably accepted shares credited by stale grace. | `qbit_prism_grace_credited_shares_total` |
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
@@ -154,10 +154,12 @@ new attempt finishes. A newer collection attempt supersedes an older result;
 late completion or cancellation cannot replace the newer publication. A real
 zero count, age, or RSS remains valid after successful collection.
 
-Pool timing pre-registers both result labels at count zero and records
-observations only for acquisition attempts that complete, including completed
-acquisition errors. Overall collector cancellation during acquisition
-does not invent a completed wait. The collector status records that failure.
+Pool timing pre-registers both result labels at count zero. Each started
+collector acquisition records one observation: success when acquired, or failure
+on acquisition error or cancellation, including the three-second overall
+deadline. Duration is the monotonic elapsed pool wait until acquisition
+completes or is cancelled; subsequent transaction work is excluded. Collector
+status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
 
