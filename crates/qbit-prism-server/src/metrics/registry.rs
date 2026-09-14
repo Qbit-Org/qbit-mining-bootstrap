@@ -1,4 +1,5 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
+use super::{Labels, LockKind, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -107,6 +108,8 @@ pub(super) fn is_collection_line(line: &str) -> bool {
 
 #[derive(Clone)]
 enum Sample {
+    /// Reserved storage is not an observation and must not render a sample.
+    Pending,
     Scalar(f64),
     Histogram {
         buckets: [u64; BUCKET_COUNT],
@@ -114,7 +117,6 @@ enum Sample {
         sum: f64,
     },
 }
-type Labels = Vec<(&'static str, String)>;
 #[derive(Clone, Default)]
 pub(super) struct Registry {
     samples: BTreeMap<(Family, Labels), Sample>,
@@ -123,12 +125,43 @@ pub(super) struct Registry {
 
 impl Registry {
     pub(super) fn declare(&mut self, family: Family) {
-        self.declared.insert(family);
+        if !self.declared.insert(family) {
+            return;
+        }
+        // These owner-dependent families have no samples at startup. Reserve
+        // their closed keys now so even the first event needs no allocation.
+        match family {
+            Family::FirstOffer => {
+                self.samples
+                    .insert((family, Labels::Empty), Sample::Pending);
+            }
+            Family::LockWait => {
+                for lock in LockKind::ALL {
+                    for result in Outcome::ALL {
+                        self.samples.insert(
+                            (
+                                family,
+                                Labels::Two(("lock", lock.as_str()), ("result", result.as_str())),
+                            ),
+                            Sample::Pending,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    pub(super) fn register(&mut self, family: Family, labels: Labels, initial: f64) {
+    pub(super) fn register(&mut self, family: Family, labels: impl Into<Labels>, initial: f64) {
+        self.sample(family, labels.into(), initial);
+    }
+    fn sample(&mut self, family: Family, labels: Labels, initial: f64) -> &mut Sample {
         self.declare(family);
-        self.samples.entry((family, labels)).or_insert_with(|| {
-            if family.descriptor().kind == Kind::Histogram {
+        let sample = self
+            .samples
+            .entry((family, labels))
+            .or_insert(Sample::Pending);
+        if matches!(sample, Sample::Pending) {
+            *sample = if family.descriptor().kind == Kind::Histogram {
                 Sample::Histogram {
                     buckets: [0; BUCKET_COUNT],
                     count: 0,
@@ -136,10 +169,11 @@ impl Registry {
                 }
             } else {
                 Sample::Scalar(initial)
-            }
-        });
+            };
+        }
+        sample
     }
-    pub(super) fn set(&mut self, family: Family, labels: Labels, value: f64) {
+    pub(super) fn set(&mut self, family: Family, labels: impl Into<Labels>, value: f64) {
         assert_ne!(
             family.descriptor().kind,
             Kind::Histogram,
@@ -147,31 +181,30 @@ impl Registry {
         );
         assert!(value.is_finite());
         self.declare(family);
-        self.samples.insert((family, labels), Sample::Scalar(value));
+        self.samples
+            .insert((family, labels.into()), Sample::Scalar(value));
     }
-    pub(super) fn increment(&mut self, family: Family, labels: Labels) {
+    pub(super) fn increment(&mut self, family: Family, labels: impl Into<Labels>) {
         assert_eq!(
             family.descriptor().kind,
             Kind::Counter,
             "only counters may increment"
         );
-        self.register(family, labels.clone(), 0.);
-        if let Sample::Scalar(value) = self.samples.get_mut(&(family, labels)).unwrap() {
+        if let Sample::Scalar(value) = self.sample(family, labels.into(), 0.) {
             *value += 1.;
         }
     }
-    pub(super) fn observe(&mut self, family: Family, labels: Labels, seconds: f64) {
+    pub(super) fn observe(&mut self, family: Family, labels: impl Into<Labels>, seconds: f64) {
         assert_eq!(
             family.descriptor().kind,
             Kind::Histogram,
             "only histograms accept observations"
         );
-        self.register(family, labels.clone(), 0.);
         if let Sample::Histogram {
             buckets,
             count,
             sum,
-        } = self.samples.get_mut(&(family, labels)).unwrap()
+        } = self.sample(family, labels.into(), 0.)
         {
             for (limit, value) in BUCKETS.iter().zip(buckets) {
                 if seconds <= *limit {
@@ -203,22 +236,32 @@ impl Registry {
             .unwrap();
             for ((_, labels), sample) in self.samples.iter().filter(|((f, _), _)| f == family) {
                 match sample {
-                    Sample::Scalar(value) => line(&mut body, d.name, "", labels, *value),
+                    Sample::Pending => {}
+                    Sample::Scalar(value) => line(&mut body, d.name, "", labels.iter(), *value),
                     Sample::Histogram {
                         buckets,
                         count,
                         sum,
                     } => {
                         for (limit, value) in BUCKETS.iter().zip(buckets) {
-                            let mut labels = labels.clone();
-                            labels.push(("le", limit.to_string()));
-                            line(&mut body, d.name, "_bucket", &labels, *value as f64);
+                            let limit = limit.to_string();
+                            line(
+                                &mut body,
+                                d.name,
+                                "_bucket",
+                                labels.iter().chain([("le", limit.as_str())]),
+                                *value as f64,
+                            );
                         }
-                        let mut infinity = labels.clone();
-                        infinity.push(("le", "+Inf".into()));
-                        line(&mut body, d.name, "_bucket", &infinity, *count as f64);
-                        line(&mut body, d.name, "_sum", labels, *sum);
-                        line(&mut body, d.name, "_count", labels, *count as f64);
+                        line(
+                            &mut body,
+                            d.name,
+                            "_bucket",
+                            labels.iter().chain([("le", "+Inf")]),
+                            *count as f64,
+                        );
+                        line(&mut body, d.name, "_sum", labels.iter(), *sum);
+                        line(&mut body, d.name, "_count", labels.iter(), *count as f64);
                     }
                 }
             }
@@ -226,11 +269,18 @@ impl Registry {
         body
     }
 }
-fn line(body: &mut String, name: &str, suffix: &str, labels: &Labels, value: f64) {
+fn line<'a>(
+    body: &mut String,
+    name: &str,
+    suffix: &str,
+    labels: impl Iterator<Item = (&'static str, &'a str)>,
+    value: f64,
+) {
     write!(body, "{name}{suffix}").unwrap();
-    if !labels.is_empty() {
+    let mut labels = labels.peekable();
+    if labels.peek().is_some() {
         body.push('{');
-        for (i, (name, value)) in labels.iter().enumerate() {
+        for (i, (name, value)) in labels.enumerate() {
             if i != 0 {
                 body.push(',');
             }
@@ -252,6 +302,76 @@ pub fn descriptors() -> impl Iterator<Item = Descriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_and_inline_keys_update_the_same_samples_in_either_insertion_order() {
+        for inline_first in [false, true] {
+            let mut registry = Registry::default();
+            let mut keys = [
+                Labels::One(("result", "accepted")),
+                Labels::Owned(vec![("result", "accepted".into())]),
+            ];
+            if !inline_first {
+                keys.reverse();
+            }
+            for key in keys {
+                registry.observe(Family::ShareAck, key, 0.125);
+            }
+            registry.increment(Family::Grace, Labels::Empty);
+            registry.increment(Family::Grace, vec![]);
+            registry.set(
+                Family::CollectorSuccess,
+                Labels::One(("collector", "process")),
+                -1.,
+            );
+            registry.set(
+                Family::CollectorSuccess,
+                vec![("collector", "process".into())],
+                0.,
+            );
+            let body = registry.render();
+            assert!(body.contains("qbit_prism_share_ack_seconds_count{result=\"accepted\"} 2\n"));
+            assert!(body.contains("qbit_prism_share_ack_seconds_sum{result=\"accepted\"} 0.25\n"));
+            assert!(body.contains("qbit_prism_grace_credited_shares_total 2\n"));
+            assert!(body.contains("qbit_prism_collector_success{collector=\"process\"} 0\n"));
+            assert_eq!(registry.samples.len(), 3);
+        }
+    }
+
+    #[test]
+    fn arbitrary_labels_keep_order_and_escape_backslashes_quotes_and_newlines() {
+        let mut registry = Registry::default();
+        let value = "\\\"\nλ";
+        registry.observe(
+            Family::ShareAck,
+            vec![
+                ("z", value.into()),
+                ("a", "".into()),
+                ("third", "free-form".into()),
+            ],
+            0.125,
+        );
+        let body = registry.render();
+        let labels = "z=\"\\\\\\\"\\nλ\",a=\"\",third=\"free-form\"";
+        assert!(body.contains(&format!(
+            "qbit_prism_share_ack_seconds_bucket{{{labels},le=\"0.25\"}} 1\n"
+        )));
+        assert!(body.contains(&format!(
+            "qbit_prism_share_ack_seconds_sum{{{labels}}} 0.125\n"
+        )));
+        assert!(body.contains(&format!(
+            "qbit_prism_share_ack_seconds_count{{{labels}}} 1\n"
+        )));
+        // The inline representation uses the same escaping and key equality.
+        registry.increment(Family::Rejections, Labels::Two(("z", value), ("a", "")));
+        registry.increment(
+            Family::Rejections,
+            vec![("z", value.into()), ("a", "".into())],
+        );
+        assert!(registry
+            .render()
+            .contains("qbit_prism_rejections_total{z=\"\\\\\\\"\\nλ\",a=\"\"} 2\n"));
+    }
 
     #[test]
     fn wrong_family_operations_fail_before_corrupting_exposition() {
