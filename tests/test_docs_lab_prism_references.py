@@ -459,6 +459,7 @@ WRAPPER_ARGUMENTS = {
     "docker": {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys"},
 }
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
+SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\+?=")
 
 
 def env_split_words(source: str) -> list[tuple[str, int]] | None:
@@ -519,6 +520,10 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
         # Only unquoted openers handled by this loop introduce such a command.
         if prefix == "coproc" and index + 1 < len(words) and words[index + 1] in {"{", "if", "while", "until"}:
             index += 1
+    # Bash recognizes += only in the leading assignment list, with an
+    # unquoted name and operator. After a launcher it is an ordinary argument.
+    while index < len(words) and SHELL_ASSIGNMENT.match(words[index]):
+        index += 1
     while index < len(words):
         word = unquote(words[index])
         if ASSIGNMENT.match(words[index]):
@@ -580,7 +585,8 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
         if program == "docker":
             index += 1  # container name
         elif program == "env":
-            while index < len(words) and ASSIGNMENT.match(unquote(words[index])):
+            # env accepts FOO+=value too, setting the literal name FOO+.
+            while index < len(words) and SHELL_ASSIGNMENT.match(unquote(words[index])):
                 index += 1  # env receives quoted assignments as ordinary arguments
     return None
 
@@ -1912,6 +1918,44 @@ class ScannerTests(unittest.TestCase):
         )
         self.assertEqual(self.commands("python3.14 -OO lab/prism/storm.py"), ["lab/prism/storm.py"])
         self.assertEqual(self.commands("python2 -m lab.prism.process_telemetry"), [])
+
+    def test_bash_append_assignments_before_commands_are_scanned(self) -> None:
+        for command, missing in (
+            ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+            ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+        ):
+            for text in (
+                f"FOO+=x {command}", f"FOO+= {command}",
+                f"_FOO2+='hello world' {command}", f'FOO+="hello world" {command}',
+                f"FOO=base FOO+=x BAR+=y {command}",
+                f"FOO+=x 2>/dev/null {command}", f"FOO+=x command -- {command}",
+                f"if FOO+=x {command}; then true; fi",
+                f"bash -c 'FOO+=x {command}'",
+                # env accepts FOO+ as a variable name; it does not append to FOO.
+                f"env FOO+=x {command}", f"env 'FOO+=x' {command}",
+                f"env -S 'FOO+=x {command}'",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+            text = f"```bash\nFOO+=x \\\n  {command}\n```"
+            self.assertEqual(self.located(text), [(2, missing)])
+
+    def test_append_assignment_lookalikes_do_not_start_commands(self) -> None:
+        command = "python3 -m lab.example.deleted"
+        for prefix in (
+            "'FOO+=x'", '"FOO+=x"', 'F"OO"+=x', "FOO'+'=x", "FOO+'='x",
+            "1FOO+=x", "FOO++=x", "FOO+ =x", "echo FOO+=x",
+            "command FOO+=x", "command -- FOO+=x", "nohup FOO+=x",
+            "exec FOO+=x", "docker exec container FOO+=x",
+            "env command FOO+=x", "FOO+=x command BAR+=y",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.commands(f"{prefix} {command}"), [])
+                self.assertEqual(
+                    self.commands(f"{prefix} {command}; python3 lab/prism/storm.py"),
+                    ["lab/prism/storm.py"],
+                )
 
     def test_compound_shell_commands_are_scanned(self) -> None:
         for command, missing in (
