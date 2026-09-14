@@ -42,6 +42,29 @@ SELECT jsonb_build_object('kind', 'ctv_artifacts', 'row', jsonb_build_object(
     'settlement_status', settlement_status))
 FROM qbit_ctv_fanout_artifacts ORDER BY fanout_txid COLLATE "C";
 
+SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
+FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
+
+-- Frozen 2.x has no native reservations or deferred credit. Skip absent
+-- tables before parsing their queries; empty native tables hash identically.
+SELECT to_regclass('qbit_prism_cpfp_packages') IS NOT NULL AS has_cpfp_packages,
+       to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL AS has_cpfp_retired_funding,
+       to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares
+\gset
+\if :has_cpfp_packages
+SELECT jsonb_build_object('kind', 'cpfp_packages', 'row', to_jsonb(p))
+FROM qbit_prism_cpfp_packages p ORDER BY fanout_txid COLLATE "C";
+\endif
+\if :has_cpfp_retired_funding
+SELECT jsonb_build_object('kind', 'cpfp_retired_funding', 'row', to_jsonb(r))
+FROM qbit_prism_cpfp_retired_funding r
+ORDER BY funding_txid COLLATE "C", funding_vout;
+\endif
+\if :has_deferred_shares
+SELECT jsonb_build_object('kind', 'deferred_shares', 'row', to_jsonb(d))
+FROM qbit_prism_deferred_shares d ORDER BY block_hash COLLATE "C";
+\endif
+
 -- Exact row shape/order used by 2.x _carry_forward_audit_head_locked.
 -- Stream rows rather than constructing one unbounded json_agg value.
 SELECT jsonb_build_object('kind', 'active_carry', 'row', jsonb_build_object(

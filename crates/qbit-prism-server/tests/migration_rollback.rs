@@ -104,6 +104,33 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
     let result = async {
         let artifacts_dir = tempfile::tempdir()?;
         let artifacts = recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        // Broadcast attempts already exist in frozen 2.x. Preserve a nonempty
+        // history through backup/restore and migration, alongside dependencies
+        // for the native-only obligations exercised below.
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO qbit_ctv_fanout_sets(
+                block_hash,manifest_set_json,manifest_set,manifest_set_sha256,
+                settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,
+                fanout_count,fanout_output_sum_sats,covenant_output_value_sats)
+            VALUES(repeat('50',32),'{}','{}',repeat('11',32),'ctv_fanout',
+                repeat('22',32),'00',1,1000,1000);
+            INSERT INTO qbit_ctv_fanout_artifacts(
+                fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,
+                manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,
+                chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,
+                fanout_tx_template_hex,fanout_tx_hex,covenant_output_value_sats,fanout_output_sum_sats)
+            VALUES(repeat('33',32),repeat('50',32),repeat('11',32),'{}','{}',
+                repeat('44',32),repeat('55',32),repeat('66',32),'00',0,1,
+                repeat('22',32),0,'00','00',1000,1000);
+            INSERT INTO qbit_ctv_fanout_broadcast_attempts(fanout_txid,attempt_status)
+            VALUES(repeat('33',32),'planned');
+            INSERT INTO qbit_block_candidate_outbox(block_hash,candidate_sha256,state,completed_at)
+            VALUES(repeat('77',32),repeat('88',32),'abandoned',clock_timestamp());
+            "#,
+        )
+        .execute(&source.pool)
+        .await?;
         let before = recovery::accounting_state(&source.pool).await?;
         let source_evidence = recovery::evidence(&source, pg_bin).await?;
         ensure!(
@@ -113,6 +140,10 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(source_evidence["accepted_shares"] == 3);
         ensure!(source_evidence["last_share_seq"] == 8);
         ensure!(source_evidence["records"]["audits"]["count"] == 3);
+        ensure!(source_evidence["records"]["ctv_broadcast_attempts"]["count"] == 1);
+        for kind in ["cpfp_packages", "cpfp_retired_funding", "deferred_shares"] {
+            ensure!(source_evidence["records"][kind]["count"] == 0);
+        }
         ensure!(source_evidence["carry_forward_integrity"]["mismatch_count"] == 0);
         // Independent 2.x chain calculation over the three fixed seed rows.
         // Comparing two exports alone would miss a consistently wrong head.
@@ -168,6 +199,47 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             lost_on_restore == 0,
             "older restore unexpectedly contains the post-cutover ACK"
         );
+
+        // Each obligation must independently change evidence even when shares,
+        // candidates and the exported CTV artifact state remain unchanged.
+        let mut prior = after;
+        for (kind, insert, update) in [
+            (
+                "cpfp_packages",
+                "INSERT INTO qbit_prism_cpfp_packages(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name) VALUES(repeat('33',32),repeat('99',32),0,1000,'recovery-test')",
+                "UPDATE qbit_prism_cpfp_packages SET signed_child_hex='deadbeef',child_txid=repeat('aa',32)",
+            ),
+            (
+                "cpfp_retired_funding",
+                "INSERT INTO qbit_prism_cpfp_retired_funding(funding_txid,funding_vout,fanout_txid,funding_value_sats,wallet_name,retirement_reason) VALUES(repeat('bb',32),1,repeat('33',32),1000,'recovery-test','spent')",
+                "UPDATE qbit_prism_cpfp_retired_funding SET wallet_lock_released=true",
+            ),
+            (
+                "ctv_broadcast_attempts",
+                "INSERT INTO qbit_ctv_fanout_broadcast_attempts(fanout_txid,attempt_status) VALUES(repeat('33',32),'submitted')",
+                "UPDATE qbit_ctv_fanout_broadcast_attempts SET submit_result='{\"accepted\":true}' WHERE attempt_status='submitted'",
+            ),
+            (
+                "deferred_shares",
+                "INSERT INTO qbit_prism_deferred_shares(block_hash,share,share_sha256) VALUES(repeat('77',32),'{\"miner_id\":\"alice\"}',repeat('cc',32))",
+                "UPDATE qbit_prism_deferred_shares SET share='{\"miner_id\":\"bob\"}',share_sha256=repeat('dd',32)",
+            ),
+        ] {
+            for (sql, added) in [(insert, 1), (update, 0)] {
+                sqlx::query(sql).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                ensure!(current["records"][kind]["count"].as_u64()
+                    == prior["records"][kind]["count"].as_u64().map(|n| n + added));
+                ensure!(current["records"][kind]["sha256"] != prior["records"][kind]["sha256"],
+                    "{kind} obligation change was invisible to recovery evidence");
+                let mut unchanged = current.clone();
+                unchanged["records"][kind] = prior["records"][kind].clone();
+                ensure!(unchanged == prior, "unrelated accounting changed with {kind}");
+                prior = current;
+            }
+        }
+        ensure!(recovery::evidence(&source, pg_bin).await? == prior);
+        ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
         ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
     }

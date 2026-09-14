@@ -65,6 +65,32 @@ class RecoveryEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.summarize(iter([record("future_format", {})] + closing()))
 
+    def test_recovery_obligations_change_summary_without_share_or_ctv_state_changes(self):
+        baseline = module.summarize(iter(closing()))
+        for kind, row, change in (
+            ("cpfp_packages", {"fanout_txid": "ab", "signed_child_hex": None},
+             {"signed_child_hex": "deadbeef"}),
+            ("cpfp_retired_funding", {"funding_txid": "cd", "wallet_lock_released": False},
+             {"wallet_lock_released": True}),
+            ("ctv_broadcast_attempts", {"attempt_seq": 1, "submit_result": None},
+             {"submit_result": {"accepted": True}}),
+            ("deferred_shares", {"block_hash": "ef", "share": {"miner_id": "alice"}},
+             {"share": {"miner_id": "bob"}}),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(baseline["records"][kind]["count"], 0)
+                added = module.summarize(iter([record(kind, row)] + closing()))
+                changed = module.summarize(iter([record(kind, row | change)] + closing()))
+                self.assertEqual(added["records"][kind]["count"], 1)
+                self.assertEqual(changed["records"][kind]["count"], 1)
+                self.assertNotEqual(baseline["records"][kind]["sha256"],
+                                    added["records"][kind]["sha256"])
+                self.assertNotEqual(added["records"][kind]["sha256"],
+                                    changed["records"][kind]["sha256"])
+                for other in baseline["records"]:
+                    if other != kind:
+                        self.assertEqual(baseline["records"][other], changed["records"][other])
+
 
 if __name__ == "__main__":
     unittest.main()
