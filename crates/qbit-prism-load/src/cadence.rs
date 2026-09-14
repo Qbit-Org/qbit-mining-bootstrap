@@ -227,10 +227,37 @@ pub struct RevisionSeries {
 }
 
 impl RevisionSeries {
-    /// True when the sampler produced no reading at all, so the bump list is
-    /// unknown rather than empty.
+    /// True when the bump list is unknown rather than empty.
+    ///
+    /// A sampler that never read anything is blind, and so is one whose first
+    /// read succeeded and whose every later read failed: it observed no
+    /// change, but it also saw almost nothing, and `changes_observed: 0` with
+    /// `blind: false` is the misreading this flag exists to prevent
+    /// (EP-ERRORS). Errors beside observed changes are not blindness: the
+    /// sampler did see the revision move, and `coverage` says how much of the
+    /// phase it watched.
     pub fn blind(&self) -> bool {
-        self.baseline.is_none()
+        self.baseline.is_none() || (self.changes.is_empty() && self.errors > 0)
+    }
+
+    /// Why the sampler is blind, when it is.
+    pub fn blind_reason(&self) -> Option<&'static str> {
+        match (self.baseline.is_none(), self.changes.is_empty() && self.errors > 0) {
+            (true, _) => Some(
+                "the sampler produced no reading, so the bump list is unknown rather than empty",
+            ),
+            (false, true) => Some(
+                "the sampler read a baseline and then failed; it observed no change, but it                  also observed almost nothing, so an empty bump list is unknown rather than                  empty. coverage says what fraction of its ticks returned a reading",
+            ),
+            (false, false) => None,
+        }
+    }
+
+    /// Fraction of the sampler's ticks that returned a reading: `samples` over
+    /// `samples + errors`. `None` when it never ticked, which is not 0.
+    pub fn coverage(&self) -> Option<f64> {
+        let ticks = self.samples + self.errors;
+        (ticks > 0).then(|| self.samples as f64 / ticks as f64)
     }
 }
 
@@ -1005,11 +1032,14 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
             },
             "samples": revisions.samples,
             "errors": revisions.errors,
+            "coverage": revisions.coverage(),
+            "coverage_definition": "samples / (samples + errors): the fraction of the sampler's \
+                                    ticks that returned a reading. Null, not 0, when it never \
+                                    ticked. A sampler that read 3% of its ticks is visible as \
+                                    such whatever blind says.",
             "first_error": revisions.first_error,
             "blind": revisions.blind(),
-            "blind_reason": revisions.blind().then_some(
-                "the sampler produced no reading, so the bump list is unknown rather than empty"
-            ),
+            "blind_reason": revisions.blind_reason(),
             "baseline_revision": revisions.baseline.as_ref().map(|sample| sample.revision),
             "baseline_server_timestamp": revisions
                 .baseline

@@ -2210,6 +2210,58 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
 }
 
 #[test]
+fn a_sampler_that_failed_after_its_baseline_reports_itself_blind() {
+    use qbit_prism_load::cadence::RevisionSeries;
+    let base = std::time::Instant::now();
+    let series = |samples: u64, errors: u64, changes: Vec<_>, baseline: bool| RevisionSeries {
+        interval_ms: 25,
+        samples,
+        errors,
+        first_error: (errors > 0).then(|| "pool timed out".to_owned()),
+        baseline: baseline.then(|| bump(4, None, base)),
+        changes,
+    };
+
+    // Never read anything: blind, as before.
+    let never = series(0, 6_000, Vec::new(), false);
+    assert!(never.blind());
+    assert!(never
+        .blind_reason()
+        .expect("a reason")
+        .contains("no reading"));
+    assert_eq!(never.coverage(), Some(0.0));
+
+    // Read a baseline, then failed for the rest of the phase. It observed no
+    // change and also observed almost nothing; blind: false with
+    // changes_observed: 0 is the misreading the flag exists to prevent.
+    let died = series(1, 5_999, Vec::new(), true);
+    assert!(died.blind(), "partial blindness is blindness");
+    assert!(died
+        .blind_reason()
+        .expect("a reason")
+        .contains("then failed"));
+    let coverage = died.coverage().expect("coverage");
+    assert!(coverage > 0.0 && coverage < 0.001, "{coverage}");
+
+    // Errors beside observed changes are not blindness: the sampler did see
+    // the revision move, and coverage says how much it watched.
+    let lossy = series(3_000, 3_000, vec![bump(5, Some(4), at(base, 2_000))], true);
+    assert!(!lossy.blind());
+    assert_eq!(lossy.blind_reason(), None);
+    assert_eq!(lossy.coverage(), Some(0.5));
+
+    // A clean sampler.
+    let clean = series(9_000, 0, vec![bump(5, Some(4), at(base, 2_000))], true);
+    assert!(!clean.blind());
+    assert_eq!(clean.coverage(), Some(1.0));
+
+    // A sampler that never ticked has unknown coverage, which is not 0.
+    let untouched = RevisionSeries::default();
+    assert_eq!(untouched.coverage(), None);
+    assert!(untouched.blind(), "no baseline is still blind");
+}
+
+#[test]
 fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
     use qbit_prism_load::cadence;
     let base = std::time::Instant::now();

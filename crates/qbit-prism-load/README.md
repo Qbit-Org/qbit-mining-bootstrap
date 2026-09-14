@@ -246,7 +246,14 @@ found by name.
   `null`.
 - A sampler that could not read the revision reports its error count and its
   first error, and marks itself `blind`, so an empty bump list is never read as
-  "no bumps happened".
+  "no bumps happened". `blind` covers partial blindness too: a sampler whose
+  first read succeeded and whose every later read failed observed no change
+  *and* observed almost nothing, so it is blind and says which of the two cases
+  it is in `blind_reason`. Beside `samples` and `errors` it reports `coverage`
+  — `samples / (samples + errors)`, `null` rather than 0 when it never ticked —
+  so a sampler that watched 3 % of the phase is visible as such whatever
+  `blind` says. Errors beside observed changes are not blindness: the sampler
+  did see the revision move.
 - A frontend that restarted or died during the phase is reported, and its
   windows are marked `incomplete` with the reason. The last landing's window is
   marked `span_truncated_at_phase_end`.
