@@ -476,6 +476,20 @@ impl Coordinator {
 
     /// This reserves a dependency only. Original economic identity and expiry
     /// stay fixed; the transaction receives a separately revalidated fence.
+    ///
+    /// Requires established polling readiness, even for an unpublished
+    /// original build. A healthy tip observation alone does not establish
+    /// last_poll; this path cannot bootstrap or restore revoked readiness.
+    /// Never set last_poll early or publish work to satisfy this precondition.
+    ///
+    /// A future cold-reservation path must carry the readiness epoch from
+    /// before the original build (not Prepared.generation). After capture it
+    /// must freshly check node/tip readiness, template freshness and current
+    /// chain payout revision against the original, without a replacement-lease
+    /// fallback, and verify the epoch is unchanged. Persistence still uses
+    /// transactional revision/configuration fences and the fixed absolute
+    /// expiry. The caller must revalidate after persistence before atomic
+    /// publication establishes last_poll, under its one outer deadline.
     pub(in crate::coordinator) async fn save_captured_compact(
         &self,
         captured: &CapturedCompactPrepared,
