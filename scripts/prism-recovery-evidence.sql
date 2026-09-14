@@ -7,19 +7,21 @@ BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TIME ZONE 'UTC';
 SET LOCAL bytea_output = 'hex';
 
--- Startup refuses a database at migration 6 whose capability declaration or
--- source record is missing, substituted or unreadable
--- (require_known_capabilities and require_migration_source). Refuse it here
+-- Startup requires every declared migration and refuses a database whose
+-- capability declaration or source record is missing or unreadable
+-- (require_schema_version, require_known_capabilities, require_migration_source). Refuse it here
 -- too, so a restore that cannot start yields no evidence. Only the current
 -- schema's own tables count: search_path must not resolve a lost table to
--- another ledger's. Frozen 2.x and pre-006 native schemas, whose #258
--- declaration of 2 remains valid, are not checked. Metadata is validated,
+-- another ledger's. Frozen 2.x, whose #258 declaration of 2 remains valid,
+-- has no native history and is not checked. Metadata is validated,
 -- never exported: routine migration provenance must not change evidence.
 DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    native boolean;
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10];
+    applied integer[];
+    missing integer[];
     metadata text;
     relation record;
     capability_table text;
@@ -30,11 +32,27 @@ DECLARE
     source_rows bigint;
 BEGIN
     IF history IS NULL THEN
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_class
+                   WHERE relnamespace = current_schema()::regnamespace
+                     AND relname IN ('qbit_prism_cluster', 'qbit_prism_migration_source',
+                                     'qbit_prism_share_hashes')) THEN
+            RAISE EXCEPTION 'native recovery is missing qbit_prism_schema_migrations' USING HINT = hint;
+        END IF;
         RETURN;
     END IF;
-    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s WHERE version >= 6)', history) INTO native;
-    IF NOT native THEN
-        RETURN;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class
+                   WHERE oid = history AND relnamespace = current_schema()::regnamespace
+                     AND relkind = 'r' AND NOT relrowsecurity AND NOT relforcerowsecurity) THEN
+        RAISE EXCEPTION 'native migration history must be an ordinary table in the current schema without row-level security' USING HINT = hint;
+    END IF;
+    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS. The
+    -- regression removes each version declared by the server in turn.
+    EXECUTE format('SELECT array_agg(version ORDER BY version) FROM %s', history) INTO applied;
+    SELECT array_agg(version ORDER BY version) INTO missing
+    FROM unnest(required_versions) AS required(version)
+    WHERE NOT version = ANY(COALESCE(applied, ARRAY[]::integer[]));
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION 'missing required native migrations % (found %)', missing, applied USING HINT = hint;
     END IF;
     FOREACH metadata IN ARRAY ARRAY['qbit_prism_schema_capabilities', 'qbit_prism_migration_source'] LOOP
         SELECT n.nspname IS NOT DISTINCT FROM current_schema() AS in_current_schema,

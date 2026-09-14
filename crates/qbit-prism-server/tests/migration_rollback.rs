@@ -768,6 +768,51 @@ async fn assert_native_metadata_required(
     pg_bin: &std::path::Path,
     native: &serde_json::Value,
 ) -> Result<()> {
+    for version in qbit_prism_server::ledger::REQUIRED_SCHEMA_VERSIONS {
+        let applied_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "DELETE FROM qbit_prism_schema_migrations WHERE version=$1 RETURNING applied_at",
+        )
+        .bind(version)
+        .fetch_one(&source.pool)
+        .await?;
+        let refused = recovery::evidence(source, pg_bin).await;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version,applied_at) VALUES($1,$2)")
+            .bind(version)
+            .bind(applied_at)
+            .execute(&source.pool)
+            .await?;
+        ensure!(
+            refused.is_err(),
+            "missing required migration {version} was accepted"
+        );
+        ensure!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("missing required native migrations"));
+        ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    }
+    // Unknown additive migrations do not prevent this release from starting.
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(999)")
+        .execute(&source.pool)
+        .await?;
+    let newer = recovery::evidence(source, pg_bin).await;
+    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=999")
+        .execute(&source.pool)
+        .await?;
+    ensure!(newer? == *native);
+    sqlx::query("ALTER TABLE qbit_prism_schema_migrations RENAME TO saved_native_history")
+        .execute(&source.pool)
+        .await?;
+    let missing = recovery::evidence(source, pg_bin).await;
+    sqlx::query("ALTER TABLE saved_native_history RENAME TO qbit_prism_schema_migrations")
+        .execute(&source.pool)
+        .await?;
+    ensure!(
+        missing.is_err(),
+        "missing native migration history was accepted"
+    );
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
+
     const SAVE_SOURCE: &str =
         "ALTER TABLE qbit_prism_migration_source RENAME TO saved_recovery_metadata";
     const RESTORE_SOURCE: &str =
