@@ -257,6 +257,73 @@ async fn migration_012_builds_its_indexes_without_blocking_appends() -> Result<(
 }
 
 #[tokio::test]
+async fn migration_012_refuses_redefined_drop_targets_before_any_ddl() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    insert_share(&pool, 2, "alice").await?;
+    undo_012(&pool).await?;
+    sqlx::raw_sql(
+        "CREATE TABLE operator_shares (miner_id text); INSERT INTO operator_shares VALUES ('alice'), ('alice')",
+    )
+    .execute(&pool)
+    .await?;
+    let versions = schema_versions(&pool).await?;
+    for (name, restore) in REPLACED {
+        sqlx::raw_sql(&format!("DROP INDEX {name}"))
+            .execute(&pool)
+            .await?;
+        for table in ["qbit_share_ledger", "operator_shares"] {
+            for unique in [false, true] {
+                // Duplicate miners leave the unique build invalid. Neither
+                // validity nor a matching table proves this is our old index.
+                let qualifier = if unique { "UNIQUE " } else { "" };
+                let built = sqlx::raw_sql(&format!(
+                    "CREATE {qualifier}INDEX CONCURRENTLY {name} ON {table} (miner_id)"
+                ))
+                .execute(&pool)
+                .await;
+                assert_eq!(built.is_ok(), !unique);
+                let index_state = "SELECT pg_get_indexdef(indexrelid),indisvalid,indexrelid::text FROM pg_index WHERE indexrelid=to_regclass($1)";
+                let foreign: (String, bool, String) = sqlx::query_as(index_state)
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!(foreign.1, !unique);
+                let before = ledger_indexes(&pool).await?;
+                let error = db
+                    .ledger("foreign-drop-target")
+                    .await
+                    .err()
+                    .context("the online migration dropped an operator's redefined index")?
+                    .to_string();
+                assert!(error.contains(&format!("index {name}")), "{error}");
+                assert!(error.contains("will not drop it"), "{error}");
+                assert!(error.contains("nothing was changed"), "{error}");
+                let after: (String, bool, String) = sqlx::query_as(index_state)
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!(after, foreign, "the operator's index was changed");
+                assert_eq!(ledger_indexes(&pool).await?, before);
+                assert_eq!(schema_versions(&pool).await?, versions);
+                assert_eq!(share_count(&pool).await?, 2);
+                sqlx::raw_sql(&format!("DROP INDEX {name}"))
+                    .execute(&pool)
+                    .await?;
+            }
+        }
+        sqlx::raw_sql(restore).execute(&pool).await?;
+    }
+    let migrated = db.ledger("restored").await?;
+    assert_trimmed(&pool).await?;
+    db.close(vec![first, migrated]).await
+}
+
+#[tokio::test]
 async fn migration_012_resumes_an_interrupted_build_keeps_its_own_index_and_refuses_another(
 ) -> Result<()> {
     let Some(db) = Database::open().await? else {

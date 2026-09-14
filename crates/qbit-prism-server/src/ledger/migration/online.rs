@@ -33,12 +33,12 @@ use std::time::{Duration, Instant};
 
 /// What one online migration changes on the source, derived from the
 /// scratch apply: the indexes it creates, rendered by `pg_get_indexdef`,
-/// and the indexes it drops, each with the table it must be on.
+/// and the original definitions of the indexes it drops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OnlineMigration {
     pub(super) version: i32,
     pub(super) creates: BTreeMap<String, IndexDefinition>,
-    pub(super) drops: BTreeMap<String, String>,
+    pub(super) drops: BTreeMap<String, IndexDefinition>,
 }
 
 /// The change an online migration made to the scratch schema, refused if
@@ -75,11 +75,11 @@ pub(super) fn derive(
             ),
         }
     }
-    let drops: BTreeMap<String, String> = before
+    let drops: BTreeMap<String, IndexDefinition> = before
         .indexes
         .iter()
         .filter(|(name, _)| !after.indexes.contains_key(*name))
-        .map(|(name, definition)| (name.clone(), definition.table.clone()))
+        .map(|(name, definition)| (name.clone(), definition.clone()))
         .collect();
     ensure!(
         !creates.is_empty() || !drops.is_empty(),
@@ -172,14 +172,20 @@ async fn apply(
             ),
         }
     }
-    for (name, table) in &migration.drops {
+    for (name, expected) in &migration.drops {
         match live_relation(connection, name).await? {
             LiveRelation::Absent => plan.push(Step::Dropped(name)),
-            LiveRelation::Index { table: found, .. } if found == *table => {
-                plan.push(Step::Drop(name, table));
+            LiveRelation::Index {
+                table, definition, ..
+            } if table == expected.table && definition == expected.definition => {
+                plan.push(Step::Drop(name, &expected.table));
             }
-            LiveRelation::Index { table: found, .. } => bail!(
-                "refusing to apply migration {version}: index {name} is on {found}, not on {table} where the release created it, so this migration does not own it and will not drop it. The migration is not recorded and nothing was changed by it. Check what it serves, then rename or drop it and migrate again"
+            LiveRelation::Index {
+                table, definition, ..
+            } => bail!(
+                "refusing to apply migration {version}: index {name} on {table} has a different definition ({definition}) from the release's {} on {}, so this migration does not own it and will not drop it. The migration is not recorded and nothing was changed by it. Check what it serves, then rename or drop it and migrate again",
+                expected.definition,
+                expected.table
             ),
             LiveRelation::Other(kind) => bail!(
                 "refusing to apply migration {version}: a {kind} named {name} holds the name of an index this migration drops, so this migration does not own it and will not drop it. The migration is not recorded and nothing was changed by it. Check what it holds, then rename or move it aside and migrate again"
@@ -418,7 +424,7 @@ mod tests {
         assert_eq!(migration.creates.keys().collect::<Vec<_>>(), vec!["new"]);
         assert_eq!(
             migration.drops,
-            BTreeMap::from([("old".to_owned(), "t".to_owned())])
+            BTreeMap::from([("old".to_owned(), index("t", "CREATE INDEX old ON t (a)"))])
         );
         assert!(derive(12, &before, &before)
             .unwrap_err()
