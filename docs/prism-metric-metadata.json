@@ -88,7 +88,7 @@
       "labels": {
         "result": "Outcome"
       },
-      "status": "Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by every ledger transaction; queries run directly on the pool outside a transaction are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait."
+      "status": "Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by instrumented coordinator ledger transactions; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait."
     },
     "database_advisory_lock_wait_seconds": {
       "labels": {
