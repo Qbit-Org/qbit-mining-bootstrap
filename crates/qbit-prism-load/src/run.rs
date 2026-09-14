@@ -1362,7 +1362,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         difficulty_premise_contradiction(&collected.difficulty_mismatches),
         replication_premise.contradiction(),
     );
-    let withhold = withhold_decision(
+    let mut withhold = withhold_decision(
         late_hard_block.as_deref(),
         premise_contradiction.as_deref(),
         aborted.as_deref(),
@@ -1490,6 +1490,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .unwrap_or(args.slow_db_delay_ms as f64);
     let mut phase_evidence = Vec::new();
     let mut artifact_phase_names = Vec::new();
+    let mut unmeasured_phases: Vec<String> = Vec::new();
     for phase in &runs {
         if !phase.plan.in_artifact {
             continue;
@@ -1500,6 +1501,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .map(|(_, rec)| rec)
             .context("missing reconciliation")?;
         let latency = phase_latency(&collected.submits, &phase.plan.name);
+        // The artifact's schema requires a p50 and a p99. A phase that
+        // acknowledged nothing has no latency to state, and writing 0.000 would
+        // put a measurement in the evidence that was never taken -- the same
+        // unknown-as-zero this crate refuses everywhere else. The validator
+        // would refuse such an artifact anyway, on the share counts, but the
+        // harness must not author the false number and leave catching it to
+        // someone else.
+        if has_no_ack_latency(&latency) {
+            unmeasured_phases.push(phase.plan.name.clone());
+        }
         let reconnects = collected
             .reconnects
             .iter()
@@ -1523,6 +1534,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 .then_some(slow_delay_observed),
         });
         artifact_phase_names.push(phase.plan.name.clone());
+    }
+    if !unmeasured_phases.is_empty() {
+        // Treated as a contradicted premise rather than given a code of its
+        // own: a capacity artifact rests on every phase it names having
+        // measured acknowledgements, and one that did not makes the artifact
+        // evidence of nothing, which is exactly what exit 8 already means.
+        withhold.get_or_insert_with(|| {
+            Withhold::PremiseContradicted(format!(
+                "{} acknowledged no shares, so the artifact has no ACK latency to state for it",
+                unmeasured_phases.join(", ")
+            ))
+        });
     }
     let overall_latency = ack_latency(
         &collected.submits,
@@ -2481,6 +2504,17 @@ pub fn rejection_latency(records: &[SubmitRecord], phase: &str) -> measure::Late
         measure::MILLISECONDS,
         "client monotonic",
     )
+}
+
+/// Whether a phase measured no acknowledgement latency at all.
+///
+/// The artifact's schema requires a p50 and a p99 for every phase it names. A
+/// phase that acknowledged nothing has neither, and writing `0.000` would state
+/// a measurement that was never taken. The validator would refuse the artifact
+/// anyway, on the share counts, but the harness must not author the false
+/// number and leave catching it to the consumer.
+pub fn has_no_ack_latency(latency: &measure::LatencySummary) -> bool {
+    latency.p50.is_none() || latency.p99.is_none()
 }
 
 fn phase_latency(records: &[SubmitRecord], phase: &str) -> measure::LatencySummary {

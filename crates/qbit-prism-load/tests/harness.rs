@@ -11,6 +11,7 @@ use qbit_prism_load::{
     classify::{self, BlockedKind, Rejection, RejectionClass},
     client, digest,
     frontend::{self, FrontendSpec, SharedEnvironment},
+    measure,
     node::{self, NodeState},
     profile, proxy, run, window,
 };
@@ -6831,5 +6832,30 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
     assert_eq!(
         drifted["bumps"],
         drifted["revision_sampler"]["changes_observed"]
+    );
+}
+
+#[test]
+fn a_phase_that_acknowledged_nothing_has_no_ack_latency_to_state() {
+    // The artifact requires a p50 and a p99 for every phase it names. A phase
+    // with no acknowledgements has neither, and the previous code wrote 0.000 --
+    // a measurement that was never taken, inside the document whose whole point
+    // is to be trustworthy. The run now withholds the artifact instead.
+    let empty = measure::summarize(Vec::new(), measure::MILLISECONDS, "client monotonic");
+    assert!(empty.p50.is_none() && empty.p99.is_none());
+    assert!(
+        run::has_no_ack_latency(&empty),
+        "a phase with no acknowledgements states no latency"
+    );
+
+    let measured = measure::summarize(
+        vec![1.0, 2.0, 3.0],
+        measure::MILLISECONDS,
+        "client monotonic",
+    );
+    assert!(measured.p50.is_some() && measured.p99.is_some());
+    assert!(
+        !run::has_no_ack_latency(&measured),
+        "a phase with acknowledgements states its latency"
     );
 }
