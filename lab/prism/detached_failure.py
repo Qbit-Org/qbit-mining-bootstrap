@@ -51,6 +51,28 @@ class DetachedFailure:
         raise _copy_error(self._error)
 
 
+def _release_invocation_frames(error: BaseException, boundary: Any) -> None:
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending.extend(chained for chained in (current.__cause__, current.__context__)
+                       if chained is not None)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        node = current.__traceback__
+        while node is not None:
+            parent = node.tb_frame.f_back
+            while parent is not None and parent is not boundary:
+                parent = parent.f_back
+            if parent is boundary:
+                node.tb_frame.clear()
+            node = node.tb_next
+
+
 def capture_failure(function: Callable[..., Any], *args: Any) -> Any:
     try:
         return function(*args)
@@ -63,16 +85,8 @@ def capture_failure(function: Callable[..., Any], *args: Any) -> Any:
         # The running capture frame and any foreign cause frames are excluded;
         # no traceback links on the original/shared exception are mutated.
         boundary = sys._getframe()
-        parent = None
-        node = error.__traceback__.tb_next
-        while node is not None:
-            parent = node.tb_frame.f_back
-            while parent is not None and parent is not boundary:
-                parent = parent.f_back
-            if parent is boundary:
-                node.tb_frame.clear()
-            node = node.tb_next
-        del boundary, parent
+        _release_invocation_frames(error, boundary)
+        del boundary
         return failure
 
 

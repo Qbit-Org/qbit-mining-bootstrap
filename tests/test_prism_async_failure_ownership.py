@@ -156,6 +156,44 @@ class AsyncFailureOwnershipTests(unittest.TestCase):
             self.assertTrue(any("producer" in note for note in error.__notes__))
         self.assertIsNone(future.result()._error.__traceback__)
 
+    def test_grouped_failures_release_nested_producers(self):
+        references = []
+
+        def child():
+            payload = Payload()
+            references.append(weakref.ref(payload))
+            error = ValueError("nested")
+            raise error
+
+        def producer():
+            try:
+                child()
+            except ValueError as error:
+                raise ExceptionGroup("group", [error])
+
+        failure = capture_failure(producer)
+        self.assertIsNone(references[0]())
+        with self.assertRaises(ExceptionGroup) as caught:
+            failure.raise_error()
+        self.assertEqual(caught.exception.exceptions[0].args, ("nested",))
+
+    def test_foreign_running_traceback_frame_is_untouched(self):
+        sentinel = Payload()
+        try:
+            raise ValueError("shared externally")
+        except ValueError as error:
+            shared = error
+        original_traceback = shared.__traceback__
+
+        def producer():
+            raise shared
+
+        failure = capture_failure(producer)
+        self.assertIsNotNone(sentinel)
+        self.assertIs(original_traceback.tb_frame.f_locals["sentinel"], sentinel)
+        with self.assertRaisesRegex(ValueError, "shared externally"):
+            failure.raise_error()
+
 
 if __name__ == "__main__":
     unittest.main()
