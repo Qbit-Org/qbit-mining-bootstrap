@@ -444,12 +444,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    for the bound, and the correlated series for the reading order above. Both
    reads run inside the container; the parsing runs on the host. The fence
    defines `capture`, which takes the samples in a loop, and then calls it.
-   Before every sample it checks that no more than 360 s have passed since
-   the previous one and that it is still reading the process the run
+   Before every sample it checks that the clock has not moved backward since
+   the previous sample ended, that no more than 360 s have passed since
+   the previous one started and that it is still reading the process the run
    started with, after the sample's reads it reads the identity again and
-   then the clock, which must be no more than 360 s past the time the
-   previous sample's reads ended, and it stops the run as invalid when any
-   of these checks fails or when one of its appends to the run's files
+   then the clock, which must not precede this sample's start or be more than
+   360 s past the time the previous sample's reads ended, and it stops the run
+   as invalid when any of these checks fails or one of its appends to the run's files
    does. It ends the run itself, as complete, after the first sample taken
    86,400 s or more after the first, once that sample has passed every
    check, by writing `soak-complete` and returning `0`:
@@ -474,6 +475,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      fi
      while true; do
        now=$(date +%s)
+       if [ -n "$prev_end" ] && [ "$now" -lt "$prev_end" ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, the clock moved backward from the previous sample's end at $prev_end to $now" | invalid
+         return 1
+       fi
        if [ -n "$prev" ] && [ $((now - prev)) -gt 360 ]; then
          echo "$(date -u +%FT%TZ): soak invalid, no sample for $((now - prev)) s at $now, the last one was at $prev" | invalid
          return 1
@@ -559,6 +564,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          return 1
        fi
        end=$(date +%s)
+       if [ "$end" -lt "$now" ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, the clock moved backward during the sample from $now to $end" | invalid
+         return 1
+       fi
        if [ -n "$prev_end" ] && [ $((end - prev_end)) -gt 360 ]; then
          echo "$(date -u +%FT%TZ): soak invalid, the reads for the sample at $now ended at $end, $((end - prev_end)) s after the previous sample's ended at $prev_end" | invalid
          return 1
@@ -699,6 +708,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    last sample's reads to it with no next iteration needed; a hole in the
    sleep itself is still seen first by the check above, before anything is
    read for the iteration. The run is invalid and starts over from step 2.
+
+   Every consecutive clock reading must also be nondecreasing: the next
+   sample's start cannot precede the previous sample's end, and a sample's
+   end cannot precede its own start, including the first and final samples.
+   A backward step invalidates the run before another sample or completion
+   marker can be written. Keep the invalid directory for diagnosis and
+   restart from step 2; sorting its CSV cannot make the timing trustworthy.
 
    The metrics sample is held to the same rule. The correlated series is what
    reads an RSS excursion back at its own five-minute sample, so a scrape

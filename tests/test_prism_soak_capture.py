@@ -59,6 +59,10 @@ sleep() {
   stub_read clock
   stub_value=$((stub_value + $1))
   echo "$stub_value" > "$STUB/clock"
+  if [ "$stub_value" = "$STUB_ROLLBACK_AT_SLEEP" ] && [ ! -e "$STUB/rolled-back" ]; then
+    echo "$STUB_ROLLBACK_TO" > "$STUB/clock"
+    : > "$STUB/rolled-back"
+  fi
   if [ -n "$STUB_INTERRUPT_AT" ] && [ "$stub_value" -ge "$STUB_INTERRUPT_AT" ]; then
     kill -s TERM $$
   fi
@@ -509,6 +513,50 @@ class SoakCaptureTests(unittest.TestCase):
                 self.assertEqual((gate.returncode, gate.stdout), (1, ""))
                 self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
                 self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_backward_clock_step_between_samples_is_invalid_before_recording(self) -> None:
+        for shell in ("sh", "bash"):
+            for sleep_at, rollback_to, previous_end, samples, first_read_end in (
+                (600, 0, 300, 2, 0),
+                # Still later than the previous start (0), but earlier than its end (30).
+                (330, 15, 30, 1, 30),
+                (86400, 3600, 86100, SAMPLES_24H - 1, 0),
+            ):
+                with self.subTest(shell=shell, sleep_at=sleep_at):
+                    soak = SoakRun(
+                        shell, STUB_ROLLBACK_AT_SLEEP=str(sleep_at), STUB_ROLLBACK_TO=str(rollback_to),
+                        STUB_SNIPPET_AT_INSPECT="2", STUB_SNIPPET=f'echo {first_read_end} > "$STUB/clock"',
+                    )
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                    self.assertIn(f"clock moved backward from the previous sample's end at {previous_end} to {rollback_to}", result.stderr)
+                    self.assertEqual(len(soak.lines("soak-rss.csv")), samples)
+                    self.assertEqual(len(soak.lines("soak-process.log")), samples)
+                    self.assert_no_marker_at_all(soak)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_backward_clock_step_during_sample_reads_is_invalid(self) -> None:
+        for shell in ("sh", "bash"):
+            for sample, end in ((1, -1), (2, 299), (14, 1800), (SAMPLES_24H, 86399)):
+                with self.subTest(shell=shell, sample=sample, end=end):
+                    soak = SoakRun(
+                        shell, STUB_SNIPPET_AT_INSPECT=str(2 * sample),
+                        STUB_SNIPPET=f'echo {end} > "$STUB/clock"',
+                    )
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                    self.assertIn(f"clock moved backward during the sample from {(sample - 1) * 300} to {end}", result.stderr)
+                    self.assert_no_marker_at_all(soak)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_equal_consecutive_clock_readings_remain_valid(self) -> None:
+        # Equality remains valid at both boundaries; only a negative interval fails.
+        soak = SoakRun("sh", STUB_ROLLBACK_AT_SLEEP="300", STUB_ROLLBACK_TO="0")
+        result = soak.capture()
+        self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
+        self.assertEqual(soak.gate_and_judge().returncode, 0)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "needs /dev/full to fail a write")
     def test_marker_write_that_fails_publishes_no_marker_even_when_invalid_cannot_be_written(self) -> None:
