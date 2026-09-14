@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod online;
+pub(super) use online::{apply_online_migration, OnlineMigration};
+
 /// The schema migrations every native start requires, each checked on its
 /// own. Add every new migration file here. `Ledger::connect` refuses a
 /// database missing any of them even without `initialize`, so a newer binary
@@ -16,8 +19,11 @@ use std::path::{Path, PathBuf};
 /// binary does not know is accepted with a warning: native migrations are
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
-/// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+/// `require_known_capabilities` refuses again at connect. Once the ledger
+/// has rows, 013 is applied online (`ONLINE_MIGRATIONS`) and recorded after
+/// its last index change, so a start refuses the database until that has
+/// completed.
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -2061,7 +2067,33 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         12,
         include_str!("../../migrations/012_offer_startup_fence.sql"),
     ),
+    (
+        13,
+        include_str!("../../migrations/012_share_ledger_index_trim.sql"),
+    ),
 ];
+
+/// The native migrations `migrate_schema` applies inside its transaction
+/// only while the share ledger is empty. Each creates and drops indexes on
+/// that table and nothing else. Once the ledger has rows it reaches the
+/// source after the commit, statement by statement with `CONCURRENTLY`,
+/// through `apply_online_migration` (see `online.rs`): `CREATE INDEX
+/// CONCURRENTLY` cannot run in a transaction block, and a plain `CREATE
+/// INDEX` on the share ledger would hold every append for the whole build.
+/// Recorded last then, so the startup gate refuses the database until the
+/// indexes are in place. A later transactional migration must not depend on
+/// an online one's indexes: within one run it is applied first.
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13];
+
+/// Whether the share ledger has no rows, in which case an online migration
+/// is applied inside the transaction: there is no append to block.
+async fn ledger_is_empty(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM qbit_share_ledger)")
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
 
 /// The SQL of one native migration, by the version it records.
 fn native_migration(version: i32) -> &'static str {
@@ -2079,8 +2111,13 @@ struct ReleaseDefinitions {
     /// What the native migrations create and the release does not; a
     /// source that already has any of it is refused.
     reserved: ReservedObjects,
-    /// Objects introduced by each requested, missing native migration.
+    /// Objects introduced by each requested, missing native migration
+    /// that is applied inside the transaction.
     native_gaps: BTreeMap<i32, ReservedObjects>,
+    /// The index changes of each requested, missing online migration:
+    /// applied inside the transaction on an empty ledger, and by
+    /// `apply_online_migration` after the commit otherwise.
+    online: BTreeMap<i32, OnlineMigration>,
     /// The schema the source lives in.
     source_schema: String,
 }
@@ -2159,6 +2196,7 @@ async fn release_fingerprint(
     );
     let expected = fingerprint_schema(tx, &scratch).await?;
     let mut native_gaps = BTreeMap::new();
+    let mut online_migrations = BTreeMap::new();
     for (version, sql) in NATIVE_MIGRATIONS {
         let before = if missing_native_versions.contains(version) {
             Some(fingerprint_schema(tx, &scratch).await?)
@@ -2168,6 +2206,15 @@ async fn release_fingerprint(
         sqlx::raw_sql(sql).execute(&mut **tx).await?;
         if let Some(before) = before {
             let after = fingerprint_schema(tx, &scratch).await?;
+            if ONLINE_MIGRATIONS.contains(version) {
+                // Applied to the source from these definitions: inside the
+                // transaction on an empty ledger, after the commit
+                // otherwise. Its names are checked with the other gaps in
+                // the first case, and by the runner in the second, which
+                // adopts an identical earlier build of its own.
+                online_migrations.insert(*version, online::derive(*version, &before, &after)?);
+                continue;
+            }
             let mut reserved = reserved_objects(&after, &before);
             // These migrations leave new tables' constraint indexes and
             // identity/serial sequences unnamed. PostgreSQL chooses another
@@ -2215,6 +2262,7 @@ async fn release_fingerprint(
         release: expected,
         reserved,
         native_gaps,
+        online: online_migrations,
         source_schema,
     })
 }
@@ -2314,25 +2362,53 @@ fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> 
 /// not silently adopt a pre-existing object. Derive each missing step's
 /// names from the same scratch replay used for fresh/2.x sources. Start
 /// with the #258 release: its capability table and storage_version column
-/// may legitimately predate 006, whose dedicated gates validate them.
+/// may legitimately predate 006, whose dedicated gates validate them. A
+/// missing online migration is checked like the others when the ledger is
+/// empty, since it is then applied inside the transaction; otherwise its
+/// names are the runner's to check, which adopts an identical earlier
+/// build of its own, and its derived index changes are returned for the
+/// caller to apply after the commit.
 async fn require_no_native_gap_collisions(
     tx: &mut Transaction<'_, Postgres>,
     versions: &[i32],
-) -> Result<()> {
+    ledger_empty: bool,
+) -> Result<Vec<OnlineMigration>> {
     let missing: Vec<i32> = NATIVE_MIGRATIONS
         .iter()
         .map(|(version, _)| *version)
         .filter(|version| !versions.contains(version))
         .collect();
     if missing.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let base_schema =
         base_schema_transaction_body(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))?;
-    let definitions =
-        release_fingerprint(tx, SourceState::Applied258, &base_schema, &missing).await?;
-    let found = source_fingerprint(tx, &definitions.source_schema).await?;
-    for (version, reserved) in definitions.native_gaps {
+    let ReleaseDefinitions {
+        native_gaps,
+        online,
+        source_schema,
+        ..
+    } = release_fingerprint(tx, SourceState::Applied258, &base_schema, &missing).await?;
+    let found = source_fingerprint(tx, &source_schema).await?;
+    let mut native_gaps = native_gaps;
+    let mut deferred = Vec::new();
+    for (version, migration) in online {
+        if ledger_empty {
+            native_gaps.insert(
+                version,
+                ReservedObjects {
+                    objects: SchemaFingerprint {
+                        indexes: migration.creates,
+                        ..SchemaFingerprint::default()
+                    },
+                    ..ReservedObjects::default()
+                },
+            );
+        } else {
+            deferred.push(migration);
+        }
+    }
+    for (version, reserved) in native_gaps {
         let mut present = objects_present(&reserved.objects, &found);
         present.extend(columns_present(&reserved.columns, &found));
         for (table, names) in &reserved.constraints {
@@ -2350,7 +2426,7 @@ async fn require_no_native_gap_collisions(
             named_objects(&present)
         );
     }
-    Ok(())
+    Ok(deferred)
 }
 
 /// The source schema as it is now, without the migrator's own version
@@ -2602,12 +2678,15 @@ async fn require_migration_history(connection: &mut sqlx::PgConnection) -> Resul
 /// Apply the base schema and every native migration inside the caller's
 /// transaction, which holds the migration lock throughout. Refusals happen
 /// before any DDL or roll the transaction back, so a refused database is
-/// unchanged.
+/// unchanged. The online migrations (`ONLINE_MIGRATIONS`) are applied here
+/// only while the share ledger is empty; otherwise what they change is
+/// returned for the caller to apply with `apply_online_migration` after the
+/// commit, and they are recorded then.
 pub(super) async fn migrate_schema(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: &str,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<()> {
+) -> Result<Vec<OnlineMigration>> {
     lock(tx, MIGRATION_LOCK, metrics).await?;
     require_source_schema_resolution(tx).await?;
     let history_exists: bool =
@@ -2643,6 +2722,9 @@ pub(super) async fn migrate_schema(
     // `candidate_storage_version` the database declared before 006 declares
     // one for it.
     let mut source: (Option<SourceState>, Option<i32>) = (None, None);
+    // The online migrations this run must apply after the commit, from the
+    // definitions the scratch apply rendered.
+    let mut online = Vec::new();
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting.
@@ -2678,12 +2760,30 @@ pub(super) async fn migrate_schema(
         // The release definitions and the reserved native objects, taken
         // once under a savepoint and rolled back before the source is
         // touched.
+        // A fresh source has no ledger yet, and a 2.x.x one without shares
+        // has an empty one: an online migration is applied below inside
+        // this transaction there, so its definitions are derived only for
+        // a ledger with rows, where they drive the build after the commit.
+        let ledger_empty = match state {
+            SourceState::Fresh => true,
+            SourceState::Pre258 | SourceState::Applied258 => ledger_is_empty(tx).await?,
+        };
+        let pending_online: Vec<i32> = if ledger_empty {
+            Vec::new()
+        } else {
+            ONLINE_MIGRATIONS
+                .iter()
+                .copied()
+                .filter(|version| !versions.contains(version))
+                .collect()
+        };
         let ReleaseDefinitions {
             release: expected,
             reserved,
             source_schema,
+            online: pending,
             ..
-        } = release_fingerprint(tx, state, &base_schema, &[]).await?;
+        } = release_fingerprint(tx, state, &base_schema, &pending_online).await?;
         let found = source_fingerprint(tx, &source_schema).await?;
         if state == SourceState::Fresh {
             // No share ledger and no 002 object: fresh only if nothing else
@@ -2698,6 +2798,8 @@ pub(super) async fn migrate_schema(
         // 001 repaired what it re-asserts; what it skipped must already be
         // the release definition before any native DDL alters those tables.
         require_release_schema(tx, state, &expected, &source_schema).await?;
+        // Its reserved names were checked with the others above.
+        online.extend(pending.into_values());
         if !versions.contains(&2) {
             sqlx::raw_sql(native_migration(2))
                 .execute(&mut **tx)
@@ -2762,7 +2864,8 @@ pub(super) async fn migrate_schema(
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }
-        require_no_native_gap_collisions(tx, &versions).await?;
+        let ledger_empty = ledger_is_empty(tx).await?;
+        online.extend(require_no_native_gap_collisions(tx, &versions, ledger_empty).await?);
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(native_migration(4))
@@ -2884,7 +2987,23 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
-    Ok(())
+    // An online migration on an empty ledger: nothing to block, so it is
+    // applied here like the others. With rows in the ledger it was returned
+    // above for the caller to apply after the commit, index by index with
+    // CONCURRENTLY, and it is recorded then.
+    for version in ONLINE_MIGRATIONS {
+        if versions.contains(version) || online.iter().any(|pending| pending.version == *version) {
+            continue;
+        }
+        sqlx::raw_sql(native_migration(*version))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES($1)")
+            .bind(version)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(online)
 }
 
 /// Refuse any instance that has not explicitly shut down, including one

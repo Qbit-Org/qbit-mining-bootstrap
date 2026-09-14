@@ -225,8 +225,16 @@ impl Ledger {
             .await?;
         if initialize {
             let mut tx = begin(&pool, metrics.as_deref()).await?;
-            migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
+            let online =
+                migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
             tx.commit().await?;
+            // Index rebuilds run after the commit, outside any transaction
+            // and with CONCURRENTLY, so appends continue; each is recorded
+            // once it has completed, and the gate below refuses the
+            // database until then.
+            for pending in &online {
+                migration::apply_online_migration(&pool, pending, metrics.as_deref()).await?;
+            }
         }
         // The startup gate. Every start, with or without `initialize`, reads
         // the schema version and the declared capabilities before any

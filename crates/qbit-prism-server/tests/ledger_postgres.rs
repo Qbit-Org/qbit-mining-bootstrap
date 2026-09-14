@@ -25,6 +25,9 @@ mod session_sequence;
 #[path = "support/fatal_state.rs"]
 mod fatal_state;
 
+#[path = "support/index_trim.rs"]
+mod index_trim;
+
 struct Database {
     admin: PgPool,
     schema: String,

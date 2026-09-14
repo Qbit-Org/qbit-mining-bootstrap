@@ -102,7 +102,7 @@ fn live_sql_stays_pinned_to_the_frozen_2x_release() {
              release: {:?}). The migrator applies this file to every 2.x.x database, so its DDL \
              must stay identical to tests/fixtures/schema_2x/001_share_ledger.sql. Revert the DDL \
              change here and put it in a new numbered migration under \
-             crates/qbit-prism-server/migrations/ (011 is next; 007, 008, 009 and 010 are taken), then add it to \
+             crates/qbit-prism-server/migrations/ (013 is next; 007 to 012 are taken), then add it to \
              REQUIRED_SCHEMA_VERSIONS in src/ledger/migration.rs",
             index + 1,
             live.get(index).map(String::as_str).unwrap_or("<end of file>"),
@@ -3595,6 +3595,7 @@ async fn undo_006(earlier: &Ledger, pool: &PgPool, state: SourceState) -> Result
 /// 011 replaced come back as 001 wrote them, or as #258's dual-format rule on
 /// such a source; and the carry-forward validator is 001's again.
 async fn undo_011(pool: &PgPool, state: SourceState) -> Result<()> {
+    super::index_trim::undo_012(pool).await?;
     sqlx::raw_sql(
         "ALTER TABLE qbit_prism_instances DROP CONSTRAINT qbit_prism_instances_offer_startup; DELETE FROM qbit_prism_schema_capabilities WHERE capability='instance_offer_startup'; DELETE FROM qbit_prism_schema_migrations WHERE version IN (11,12); \
          DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'; \
