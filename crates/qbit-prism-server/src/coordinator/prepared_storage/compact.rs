@@ -95,6 +95,8 @@ impl CanonicalCompactBalances {
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::coordinator) enum IncompatibleCompactBuild {
+    #[error("original compact window reference differs from snapshot bounds")]
+    WindowSnapshotMismatch,
     #[error("original compact build balances are not in canonical order")]
     NonCanonicalBalances,
     #[error("original bundle balances differ from compact build inputs")]
@@ -351,6 +353,30 @@ impl Coordinator {
                 #[cfg(test)]
                 if let Some(probe) = &original_source.capture_probe {
                     probe.block();
+                }
+                // Check the original handoff's cheap structural identity, not
+                // a recomputed replacement hash. A false empty range would
+                // otherwise discard the original audit and hydrate no shares.
+                let snapshot = &original_source.stored.snapshot;
+                let expected_range = match (snapshot.shares.first(), snapshot.shares.last()) {
+                    (Some(first), Some(last)) => Some((
+                        first.share_seq,
+                        last.share_seq,
+                        u64::try_from(snapshot.shares.len())?,
+                    )),
+                    _ => None,
+                };
+                let supplied_range = original_source.window.shares.map(|range| {
+                    (
+                        range.first_share_seq,
+                        range.last_share_seq,
+                        range.share_count,
+                    )
+                });
+                if original_source.window.anchor_ms != snapshot.anchor_ms
+                    || supplied_range != expected_range
+                {
+                    return Err(IncompatibleCompactBuild::WindowSnapshotMismatch.into());
                 }
                 // The original build must already have used canonical input.
                 // Sorting here would silently change a completed audit's hash.

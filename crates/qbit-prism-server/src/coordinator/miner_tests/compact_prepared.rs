@@ -336,6 +336,87 @@ async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_
 }
 
 #[tokio::test]
+async fn capture_rejects_mismatched_original_window_without_changing_identity() {
+    use crate::coordinator::prepared_storage::compact::CompactDropProbe;
+    let runtime_thread = std::thread::current().id();
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    let original = f.coordinator.prepared.read().await.clone().unwrap();
+    let original_bytes = serde_json::to_vec(original.bundle.as_ref().unwrap()).unwrap();
+    for mismatch in [
+        "anchor",
+        "missing range",
+        "unexpected range",
+        "first",
+        "last",
+        "count",
+    ] {
+        let mut window = original.window;
+        let mut snapshot = (*original.snapshot).clone();
+        match mismatch {
+            "anchor" => window.anchor_ms += 1,
+            "missing range" => window.shares = None,
+            "unexpected range" => snapshot.shares.clear(),
+            "first" => window.shares.as_mut().unwrap().first_share_seq += 1,
+            "last" => window.shares.as_mut().unwrap().last_share_seq += 1,
+            _ => window.shares.as_mut().unwrap().share_count += 1,
+        }
+        let source = OriginalPreparedBuild::from_original_build(
+            format!("prepared:mismatched:{}", uuid::Uuid::new_v4().simple()),
+            Arc::new(StoredPrepared {
+                snapshot: Arc::new(snapshot),
+                template: original.template.clone(),
+                bundle: original.bundle.clone(),
+                fee: original.fee,
+                fingerprint: original.fingerprint.clone(),
+                generation: original.generation,
+                parent_of_tip: original.parent_of_tip.clone(),
+                coinbase_suffix: original.stored.coinbase_suffix.clone(),
+            }),
+            window,
+            original.inputs.clone(),
+        );
+        let (dropped, receive) = tokio::sync::oneshot::channel();
+        let release = ReleaseProbe(Arc::new(prepared_storage::RepairProbe::default()));
+        let source = OriginalPreparedBuild::with_drop_probe(
+            source,
+            CompactDropProbe {
+                dropped: Some(dropped),
+                release: release.0.clone(),
+                runtime_thread,
+            },
+        );
+        let capture = tokio::spawn({
+            let c = f.coordinator.clone();
+            async move { c.capture_compact_prepared(source, 130_000).await }
+        });
+        let dropped_on = tokio::time::timeout(Duration::from_secs(5), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(dropped_on, runtime_thread);
+        assert_eq!(f.coordinator.build_slots.available_permits(), 0);
+        release.0.release();
+        let Err(error) = capture.await.unwrap() else {
+            panic!("{mismatch}: mismatched original window was accepted")
+        };
+        assert!(matches!(
+            error.downcast::<IncompatibleCompactBuild>().unwrap(),
+            IncompatibleCompactBuild::WindowSnapshotMismatch
+        ));
+        assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+        assert_eq!(
+            serde_json::to_vec(original.bundle.as_ref().unwrap()).unwrap(),
+            original_bytes
+        );
+    }
+    assert!(f.store.compact.save_calls.lock().unwrap().is_empty());
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &original
+    ));
+}
+
+#[tokio::test]
 async fn fresh_capture_saves_without_publication_and_preserves_inline_conflicts() {
     for empty in [false, true] {
         let mut f = Fixture::new(Duration::from_secs(10)).await;
