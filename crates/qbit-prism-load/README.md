@@ -339,15 +339,22 @@ target/release/qbit-prism-load \
 |---|---|
 | 0 | The run completed and reconciled exactly |
 | 2 | The harness failed before it could measure anything |
-| 3 | Blocked: no frontend served work, or a log showed a refusal |
+| 3 | Blocked: no frontend served work, or a log showed a refusal. Only the side report is written, and an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
-| 6 | The run was aborted: the memory floor was crossed, a frontend exited, or the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin. No `capacity-evidence.json` is written, and one left by an earlier run in the same `--out` is removed, so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
+| 6 | The run was aborted: the memory floor was crossed, a frontend exited, or the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 
 ## Outputs
 
-`--out` receives four things.
+`--out` receives four things. Each invocation takes the directory for itself
+first: any `capacity-evidence.json`, `database-profile.json` or
+`load-harness-report.json` an earlier run left there is removed before
+anything else happens, and the side report lists what was removed under
+`stale_outputs_removed`. So however this invocation ends -- blocked before a
+frontend served work, aborted mid-run, failed before it measured, or complete
+-- the directory holds only this invocation's outputs, and never an earlier
+run's self-validating artifact beside this run's blocked or aborted report.
 
 ### 1. `capacity-evidence.json`
 

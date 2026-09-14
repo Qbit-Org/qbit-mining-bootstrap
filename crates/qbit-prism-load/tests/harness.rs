@@ -1362,6 +1362,60 @@ fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()>
     Ok(())
 }
 
+/// The abort path withholds the artifact and removes a stale one, but the
+/// blocked path writes only a side report, and a run that fails before it
+/// measures writes nothing. Reusing a default `--out` after a successful run
+/// then left that run's self-validating artifact and profile beside a fresh
+/// blocked report. The honest fix is one obligation at entry: an invocation
+/// that takes the directory removes every earlier output first, so no exit
+/// path can leave evidence it did not produce.
+#[test]
+fn an_invocation_removes_the_previous_run_s_outputs_when_it_takes_the_directory() -> Result<()> {
+    use qbit_prism_load::report::{claim_out_dir, OUTPUTS};
+    let dir = ScratchDir::new("claim-out");
+    let out = dir.path().join("out");
+    assert_eq!(
+        OUTPUTS,
+        [
+            "capacity-evidence.json",
+            "database-profile.json",
+            "load-harness-report.json"
+        ],
+        "the three documents a run writes are the three an invocation clears"
+    );
+
+    // A fresh directory is created and nothing is reported removed.
+    assert!(claim_out_dir(&out)?.is_empty());
+    assert!(out.is_dir());
+
+    // A previous run's outputs, plus a log the frontends manage themselves.
+    for name in OUTPUTS {
+        std::fs::write(out.join(name), b"{\"schema\": \"an earlier run\"}")?;
+    }
+    std::fs::create_dir_all(out.join("logs"))?;
+    std::fs::write(out.join("logs/load-fe-0.stderr.log"), b"earlier log\n")?;
+
+    let removed = claim_out_dir(&out)?;
+    assert_eq!(
+        removed, OUTPUTS,
+        "every earlier output is removed and named"
+    );
+    for name in OUTPUTS {
+        assert!(!out.join(name).exists(), "{name} survived");
+    }
+    assert!(
+        out.join("logs/load-fe-0.stderr.log").exists(),
+        "the logs are the frontends' to start empty, not this step's"
+    );
+
+    // A partial leftover -- the artifact alone, as an interrupted copy might
+    // leave -- is removed and reported by name.
+    std::fs::write(out.join("capacity-evidence.json"), b"{}")?;
+    assert_eq!(claim_out_dir(&out)?, ["capacity-evidence.json"]);
+    assert!(claim_out_dir(&out)?.is_empty());
+    Ok(())
+}
+
 #[test]
 fn removing_one_required_field_or_one_phase_invalidates_the_artifact() -> Result<()> {
     let inputs = sample_inputs();

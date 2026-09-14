@@ -189,8 +189,11 @@ pub async fn execute(args: Args) -> Result<i32> {
     let payout_address = format!("{address_prefix}{run_tag}");
     let share_prefix = format!("{payout_address}.");
 
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("creating {}", args.out.display()))?;
+    // Whatever this invocation ends as -- blocked, aborted, failed before it
+    // measured, or complete -- nothing an earlier run wrote may outlive it in
+    // the directory, so the earlier outputs go now rather than on each exit
+    // path separately.
+    let stale_outputs_removed = report::claim_out_dir(&args.out)?;
     let log_dir = args.out.join("logs");
     std::fs::create_dir_all(&log_dir)?;
 
@@ -287,6 +290,7 @@ pub async fn execute(args: Args) -> Result<i32> {
             node_state,
             direct_url: direct_url.clone(),
             log_dir,
+            stale_outputs_removed,
             declared_replication: replication,
             managed_standby: managed.as_ref().and_then(|m| m.standby_url.clone()),
             pg_stat_statements: managed
@@ -325,6 +329,8 @@ struct RunContext {
     node_state: Arc<crate::node::NodeState>,
     direct_url: String,
     log_dir: PathBuf,
+    /// The earlier run's outputs removed from `--out` at entry, by name.
+    stale_outputs_removed: Vec<String>,
     declared_replication: Replication,
     managed_standby: Option<String>,
     pg_stat_statements: String,
@@ -1152,6 +1158,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "submits_outstanding_at_stop": undrained,
         },
         "validator": validator_block(&evidence, args, slowest_rate, worst_p99),
+        "stale_outputs_removed": ctx.stale_outputs_removed,
     });
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
@@ -2203,6 +2210,7 @@ async fn finish_blocked(
             "environment": frontend::redacted(&child.environment),
         })).collect::<Vec<_>>(),
         "host": measure::host_facts(),
+        "stale_outputs_removed": ctx.stale_outputs_removed,
     });
     report::write_json(&report_path, &document)?;
     eprintln!("run blocked: {error}");

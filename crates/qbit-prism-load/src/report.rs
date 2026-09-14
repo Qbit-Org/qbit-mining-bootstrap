@@ -70,6 +70,45 @@ pub fn honest_value_notes() -> Value {
     ])
 }
 
+/// The documents a run writes into `--out`, each of which makes a claim about
+/// the run that produced it: the self-validating artifact, the profile its
+/// digest names, and the side report.
+pub const OUTPUTS: &[&str] = &[
+    "capacity-evidence.json",
+    "database-profile.json",
+    "load-harness-report.json",
+];
+
+/// Take `out` for this invocation: create it, and remove any of [`OUTPUTS`]
+/// an earlier invocation left there. Returns the names removed, so the side
+/// report can say what was cleared.
+///
+/// This happens once, at entry, rather than on each exit path, because every
+/// exit path has the same obligation and only the successful one rewrites all
+/// three documents. A blocked run writes only the side report, an aborted
+/// run withholds the artifact, and a run that fails before it measures
+/// writes nothing; each would otherwise leave an earlier run's artifact and
+/// profile standing beside this run's outcome, or beside no outcome, looking
+/// like evidence for a run that did not produce them (EP-OBSERVABILITY).
+/// The frontend logs are not touched here: `Frontend::launch` starts each
+/// one empty itself.
+pub fn claim_out_dir(out: &Path) -> Result<Vec<String>> {
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut removed = Vec::new();
+    for name in OUTPUTS {
+        let path = out.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push((*name).to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing an earlier run's {}", path.display()))
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Write a JSON document with a trailing newline.
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     let mut text = serde_json::to_string_pretty(value)?;
