@@ -323,7 +323,7 @@ target/release/qbit-prism-load \
 | 3 | Blocked: no frontend served work, or a log showed a refusal |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
-| 6 | The run was aborted, by a signal or by the memory floor |
+| 6 | The run was aborted: the memory floor was crossed, or a frontend exited. No `capacity-evidence.json` is written, and one left by an earlier run in the same `--out` is removed, so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 
 ## Outputs

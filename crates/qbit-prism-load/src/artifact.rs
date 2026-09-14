@@ -177,6 +177,62 @@ pub fn build(inputs: &ArtifactInputs) -> Result<Value> {
     Ok(document)
 }
 
+/// What became of the capacity-evidence artifact at the end of a run.
+#[derive(Clone, Debug)]
+pub enum Evidence {
+    /// The run completed: the artifact was built, written and validated.
+    Written {
+        path: std::path::PathBuf,
+        document: Value,
+        verdict: Verdict,
+        command: String,
+    },
+    /// The run aborted: no artifact is written, and any artifact an earlier
+    /// run left at the same path is removed so nothing self-validating
+    /// survives an abort.
+    Withheld {
+        reason: String,
+        stale_artifact_removed: bool,
+    },
+}
+
+/// Build, write and validate the artifact, or withhold it if the run
+/// aborted. An aborted run can have fewer than the required phases, or a
+/// partial phase that looks complete, and either way its numbers are not
+/// capacity evidence; the side report still carries them, marked aborted.
+pub fn write_or_withhold(
+    inputs: &ArtifactInputs,
+    aborted: Option<&str>,
+    out: &std::path::Path,
+    server_bin: &str,
+) -> Result<Evidence> {
+    let path = out.join("capacity-evidence.json");
+    if let Some(reason) = aborted {
+        let stale_artifact_removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing stale {}", path.display()))
+            }
+        };
+        return Ok(Evidence::Withheld {
+            reason: format!("the run aborted: {reason}"),
+            stale_artifact_removed,
+        });
+    }
+    let document = build(inputs)?;
+    crate::report::write_json(&path, &document)?;
+    let options = validation_options(inputs);
+    let verdict = verdict(&document, &options);
+    let command = cli_command(inputs, &path.display().to_string(), server_bin);
+    Ok(Evidence::Written {
+        path,
+        document,
+        verdict,
+        command,
+    })
+}
+
 /// The options the harness validates its own artifact with: the exact
 /// configuration, subject, forecast and limit the run used.
 pub fn validation_options(inputs: &ArtifactInputs) -> ValidationOptions {

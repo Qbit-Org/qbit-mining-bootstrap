@@ -109,6 +109,9 @@ impl Collected {
 
 struct PhaseRun {
     plan: PhasePlan,
+    /// False for the phase an abort cut short: its numbers cover only the
+    /// part that ran.
+    completed: bool,
     started_wall: chrono::DateTime<chrono::Utc>,
     ended_wall: chrono::DateTime<chrono::Utc>,
     duration_millis: u64,
@@ -650,6 +653,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .collect();
         runs.push(PhaseRun {
             plan: plan.clone(),
+            completed: outcome.aborted.is_none(),
             started_wall,
             ended_wall,
             duration_millis: ended.saturating_duration_since(started).as_millis() as u64,
@@ -913,16 +917,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         ),
         phases: phase_evidence.clone(),
     };
-    let document = artifact::build(&inputs)?;
-    let evidence_path = args.out.join("capacity-evidence.json");
-    report::write_json(&evidence_path, &document)?;
-    let options = artifact::validation_options(&inputs);
-    let verdict = artifact::verdict(&document, &options);
-    let command = artifact::cli_command(
+    // An aborted run gets no artifact: its evidence is incomplete however
+    // complete a partial phase looks, and `artifact::build` would refuse a
+    // run that never reached all three required phases anyway (EP-ERRORS).
+    // The side report below still carries every number, marked aborted.
+    let evidence = artifact::write_or_withhold(
         &inputs,
-        &evidence_path.display().to_string(),
+        aborted.as_deref(),
+        &args.out,
         &ctx.server_bin.display().to_string(),
-    );
+    )?;
 
     // --- side report ------------------------------------------------------
     let slowest_rate = phase_evidence
@@ -1112,27 +1116,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                      outstanding here is a genuine lost acknowledgement",
             "submits_outstanding_at_stop": undrained,
         },
-        "validator": {
-            "verdict": verdict,
-            "command": command,
-            "artifact_path": evidence_path.display().to_string(),
-            "forecast_used": args.forecast_peak_shares_per_second,
-            "slowest_artifact_phase_rate_shares_per_second": slowest_rate,
-            "suggested_forecast_for_a_valid_artifact": (slowest_rate / 2.0).max(0.0),
-            "ack_p99_limit_used_milliseconds": args.ack_p99_limit_ms,
-            "worst_artifact_phase_ack_p99_milliseconds": worst_p99,
-            "suggested_ack_p99_limit_milliseconds": worst_p99.map(|p99| {
-                // Round up to the next 100 ms, and never above the commit
-                // timeout the consumer checks against.
-                ((p99 / 100.0).ceil() * 100.0).min(args.share_commit_timeout_seconds * 1000.0)
-            }),
-        },
+        "validator": validator_block(&evidence, args, slowest_rate, worst_p99),
     });
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
 
     // --- exit code --------------------------------------------------------
-    println!("{}", summary_text(&side_report, &verdict, &command));
+    println!("{}", summary_text(&side_report, &evidence));
     for mut child in frontends {
         child.kill();
     }
@@ -1967,6 +1957,7 @@ fn phase_report(
     json!({
         "name": phase.plan.name,
         "in_artifact": phase.plan.in_artifact,
+        "completed": phase.completed,
         "started_at": phase.started_wall.to_rfc3339(),
         "ended_at": phase.ended_wall.to_rfc3339(),
         "duration_seconds": seconds,
@@ -2171,7 +2162,59 @@ async fn finish_blocked(
     Ok(EXIT_BLOCKED)
 }
 
-fn summary_text(report: &Value, verdict: &artifact::Verdict, command: &str) -> String {
+/// The side report's `validator` block: the verdict and the reproducing
+/// command when an artifact was written, and the reason when it was not.
+fn validator_block(
+    evidence: &artifact::Evidence,
+    args: &Args,
+    slowest_rate: f64,
+    worst_p99: Option<f64>,
+) -> Value {
+    let mut block = match evidence {
+        artifact::Evidence::Written {
+            path,
+            verdict,
+            command,
+            ..
+        } => json!({
+            "artifact_written": true,
+            "verdict": verdict,
+            "command": command,
+            "artifact_path": path.display().to_string(),
+        }),
+        artifact::Evidence::Withheld {
+            reason,
+            stale_artifact_removed,
+        } => json!({
+            "artifact_written": false,
+            "withheld_reason": reason,
+            "stale_artifact_removed": stale_artifact_removed,
+            "verdict": Value::Null,
+            "command": Value::Null,
+            "artifact_path": Value::Null,
+        }),
+    };
+    let suggestions = json!({
+        "forecast_used": args.forecast_peak_shares_per_second,
+        "slowest_artifact_phase_rate_shares_per_second": slowest_rate,
+        "suggested_forecast_for_a_valid_artifact": (slowest_rate / 2.0).max(0.0),
+        "ack_p99_limit_used_milliseconds": args.ack_p99_limit_ms,
+        "worst_artifact_phase_ack_p99_milliseconds": worst_p99,
+        "suggested_ack_p99_limit_milliseconds": worst_p99.map(|p99| {
+            // Round up to the next 100 ms, and never above the commit
+            // timeout the consumer checks against.
+            ((p99 / 100.0).ceil() * 100.0).min(args.share_commit_timeout_seconds * 1000.0)
+        }),
+    });
+    if let (Some(block), Some(suggestions)) = (block.as_object_mut(), suggestions.as_object()) {
+        for (key, value) in suggestions {
+            block.insert(key.clone(), value.clone());
+        }
+    }
+    block
+}
+
+fn summary_text(report: &Value, evidence: &artifact::Evidence) -> String {
     let mut text = String::new();
     text.push_str("=== qbit-prism-load ===\n");
     for phase in report["phases"].as_array().into_iter().flatten() {
@@ -2202,16 +2245,25 @@ fn summary_text(report: &Value, verdict: &artifact::Verdict, command: &str) -> S
             phase["shortfall"].as_u64().unwrap_or_default(),
         ));
     }
-    text.push_str(&format!(
-        "artifact verdict: {}\n",
-        if verdict.valid {
-            verdict.summary.clone().unwrap_or_default()
-        } else {
-            format!("INVALID: {}", verdict.error_chain.join(": "))
+    match evidence {
+        artifact::Evidence::Written {
+            verdict, command, ..
+        } => {
+            text.push_str(&format!(
+                "artifact verdict: {}\n",
+                if verdict.valid {
+                    verdict.summary.clone().unwrap_or_default()
+                } else {
+                    format!("INVALID: {}", verdict.error_chain.join(": "))
+                }
+            ));
+            text.push_str("validate with:\n");
+            text.push_str(command);
+            text.push('\n');
         }
-    ));
-    text.push_str("validate with:\n");
-    text.push_str(command);
-    text.push('\n');
+        artifact::Evidence::Withheld { reason, .. } => {
+            text.push_str(&format!("artifact withheld: {reason}\n"));
+        }
+    }
     text
 }

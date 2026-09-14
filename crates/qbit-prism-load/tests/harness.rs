@@ -1163,6 +1163,74 @@ fn the_artifact_builder_produces_evidence_the_validator_accepts() -> Result<()> 
     Ok(())
 }
 
+/// An aborted run must not leave a qualification artifact behind. Crossing
+/// the memory floor or losing a frontend only broke out of the phase loop,
+/// and execution continued into artifact generation: an abort before the
+/// three required phases made `artifact::build` error out before the side
+/// report was written, and an abort during a long `slow_database` phase
+/// emitted the partial phase as `completed: true`. The artifact step now
+/// withholds the file on abort and removes a stale one at the same path.
+#[test]
+fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()> {
+    use qbit_prism_load::artifact::{write_or_withhold, Evidence};
+    let dir = ScratchDir::new("withhold");
+    let path = dir.path().join("capacity-evidence.json");
+    std::fs::write(
+        &path,
+        b"{\"schema\": \"stale artifact from an earlier run\"}",
+    )?;
+    let inputs = sample_inputs();
+
+    let withheld = write_or_withhold(
+        &inputs,
+        Some("MemAvailable fell to 512 MiB, below the 4096 MiB floor"),
+        dir.path(),
+        "qbit-prism-server",
+    )?;
+    let Evidence::Withheld {
+        reason,
+        stale_artifact_removed,
+    } = withheld
+    else {
+        panic!("an aborted run must not write an artifact");
+    };
+    assert!(reason.contains("aborted"), "{reason}");
+    assert!(reason.contains("MemAvailable"), "{reason}");
+    assert!(
+        stale_artifact_removed,
+        "the earlier run's artifact is removed"
+    );
+    assert!(!path.exists(), "nothing self-validating survives the abort");
+
+    // Aborting with nothing to remove says so, rather than claiming a removal.
+    let Evidence::Withheld {
+        stale_artifact_removed,
+        ..
+    } = write_or_withhold(&inputs, Some("load-fe-1 exited"), dir.path(), "srv")?
+    else {
+        panic!("still withheld");
+    };
+    assert!(!stale_artifact_removed);
+
+    // Even inputs that would build a valid artifact are withheld on abort:
+    // the same inputs, not aborted, are written and validate.
+    let Evidence::Written {
+        path: written,
+        verdict,
+        command,
+        document,
+    } = write_or_withhold(&inputs, None, dir.path(), "qbit-prism-server")?
+    else {
+        panic!("a completed run writes its artifact");
+    };
+    assert_eq!(written, path);
+    assert!(path.exists());
+    assert!(verdict.valid, "{:?}", verdict.error_chain);
+    assert!(command.contains("capacity-evidence"));
+    assert_eq!(document["artifact_kind"], "qualification");
+    Ok(())
+}
+
 #[test]
 fn removing_one_required_field_or_one_phase_invalidates_the_artifact() -> Result<()> {
     let inputs = sample_inputs();
