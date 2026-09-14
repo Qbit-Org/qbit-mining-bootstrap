@@ -373,7 +373,7 @@ target/release/qbit-prism-load \
 | Code | Meaning |
 |---|---|
 | 0 | The run completed and reconciled exactly |
-| 2 | The harness failed with an error: before it could measure anything, or, rarely, while reconciling or writing its outputs after the load. Once the invocation has taken `--out`, the side report is written with `failed.error` naming the failure and nothing that could be read as a measurement; a failure after the phases does not recover their numbers. No artifact is written |
+| 2 | The harness failed with an error: before it could measure anything, or, rarely, while reconciling or writing its outputs after the load. The error is printed on stderr, redacted. Once the invocation has taken `--out`, the side report is written with `failed.error` naming the failure and nothing that could be read as a measurement; a failure after the phases does not recover their numbers. No artifact is written |
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, a committed share was never acknowledged and nothing explains it, or PostgreSQL holds a run-prefixed row that no phase offered |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share whose acknowledgement never reached the client. The server refused it with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324), or the submit got no response because the socket closed before its answer was read (`no_response_commits`). Nothing was lost in any of the three |
@@ -451,10 +451,16 @@ restart is reported the same way rather than as a negative number.
 The frontend environment is printed redacted, here and in
 `database-profile.json`: the RPC password and the signing seeds are replaced
 outright, and any URL-valued variable loses the password in its userinfo and
-the value of any `password` query parameter. So a `--database-url` of
+the value of any `password` query parameter, the parameter's key compared
+percent-decoded as SQLx reads it. So a `--database-url` of
 `postgresql://user:secret@host/db` is recorded as
 `postgresql://user:<redacted>@host/db`, and the same rule covers every other
-URL the harness records.
+URL the harness records. The free-text sinks redact as well, whatever their
+sources did: a failure report's `failed.error` and the error the harness
+prints on stderr have every URL-shaped token and every libpq `password=`
+value redacted, and so does every `pg_settings` value in
+`database-profile.json`, because `primary_conninfo` on a promoted standby
+carries a password and a superuser sees it unmasked.
 
 ### 4. Logs
 

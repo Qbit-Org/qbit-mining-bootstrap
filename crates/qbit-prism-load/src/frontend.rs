@@ -256,6 +256,74 @@ pub fn redact_url_secrets(value: &str) -> String {
     format!("{scheme}://{authority}{tail}")
 }
 
+/// Redact every secret a piece of free text may carry: each URL-shaped
+/// token through [`redact_url_secrets`], and the value of each libpq
+/// keyword/value `password=...` (or any key ending in `password`, such as
+/// `sslpassword`), bare or single-quoted. For text whose shape nobody
+/// controls and which is about to be written out -- an error chain, a
+/// `pg_settings` value -- so a sink can redact what its sources forgot to.
+/// The round-trip error that embedded the whole `--database-url` reached
+/// the failure report through exactly such a sink (EP-OBSERVABILITY).
+/// Text with nothing to redact is returned unchanged, and the function is
+/// idempotent.
+pub fn redact_secrets_in_text(text: &str) -> String {
+    // Pass one: every whitespace-delimited token that looks like a URL.
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (token, after) = rest.split_at(end);
+        if token.contains("://") {
+            out.push_str(&redact_url_secrets(token));
+        } else {
+            out.push_str(token);
+        }
+        let space_end = after
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(after.len());
+        out.push_str(&after[..space_end]);
+        rest = &after[space_end..];
+    }
+    // Pass two: libpq keyword/value pairs. The key is the run of word
+    // characters before an `=`; one ending in `password` names a secret.
+    let text = out;
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let bytes = text.as_bytes();
+    while index < bytes.len() {
+        let Some(offset) = text[index..].find('=') else {
+            out.push_str(&text[index..]);
+            break;
+        };
+        let equals = index + offset;
+        let key_start = text[index..equals]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(index, |at| index + at + 1);
+        let key = &text[key_start..equals];
+        out.push_str(&text[index..=equals]);
+        index = equals + 1;
+        if !key.to_ascii_lowercase().ends_with("password") || index >= bytes.len() {
+            continue;
+        }
+        let value_end = if bytes[index] == b'\'' {
+            // Single-quoted, with backslash escapes, as libpq reads it.
+            let mut at = index + 1;
+            while at < bytes.len() && bytes[at] != b'\'' {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            (at + 1).min(bytes.len())
+        } else {
+            index
+                + text[index..]
+                    .find(|c: char| c.is_whitespace() || c == '&' || c == '#')
+                    .unwrap_or(bytes.len() - index)
+        };
+        out.push_str(REDACTED);
+        index = value_end;
+    }
+    out
+}
+
 /// Decode `%XX` escapes and `+` in one query-string component, as a
 /// form-encoded reader does; an escape that is not two hex digits is kept
 /// as written, the way SQLx's decoder keeps it. This is how SQLx reads a

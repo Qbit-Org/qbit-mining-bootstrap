@@ -71,6 +71,15 @@ pub fn write_document(path: &std::path::Path, canonical: &str) -> Result<()> {
 }
 
 /// `SHOW ALL`, as a name to setting map plus the units the server reports.
+///
+/// Every value goes through `redact_secrets_in_text`. A setting is free text
+/// PostgreSQL does not mask for a superuser, and some carry credentials:
+/// `primary_conninfo` on a promoted standby is a libpq string with
+/// `password=`, and `archive_command`, `restore_command` or
+/// `ssl_passphrase_command` can embed a URL. The profile is shipped beside
+/// the artifact for a third party to verify, so it must not be the file
+/// that carries the database password (EP-OBSERVABILITY). A value with no
+/// secret in it is written as PostgreSQL reports it.
 pub async fn show_all(pool: &PgPool) -> Result<Value> {
     let rows = sqlx::query("SELECT name, setting, COALESCE(unit,'') AS unit FROM pg_settings")
         .fetch_all(pool)
@@ -80,6 +89,7 @@ pub async fn show_all(pool: &PgPool) -> Result<Value> {
         let name: String = row.try_get("name")?;
         let setting: String = row.try_get("setting")?;
         let unit: String = row.try_get("unit")?;
+        let setting = crate::frontend::redact_secrets_in_text(&setting);
         settings.insert(name, json!({"setting": setting, "unit": unit}));
     }
     Ok(Value::Object(settings))

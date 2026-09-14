@@ -673,6 +673,60 @@ fn a_percent_encoded_password_key_is_redacted_as_sqlx_reads_it() {
     assert_eq!(frontend::percent_decode("a+b%2"), "a b%2");
 }
 
+/// The free-text sinks -- the failure report's error, the stderr print, the
+/// `pg_settings` values in the profile -- redact whatever their sources
+/// forgot to: every URL-shaped token, and every libpq `password=` value,
+/// bare or quoted. Text with no secret is untouched, and redacting twice
+/// changes nothing.
+#[test]
+fn free_text_sinks_redact_urls_and_libpq_passwords() {
+    let password = "hunter2-Sup3r_Secret";
+    let cases = [
+        (
+            format!("timing a round trip: connect: postgresql://alex:{password}@db:5432/q?a=1 x"),
+            "timing a round trip: connect: postgresql://alex:<redacted>@db:5432/q?a=1 x",
+        ),
+        (
+            format!("one postgresql://u:{password}@h/d\nand two https://s:{password}@api/v#f"),
+            "one postgresql://u:<redacted>@h/d\nand two https://s:<redacted>@api/v#f",
+        ),
+        (
+            format!("host=127.0.0.1 port=5432 user=rep password={password} application_name=s"),
+            "host=127.0.0.1 port=5432 user=rep password=<redacted> application_name=s",
+        ),
+        (
+            format!("host=h password='{password} with space' sslpassword='a\\'b' dbname=d"),
+            "host=h password=<redacted> sslpassword=<redacted> dbname=d",
+        ),
+        (
+            format!("postgresql://h/d?password={password}&sslmode=require"),
+            "postgresql://h/d?password=<redacted>&sslmode=require",
+        ),
+    ];
+    for (text, expected) in cases {
+        let redacted = frontend::redact_secrets_in_text(&text);
+        assert!(
+            !redacted.contains(password),
+            "{text:?} still carries the password: {redacted:?}"
+        );
+        assert_eq!(redacted, expected);
+        assert_eq!(
+            frontend::redact_secrets_in_text(&redacted),
+            expected,
+            "idempotent"
+        );
+    }
+    for untouched in [
+        "initialising the schema: connection refused",
+        "fsync=on full_page_writes=on synchronous_commit=on",
+        "test ! -f /archive/%f && cp %p /archive/%f",
+        "",
+        "a = b",
+    ] {
+        assert_eq!(frontend::redact_secrets_in_text(untouched), untouched);
+    }
+}
+
 /// A scratch directory under the system temp dir, removed on drop.
 struct ScratchDir(std::path::PathBuf);
 
@@ -2280,6 +2334,24 @@ fn a_run_that_fails_after_taking_its_directory_leaves_the_reason_in_it() -> Resu
     assert_eq!(again, None);
     let unchanged: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     assert_eq!(unchanged, document);
+
+    // The report is a sink: an error that names a URL, from a context the
+    // source forgot to redact, is redacted here regardless.
+    let dir = ScratchDir::new("failed-url");
+    let path = report::write_failure(
+        dir.path(),
+        run_id,
+        "timing a round trip through the delay proxy: connect for round-trip measurement: \
+         postgresql://alex:hunter2@127.0.0.1:1/qbit: connection refused",
+        &[],
+    )?
+    .expect("written");
+    let text = std::fs::read_to_string(&path)?;
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(
+        text.contains("postgresql://alex:<redacted>@127.0.0.1:1/qbit"),
+        "{text}"
+    );
     Ok(())
 }
 

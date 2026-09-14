@@ -111,6 +111,12 @@ pub fn claim_out_dir(out: &Path) -> Result<Vec<String>> {
 /// invocation had already claimed stayed empty, as if nothing had run
 /// (EP-OBSERVABILITY). A report this invocation already wrote stands: the
 /// failure is then not the whole story, and `None` is returned.
+///
+/// The error is written through `redact_secrets_in_text`: it is free text
+/// assembled from every context on the way out, and this report is what an
+/// operator attaches to an issue. The sink redacts whatever a source forgot
+/// to, so a new context that names a URL cannot reintroduce the credential
+/// leak this report once carried (EP-OBSERVABILITY).
 pub fn write_failure(
     out: &Path,
     run_id: uuid::Uuid,
@@ -121,6 +127,7 @@ pub fn write_failure(
     if path.exists() {
         return Ok(None);
     }
+    let error = crate::frontend::redact_secrets_in_text(error);
     let document = json!({
         "schema": SCHEMA,
         "run_id": run_id.to_string(),
