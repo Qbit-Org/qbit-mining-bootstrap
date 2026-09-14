@@ -30,7 +30,8 @@ use qbit_prism::{
     AcceptedShare, AuditBundle, FoundBlock, PayoutPolicy,
 };
 use qbit_prism_server::ledger::{
-    audit_canonical_bytes, Candidate, CandidateClaim, Ledger, Snapshot,
+    audit_canonical_bytes, Candidate, CandidateClaim, Ledger, ShareRange, SignerKeys, Snapshot,
+    WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde::Deserialize;
@@ -135,11 +136,27 @@ fn share(id: u64) -> AcceptedShare {
 /// The `candidate_with_bundle` recipe from `tests/ledger_postgres.rs`: an
 /// 80-byte header whose double SHA-256 is the candidate's `block_hash`, with
 /// the verified coinbase transaction as the block's first transaction.
+/// A candidate and the assembled bundle it was built from. Since #265 the
+/// stored candidate holds a window reference rather than the bundle, so a test
+/// that needs both keeps them side by side, as `tests/ledger_postgres.rs` does.
+struct TestCandidate {
+    candidate: Candidate,
+    bundle: AuditBundle,
+}
+
+impl TestCandidate {
+    /// Attach the parts a landing needs, which the claim no longer carries.
+    fn claim(&self, claim: CandidateClaim) -> CandidateClaim {
+        claim.with_bundle(self.bundle.clone())
+    }
+}
+
 fn candidate_with_bundle(
     bundle: AuditBundle,
+    window: WindowRef,
     payout_revision: i64,
     nonce: u32,
-) -> Result<Candidate> {
+) -> Result<TestCandidate> {
     let report = verify_audit_bundle_with_ledger_public_key(&bundle, &ledger_public_key())?;
     let mut block = vec![0u8; 80];
     block[..4].copy_from_slice(&0x2000_0000u32.to_le_bytes());
@@ -154,14 +171,51 @@ fn candidate_with_bundle(
     hash.reverse();
     block.push(1);
     block.extend(hex::decode(&report.coinbase_tx_hex)?);
-    Ok(Candidate {
+    let (coinbase_key, ledger_key) = keys();
+    let candidate = Candidate {
         block_hash: hex::encode(hash),
-        block_hex: hex::encode(block),
+        block_sha256: Candidate::block_digest_hex(&block),
         job_id: "audit-body-job".into(),
         payout_revision,
-        bundle,
+        window,
+        bootstrap_share: None,
+        found_block: bundle.found_block.clone(),
+        payout_policy: bundle.payout_policy.clone(),
+        ctv: None,
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        signer_keys: SignerKeys::of(&coinbase_key, &ledger_key),
+        leased: false,
+        coinbase_suffix_hex: bundle
+            .coinbase_script_sig_suffix_hex
+            .clone()
+            .unwrap_or_else(|| "00".repeat(12)),
         deferred_share: None,
-        coinbase_suffix_hex: None,
+        block_bytes: block,
+        as_issued_balances: Vec::new(),
+    };
+    Ok(TestCandidate { candidate, bundle })
+}
+
+/// The reference a candidate carries for `shares`, derived from those shares
+/// rather than from the snapshot. The negative cases below hand the claim a
+/// window the ledger does not hold; their reference has to describe the window
+/// they actually carry, or landing would refuse them at the reference digest
+/// before the durable-range proof ever runs, and the proof is what is under
+/// test.
+fn window_ref_for(shares: &[AcceptedShare], snapshot: &Snapshot) -> Result<WindowRef> {
+    let range = match (shares.first(), shares.last()) {
+        (Some(first), Some(last)) => Some(ShareRange {
+            first_share_seq: first.share_seq,
+            last_share_seq: last.share_seq,
+            share_count: u64::try_from(shares.len())?,
+            snapshot_sha256: Sha256::digest(serde_json::to_vec(shares)?).into(),
+        }),
+        _ => None,
+    };
+    Ok(WindowRef {
+        anchor_ms: snapshot.anchor_ms,
+        prior_balances_digest: qbit_prism::prior_balances_digest(&snapshot.prior_balances),
+        shares: range,
     })
 }
 
@@ -173,6 +227,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// and the logical value of the candidate bundle, both taken before landing.
 struct Landed {
     claim: CandidateClaim,
+    bundle: AuditBundle,
     canonical: Vec<u8>,
     logical: Value,
 }
@@ -183,7 +238,7 @@ impl Landed {
     }
 
     fn bundle(&self) -> &AuditBundle {
-        &self.claim.candidate.bundle
+        &self.bundle
     }
 }
 
@@ -212,16 +267,24 @@ async fn land_small_block(ledger: &Ledger, nonce: u32) -> Result<Landed> {
     )?;
     let canonical = canonical_audit_bundle_bytes(&bundle)?;
     let logical = serde_json::to_value(&bundle)?;
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, nonce)?;
-    ledger.enqueue_candidate(block).await?;
-    let claim = ledger
-        .claim_candidate(60)
-        .await?
-        .context("no pending candidate to claim")?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        nonce,
+    )?;
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(
+        ledger
+            .claim_candidate(60)
+            .await?
+            .context("no pending candidate to claim")?,
+    );
     ledger.land_candidate(&claim, &ledger_public_key()).await?;
     ledger.append(share(2), None).await?;
     Ok(Landed {
         claim,
+        bundle: block.bundle,
         canonical,
         logical,
     })
@@ -518,7 +581,7 @@ fn signed_candidate(
     snapshot: &Snapshot,
     plan: &WindowPlan,
     nonce: u32,
-) -> Result<Candidate> {
+) -> Result<TestCandidate> {
     let (coinbase_key, ledger_key) = keys();
     let bundle = build_audit_bundle(
         window,
@@ -533,17 +596,22 @@ fn signed_candidate(
         &coinbase_key,
         &ledger_key,
     )?;
-    candidate_with_bundle(bundle, snapshot.payout_revision, nonce)
+    let reference = window_ref_for(&bundle.shares, snapshot)?;
+    candidate_with_bundle(bundle, reference, snapshot.payout_revision, nonce)
 }
 
 /// Enqueue `candidate` and claim it back through the outbox.
-async fn claim_enqueued(ledger: &Ledger, candidate: Candidate) -> Result<CandidateClaim> {
-    let hash = candidate.block_hash.clone();
-    ledger.enqueue_candidate(candidate).await?;
-    let claim = ledger
-        .claim_candidate(60)
-        .await?
-        .context("no pending candidate to claim")?;
+async fn claim_enqueued(ledger: &Ledger, candidate: TestCandidate) -> Result<CandidateClaim> {
+    let hash = candidate.candidate.block_hash.clone();
+    ledger
+        .enqueue_candidate(candidate.candidate.clone())
+        .await?;
+    let claim = candidate.claim(
+        ledger
+            .claim_candidate(60)
+            .await?
+            .context("no pending candidate to claim")?,
+    );
     ensure!(
         claim.candidate.block_hash == hash,
         "claimed another candidate than the one just enqueued"
@@ -792,6 +860,7 @@ async fn measure(db: &Database, ledger: &Ledger, plan: &WindowPlan) -> Result<()
     );
     let payout_revision = snapshot.payout_revision;
     let anchor_ms = snapshot.anchor_ms;
+    let reference = window_ref_for(&snapshot.shares, &snapshot)?;
     let (coinbase_key, ledger_key) = keys();
     let bundle = build_audit_bundle(
         snapshot.shares,
@@ -810,24 +879,28 @@ async fn measure(db: &Database, ledger: &Ledger, plan: &WindowPlan) -> Result<()
     let canonical_len = canonical.len();
     let expected_sha = sha256_hex(&canonical);
     drop(canonical);
-    let candidate = candidate_with_bundle(bundle, payout_revision, 0x0267)?;
-    let hash = candidate.block_hash.clone();
+    let candidate = candidate_with_bundle(bundle, reference, payout_revision, 0x0267)?;
+    let hash = candidate.candidate.block_hash.clone();
     let mut winning = plan.share(n);
     winning.share_seq = 0;
     winning.share_id = "audit-body-measure:winning-share".into();
     winning.job_issued_at_ms = 1;
     winning.accepted_at_ms = 0;
-    ledger.append(winning, Some(candidate)).await?;
-    let claim = ledger
-        .claim_candidate(600)
-        .await?
-        .context("claim found no pending candidate")?;
+    ledger
+        .append(winning, Some(candidate.candidate.clone()))
+        .await?;
+    let claim = candidate.claim(
+        ledger
+            .claim_candidate(600)
+            .await?
+            .context("claim found no pending candidate")?,
+    );
 
     // The window-sized computations `land_candidate` still performs inside
     // the settlement transaction, timed on the claim's own bundle so the
     // residual lock hold can be attributed. They are pure, so timing them here
     // first changes nothing about the landing that follows.
-    let bundle = &claim.candidate.bundle;
+    let bundle = &candidate.bundle;
     let clock = Instant::now();
     let _ = Sha256::digest(serde_json::to_vec(&bundle.shares)?);
     let snapshot_digest_seconds = clock.elapsed().as_secs_f64();

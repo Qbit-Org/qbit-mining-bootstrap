@@ -173,7 +173,11 @@ async fn postgres_cases(url: &str, pools: &mut Vec<PgPool>) -> anyhow::Result<()
         ledger.release_session_owner_reservations().await?;
         assert_eq!(ledger.payout_revision().await?, 0);
         assert_eq!(counts(&metrics), (before.0 + 8., before.1));
-        ledger.configure("acquire-test").await?;
+        let signer_keys = crate::ledger::SignerKeys {
+            manifest_key_hex: "11".repeat(32),
+            ledger_key_hex: "22".repeat(32),
+        };
+        ledger.configure("acquire-test", &signer_keys).await?;
         Ok::<_, anyhow::Error>(())
     })
     .await??;

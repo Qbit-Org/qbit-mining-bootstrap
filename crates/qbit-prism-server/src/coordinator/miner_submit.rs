@@ -344,14 +344,29 @@ impl Coordinator {
                 "{prefix}{}{}",
                 job.wire.extranonce1, submission.extranonce2_hex
             );
+            // The slim candidate: the window reference `refresh_once`
+            // already computed, the stored inputs the job was built with,
+            // and the block as bytes. Nothing here walks the window, clones
+            // the bundle or reads configuration.
+            let inputs = &context.prepared.inputs;
+            let block_bytes = hex::decode(&submission.block_hex)?;
             anyhow::Ok(Some(Candidate {
                 block_hash: submission.block_hash_hex,
-                block_hex: submission.block_hex,
+                block_sha256: Candidate::block_digest_hex(&block_bytes),
                 job_id: job.wire.job_id.clone(),
                 payout_revision: context.prepared.snapshot.payout_revision,
-                bundle: (*context.bundle).clone(),
-                coinbase_suffix_hex: Some(suffix),
+                window: context.prepared.window,
+                bootstrap_share: context.bootstrap_share.clone(),
+                found_block: context.bundle.found_block.clone(),
+                payout_policy: inputs.payout_policy.clone(),
+                ctv: inputs.ctv.clone(),
+                audit_builder_version: inputs.audit_builder_version,
+                signer_keys: inputs.signer_keys.clone(),
+                leased: false,
+                coinbase_suffix_hex: suffix,
                 deferred_share: (!share_pass).then(|| share.clone()),
+                block_bytes,
+                as_issued_balances: Vec::new(),
             }))
         })();
         let outcome = match candidate {

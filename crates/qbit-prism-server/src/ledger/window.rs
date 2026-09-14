@@ -84,8 +84,62 @@ pub enum WindowError {
     },
     #[error("window database error: {0}")]
     Database(#[from] sqlx::Error),
+    /// A blocking decode, hash or encode hand-off was cancelled or panicked.
+    ///
+    /// Callers treat this as a **retryable failure with its own alert, never
+    /// as corruption**: no share row, balance row or digest was found wrong,
+    /// so it must never take the corruption or abandon path that
+    /// [`WindowError::Decode`] and [`WindowError::SnapshotDigestMismatch`]
+    /// take. A cancelled read is the ordinary shape of a caller's deadline
+    /// expiring or its task being aborted.
+    #[error("window blocking task cancelled or failed: {0}")]
+    TaskFailed(#[source] tokio::task::JoinError),
     #[error("window decode error: {0}")]
     Decode(#[source] anyhow::Error),
+}
+
+impl WindowRef {
+    /// The reference for a captured [`Snapshot`].
+    ///
+    /// **Synchronous, and whole-window work.** Serializing and hashing the
+    /// share array is the per-non-cached-refresh cost the design record
+    /// budgets at 0.7 to 1.4 s for 400,000 shares, so every caller runs this
+    /// inside its own `spawn_blocking`; it is never awaited and never run on
+    /// a runtime thread. The digest streams through the module's `DigestWriter`,
+    /// so the 233 to 260 MB serialized array is never materialized, and it is
+    /// byte-identical to `sha256(serde_json::to_vec(&snapshot.shares))`, the
+    /// bytes `qbit_prism_audit_snapshots.snapshot_sha256` already stores for
+    /// the same window.
+    ///
+    /// An empty snapshot gives `shares: None`, the empty-window reference; it
+    /// costs only the O(recipients) balances digest, because no share array
+    /// is reached. `Snapshot.prior_balances` is hashed in the vector order it
+    /// arrives in: [`qbit_prism::prior_balances_digest`] sorts internally, so
+    /// the reference does not depend on that order and the read path never
+    /// re-sorts the vector it returns.
+    pub fn from_snapshot(snapshot: &Snapshot) -> Result<Self> {
+        let shares = match (snapshot.shares.first(), snapshot.shares.last()) {
+            (Some(first), Some(last)) => Some(ShareRange {
+                first_share_seq: first.share_seq,
+                last_share_seq: last.share_seq,
+                share_count: u64::try_from(snapshot.shares.len())?,
+                snapshot_sha256: share_array_digest(&snapshot.shares)?,
+            }),
+            _ => None,
+        };
+        Ok(Self {
+            anchor_ms: snapshot.anchor_ms,
+            prior_balances_digest: qbit_prism::prior_balances_digest(&snapshot.prior_balances),
+            shares,
+        })
+    }
+}
+
+/// `sha256(serde_json::to_vec(&shares))` without the serialized copy.
+fn share_array_digest(shares: &[AcceptedShare]) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut digest), shares)?;
+    Ok(digest.finalize().into())
 }
 
 impl ShareRange {
@@ -175,42 +229,30 @@ impl Ledger {
                 })
             }
         };
-        let prior_balances = balance_task
-            .await
-            .map_err(|error| WindowError::Decode(error.into()))??;
+        let prior_balances = balance_task.await.map_err(WindowError::TaskFailed)??;
         let shares = if let (Some(range), Some((first, last))) = (window.shares, bounds) {
-            let endpoints: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1) AND EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2)",
-            ).bind(first).bind(last).fetch_one(&mut *tx).await?;
-            if !endpoints {
+            if !probe_share_rows(&mut tx, first, last).await? {
                 // No page has been read; an endpoint probe is not a window count.
                 return Err(WindowError::Incomplete {
                     expected: range.share_count,
                     got: 0,
                 });
             }
-            let mut state = BlockingDrop::new(WindowRead::new(first - 1));
-            while state.get().cursor < last {
-                let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT 4096"))
-                    .bind(state.get().cursor).bind(last).bind(window.anchor_ms)
-                    .fetch_all(&mut *tx).await?;
-                if rows.is_empty() {
-                    break;
-                }
-                state = tokio::task::spawn_blocking(move || {
-                    state
-                        .into_inner()
-                        .page(rows, range.share_count)
-                        .map(BlockingDrop::new)
-                })
-                .await
-                .map_err(|error| WindowError::Decode(error.into()))??;
-            }
+            let state = read_range_paged(
+                &mut tx,
+                first,
+                last,
+                window.anchor_ms,
+                WindowRead::new(),
+                move |state, shares| state.page(shares, range.share_count),
+            )
+            .await?;
+            let state = BlockingDrop::new(state);
             tokio::task::spawn_blocking(move || {
                 state.into_inner().finish(range).map(BlockingDrop::new)
             })
             .await
-            .map_err(|error| WindowError::Decode(error.into()))??
+            .map_err(WindowError::TaskFailed)??
         } else {
             BlockingDrop::new(Vec::new())
         };
@@ -220,6 +262,42 @@ impl Ledger {
             prior_balances: prior_balances.into_inner(),
             payout_revision,
         })
+    }
+
+    /// [`Ledger::read_window`], holding the caller's `window_reads` permit for
+    /// exactly as long as the read owns database and blocking work.
+    ///
+    /// The `window_reads` semaphore is the callers' own, created next to
+    /// `build_slots` and sized `clamp(database_max_connections - 2, 1,
+    /// build_workers)` so at least two pool connections always stay free for
+    /// share appends and the candidate-lease heartbeat. A caller takes its
+    /// `build_slots` permit first, then this one, and releases this one before
+    /// the rebuild; the read still acquires nothing of its own, so there is no
+    /// nested acquisition to wait on itself.
+    ///
+    /// The permit is not dropped with the future. It is moved into the
+    /// module's blocking-drop guard, declared before the read begins, so a
+    /// cancellation
+    /// releases it on a blocking thread **after** the page state and the
+    /// vectors awaiting commit have been released there: the in-progress
+    /// read's own guards were created later, so they are dropped first and
+    /// their blocking drops are queued first. A successful or failed return
+    /// has nothing left to clean up off the runtime, so the permit is released
+    /// inline the moment the read returns, before the caller's rebuild.
+    ///
+    /// Callers await this on the runtime, exactly as they do
+    /// [`Ledger::read_window`]; wrapping either in `spawn_blocking` is
+    /// forbidden.
+    pub async fn read_window_with_permit(
+        &self,
+        window: &WindowRef,
+        balances: BalanceSource,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Window, WindowError> {
+        let permit = BlockingDrop::new(permit);
+        let outcome = self.read_window(window, balances).await;
+        drop(permit.into_inner());
+        outcome
     }
 
     /// Coordinate nodes by cumulative proof of work. A slower peer or an
@@ -321,6 +399,17 @@ impl Ledger {
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
+        // The ACK path is the incident path. A block-solving share's candidate
+        // is serialized, digested and checked here, before the transaction
+        // opens, so `ORDER_LOCK` is held only for the share append and the
+        // insert of the prepared bytes, whatever the window size.
+        if let Some(candidate) = &candidate {
+            ensure!(
+                candidate.deferred_share.is_none(),
+                "credited candidates cannot also contain a deferred share"
+            );
+        }
+        let prepared = candidate.as_ref().map(prepare_candidate).transpose()?;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
@@ -332,12 +421,9 @@ impl Ledger {
             );
         }
         let result = self.append_in(&mut tx, share).await?;
-        if let Some(candidate) = candidate {
-            ensure!(
-                candidate.deferred_share.is_none(),
-                "credited candidates cannot also contain a deferred share"
-            );
-            persist_candidate(&mut tx, &candidate, Some(&result.share.share_id)).await?;
+        if let Some(prepared) = &prepared {
+            self.persist_prepared_candidate(&mut tx, prepared, Some(&result.share.share_id))
+                .await?;
         }
         if pre_commit.is_some_and(|allow| !allow()) {
             // Release ORDER_LOCK before the refusal is observed.
@@ -527,6 +613,193 @@ fn check_balances(
     Ok(balances)
 }
 
+/// The mandatory keyset page bound. One page is about 2 MB of raw rows, and
+/// each page runs under the connection's own `statement_timeout`.
+const WINDOW_PAGE_ROWS: i64 = 4096;
+
+/// Does every named share row exist? One statement and two primary-key
+/// lookups, on the caller's connection or transaction.
+///
+/// Two callers share it, and both need it inside a transaction of their own:
+///
+/// * [`Ledger::read_window`] probes both endpoints of a range inside its
+///   `REPEATABLE READ READ ONLY` snapshot, so a pruned range becomes a typed
+///   [`WindowError::Incomplete`] in one round trip, before any page is read,
+///   mapped or hashed;
+/// * the candidate enqueue probes a non-empty window's `first_share_seq`
+///   alone, under `ORDER_LOCK` and in the transaction that writes the
+///   candidate, by passing that sequence as **both** bounds. Retention only
+///   ever removes a prefix, so the presence of the first row means the whole
+///   range is present, and the committed row then holds the retention floor.
+///   The same probe backs the `save_job` reservation check.
+///
+/// Share rows are immutable, so a row that is absent was pruned and a row that
+/// is present can never later stop matching the window predicate. This is
+/// deliberately an existence test on `share_seq` only, not the window
+/// predicate: it is a retention probe, never a substitute for the per-page
+/// count and digest checks.
+pub async fn probe_share_rows(
+    connection: &mut sqlx::PgConnection,
+    first_share_seq: i64,
+    last_share_seq: i64,
+) -> Result<bool, WindowError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1) AND EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2)",
+    ).bind(first_share_seq).bind(last_share_seq).fetch_one(&mut *connection).await?)
+}
+
+/// Read `first..=last` under the payout-window predicate, in ascending keyset
+/// pages of at most 4096 rows, on the caller's connection or transaction.
+///
+/// The runtime thread only issues each statement and receives its wire
+/// buffers. Mapping the rows (`share_from_row`) and whatever `consume` does
+/// with them run together in one `spawn_blocking` task per page, which takes
+/// the state and the rows and hands the state back, so no whole-window serde
+/// or hashing ever touches a runtime thread. One implementation serves both
+/// callers:
+///
+/// * [`Ledger::read_window`], whose state is the growing `Vec<AcceptedShare>`
+///   and the running SHA-256, bounded per page by the reference's
+///   `share_count` and checked in full after the last page;
+/// * the landing re-read, whose state is the claim's existing share vector and
+///   an offset, compared page by page inside the landing transaction. The same
+///   final count and digest checks apply there; this reader performs neither,
+///   because only the caller knows the reference.
+///
+/// `consume` is called once per page, with the page's shares in ascending
+/// `share_seq`. The state and the closure both travel to the blocking thread,
+/// so both must be `Send + 'static`; a consumer that compares against a vector
+/// it does not own takes an `Arc` of it.
+///
+/// While the read is in flight the state is held in a guard that releases it
+/// on a blocking thread if the future is dropped, so a cancellation never frees
+/// an accumulated window on a runtime worker. After a successful return the
+/// caller owns the state and that off-thread cleanup obligation.
+///
+/// The reader takes no deadline of its own: every statement runs under the
+/// connection's `statement_timeout`, and dropping the future between pages
+/// rolls the caller's transaction back and leaves at most one page of blocking
+/// work running detached.
+pub async fn read_range_paged<S, F>(
+    connection: &mut sqlx::PgConnection,
+    first: i64,
+    last: i64,
+    anchor_ms: i64,
+    state: S,
+    consume: F,
+) -> Result<S, WindowError>
+where
+    S: Send + 'static,
+    F: FnMut(&mut S, Vec<AcceptedShare>) -> Result<(), WindowError> + Send + 'static,
+{
+    // `read_range`'s predicate (`ledger/audit.rs`), paged forwards: both
+    // bounds are known here, so rows arrive in canonical order and a digest
+    // over them can stream. `$1` is the exclusive cursor, which starts one
+    // below `first` and advances to each page's last `share_seq`.
+    let page = format!(
+        "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}"
+    );
+    let mut carried = BlockingDrop::new((state, consume, first.saturating_sub(1)));
+    while carried.get().2 < last {
+        let rows = sqlx::query(&page)
+            .bind(carried.get().2)
+            .bind(last)
+            .bind(anchor_ms)
+            .fetch_all(&mut *connection)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        carried = tokio::task::spawn_blocking(move || {
+            let (mut state, mut consume, mut cursor) = carried.into_inner();
+            let shares = rows
+                .iter()
+                .map(share_from_row)
+                .collect::<Result<Vec<_>>>()
+                .map_err(WindowError::Decode)?;
+            if let Some(last) = shares.last() {
+                cursor = i64::try_from(last.share_seq)
+                    .map_err(|error| WindowError::Decode(error.into()))?;
+            }
+            consume(&mut state, shares)?;
+            Ok::<_, WindowError>(BlockingDrop::new((state, consume, cursor)))
+        })
+        .await
+        .map_err(WindowError::TaskFailed)??;
+    }
+    Ok(carried.into_inner().0)
+}
+
+/// Write the canonical encoding of an as-issued balance set, on the caller's
+/// transaction, and return the [`qbit_prism::prior_balances_digest`] that keys
+/// it. Shared by every writer of the row: the candidate enqueue, which
+/// re-establishes what a `leased` candidate references under `ORDER_LOCK`, and
+/// `save_job` and its repair, under `SETTLEMENT_LOCK`.
+///
+/// **Stored order.** The row holds compact
+/// `serde_json::to_vec(&CarryForwardBalance)` bytes over the set sorted
+/// bytewise by `(order_key, recipient_id, p2mr_program_hex)`, the digest's own
+/// comparator, exactly as migration 008's column comment specifies. That sort
+/// defines the stored encoding of the as-issued set and is what makes the row
+/// a function of the set alone: any permutation of the same balances writes
+/// the same bytes, so two frontends never disagree about a digest's content.
+/// It is unrelated to the read path's order, which is never sorted:
+/// `read_prior_balances` and the current-balance read keep their SQL order,
+/// and `read_window(…, BalanceSource::AsIssued)` returns these bytes decoded,
+/// so it returns the **stored, sorted** order.
+///
+/// **Immutability.** The insert is `ON CONFLICT DO NOTHING`, so a prune that
+/// ran first costs nothing and a re-insert of the same set is free. On a
+/// conflict the stored bytes are read back and compared with this encoding
+/// byte for byte; a mismatch is [`WindowError::Decode`], because these rows
+/// are immutable and can only disagree through corruption or a second,
+/// incompatible encoding of the same digest.
+///
+/// The sort, the digest and the serialization are O(recipients) but are still
+/// whole-set work, so they run in `spawn_blocking`; the runtime thread only
+/// issues the statements.
+pub async fn put_balance_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    balances: &[CarryForwardBalance],
+) -> Result<[u8; 32], WindowError> {
+    let owned = balances.to_vec();
+    let (digest, bytes) = tokio::task::spawn_blocking(move || canonical_balance_snapshot(owned))
+        .await
+        .map_err(WindowError::TaskFailed)??;
+    let key = hex::encode(digest);
+    let written = sqlx::query(
+        "INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    ).bind(&key).bind(&bytes).execute(&mut **tx).await?.rows_affected();
+    if written == 0 {
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+        )
+        .bind(&key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(WindowError::BalanceSnapshotMissing { digest })?;
+        if stored != bytes {
+            return Err(WindowError::Decode(anyhow::anyhow!(
+                "immutable balance snapshot {key} already holds {} bytes that differ from this window's canonical encoding of {} bytes",
+                stored.len(),
+                bytes.len()
+            )));
+        }
+    }
+    Ok(digest)
+}
+
+/// The canonical stored form of an as-issued balance set: its digest and the
+/// bytes `read_window(…, BalanceSource::AsIssued)` decodes.
+fn canonical_balance_snapshot(
+    mut balances: Vec<CarryForwardBalance>,
+) -> Result<([u8; 32], Vec<u8>), WindowError> {
+    sort_balances(&mut balances);
+    let digest = qbit_prism::prior_balances_digest(&balances);
+    let bytes = serde_json::to_vec(&balances).map_err(|error| WindowError::Decode(error.into()))?;
+    Ok((digest, bytes))
+}
+
 struct DigestWriter<'a>(&'a mut Sha256);
 impl std::io::Write for DigestWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -538,17 +811,17 @@ impl std::io::Write for DigestWriter<'_> {
     }
 }
 
+/// [`Ledger::read_window`]'s [`read_range_paged`] state: the window read so
+/// far and the running digest of the bytes it has streamed.
 struct WindowRead {
     shares: Vec<AcceptedShare>,
     digest: Sha256,
-    cursor: i64,
 }
 impl WindowRead {
-    fn new(cursor: i64) -> Self {
+    fn new() -> Self {
         Self {
             shares: Vec::new(),
             digest: Sha256::new(),
-            cursor,
         }
     }
 
@@ -557,15 +830,13 @@ impl WindowRead {
             .update(if self.shares.is_empty() { b"[" } else { b"," });
         serde_json::to_writer(DigestWriter(&mut self.digest), &share)
             .map_err(|error| WindowError::Decode(error.into()))?;
-        self.cursor =
-            i64::try_from(share.share_seq).map_err(|error| WindowError::Decode(error.into()))?;
         self.shares.push(share);
         Ok(())
     }
 
-    fn page(mut self, rows: Vec<PgRow>, expected: u64) -> Result<Self, WindowError> {
-        for row in rows {
-            self.push(share_from_row(&row).map_err(WindowError::Decode)?)?;
+    fn page(&mut self, shares: Vec<AcceptedShare>, expected: u64) -> Result<(), WindowError> {
+        for share in shares {
+            self.push(share)?;
         }
         if self.shares.len() as u64 > expected {
             return Err(WindowError::Incomplete {
@@ -573,7 +844,7 @@ impl WindowRead {
                 got: self.shares.len() as u64,
             });
         }
-        Ok(self)
+        Ok(())
     }
 
     fn finish(mut self, range: ShareRange) -> Result<Vec<AcceptedShare>, WindowError> {
