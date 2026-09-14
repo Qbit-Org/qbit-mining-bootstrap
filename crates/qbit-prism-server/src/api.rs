@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use chrono::{SecondsFormat, Utc};
+pub(crate) use metrics_snapshot::health_stale_after;
 use metrics_snapshot::MetricsSnapshot;
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};

@@ -457,8 +457,9 @@ LIMIT 200;
 Every row must show `stopped` or `drained`. A running frontend's row holds its
 health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
 never became ready. Stale does not mean stopped: a heartbeat older than the
-15-second `self-check` window shows only that reporting stopped. The process
-may be hung, paused, cut off from PostgreSQL, or on an unreachable host, and
+`self-check` window (`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds) shows
+only that reporting stopped. The process may be hung, paused, cut off from
+PostgreSQL, or on an unreachable host, and
 may resume. `clear` therefore rejects missing, `starting`, unready, unknown,
 and old live states, however old the heartbeat.
 

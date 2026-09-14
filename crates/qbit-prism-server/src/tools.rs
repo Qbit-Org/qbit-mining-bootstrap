@@ -333,14 +333,17 @@ async fn self_check() -> Result<()> {
         live_instances: unavailable_live_instances(
             "unknown",
             "Heartbeat not sampled because configuration is unavailable; HA is unknown",
+            crate::api::ApiConfig::default().health_stale_after(),
         ),
     };
     let result = async {
         let config = Config::from_env()?;
+        let freshness =
+            crate::api::health_stale_after(crate::api::health_refresh_interval_from_env()?);
         report.instance_id = Some(config.instance_id.clone());
         // Snapshot before Coordinator::new: Ledger::connect writes a "starting"
         // heartbeat, which must not manufacture an additional live frontend.
-        report.live_instances = live_instances(&config.database_url).await;
+        report.live_instances = live_instances(&config.database_url, freshness).await;
         // A failed heartbeat sample must not suppress the remaining local checks.
         self_check_local(config, &mut report).await?;
         ensure!(

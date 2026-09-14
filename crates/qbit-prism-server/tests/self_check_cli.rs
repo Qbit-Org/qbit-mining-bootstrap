@@ -117,6 +117,40 @@ async fn unreachable_database_emits_complete_failed_report_without_zero_count() 
     );
 }
 
+#[tokio::test]
+async fn slow_health_cadence_is_reported_even_when_the_database_is_unavailable() {
+    let output = self_check(
+        &[("PRISM_HEALTH_REFRESH_SECONDS", "20")],
+        Duration::from_secs(8),
+    )
+    .await;
+    let mut expected = unavailable_report(
+        Some("self-check-cli"),
+        "failed",
+        "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
+    );
+    expected["live_instances"]["freshness_seconds"] = json!(60.0);
+    assert_eq!(failed_report(&output), expected);
+}
+
+#[tokio::test]
+async fn invalid_health_cadence_fails_before_sampling_heartbeats() {
+    let output = self_check(
+        &[("PRISM_HEALTH_REFRESH_SECONDS", "0")],
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        failed_report(&output),
+        unavailable_report(
+            None,
+            "unknown",
+            "Heartbeat not sampled because configuration is unavailable; HA is unknown"
+        )
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("PRISM_HEALTH_REFRESH_SECONDS"));
+}
+
 async fn startup_only_rpc(Json(request): Json<Value>) -> Json<Value> {
     let result = match request["method"].as_str() {
         Some("getblockhash") if request["params"] == json!([0]) => json!("00".repeat(32)),
@@ -185,9 +219,46 @@ async fn postgres_reports(database_url: &str) -> Result<()> {
     );
 
     let ledger = Ledger::connect(database_url, "self-check-cli".into(), 4, true).await?;
-    let result = sample_before_startup(database_url, &ledger).await;
+    let result = async {
+        sample_before_startup(database_url, &ledger).await?;
+        sample_slow_heartbeats(database_url, &ledger).await
+    }
+    .await;
     ledger.pool.close().await;
     result
+}
+
+async fn sample_slow_heartbeats(database_url: &str, ledger: &Ledger) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO qbit_prism_instances(instance_id,heartbeat_at,status) VALUES
+         ('frontend-a',clock_timestamp()-interval '20 seconds',$1),
+         ('frontend-b',clock_timestamp()-interval '30 seconds',$1),
+         ('expired',clock_timestamp()-interval '61 seconds',$1)",
+    )
+    .bind(json!({"schema":"qbit.prism.audit-health.v1","ready":true}))
+    .execute(&ledger.pool)
+    .await?;
+    let output = self_check(
+        &[
+            ("PRISM_DATABASE_URL", database_url),
+            ("PRISM_HEALTH_REFRESH_SECONDS", "20"),
+        ],
+        Duration::from_secs(8),
+    )
+    .await;
+    let report = failed_report(&output);
+    let live = &report["live_instances"];
+    ensure!(
+        live["status"] == "observed"
+            && live["freshness_seconds"] == 60.0
+            && live["count"] == 2
+            && live["instance_ids"] == json!(["frontend-a", "frontend-b"])
+            && live["single_instance"] == false
+            && live["ha_warning"].is_null()
+            && live["stale_instances"][0]["instance_id"] == "expired",
+        "slow heartbeat cadence did not preserve HA and expire stale rows: {live}"
+    );
+    Ok(())
 }
 
 async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()> {

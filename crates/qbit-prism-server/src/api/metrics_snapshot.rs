@@ -3,7 +3,7 @@ use super::{HeaderValue, IntoResponse, Response};
 use std::time::{Duration, Instant};
 
 /// Three missed publications, never less than fifteen seconds.
-pub(super) fn health_stale_after(refresh_interval: Duration) -> Duration {
+pub(crate) fn health_stale_after(refresh_interval: Duration) -> Duration {
     refresh_interval
         .saturating_mul(3)
         .max(Duration::from_secs(15))

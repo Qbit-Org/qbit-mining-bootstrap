@@ -75,8 +75,9 @@ probes; `healthcheck --public-api` probes the independent public role without
 sending it. Probes refuse redirects.
 
 `PRISM_HEALTH_REFRESH_SECONDS` controls the health publisher cadence as well
-as the snapshot staleness budget. It must be a whole number from 1 through
-86400 seconds (default 2).
+as the snapshot and `self-check` heartbeat staleness budgets, both
+`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. It must be a whole number
+from 1 through 86400 seconds (default 2).
 The public API remains a separate process and does not need signing seeds.
 
 ## Preventing stale guidance
