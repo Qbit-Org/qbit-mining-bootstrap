@@ -40,8 +40,8 @@ SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
     'fanout_count', fanout_count, 'fanout_output_sum_sats', fanout_output_sum_sats,
     'covenant_output_value_sats', covenant_output_value_sats))
 FROM qbit_ctv_fanout_sets ORDER BY block_hash COLLATE "C";
--- Keep the immutable payout payload in the fingerprint while excluding native
--- claim/confirmation metadata that does not exist in the frozen 2.x schema.
+-- Keep the immutable payout payload separate from native progress below.
+-- Ephemeral claim ownership is not part of recovery evidence.
 SELECT jsonb_build_object('kind', 'ctv_artifacts', 'row', jsonb_build_object(
     'fanout_txid', fanout_txid, 'block_hash', block_hash,
     'manifest_set_sha256', manifest_set_sha256,
@@ -55,6 +55,24 @@ SELECT jsonb_build_object('kind', 'ctv_artifacts', 'row', jsonb_build_object(
     'fanout_output_sum_sats', fanout_output_sum_sats,
     'settlement_status', settlement_status))
 FROM qbit_ctv_fanout_artifacts ORDER BY fanout_txid COLLATE "C";
+
+-- Missing legacy columns and freshly migrated NULL/zero checkpoints are
+-- equivalent. Any native confirmation or spend-scan progress must survive
+-- recovery, even when settlement_status does not change.
+SELECT jsonb_build_object('kind', 'ctv_checkpoints', 'row',
+    checkpoint || jsonb_build_object('fanout_txid', fanout_txid))
+FROM (
+    SELECT fanout_txid, jsonb_build_object(
+        'confirmed_block_hash', to_jsonb(a)->'confirmed_block_hash',
+        'confirmed_block_height', to_jsonb(a)->'confirmed_block_height',
+        'confirmed_depth', COALESCE(to_jsonb(a)->'confirmed_depth', '0'::jsonb),
+        'spend_scan_next_height', to_jsonb(a)->'spend_scan_next_height',
+        'spend_scan_anchor_height', to_jsonb(a)->'spend_scan_anchor_height',
+        'spend_scan_anchor_hash', to_jsonb(a)->'spend_scan_anchor_hash') AS checkpoint
+    FROM qbit_ctv_fanout_artifacts a
+) progress
+WHERE checkpoint <> '{"confirmed_block_hash":null,"confirmed_block_height":null,"confirmed_depth":0,"spend_scan_next_height":null,"spend_scan_anchor_height":null,"spend_scan_anchor_hash":null}'::jsonb
+ORDER BY fanout_txid COLLATE "C";
 
 SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;

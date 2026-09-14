@@ -142,7 +142,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(source_evidence["records"]["audits"]["count"] == 3);
         ensure!(source_evidence["records"]["ctv_broadcast_attempts"]["count"] == 1);
         for kind in [
-            "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
+            "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
             "fatal_state", "fatal_state_events",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
@@ -243,6 +243,51 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         }
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
         ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
+
+        // Checkpoints can change while settlement remains confirmed. Each
+        // field alone must create evidence, and resetting it must remove it.
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='confirmed' WHERE fanout_txid=repeat('33',32)")
+            .execute(&source.pool).await?;
+        prior = recovery::evidence(&source, pg_bin).await?;
+        let before_checkpoints = prior.clone();
+        ensure!(prior["records"]["ctv_checkpoints"]["count"] == 0);
+        for (column, first, next, default) in [
+            ("confirmed_block_hash", "repeat('aa',32)", "repeat('bb',32)", "NULL"),
+            ("confirmed_block_height", "100", "101", "NULL"),
+            ("confirmed_depth", "999", "1000", "0"),
+            ("spend_scan_next_height", "0", "1", "NULL"),
+            ("spend_scan_anchor_height", "0", "1", "NULL"),
+            ("spend_scan_anchor_hash", "repeat('cc',32)", "repeat('dd',32)", "NULL"),
+        ] {
+            for value in [first, next, default] {
+                sqlx::query(&format!(
+                    "UPDATE qbit_ctv_fanout_artifacts SET {column}={value} WHERE fanout_txid=repeat('33',32)"
+                )).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                ensure!(current["records"]["ctv_checkpoints"]["count"].as_u64()
+                    == Some(u64::from(value != default)));
+                ensure!(current["records"]["ctv_checkpoints"]["sha256"]
+                    != prior["records"]["ctv_checkpoints"]["sha256"],
+                    "CTV checkpoint change was invisible to recovery evidence: {column}={value}");
+                let mut unchanged = current.clone();
+                unchanged["records"]["ctv_checkpoints"] = prior["records"]["ctv_checkpoints"].clone();
+                ensure!(unchanged == prior, "unrelated accounting changed with {column}={value}");
+                prior = current;
+            }
+            ensure!(prior == before_checkpoints);
+        }
+        // Leave a populated checkpoint for the native backup roundtrip below.
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET confirmed_block_hash=repeat('aa',32),confirmed_block_height=100,confirmed_depth=1000,spend_scan_next_height=1101,spend_scan_anchor_height=1100,spend_scan_anchor_hash=repeat('bb',32) WHERE fanout_txid=repeat('33',32)")
+            .execute(&source.pool).await?;
+        prior = recovery::evidence(&source, pg_bin).await?;
+        ensure!(prior["records"]["ctv_checkpoints"]["count"] == 1);
+        let mut unchanged = prior.clone();
+        unchanged["records"]["ctv_checkpoints"] = before_checkpoints["records"]["ctv_checkpoints"].clone();
+        ensure!(unchanged == before_checkpoints);
+        // Acquiring or renewing ownership must not alter durable evidence.
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_token='recovery-claim',claim_instance_id='recovery-owner',claim_expires_at=clock_timestamp()+interval '1 minute' WHERE fanout_txid=repeat('33',32)")
+            .execute(&source.pool).await?;
+        ensure!(recovery::evidence(&source, pg_bin).await? == prior);
 
         // A halt can be the only durable change. Routine cluster activity must
         // not count, but every halt and its immutable recovery decision must.

@@ -68,6 +68,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
     def test_recovery_obligations_change_summary_without_share_or_ctv_state_changes(self):
         baseline = module.summarize(iter(closing()))
         for kind, row, change in (
+            ("ctv_checkpoints", {"fanout_txid": "ab", "confirmed_depth": 999},
+             {"confirmed_depth": 1000}),
             ("cpfp_packages", {"fanout_txid": "ab", "signed_child_hex": None},
              {"signed_child_hex": "deadbeef"}),
             ("cpfp_retired_funding", {"funding_txid": "cd", "wallet_lock_released": False},
