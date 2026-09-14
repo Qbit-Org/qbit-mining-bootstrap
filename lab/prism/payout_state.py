@@ -2707,10 +2707,21 @@ class PayoutStateService:
                     print("prism coordinator: payout artifact preparation failed", flush=True)
                     traceback.print_exc()
             except BaseException:
-                # A fatal exit (including a failing diagnostic sink) must not
-                # leave a completed Future closing subsequent admission.
+                # Relinquish the failed Future, but hand already-accepted
+                # work to a successor before releasing the admission lock.
+                # Otherwise a fatal exit (including diagnostic failure) can
+                # strand the latest request until an unrelated schedule.
                 with runtime._payout_artifact_executor_lock:
                     runtime._payout_artifact_future = None
+                    executor = runtime._payout_artifact_executor
+                    if (
+                        not runtime._payout_artifact_executor_shutdown
+                        and runtime._payout_artifact_requested is not None
+                        and executor is not None
+                    ):
+                        runtime._payout_artifact_future = executor.submit(
+                            runtime._payout_artifact_preparation_loop
+                        )
                 raise
 
     def _schedule_payout_ledger_artifact_preparation(

@@ -5,6 +5,7 @@ from dataclasses import replace
 from contextlib import redirect_stderr
 import io
 import threading
+from unittest.mock import patch
 from tests.prism_async_ownership_support import LifetimeCase, RecordingExecutor, WAIT, held_worker
 from tests.prism_coordinator_test_support import coordinator
 from tests.test_prism_job_build_exception_retention import WindowLedger
@@ -233,5 +234,118 @@ class PayoutPreparationOwnershipTests(LifetimeCase):
         self.executor.drain()
         self.assertEqual(len(self.executor.futures), 2)
         self.assertIsNotNone(self.server._payout_ledger_artifact)
+        self.retire()
+        self.released()
+
+    def test_fatal_worker_exit_drains_latest_queued_request(self):
+        self._assert_fatal_exit_drains_latest_request(diagnostic_failure=False)
+
+    def test_diagnostic_failure_drains_latest_queued_request(self):
+        self._assert_fatal_exit_drains_latest_request(diagnostic_failure=True)
+
+    def test_fatal_worker_exit_does_not_resubmit_after_shutdown(self):
+        class FatalPreparation(BaseException):
+            pass
+
+        reached, proceed, shutting_down = (
+            threading.Event(), threading.Event(), threading.Event())
+        original_shutdown = self.executor.shutdown
+        shutdown_errors = []
+
+        def install(artifact):
+            payload = self.owner.window(parsed=True)
+            reached.set()
+            if not proceed.wait(WAIT):
+                raise AssertionError("test did not release install")
+            raise FatalPreparation("fatal preparation during shutdown")
+
+        def shutdown(**kwargs):
+            shutting_down.set()  # Service has closed admission under its lock.
+            return original_shutdown(**kwargs)
+
+        def shutdown_service():
+            try:
+                self.server.shutdown_payout_artifact_executor()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
+        self.server._install_payout_ledger_artifact = install
+        self.executor.shutdown = shutdown
+        self.addCleanup(proceed.set)
+        self.schedule()
+        self.wait(reached)
+        self.server._schedule_payout_ledger_artifact_preparation(
+            42, self.difficulty, bypass_build_interval=True)
+        thread = threading.Thread(target=shutdown_service)
+        thread.start()
+        try:
+            self.wait(shutting_down)
+        finally:
+            proceed.set()
+            thread.join(WAIT)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(shutdown_errors, [])
+        self.assertEqual(len(self.executor.futures), 1)
+        self.assertIsInstance(self.executor.futures[0].exception(WAIT), FatalPreparation)
+        self.assertIsNone(self.server._payout_artifact_future)
+        self.assertIsNone(self.server._payout_artifact_requested)
+        self.assertFalse(self.server._payout_artifact_requested_bypass)
+        self.retire()
+        self.released()
+
+    def _assert_fatal_exit_drains_latest_request(self, *, diagnostic_failure):
+        class FatalPreparation(BaseException):
+            pass
+
+        reached, proceed = threading.Event(), threading.Event()
+        calls = []
+        original_prepare = self.server._prepare_payout_ledger_artifact
+        original_install = self.server._install_payout_ledger_artifact
+
+        def prepare(generation, difficulty, *, bypass_build_interval=False):
+            calls.append((generation, bypass_build_interval))
+            return original_prepare(
+                generation, difficulty, bypass_build_interval=bypass_build_interval)
+
+        def install(artifact):
+            if len(calls) == 1:
+                payload = self.owner.window(parsed=True)
+                reached.set()
+                if not proceed.wait(WAIT):
+                    raise AssertionError("test did not release install")
+                if diagnostic_failure:
+                    raise ValueError("preparation failure before diagnostic failure")
+                raise FatalPreparation("fatal preparation with queued work")
+            return original_install(artifact)
+
+        def fail_diagnostics():
+            raise OSError("diagnostic sink failed")
+
+        self.server._prepare_payout_ledger_artifact = prepare
+        self.server._install_payout_ledger_artifact = install
+        self.addCleanup(proceed.set)
+        with patch("lab.prism.payout_state.traceback.print_exc", new=fail_diagnostics):
+            self.schedule()
+            self.wait(reached)
+            self.schedule(41)
+            self.server._schedule_payout_ledger_artifact_preparation(
+                0, self.difficulty, bypass_build_interval=True)
+            self.schedule(0)  # Coalescing must preserve the pending bypass bit.
+            self.assertEqual(len(self.executor.futures), 1)
+            proceed.set()
+            self.assertIsInstance(
+                self.executor.futures[0].exception(WAIT),
+                OSError if diagnostic_failure else FatalPreparation,
+            )
+            self.assertEqual(len(self.executor.futures), 2)
+            # Wait before drain shuts down the executor: the failed worker
+            # must submit its successor while the executor still accepts work.
+            self.assertIsNone(self.executor.futures[1].exception(WAIT))
+            self.executor.drain()
+        self.assertEqual(calls, [(0, False), (0, True)])
+        self.assertIsNotNone(self.server._payout_ledger_artifact)
+        self.assertIsNone(self.server._payout_artifact_future)
+        self.assertIsNone(self.server._payout_artifact_requested)
+        self.assertFalse(self.server._payout_artifact_requested_bypass)
         self.retire()
         self.released()
