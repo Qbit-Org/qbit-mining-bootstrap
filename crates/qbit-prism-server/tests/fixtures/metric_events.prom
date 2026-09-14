@@ -1,0 +1,188 @@
+# HELP qbit_prism_share_ack_seconds Complete mining.submit frame arrival to completed response write, by outcome.
+# TYPE qbit_prism_share_ack_seconds histogram
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.01"} 3
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.025"} 4
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.05"} 4
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.1"} 4
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.25"} 5
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="0.5"} 5
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="1"} 5
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="2.5"} 5
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="5"} 6
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="10"} 7
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="30"} 8
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="+Inf"} 9
+qbit_prism_share_ack_seconds_sum{result="accepted"} 60.166
+qbit_prism_share_ack_seconds_count{result="accepted"} 9
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.01"} 3
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.025"} 4
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.05"} 4
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.1"} 4
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.25"} 5
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="0.5"} 5
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="1"} 5
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="2.5"} 5
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="5"} 6
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="10"} 7
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="30"} 8
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="+Inf"} 9
+qbit_prism_share_ack_seconds_sum{result="rejected"} 60.166
+qbit_prism_share_ack_seconds_count{result="rejected"} 9
+# HELP qbit_prism_rejections_total Share rejections by canonical bounded reason ID.
+# TYPE qbit_prism_rejections_total counter
+qbit_prism_rejections_total{reason_id="backend-rpc-unavailable"} 1
+qbit_prism_rejections_total{reason_id="duplicate-share"} 1
+qbit_prism_rejections_total{reason_id="internal-error"} 1
+qbit_prism_rejections_total{reason_id="invalid-extranonce"} 1
+qbit_prism_rejections_total{reason_id="invalid-ntime-or-nonce"} 1
+qbit_prism_rejections_total{reason_id="ledger-confirmation-failed"} 1
+qbit_prism_rejections_total{reason_id="low-difficulty"} 1
+qbit_prism_rejections_total{reason_id="malformed-submit"} 1
+qbit_prism_rejections_total{reason_id="pool-closed"} 1
+qbit_prism_rejections_total{reason_id="stale-job"} 1
+qbit_prism_rejections_total{reason_id="unauthorized-worker"} 1
+qbit_prism_rejections_total{reason_id="unknown-job"} 1
+# HELP qbit_prism_stale_shares_total Shares rejected as stale or unknown jobs.
+# TYPE qbit_prism_stale_shares_total counter
+qbit_prism_stale_shares_total 2
+# HELP qbit_prism_duplicate_shares_total Duplicate share rejections.
+# TYPE qbit_prism_duplicate_shares_total counter
+qbit_prism_duplicate_shares_total 1
+# HELP qbit_prism_low_difficulty_shares_total Low difficulty share rejections.
+# TYPE qbit_prism_low_difficulty_shares_total counter
+qbit_prism_low_difficulty_shares_total 1
+# HELP qbit_prism_grace_credited_shares_total Durably accepted shares credited by stale grace.
+# TYPE qbit_prism_grace_credited_shares_total counter
+qbit_prism_grace_credited_shares_total 1
+# HELP qbit_prism_block_submit_seconds Locally validated block proof to first node offer; requires the offer owner's timestamp boundary.
+# TYPE qbit_prism_block_submit_seconds histogram
+qbit_prism_block_submit_seconds_bucket{le="0.01"} 3
+qbit_prism_block_submit_seconds_bucket{le="0.025"} 4
+qbit_prism_block_submit_seconds_bucket{le="0.05"} 4
+qbit_prism_block_submit_seconds_bucket{le="0.1"} 4
+qbit_prism_block_submit_seconds_bucket{le="0.25"} 5
+qbit_prism_block_submit_seconds_bucket{le="0.5"} 5
+qbit_prism_block_submit_seconds_bucket{le="1"} 5
+qbit_prism_block_submit_seconds_bucket{le="2.5"} 5
+qbit_prism_block_submit_seconds_bucket{le="5"} 6
+qbit_prism_block_submit_seconds_bucket{le="10"} 7
+qbit_prism_block_submit_seconds_bucket{le="30"} 8
+qbit_prism_block_submit_seconds_bucket{le="+Inf"} 9
+qbit_prism_block_submit_seconds_sum 60.166
+qbit_prism_block_submit_seconds_count 9
+# HELP qbit_prism_database_pool_acquire_seconds Actual database pool acquisition wait by outcome.
+# TYPE qbit_prism_database_pool_acquire_seconds histogram
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.01"} 3
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.025"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.05"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.1"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.25"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="0.5"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="1"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="2.5"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="5"} 6
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="10"} 7
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="30"} 8
+qbit_prism_database_pool_acquire_seconds_bucket{result="failure",le="+Inf"} 9
+qbit_prism_database_pool_acquire_seconds_sum{result="failure"} 60.166
+qbit_prism_database_pool_acquire_seconds_count{result="failure"} 9
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.01"} 3
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.025"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.05"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.1"} 4
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.25"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="0.5"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="1"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="2.5"} 5
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="5"} 6
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="10"} 7
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="30"} 8
+qbit_prism_database_pool_acquire_seconds_bucket{result="success",le="+Inf"} 9
+qbit_prism_database_pool_acquire_seconds_sum{result="success"} 60.166
+qbit_prism_database_pool_acquire_seconds_count{result="success"} 9
+# HELP qbit_prism_database_advisory_lock_wait_seconds Database advisory transaction lock wait by lock and outcome.
+# TYPE qbit_prism_database_advisory_lock_wait_seconds histogram
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="failure",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="migration",result="failure"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="migration",result="failure"} 9
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="migration",result="success",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="migration",result="success"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="migration",result="success"} 9
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="failure",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="order",result="failure"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="order",result="failure"} 9
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="order",result="success",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="order",result="success"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="order",result="success"} 9
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="failure",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="settlement",result="failure"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="settlement",result="failure"} 9
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.01"} 3
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.025"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.05"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.1"} 4
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.25"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="0.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="1"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="2.5"} 5
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="5"} 6
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="10"} 7
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="30"} 8
+qbit_prism_database_advisory_lock_wait_seconds_bucket{lock="settlement",result="success",le="+Inf"} 9
+qbit_prism_database_advisory_lock_wait_seconds_sum{lock="settlement",result="success"} 60.166
+qbit_prism_database_advisory_lock_wait_seconds_count{lock="settlement",result="success"} 9

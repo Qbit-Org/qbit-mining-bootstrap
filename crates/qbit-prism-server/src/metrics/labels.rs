@@ -1,4 +1,54 @@
 //! Every label dimension has a finite set of values.
+use std::cmp::Ordering;
+
+/// Event keys stay inline; snapshot callers may still supply arbitrary values.
+/// Compare the pairs, not their storage, so both forms address the same sample.
+#[derive(Clone)]
+pub(super) enum Labels {
+    Empty,
+    One((&'static str, &'static str)),
+    Two((&'static str, &'static str), (&'static str, &'static str)),
+    Owned(Vec<(&'static str, String)>),
+}
+
+impl Labels {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        let (inline, owned): (_, &[(&'static str, String)]) = match self {
+            Self::Empty => ([None, None], &[]),
+            Self::One(pair) => ([Some(*pair), None], &[]),
+            Self::Two(first, second) => ([Some(*first), Some(*second)], &[]),
+            Self::Owned(pairs) => ([None, None], pairs),
+        };
+        inline
+            .into_iter()
+            .flatten()
+            .chain(owned.iter().map(|(key, value)| (*key, value.as_str())))
+    }
+}
+
+impl From<Vec<(&'static str, String)>> for Labels {
+    fn from(pairs: Vec<(&'static str, String)>) -> Self {
+        Self::Owned(pairs)
+    }
+}
+
+impl PartialEq for Labels {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Labels {}
+impl PartialOrd for Labels {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Labels {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.iter().cmp(other.iter())
+    }
+}
+
 macro_rules! labels {
     ($name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
