@@ -370,6 +370,11 @@ is not recorded. A partial, complete or populated metadata table is refused
 before native DDL: 006 must create its own record, never retain unverified
 provenance through `IF NOT EXISTS`. Restore the full backup, or review and
 move the existing object aside before retrying; migration removes nothing.
+The pre-006 native outbox must have neither row-level security (`ENABLE` or
+`FORCE`) nor policies, including inactive policies. The drain check reads
+these settings from the catalog before counting pending candidates, so a
+policy cannot hide a legacy row and make the database appear drained.
+Refusal preserves the rows and security settings for operator review.
 
 Native pending rows the earlier build wrote carry the native fields and are
 not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a

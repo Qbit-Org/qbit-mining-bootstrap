@@ -3306,6 +3306,102 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
     db.close(vec![earlier, migrated]).await
 }
 
+#[tokio::test]
+async fn pre_006_native_outbox_row_security_is_refused_before_the_drain_check() -> Result<()> {
+    for state in [SourceState::Applied258, SourceState::Pre258] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()::text")
+            .fetch_one(&pool)
+            .await?;
+        let role = format!("prism_native_rls_{}", Uuid::new_v4().simple());
+        sqlx::raw_sql(&format!("CREATE ROLE {role} LOGIN PASSWORD 'rls'; GRANT USAGE, CREATE ON SCHEMA {} TO {role}; GRANT CREATE ON DATABASE {database} TO {role}", db.schema))
+            .execute(&pool).await?;
+        let mut limited = url::Url::parse(&db.url)?;
+        limited.set_username(&role).ok().context("role username")?;
+        limited
+            .set_password(Some("rls"))
+            .ok()
+            .context("role password")?;
+        let limited_pool = PgPool::connect(limited.as_str()).await?;
+        apply_frozen_2x_schema(&limited_pool, state).await?;
+        let earlier = Ledger::connect(limited.as_str(), "earlier".into(), 8, true).await?;
+        undo_006(&limited_pool, state).await?;
+        let hash = legacy_hash(0x66);
+        if state == SourceState::Applied258 {
+            insert_v2_pending(&limited_pool, &hash).await?;
+        } else {
+            insert_v1_pending(&limited_pool, &hash).await?;
+        }
+        sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ENABLE ROW LEVEL SECURITY; ALTER TABLE qbit_block_candidate_outbox FORCE ROW LEVEL SECURITY; CREATE POLICY hide_pending ON qbit_block_candidate_outbox USING (state <> 'pending')")
+            .execute(&limited_pool).await?;
+        assert_eq!(pending_rows(&pool).await?, 1);
+        assert_eq!(pending_rows(&limited_pool).await?, 0);
+        let versions = schema_versions(&pool).await?;
+        let objects = schema_objects(&pool).await?;
+        let rows: Vec<Value> =
+            sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+                .fetch_all(&pool)
+                .await?;
+        for disable_flags in [false, true] {
+            if disable_flags {
+                sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox NO FORCE ROW LEVEL SECURITY; ALTER TABLE qbit_block_candidate_outbox DISABLE ROW LEVEL SECURITY")
+                    .execute(&limited_pool).await?;
+            }
+            let error = Ledger::connect(limited.as_str(), "this-build".into(), 8, true)
+                .await
+                .err()
+                .context("006 trusted an outbox with row security or policies")?
+                .to_string();
+            assert!(error.contains("qbit_block_candidate_outbox"), "{error}");
+            assert!(error.contains("hide_pending"), "{error}");
+            assert!(error.contains("before any DDL"), "{error}");
+            assert_eq!(schema_versions(&pool).await?, versions);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert!(objects_006_absent(&pool, state).await?);
+            assert_eq!(sqlx::query_as::<_, (bool, bool, i64)>("SELECT relrowsecurity,relforcerowsecurity,(SELECT count(*) FROM pg_policy WHERE polrelid=c.oid) FROM pg_class c WHERE c.oid='qbit_block_candidate_outbox'::regclass")
+                .fetch_one(&pool).await?, (!disable_flags, !disable_flags, 1));
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o"
+                )
+                .fetch_all(&pool)
+                .await?,
+                rows
+            );
+        }
+        sqlx::query("DROP POLICY hide_pending ON qbit_block_candidate_outbox")
+            .execute(&limited_pool)
+            .await?;
+        let error = Ledger::connect(limited.as_str(), "this-build".into(), 8, true)
+            .await
+            .err()
+            .context("006 accepted the now-visible legacy candidate")?
+            .to_string();
+        assert!(
+            error.contains("outbox is not drained") && error.contains(&hash),
+            "{error}"
+        );
+        assert_eq!(schema_versions(&pool).await?, versions);
+        // Fixture-only completion stands in for recovery from a drained backup.
+        drain_2x_row(&limited_pool, &hash, state == SourceState::Applied258).await?;
+        let migrated = Ledger::connect(limited.as_str(), "this-build".into(), 8, true).await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        exercise_native_writers(&migrated, 1, 6501).await?;
+        earlier.pool.close().await;
+        migrated.pool.close().await;
+        limited_pool.close().await;
+        sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        db.close(vec![]).await?;
+    }
+    Ok(())
+}
+
 /// A database an earlier 3.x.x build migrated, which a newer release then
 /// wrote: its capability rows are refused before 004, 005 and 006 run, so
 /// this build never alters it and never records version 6 for it. On a

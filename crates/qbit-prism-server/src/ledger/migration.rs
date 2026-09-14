@@ -650,6 +650,20 @@ pub(super) async fn refuse_undrained_outbox(
     if !inventory.outbox {
         return Ok(());
     }
+    if let Some(versions) = native_versions {
+        // The legacy path also fingerprints the release table, but this
+        // native path does not. Its drain query must see every pending row.
+        let (enabled, forced, policies): (bool, bool, Vec<String>) = sqlx::query_as(
+            "SELECT c.relrowsecurity,c.relforcerowsecurity,ARRAY(SELECT p.polname::text FROM pg_policy p WHERE p.polrelid=c.oid ORDER BY p.polname) FROM pg_class c WHERE c.oid='qbit_block_candidate_outbox'::regclass",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        ensure!(
+            !enabled && !forced && policies.is_empty(),
+            "refusing to apply migration 006 to a native database at schema migrations {} before any DDL: qbit_block_candidate_outbox has row-level security or policies (enabled={enabled}, forced={forced}, policies={}); the drain check cannot trust a possibly filtered outbox. Nothing was changed. Restore the full backup, or review and remove these policies and security flags before retrying the drain check",
+            schema_version_list(versions), named_objects(&policies)
+        );
+    }
     let mut clauses = Vec::new();
     if inventory.has_outbox_column("storage_version") {
         clauses.push("storage_version <> 1");
