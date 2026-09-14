@@ -36,6 +36,7 @@ qbit_prism_rejections_total{reason_id="internal-error"} 1
 qbit_prism_rejections_total{reason_id="invalid-extranonce"} 1
 qbit_prism_rejections_total{reason_id="invalid-ntime-or-nonce"} 1
 qbit_prism_rejections_total{reason_id="ledger-confirmation-failed"} 1
+qbit_prism_rejections_total{reason_id="ledger-outcome-unknown"} 1
 qbit_prism_rejections_total{reason_id="low-difficulty"} 1
 qbit_prism_rejections_total{reason_id="malformed-submit"} 1
 qbit_prism_rejections_total{reason_id="pool-closed"} 1
