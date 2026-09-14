@@ -176,6 +176,7 @@ qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_bootstr
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_single_share_from_another_miner_takes_the_whole_coinbase
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share
+qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace
 qbit-prism-server::readiness_rpc::cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs

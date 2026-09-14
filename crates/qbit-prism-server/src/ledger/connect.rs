@@ -1,6 +1,8 @@
 use super::*;
 use crate::metrics::{LockKind, Metrics, Outcome};
 
+mod acquire;
+
 const SESSION_ALLOCATION_ATTEMPTS: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -131,7 +133,7 @@ impl Ledger {
 
     /// Begin a ledger transaction, recording this ledger's pool acquisition.
     pub(super) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-        begin(&self.pool, self.metrics.as_deref()).await
+        Transaction::begin(self.acquire().await?, None).await
     }
 
     /// Take one advisory lock, recording this ledger's wait for it.
@@ -287,7 +289,7 @@ impl Ledger {
     pub async fn release_session_owner_reservations(&self) -> Result<()> {
         sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE owner_token=$1")
             .bind(&self.session_owner.token)
-            .execute(&self.pool)
+            .execute(&mut *self.acquire().await?)
             .await?;
         Ok(())
     }
@@ -335,7 +337,7 @@ impl Ledger {
     }
 
     pub async fn payout_revision(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'").fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'").fetch_one(&mut *self.acquire().await?).await?)
     }
 }
 
@@ -452,16 +454,7 @@ async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-    let guard = metrics.map(|metrics| WaitGuard::arm(metrics, WaitKind::PoolAcquire));
-    let acquired = pool.acquire().await;
-    if let Some(guard) = guard {
-        guard.complete(if acquired.is_ok() {
-            Outcome::Success
-        } else {
-            Outcome::Failure
-        });
-    }
-    Transaction::begin(acquired?, None).await
+    Transaction::begin(acquire::acquire(pool, metrics).await?, None).await
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
