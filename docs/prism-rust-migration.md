@@ -362,6 +362,11 @@ expression. Migration 006 uses `ADD COLUMN IF NOT EXISTS`, so it would keep a
 malformed column that breaks subsequent native candidate inserts or claims.
 A mismatch refuses the upgrade, names the differing properties, and leaves
 the database unchanged. An absent column is accepted and created by 006.
+The `qbit_prism_migration_source` name must also be absent when migration 6
+is not recorded. A partial, complete or populated metadata table is refused
+before native DDL: 006 must create its own record, never retain unverified
+provenance through `IF NOT EXISTS`. Restore the full backup, or review and
+move the existing object aside before retrying; migration removes nothing.
 
 Native pending rows the earlier build wrote carry the native fields and are
 not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a

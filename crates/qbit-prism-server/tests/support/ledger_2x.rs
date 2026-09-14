@@ -3316,6 +3316,87 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
     db.close(vec![earlier, migrated]).await
 }
 
+/// A pre-006 native database cannot already have source metadata: even a
+/// complete table could carry provenance this migration did not establish.
+#[tokio::test]
+async fn pre_006_native_schema_refuses_preexisting_source_metadata() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for alteration in [
+            "ALTER TABLE qbit_prism_migration_source DROP COLUMN migrated_at",
+            "",
+            "INSERT INTO qbit_prism_migration_source SELECT * FROM operator_source_template",
+        ] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            let earlier = db.ledger("earlier-build").await?;
+            sqlx::raw_sql("CREATE TABLE operator_source_template (LIKE qbit_prism_migration_source INCLUDING ALL); INSERT INTO operator_source_template SELECT * FROM qbit_prism_migration_source")
+                .execute(&pool).await?;
+            undo_006(&pool, state).await?;
+            sqlx::raw_sql("CREATE TABLE qbit_prism_migration_source (LIKE operator_source_template INCLUDING ALL)")
+                .execute(&pool).await?;
+            sqlx::raw_sql(alteration).execute(&pool).await?;
+            let versions = schema_versions(&pool).await?;
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> =
+                sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_prism_migration_source s")
+                    .fetch_all(&pool)
+                    .await?;
+            let error = db
+                .ledger("this-build")
+                .await
+                .err()
+                .context("006 accepted pre-existing source metadata")?;
+            assert_eq!(schema_versions(&pool).await?, versions);
+            let error = format!("{error:#}");
+            assert!(error.contains("before any DDL"), "{error}");
+            assert!(
+                error.contains("qbit_prism_migration_source exists without migration 6"),
+                "{error}"
+            );
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT to_jsonb(s) FROM qbit_prism_migration_source s"
+                )
+                .fetch_all(&pool)
+                .await?,
+                rows
+            );
+            // Operator-reviewed recovery retains every old row under another
+            // name; 006 must create and populate its own metadata table.
+            sqlx::raw_sql(
+                "ALTER TABLE qbit_prism_migration_source RENAME TO operator_preserved_source",
+            )
+            .execute(&pool)
+            .await?;
+            let migrated = db.ledger("this-build").await?;
+            let source = migrated
+                .migration_source()
+                .await?
+                .context("source record")?;
+            assert_eq!(source.source_state, "native");
+            assert_eq!(source.migrated_by, "this-build");
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT to_jsonb(s) FROM operator_preserved_source s"
+                )
+                .fetch_all(&pool)
+                .await?,
+                rows
+            );
+            exercise_native_writers(&migrated, 1, 7101).await?;
+            pool.close().await;
+            db.close(vec![earlier, migrated]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// 006 must not preserve a malformed column that breaks future native candidates.
 #[tokio::test]
 async fn pre_006_native_schema_refuses_a_malformed_storage_version_column() -> Result<()> {

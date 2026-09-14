@@ -2437,6 +2437,15 @@ pub(super) async fn migrate_schema(
             }
         }
         if !versions.contains(&6) {
+            let source_absent: bool =
+                sqlx::query_scalar("SELECT to_regclass('qbit_prism_migration_source') IS NULL")
+                    .fetch_one(&mut **tx)
+                    .await?;
+            ensure!(
+                source_absent,
+                "refusing to migrate a native database at schema migrations {} before any DDL: qbit_prism_migration_source exists without migration 6, so 006 would preserve metadata it did not create or verify. Nothing was changed. Restore the full backup, or review and move the existing object aside before migrating again",
+                schema_version_list(&versions)
+            );
             // Native schema 3, 4 or 5, with or without 008 and 009. That
             // build's drain check used the v1-only predicate, which never
             // counted a v2 row (`candidate ?& ...` is NULL for a NULL body),
