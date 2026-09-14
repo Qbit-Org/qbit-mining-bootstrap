@@ -14,7 +14,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from lab.prism.bundle_compiler import _ShareWindowSerialization
 from lab.prism.window_lifecycle import (
@@ -282,6 +282,49 @@ class PreparedWindowLifecycleTests(unittest.TestCase):
 
 
 class WindowLifecycleAttributionTests(unittest.TestCase):
+    def test_output_failures_preserve_accounting_and_rate_limited_recovery(self):
+        for method, error in (
+            ("write", BrokenPipeError("logging pipe closed")),
+            ("write", OSError("logging write failed")),
+            ("flush", OSError("logging flush failed")),
+        ):
+            with self.subTest(method=method, error=type(error).__name__):
+                telemetry = WindowLifecycleTelemetry()
+                output = Mock()
+                getattr(output, method).side_effect = error
+                with (
+                    redirect_stdout(output),
+                    patch("lab.prism.window_lifecycle.time.monotonic", return_value=100),
+                ):
+                    telemetry.note("spawn", "started", daemon_generation=1)
+                    telemetry.note("spawn", "started", daemon_generation=2)
+                getattr(output, method).assert_called_once()
+                counts, events, suppressed = telemetry.snapshot()
+                self.assertEqual(counts["spawn", "started"], 2)
+                self.assertEqual([event["daemon_generation"] for event in events], [1, 2])
+                self.assertEqual(suppressed, 1)
+
+                with (
+                    redirect_stdout(io.StringIO()) as recovered,
+                    patch("lab.prism.window_lifecycle.time.monotonic", return_value=130),
+                ):
+                    telemetry.note("spawn", "started", daemon_generation=3)
+                self.assertEqual(len(recovered.getvalue().splitlines()), 1)
+                counts, events, suppressed = telemetry.snapshot()
+                self.assertEqual(counts["spawn", "started"], 3)
+                self.assertEqual(events[-1]["sequence"], 3)
+                self.assertEqual(suppressed, 1)
+
+    def test_closed_stdout_does_not_interrupt_retirement_telemetry(self):
+        telemetry = WindowLifecycleTelemetry()
+        output = io.StringIO()
+        output.close()
+        with redirect_stdout(output):
+            telemetry.note("retire", "shutdown", daemon_generation=1)
+        counts, events, _ = telemetry.snapshot()
+        self.assertEqual(counts["retire", "shutdown"], 1)
+        self.assertEqual(events[-1]["daemon_generation"], 1)
+
     def test_metrics_and_diagnostics_are_bounded_under_churn(self):
         telemetry = WindowLifecycleTelemetry()
         with (

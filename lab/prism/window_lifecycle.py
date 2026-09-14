@@ -157,7 +157,13 @@ class WindowLifecycleTelemetry:
             else:
                 self.suppressed_logs += 1
         if emit:
-            print("prism coordinator: " + json.dumps(entry, sort_keys=True), flush=True)
+            message = "prism coordinator: " + json.dumps(entry, sort_keys=True)
+            try:
+                print(message, flush=True)
+            except (OSError, ValueError):
+                # Broken pipes and closed streams must not affect builds or
+                # daemon cleanup. The counters and metadata are already saved.
+                pass
 
     def snapshot(self):
         with self._lock:
