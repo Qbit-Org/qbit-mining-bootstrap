@@ -1625,12 +1625,18 @@ pub fn host_port(url: &str) -> Result<String> {
             frontend::redact_url_secrets(url)
         )
     })?;
-    ensure!(
-        options.get_socket().is_none(),
-        "the database URL names a Unix socket, which the delay proxy cannot front; give it a \
-         TCP host"
-    );
     let host = options.get_host();
+    // Two ways a socket reaches here. An explicit `?host=/var/run/postgresql`
+    // sets `socket`, and SQLx's own default host is a socket directory on some
+    // platforms -- on macOS a URL with no host at all yields /tmp -- which
+    // arrives as a *host* that happens to be a path, leaving `socket` empty. Both
+    // are refused with the same reason, because `lookup_host` would otherwise
+    // report a path as a DNS failure and hide what is really wrong.
+    ensure!(
+        options.get_socket().is_none() && !host.starts_with('/'),
+        "the database URL names a Unix socket ({host}), which the delay proxy cannot front; \
+         give it a TCP host and port"
+    );
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {

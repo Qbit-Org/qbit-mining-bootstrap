@@ -2257,10 +2257,25 @@ fn a_bracketed_ipv6_authority_keeps_or_gains_its_port() -> Result<()> {
         run::host_port("postgres:///db?host=db.internal&port=5433")?,
         "db.internal:5433"
     );
-    assert_eq!(run::host_port("postgresql:///db")?, "localhost:5432");
-    // What the proxy cannot front is refused with the reason, not resolved.
+    // What the proxy cannot front is refused with the reason, not resolved. A
+    // URL with no host is deliberately not asserted to a value: SQLx's default
+    // is platform-dependent, a socket directory on macOS and a TCP host
+    // elsewhere, so pinning one of them would pass on the machine it was written
+    // on and fail on the next. What must hold everywhere is that a socket is
+    // refused, whether it arrives as `socket` or as a path-shaped host.
     let socket = run::host_port("postgresql:///db?host=/var/run/postgresql").unwrap_err();
     assert!(format!("{socket:#}").contains("Unix socket"), "{socket:#}");
+    let default_host = run::host_port("postgresql:///db");
+    match default_host {
+        Ok(value) => assert!(
+            !value.starts_with('/'),
+            "a frontable default must be a TCP host, got {value}"
+        ),
+        Err(error) => assert!(
+            format!("{error:#}").contains("Unix socket"),
+            "an unfrontable default must say why: {error:#}"
+        ),
+    }
     let junk = run::host_port("not-a-url").unwrap_err();
     assert!(
         format!("{junk:#}").contains("parsing the database URL"),
