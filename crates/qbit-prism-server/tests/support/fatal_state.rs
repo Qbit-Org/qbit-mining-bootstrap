@@ -17,7 +17,13 @@ async fn setup(db: &Database) -> Result<(Ledger, fake::FakeNode, Config)> {
     let mut config = fake::coordinator_config(db.url.clone(), &node, "operator")?;
     config.username_fallback = Some("recovery-test-fallback".into());
     ledger
-        .configure(&config.fingerprint(&"00".repeat(32))?)
+        .configure(
+            &config.fingerprint(&"00".repeat(32))?,
+            &qbit_prism_server::ledger::SignerKeys {
+                manifest_key_hex: "11".repeat(32),
+                ledger_key_hex: "22".repeat(32),
+            },
+        )
         .await?;
     Ok((ledger, node, config))
 }

@@ -1,10 +1,12 @@
 //! JSONB ceiling gate for the PRISM payout window (issue #264, workstream #261).
 //!
 //! PostgreSQL refuses a JSONB container whose elements exceed 268,435,455
-//! bytes. Two native writes still embed the whole payout window, so they grow
-//! linearly with the share count and walk into that wall. Landing was a third
-//! until #267; it now stores neither share copy and rebuilds the counted window
-//! on read. This gate drives the
+//! bytes. One native write still embeds the whole payout window, so it grows
+//! linearly with the share count and walks into that wall: the prepared job
+//! payload, which #273 removes. The candidate enqueue and the legacy audit
+//! import no longer do, they store a window reference and canonical bytes
+//! instead (#265), and landing stores neither share copy and rebuilds the
+//! counted window on read (#267). This gate drives the
 //! five window-carrying phases (refresh, enqueue, claim, landing, import)
 //! against a real PostgreSQL 16, measures every JSONB column it can discover,
 //! projects each write to the target share count, and compares the set of
@@ -64,10 +66,12 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
-use qbit_prism::{AcceptedShare, AuditBundle, AuditVerificationReport, FoundBlock, PayoutPolicy};
+use qbit_prism::{
+    AcceptedShare, AuditBundle, AuditBundleBody, AuditVerificationReport, FoundBlock, PayoutPolicy,
+};
 use qbit_prism_server::{
     coordinator::Coordinator,
-    ledger::{Candidate, CandidateClaim, Ledger, Snapshot},
+    ledger::{Candidate, CandidateClaim, ClaimParts, Ledger, SignerKeys, Snapshot, WindowRef},
 };
 use qbit_prism_test_gate as gate;
 use sha2::{Digest, Sha256};
@@ -162,21 +166,17 @@ struct Violation {
     phase: &'static str,
 }
 
-/// The three known window-carrying writes at this base commit. Each entry names
+/// The two known window-carrying writes at this base commit. Each entry names
 /// the issue that removes it; when that lands, the gate fails until the entry
-/// is deleted.
+/// is deleted. The candidate enqueue (`qbit_block_candidate_outbox.candidate`)
+/// was removed by #265: the row stores a window reference and its block as
+/// `bytea`, so the JSONB document is O(1) in the window.
 const KNOWN_VIOLATIONS: &[Violation] = &[
     // 3 window copies (2 x AcceptedShare + 1 x CountedShare). Removed by #273.
     Violation {
         table: "qbit_prism_jobs",
         column: "payload",
         phase: PHASE_REFRESH,
-    },
-    // 2 window copies (bundle.shares + bundle.reward_manifest.shares). Removed by #265.
-    Violation {
-        table: "qbit_block_candidate_outbox",
-        column: "candidate",
-        phase: PHASE_ENQUEUE,
     },
 ];
 
@@ -1002,15 +1002,27 @@ fn build_window_bundle(
 
 /// The `candidate_with_bundle` recipe from `tests/ledger_postgres.rs`: an
 /// 80-byte header whose double SHA-256 is the candidate's `block_hash`, with
-/// the verified coinbase transaction as the block's first transaction.
-fn candidate_with_bundle(
-    bundle: AuditBundle,
+/// the verified coinbase transaction as the block's first transaction. The
+/// candidate is the slim reference form production enqueues: the window
+/// `window` names, the inputs `build_window_bundle` used, and the block as
+/// bytes; the bundle stays with the caller for the landing parts and the
+/// import envelope.
+fn candidate_from_bundle(
+    bundle: &AuditBundle,
+    window: WindowRef,
     payout_revision: i64,
-    ledger_public_key: &str,
+    config: &qbit_prism_server::config::Config,
     nonce: u32,
 ) -> Result<(Candidate, AuditVerificationReport)> {
-    let report =
-        qbit_prism::verify_audit_bundle_with_ledger_public_key(&bundle, ledger_public_key)?;
+    ensure!(
+        !config.ctv_enabled,
+        "the gate's coordinator runs with CTV off; a CTV candidate would store its settlement inputs"
+    );
+    let (manifest_key, ledger_key) = keys(config)?;
+    let report = qbit_prism::verify_audit_bundle_with_ledger_public_key(
+        bundle,
+        &ledger_key.public_key_hex(),
+    )?;
     let mut block = vec![0u8; 80];
     block[..4].copy_from_slice(&0x2000_0000u32.to_le_bytes());
     block[4..36].fill(0x22);
@@ -1027,12 +1039,21 @@ fn candidate_with_bundle(
     Ok((
         Candidate {
             block_hash: hex::encode(hash),
-            block_hex: hex::encode(block),
+            block_sha256: Candidate::block_digest_hex(&block),
             job_id: "jsonb-gate-job".into(),
             payout_revision,
-            bundle,
+            window,
+            bootstrap_share: None,
+            found_block: bundle.found_block.clone(),
+            payout_policy: PayoutPolicy::day_one_default(),
+            ctv: None,
+            audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+            signer_keys: SignerKeys::of(&manifest_key, &ledger_key),
+            leased: false,
+            coinbase_suffix_hex: coinbase_suffix(config),
             deferred_share: None,
-            coinbase_suffix_hex: None,
+            block_bytes: block,
+            as_issued_balances: Vec::new(),
         },
         report,
     ))
@@ -1195,9 +1216,10 @@ async fn pipeline_body(
     });
     report!("[n={n}] refresh: {} in {seconds:.2} s", status.label());
 
-    // The candidate the enqueue phase commits carries the full job bundle, as
-    // production does. Building it here keeps every later phase reachable even
-    // when the refresh write was rejected.
+    // The candidate the enqueue phase commits references the window, as
+    // production does; the bundle it was found on is built beside it for the
+    // landing parts and the import envelope. Building both here keeps every
+    // later phase reachable even when the refresh write was rejected.
     let snapshot = ledger.snapshot(plan.window_network_difficulty()).await?;
     ensure!(
         snapshot.shares.len() as u64 == n,
@@ -1205,12 +1227,13 @@ async fn pipeline_body(
         snapshot.shares.len()
     );
     let payout_revision = snapshot.payout_revision;
+    let window = WindowRef::from_snapshot(&snapshot)?;
     let bundle = build_window_bundle(&snapshot, &config)?;
     // The window now lives in the bundle; a second copy of 400,000 shares is
     // pure peak RSS.
     drop(snapshot);
     let (candidate, report) =
-        candidate_with_bundle(bundle, payout_revision, &config.ledger_public_key, 0x0264)?;
+        candidate_from_bundle(&bundle, window, payout_revision, &config, 0x0264)?;
     // Bundle construction touches no JSONB column; keep the cache in step.
     inventory.observe(&pool, Observe::Baseline).await?;
 
@@ -1244,11 +1267,11 @@ async fn pipeline_body(
     };
     // Observed before any substitute exists, so only production writes are
     // attributed to enqueue.
-    writes.append(
-        &mut inventory
-            .observe(&pool, Observe::Phase(PHASE_ENQUEUE))
-            .await?,
-    );
+    let mut enqueue_writes = inventory
+        .observe(&pool, Observe::Phase(PHASE_ENQUEUE))
+        .await?;
+    ensure_enqueue_writes_no_window(n, status, &enqueue_writes)?;
+    writes.append(&mut enqueue_writes);
     let mut substitutes: BTreeMap<WriteKey, PhaseWrite> = BTreeMap::new();
     let note = if status == PhaseStatus::Rejected {
         scaffold_outbox(&pool, &candidate).await?;
@@ -1297,13 +1320,19 @@ async fn pipeline_body(
         claimed.candidate.block_hash == candidate.block_hash,
         "claim returned a different candidate"
     );
-    // The claim UPDATE never rewrites `candidate`; the in-memory bundle is the
-    // authority for the landing write, exactly as it is in production. Moving
-    // the gate's own candidate in here drops the copy the claim deserialized.
+    // The claim UPDATE never rewrites `candidate`. Landing takes the audit as
+    // parts, which the coordinator's claim rebuilds from the referenced window;
+    // here they are the bundle's own, split without a copy. Moving the gate's
+    // candidate in drops the copy the claim deserialized.
     let block_hash = candidate.block_hash.clone();
+    let (body, shares) = bundle.into_parts();
     let claim = CandidateClaim {
         candidate,
         claim_token: claimed.claim_token,
+        parts: Some(ClaimParts {
+            body: std::sync::Arc::new(body),
+            shares: std::sync::Arc::new(shares),
+        }),
     };
     drop(claimed.candidate);
     writes.append(
@@ -1377,13 +1406,21 @@ async fn pipeline_body(
     // --- phase: import ---------------------------------------------------
     let directory = tempfile::tempdir()?;
     let envelope_path = directory.path().join("legacy-audit.json");
-    // Landing is done, so the in-memory window has no reader left. Move it into
-    // the envelope writer and drop it: at 400,000 shares the import phase
-    // rebuilds the whole bundle itself, and keeping a second copy alive is pure
-    // peak RSS.
-    let mut bundle = claim.candidate.bundle;
-    write_legacy_envelope(&envelope_path, &mut bundle, &report)?;
-    drop(bundle);
+    // Landing is done, so the in-memory window has no reader left. Take the
+    // parts back out of the claim, write the envelope and drop them: at
+    // 400,000 shares the import phase rebuilds the whole bundle itself, and
+    // keeping a second copy alive is pure peak RSS.
+    let parts = claim
+        .parts
+        .context("the gate's claim carried no audit parts")?;
+    drop(claim.candidate);
+    let body = std::sync::Arc::try_unwrap(parts.body)
+        .map_err(|_| anyhow::anyhow!("the audit body is still shared after landing"))?;
+    let shares = std::sync::Arc::try_unwrap(parts.shares)
+        .map_err(|_| anyhow::anyhow!("the window is still shared after landing"))?;
+    write_legacy_envelope(&envelope_path, &body, &shares, &report)?;
+    drop(body);
+    drop(shares);
     legacy_shape(&pool, &block_hash, &report, &envelope_path).await?;
     inventory.observe(&pool, Observe::Baseline).await?;
     let rss_reset = reset_peak_rss();
@@ -1495,23 +1532,87 @@ async fn pipeline_body(
     })
 }
 
-/// Only used when PostgreSQL refused the production enqueue write. Writes an
-/// outbox row whose candidate is the same block with an emptied window, so the
-/// downstream phases still exercise their own production writes instead of
-/// being reported as unreached.
+/// The candidate outbox document's ceiling at every measured size (#265): a
+/// window reference and stored inputs, never a window value.
+const OUTBOX_DOCUMENT_CEILING: i64 = 1_048_576;
+
+/// #265: the enqueue is accepted at every size, writes the outbox
+/// `candidate` document, and every JSONB value it writes stays under 1 MiB,
+/// so no window value is among them.
+fn ensure_enqueue_writes_no_window(
+    n: u64,
+    status: PhaseStatus,
+    enqueue_writes: &BTreeMap<WriteKey, PhaseWrite>,
+) -> Result<()> {
+    ensure!(
+        status == PhaseStatus::Ran,
+        "[n={n}] PostgreSQL refused the candidate enqueue; the reference row must be accepted at every size"
+    );
+    let outbox = WriteKey {
+        table: "qbit_block_candidate_outbox".into(),
+        column: "candidate".into(),
+        phase: PHASE_ENQUEUE,
+    };
+    ensure!(
+        enqueue_writes.contains_key(&outbox),
+        "[n={n}] no {} value was attributed to the enqueue",
+        label(&outbox)
+    );
+    for (key, write) in enqueue_writes {
+        ensure!(
+            write.uncompressed < OUTBOX_DOCUMENT_CEILING && write.text_len < OUTBOX_DOCUMENT_CEILING,
+            "[n={n}] the enqueue wrote {} at {} B uncompressed ({} B of text), not under {OUTBOX_DOCUMENT_CEILING} B",
+            label(key),
+            write.uncompressed,
+            write.text_len
+        );
+    }
+    Ok(())
+}
+
+/// #265: at the reduced sizes the enqueue, the claim and the landing all run;
+/// none is refused and none is unreached.
+fn ensure_reference_phases_ran(pipeline: &Pipeline) -> Result<()> {
+    for phase in [PHASE_ENQUEUE, PHASE_CLAIM, PHASE_LANDING] {
+        let status = pipeline
+            .phases
+            .iter()
+            .find(|stat| stat.name == phase)
+            .map(|stat| stat.status);
+        ensure!(
+            status == Some(PhaseStatus::Ran),
+            "[n={}] the {phase} phase did not run to completion: {status:?}",
+            pipeline.n
+        );
+    }
+    Ok(())
+}
+
+/// Only used when PostgreSQL refused the production enqueue write. The
+/// reference form makes that impossible for the window, so this is kept for a
+/// refusal of any other kind: it writes the same slim row production would,
+/// so the downstream phases still exercise their own production writes
+/// instead of being reported as unreached.
 async fn scaffold_outbox(pool: &PgPool, candidate: &Candidate) -> Result<()> {
-    let mut lean = candidate.clone();
-    lean.bundle.shares.clear();
-    lean.bundle.reward_manifest.shares.clear();
-    let payload = serde_json::to_value(&lean)?;
-    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&lean)?));
+    let payload = serde_json::to_value(candidate)?;
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(candidate)?));
+    let range = candidate.window.shares;
     sqlx::query(
-        "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256) \
-         VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+        "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,block_bytes,\
+         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,\
+         window_share_count,window_snapshot_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(&candidate.block_hash)
     .bind(payload)
     .bind(digest)
+    .bind(&candidate.block_bytes)
+    .bind(candidate.window.anchor_ms)
+    .bind(hex::encode(candidate.window.prior_balances_digest))
+    .bind(range.map(|r| i64::try_from(r.first_share_seq)).transpose()?)
+    .bind(range.map(|r| i64::try_from(r.last_share_seq)).transpose()?)
+    .bind(range.map(|r| i64::try_from(r.share_count)).transpose()?)
+    .bind(range.map(|r| hex::encode(r.snapshot_sha256)))
     .execute(pool)
     .await?;
     Ok(())
@@ -1521,15 +1622,15 @@ async fn scaffold_outbox(pool: &PgPool, candidate: &Candidate) -> Result<()> {
 /// to disk so a 400,000-share body never has to be buffered twice.
 fn write_legacy_envelope(
     path: &std::path::Path,
-    bundle: &mut AuditBundle,
+    body: &AuditBundleBody,
+    shares: &[AcceptedShare],
     report: &AuditVerificationReport,
 ) -> Result<()> {
     use std::io::Write;
     // Streamed rather than built as one `serde_json::Value`: a 400,000-share
-    // bundle costs gigabytes as a Value tree. `bundle_without_shares` may carry
-    // an empty `shares` array; the reader overwrites that key when it splices
-    // the share parts back in (`qbit-prism/src/audit_body_ref.rs`).
-    let shares = std::mem::take(&mut bundle.shares);
+    // bundle costs gigabytes as a Value tree. `bundle_without_shares` is the
+    // body, which has no `shares` key; the reader splices the share parts in
+    // (`qbit-prism/src/audit_body_ref.rs`).
     let count = shares.len();
     let first = shares.first().context("empty window")?.share_seq;
     let last = shares.last().context("empty window")?.share_seq;
@@ -1539,13 +1640,13 @@ fn write_legacy_envelope(
     write!(file, ",\"audit_bundle_sha256\":")?;
     serde_json::to_writer(&mut file, &report.audit_bundle_sha256_hex)?;
     write!(file, ",\"share_count\":{count},\"bundle_without_shares\":")?;
-    serde_json::to_writer(&mut file, &*bundle)?;
+    serde_json::to_writer(&mut file, body)?;
     write!(
         file,
         ",\"share_parts\":[{{\"kind\":\"inline\",\"first_share_seq\":{first},\
          \"last_share_seq\":{last},\"share_count\":{count},\"shares\":"
     )?;
-    serde_json::to_writer(&mut file, &shares)?;
+    serde_json::to_writer(&mut file, shares)?;
     write!(file, "}}]}}")?;
     file.flush()?;
     Ok(())
@@ -2569,6 +2670,8 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
         high.seconds,
         low.seconds + high.seconds
     );
+    ensure_reference_phases_ran(&low)?;
+    ensure_reference_phases_ran(&high)?;
     assert_ratchet(
         &rows,
         RatchetMode::Projected {

@@ -2,6 +2,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     build_audit_bundle, canonical_audit_bundle_bytes, verify_audit_bundle, AcceptedShare,
     AuditBundle, CarryForwardBalance, CoinbaseOutputPolicy, FoundBlock, PayoutPolicy,
+    AUDIT_BUILDER_VERSION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -349,6 +350,51 @@ fn canonicalize_cli_emits_verifier_hash_bytes() {
     assert_eq!(reparsed, bundle);
 }
 
+/// The CC5 fixture's canonical output under one builder version.
+struct Cc5Golden {
+    builder_version: u16,
+    canonical_bytes_len: usize,
+    canonical_sha256: &'static str,
+    reward_manifest_sha256: &'static str,
+    payout_policy_manifest_sha256: &'static str,
+    coinbase_manifest_sha256: &'static str,
+    share_slice_digest: &'static str,
+    audit_commitment_root: &'static str,
+}
+
+/// One entry per `AUDIT_BUILDER_VERSION` that has ever produced these bytes.
+///
+/// A change that alters `canonical_audit_bundle_bytes` for the same inputs
+/// bumps `AUDIT_BUILDER_VERSION` and **adds** the new digests here, next to
+/// the old ones; a stored candidate or prepared job at an older version is
+/// refused rather than rebuilt, so both outputs stay on the record and review
+/// sees the change. Never edit an existing entry: an expected value that moved
+/// under an unchanged version is a canonical-hash regression, not a golden to
+/// refresh.
+const CC5_GOLDENS: &[Cc5Golden] = &[Cc5Golden {
+    builder_version: 1,
+    canonical_bytes_len: 10_999,
+    canonical_sha256: "65b11e1b7e2025472fad2e4cd6b555eaba5eab2a4903e17179ba792d58780a4b",
+    reward_manifest_sha256: "14feb3360ba2d97faadf178151ca7c09bbb6a6e59e6c39a079e7d97986357ae1",
+    payout_policy_manifest_sha256:
+        "2db25eb6db270fb0e5ef9100158b2bfcca95ae6228717fb9779de47fbe11a668",
+    coinbase_manifest_sha256: "635e6133c760cbed7965b0475a273a82495141b4e3939a9908441baa532a0c39",
+    share_slice_digest: "fc39e87eaedeb6cb6442afbdf060ddc81a93846acc3ffdb47cf202c408c6a9d3",
+    audit_commitment_root: "492c8e5f83049d3f6b04a175a531f130a8c52c2fa944b06741f442587f365d3a",
+}];
+
+fn cc5_golden() -> &'static Cc5Golden {
+    CC5_GOLDENS
+        .iter()
+        .find(|golden| golden.builder_version == AUDIT_BUILDER_VERSION)
+        .unwrap_or_else(|| {
+            panic!(
+                "no CC5 golden entry for AUDIT_BUILDER_VERSION {AUDIT_BUILDER_VERSION}; \
+                 add the new builder's digests to CC5_GOLDENS, keeping every older entry"
+            )
+        })
+}
+
 #[test]
 fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
     let fixture: Fixture = serde_json::from_str(include_str!(
@@ -494,30 +540,31 @@ fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
         .contains("qbit-prism-build-phase-metrics"));
 
     let report = verify_audit_bundle(&emitted_bundle, &ledger_public_key_hex()).unwrap();
-    assert_eq!(output.stdout.len(), 10_999);
+    let golden = cc5_golden();
+    assert_eq!(output.stdout.len(), golden.canonical_bytes_len);
     assert_eq!(
         hex::encode(Sha256::digest(&output.stdout)),
-        "65b11e1b7e2025472fad2e4cd6b555eaba5eab2a4903e17179ba792d58780a4b"
+        golden.canonical_sha256
     );
     assert_eq!(
         report.reward_manifest_sha256_hex,
-        "14feb3360ba2d97faadf178151ca7c09bbb6a6e59e6c39a079e7d97986357ae1"
+        golden.reward_manifest_sha256
     );
     assert_eq!(
         report.payout_policy_manifest_sha256_hex,
-        "2db25eb6db270fb0e5ef9100158b2bfcca95ae6228717fb9779de47fbe11a668"
+        golden.payout_policy_manifest_sha256
     );
     assert_eq!(
         report.coinbase_manifest_sha256_hex,
-        "635e6133c760cbed7965b0475a273a82495141b4e3939a9908441baa532a0c39"
+        golden.coinbase_manifest_sha256
     );
     assert_eq!(
         emitted_bundle.reward_manifest.share_slice_digest_hex,
-        "fc39e87eaedeb6cb6442afbdf060ddc81a93846acc3ffdb47cf202c408c6a9d3"
+        golden.share_slice_digest
     );
     assert_eq!(
         report.audit_commitment_root_hex,
-        "492c8e5f83049d3f6b04a175a531f130a8c52c2fa944b06741f442587f365d3a"
+        golden.audit_commitment_root
     );
     assert_eq!(report.onchain_output_count, 3);
     assert_eq!(report.accrued_account_count, 3);

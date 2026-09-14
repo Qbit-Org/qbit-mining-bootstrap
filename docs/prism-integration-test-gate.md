@@ -112,6 +112,7 @@ The number of test ids in that file is the minimum count; see the file for
 the current list and the `check-gate-manifest` success line from
 [scripts/check_gate_manifest.py](../scripts/check_gate_manifest.py) for the
 count verified in a green run.
+
 The job has four shards, each with its own PostgreSQL service and qbitd.
 [scripts/run_rust_test_shard.py](../scripts/run_rust_test_shard.py) discovers
 all workspace targets from Cargo metadata, sorts by package, kind, and name,

@@ -98,7 +98,7 @@ fn ranges_reject_unrepresentable_sequences_and_impossible_counts() {
 fn streamed_digest_preserves_native_bytes_and_differs_from_legacy_digest() {
     let shares = vec![share(1), share(3), share(4)];
     let expected: [u8; 32] = Sha256::digest(serde_json::to_vec(&shares).unwrap()).into();
-    let mut state = WindowRead::new(0);
+    let mut state = WindowRead::new();
     for share in &shares {
         state.push(share.clone()).unwrap();
     }
@@ -142,4 +142,92 @@ fn balance_order_and_failure_variants_match_the_source() {
         check_balances(reversed, [0; 32], BalanceSource::AsIssued),
         Err(WindowError::Decode(_))
     ));
+}
+
+fn snapshot_of(shares: Vec<AcceptedShare>) -> Snapshot {
+    Snapshot {
+        anchor_ms: 1_700_000_000_000,
+        share_seq: shares.last().map(|share| share.share_seq).unwrap_or(0),
+        payout_revision: 5,
+        shares,
+        prior_balances: vec![
+            CarryForwardBalance {
+                recipient_id: "z".into(),
+                order_key: "a".into(),
+                p2mr_program_hex: "11".repeat(32),
+                balance_sats: 7,
+            },
+            CarryForwardBalance {
+                recipient_id: "a".into(),
+                order_key: "z".into(),
+                p2mr_program_hex: "22".repeat(32),
+                balance_sats: 9,
+            },
+        ],
+    }
+}
+
+#[test]
+fn from_snapshot_streams_the_native_digest_and_keeps_an_empty_window_empty() {
+    let shares = vec![share(4), share(9), share(11)];
+    let snapshot = snapshot_of(shares.clone());
+    let reference = WindowRef::from_snapshot(&snapshot).unwrap();
+    assert_eq!(reference.anchor_ms, snapshot.anchor_ms);
+    assert_eq!(
+        reference.prior_balances_digest,
+        qbit_prism::prior_balances_digest(&snapshot.prior_balances)
+    );
+    let range = reference.shares.expect("a non-empty snapshot has a range");
+    assert_eq!(range.first_share_seq, 4);
+    assert_eq!(range.last_share_seq, 11);
+    assert_eq!(range.share_count, 3);
+    // The streamed digest is the bytes `qbit_prism_audit_snapshots` stores.
+    let expected: [u8; 32] = Sha256::digest(serde_json::to_vec(&shares).unwrap()).into();
+    assert_eq!(range.snapshot_sha256, expected);
+    // The same bytes the paged reader accumulates one share at a time.
+    let mut state = WindowRead::new();
+    for share in &shares {
+        state.push(share.clone()).unwrap();
+    }
+    assert_eq!(state.finish(range).unwrap(), shares);
+
+    let mut permuted = snapshot_of(Vec::new());
+    permuted.prior_balances.reverse();
+    let empty = WindowRef::from_snapshot(&permuted).unwrap();
+    assert!(empty.shares.is_none(), "an empty snapshot has no range");
+    // The balances digest sorts internally, so the vector order never moves it.
+    assert_eq!(empty.prior_balances_digest, reference.prior_balances_digest);
+}
+
+#[test]
+fn canonical_balance_snapshot_is_sorted_and_permutation_independent() {
+    let balances = snapshot_of(Vec::new()).prior_balances;
+    let mut reversed = balances.clone();
+    reversed.reverse();
+    let (digest, bytes) = canonical_balance_snapshot(balances.clone()).unwrap();
+    let (other_digest, other_bytes) = canonical_balance_snapshot(reversed).unwrap();
+    assert_eq!((digest, &bytes), (other_digest, &other_bytes));
+    let mut sorted = balances;
+    sort_balances(&mut sorted);
+    assert_eq!(bytes, serde_json::to_vec(&sorted).unwrap());
+    assert_eq!(digest, qbit_prism::prior_balances_digest(&sorted));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancelled_blocking_handoff_is_task_failed_and_never_decode() {
+    // A blocking task aborted before it starts is the shape a cancelled
+    // hand-off takes. Every hand-off in this module maps it the same way.
+    let handle = tokio::task::spawn_blocking(|| unreachable!("cancelled before it ran"));
+    handle.abort();
+    let error = handle
+        .await
+        .map(|(): ()| ())
+        .map_err(WindowError::TaskFailed)
+        .unwrap_err();
+    assert!(
+        matches!(&error, WindowError::TaskFailed(join) if join.is_cancelled()),
+        "{error:?}"
+    );
+    assert!(!matches!(error, WindowError::Decode(_)));
+    assert!(error.to_string().contains("cancelled or failed"), "{error}");
 }
