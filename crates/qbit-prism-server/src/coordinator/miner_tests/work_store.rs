@@ -107,6 +107,12 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 current_revision: expected_current_revision,
                 original_expires_at_ms: expires_at_ms,
             });
+            // Inline and compact payloads cannot reserve the same immutable
+            // key. Do not let a scripted success hide this producer conflict.
+            ensure!(
+                !self.jobs.lock().unwrap().contains_key(key),
+                "immutable compact prepared conflict"
+            );
             self.compact
                 .saves
                 .lock()

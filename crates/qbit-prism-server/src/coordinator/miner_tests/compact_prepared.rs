@@ -1,11 +1,25 @@
 use super::*;
-use crate::coordinator::prepared_storage::compact::CapturedCompactPrepared;
+use crate::coordinator::prepared_storage::compact::{
+    CapturedCompactPrepared, CompactOwner, OriginalPreparedBuild,
+};
 use crate::ledger::{PayoutState, StoredCompactPrepared};
 use work_ledger::WorkLedger;
 
-async fn captured(f: &Fixture) -> CapturedCompactPrepared {
+// Reuse the fixture's original build parts under an unreserved key. This is
+// test setup, not a production conversion from a legacy/resumed Prepared.
+fn original_build(original: &Prepared) -> CompactOwner<OriginalPreparedBuild> {
+    OriginalPreparedBuild::from_original_build(
+        format!("prepared:fresh:{}", uuid::Uuid::new_v4().simple()),
+        original.stored.clone(),
+        original.window,
+        original.inputs.clone(),
+    )
+}
+
+async fn captured(f: &Fixture) -> CompactOwner<CapturedCompactPrepared> {
+    let original = f.coordinator.prepared.read().await.clone().unwrap();
     f.coordinator
-        .capture_compact_prepared(130_000)
+        .capture_compact_prepared(original_build(&original), 130_000)
         .await
         .unwrap()
 }
@@ -59,6 +73,109 @@ async fn cleanup_finished(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn fresh_capture_saves_without_publication_and_preserves_inline_conflicts() {
+    for empty in [false, true] {
+        let mut f = Fixture::new(Duration::from_secs(10)).await;
+        // The fixture supplies original builder outputs without database I/O.
+        // Remove its access view: fresh capture must not read a publication.
+        let original = f.coordinator.prepared.write().await.take().unwrap();
+        let mut snapshot = (*original.snapshot).clone();
+        if empty {
+            snapshot.shares.clear();
+        }
+        let window = WindowRef::from_snapshot(&snapshot).unwrap();
+        let stored = Arc::new(StoredPrepared {
+            snapshot: Arc::new(snapshot),
+            template: original.template.clone(),
+            bundle: (!empty).then(|| original.stored.bundle.clone().unwrap()),
+            fee: original.fee,
+            fingerprint: original.fingerprint.clone(),
+            generation: original.generation,
+            parent_of_tip: original.parent_of_tip.clone(),
+            coinbase_suffix: original.stored.coinbase_suffix.clone(),
+        });
+        let key = format!("prepared:fresh:{}", uuid::Uuid::new_v4().simple());
+        let source = OriginalPreparedBuild::from_original_build(
+            key.clone(),
+            stored.clone(),
+            window,
+            original.inputs.clone(),
+        );
+        f.detect(1).await;
+        let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
+        config.payout_policy.safety_multiplier += 1;
+        config.ctv_enabled = true;
+        config.ctv_direct_floor += 1;
+        config.manifest_seed = hash(0x33);
+        config.ledger_seed = hash(0x44);
+        let captured = f
+            .coordinator
+            .capture_compact_prepared(source, 130_000)
+            .await
+            .unwrap();
+        assert!(f.coordinator.prepared.read().await.is_none());
+        assert!(f.store.jobs.lock().unwrap().is_empty());
+        assert_eq!(captured.record.payout_policy, original.inputs.payout_policy);
+        assert_eq!(captured.record.ctv, original.inputs.ctv);
+        assert_eq!(captured.record.signer_keys, original.inputs.signer_keys);
+        assert_eq!(captured.record.window, window);
+        assert_eq!(captured.record.audit_hashes.is_none(), empty);
+        f.store
+            .compact
+            .saves
+            .lock()
+            .unwrap()
+            .extend([Ok(true), Ok(false)]);
+        assert!(f
+            .coordinator
+            .save_captured_compact(&captured)
+            .await
+            .unwrap());
+        assert!(!f
+            .coordinator
+            .save_captured_compact(&captured)
+            .await
+            .unwrap());
+        assert!(f.coordinator.prepared.read().await.is_none());
+        for saved in f.store.compact.save_calls.lock().unwrap().iter() {
+            assert_eq!(saved.key, key);
+            assert_eq!(saved.original_expires_at_ms, 130_000);
+            assert_eq!(saved.record, captured.record);
+        }
+
+        // Negative control for the old published-only path: an inline save
+        // already owns the selected key. Compact save must keep that conflict
+        // an error and leave the incompatible row and its expiry untouched.
+        let occupied = format!("prepared:inline:{}", uuid::Uuid::new_v4().simple());
+        let inline = serde_json::to_value(&stored).unwrap();
+        f.store
+            .save_job(&occupied, &inline, 0, &hash(1), 30)
+            .await
+            .unwrap();
+        let conflict_source = OriginalPreparedBuild::from_original_build(
+            occupied.clone(),
+            stored,
+            window,
+            original.inputs.clone(),
+        );
+        let conflict = f
+            .coordinator
+            .capture_compact_prepared(conflict_source, 130_000)
+            .await
+            .unwrap();
+        let error = f
+            .coordinator
+            .save_captured_compact(&conflict)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "immutable compact prepared conflict");
+        let jobs = f.store.jobs.lock().unwrap();
+        assert_eq!(jobs[&occupied].payload, inline);
+        assert_eq!(jobs[&occupied].expires_at_ms, 130_000);
+    }
+}
+
+#[tokio::test]
 async fn capture_preserves_original_identity_and_exact_save_arguments() {
     let mut f = Fixture::build(
         Duration::from_secs(10),
@@ -71,6 +188,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     .await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
+    let source = original_build(&original);
     let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
     config.ctv_enabled = false;
     config.ctv_direct_floor += 1;
@@ -78,8 +196,13 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     config.coinbase_tag = "/changed/".into();
     config.manifest_seed = hash(0x33);
     config.ledger_seed = hash(0x44);
-    let captured = captured(&f).await;
-    assert!(Arc::ptr_eq(&captured.original, &original));
+    let captured = f
+        .coordinator
+        .capture_compact_prepared(source, 130_000)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&captured.original.stored, &original.stored));
+    assert_ne!(captured.original.storage_key, original.storage_key);
     assert_eq!(captured.record.window, original.window);
     assert_eq!(captured.record.share_seq, original.snapshot.share_seq);
     assert_eq!(
@@ -143,7 +266,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     let saves = f.store.compact.save_calls.lock().unwrap();
     assert_eq!(saves.len(), 2);
     for saved in saves.iter() {
-        assert_eq!(saved.key, original.storage_key);
+        assert_eq!(saved.key, captured.original.storage_key);
         assert_eq!(saved.record, captured.record);
         assert_eq!(saved.template_sha256, captured.template.sha256());
         assert_eq!(saved.balances, original.snapshot.prior_balances);
@@ -165,6 +288,7 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
         .shares
         .clear();
     f.coordinator.refresh_once().await.unwrap();
+    let source = original_build(f.coordinator.prepared.read().await.as_ref().unwrap());
     let worker = f.job(1, 0, "original.worker").context.worker.clone();
     let issued = f
         .coordinator
@@ -186,7 +310,7 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
     assert!(original.stored.bundle.is_none());
     let captured = f
         .coordinator
-        .capture_compact_prepared(130_000)
+        .capture_compact_prepared(source, 130_000)
         .await
         .unwrap();
     assert_eq!(captured.record.window, original.window);
@@ -200,10 +324,11 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
 }
 
 #[tokio::test]
-async fn capture_uses_published_original_not_legacy_resumed_inputs() {
+async fn original_build_capture_does_not_recapture_legacy_resumed_inputs() {
     let mut f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
+    let source = original_build(&original);
     let worker = f.job(1, 0, "original.worker").context.worker.clone();
     let job = f
         .coordinator
@@ -226,8 +351,12 @@ async fn capture_uses_published_original_not_legacy_resumed_inputs() {
         resumed.context.prepared.inputs.payout_policy,
         original.inputs.payout_policy
     );
-    let captured = captured(&f).await;
-    assert!(Arc::ptr_eq(&captured.original, &original));
+    let captured = f
+        .coordinator
+        .capture_compact_prepared(source, 130_000)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&captured.original.stored, &original.stored));
     assert!(!Arc::ptr_eq(&captured.original, &resumed.context.prepared));
     assert_eq!(captured.record.payout_policy, original.inputs.payout_policy);
     let report = qbit_prism::verify_audit_bundle(
@@ -236,7 +365,12 @@ async fn capture_uses_published_original_not_legacy_resumed_inputs() {
     )
     .unwrap();
     assert_eq!(
-        captured.record.audit_hashes.unwrap().audit_bundle_sha256,
+        captured
+            .record
+            .audit_hashes
+            .as_ref()
+            .unwrap()
+            .audit_bundle_sha256,
         report.audit_bundle_sha256_hex
     );
 }
@@ -248,21 +382,22 @@ impl Drop for ReleaseProbe {
     }
 }
 
-async fn with_probe() -> (Fixture, ReleaseProbe) {
+async fn with_probe() -> (Fixture, CompactOwner<OriginalPreparedBuild>, ReleaseProbe) {
     let f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
     let probe = Arc::new(prepared_storage::RepairProbe::default());
-    *original.repair_probe.lock().unwrap() = Some(probe.clone());
-    (f, ReleaseProbe(probe))
+    let source =
+        OriginalPreparedBuild::with_capture_probe(original_build(&original), probe.clone());
+    (f, source, ReleaseProbe(probe))
 }
 
 #[tokio::test]
 async fn cancelled_capture_retains_build_permit_until_actual_completion() {
-    let (f, probe) = with_probe().await;
+    let (f, source, probe) = with_probe().await;
     let capture = tokio::spawn({
         let c = f.coordinator.clone();
-        async move { c.capture_compact_prepared(130_000).await }
+        async move { c.capture_compact_prepared(source, 130_000).await }
     });
     probe.0.entered.notified().await;
     capture.abort();
@@ -291,11 +426,11 @@ async fn cancelled_capture_retains_build_permit_until_actual_completion() {
 #[tokio::test]
 async fn save_revalidates_authority_and_fixed_deadline_after_capture_wait() {
     for expire in [false, true] {
-        let (f, probe) = with_probe().await;
+        let (f, source, probe) = with_probe().await;
         let save = tokio::spawn({
             let c = f.coordinator.clone();
             async move {
-                let captured = c.capture_compact_prepared(130_000).await?;
+                let captured = c.capture_compact_prepared(source, 130_000).await?;
                 c.save_captured_compact(&captured).await
             }
         });
@@ -356,6 +491,7 @@ async fn hydration_preserves_original_inputs_and_three_distinct_deadlines() {
                 .clear();
         }
         f.coordinator.refresh_once().await.unwrap();
+        let publication = f.coordinator.prepared.read().await.clone().unwrap();
         let captured = captured(&f).await;
         let issued = issued(&f, &captured);
         let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
@@ -418,7 +554,7 @@ async fn hydration_preserves_original_inputs_and_three_distinct_deadlines() {
         assert_eq!(hydrated.build_permit.num_permits(), 1);
         assert!(Arc::ptr_eq(
             f.coordinator.prepared.read().await.as_ref().unwrap(),
-            &captured.original
+            &publication
         ));
         drop(hydrated);
         cleanup_finished(&f).await;
@@ -637,6 +773,7 @@ async fn hydrated_inputs_and_permit_survive_until_blocking_cleanup_finishes() {
         *f.store.compact.clock_gate.lock().unwrap() = Some(clock.clone());
         window.release.notify_one();
         clock.entered.notified().await;
+        let mut external_drop = None;
         match outcome {
             "cancel" => {
                 hydrate.abort();
@@ -657,7 +794,12 @@ async fn hydrated_inputs_and_permit_survive_until_blocking_cleanup_finishes() {
                 let inputs = hydrate.await.unwrap().unwrap().unwrap();
                 // Dropping after handoff, outside a Tokio context, still uses
                 // the captured runtime for owned blocking cleanup.
-                std::thread::spawn(move || drop(inputs)).join().unwrap();
+                let (finished, completion) = tokio::sync::oneshot::channel();
+                let thread = std::thread::spawn(move || {
+                    drop(inputs);
+                    let _ = finished.send(());
+                });
+                external_drop = Some((thread, completion));
             }
         }
         let dropped_on = tokio::time::timeout(Duration::from_secs(5), receive)
@@ -665,6 +807,11 @@ async fn hydrated_inputs_and_permit_survive_until_blocking_cleanup_finishes() {
             .unwrap()
             .unwrap();
         assert_ne!(dropped_on, runtime_thread);
+        if let Some((thread, _)) = &external_drop {
+            // An inline drop on this external thread must fail rather than
+            // deadlock the runtime in join() while the probe awaits release.
+            assert_ne!(dropped_on, thread.thread().id());
+        }
         assert_eq!(
             f.coordinator.build_slots.available_permits(),
             0,
@@ -672,6 +819,13 @@ async fn hydrated_inputs_and_permit_survive_until_blocking_cleanup_finishes() {
         );
         release.0.release();
         cleanup_finished(&f).await;
+        if let Some((thread, completion)) = external_drop {
+            tokio::time::timeout(Duration::from_secs(5), completion)
+                .await
+                .unwrap()
+                .unwrap();
+            thread.join().unwrap();
+        }
     }
 }
 

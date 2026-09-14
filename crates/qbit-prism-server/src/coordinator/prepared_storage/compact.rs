@@ -60,6 +60,50 @@ pub(in crate::coordinator) struct CapturedCompactPrepared {
     pub original_expires_at_ms: i64,
 }
 
+/// Explicit handoff from the original builder, before either persistence
+/// format reserves the key. Legacy/resumed Prepared cannot recover historical
+/// CTV/version inputs, so there is intentionally no conversion from Prepared.
+pub(in crate::coordinator) struct OriginalPreparedBuild {
+    storage_key: String,
+    stored: Arc<StoredPrepared>,
+    window: WindowRef,
+    inputs: BundleInputs,
+    created: Instant,
+    #[cfg(test)]
+    capture_probe: Option<Arc<RepairProbe>>,
+}
+
+impl OriginalPreparedBuild {
+    /// Call on the coordinator runtime with the exact locals used by the
+    /// original build, including its suffix and inputs, never current config.
+    /// The owner also protects cancellation while waiting for admission.
+    pub fn from_original_build(
+        storage_key: String,
+        stored: Arc<StoredPrepared>,
+        window: WindowRef,
+        inputs: BundleInputs,
+    ) -> CompactOwner<Self> {
+        CompactOwner::new(Self {
+            storage_key,
+            stored,
+            window,
+            inputs,
+            created: Instant::now(),
+            #[cfg(test)]
+            capture_probe: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn with_capture_probe(
+        mut source: CompactOwner<Self>,
+        probe: Arc<RepairProbe>,
+    ) -> CompactOwner<Self> {
+        source.value.as_mut().unwrap().capture_probe = Some(probe);
+        source
+    }
+}
+
 /// Original reconstruction inputs and their admission, never a published job.
 /// A later builder must move this permit into its blocking owner, not call
 /// build_bundle (which acquires another slot). Compare the rebuilt hashes with
@@ -123,6 +167,24 @@ fn prepared_dependency_key(key: &str) -> Result<()> {
         return Err(InvalidPreparedDependency.into());
     }
     Ok(())
+}
+
+/// Hash the producer's canonical Serialize representation without retaining a
+/// second whole-bundle byte array or rebuilding the original payout to read it.
+fn canonical_json_sha256(value: &impl serde::Serialize) -> Result<String> {
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(hex::encode(writer.0.finalize()))
 }
 
 impl Coordinator {
@@ -216,75 +278,103 @@ impl Coordinator {
 
     /// One admitted blocking owner retains its permit through encoding and
     /// hashing, even if the async waiter is cancelled. No nested build_bundle.
-    /// Capture only the coordinator's original publication: legacy resumed
-    /// Prepared values recapture configuration and cannot attest original inputs.
+    /// Capture the explicit original-build handoff before persistence. Reading
+    /// the publication here would select a key already reserved inline.
     pub(in crate::coordinator) async fn capture_compact_prepared(
         &self,
+        source: CompactOwner<OriginalPreparedBuild>,
         original_expires_at_ms: i64,
-    ) -> Result<CapturedCompactPrepared> {
-        let original = self
-            .prepared
-            .read()
-            .await
-            .clone()
-            .context("no published prepared work")?;
-        prepared_dependency_key(&original.storage_key)?;
+    ) -> Result<CompactOwner<CapturedCompactPrepared>> {
+        prepared_dependency_key(&source.storage_key)?;
         let permit = self.build_slots.clone().acquire_owned().await?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            #[cfg(test)]
-            if let Some(probe) = original.repair_probe.lock().unwrap().clone() {
-                probe.block();
-            }
-            let stored = &original.stored;
-            let template = PreparedTemplate::encode(&stored.template)?;
-            // A resumed bootstrap can have a worker-specific bundle in the
-            // access view; only the original nonempty window has audit hashes.
-            let audit_hashes = if original.window.shares.is_some() {
-                let bundle = stored
-                    .bundle
-                    .as_ref()
-                    .context("prepared audit bundle missing")?;
-                let report = qbit_prism::verify_audit_bundle(
-                    bundle,
-                    &original.inputs.signer_keys.ledger_key_hex,
-                )?;
-                Some(PreparedAuditHashes {
-                    audit_bundle_sha256: report.audit_bundle_sha256_hex,
-                    coinbase_manifest_sha256: report.coinbase_manifest_sha256_hex,
-                })
-            } else {
-                None
-            };
-            let record = CompactPrepared {
-                format_version: CompactPrepared::FORMAT_VERSION,
-                window: original.window,
-                share_seq: stored.snapshot.share_seq,
-                payout_revision: stored.snapshot.payout_revision,
-                template_sha256: template.sha256().into(),
-                parent_hash: stored.template["previousblockhash"]
-                    .as_str()
-                    .context("prepared parent missing")?
-                    .into(),
-                parent_of_tip: stored.parent_of_tip.clone(),
-                fingerprint: stored.fingerprint.clone(),
-                generation: stored.generation,
-                coinbase_suffix_hex: stored.coinbase_suffix.clone(),
-                payout_policy: original.inputs.payout_policy.clone(),
-                ctv: original.inputs.ctv.clone(),
-                fee: stored.fee,
-                audit_builder_version: original.inputs.audit_builder_version,
-                signer_keys: original.inputs.signer_keys.clone(),
-                audit_hashes,
-            };
-            Ok(CapturedCompactPrepared {
-                original,
-                record,
-                template,
-                original_expires_at_ms,
+        let admitted = CompactOwner::new((source.into_inner(), permit));
+        let encoded = admitted
+            .spawn_blocking(move |(source, permit)| {
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(probe) = &source.capture_probe {
+                    probe.block();
+                }
+                // Only original parts enter this private authority view. Neither
+                // this assembly nor capture publishes it or reads configuration.
+                let stored = source.stored;
+                let original = Arc::new(Prepared {
+                    template: stored.template.clone(),
+                    snapshot: stored.snapshot.clone(),
+                    window: source.window,
+                    inputs: source.inputs,
+                    bundle: stored.bundle.clone(),
+                    base_wire: None,
+                    storage_key: source.storage_key,
+                    fee: stored.fee,
+                    fingerprint: stored.fingerprint.clone(),
+                    generation: stored.generation,
+                    created: source.created,
+                    parent_of_tip: stored.parent_of_tip.clone(),
+                    stored,
+                    repair: Arc::new(Mutex::new(())),
+                    #[cfg(test)]
+                    repair_probe: Default::default(),
+                });
+                let stored = &original.stored;
+                let template = PreparedTemplate::encode(&stored.template)?;
+                // Only the original nonempty window has audit hashes; a later
+                // worker-specific bootstrap bundle is not part of this identity.
+                let audit_hashes = if original.window.shares.is_some() {
+                    let bundle = stored
+                        .bundle
+                        .as_ref()
+                        .context("prepared audit bundle missing")?;
+                    // This is the original builder's output, not untrusted
+                    // resumed data. Preserve its exact canonical byte identity;
+                    // do not reconstruct or rewrite it while capturing hashes.
+                    Some(PreparedAuditHashes {
+                        audit_bundle_sha256: canonical_json_sha256(bundle)?,
+                        coinbase_manifest_sha256: canonical_json_sha256(
+                            &bundle.signed_coinbase_manifest.manifest,
+                        )?,
+                    })
+                } else {
+                    None
+                };
+                let record = CompactPrepared {
+                    format_version: CompactPrepared::FORMAT_VERSION,
+                    window: original.window,
+                    share_seq: stored.snapshot.share_seq,
+                    payout_revision: stored.snapshot.payout_revision,
+                    template_sha256: template.sha256().into(),
+                    parent_hash: stored.template["previousblockhash"]
+                        .as_str()
+                        .context("prepared parent missing")?
+                        .into(),
+                    parent_of_tip: stored.parent_of_tip.clone(),
+                    fingerprint: stored.fingerprint.clone(),
+                    generation: stored.generation,
+                    coinbase_suffix_hex: stored.coinbase_suffix.clone(),
+                    payout_policy: original.inputs.payout_policy.clone(),
+                    ctv: original.inputs.ctv.clone(),
+                    fee: stored.fee,
+                    audit_builder_version: original.inputs.audit_builder_version,
+                    signer_keys: original.inputs.signer_keys.clone(),
+                    audit_hashes,
+                };
+                Ok::<_, anyhow::Error>(CompactOwner::new((
+                    CapturedCompactPrepared {
+                        original,
+                        record,
+                        template,
+                        original_expires_at_ms,
+                    },
+                    _permit,
+                )))
             })
-        })
-        .await?
+            .await??;
+        // A cancelled waiter leaves both output and admission in one blocking
+        // cleanup owner. Release admission only after successful async handoff.
+        let (captured, permit) = encoded.into_inner();
+        let captured = CompactOwner::new(captured);
+        drop(permit);
+        Ok(captured)
     }
 
     /// This reserves a dependency only. Original economic identity and expiry
