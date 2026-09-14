@@ -39,6 +39,7 @@ import weakref
 from typing import Any, Callable, Protocol
 
 from lab.prism import direct_stratum
+from lab.prism.window_lifecycle import capture_artifact_reuse
 from lab.prism.bundle_compiler import _ShareWindowSerialization
 from lab.prism.future_callbacks import add_releasing_done_callback
 from lab.prism.share_json_stream import share_array_json_view
@@ -502,6 +503,7 @@ class JobBuildRequest:
     idle_retarget: bool = False
     publication_critical: bool = False
     request_source: str = "routine"
+    artifact_reuse_reason: str = "not_probed"
     priority_admission_recorded: bool = False
     promise: Future[CachedJobBundle] = field(default_factory=Future)
     requested_monotonic: float = field(default_factory=time.monotonic)
@@ -2849,14 +2851,15 @@ class JobBundleService:
                 )
             with self._job_cache_lock:
                 payout_state_generation = runtime._payout_state_generation
-            payout_artifact = (
-                runtime._usable_payout_ledger_artifact(
-                    payout_state_generation,
-                    artifacts.network_difficulty,
+            with capture_artifact_reuse() as reuse_probe:
+                payout_artifact = (
+                    runtime._usable_payout_ledger_artifact(
+                        payout_state_generation,
+                        artifacts.network_difficulty,
+                    )
+                    if resolved_mode == "ready"
+                    else None
                 )
-                if resolved_mode == "ready"
-                else None
-            )
             if preparation_cancellation is not None:
                 preparation_cancellation.raise_if_cancelled(
                     "payout artifact lookup"
@@ -2949,6 +2952,7 @@ class JobBundleService:
                     ),
                     preparation_cancellation=preparation_cancellation,
                 )
+                request.artifact_reuse_reason = reuse_probe.reason
                 # Preserve the historical readiness handoff without holding a
                 # lock across construction: only admission and the final mode
                 # re-selection are serialized here.
@@ -3360,6 +3364,13 @@ class JobBundleService:
                         inflight_scan_anchor_token
                     )
                     isolated_shares = None
+                    runtime._ensure_bundle_compiler().window_lifecycle.note(
+                        "ready_snapshot", build_request.artifact_reuse_reason,
+                        anchor_ms=issued_at_ms,
+                        append_epoch=build_request.key.payout_append_invalidation_epoch,
+                        payout_generation=payout_state_generation,
+                        template_generation=artifacts.generation,
+                    )
                     try:
                         if callable(getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)):
                             verified = snapshot_window(
