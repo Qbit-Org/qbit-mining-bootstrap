@@ -226,6 +226,16 @@ OPTIONS_END = "--"
 # interpreter or the word before; nothing at the end of the line or at a word
 # the shell would reject.
 NEXT_WORD = re.compile(rf"\s+(?P<word>{SHELL_WORD})")
+# A redirection the shell removes before CPython sees its arguments, so it may
+# sit anywhere among the options and target: `python3 2>/dev/null -m lab.x`,
+# `python3 </dev/null -m lab.x`, `python3 -m 2>&1 lab.x` and `python3
+# -X>log dev lab/x.py` run as if it were absent. A file descriptor number
+# counts only as a whole word before `<` or `>`; the operator, including the
+# `>&`, `<&`, `&>` and `&>>` duplications, is followed by its one target word.
+# An escaped operator is word text, not a redirection, and ends the scan.
+REDIRECTION = re.compile(
+    rf"\s*(?:(?<=\s)[0-9]+(?=[<>]))?(?<!\\)(?:<<<|<<-?|<&|<>|<|>&|>>|>\||>|&>>?)\s*{SHELL_WORD}"
+)
 
 
 # The interpreter is read as a whole shell word (`INTERPRETER_WORD`), like
@@ -409,6 +419,11 @@ def shell_tokens(line: str):
             if line[start] in "<>" and line.startswith(line[start], position):
                 position += 1
                 if line[start] == "<" and position < len(line) and line[position] in "<-":
+                    position += 1
+            elif line.startswith((">&", "<&", ">|", "&>"), start):
+                # One redirection operator: its `&` or `|` separates no command.
+                position += 1
+                if line.startswith("&>>", start):
                     position += 1
             yield "operator", start, position
             continue
@@ -625,8 +640,8 @@ def python_commands(line: str):
                 words.append((start, end))
             redirect = False
             continue
-        if token.startswith(("<", ">")):
-            if words and words[-1][1] == start and line[words[-1][0]:start].isdigit():
+        if token.startswith(("<", ">", "&>")):
+            if token[0] != "&" and words and words[-1][1] == start and re.fullmatch(r"[0-9]+", line[words[-1][0]:start]):
                 words.pop()  # the adjacent number is a file descriptor, not a word
             redirect = True
             continue
@@ -667,9 +682,14 @@ def shell_words(line: str, position: int):
     """Each ``NEXT_WORD`` match on ``line`` from ``position``, until no word follows.
 
     The words end at the end of the line and at a word with an unterminated or
-    mismatched quote, which bash rejects before anything runs.
+    mismatched quote, which bash rejects before anything runs. Redirections
+    (``REDIRECTION``) between the words are skipped with their target word.
     """
-    while (match := NEXT_WORD.match(line, position)) is not None:
+    while True:
+        while (redirection := REDIRECTION.match(line, position)) is not None:
+            position = redirection.end()
+        if (match := NEXT_WORD.match(line, position)) is None:
+            return
         yield match
         position = match.end()
 
@@ -2634,6 +2654,73 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.assertEqual(self.commands(f"{prefix} python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
         self.assertEqual(self.commands("printf '%s\\n' 2>/dev/null python3 -m lab.example.deleted"), [])
+
+    def test_redirections_among_python_options_and_targets_are_removed(self) -> None:
+        missing = "lab/example/deleted.py or lab/example/deleted/__main__.py"
+        for redirection in (
+            "2>/dev/null", "</dev/null", "2> /dev/null", "> out.log", ">>out.log", "2>&1", ">&2",
+            "2>&-", "<&0", "&>/dev/null", "&>> out.log", ">|out.log", "<>tty", "<<<'data'",
+            "2>'quoted file'", '>"$log"', "2>/dev/null </dev/null",
+        ):
+            for command in (
+                f"python3 {redirection} -m lab.example.deleted",
+                f"python3 -O {redirection} -m lab.example.deleted",
+                f"python3 -m {redirection} lab.example.deleted",
+                f"python3 -X {redirection} dev -m lab.example.deleted",
+                f"python3 -W {redirection} error -m lab.example.deleted",
+                f"python3 --check-hash-based-pycs {redirection} always -m lab.example.deleted",
+                f"{redirection} python3 -m lab.example.deleted",
+                f"env {redirection} python3 -m lab.example.deleted",
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(self.commands(command), [missing])
+                    self.assertEqual(list(dead_commands(command, {"lab/example/deleted.py"})), [])
+        for command in (
+            "python3 2>/dev/null lab/example/deleted.py", "python3 -- 2>&1 lab/example/deleted.py",
+            "python3>/dev/null -OO lab/example/deleted.py", "python3 -O>log lab/example/deleted.py",
+            "true && python3 </dev/null lab/example/deleted.py", "true & python3 2>&1 lab/example/deleted.py",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.commands(command), ["lab/example/deleted.py"])
+                self.assertEqual(list(dead_commands(command, {"lab/example/deleted.py"})), [])
+
+    def test_redirected_commands_keep_their_text_and_first_line(self) -> None:
+        text = "```sh\ntrue\npython3 2>/dev/null \\\n  </dev/null -m lab.example.deleted >out.log\n```"
+        self.assertEqual(
+            [(number, command) for number, command, _ in dead_commands(text, self.TRACKED)],
+            [(3, "python3 2>/dev/null   </dev/null -m lab.example.deleted")],
+        )
+        text = "python3 <<'EOF' -m lab.example.deleted\npython3 -m lab.prism.gone\nEOF\npython3 2>&1 lab/prism/storm.py"
+        self.assertEqual(
+            self.located(text),
+            [(1, "lab/example/deleted.py or lab/example/deleted/__main__.py"), (4, "lab/prism/storm.py")],
+        )
+
+    def test_redirection_text_in_data_and_escapes_is_not_removed(self) -> None:
+        for text in (
+            "python3 2 >/dev/null -m lab.example.deleted",
+            "python3 '2'>/dev/null -m lab.example.deleted",
+            "python3 2&>/dev/null -m lab.example.deleted",
+            "python3 2&>>/dev/null -m lab.example.deleted",
+            "python3 ٢>/dev/null -m lab.example.deleted",
+            "٢>/dev/null python3 -m lab.example.deleted",
+            "python3 '2>/dev/null' -m lab.example.deleted",
+            'python3 "</dev/null" -m lab.example.deleted',
+            "python3 2'>'/dev/null -m lab.example.deleted",
+            "python3 \\>out -m lab.example.deleted",
+            "python3 2\\>out -m lab.example.deleted",
+            "python3 -c 2>/dev/null -m lab.example.deleted",
+            "env -S 'python3 2>/dev/null -m lab.example.deleted'",
+            "python3 2> ; -m lab.example.deleted",
+            "printf '%s\\n' 2>&1 python3 -m lab.example.deleted",
+            "echo x >&2 python3 -m lab.example.deleted",
+            "echo x &>/dev/null python3 -m lab.example.deleted",
+            "echo x &>> log python3 -m lab.example.deleted",
+            "echo x >| log python3 -m lab.example.deleted",
+            "echo x <&0 python3 -m lab.example.deleted",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
 
     def test_heredoc_data_cannot_change_comments_continuations_or_fences(self) -> None:
         text = (
