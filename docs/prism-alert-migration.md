@@ -90,6 +90,9 @@ durable-credit counter. The collector pool histogram records each started
 `PgPool::acquire` attempt once: success when acquired, or failure on acquisition
 error or cancellation, including the three-second collection deadline. Since #328
 instrumented coordinator ledger transactions record acquisition the same way.
+Selected direct ledger queries now share that boundary; the
+[acquisition guide](prism-pool-acquire-metrics.md) lists the covered callers and
+remaining #352 work.
 Rollup worker transactions, public API queries and other pool traffic outside
 these acquisition paths are not timed. Durations measure elapsed pool
 wait and exclude subsequent transaction work. The pool histogram is overlaid from
