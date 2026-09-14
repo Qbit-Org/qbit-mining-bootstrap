@@ -37,11 +37,11 @@ class WalHelperTests(unittest.TestCase):
             p = subprocess.run([sys.executable, str(HELPER), "--dsn", dsn, "--sql", "select 1", "--config", "test"], capture_output=True, text=True, cwd=ROOT)
             self.assertEqual(p.returncode, 1)
             self.assertIn("invalid_input", p.stdout)
-    @patch("scripts.measure_postgres_wal.psql", side_effect=subprocess.TimeoutExpired("psql", 1))
+    @patch("scripts.measure_postgres_wal.psql", side_effect=RuntimeError("PostgreSQL command timed out"))
     def test_timeout_is_sanitized(self, _):
         with self.assertRaises(RuntimeError) as ctx: measure("postgresql://127.0.0.1/db", "select 1", "u", "t", 1)
         self.assertIn("timed out", str(ctx.exception))
-    @patch("scripts.measure_postgres_wal.psql", side_effect=FileNotFoundError())
+    @patch("scripts.measure_postgres_wal.psql", side_effect=RuntimeError("psql executable is unavailable"))
     def test_missing_executable_is_sanitized(self, _):
         with self.assertRaises(RuntimeError) as ctx: measure("postgresql://127.0.0.1/db", "select 1", "u", "t", 1)
         self.assertIn("unavailable", str(ctx.exception))
