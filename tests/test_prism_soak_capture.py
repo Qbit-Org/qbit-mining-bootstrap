@@ -18,6 +18,8 @@ the hour-1, hour-12 and hour-24 snapshots itself, at the first sample due for
 each counted from its first, so the baseline and intermediate snapshots
 precede the end state. A snapshot that fails leaves ``soak-invalid`` instead
 of a completion marker.
+Each sample also requires the configured authorized-client population and a
+valid accepted ACK count, with progress after the initial baseline sample.
 """
 
 from __future__ import annotations
@@ -35,15 +37,16 @@ ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "prism-capacity-readiness.md"
 
 PLACEHOLDER = "c=<prism-coordinator-container>\n"
+POPULATION_PLACEHOLDER = "expected_authorized_clients=<ordinary-load-authorized-client-count>\n"
 RUN = "soak-20260914T000000Z"
 RSS_KB = 102400
 SAMPLES_24H = 86400 // 300 + 1
-METRICS_LINES_PER_SAMPLE = 4
+METRICS_LINES_PER_SAMPLE = 6
 
 # `sleep` moves the clock; `date` reads it; `docker` counts its `inspect` calls
 # so a test can change the identity, or run a snippet in the run directory, at
 # a chosen call, and counts the snapshot functions' `curl -fsS` scrapes so a
-# test can answer one with a cached body; every scrape's share-ack histogram
+# test can answer one with a cached body; every scrape's fixture header
 # carries the clock it was read at. Anything the fences ask of a stub that it
 # does not expect is appended to `$STUB/unexpected`, which every test requires
 # to stay absent.
@@ -95,17 +98,33 @@ docker() {
       printf 'Name:\tqbit-prism-server\nVmRSS:\t  %s kB\nThreads:\t8\n' "$STUB_RSS_KB"
       if [ "$stub_value" = "$STUB_RSS_FAULT_AT" ]; then return 1; fi ;;
     'exec curl')
+      stub_bump scrapes
       stub_state=fresh
       if [ "$4" = -fsS ]; then
         stub_bump snapshots
         if [ "$stub_value" = "$STUB_SNAPSHOT_STALE_AT" ]; then stub_state=stale; fi
+        stub_read samples
+        stub_accepted=$((STUB_ACCEPTED_BASE + stub_value - 1))
+      else
+        stub_bump samples
+        stub_accepted=$((STUB_ACCEPTED_BASE + stub_value - 1))
       fi
       stub_read clock
-      printf 'HTTP/1.1 200 OK\r\nx-prism-metrics-state: %s\r\ncontent-type: text/plain\r\n\r\n' "$stub_state"
+      printf 'HTTP/1.1 200 OK\r\nx-prism-metrics-state: %s\r\ncontent-type: text/plain\r\nx-soak-fixture-clock: %s\r\n\r\n' "$stub_state" "$stub_value"
       printf 'qbit_prism_collector_available{collector="process"} 1\n'
       printf 'qbit_prism_process_resident_memory_bytes %s\n' "$((STUB_RSS_KB * 1024))"
       printf 'qbit_prism_connections 3\n'
-      printf 'qbit_prism_share_ack_seconds_count{result="accepted"} %s\n' "$stub_value" ;;
+      if [ "$STUB_AUTHORIZED_FAULT_AT" = all ] || [ "$stub_value" = "$STUB_AUTHORIZED_FAULT_AT" ]; then
+        printf '%s' "$STUB_AUTHORIZED_BODY"
+      else
+        printf 'qbit_prism_authorized_clients 3\n'
+      fi
+      if [ "$STUB_ACCEPTED_FAULT_AT" = all ] || [ "$stub_value" = "$STUB_ACCEPTED_FAULT_AT" ]; then
+        printf '%s' "$STUB_ACCEPTED_BODY"
+      else
+        printf 'qbit_prism_share_ack_seconds_count{result="accepted"} %s\n' "$stub_accepted"
+      fi
+      printf 'qbit_prism_share_ack_seconds_count{result="rejected"} %s\n' "$((stub_value + 100))" ;;
     *) echo "docker $*" >> "$STUB/unexpected"; return 1 ;;
   esac
 }
@@ -154,6 +173,7 @@ SHARE_ACK = fence_containing("share_ack_snapshot() (")
 FULL_METRICS = fence_containing("full_metrics_snapshot() (")
 START = "capture\n"
 assert CAPTURE.count(PLACEHOLDER) == 1
+assert CAPTURE.count(POPULATION_PLACEHOLDER) == 1
 assert GATE.endswith("}\ncompleted\n")
 # `capture` calls both snapshot functions, so the three fences only define
 # functions and the run starts in the fence after them.
@@ -161,7 +181,11 @@ assert CAPTURE.endswith("\n}\n") and SHARE_ACK.endswith("\n)\n") and FULL_METRIC
 assert FENCES.count(START) == 1
 assert FENCES[FENCES.index(CAPTURE) : FENCES.index(START) + 1] == [CAPTURE, SHARE_ACK, FULL_METRICS, START]
 
-CAPTURE_SCRIPT = STUBS + CAPTURE.replace(PLACEHOLDER, "c=stub-container\n") + SHARE_ACK + FULL_METRICS + START
+CAPTURE_SCRIPT = (
+    STUBS + CAPTURE.replace(PLACEHOLDER, "c=stub-container\n")
+    .replace(POPULATION_PLACEHOLDER, 'expected_authorized_clients="$STUB_EXPECTED_CLIENTS"\n')
+    + SHARE_ACK + FULL_METRICS + START
+)
 GATE_SCRIPT = f"run={RUN}\n" + GATE
 # What step 6 tells the operator to do: judge inside the directory, and only
 # once the gate has accepted it.
@@ -176,14 +200,19 @@ class SoakRun:
         (self.stub / "clock").write_text("0\n")
         (self.stub / "inspects").write_text("0\n")
         (self.stub / "snapshots").write_text("0\n")
+        (self.stub / "scrapes").write_text("0\n")
+        (self.stub / "samples").write_text("0\n")
         self.run = self.work / RUN
         self.shell = shell
-        self.env = {**os.environ, "STUB": str(self.stub), "STUB_RSS_KB": str(RSS_KB), **env}
+        self.env = {
+            **os.environ, "STUB": str(self.stub), "STUB_RSS_KB": str(RSS_KB),
+            "STUB_EXPECTED_CLIENTS": "3", "STUB_ACCEPTED_BASE": "0", **env,
+        }
 
-    def capture(self) -> subprocess.CompletedProcess[str]:
-        script = self.work / "capture.sh"
-        script.write_text(CAPTURE_SCRIPT)
-        return self._run([self.shell, str(script)], self.work)
+    def capture(self, *, script: str = CAPTURE_SCRIPT) -> subprocess.CompletedProcess[str]:
+        path = self.work / "capture.sh"
+        path.write_text(script)
+        return self._run([self.shell, str(path)], self.work)
 
     def gate(self) -> subprocess.CompletedProcess[str]:
         return self._run([self.shell, "-c", GATE_SCRIPT], self.work)
@@ -212,10 +241,10 @@ class SoakRun:
         clocks = {}
         for name in SNAPSHOTS:
             if (self.run / name).exists():
-                (count,) = re.findall(
-                    r'^qbit_prism_share_ack_seconds_count\{result="accepted"\} (\d+)$', (self.run / name).read_text(), re.M,
+                (clock,) = re.findall(
+                    r"^x-soak-fixture-clock: (\d+)$", (self.run / name).read_text(), re.M,
                 )
-                clocks[name] = int(count)
+                clocks[name] = int(clock)
         return clocks
 
 
@@ -233,14 +262,15 @@ class ShareAckSnapshotTests(unittest.TestCase):
     )
 
     def snapshot(
-        self, shell: str, state: str | None, *, status: int = 0, histogram: bool = True,
+        self, shell: str, state: str | None, *, status: int = 0, histogram: bool = True, body: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str | None]:
         with tempfile.TemporaryDirectory(prefix="share-ack-snapshot-") as directory:
             work = Path(directory)
             headers = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n"
             if state is not None:
                 headers += f"x-prism-metrics-state: {state}\r\n"
-            body = "qbit_prism_connections 3\n" + (self.HISTOGRAM if histogram else "")
+            if body is None:
+                body = "qbit_prism_connections 3\n" + (self.HISTOGRAM if histogram else "")
             (work / "response").write_bytes((headers + "\r\n" + body).encode())
             # Like curl, the stub includes headers only when asked with -D -.
             script = r'''
@@ -286,6 +316,18 @@ run=.
                 with self.subTest(shell=shell, status=status, histogram=histogram):
                     result, snapshot = self.snapshot(shell, "fresh", status=status, histogram=histogram)
                     self.assertNotEqual(result.returncode, 0, result)
+                    self.assertIsNone(snapshot)
+
+    def test_snapshot_requires_positive_unambiguous_accepted_count(self) -> None:
+        rejected = self.HISTOGRAM.replace('result="accepted"', 'result="rejected"')
+        prefix = 'qbit_prism_share_ack_seconds_count{result="accepted"}'
+        for shell in ("sh", "bash"):
+            for accepted in ("", *(f"{prefix} {value}\n" for value in ("0", "-1", "NaN", "1.5", "5 extra")),
+                             f"{prefix} 5\n{prefix} 6\n"):
+                with self.subTest(shell=shell, accepted=accepted):
+                    result, snapshot = self.snapshot(shell, "fresh", body=rejected + accepted)
+                    self.assertNotEqual(result.returncode, 0, result)
+                    self.assertIn("positive accepted ACK count required", result.stderr)
                     self.assertIsNone(snapshot)
 
 
@@ -387,6 +429,121 @@ class SoakCaptureTests(unittest.TestCase):
             for script in (CAPTURE_SCRIPT, GATE_SCRIPT, GATE_AND_JUDGE_SCRIPT):
                 check = subprocess.run([shell, "-n"], input=script, capture_output=True, text=True)
                 self.assertEqual(check.returncode, 0, (shell, check.stderr))
+
+    def test_accepted_progress_is_recorded_from_zero_without_extra_scrapes(self) -> None:
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(shell, STUB_INTERRUPT_AT="600")
+                result = soak.capture()
+                self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
+                metrics = soak.lines("soak-metrics.log")
+                self.assertEqual(
+                    [line for line in metrics if "share_ack_seconds_count" in line],
+                    ['0 qbit_prism_share_ack_seconds_count{result="accepted"} 0',
+                     '300 qbit_prism_share_ack_seconds_count{result="accepted"} 1'],
+                )
+                self.assertEqual(
+                    [line for line in metrics if "authorized_clients" in line],
+                    ["0 qbit_prism_authorized_clients 3", "300 qbit_prism_authorized_clients 3"],
+                )
+                self.assertEqual(len(metrics), 2 * METRICS_LINES_PER_SAMPLE)
+                self.assertEqual((soak.stub / "scrapes").read_text(), "2\n")
+                self.assert_gate_refuses_for_want_of_marker(soak)
+
+    def test_frozen_or_decreasing_accepted_counts_invalidate_the_run(self) -> None:
+        prefix = 'qbit_prism_share_ack_seconds_count{result="accepted"}'
+        for shell in ("sh", "bash"):
+            for baseline, fault_at, count in (("0", "all", "42"), ("0", "all", "0"), ("10", "300", "9")):
+                with self.subTest(shell=shell, baseline=baseline, fault_at=fault_at, count=count):
+                    soak = SoakRun(
+                        shell, STUB_ACCEPTED_BASE=baseline, STUB_ACCEPTED_FAULT_AT=fault_at,
+                        STUB_ACCEPTED_BODY=f"{prefix} {count}\n",
+                    )
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                    previous = count if fault_at == "all" else baseline
+                    self.assertIn(f"accepted share ACK count did not increase from {previous} to {count}", result.stderr)
+                    self.assertIn("no metrics sample at 300", result.stderr)
+                    self.assertEqual(len(soak.lines("soak-metrics.log")), METRICS_LINES_PER_SAMPLE)
+                    self.assertEqual((soak.stub / "scrapes").read_text(), "2\n")
+                    self.assert_no_marker_at_all(soak)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_missing_malformed_or_duplicate_accepted_count_invalidates_the_run(self) -> None:
+        # Rejected counts keep growing in every stub response; they never
+        # supply the accepted progress required by the soak.
+        prefix = 'qbit_prism_share_ack_seconds_count{result="accepted"}'
+        for shell in ("sh", "bash"):
+            for body in ("", *(f"{prefix} {value}\n" for value in ("", "-1", "NaN", "1.5", "1e3", "5 extra")),
+                         f"{prefix} 5\n{prefix} 6\n"):
+                with self.subTest(shell=shell, body=body):
+                    soak = SoakRun(shell, STUB_ACCEPTED_FAULT_AT="all", STUB_ACCEPTED_BODY=body)
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertIn(f"{prefix} must have one nonnegative integer sample", result.stderr)
+                    self.assertFalse((soak.run / "soak-metrics.log").exists())
+                    self.assert_no_marker_at_all(soak)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_expected_population_must_be_positive_and_present_in_each_sample(self) -> None:
+        for shell in ("sh", "bash"):
+            for expected in ("", "0", "00", "-1", "1.5", "three"):
+                with self.subTest(shell=shell, expected=expected):
+                    soak = SoakRun(shell, STUB_EXPECTED_CLIENTS=expected)
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertIn("expected_authorized_clients must be a positive integer", result.stderr)
+                    self.assertEqual((soak.stub / "scrapes").read_text(), "0\n")
+                    self.assert_no_marker_at_all(soak)
+            for value in (None, "0", "2", "4", "-1", "NaN", "3.5", "3 extra"):
+                with self.subTest(shell=shell, actual=value):
+                    body = "" if value is None else f"qbit_prism_authorized_clients {value}\n"
+                    soak = SoakRun(shell, STUB_AUTHORIZED_FAULT_AT="300", STUB_AUTHORIZED_BODY=body)
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    expected_error = (f"authorized client count {value} does not match expected 3"
+                                      if value in ("0", "2", "4") else
+                                      "qbit_prism_authorized_clients must have one nonnegative integer sample")
+                    self.assertIn(expected_error, result.stderr)
+                    self.assertEqual(len(soak.lines("soak-metrics.log")), METRICS_LINES_PER_SAMPLE)
+                    self.assert_no_marker_at_all(soak)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_accepted_counter_comparison_preserves_large_integer_progress(self) -> None:
+        # Integer histogram counters must not round away a one-ACK increase
+        # above the exact-integer range of awk floating-point arithmetic.
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(shell, STUB_ACCEPTED_BASE="9007199254740992", STUB_INTERRUPT_AT="600")
+                result = soak.capture()
+                self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
+                self.assertIn(
+                    '300 qbit_prism_share_ack_seconds_count{result="accepted"} 9007199254740993',
+                    soak.lines("soak-metrics.log"),
+                )
+
+    def test_accepted_progress_stopping_on_final_sample_prevents_completion(self) -> None:
+        # Anchor the already-running soak at 0 while starting its last two
+        # samples at 86100, so the real completion branch is exercised
+        # without repeating 287 earlier samples for this fault case.
+        script = CAPTURE_SCRIPT.replace("  start=\n", "  start=0\n")
+        self.assertNotEqual(script, CAPTURE_SCRIPT)
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(
+                    shell, STUB_ACCEPTED_BASE="100", STUB_ACCEPTED_FAULT_AT="86400",
+                    STUB_ACCEPTED_BODY='qbit_prism_share_ack_seconds_count{result="accepted"} 100\n',
+                )
+                (soak.stub / "clock").write_text("86100\n")
+                result = soak.capture(script=script)
+                self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                self.assertIn("no metrics sample at 86400", result.stderr)
+                self.assertIn("accepted share ACK count did not increase from 100 to 100", result.stderr)
+                self.assertEqual(len(soak.lines("soak-rss.csv")), 2)
+                self.assertFalse((soak.run / "share-ack-h24.txt").exists())
+                self.assert_no_marker_at_all(soak)
+                self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     def test_full_run_completes_after_24_h_and_is_judged(self) -> None:
         for shell in ("sh", "bash"):
@@ -619,7 +776,7 @@ class SoakCaptureTests(unittest.TestCase):
         # answered with a cached body. The run stops at that sample, keeps the
         # snapshots taken before it, publishes nothing under the failed name
         # and, when the failure is an hour-24 snapshot, writes no marker.
-        share_ack = "  share-ack snapshot failed: fresh state header and histogram required"
+        share_ack = "  share-ack snapshot failed: fresh state header and positive accepted ACK count required"
         full_metrics = "  full metrics snapshot failed: fresh state header required"
         for shell in ("sh", "bash"):
             for scrape, hour, kind, detail in (

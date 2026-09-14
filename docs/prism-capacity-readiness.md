@@ -457,10 +457,20 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    sample's appends and its second identity read, and a snapshot that fails
    stops the run the same way. It ends the run itself, as complete, after the
    first sample taken 86,400 s or more after the first, once that sample has
-   passed every check, by writing `soak-complete` and returning `0`:
+   passed every check, by writing `soak-complete` and returning `0`.
+
+   Set `expected_authorized_clients` to the positive number of authorized
+   clients in the ordinary-load population. Every sample must match it and,
+   after the first establishes a baseline, show at least one new accepted
+   share ACK since the previous sample. Keep ordinary load producing accepted
+   shares in each five-minute interval; a cumulative histogram left by earlier
+   traffic or rejected-only traffic cannot qualify an idle run. The count
+   checks population size, so the operator must also keep the individual
+   miners unchanged.
 
    ```sh
    c=<prism-coordinator-container>
+   expected_authorized_clients=<ordinary-load-authorized-client-count>
    run=soak-$(date -u +%Y%m%dT%H%M%SZ)
    process() {
      docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}' "$c"
@@ -472,8 +482,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      prev=
      prev_end=
      start=
+     prev_accepted=
      snapped=0
      mkdir "$run" || return
+     if ! awk -v expected="$expected_authorized_clients" 'BEGIN { exit !(expected ~ /^[0-9]+$/ && expected + 0 > 0) }'; then
+       echo "$(date -u +%FT%TZ): soak invalid, expected_authorized_clients must be a positive integer" | invalid
+       return 1
+     fi
      if ! first=$(process) || [ -z "$first" ]; then
        echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity at the start of the run" | invalid
        return 1
@@ -529,17 +544,32 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics)
        rc=$?
        metrics=$(printf '%s\n' "$metrics" | tr -d '\r')
-       why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" '
+       why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" -v previous="$prev_accepted" -v expected="$expected_authorized_clients" '
+         function canonical(n) { sub(/^0+/, "", n); return n == "" ? "0" : n }
+         function increased(n, p) {
+           n = canonical(n); p = canonical(p)
+           return length(n) > length(p) || (length(n) == length(p) && ("n" n) > ("n" p))
+         }
          /^x-prism-metrics-state:/ { state = $0 }
          $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
          /^qbit_prism_collector_available\{collector="process"\} / { up = $0 }
          $0 == "qbit_prism_collector_available{collector=\"process\"} 1" { up_ok = 1 }
          /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = $0; if ($NF ~ /^[0-9]+$/) rss_ok = 1 }
+         $1 == "qbit_prism_share_ack_seconds_count{result=\"accepted\"}" {
+           accepted_n++; accepted = $2; accepted_ok = NF == 2 && $2 ~ /^[0-9]+$/
+         }
+         $1 == "qbit_prism_authorized_clients" {
+           clients_n++; clients = $2; clients_ok = NF == 2 && $2 ~ /^[0-9]+$/
+         }
          END {
            if (rc != 0) print "docker exec exited " rc
            else if (!fresh) print (state ? "state header read \"" state "\"" : "no x-prism-metrics-state header")
            else if (!up_ok) print (up ? "process collector gauge read \"" up "\"" : "no qbit_prism_collector_available{collector=\"process\"} sample")
-           else if (!rss_ok) print (rss ? "RSS gauge read \"" rss "\"" : "no qbit_prism_process_resident_memory_bytes sample") }')
+           else if (!rss_ok) print (rss ? "RSS gauge read \"" rss "\"" : "no qbit_prism_process_resident_memory_bytes sample")
+           else if (accepted_n != 1 || !accepted_ok) print "qbit_prism_share_ack_seconds_count{result=\"accepted\"} must have one nonnegative integer sample"
+           else if (previous != "" && !increased(accepted, previous)) print "accepted share ACK count did not increase from " previous " to " accepted
+           else if (clients_n != 1 || !clients_ok) print "qbit_prism_authorized_clients must have one nonnegative integer sample"
+           else if (canonical(clients) != canonical(expected)) print "authorized client count " clients " does not match expected " expected }')
        if [ -n "$why" ]; then
          {
            echo "$(date -u +%FT%TZ): soak invalid, no metrics sample at $now"
@@ -549,8 +579,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          } | invalid
          return 1
        fi
+       prev_accepted=$(printf '%s\n' "$metrics" | awk '$1 == "qbit_prism_share_ack_seconds_count{result=\"accepted\"}" { print $2 }')
        lines=$(printf '%s\n' "$metrics" \
-         | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
+         | grep -E '^(x-prism-metrics-state:|qbit_prism_share_ack_seconds_count\{result="accepted"\} |qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
          | sed "s/^/$now /")
        printf '%s\n' "$lines" >> "$run/soak-metrics.log" || {
          echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
@@ -761,12 +792,19 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    seconds, the server renders the process collector gauge at 0 and
    `qbit_prism_process_resident_memory_bytes` at `-1` under a header that
    still says `fresh`. That sample has no RSS value for the reading order to
-   start from, so it is unusable and the run is invalid. The other families
+   start from, so it is unusable and the run is invalid. The same fresh scrape
+   must contain exactly one nonnegative integer accepted ACK count and
+   authorized-client gauge. The accepted count must increase after the first
+   sample, and the authorized count must match `expected_authorized_clients`;
+   missing, malformed, frozen or decreasing evidence invalidates the run
+   before completion can be published. Both counts are retained in
+   `soak-metrics.log`. The other families
    in the filter are not required, because a histogram bucket or a
    `runtime_task_stalled{task}` series can legitimately be absent from a
    given scrape. The step-2 gate proves the body fresh and the collector
-   publishing once, at the start; this check proves both, and a usable RSS
-   value, at every sample.
+   publishing once, at the start; this check proves both, a usable RSS value,
+   the configured population size and accepted-share progress at every later
+   sample.
 
    Every stop path writes its message the same way, through `invalid`,
    which copies what it is given to `$run/soak-invalid` and to stderr, and
@@ -851,11 +889,14 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          next
        }
        /^qbit_prism_share_ack_seconds_(bucket|sum|count)[{ ]/ { histogram = histogram $0 "\n" }
+       $1 == "qbit_prism_share_ack_seconds_count{result=\"accepted\"}" {
+         accepted_n++; accepted_ok = NF == 2 && $2 ~ /^[0-9]+$/ && $2 + 0 > 0
+       }
        END {
-         if (!fresh || histogram == "") exit 1
+         if (!fresh || histogram == "" || accepted_n != 1 || !accepted_ok) exit 1
          printf "%s%s", headers, histogram
        }') || {
-       echo "share-ack snapshot failed: fresh state header and histogram required" >&2
+       echo "share-ack snapshot failed: fresh state header and positive accepted ACK count required" >&2
        exit 1
      }
      if ! printf '%s\n' "$lines" > "$snapshot.tmp" || ! mv "$snapshot.tmp" "$snapshot"; then
@@ -870,9 +911,11 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    samples taken 3,600 s, 43,200 s and 86,400 s or more after its first.
    Each file keeps the response headers and the histogram from the same
    successful scrape. A cached response can return HTTP 200 with a `stale`
-   or `unavailable` state, so the function requires the `fresh` header before
-   writing anything. It publishes the snapshot by renaming a completed
-   temporary file; a failed write leaves no partial snapshot at the final
+   or `unavailable` state, so the function requires the `fresh` header and a
+   positive integer accepted ACK count before writing anything. A rejected-only
+   histogram is not accepted-share latency evidence; the capture loop separately
+   checks that accepted ACKs keep progressing. It publishes the snapshot by
+   renaming a completed temporary file; a failed write leaves no partial snapshot at the final
    name. Use only the final `.txt` files for the latency comparison. If any
    call fails, the run lacks usable latency evidence, so `capture` ends it
    as invalid through `invalid`: keep its directory and repeat the soak from
