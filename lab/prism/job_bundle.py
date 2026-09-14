@@ -34,7 +34,7 @@ import json
 import subprocess
 import threading
 import time
-from types import FrameType
+from types import FrameType, MemberDescriptorType, TracebackType
 import weakref
 from typing import Any, Callable, Protocol
 
@@ -224,8 +224,8 @@ def _clear_finished_frame(frame: FrameType) -> None:
 def _release_finished_job_build_frames(error: BaseException) -> None:
     """Drop the locals of the finished producer frames a build error retains.
 
-    A build that observes its cancellation raises from deep inside the
-    executor task. The stored exception's traceback references every frame it
+    A failed or cancelled build raises from deep inside the executor task.
+    The stored exception's traceback references every frame it
     unwound through, from the executor's task plumbing and the entry point
     down to the checkpoint, and those frames still own the request (as a
     local and inside the task's argument tuple), its template artifacts, the
@@ -235,18 +235,13 @@ def _release_finished_job_build_frames(error: BaseException) -> None:
 
     The traceback's first entry is the executor's work-item frame that caught
     the error and stored it on the future. That frame is still executing
-    while done callbacks run and is never touched. Every entry below it has
-    returned: the error could only reach the work item by propagating out of
-    all of them, including the executor context frame that unpacked the task
-    arguments. Those finished frames are cleared, and so are the finished
-    producer frames recorded by the error's ``__cause__`` and ``__context__``
-    chain (a compiler failure re-raised as supersession keeps the failure as
-    its cause, whose own traceback still reaches the request). A chained
-    entry is only cleared from the first frame the cancellation itself
-    unwound through, so a frame that belongs to some other execution is left
-    alone. Clearing a finished frame drops only its locals; formatted
-    tracebacks keep their files, line numbers, and source lines, and the
-    chain itself is preserved.
+    while done callbacks run and is never touched. Frames below it belonging
+    to this invocation have returned, including the executor context frame
+    that unpacked the task arguments. They can also occur in causes, contexts
+    and exception-group members. Check each frame's ancestry: a re-raised
+    error may additionally carry older frames from a foreign execution.
+    Clearing a finished frame drops only its locals; traceback locations and
+    links remain intact, including those shared with an external observer.
     """
 
     head = error.__traceback__
@@ -258,51 +253,139 @@ def _release_finished_job_build_frames(error: BaseException) -> None:
         entry = entry.tb_next
     if head is None or entry is None:
         return
-    finished: set[FrameType] = set()
-    node = head.tb_next
-    while node is not None:
-        finished.add(node.tb_frame)
-        _clear_finished_frame(node.tb_frame)
-        node = node.tb_next
-    seen = {id(error)}
+    # Use invocation identity, not a contiguous traceback suffix: a producer
+    # can re-raise an exception whose older frames belong to another call or
+    # thread. Only descendants of this executor invocation may be cleared.
+    # This includes Python 3.14's context.run frame holding the task tuple.
+    boundary = head.tb_frame
+    parent = entry.tb_frame.f_back
+    while parent is not None and parent is not boundary:
+        parent = parent.f_back
+    if parent is None:
+        return
+    seen: set[int] = set()
     pending = [error]
     while pending:
         current = pending.pop()
-        for chained in (current.__cause__, current.__context__):
-            if chained is None or id(chained) in seen:
-                continue
-            seen.add(id(chained))
-            pending.append(chained)
-            node = chained.__traceback__
-            while node is not None and node.tb_frame not in finished:
-                node = node.tb_next
-            while node is not None:
-                finished.add(node.tb_frame)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        pending.extend(chained for chained in (current.__cause__, current.__context__)
+                       if chained is not None)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        node = current.__traceback__
+        while node is not None:
+            parent = node.tb_frame.f_back
+            while parent is not None and parent is not boundary:
+                parent = parent.f_back
+            if parent is boundary:
                 _clear_finished_frame(node.tb_frame)
-                node = node.tb_next
+            node = node.tb_next
 
 
-def _job_build_error_for_waiter(error: JobBuildCancelled) -> JobBuildCancelled:
-    """Return one waiter's private copy of a promise's cancellation error.
+def _copy_job_build_error(
+    error: BaseException,
+    children: tuple[BaseException, ...] | None = None,
+) -> BaseException:
+    """Copy initialized exception state without sharing mutable traceback links."""
 
-    The copy carries the same type, message, diagnostic attributes, notes,
-    and ``__cause__``/``__context__`` chain, and shares the producer
-    traceback entries, so a formatted traceback still shows where the build
-    observed its cancellation and why. Raising a private instance leaves the
-    stored exception's traceback untouched: no waiter frame is ever appended
-    to it, and concurrent waiters cannot interleave their frames in each
-    other's diagnostics.
-    """
-
-    private = type(error)(*error.args)
+    if isinstance(error, BaseExceptionGroup):
+        private = BaseExceptionGroup.__new__(
+            type(error), error.message,
+            error.exceptions if children is None else children,
+        )
+    elif isinstance(error, OSError):
+        # OSError has a native layout that BaseException.__new__ refuses.
+        private = OSError.__new__(type(error), *error.args)
+        if hasattr(error, "characters_written"):
+            private.characters_written = error.characters_written
+    elif isinstance(error, MemoryError):
+        private = MemoryError.__new__(type(error), *error.args)
+    else:
+        # Do not rerun a custom constructor or __copy__/pickle hook. Its
+        # args need not match its constructor, and hooks may return itself.
+        private = BaseException.__new__(type(error), *error.args)
+    if children is None:
+        private.args = error.args
     private.__dict__.update(error.__dict__)
+    # Preserve native diagnostic fields and Python subclass slots as well
+    # as __dict__; args alone omits e.g. OSError.filename and custom phases.
+    for cls in type(error).__mro__:
+        for name, descriptor in vars(cls).items():
+            if isinstance(descriptor, MemberDescriptorType) and hasattr(error, name):
+                value = getattr(error, name)
+                if cls is OSError and value is None:
+                    # Absent native fields read as None. Assigning None would
+                    # make them present and alter str(error), including a
+                    # message-only TimeoutError's absent errno/strerror.
+                    continue
+                try:
+                    setattr(private, name, value)
+                except AttributeError:
+                    pass  # Group message/membership are constructor-owned.
     notes = getattr(error, "__notes__", None)
     if notes is not None:
         private.__notes__ = list(notes)
+    entries = []
+    node = error.__traceback__
+    while node is not None:
+        entries.append(node)
+        node = node.tb_next
+    traceback = None
+    for node in reversed(entries):
+        traceback = TracebackType(traceback, node.tb_frame, node.tb_lasti, node.tb_lineno)
+    private.__traceback__ = traceback
     private.__cause__ = error.__cause__
     private.__context__ = error.__context__
     private.__suppress_context__ = error.__suppress_context__
-    return private.with_traceback(error.__traceback__)
+    return private
+
+
+def _job_build_error_for_waiter(error: BaseException) -> BaseException:
+    """Give an observer private exceptions, notes and traceback links.
+
+    Only retired producer frames are shared. Their files, line numbers and
+    source locations remain available, while raising or editing one copy
+    cannot append another waiter's frames to the stored error or its chain.
+    Explicit diagnostic attributes retain their normal shallow-copy meaning.
+    """
+
+    copies: dict[int, BaseException] = {}
+    pending: list[BaseException] = []
+
+    def allocate(source: BaseException) -> BaseException:
+        if id(source) in copies:
+            return copies[id(source)]
+        if isinstance(source, BaseExceptionGroup):
+            # The immutable group membership is acyclic. Cause/context links
+            # are connected later, after all group nodes have been allocated.
+            children = tuple(allocate(child) for child in source.exceptions)
+            private = _copy_job_build_error(source, children)
+        else:
+            private = _copy_job_build_error(source)
+        copies[id(source)] = private
+        pending.append(source)
+        return private
+
+    try:
+        private = allocate(error)
+        while pending:
+            source = pending.pop()
+            target = copies[id(source)]
+            target.__cause__ = allocate(source.__cause__) if source.__cause__ is not None else None
+            target.__context__ = allocate(source.__context__) if source.__context__ is not None else None
+            target.__suppress_context__ = source.__suppress_context__
+        # A cyclic diagnostic chain may refer back to its root. Keep that
+        # root unraised so it cannot acquire a waiter frame and retain the
+        # request/promise through the diagnostic cycle.
+        return _copy_job_build_error(private)
+    finally:
+        # The recursive allocator's closure must not keep the copied graph
+        # (and a possibly still-running executor's traceback) until GC.
+        copies.clear()
+        pending.clear()
+        del allocate
 
 
 def _await_job_build_promise(
@@ -315,13 +398,13 @@ def _await_job_build_promise(
     waiter's frames to the exception's traceback. A waiter that owns the
     request or promise while it unwinds -- the retrying bundle loop does --
     thereby rebuilds the request -> promise -> exception -> traceback ->
-    request cycle for every cancelled build it observes. Cancellation
-    outcomes are raised as waiter-private copies instead; successful builds
-    and unexpected errors keep ``Future.result`` semantics exactly.
+    request cycle for every failed build it observes. All errors are raised
+    as waiter-private copies; successful results, wait expiry and Future
+    cancellation retain their existing semantics.
     """
 
     error = promise.exception(timeout=timeout)
-    if isinstance(error, JobBuildCancelled):
+    if error is not None:
         raise _job_build_error_for_waiter(error)
     return promise.result()
 
@@ -1379,12 +1462,10 @@ class JobBundleService:
             return None, CancelledError()
         error = future.exception()
         if error is not None:
-            if isinstance(error, JobBuildCancelled):
-                # The finished producer frames still own the request and its
-                # payout window through this traceback. Release them before
-                # the error is published to waiters; unexpected failures keep
-                # their full traceback for post-mortem inspection.
-                _release_finished_job_build_frames(error)
+            # Release invocation-owned locals before any failure is published
+            # to waiters. Traceback locations and error metadata survive;
+            # post-mortem producer locals intentionally do not.
+            _release_finished_job_build_frames(error)
             return None, error
         result = future.result()
         if request.cancellation.is_set():
