@@ -204,8 +204,12 @@ SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
     'parent_hash', parent_hash, 'coinbase_txid', coinbase_txid,
     'payout_manifest_sha256', payout_manifest_sha256,
     'audit_publication_sequence', audit_publication_sequence,
-    'chain_state', chain_state, 'maturity_state', maturity_state))
-FROM qbit_pool_blocks ORDER BY block_hash COLLATE "C";
+    'chain_state', chain_state, 'maturity_state', maturity_state,
+    'found_at', to_jsonb(found_at AT TIME ZONE 'UTC'),
+    'matured_at', to_jsonb(matured_at AT TIME ZONE 'UTC'),
+    'disconnected_at', to_jsonb(disconnected_at AT TIME ZONE 'UTC'),
+    'inactive_since', to_jsonb((to_jsonb(b)->>'inactive_since')::timestamptz AT TIME ZONE 'UTC')))
+FROM qbit_pool_blocks b ORDER BY block_hash COLLATE "C";
 
 -- Import authenticates added bytes against the declared digest. Normalize
 -- absent bytes to that digest so frozen, migrated and imported rows agree.

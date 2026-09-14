@@ -503,6 +503,66 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
                 ensure!(unchanged == prior, "unrelated accounting changed with {mutation}");
                 prior = current;
             }
+            // Dashboard history reads block lifecycle timestamps, so a restore
+            // that alters any of them must be visible even when chain and
+            // maturity state are unchanged.
+            let baseline = prior.clone();
+            ensure!(baseline["records"]["blocks"]["count"].as_u64().unwrap_or(0) > 0);
+            let target = format!(
+                "WHERE block_hash=(SELECT min(block_hash COLLATE \"C\") FROM {}.qbit_pool_blocks)",
+                db.schema
+            );
+            let (found_at, inactive_since): (String, Option<String>) = sqlx::query_as(&format!(
+                "SELECT found_at::text,to_jsonb(b)->>'inactive_since' FROM {}.qbit_pool_blocks b {target}",
+                db.schema
+            ))
+            .fetch_one(&db.pool)
+            .await?;
+            let has_inactive_since: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=$1 AND table_name='qbit_pool_blocks' AND column_name='inactive_since')",
+            )
+            .bind(&db.schema)
+            .fetch_one(&db.pool)
+            .await?;
+            let update = |set: &str| format!("UPDATE {}.qbit_pool_blocks SET {set} {target}", db.schema);
+            // CHECKs tie matured_at to 'mature' and disconnected_at to
+            // 'reversed'. Each state change is setup, never asserted; within
+            // a state only one timestamp moves per check.
+            let stages: [(&str, &[&str]); 3] = [
+                ("found_at=found_at", &["found_at='2001-01-01T00:00:00Z'", "inactive_since='2026-09-14T20:00:02Z'"]),
+                ("maturity_state='mature',matured_at='2026-09-14T19:00:00Z'", &["matured_at='2026-09-14T19:00:01Z'"]),
+                ("maturity_state='reversed',matured_at=NULL,disconnected_at='2026-09-14T20:00:00Z'", &["disconnected_at='2026-09-14T20:00:01Z'"]),
+            ];
+            for (setup, mutations) in stages {
+                sqlx::query(&update(setup)).execute(&db.pool).await?;
+                let mut prior = recovery::evidence(db, pg_bin).await?;
+                for mutation in mutations.iter().filter(|m| has_inactive_since || !m.starts_with("inactive_since")) {
+                    sqlx::query(&update(mutation)).execute(&db.pool).await?;
+                    let current = recovery::evidence(db, pg_bin).await?;
+                    ensure!(
+                        current["records"]["blocks"]["sha256"] != prior["records"]["blocks"]["sha256"],
+                        "{schema} block lifecycle change was invisible to recovery evidence: {mutation}"
+                    );
+                    let mut unchanged = current.clone();
+                    unchanged["records"]["blocks"] = prior["records"]["blocks"].clone();
+                    ensure!(unchanged == prior, "unrelated accounting changed with {mutation}");
+                    prior = current;
+                }
+            }
+            sqlx::query(&update("maturity_state='immature',disconnected_at=NULL,found_at=$1::timestamptz"))
+                .bind(&found_at)
+                .execute(&db.pool)
+                .await?;
+            if has_inactive_since {
+                sqlx::query(&update("inactive_since=$1::timestamptz"))
+                    .bind(&inactive_since)
+                    .execute(&db.pool)
+                    .await?;
+            }
+            ensure!(
+                recovery::evidence(db, pg_bin).await? == baseline,
+                "{schema} block lifecycle restore diverged from baseline"
+            );
         }
         ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
