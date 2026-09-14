@@ -2,6 +2,7 @@ use crate::{
     api::{ApiConfig, ApiState},
     config::{self, Config},
     coordinator::Coordinator,
+    ledger::{HeartbeatHealth, HeartbeatStatus},
     metrics::{self, TaskKind},
     stratum::{run_listener, StratumConfig, StratumStats},
 };
@@ -182,11 +183,7 @@ pub async fn run(config: Config) -> Result<()> {
     // Publish stopped first; only then is it safe to release this token's
     // reservations. On failure, retain reservations and close without a
     // stopped marker so a replacement cannot reclaim live IDs.
-    if let Err(error) = coordinator
-        .ledger
-        .heartbeat(serde_json::json!({"state":"stopped"}))
-        .await
-    {
+    if let Err(error) = coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await {
         coordinator.ledger.pool.close().await;
         if let Some(failure) = failure {
             return Err(anyhow::anyhow!(
@@ -269,7 +266,12 @@ async fn publish_health(
             Ok(health)
         })
         .await?;
-        if let Err(error) = coordinator.ledger.heartbeat(health).await {
+        let health: HeartbeatHealth = serde_json::from_value(health)?;
+        if let Err(error) = coordinator
+            .ledger
+            .heartbeat(HeartbeatStatus::Health(health))
+            .await
+        {
             tracing::warn!(%error,"cluster heartbeat failed");
         }
         if let Err(error) = coordinator.ledger.prune_expired_jobs().await {
