@@ -812,6 +812,49 @@ async fn assert_native_metadata_required(
         "missing native migration history was accepted"
     );
     ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    // Startup refuses any history-table shape other than the native one.
+    for (mutation, revert) in [
+        (
+            "ALTER TABLE qbit_prism_schema_migrations DROP CONSTRAINT qbit_prism_schema_migrations_pkey",
+            "ALTER TABLE qbit_prism_schema_migrations ADD PRIMARY KEY (version)",
+        ),
+        (
+            "ALTER TABLE qbit_prism_schema_migrations SET UNLOGGED",
+            "ALTER TABLE qbit_prism_schema_migrations SET LOGGED",
+        ),
+        (
+            "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at SET DEFAULT now()",
+            "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at DROP NOT NULL",
+            "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at SET NOT NULL",
+        ),
+        (
+            "ALTER TABLE qbit_prism_schema_migrations ADD COLUMN note text",
+            "ALTER TABLE qbit_prism_schema_migrations DROP COLUMN note",
+        ),
+        (
+            "CREATE INDEX saved_native_history_applied ON qbit_prism_schema_migrations(applied_at)",
+            "DROP INDEX saved_native_history_applied",
+        ),
+        (
+            "CREATE RULE saved_native_history_rule AS ON UPDATE TO qbit_prism_schema_migrations DO INSTEAD NOTHING",
+            "DROP RULE saved_native_history_rule ON qbit_prism_schema_migrations",
+        ),
+    ] {
+        sqlx::raw_sql(mutation).execute(&source.pool).await?;
+        let refused = recovery::evidence(source, pg_bin).await;
+        sqlx::raw_sql(revert).execute(&source.pool).await?;
+        let Err(error) = refused else {
+            anyhow::bail!("export accepted a history table startup refuses: {mutation}");
+        };
+        ensure!(
+            error.to_string().contains("native migration history must have the native"),
+            "{mutation}: {error:#}"
+        );
+        ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    }
 
     const SAVE_SOURCE: &str =
         "ALTER TABLE qbit_prism_migration_source RENAME TO saved_recovery_metadata";

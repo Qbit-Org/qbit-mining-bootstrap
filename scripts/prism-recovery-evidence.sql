@@ -40,10 +40,56 @@ BEGIN
         END IF;
         RETURN;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class
-                   WHERE oid = history AND relnamespace = current_schema()::regnamespace
-                     AND relkind = 'r' AND NOT relrowsecurity AND NOT relforcerowsecurity) THEN
-        RAISE EXCEPTION 'native migration history must be an ordinary table in the current schema without row-level security' USING HINT = hint;
+    -- Mirrors require_migration_history: startup refuses any other storage,
+    -- columns, defaults, keys, indexes or behavior on the history table.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_am am ON am.oid=c.relam
+        WHERE c.oid=history
+          AND c.relnamespace=current_schema()::regnamespace
+          AND c.relkind='r' AND c.relpersistence='p' AND am.amname='heap'
+          AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+          AND NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+          AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid)
+          AND NOT EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid)
+          AND NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=c.oid)
+          AND (SELECT count(*) FROM pg_attribute WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped)=2
+          AND EXISTS (
+              SELECT 1 FROM pg_attribute a
+              WHERE a.attrelid=c.oid AND a.attname='version' AND NOT a.attisdropped
+                AND a.atttypid='pg_catalog.int4'::regtype AND a.atttypmod=-1
+                AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
+                AND NOT EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid=c.oid AND adnum=a.attnum)
+          )
+          AND EXISTS (
+              SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+              WHERE a.attrelid=c.oid AND a.attname='applied_at' AND NOT a.attisdropped
+                AND a.atttypid='pg_catalog.timestamptz'::regtype AND a.atttypmod=-1
+                AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
+                AND pg_get_expr(d.adbin,d.adrelid) IN ('clock_timestamp()', 'pg_catalog.clock_timestamp()')
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_depend dep WHERE dep.classid='pg_attrdef'::regclass
+                      AND dep.objid=d.oid AND dep.refclassid='pg_proc'::regclass
+                      AND dep.refobjid<>'pg_catalog.clock_timestamp()'::regprocedure
+                )
+          )
+          AND (SELECT count(*) FROM pg_constraint WHERE conrelid=c.oid OR confrelid=c.oid)=1
+          AND (SELECT count(*) FROM pg_index WHERE indrelid=c.oid)=1
+          AND EXISTS (
+              SELECT 1 FROM pg_constraint k JOIN pg_index i ON i.indexrelid=k.conindid
+              JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='version' AND NOT a.attisdropped
+              JOIN pg_opclass op ON op.oid=i.indclass[0]
+              JOIN pg_am iam ON iam.oid=op.opcmethod
+              WHERE k.conrelid=c.oid AND k.contype='p' AND k.convalidated
+                AND NOT k.condeferrable AND NOT k.condeferred AND k.conkey=ARRAY[a.attnum]
+                AND i.indrelid=c.oid AND i.indisprimary AND i.indisunique
+                AND i.indisvalid AND i.indisready AND i.indislive
+                AND i.indnatts=1 AND i.indnkeyatts=1 AND i.indkey[0]=a.attnum
+                AND i.indexprs IS NULL AND i.indpred IS NULL
+                AND op.opcnamespace='pg_catalog'::regnamespace
+                AND op.opcname='int4_ops' AND iam.amname='btree'
+          )
+    ) THEN
+        RAISE EXCEPTION 'native migration history must have the native logged-table, version primary-key and applied_at definitions, without extra columns, constraints, indexes, triggers, rules, inheritance or row security' USING HINT = hint;
     END IF;
     -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS. The
     -- regression removes each version declared by the server in turn.
