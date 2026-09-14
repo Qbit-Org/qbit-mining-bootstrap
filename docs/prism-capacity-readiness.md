@@ -304,18 +304,21 @@ not a graph someone reads. The Python tool that computed the verdict left with
 #244; the same verdict is one `awk` pass over the sample file:
 
 ```sh
-sort -t, -k1,1n soak-rss.csv | awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
+sort -t, -k1,1n soak-rss.csv | awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 -v max_gap=360 '
   function numeric(s) { return s ~ /^[ \t]*-?([0-9]+\.?[0-9]*|\.[0-9]+)[ \t]*$/ }
   /^[ \t]*(#|$)/ { next }
   NF != 2 || !numeric($1) || !numeric($2) { bad = $0; unusable = 1; exit }
   $2 < 0 { next }
-  { if (t0 == "") t0 = $1
+  prev != "" && $1 - prev > max_gap { gap = $1 - prev; gap_at = $1; exit }
+  { prev = $1
+    if (t0 == "") t0 = $1
     if ($1 - t0 <= warmup) { if ($2 > base) base = $2; next }
     post++; last = $1
     if ($2 > peak) { peak = $2; peak_at = $1 }
     if (!breach && $2 > base * multiple) breach = $1 }
   END {
     if (unusable) { print "unusable input: row \"" bad "\" is not seconds,rss_bytes"; exit 2 }
+    if (gap) { printf "unusable input: %d s between the samples at %d and %d, soak samples every 300 s\n", gap, prev, gap_at; exit 2 }
     if (base == "" || !post) { print "unusable input: no warm-up or no post-warm-up samples"; exit 2 }
     if (last - t0 < min_span) { printf "unusable input: series spans %d s, soak needs %d s\n", last - t0, min_span; exit 2 }
     printf "baseline=%d bound=%d peak=%d peak_at=%d first_breach_at=%s\n", base, base * multiple, peak, peak_at, breach ? breach : "none"
@@ -344,10 +347,29 @@ exits `0` on pass, `1` on fail, `2` on unusable input. The span floor is the
 Python tool's default: `min_span=82800` refuses a series that spans less than
 23 hours from its first sample to its last, not one shorter than the soak. The
 tool's source recorded the hour of slack as tolerance for a late first sample;
-the run itself is still the 24 h that step 2 below asks for. The slope guard
-the Python tool offered (a leak slow enough to stay under the multiple inside
-24 hours) has no replacement in the runbook; take it from the RSS series on
-the deployment's dashboard, whose rules #279 owns.
+the run itself is still the 24 h that step 2 below asks for. The span floor
+sees only the first and last samples, so it cannot see a hole between them:
+two samples 23 hours apart satisfy it, and so does a series with an hour
+missing after the warm-up. `max_gap=360` refuses a series in which two
+consecutive samples are more than 360 seconds apart, as unusable input (exit
+`2`) naming the interval and both timestamps, because an excursion that rose
+and drained inside such a hole is not in the file, and a verdict over the
+rest would be a pass over evidence the run never took. The tolerance is the
+five-minute cadence plus a minute of slack for the three reads an iteration
+of the capture loop makes before it sleeps, of which only the `curl` is
+bounded; a series taken in cadence has no interval near it. A `-1` row is
+skipped before the interval is measured, as it is skipped everywhere else, so
+a hole bridged by `-1` rows every five minutes is still a hole: those rows
+are samples without a value and say nothing about what RSS did between the
+usable ones. By the same rule a single `-1` row between two five-minute
+samples opens a 600 s gap; the capture loop below never writes one, it stops
+the run instead, so a file refused on that account was not the loop's. The
+Python tool had no gap rule, so this is a tightening over it of the same
+kind as the exact field count: its verdict passed a series with an
+hour-long hole after the warm-up, and a faithful port would have too. The
+slope guard the Python tool offered (a leak slow enough to stay under the
+multiple inside 24 hours) has no replacement in the runbook; take it from
+the RSS series on the deployment's dashboard, whose rules #279 owns.
 
 When it fails: the first breach time says whether the growth is the steady
 slope (breach hours in) or an excursion (breach right after a candidate storm
@@ -418,8 +440,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
    for the bound, and the correlated series for the reading order above. Both
    reads run inside the container; the parsing runs on the host. The loop
-   also checks, before every sample, that it is still reading the process
-   the run started with, and stops the run as invalid when it is not:
+   also checks, before every sample, that no more than 360 s have passed
+   since the previous one and that it is still reading the process the run
+   started with, and stops the run as invalid when either check fails:
 
    ```sh
    c=<prism-coordinator-container>
@@ -428,9 +451,15 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}' "$c"
    }
    first=$(process)
+   prev=
    mkdir "$run" &&
    while true; do
      now=$(date +%s)
+     if [ -n "$prev" ] && [ $((now - prev)) -gt 360 ]; then
+       echo "$(date -u +%FT%TZ): soak invalid, no sample for $((now - prev)) s at $now, the last one was at $prev" >&2
+       break
+     fi
+     prev=$now
      current=$(process)
      echo "$now $current" >> "$run/soak-process.log"
      if [ "$current" != "$first" ]; then
@@ -516,7 +545,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    them can hide an excursion that drained back before the next sample. A
    loop that wrote nothing on a failed read would leave exactly that gap, and
    the judge's malformed-row rule cannot catch it because no row is written
-   at all. So each iteration writes exactly one `seconds,bytes` row or stops:
+   at all; its gap rule would, but a day later, without the failed read's
+   output. So each iteration writes exactly one `seconds,bytes` row or stops:
    the body is read into a variable first, because the exit status of a
    pipeline is its last command's without `pipefail`, which not every
    operator shell sets; the row is printed only when the body carries one
@@ -525,6 +555,23 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    `VmRSS:` (the body is printed), ends the run. A transient `docker exec`
    failure is therefore not skipped: the run is invalid and starts over from
    step 2.
+
+   A gap between samples invalidates the run for the same reason, and it is
+   the hole no read can report. A host that is suspended for an hour, or a
+   `docker inspect` or `docker exec ... cat` that stalls for one, leaves the
+   series the same hole a missing sample would; neither call is bounded, only
+   the `curl` carries `--max-time`. Until now the iteration after the stall
+   wrote a valid row and the loop went on, the judge's span floor saw the
+   first and last timestamps and nothing between, and an excursion that rose
+   and drained inside the hole was gone from the record. So the loop keeps
+   the previous iteration's `now` and compares each new one with it before
+   anything is written for the iteration: past 360 s it prints the interval,
+   its own timestamp and the last sample's to stderr and stops, so the run's
+   files end at the last sample taken in cadence. The tolerance is the 300 s of sleep plus a
+   minute for the three reads, and it is the same `max_gap=360` the judge
+   above holds the file to, so a run judged from its file alone, or a file
+   whose loop was ended some other way, is held to the same interval. The
+   run is invalid and starts over from step 2.
 
    The metrics sample is held to the same rule. The correlated series is what
    reads an RSS excursion back at its own five-minute sample, so a scrape
@@ -579,9 +626,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 6. **Judge** each run with the `awk` bound check above against its own
    `$run/soak-rss.csv`; the check names `soak-rss.csv`, so run it inside the
    run directory or substitute the path. A run whose capture loop stopped on
-   a process change, a missing RSS sample or a metrics scrape that failed,
-   was not fresh, had its process collector unavailable or carried no usable
-   RSS value is not judged: it is invalid and is run again from step 2.
+   a gap between samples, a process change, a missing RSS sample or a
+   metrics scrape that failed, was not fresh, had its process collector
+   unavailable or carried no usable RSS value is not judged: it is invalid
+   and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
