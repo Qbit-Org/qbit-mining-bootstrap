@@ -470,8 +470,13 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
     index = 0
     # Reserved words are syntax only when unquoted in shell command position;
     # after an assignment or launcher they are ordinary executable arguments.
-    while index < len(words) and words[index] in {"!", "if", "then", "elif", "else", "do", "{", "while", "until"}:
+    while index < len(words) and words[index] in {"!", "if", "then", "elif", "else", "do", "{", "while", "until", "time"}:
+        prefix = words[index]
         index += 1
+        # Bash's time prefix accepts one unquoted -p; quoted spellings are
+        # executable words, just as quoted time is not a reserved word.
+        if prefix == "time" and index < len(words) and words[index] == "-p":
+            index += 1
     while index < len(words):
         word = unquote(words[index])
         if ASSIGNMENT.match(words[index]):
@@ -1829,6 +1834,39 @@ class ScannerTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.commands(text), [])
+
+    def test_time_shell_prefixes_run_the_following_command(self) -> None:
+        for command, missing in (
+            ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+            ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+        ):
+            for text in (
+                f"time {command}", f"time -p {command}", f"time ! {command}",
+                f"if time -p {command}; then true; fi",
+                f"while time {command}; do break; done",
+                f"{{ time -p {command}; }}", f"time -p {{ {command}; }}",
+                f"time X=1 {command}", f"time -p env X=1 {command}",
+                f"time command -- {command}", f"time sudo -u prism {command}",
+                f"env X=1 bash -c 'time -p {command}'",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+            text = f"```bash\ntime -p \\\n  {command}\n```"
+            self.assertEqual(self.located(text), [(2, missing)])
+
+    def test_time_words_and_options_in_data_are_not_shell_prefixes(self) -> None:
+        command = "python3 -m lab.example.deleted"
+        for prefix in (
+            "'time'", '"time"', "ti'me'", "$'time'", "'time' -p",
+            "echo time", "printf '%s\\n' time -p", "env time", "X=1 time",
+            "command -- time", "time echo", "time -p printf '%s\\n'",
+            "time '-p'", 'time "-p"', 'time -"p"', "time -p -p", "time --help",
+        ):
+            with self.subTest(prefix=prefix):
+                text = f"{prefix} {command}"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
 
     def test_inline_code_is_neither_a_module_nor_a_script_command(self) -> None:
         # `-c cmd` runs its argument and ends the option list; the prose contract
