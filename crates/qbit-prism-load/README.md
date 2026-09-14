@@ -342,7 +342,7 @@ target/release/qbit-prism-load \
 | 3 | Blocked: no frontend served work, or a log showed a refusal. Only the side report is written, and an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
-| 6 | The run was aborted: the memory floor was crossed, a frontend exited, or the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
+| 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 
 ## Outputs
@@ -537,6 +537,17 @@ The side report repeats all of this under `honest_value_notes`.
   Every phase's observation is in its `phases[]` entry as
   `database_delay_observed_select1_median_milliseconds`, with the floor beside
   it, and the entry check's under `delay_proxy`.
+- **A phase's numbers were produced under the delay it reports.** The proxy
+  reads its delay per chunk, so the delay is changed at a phase boundary only
+  once every submit offered under the previous delay has been answered:
+  nothing is offered while that settles, the wait is recorded in the next
+  phase's entry as `previous_phase_settled_before_delay_change_seconds`
+  (`null` when the delay did not change), and the same rule holds at
+  teardown, where the last phase's delay stays on until its submits have
+  settled. If they have not settled after the share-commit timeout plus 5 s
+  the delay is left alone and the run aborts (exit 6) rather than let a
+  `reconnect` submit pay the slow-database delay or a `slow_database` submit
+  finish without it.
 - **Two advisory locks are sampled, and reported apart.** Each phase carries an
   `order_lock` block and a `settlement_lock` block, same shape, same own/foreign
   split, from the same polls. `ORDER_LOCK` (`0x505249534d000002`) is what a

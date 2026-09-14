@@ -3033,6 +3033,79 @@ async fn a_paused_session_is_not_offered_work_until_it_is_retargeted() -> Result
 }
 
 /// The drain waits at least the configured commit timeout.
+/// The proxy reads its delay per chunk, so a submit still in flight when a
+/// phase boundary changes the delay finishes under the next phase's delay
+/// while keeping the phase stamp it was offered with. The boundary therefore
+/// waits for everything outstanding to settle before it touches the delay,
+/// leaves the delay alone when nothing settles in time, and does nothing at
+/// all when the delay is not changing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phase_delay_is_applied_only_once_the_previous_phase_has_settled() -> Result<()> {
+    use qbit_prism_load::proxy::DelayProxy;
+    use qbit_prism_load::run::{apply_phase_delay, settle_outstanding, DelayChange};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    // A numeric upstream needs no lookup, and nothing connects to it.
+    let proxy = DelayProxy::open("127.0.0.1:1").await?;
+    let (settled, _control_a) = detached_session(0, 0, 0);
+    let (in_flight, _control_b) = detached_session(1, 0, 2);
+    let sessions = [settled, in_flight];
+
+    // Same delay: nothing to wait for, whatever is outstanding.
+    assert_eq!(
+        apply_phase_delay(&proxy, &sessions, 0, Duration::from_millis(50)).await,
+        DelayChange::Unchanged
+    );
+
+    // A change waits. The delay is still the old one while submits are
+    // outstanding, and goes on the instant they settle.
+    let outstanding = sessions[1].outstanding.clone();
+    let releaser = tokio::spawn({
+        let outstanding = outstanding.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            outstanding.store(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            outstanding.store(0, Ordering::SeqCst);
+        }
+    });
+    let started = std::time::Instant::now();
+    let change = apply_phase_delay(&proxy, &sessions, 10, Duration::from_secs(10)).await;
+    let waited = started.elapsed();
+    releaser.await?;
+    assert_eq!(change, DelayChange::Applied);
+    assert_eq!(
+        proxy.delay_millis(),
+        10,
+        "the delay is on once nothing is outstanding"
+    );
+    assert!(
+        waited >= Duration::from_millis(400),
+        "the boundary waited for the last submit to settle, not just the first: {waited:?}"
+    );
+
+    // Submits that never settle: the delay stays where it was, and the
+    // caller learns how many are still out.
+    outstanding.store(3, Ordering::SeqCst);
+    let change = apply_phase_delay(&proxy, &sessions, 0, Duration::from_millis(200)).await;
+    assert_eq!(change, DelayChange::Refused { outstanding: 3 });
+    assert_eq!(
+        proxy.delay_millis(),
+        10,
+        "a delay is never changed under submits offered under the old one"
+    );
+    assert_eq!(
+        settle_outstanding(&sessions, Duration::from_millis(50)).await,
+        3
+    );
+    outstanding.store(0, Ordering::SeqCst);
+    assert_eq!(
+        settle_outstanding(&sessions, Duration::from_millis(50)).await,
+        0
+    );
+    Ok(())
+}
+
 #[test]
 fn the_drain_limit_covers_the_configured_commit_timeout() {
     use std::time::Duration;

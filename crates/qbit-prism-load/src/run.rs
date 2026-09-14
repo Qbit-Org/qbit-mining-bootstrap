@@ -62,6 +62,63 @@ pub fn drain_limit(share_commit_timeout_seconds: f64) -> Duration {
     Duration::from_secs_f64(share_commit_timeout_seconds.max(0.0)) + DRAIN_MARGIN
 }
 
+/// What applying a phase's delay to the proxy did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DelayChange {
+    /// The proxy already held this delay; nothing had to settle.
+    Unchanged,
+    /// Every outstanding submit settled and the new delay is on.
+    Applied,
+    /// Submits were still outstanding at the limit. The delay was left as it
+    /// was, so those submits finish under the delay they were offered under.
+    Refused { outstanding: usize },
+}
+
+/// Wait until no session has a submit outstanding, or `limit` passes. Returns
+/// what is still outstanding: 0 means everything settled.
+pub async fn settle_outstanding(sessions: &[SessionHandle], limit: Duration) -> usize {
+    let deadline = Instant::now() + limit;
+    let outstanding = || -> usize {
+        sessions
+            .iter()
+            .map(|session| session.outstanding.load(Ordering::Relaxed))
+            .sum()
+    };
+    let mut left = outstanding();
+    while left > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        left = outstanding();
+    }
+    left
+}
+
+/// Put `delay_ms` on the proxy, but only once nothing offered under the
+/// previous delay is still in flight.
+///
+/// The proxy reads its delay per chunk, so a submit outstanding when the
+/// delay changes would finish under the new one while keeping the phase
+/// stamp it was offered with; that phase's rate and p99 would then describe
+/// a delay it does not report. If the outstanding submits do not settle
+/// within `limit` the delay is left untouched and the caller is told how
+/// many remain, so a number is never produced under a delay other than the
+/// one it names (EP-STATE).
+pub async fn apply_phase_delay(
+    proxy: &proxy::DelayProxy,
+    sessions: &[SessionHandle],
+    delay_ms: u64,
+    limit: Duration,
+) -> DelayChange {
+    if proxy.delay_millis() == delay_ms {
+        return DelayChange::Unchanged;
+    }
+    let outstanding = settle_outstanding(sessions, limit).await;
+    if outstanding > 0 {
+        return DelayChange::Refused { outstanding };
+    }
+    proxy.set_delay_millis(delay_ms);
+    DelayChange::Applied
+}
+
 /// Everything the sessions reported, folded by the collector task.
 #[derive(Default)]
 pub struct Collected {
@@ -140,6 +197,10 @@ struct PhaseRun {
     replication_start: cluster::ReplicationObservation,
     replication_end: cluster::ReplicationObservation,
     proxy_delay_configured_ms: u64,
+    /// How long the boundary waited for the previous phase's submits to
+    /// settle before this phase's delay was applied; `None` when the delay
+    /// did not change and nothing had to settle.
+    delay_settled_seconds: Option<f64>,
     /// Median `SELECT 1` round trip through the frontends' URL, timed just
     /// before the phase was driven with its delay already applied; the
     /// reason when it could not be timed. Unknown is not zero.
@@ -603,9 +664,41 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let mut external_tips: Vec<crate::node::TipChange> = Vec::new();
     let mut remaining_blocks = args.scheduled_blocks;
     let mut remaining_tips = args.external_tips;
+    let settle_limit = drain_limit(args.share_commit_timeout_seconds);
     for plan in &plans {
+        // The proxy's delay is changed only once nothing offered under the
+        // previous delay is still in flight. The proxy reads its delay per
+        // chunk, so a submit outstanding across the boundary would otherwise
+        // finish under the next phase's delay while keeping its own phase's
+        // stamp, and that phase's rate and p99 would stop describing the
+        // delay it reports (EP-STATE). Nothing is offered while it settles:
+        // the previous phase's scheduler has returned. A drain that does not
+        // complete within the commit timeout and its margin aborts the run,
+        // as the reconnect phase's restart does, rather than leaking.
+        let settling = Instant::now();
+        let delay_settled_seconds = match apply_phase_delay(
+            &delay_proxy,
+            &sessions,
+            plan.database_delay_ms,
+            settle_limit,
+        )
+        .await
+        {
+            DelayChange::Unchanged => None,
+            DelayChange::Applied => Some(settling.elapsed().as_secs_f64()),
+            DelayChange::Refused { outstanding } => {
+                aborted = Some(format!(
+                    "{outstanding} submit(s) offered before the {} phase were still outstanding \
+                     {:.1} s later, so its {} ms delay could not be applied without them \
+                     finishing under it",
+                    plan.name,
+                    settle_limit.as_secs_f64(),
+                    plan.database_delay_ms
+                ));
+                break;
+            }
+        };
         *shared_session.phase.write().expect("phase lock") = plan.name.clone();
-        delay_proxy.set_delay_millis(plan.database_delay_ms);
         // The delay this phase will report is observed through the frontends'
         // URL before the phase is driven. A delayed phase whose trip did not
         // pay it aborts the run: its numbers would describe a delay that was
@@ -745,6 +838,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             replication_start,
             replication_end,
             proxy_delay_configured_ms: plan.database_delay_ms,
+            delay_settled_seconds,
             proxy_delay_observed_ms,
             min_mem_available_kib: outcome.min_mem_available_kib,
             scheduled_blocks: outcome.scheduled_blocks,
@@ -761,13 +855,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             break;
         }
     }
-    delay_proxy.set_delay_millis(0);
     *shared_session.phase.write().expect("phase lock") = "teardown".to_owned();
 
     // --- stop the load ----------------------------------------------------
     // Quiesce first: a socket closed with a submit outstanding manufactures an
     // indeterminate share that no phase asked for, and the run would then
-    // report a durability finding it created itself.
+    // report a durability finding it created itself. The last phase's delay
+    // stays on until its submits have settled, for the same reason the
+    // phase boundaries wait: the answers still in flight are that phase's.
     for session in &sessions {
         session.paused.store(true, Ordering::Relaxed);
         let _ = session.control.send(client::Control::Pause);
@@ -784,6 +879,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .map(|session| session.outstanding.load(Ordering::Relaxed))
         .sum();
+    delay_proxy.set_delay_millis(0);
     for session in &sessions {
         let _ = session.control.send(client::Control::Stop);
     }
@@ -2179,6 +2275,7 @@ fn phase_report(
         "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
         "database_delay_milliseconds_configured": phase.proxy_delay_configured_ms,
+        "previous_phase_settled_before_delay_change_seconds": phase.delay_settled_seconds,
         "database_delay_observed_select1_median_milliseconds": phase.proxy_delay_observed_ms.as_ref().ok(),
         "database_delay_observation_error": phase.proxy_delay_observed_ms.as_ref().err(),
         "database_delay_round_trip_floor_milliseconds": delay_floor_millis(phase.proxy_delay_configured_ms),
