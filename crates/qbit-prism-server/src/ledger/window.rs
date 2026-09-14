@@ -3,7 +3,7 @@ use super::*;
 mod payout_state;
 pub use payout_state::PayoutState;
 mod blocking_drop;
-use blocking_drop::BlockingDrop;
+use blocking_drop::{BlockingDrop, ReadCompletion};
 
 #[derive(Clone, Debug)]
 pub struct AppendResult {
@@ -200,6 +200,16 @@ impl Ledger {
         window: &WindowRef,
         balances: BalanceSource,
     ) -> Result<Window, WindowError> {
+        self.read_window_owned(window, balances, ReadCompletion::default())
+            .await
+    }
+
+    async fn read_window_owned(
+        &self,
+        window: &WindowRef,
+        balances: BalanceSource,
+        completion: ReadCompletion,
+    ) -> Result<Window, WindowError> {
         let bounds = window.shares.map(ShareRange::bounds).transpose()?;
         let mut tx = self.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -209,27 +219,32 @@ impl Ledger {
             "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery()",
         ).fetch_one(&mut *tx).await?;
         let expected_balances = window.prior_balances_digest;
-        let balance_task = match balances {
+        let prior_balances = match balances {
             BalanceSource::Current => {
                 let rows = prior_balance_rows(&mut tx).await?;
-                tokio::task::spawn_blocking(move || {
-                    let decoded = decode_prior_balances(rows).map_err(WindowError::Decode)?;
-                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
-                })
+                completion
+                    .own(rows)
+                    .map(move |rows| {
+                        let decoded = decode_prior_balances(rows).map_err(WindowError::Decode)?;
+                        check_balances(decoded, expected_balances, balances)
+                    })
+                    .await?
             }
             BalanceSource::AsIssued => {
                 let bytes: Vec<u8> = sqlx::query_scalar(
                     "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
                 ).bind(hex::encode(expected_balances)).fetch_optional(&mut *tx).await?
                     .ok_or(WindowError::BalanceSnapshotMissing { digest: expected_balances })?;
-                tokio::task::spawn_blocking(move || {
-                    let decoded = serde_json::from_slice(&bytes)
-                        .map_err(|error| WindowError::Decode(error.into()))?;
-                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
-                })
+                completion
+                    .own(bytes)
+                    .map(move |bytes| {
+                        let decoded = serde_json::from_slice(&bytes)
+                            .map_err(|error| WindowError::Decode(error.into()))?;
+                        check_balances(decoded, expected_balances, balances)
+                    })
+                    .await?
             }
         };
-        let prior_balances = balance_task.await.map_err(WindowError::TaskFailed)??;
         let shares = if let (Some(range), Some((first, last))) = (window.shares, bounds) {
             if !probe_share_rows(&mut tx, first, last).await? {
                 // No page has been read; an endpoint probe is not a window count.
@@ -238,23 +253,20 @@ impl Ledger {
                     got: 0,
                 });
             }
-            let state = read_range_paged(
+            let state = read_range_owned(
                 &mut tx,
-                first,
                 last,
                 window.anchor_ms,
-                WindowRead::new(),
-                move |state, shares| state.page(shares, range.share_count),
+                completion.own((
+                    WindowRead::new(),
+                    move |state: &mut WindowRead, shares| state.page(shares, range.share_count),
+                    first.saturating_sub(1),
+                )),
             )
             .await?;
-            let state = BlockingDrop::new(state);
-            tokio::task::spawn_blocking(move || {
-                state.into_inner().finish(range).map(BlockingDrop::new)
-            })
-            .await
-            .map_err(WindowError::TaskFailed)??
+            state.map(move |(state, _, _)| state.finish(range)).await?
         } else {
-            BlockingDrop::new(Vec::new())
+            completion.own(Vec::new())
         };
         tx.commit().await?;
         Ok(Window {
@@ -275,15 +287,13 @@ impl Ledger {
     /// the rebuild; the read still acquires nothing of its own, so there is no
     /// nested acquisition to wait on itself.
     ///
-    /// The permit is not dropped with the future. It is moved into the
-    /// module's blocking-drop guard, declared before the read begins, so a
-    /// cancellation
-    /// releases it on a blocking thread **after** the page state and the
-    /// vectors awaiting commit have been released there: the in-progress
-    /// read's own guards were created later, so they are dropped first and
-    /// their blocking drops are queued first. A successful or failed return
-    /// has nothing left to clean up off the runtime, so the permit is released
-    /// inline the moment the read returns, before the caller's rebuild.
+    /// One shared completion owner retains the permit through every blocking
+    /// hand-off and payload cleanup. Cancellation drops the transaction and
+    /// stops paging immediately, but admission remains held until any running
+    /// mapping and every accumulated vector's cleanup actually finish. Separate
+    /// cleanup tasks may finish in any order. On success the vectors pass to
+    /// the caller and admission is released before its rebuild; on failure it
+    /// can remain held while off-runtime cleanup finishes.
     ///
     /// Callers await this on the runtime, exactly as they do
     /// [`Ledger::read_window`]; wrapping either in `spawn_blocking` is
@@ -294,10 +304,8 @@ impl Ledger {
         balances: BalanceSource,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Window, WindowError> {
-        let permit = BlockingDrop::new(permit);
-        let outcome = self.read_window(window, balances).await;
-        drop(permit.into_inner());
-        outcome
+        self.read_window_owned(window, balances, ReadCompletion::new(permit))
+            .await
     }
 
     /// Coordinate nodes by cumulative proof of work. A slower peer or an
@@ -655,16 +663,11 @@ pub async fn probe_share_rows(
 /// buffers. Mapping the rows (`share_from_row`) and whatever `consume` does
 /// with them run together in one `spawn_blocking` task per page, which takes
 /// the state and the rows and hands the state back, so no whole-window serde
-/// or hashing ever touches a runtime thread. One implementation serves both
-/// callers:
-///
-/// * [`Ledger::read_window`], whose state is the growing `Vec<AcceptedShare>`
-///   and the running SHA-256, bounded per page by the reference's
-///   `share_count` and checked in full after the last page;
-/// * the landing re-read, whose state is the claim's existing share vector and
-///   an offset, compared page by page inside the landing transaction. The same
-///   final count and digest checks apply there; this reader performs neither,
-///   because only the caller knows the reference.
+/// or hashing ever touches a runtime thread. The same paging implementation
+/// serves [`Ledger::read_window`], whose state is the growing share vector
+/// and running SHA-256. That caller bounds each page by the reference's
+/// `share_count` and checks the final count and digest. This generic API leaves
+/// those checks to its consumer, because only it knows the reference.
 ///
 /// `consume` is called once per page, with the page's shares in ascending
 /// `share_seq`. The state and the closure both travel to the blocking thread,
@@ -692,6 +695,25 @@ where
     S: Send + 'static,
     F: FnMut(&mut S, Vec<AcceptedShare>) -> Result<(), WindowError> + Send + 'static,
 {
+    let carried = BlockingDrop::new((state, consume, first.saturating_sub(1)));
+    Ok(read_range_owned(connection, last, anchor_ms, carried)
+        .await?
+        .into_inner()
+        .0)
+}
+
+/// Keep the completion owner attached to the accumulated state until its
+/// caller finishes validation and commits, or hands that state to cleanup.
+async fn read_range_owned<S, F>(
+    connection: &mut sqlx::PgConnection,
+    last: i64,
+    anchor_ms: i64,
+    mut carried: BlockingDrop<(S, F, i64)>,
+) -> Result<BlockingDrop<(S, F, i64)>, WindowError>
+where
+    S: Send + 'static,
+    F: FnMut(&mut S, Vec<AcceptedShare>) -> Result<(), WindowError> + Send + 'static,
+{
     // `read_range`'s predicate (`ledger/audit.rs`), paged forwards: both
     // bounds are known here, so rows arrive in canonical order and a digest
     // over them can stream. `$1` is the exclusive cursor, which starts one
@@ -699,7 +721,6 @@ where
     let page = format!(
         "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}"
     );
-    let mut carried = BlockingDrop::new((state, consume, first.saturating_sub(1)));
     while carried.get().2 < last {
         let rows = sqlx::query(&page)
             .bind(carried.get().2)
@@ -710,24 +731,23 @@ where
         if rows.is_empty() {
             break;
         }
-        carried = tokio::task::spawn_blocking(move || {
-            let (mut state, mut consume, mut cursor) = carried.into_inner();
-            let shares = rows
-                .iter()
-                .map(share_from_row)
-                .collect::<Result<Vec<_>>>()
-                .map_err(WindowError::Decode)?;
-            if let Some(last) = shares.last() {
-                cursor = i64::try_from(last.share_seq)
-                    .map_err(|error| WindowError::Decode(error.into()))?;
-            }
-            consume(&mut state, shares)?;
-            Ok::<_, WindowError>(BlockingDrop::new((state, consume, cursor)))
-        })
-        .await
-        .map_err(WindowError::TaskFailed)??;
+        carried = carried
+            .map(move |(mut state, mut consume, mut cursor)| {
+                let shares = rows
+                    .iter()
+                    .map(share_from_row)
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(WindowError::Decode)?;
+                if let Some(last) = shares.last() {
+                    cursor = i64::try_from(last.share_seq)
+                        .map_err(|error| WindowError::Decode(error.into()))?;
+                }
+                consume(&mut state, shares)?;
+                Ok((state, consume, cursor))
+            })
+            .await?;
     }
-    Ok(carried.into_inner().0)
+    Ok(carried)
 }
 
 /// Write the canonical encoding of an as-issued balance set, on the caller's
