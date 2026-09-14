@@ -2454,6 +2454,74 @@ fn an_unknown_outcome_commit_is_neither_a_divergence_nor_a_loss() {
     );
 }
 
+/// `reconciliation.unexpected_outside_phases` counted the run-prefixed rows
+/// PostgreSQL holds that no phase claims, and nothing read the count: a run
+/// holding such a row reconciled clean and exited 0. Every share the harness
+/// offered has a submit record stamped with its phase, so the row is either
+/// a commit the harness never saw offered or a persisted rejection it kept
+/// out of the offered set as an entitled race. Both are durability
+/// questions, so the rows are now a durability finding of their own kind,
+/// with the sample, and weigh what an acknowledged share that went missing
+/// weighs: exit 4.
+#[test]
+fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
+    use qbit_prism_load::run::{
+        classify_gaps, outside_phases_finding, RunOutcome, OUTSIDE_PHASES_KIND,
+    };
+    use std::collections::BTreeSet;
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    // One phase offered and was acknowledged `a`; the database also holds
+    // `z`, which no phase offered. A mid-flight kill phase ran too: its
+    // exemption covers its own indeterminate rows, not rows outside every
+    // phase.
+    let committed = set(&["a", "z"]);
+    let reconciliation = digest::reconcile(set(&["a"]), set(&["a"]), &committed);
+    let phases = vec![
+        ("steady_state".to_owned(), false),
+        ("mid_flight_kill".to_owned(), true),
+    ];
+    let reconciliations = vec![("steady_state".to_owned(), reconciliation.clone())];
+    let attribution =
+        digest::attribute_unexpected(&committed, &[("steady_state".to_owned(), &reconciliation)]);
+    assert_eq!(attribution.outside_phases, vec!["z".to_owned()]);
+    let (findings, divergences, unknown_outcomes) =
+        classify_gaps(&phases, &reconciliations, &attribution, &[], 15.0);
+    let findings = findings.as_array().expect("durability_findings is a list");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["kind"], json!(OUTSIDE_PHASES_KIND));
+    assert_eq!(findings[0]["count"], json!(1));
+    assert_eq!(findings[0]["sample"], json!(["z"]));
+    assert!(
+        findings[0]["phase"].is_null(),
+        "the row belongs to no phase, and the finding says so rather than naming one"
+    );
+    assert!(divergences.is_empty() && unknown_outcomes.is_empty());
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: findings.len(),
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_DURABILITY);
+
+    // No such row, no finding: the fold adds nothing to a clean run.
+    assert_eq!(outside_phases_finding(&[]), None);
+    let clean = set(&["a"]);
+    let reconciliation = digest::reconcile(set(&["a"]), set(&["a"]), &clean);
+    let attribution =
+        digest::attribute_unexpected(&clean, &[("steady_state".to_owned(), &reconciliation)]);
+    let (findings, _, _) = classify_gaps(
+        &phases,
+        &[("steady_state".to_owned(), reconciliation)],
+        &attribution,
+        &[],
+        15.0,
+    );
+    assert_eq!(findings, json!([]));
+}
+
 #[test]
 fn only_entitled_races_are_kept_out_of_the_offered_set() {
     use qbit_prism_load::client::Outcome;

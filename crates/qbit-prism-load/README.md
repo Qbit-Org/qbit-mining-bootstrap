@@ -364,7 +364,7 @@ target/release/qbit-prism-load \
 | 0 | The run completed and reconciled exactly |
 | 2 | The harness failed with an error: before it could measure anything, or, rarely, while reconciling or writing its outputs after the load. Once the invocation has taken `--out`, the side report is written with `failed.error` naming the failure and nothing that could be read as a measurement; a failure after the phases does not recover their numbers. No artifact is written |
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
-| 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
+| 4 | A durability loss: an acknowledged share is missing from PostgreSQL, a committed share was never acknowledged and nothing explains it, or PostgreSQL holds a run-prefixed row that no phase offered |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
@@ -688,6 +688,11 @@ username prefix, and which are in O.
 - **`missing`** is A minus the database.
 - **`unexpected`** is every run-prefixed database row that is in no phase's A,
   attributed to the phase in which it was offered, or to "outside phases".
+  A row outside every phase is one the harness never saw offered, or a
+  persisted rejection it kept out of the offered set as an entitled race;
+  nothing explains it either way, so beside its count under
+  `reconciliation.unexpected_outside_phases` it is a durability finding of
+  its own kind, `committed share that no phase offered`, with the sample.
 - **The digest** is SHA-256 in lowercase hex over the de-duplicated share
   identifiers sorted by UTF-8 byte order, each followed by one `0x0a` byte. The
   top level uses the union of the artifact phases. Byte order is Rust's and
@@ -697,9 +702,10 @@ username prefix, and which are in O.
 A gap between what was acknowledged and what PostgreSQL holds is one of two
 different failures, and the harness never reports them as one thing.
 
-- **A durability loss** is an acknowledged share the database does not hold, or
-  a committed share that was never acknowledged and that nothing explains. The
-  run exits 4 with the evidence in the side report, and it is a stop-and-ask.
+- **A durability loss** is an acknowledged share the database does not hold, a
+  committed share that was never acknowledged and that nothing explains, or a
+  run-prefixed row that no phase offered at all. The run exits 4 with the
+  evidence in the side report, and it is a stop-and-ask.
 - **An ACK/commit divergence** is a share the database holds that the server
   had already refused with `ledger-confirmation-failed` / `share was not
   confirmed by the database`. Nothing was lost: the share is credited in the

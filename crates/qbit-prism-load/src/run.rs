@@ -1360,8 +1360,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .filter(|record| !record.reoffer && bug_rejection(record))
         .collect();
+    let driven: Vec<(String, bool)> = runs
+        .iter()
+        .map(|phase| (phase.plan.name.clone(), phase.plan.mid_flight_kill))
+        .collect();
     let (durability_findings, divergences, unknown_outcome_commits) = classify_gaps(
-        &runs,
+        &driven,
         &phase_reconciliations,
         &attribution,
         &collected.submits,
@@ -1462,6 +1466,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "unexpected_outside_phases": {
                 "count": attribution.outside_phases.len(),
                 "sample": attribution.outside_phases.iter().take(10).collect::<Vec<_>>(),
+                "note": "also a durability finding, under durability_findings with kind \
+                         committed share that no phase offered; the count here is the \
+                         same rows",
             },
         },
         "time_to_usable_work": time_to_usable_work(
@@ -2659,8 +2666,39 @@ pub fn classify_committed_gap(record: Option<&SubmitRecord>) -> GapKind {
     }
 }
 
-fn classify_gaps(
-    runs: &[PhaseRun],
+/// The kind a committed row that no phase offered is reported under.
+pub const OUTSIDE_PHASES_KIND: &str = "committed share that no phase offered";
+
+/// The durability finding for the run-prefixed rows PostgreSQL holds that no
+/// phase claims, or nothing when there are none.
+///
+/// Every share the harness offered has a submit record stamped with the
+/// phase that offered it, so a row outside every phase is one of two
+/// things: a commit the harness never saw offered, or a persisted rejection
+/// the harness classified as a race the server was entitled to lose and so
+/// kept out of the offered set. Both are durability questions, and the
+/// count used to be recorded under `reconciliation.unexpected_outside_phases`
+/// where nothing read it. It carries the same weight as an acknowledged
+/// share that went missing (EP-OBSERVABILITY).
+pub fn outside_phases_finding(rows: &[String]) -> Option<Value> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "phase": Value::Null,
+        "kind": OUTSIDE_PHASES_KIND,
+        "count": rows.len(),
+        "sample": rows.iter().take(20).collect::<Vec<_>>(),
+        "note": "a run-prefixed row PostgreSQL holds that is in no phase's offered set: \
+                 either a commit the harness never saw offered, or a persisted rejection \
+                 the harness kept out of the offered set as an entitled race. Neither is \
+                 explained, so it is a durability finding and the run exits 4.",
+    }))
+}
+
+/// `phases` is every phase the run drove, as `(name, mid_flight_kill)`.
+pub fn classify_gaps(
+    phases: &[(String, bool)],
     reconciliations: &[(String, digest::Reconciliation)],
     attribution: &digest::UnexpectedAttribution,
     submits: &[SubmitRecord],
@@ -2674,21 +2712,19 @@ fn classify_gaps(
         .filter(|record| !record.reoffer)
         .map(|record| (record.share_id.as_str(), record))
         .collect();
-    for phase in runs {
+    for (phase_name, mid_flight_kill) in phases {
         // Only a phase that deliberately tears a socket down can legitimately
         // produce an indeterminate share; everywhere else a gap is a finding.
-        if phase.plan.mid_flight_kill {
+        if *mid_flight_kill {
             continue;
         }
-        let Some((_, reconciliation)) = reconciliations
-            .iter()
-            .find(|(name, _)| *name == phase.plan.name)
+        let Some((_, reconciliation)) = reconciliations.iter().find(|(name, _)| name == phase_name)
         else {
             continue;
         };
         if !reconciliation.missing.is_empty() {
             findings.push(json!({
-                "phase": phase.plan.name,
+                "phase": phase_name,
                 "kind": "acknowledged share missing from PostgreSQL",
                 "count": reconciliation.missing.len(),
                 "sample": reconciliation.missing.iter().take(20).collect::<Vec<_>>(),
@@ -2697,7 +2733,7 @@ fn classify_gaps(
         let Some((_, rows)) = attribution
             .by_phase
             .iter()
-            .find(|(name, _)| *name == phase.plan.name)
+            .find(|(name, _)| name == phase_name)
         else {
             continue;
         };
@@ -2715,7 +2751,7 @@ fn classify_gaps(
             ) {
                 let detail = json!({
                     "share_id": share,
-                    "phase": phase.plan.name,
+                    "phase": phase_name,
                     "frontend": record.map(|record| record.frontend),
                     "session": record.map(|record| record.session),
                     "job_id": record.map(|record| record.job_id.clone()),
@@ -2739,13 +2775,16 @@ fn classify_gaps(
         }
         if !unexplained.is_empty() {
             findings.push(json!({
-                "phase": phase.plan.name,
+                "phase": phase_name,
                 "kind": "committed share that was never acknowledged",
                 "count": unexplained.len(),
                 "sample": unexplained.iter().take(20).collect::<Vec<_>>(),
             }));
         }
     }
+    // The rows no phase claims are not any phase's, so the mid-flight
+    // exemption above cannot cover them: they are findings in every run.
+    findings.extend(outside_phases_finding(&attribution.outside_phases));
     (json!(findings), divergences, unknown_outcomes)
 }
 
