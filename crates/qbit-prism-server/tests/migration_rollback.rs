@@ -970,12 +970,12 @@ async fn assert_candidate_payload_fingerprints(
                     &qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"42".repeat(32))?,
                     &recovery::ledger_key(),
                 ),
-                leased: false,
+                leased: true,
                 coinbase_suffix_hex: bundle.coinbase_script_sig_suffix_hex
                     .unwrap_or_else(|| "00".repeat(12)),
                 deferred_share: None,
                 block_bytes: block.to_vec(),
-                as_issued_balances: Vec::new(),
+                as_issued_balances: snapshot.prior_balances.clone(),
             };
             let body = serde_json::to_value(&candidate)?;
             let digest = hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?));
@@ -1021,6 +1021,10 @@ async fn assert_candidate_payload_fingerprints(
                 ensure!(declared == digest);
                 let mut unchanged = current;
                 unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
+                if mutation.starts_with("window_prior_balances_sha256=") {
+                    // Changing the reference also changes which snapshot is retained.
+                    unchanged["records"]["candidate_balances"] = baseline["records"]["candidate_balances"].clone();
+                }
                 ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
                 sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1,block_bytes=$3,\
                     ({WINDOW_COLUMNS})=(SELECT {WINDOW_COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$4)) WHERE block_hash=$1"))
@@ -1028,12 +1032,17 @@ async fn assert_candidate_payload_fingerprints(
                     .execute(&source.pool).await?;
                 ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
             }
+            assert_candidate_balance_fingerprints(&source, &ledger, pg_bin, &candidate).await?;
             let archive = recovery::backup(&source, pg_bin).await?;
             recovery::restore(&archive, &source, &restored, pg_bin).await?;
             ensure!(recovery::evidence(&restored, pg_bin).await? == baseline);
             let restored_ledger = Ledger::connect_operator(&restored.url, false).await?;
             let replayed = restored_ledger.claim_candidate(60).await;
+            let window = restored_ledger.read_window(
+                &candidate.window, qbit_prism_server::ledger::BalanceSource::AsIssued,
+            ).await;
             restored_ledger.pool.close().await;
+            ensure!(window?.prior_balances == snapshot.prior_balances);
             let replayed = replayed?.expect("restored pending candidate").candidate;
             ensure!(replayed.block_bytes == block);
             ensure!(serde_json::to_value(replayed)? == body);
@@ -1045,6 +1054,85 @@ async fn assert_candidate_payload_fingerprints(
     source.close().await?;
     restored.close().await?;
     result
+}
+
+async fn assert_candidate_balance_fingerprints(
+    source: &recovery::Database,
+    ledger: &Ledger,
+    pg_bin: &std::path::Path,
+    candidate: &qbit_prism_server::ledger::Candidate,
+) -> Result<()> {
+    use qbit_prism_server::ledger::BalanceSource;
+    let digest = hex::encode(candidate.window.prior_balances_digest);
+    let original: Vec<u8> = sqlx::query_scalar(
+        "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+    )
+    .bind(&digest)
+    .fetch_one(&source.pool)
+    .await?;
+    let baseline = recovery::evidence(source, pg_bin).await?;
+    ensure!(baseline["records"]["candidate_balances"]["count"] == 1);
+    ledger
+        .read_window(&candidate.window, BalanceSource::AsIssued)
+        .await?;
+    for bytes in [None, Some(b"null".to_vec()), Some(vec![0xff])] {
+        sqlx::query("DELETE FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1")
+            .bind(&digest)
+            .execute(&source.pool)
+            .await?;
+        if let Some(bytes) = &bytes {
+            sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2)")
+                .bind(&digest).bind(bytes).execute(&source.pool).await?;
+        }
+        let changed = recovery::evidence(source, pg_bin).await?;
+        ensure!(ledger
+            .read_window(&candidate.window, BalanceSource::AsIssued)
+            .await
+            .is_err());
+        sqlx::query("DELETE FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1")
+            .bind(&digest)
+            .execute(&source.pool)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2)")
+            .bind(&digest).bind(&original).execute(&source.pool).await?;
+        ensure!(
+            changed["records"]["candidate_balances"] != baseline["records"]["candidate_balances"]
+        );
+        ensure!(changed["records"]["candidate_balances"]["count"] == usize::from(bytes.is_some()));
+        let mut unchanged = changed;
+        unchanged["records"]["candidate_balances"] =
+            baseline["records"]["candidate_balances"].clone();
+        ensure!(
+            unchanged == baseline,
+            "unrelated evidence changed with candidate balances"
+        );
+        ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+    }
+    sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES(repeat('ab',32),$1)")
+        .bind(b"[]".as_slice()).execute(&source.pool).await?;
+    ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+    sqlx::query(
+        "DELETE FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=repeat('ab',32)",
+    )
+    .execute(&source.pool)
+    .await?;
+    ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+    sqlx::query("ALTER TABLE qbit_prism_balance_snapshots RENAME TO saved_candidate_balances")
+        .execute(&source.pool)
+        .await?;
+    let missing = recovery::evidence(source, pg_bin).await;
+    sqlx::query("ALTER TABLE saved_candidate_balances RENAME TO qbit_prism_balance_snapshots")
+        .execute(&source.pool)
+        .await?;
+    ensure!(
+        missing.is_err(),
+        "missing candidate balance snapshots table was accepted"
+    );
+    ledger
+        .read_window(&candidate.window, BalanceSource::AsIssued)
+        .await?;
+    ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+    Ok(())
 }
 
 async fn assert_native_audit_payload_fingerprints(

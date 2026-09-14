@@ -191,6 +191,21 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'window_snapshot_sha256', to_jsonb(o)->'window_snapshot_sha256',
     'storage_version', COALESCE(to_jsonb(o)->'storage_version', '1'::jsonb)))
 FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
+-- Pending candidates retain the as-issued balances needed for replay.
+-- Ignore unreferenced snapshots, which ordinary garbage collection removes.
+SELECT (to_regclass('qbit_prism_balance_snapshots') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_candidate_balances
+\gset
+\if :has_candidate_balances
+SELECT jsonb_build_object('kind', 'candidate_balances', 'row', jsonb_build_object(
+    'prior_balances_digest', b.prior_balances_digest,
+    'balances_sha256', encode(pg_catalog.sha256(b.balances), 'hex')))
+FROM qbit_prism_balance_snapshots b
+WHERE EXISTS (SELECT 1 FROM qbit_block_candidate_outbox c
+              WHERE c.state = 'pending'
+                AND c.window_prior_balances_sha256 = b.prior_balances_digest)
+ORDER BY b.prior_balances_digest COLLATE "C";
+\endif
 SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
     'block_hash', block_hash, 'manifest_set_sha256', manifest_set_sha256,
     'manifest_set_json', manifest_set_json, 'manifest_set', manifest_set,

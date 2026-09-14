@@ -74,6 +74,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
              {"is_called": False}),
             ("share_hashes", {"header_hash": "ab", "share_id": "first"},
              {"share_id": "later"}),
+            ("candidate_balances", {"prior_balances_digest": "ab", "balances_sha256": "cd"},
+             {"balances_sha256": "ef"}),
             ("audit_bodies", {"block_hash": "ab", "audit_bundle": {"schema": "native"}},
              {"audit_bundle": {"schema": "corrupted"}}),
             ("audit_snapshots", {"snapshot_sha256": "cd", "share_count": 3},
