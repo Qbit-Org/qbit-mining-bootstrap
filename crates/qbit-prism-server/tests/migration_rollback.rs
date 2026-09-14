@@ -574,16 +574,26 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
             let archive = recovery::backup(&source, pg_bin).await?;
             recovery::restore(&archive, &source, &restored, pg_bin).await?;
             ensure!(recovery::evidence(&restored, pg_bin).await? == native);
-            // Losing the whole native table must fail closed, never fall back
-            // to synthesizing the protection rows from the accepted ledger.
-            sqlx::query("ALTER TABLE qbit_prism_share_hashes RENAME TO missing_share_hashes")
-                .execute(&source.pool).await?;
-            let missing = recovery::evidence(&source, pg_bin).await
-                .expect_err("missing native replay table must fail export");
-            ensure!(missing.to_string().contains("qbit_prism_share_hashes"));
-            sqlx::query("ALTER TABLE missing_share_hashes RENAME TO qbit_prism_share_hashes")
-                .execute(&source.pool).await?;
-            ensure!(recovery::evidence(&source, pg_bin).await? == native);
+            // Losing any native evidence table must fail closed, including
+            // empty tables that would otherwise match an older restore.
+            for table in [
+                "qbit_prism_share_hashes",
+                "qbit_prism_cpfp_packages",
+                "qbit_prism_cpfp_retired_funding",
+                "qbit_prism_deferred_shares",
+                "qbit_prism_audit_snapshots",
+                "qbit_prism_cluster",
+                "qbit_prism_fatal_state_events",
+            ] {
+                sqlx::query(&format!("ALTER TABLE {table} RENAME TO missing_recovery_table"))
+                    .execute(&source.pool).await?;
+                let missing = recovery::evidence(&source, pg_bin).await;
+                sqlx::query(&format!("ALTER TABLE missing_recovery_table RENAME TO {table}"))
+                    .execute(&source.pool).await?;
+                ensure!(missing.is_err(), "missing native evidence table must fail export: {table}");
+                ensure!(missing.unwrap_err().to_string().contains(table));
+                ensure!(recovery::evidence(&source, pg_bin).await? == native);
+            }
             Ok::<_, anyhow::Error>(())
         }.await;
         ledger.pool.close().await;

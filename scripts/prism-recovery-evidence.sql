@@ -99,15 +99,23 @@ SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 
 -- Frozen 2.x lacks these native tables. Skip absent tables before parsing
--- their queries; empty native tables hash identically.
-SELECT to_regclass('qbit_prism_cpfp_packages') IS NOT NULL AS has_cpfp_packages,
-       to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL AS has_cpfp_retired_funding,
-       to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares,
-       to_regclass('qbit_prism_audit_snapshots') IS NOT NULL AS has_audit_snapshots,
+-- their queries only without native migration history. A native marker
+-- requires the complete native evidence tables; loss must fail the export.
+-- Empty native tables still hash identically to frozen 2.x.
+SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_packages,
+       (to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_retired_funding,
+       (to_regclass('qbit_prism_deferred_shares') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_deferred_shares,
+       (to_regclass('qbit_prism_audit_snapshots') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_audit_snapshots,
        (to_regclass('qbit_prism_share_hashes') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_native_share_hashes,
-       to_regclass('qbit_prism_cluster') IS NOT NULL AS has_cluster,
-       to_regclass('qbit_prism_fatal_state_events') IS NOT NULL AS has_fatal_state_events
+       (to_regclass('qbit_prism_cluster') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
+       (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events
 \gset
 -- Native replay protection must survive recovery. Frozen 2.x exports the
 -- exact mapping migration 002 will backfill, including its duplicate rule.
@@ -158,7 +166,7 @@ FROM qbit_prism_deferred_shares d ORDER BY block_hash COLLATE "C";
 \if :has_cluster
 -- A fresh migration has no halt. Exclude routine cluster metadata so that
 -- migrating an unchanged legacy backup still produces identical evidence.
--- JSON extraction also supports native schemas predating the set-at column.
+-- Historical halts can have an unknown set time; retain that NULL value.
 SELECT jsonb_build_object('kind', 'fatal_state', 'row', jsonb_build_object(
     'fatal_error', fatal_error, 'fatal_error_set_at', to_jsonb(c)->'fatal_error_set_at'))
 FROM qbit_prism_cluster c WHERE fatal_error IS NOT NULL ORDER BY singleton;
