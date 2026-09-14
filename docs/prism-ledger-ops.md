@@ -457,8 +457,9 @@ LIMIT 200;
 Every row must show `stopped` or `drained`. A running frontend's row holds its
 health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
 never became ready. Stale does not mean stopped: a heartbeat older than the
-15-second `self-check` window shows only that reporting stopped. The process
-may be hung, paused, cut off from PostgreSQL, or on an unreachable host, and
+`self-check` window (`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds) shows
+only that reporting stopped. The process may be hung, paused, cut off from
+PostgreSQL, or on an unreachable host, and
 may resume. `clear` therefore rejects missing, `starting`, unready, unknown,
 and old live states, however old the heartbeat.
 
@@ -578,10 +579,10 @@ three gauges at scrape time:
 
 The coordinator uses the same budget as `/healthz`:
 `max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. The setting is read as an
-unsigned whole number of seconds, defaulting to 2 when absent or invalid;
-Compose supplies 5 by default. Both values give a 15-second freshness budget.
-The publisher still ticks every 2 seconds: this setting changes the staleness
-budget, not the publication interval.
+unsigned whole number of seconds from 1 through 86400, defaulting to 2 when
+absent; invalid values fail startup. Compose supplies 5 by default. Both values
+give a 15-second freshness budget. The publisher ticks at this configured
+interval, so publication cadence and the staleness budget stay aligned.
 Once the age exceeds that budget, a scrape sets `qbit_prism_health_state` to `0`
 while retaining the other cached samples. Collector age/availability and runtime
 state are overlaid from memory at scrape time; this does not refresh the cached

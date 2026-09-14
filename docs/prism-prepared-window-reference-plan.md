@@ -42,7 +42,7 @@ addition is 008 membership. Migration009 still creates
 `(lower(payload->>'extranonce1'), expires_at)` and leaves existing jobs intact.
 The regular B migration test now uses the landed 009 SQL, installs either
 predecessor under `MIGRATION_LOCK`, and runs/restarts the real combined runner.
-Both migration tests require the exact set `[2, 3, 4, 5, 8, 9]`. Existing job
+Both migration tests require the exact set `[2, 3, 4, 5, 6, 8, 9]`. Existing job
 fields must match exactly, with only 008's seven new null columns added.
 Do not duplicate or edit 009. Coordinate the final 006/007 manifest with A/C.
 

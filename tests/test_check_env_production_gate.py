@@ -37,15 +37,11 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_POSTGRES_DATA_SOURCE": str(root / "postgres-data"),
             "PRISM_POSTGRES_WAL_SOURCE": str(root / "postgres-wal"),
             "PRISM_AUDIT_DATA_SOURCE": str(root / "prism-audit"),
+            "PRISM_SECRETS_SOURCE": str(root / "prism-secrets"),
             "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
             "PRISM_POSTGRES_PASSWORD": "not-default",
-            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
-            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
             "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
-            "PRISM_LEDGER_WRITER_ID": "managed-writer",
-            "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
-            "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF": "1",
@@ -58,9 +54,6 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN": "4",
             "PRISM_STRATUM_VARDIFF_EWMA_ALPHA": "0.4",
             "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE": "0.25",
-            "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "15",
-            "PRISM_SHARE_COMMIT_BATCH_SIZE": "64",
-            "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS": "5",
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS": "20",
         }
@@ -136,13 +129,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "CKPOOL_STARTDIFF": "65536",
             "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
             "PRISM_POSTGRES_PASSWORD": "not-default",
-            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
-            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
             "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
-            "PRISM_LEDGER_WRITER_ID": "managed-writer",
-            "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
-            "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
@@ -742,6 +730,55 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("PRISM_POSTGRES_DATA_SOURCE and PRISM_POSTGRES_WAL_SOURCE must be distinct", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_production_rejects_direct_signing_seeds_before_docker_check(self) -> None:
+        for name in ("PRISM_MANIFEST_SIGNING_SEED_HEX", "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                env = self.production_prism_env(Path(temp_dir))
+                env[name] = "42" * 32
+
+                result = self.run_check_env(**env)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"production mode requires mounted {name}_FILE; unset {name}", result.stderr)
+                self.assertNotIn("42" * 32, result.stderr)
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_production_treats_whitespace_signing_seeds_as_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_prism_env(Path(temp_dir))
+            env["PRISM_MANIFEST_SIGNING_SEED_HEX"] = " \t "
+
+            result = self.run_check_env(**env)
+
+        self.assertNotIn("requires mounted", result.stderr)
+
+    def test_release_provenance_requires_distinct_absolute_prism_secrets_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for value, message in (
+                ("", "release provenance requires PRISM_SECRETS_SOURCE as an absolute host path"),
+                ("relative/secrets", "release provenance requires PRISM_SECRETS_SOURCE as an absolute host path"),
+                (str(root / "prism-audit"), "PRISM_AUDIT_DATA_SOURCE and PRISM_SECRETS_SOURCE must be distinct"),
+            ):
+                with self.subTest(value=value):
+                    env = self.production_prism_env(root)
+                    env["PRISM_SECRETS_SOURCE"] = value
+
+                    result = self.run_check_env(**env)
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+
+    def test_lab_accepts_direct_signing_seeds(self) -> None:
+        result = self.run_check_env(
+            MINING_LANES="prism",
+            PRISM_MANIFEST_SIGNING_SEED_HEX="42" * 32,
+            PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="43" * 32,
+        )
+
+        self.assertNotIn("requires mounted", result.stderr)
+        self.assertIn("docker daemon is not reachable", result.stderr)
+
     def test_qbit_mainnet_auxpow_requires_mainnet_parent(self) -> None:
         result = self.run_check_env(
             MINING_LANES="auxpow",
@@ -765,13 +802,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             BITCOIN_RPC_PASSWORD="not-default",
             PRISM_DATABASE_URL="postgresql://example.invalid/qbit",
             PRISM_POSTGRES_PASSWORD="not-default",
-            PRISM_MANIFEST_SIGNING_SEED_HEX="42" * 32,
-            PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="43" * 32,
             PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="44" * 32,
-            PRISM_LEDGER_WRITER_ID="managed-writer",
-            PRISM_LEDGER_WRITER_EPOCH="7",
             PRISM_AUDIT_DIR="/var/lib/qbit/prism/audit",
-            PRISM_EVIDENCE_PATH="/var/lib/qbit/prism/evidence.json",
             CKPOOL_MINDIFF="1024",
             CKPOOL_STARTDIFF="65536",
             CKPOOL_REQUIRE_P2MR_PAYOUT="1",
@@ -794,13 +826,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             BITCOIN_RPC_PASSWORD="not-default",
             PRISM_DATABASE_URL="postgresql://example.invalid/qbit",
             PRISM_POSTGRES_PASSWORD="change-this",
-            PRISM_MANIFEST_SIGNING_SEED_HEX="42" * 32,
-            PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="43" * 32,
             PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="44" * 32,
-            PRISM_LEDGER_WRITER_ID="managed-writer",
-            PRISM_LEDGER_WRITER_EPOCH="7",
             PRISM_AUDIT_DIR="/var/lib/qbit/prism/audit",
-            PRISM_EVIDENCE_PATH="/var/lib/qbit/prism/evidence.json",
             CKPOOL_MINDIFF="1024",
             CKPOOL_STARTDIFF="65536",
             CKPOOL_REQUIRE_P2MR_PAYOUT="1",
@@ -822,13 +849,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             BITCOIN_RPC_PASSWORD="not-default",
             PRISM_DATABASE_URL="postgresql://qbit:change-this@prism-postgres:5432/qbit",
             PRISM_POSTGRES_PASSWORD="not-default",
-            PRISM_MANIFEST_SIGNING_SEED_HEX="42" * 32,
-            PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="43" * 32,
             PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="44" * 32,
-            PRISM_LEDGER_WRITER_ID="managed-writer",
-            PRISM_LEDGER_WRITER_EPOCH="7",
             PRISM_AUDIT_DIR="/var/lib/qbit/prism/audit",
-            PRISM_EVIDENCE_PATH="/var/lib/qbit/prism/evidence.json",
             CKPOOL_MINDIFF="1024",
             CKPOOL_STARTDIFF="65536",
             CKPOOL_REQUIRE_P2MR_PAYOUT="1",
@@ -961,13 +983,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                     "BITCOIN_RPC_PASSWORD": "not-default",
                     "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
                     "PRISM_POSTGRES_PASSWORD": "not-default",
-                    "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
-                    "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
                     "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
-                    "PRISM_LEDGER_WRITER_ID": "managed-writer",
-                    "PRISM_LEDGER_WRITER_EPOCH": "7",
                     "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
-                    "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
                     "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                     "CKPOOL_MINDIFF": "1024",
                     "CKPOOL_STARTDIFF": "65536",
@@ -1390,13 +1407,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "BITCOIN_RPC_PASSWORD": "not-default",
             "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
             "PRISM_POSTGRES_PASSWORD": "not-default",
-            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
-            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
             "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32,
-            "PRISM_LEDGER_WRITER_ID": "managed-writer",
-            "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
-            "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
             "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "CKPOOL_MINDIFF": "1024",
             "CKPOOL_STARTDIFF": "65536",

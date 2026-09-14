@@ -1,4 +1,7 @@
+mod process_security;
+
 fn main() -> anyhow::Result<()> {
+    process_security::disable_core_dumps()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

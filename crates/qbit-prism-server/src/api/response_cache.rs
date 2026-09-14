@@ -229,6 +229,7 @@ mod tests {
             ttl: 300,
             stale: 60,
             immutable: false,
+            debug_headers: false,
         };
         let (result, cache, age) =
             public_response(&state, path, &Query::default(), &policy, None).await;
@@ -280,6 +281,7 @@ mod tests {
                 ttl: 1000,
                 stale: 0,
                 immutable: false,
+                debug_headers: false,
             },
             Some(&view),
         )
@@ -303,6 +305,7 @@ mod tests {
             ttl: 5,
             stale: 30,
             immutable: false,
+            debug_headers: false,
         };
         seed(&state, path, 1).await;
         let (result, cache, age) =

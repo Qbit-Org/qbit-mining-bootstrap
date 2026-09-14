@@ -1384,6 +1384,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "libc",
  "num-bigint",
  "num-traits",
  "percent-encoding",

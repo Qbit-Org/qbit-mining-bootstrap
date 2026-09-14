@@ -19,8 +19,20 @@ use std::{
     str::FromStr,
 };
 
-pub const SCHEMA: &str = "qbit-prism-capacity-evidence/v2";
+pub const SCHEMA: &str = "qbit-prism-capacity-evidence/v3";
+const SCHEMA_PREFIX: &str = "qbit-prism-capacity-evidence/";
+const RETIRED_SCHEMAS: &[&str] = &[
+    "qbit-prism-capacity-evidence/v1",
+    "qbit-prism-capacity-evidence/v2",
+];
 pub const DEFAULT_MAX_AGE_SECONDS: i64 = 86400;
+/// Python-runtime knobs bound by v2 evidence. The native server never reads
+/// them, so evidence that names them did not measure the native binary.
+pub const RETIRED_CONFIGURATION_KEYS: &[&str] = &[
+    "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
+    "PRISM_SHARE_COMMIT_BATCH_SIZE",
+    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
+];
 pub const DIFFICULTY_CONFIGURATION_KEYS: &[&str] = &[
     "PRISM_STRATUM_SHARE_DIFF",
     "PRISM_STRATUM_VARDIFF_MIN_DIFF",
@@ -38,15 +50,30 @@ pub const DECIMAL_CONFIGURATION_KEYS: &[&str] = &[
     "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN",
     "PRISM_STRATUM_VARDIFF_EWMA_ALPHA",
     "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE",
-    "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
     "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS",
     "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
 ];
 pub const INTEGER_CONFIGURATION_KEYS: &[&str] = &[
     "PRISM_STRATUM_VARDIFF",
-    "PRISM_SHARE_COMMIT_BATCH_SIZE",
-    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
+    "PRISM_RUNTIME_WORKERS",
+    "PRISM_DATABASE_MAX_CONNECTIONS",
+    "PRISM_STRATUM_MAX_CONNECTIONS",
+    "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
 ];
+/// Inclusive bounds the native configuration loader enforces at startup.
+/// The build executor's upper bound depends on the runtime and is checked separately.
+const INTEGER_CONFIGURATION_BOUNDS: &[(&str, usize, usize)] = &[
+    ("PRISM_STRATUM_VARDIFF", 0, 1),
+    ("PRISM_RUNTIME_WORKERS", 1, 1024),
+    ("PRISM_DATABASE_MAX_CONNECTIONS", 4, 1024),
+    (
+        "PRISM_STRATUM_MAX_CONNECTIONS",
+        1,
+        tokio::sync::Semaphore::MAX_PERMITS,
+    ),
+];
+/// Blocking threads the runtime reserves beyond its workers for the build executor.
+const BUILD_EXECUTOR_EXTRA_WORKERS: u32 = 8;
 pub const CONFIGURATION_KEYS: &[&str] = &[
     "PRISM_STRATUM_SHARE_DIFF",
     "PRISM_STRATUM_VARDIFF_MIN_DIFF",
@@ -58,12 +85,13 @@ pub const CONFIGURATION_KEYS: &[&str] = &[
     "PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN",
     "PRISM_STRATUM_VARDIFF_EWMA_ALPHA",
     "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE",
-    "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS",
     "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS",
     "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
     "PRISM_STRATUM_VARDIFF",
-    "PRISM_SHARE_COMMIT_BATCH_SIZE",
-    "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS",
+    "PRISM_RUNTIME_WORKERS",
+    "PRISM_DATABASE_MAX_CONNECTIONS",
+    "PRISM_STRATUM_MAX_CONNECTIONS",
+    "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
 ];
 pub const SUBJECT_KEYS: &[&str] = &[
     "coordinator_revision",
@@ -275,6 +303,10 @@ pub fn run(args: Args) -> Result<()> {
             .filter(|(k, v)| !k.is_empty() && !v.is_empty())
             .with_context(|| format!("--expect must use NAME=VALUE, got {value:?}"))?;
         ensure!(
+            !RETIRED_CONFIGURATION_KEYS.contains(&key),
+            "--expect names retired configuration key {key}; the native server does not read it"
+        );
+        ensure!(
             CONFIGURATION_KEYS.contains(&key),
             "--expect contains unknown configuration keys: {key}"
         );
@@ -377,14 +409,22 @@ fn sha<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 fn normalized_configuration(value: &Value, field: &str) -> Result<BTreeMap<String, Decimal>> {
     let cfg = mapping(value, field)?;
+    let retired = RETIRED_CONFIGURATION_KEYS
+        .iter()
+        .copied()
+        .filter(|key| cfg.contains_key(*key))
+        .collect::<Vec<_>>();
+    ensure!(
+        retired.is_empty(),
+        "{field} contains retired configuration keys the native server does not read: {}",
+        retired.join(", ")
+    );
     keys(cfg, CONFIGURATION_KEYS, field)?;
     let mut normalized = BTreeMap::new();
     for key in DECIMAL_CONFIGURATION_KEYS {
         let zero = matches!(
             *key,
-            "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE"
-                | "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"
-                | "PRISM_STRATUM_SEND_TIMEOUT_SECONDS"
+            "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE" | "PRISM_STRATUM_SEND_TIMEOUT_SECONDS"
         );
         let v = decimal(&cfg[*key], &format!("{field}.{key}"), zero)?;
         ensure!(
@@ -394,18 +434,24 @@ fn normalized_configuration(value: &Value, field: &str) -> Result<BTreeMap<Strin
         normalized.insert((*key).into(), v);
     }
     for key in INTEGER_CONFIGURATION_KEYS {
-        let zero = matches!(
-            *key,
-            "PRISM_STRATUM_VARDIFF" | "PRISM_SHARE_COMMIT_LINGER_MILLISECONDS"
-        );
+        let zero = *key == "PRISM_STRATUM_VARDIFF";
         normalized.insert(
             (*key).into(),
             Decimal::integer(integer(&cfg[*key], &format!("{field}.{key}"), zero)?),
         );
     }
+    for (key, minimum, maximum) in INTEGER_CONFIGURATION_BOUNDS {
+        ensure!(
+            normalized[*key] >= Decimal::integer(*minimum)
+                && normalized[*key] <= Decimal::integer(*maximum),
+            "{field}.{key} must be {minimum}..={maximum}"
+        );
+    }
+    let build_maximum =
+        normalized["PRISM_RUNTIME_WORKERS"].add(&Decimal::integer(BUILD_EXECUTOR_EXTRA_WORKERS));
     ensure!(
-        normalized["PRISM_STRATUM_VARDIFF"] <= Decimal::integer(1u8),
-        "{field}.PRISM_STRATUM_VARDIFF must be 0 or 1"
+        normalized["PRISM_JOB_BUILD_EXECUTOR_WORKERS"] <= build_maximum,
+        "{field}.PRISM_JOB_BUILD_EXECUTOR_WORKERS must be 1..=PRISM_RUNTIME_WORKERS + {BUILD_EXECUTOR_EXTRA_WORKERS} ({build_maximum})"
     );
     ensure!(
         normalized["PRISM_STRATUM_VARDIFF_MIN_DIFF"]
@@ -557,6 +603,18 @@ pub fn validate_capacity_evidence(
     options: &ValidationOptions,
 ) -> Result<CapacityEvidenceSummary> {
     let v = mapping(payload, "document")?;
+    // Other versions are named before the field check so their different shape
+    // reports the version rather than a list of unknown fields.
+    if let Some(schema) = v.get("schema").and_then(Value::as_str) {
+        ensure!(
+            !RETIRED_SCHEMAS.contains(&schema),
+            "schema '{schema}' is retired; re-run qualification against the native server and record '{SCHEMA}'"
+        );
+        ensure!(
+            schema == SCHEMA || !schema.starts_with(SCHEMA_PREFIX),
+            "schema '{schema}' is unsupported; this validator accepts only '{SCHEMA}'"
+        );
+    }
     keys(v, TOP_KEYS, "document")?;
     ensure!(v["schema"] == SCHEMA, "schema must be '{SCHEMA}'");
     ensure!(

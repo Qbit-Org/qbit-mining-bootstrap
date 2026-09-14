@@ -1,0 +1,2622 @@
+-- Canonical ordered share ledger for qbit PRISM mining.
+--
+-- Invariant: only one logical writer inserts into qbit_share_ledger. Stratum
+-- frontends may scale horizontally, but they must feed that writer through a
+-- queue instead of inserting shares independently.
+--
+-- The whole file applies inside exactly one transaction, enforced by the
+-- BEGIN/COMMIT wrapper below rather than by any caller's flags. This is what
+-- makes the apply atomic everywhere it runs: the coordinator's psql backend
+-- (which additionally passes --single-transaction), the native psycopg client
+-- (whose single script execution wraps the string in the simple-query
+-- protocol), and a manual operator apply with plain autocommit psql. Without
+-- it, a failure or interruption mid-file commits some statements -- the
+-- carry-forward summary sync triggers -- while later statements, including
+-- the summary seed near the end of the file, never run; a live writer
+-- mutating carry state in that gap leaves a permanently partial summary
+-- (#124). A per-statement autocommit apply of this file is a bug regardless
+-- of who performs it.
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS qbit_ledger_writer_lease (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    writer_id text NOT NULL,
+    writer_epoch bigint NOT NULL CHECK (writer_epoch >= 0),
+    writer_session_token text NOT NULL,
+    lease_expires_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+ALTER TABLE qbit_ledger_writer_lease
+    ADD COLUMN IF NOT EXISTS writer_session_token text;
+
+UPDATE qbit_ledger_writer_lease
+SET writer_session_token = writer_id || ':' || writer_epoch::text
+WHERE writer_session_token IS NULL;
+
+ALTER TABLE qbit_ledger_writer_lease
+    ALTER COLUMN writer_session_token SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS qbit_share_ledger (
+    share_seq bigserial PRIMARY KEY,
+    share_id text NOT NULL UNIQUE,
+    miner_id text NOT NULL,
+    payout_order_key text NOT NULL,
+    p2mr_program bytea NOT NULL CHECK (octet_length(p2mr_program) = 32),
+    share_difficulty numeric(78, 0) NOT NULL CHECK (share_difficulty > 0),
+    network_difficulty numeric(78, 0) NOT NULL CHECK (network_difficulty > 0),
+    template_height bigint NOT NULL CHECK (template_height >= 0),
+    job_id text NOT NULL,
+    job_issued_at timestamptz NOT NULL,
+    ntime bigint NOT NULL CHECK (ntime >= 0),
+    accepted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    accepted boolean NOT NULL DEFAULT true,
+    reject_reason text CHECK (
+        reject_reason IS NULL OR reject_reason IN (
+            'stale-job',
+            'duplicate-share',
+            'low-difficulty',
+            'malformed-submit',
+            'unauthorized-worker',
+            'unknown-job',
+            'invalid-extranonce',
+            'invalid-ntime-or-nonce',
+            'candidate-audit-mismatch',
+            'submitblock-rejected',
+            'backend-rpc-unavailable',
+            'internal-error',
+            'pool-closed',
+            'block-stale',
+            'ledger-confirmation-failed'
+        )
+    ),
+    writer_id text NOT NULL,
+    writer_epoch bigint NOT NULL CHECK (writer_epoch >= 0),
+    credit_policy text,
+    CONSTRAINT qbit_share_ledger_credit_policy_check
+        CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')),
+    CHECK (accepted OR reject_reason IS NOT NULL)
+);
+
+-- A block-worthy share and the information needed to finish submitting its
+-- block are committed in the same transaction.  The coordinator's in-memory
+-- queue is only a low-latency wakeup; this outbox is the source of truth after
+-- a process or host restart.
+CREATE TABLE IF NOT EXISTS qbit_block_candidate_outbox (
+    block_hash text PRIMARY KEY,
+    share_id text UNIQUE REFERENCES qbit_share_ledger(share_id),
+    candidate jsonb,
+    candidate_sha256 text NOT NULL CHECK (candidate_sha256 ~ '^[0-9a-f]{64}$'),
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'submitted', 'abandoned')),
+    attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    CHECK (
+        (state = 'pending' AND completed_at IS NULL AND candidate IS NOT NULL)
+        OR (
+            state IN ('submitted', 'abandoned')
+            AND completed_at IS NOT NULL
+            AND candidate IS NULL
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS qbit_block_candidate_outbox_pending_idx
+    ON qbit_block_candidate_outbox (created_at, block_hash)
+    WHERE state = 'pending';
+
+ALTER TABLE qbit_share_ledger
+    ADD COLUMN IF NOT EXISTS credit_policy text;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'qbit_share_ledger'::regclass
+          AND conname = 'qbit_share_ledger_credit_policy_check'
+    ) THEN
+        ALTER TABLE qbit_share_ledger
+            ADD CONSTRAINT qbit_share_ledger_credit_policy_check
+            CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace'))
+            NOT VALID;
+    END IF;
+END
+$$;
+
+CREATE TABLE IF NOT EXISTS qbit_payout_carry_forward (
+    carry_forward_seq bigserial PRIMARY KEY,
+    block_height bigint NOT NULL CHECK (block_height >= 0),
+    block_hash text,
+    miner_id text NOT NULL,
+    payout_order_key text NOT NULL,
+    p2mr_program bytea NOT NULL CHECK (octet_length(p2mr_program) = 32),
+    gross_amount_sats bigint NOT NULL CHECK (gross_amount_sats >= 0),
+    prior_balance_sats numeric(78, 0) NOT NULL,
+    candidate_balance_sats numeric(78, 0) NOT NULL,
+    onchain_amount_sats bigint NOT NULL CHECK (onchain_amount_sats >= 0),
+    settlement_fee_sats bigint NOT NULL DEFAULT 0 CHECK (settlement_fee_sats >= 0),
+    carry_forward_balance_sats numeric(78, 0) NOT NULL,
+    action text NOT NULL CHECK (action IN ('onchain', 'accrued')),
+    maturity_state text NOT NULL DEFAULT 'immature'
+        CHECK (maturity_state IN ('immature', 'mature', 'reversed')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+ALTER TABLE qbit_payout_carry_forward
+    ADD COLUMN IF NOT EXISTS settlement_fee_sats bigint NOT NULL DEFAULT 0 CHECK (settlement_fee_sats >= 0);
+
+CREATE TABLE IF NOT EXISTS qbit_pool_blocks (
+    block_hash text PRIMARY KEY,
+    audit_publication_sequence bigint,
+    block_height bigint NOT NULL CHECK (block_height >= 0),
+    parent_hash text NOT NULL,
+    coinbase_txid text NOT NULL,
+    payout_manifest_sha256 text NOT NULL,
+    found_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    chain_state text NOT NULL DEFAULT 'prepared'
+        CHECK (chain_state IN ('prepared', 'confirmed', 'inactive', 'rejected', 'reversed')),
+    maturity_state text NOT NULL DEFAULT 'immature'
+        CHECK (maturity_state IN ('immature', 'mature', 'reversed')),
+    matured_at timestamptz,
+    disconnected_at timestamptz,
+    CHECK ((maturity_state = 'mature') = (matured_at IS NOT NULL)),
+    CHECK ((maturity_state = 'reversed') = (disconnected_at IS NOT NULL))
+);
+
+ALTER TABLE qbit_pool_blocks
+    ADD COLUMN IF NOT EXISTS chain_state text;
+
+UPDATE qbit_pool_blocks
+SET chain_state = 'confirmed'
+WHERE chain_state IS NULL;
+
+ALTER TABLE qbit_pool_blocks
+    ALTER COLUMN chain_state SET DEFAULT 'prepared',
+    ALTER COLUMN chain_state SET NOT NULL;
+
+ALTER TABLE qbit_pool_blocks
+    DROP CONSTRAINT IF EXISTS qbit_pool_blocks_chain_state_check;
+
+ALTER TABLE qbit_pool_blocks
+    ADD CONSTRAINT qbit_pool_blocks_chain_state_check
+    CHECK (chain_state IN ('prepared', 'confirmed', 'inactive', 'rejected', 'reversed'));
+
+-- Artifact order is allocated at the durable prepared -> confirmed boundary.
+-- Exact confirmed replay and a later inactive -> confirmed transition reuse it,
+-- independent of block height. Upgrade existing confirmed and inactive rows
+-- deterministically and advance the sequence beyond any value already installed
+-- by a partial migration.
+--
+-- This serialized phase relies on the whole-file BEGIN/COMMIT wrapper: the
+-- transaction-scoped advisory lock is held from here until the end of the
+-- entire apply, serializing concurrent appliers of this migration.
+SELECT pg_advisory_xact_lock(
+    hashtext('qbit_audit_publication_sequence_migration')
+);
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class relation
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = table_namespace
+          AND relation.relname = 'qbit_audit_publication_sequence_seq'
+    ) THEN
+        EXECUTE format(
+            'CREATE SEQUENCE %I.qbit_audit_publication_sequence_seq',
+            table_namespace
+        );
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    sequence_definition record;
+BEGIN
+    SELECT
+        sequence.seqtypid,
+        sequence.seqstart,
+        sequence.seqincrement,
+        sequence.seqmax,
+        sequence.seqmin,
+        sequence.seqcache,
+        sequence.seqcycle,
+        relation.relnamespace AS sequence_namespace,
+        relation.relpersistence AS sequence_persistence,
+        relation.relowner AS sequence_owner,
+        pool_blocks.relnamespace AS table_namespace,
+        pool_blocks.relowner AS table_owner,
+        EXISTS (
+            SELECT 1
+            FROM pg_depend dependency
+            WHERE dependency.classid = 'pg_class'::regclass
+              AND dependency.objid = relation.oid
+              AND dependency.refclassid = 'pg_class'::regclass
+              AND dependency.refobjsubid > 0
+              AND dependency.deptype IN ('a', 'i')
+        ) AS owned_by_column
+    INTO sequence_definition
+    FROM pg_class pool_blocks
+    JOIN pg_namespace table_namespace
+      ON table_namespace.oid = pool_blocks.relnamespace
+    JOIN pg_class relation
+      ON relation.relnamespace = pool_blocks.relnamespace
+     AND relation.relname = 'qbit_audit_publication_sequence_seq'
+    JOIN pg_sequence sequence ON sequence.seqrelid = relation.oid
+    WHERE relation.relkind = 'S'
+      AND table_namespace.nspname = current_schema()
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF NOT FOUND
+       OR sequence_definition.seqtypid <> 'bigint'::regtype
+       OR sequence_definition.seqstart <> 1
+       OR sequence_definition.seqincrement <> 1
+       OR sequence_definition.seqmax <> 9223372036854775807
+       OR sequence_definition.seqmin <> 1
+       OR sequence_definition.seqcache <> 1
+       OR sequence_definition.seqcycle
+       OR sequence_definition.sequence_namespace <>
+          sequence_definition.table_namespace
+       OR sequence_definition.sequence_persistence <> 'p'
+       OR sequence_definition.sequence_owner <> sequence_definition.table_owner
+       OR sequence_definition.owned_by_column THEN
+        RAISE EXCEPTION 'invalid audit publication sequence definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class pool_blocks
+        JOIN pg_namespace namespace
+          ON namespace.oid = pool_blocks.relnamespace
+        WHERE namespace.nspname = table_namespace
+          AND pool_blocks.relname = 'qbit_pool_blocks'
+          AND pool_blocks.relkind = 'r'
+    ) THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    EXECUTE format(
+        'ALTER TABLE %I.qbit_pool_blocks '
+        'ADD COLUMN IF NOT EXISTS audit_publication_sequence bigint',
+        table_namespace
+    );
+END;
+$$;
+
+DO $$
+DECLARE
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = current_schema()
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_attribute
+        WHERE attrelid = table_oid
+          AND attname = 'audit_publication_sequence'
+          AND attnum > 0
+          AND NOT attisdropped
+          AND atttypid = 'bigint'::regtype
+          AND NOT attnotnull
+          AND NOT atthasdef
+          AND attidentity = ''
+          AND attgenerated = ''
+          AND attcollation = 0
+    ) THEN
+        RAISE EXCEPTION 'invalid audit publication sequence column definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    pending record;
+    assigned_sequence numeric;
+    assignment_start numeric;
+    invalid_sequence boolean;
+    duplicate_sequence boolean;
+    maximum_sequence bigint;
+    pending_count bigint;
+    raw_next_sequence numeric;
+    sequence_last bigint;
+    sequence_called boolean;
+    sequence_relation regclass;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    -- Serialize partial/concurrent schema initialization and exclude live
+    -- confirmation updates while setval/backfill establish the ordinal floor.
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    EXECUTE format(
+        'LOCK TABLE %I.qbit_pool_blocks IN SHARE ROW EXCLUSIVE MODE',
+        table_namespace
+    );
+    EXECUTE format(
+        'SELECT EXISTS ('
+        'SELECT 1 FROM %I.qbit_pool_blocks '
+        'WHERE audit_publication_sequence IS NOT NULL '
+        'AND audit_publication_sequence <= 0)',
+        table_namespace
+    ) INTO invalid_sequence;
+    IF invalid_sequence THEN
+        RAISE EXCEPTION 'invalid non-positive audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT EXISTS ('
+        'SELECT audit_publication_sequence '
+        'FROM %I.qbit_pool_blocks '
+        'WHERE audit_publication_sequence IS NOT NULL '
+        'GROUP BY audit_publication_sequence HAVING count(*) > 1)',
+        table_namespace
+    ) INTO duplicate_sequence;
+    IF duplicate_sequence THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT COALESCE(MAX(audit_publication_sequence), 0) '
+        'FROM %I.qbit_pool_blocks',
+        table_namespace
+    ) INTO maximum_sequence;
+    SELECT sequence.oid::regclass
+    INTO sequence_relation
+    FROM pg_class sequence
+    WHERE sequence.relnamespace = (
+              SELECT oid FROM pg_namespace
+              WHERE nspname = table_namespace
+          )
+      AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+      AND sequence.relkind = 'S';
+    EXECUTE format(
+        'SELECT last_value, is_called '
+        'FROM %I.qbit_audit_publication_sequence_seq',
+        table_namespace
+    ) INTO sequence_last, sequence_called;
+    raw_next_sequence := sequence_last::numeric
+        + CASE WHEN sequence_called THEN 1 ELSE 0 END;
+    EXECUTE format(
+        'SELECT count(*) FROM %I.qbit_pool_blocks '
+        'WHERE chain_state IN (''confirmed'', ''inactive'') '
+        'AND audit_publication_sequence IS NULL',
+        table_namespace
+    ) INTO pending_count;
+    assignment_start := GREATEST(
+        raw_next_sequence,
+        maximum_sequence::numeric + 1
+    );
+    IF pending_count > 0
+       AND (
+           assignment_start < 1
+           OR assignment_start + pending_count::numeric - 1
+              > 9223372036854775807::numeric
+       ) THEN
+        RAISE EXCEPTION 'audit publication sequence exhausted';
+    END IF;
+    assigned_sequence := assignment_start;
+    FOR pending IN EXECUTE format(
+        'SELECT block_hash FROM %I.qbit_pool_blocks '
+        'WHERE chain_state IN (''confirmed'', ''inactive'') '
+        'AND audit_publication_sequence IS NULL '
+        'ORDER BY found_at, block_hash',
+        table_namespace
+    )
+    LOOP
+        EXECUTE format(
+            'UPDATE %I.qbit_pool_blocks '
+            'SET audit_publication_sequence = $1 '
+            'WHERE block_hash = $2 '
+            'AND audit_publication_sequence IS NULL',
+            table_namespace
+        ) USING assigned_sequence::bigint, pending.block_hash;
+        assigned_sequence := assigned_sequence + 1;
+    END LOOP;
+END;
+$$;
+
+DO $$
+DECLARE
+    index_name constant text :=
+        'qbit_pool_blocks_audit_publication_sequence_idx';
+    canonical_index_oid oid;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    SELECT index_relation.oid
+    INTO canonical_index_oid
+    FROM pg_class index_relation
+    WHERE index_relation.relnamespace = (
+              SELECT oid FROM pg_namespace
+              WHERE nspname = table_namespace
+          )
+      AND index_relation.relname = index_name;
+    IF canonical_index_oid IS NULL THEN
+        EXECUTE format(
+            'CREATE UNIQUE INDEX %I '
+            'ON %I.qbit_pool_blocks (audit_publication_sequence)',
+            index_name,
+            table_namespace
+        );
+        SELECT index_relation.oid
+        INTO canonical_index_oid
+        FROM pg_class index_relation
+        WHERE index_relation.relnamespace = (
+                  SELECT oid FROM pg_namespace
+                  WHERE nspname = table_namespace
+              )
+          AND index_relation.relname = index_name;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_index index_definition
+        JOIN pg_class index_relation
+          ON index_relation.oid = index_definition.indexrelid
+        JOIN pg_am access_method
+          ON access_method.oid = index_relation.relam
+        JOIN pg_attribute ordinal_attribute
+          ON ordinal_attribute.attrelid = index_definition.indrelid
+         AND ordinal_attribute.attname = 'audit_publication_sequence'
+         AND NOT ordinal_attribute.attisdropped
+        JOIN pg_opclass operator_class
+          ON index_definition.indclass::text = operator_class.oid::text
+        WHERE index_definition.indexrelid = canonical_index_oid
+          AND index_definition.indrelid = table_oid
+          AND access_method.amname = 'btree'
+          AND index_relation.relkind = 'i'
+          AND index_relation.relnamespace = (
+              SELECT relnamespace
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_relation.relpersistence = 'p'
+          AND index_relation.relowner = (
+              SELECT relowner
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_definition.indisunique
+          AND index_definition.indisvalid
+          AND index_definition.indisready
+          AND index_definition.indislive
+          AND index_definition.indimmediate
+          AND NOT index_definition.indisprimary
+          AND NOT index_definition.indisexclusion
+          AND NOT index_definition.indisclustered
+          AND NOT index_definition.indisreplident
+          AND NOT index_definition.indnullsnotdistinct
+          AND index_definition.indnkeyatts = 1
+          AND index_definition.indnatts = 1
+          AND index_definition.indkey::text = ordinal_attribute.attnum::text
+          AND index_definition.indcollation::text = '0'
+          AND index_definition.indoption::text = '0'
+          AND operator_class.opcname = 'int8_ops'
+          AND operator_class.opcmethod = index_relation.relam
+          AND operator_class.opcnamespace = 'pg_catalog'::regnamespace
+          AND operator_class.opcintype = 'bigint'::regtype
+          AND operator_class.opcdefault
+          AND index_definition.indexprs IS NULL
+          AND index_definition.indpred IS NULL
+    ) THEN
+        RAISE EXCEPTION 'invalid audit publication sequence index definition';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_index index_definition
+        JOIN pg_class index_relation
+          ON index_relation.oid = index_definition.indexrelid
+        JOIN pg_am access_method
+          ON access_method.oid = index_relation.relam
+        JOIN pg_attribute ordinal_attribute
+          ON ordinal_attribute.attrelid = index_definition.indrelid
+         AND ordinal_attribute.attname = 'audit_publication_sequence'
+         AND NOT ordinal_attribute.attisdropped
+        JOIN pg_opclass operator_class
+          ON index_definition.indclass::text = operator_class.oid::text
+        WHERE index_definition.indrelid = table_oid
+          AND index_definition.indexrelid <> canonical_index_oid
+          AND access_method.amname = 'btree'
+          AND index_relation.relkind = 'i'
+          AND index_relation.relnamespace = (
+              SELECT relnamespace
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_relation.relpersistence = 'p'
+          AND index_relation.relowner = (
+              SELECT relowner
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_definition.indisunique
+          AND index_definition.indisvalid
+          AND index_definition.indisready
+          AND index_definition.indnkeyatts = 1
+          AND index_definition.indnatts = 1
+          AND index_definition.indkey::text = ordinal_attribute.attnum::text
+          AND index_definition.indcollation::text = '0'
+          AND index_definition.indoption::text = '0'
+          AND operator_class.opcname = 'int8_ops'
+          AND operator_class.opcmethod = index_relation.relam
+          AND operator_class.opcnamespace = 'pg_catalog'::regnamespace
+          AND operator_class.opcintype = 'bigint'::regtype
+          AND operator_class.opcdefault
+          AND index_definition.indexprs IS NULL
+          AND index_definition.indpred IS NULL
+    ) THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence index definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    constraint_definition text;
+    constraint_validated boolean;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = table_oid
+          AND conname = 'qbit_pool_blocks_audit_publication_sequence_check'
+    ) THEN
+        EXECUTE format(
+            'ALTER TABLE %I.qbit_pool_blocks '
+            'ADD CONSTRAINT '
+            'qbit_pool_blocks_audit_publication_sequence_check '
+            'CHECK ((audit_publication_sequence IS NULL '
+            'OR audit_publication_sequence > 0) '
+            'AND (chain_state <> ''confirmed'' '
+            'OR audit_publication_sequence IS NOT NULL))',
+            table_namespace
+        );
+    END IF;
+    SELECT
+        regexp_replace(
+            regexp_replace(
+                pg_get_constraintdef(oid, true),
+                '[[:space:]]+',
+                ' ',
+                'g'
+            ),
+            ' NOT VALID$',
+            ''
+        ),
+        convalidated
+    INTO constraint_definition, constraint_validated
+    FROM pg_constraint
+    WHERE conrelid = table_oid
+      AND conname = 'qbit_pool_blocks_audit_publication_sequence_check'
+      AND contype = 'c'
+      AND NOT condeferrable
+      AND NOT condeferred
+      AND NOT connoinherit
+      AND conislocal
+      AND coninhcount = 0
+      AND cardinality(conkey) = 2
+      AND conkey @> ARRAY[
+          (
+              SELECT attnum::smallint
+              FROM pg_attribute
+              WHERE attrelid = table_oid
+                AND attname = 'audit_publication_sequence'
+                AND NOT attisdropped
+          ),
+          (
+              SELECT attnum::smallint
+              FROM pg_attribute
+              WHERE attrelid = table_oid
+                AND attname = 'chain_state'
+                AND NOT attisdropped
+          )
+      ]::smallint[];
+    IF constraint_definition IS NULL
+       OR constraint_definition <>
+          'CHECK ((audit_publication_sequence IS NULL OR audit_publication_sequence > 0) AND (chain_state <> ''confirmed''::text OR audit_publication_sequence IS NOT NULL))' THEN
+        RAISE EXCEPTION 'invalid audit publication sequence constraint definition';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = table_oid
+          AND conname <> 'qbit_pool_blocks_audit_publication_sequence_check'
+          AND contype = 'c'
+          AND regexp_replace(
+              regexp_replace(
+                  pg_get_constraintdef(oid, true),
+                  '[[:space:]]+',
+                  ' ',
+                  'g'
+              ),
+              ' NOT VALID$',
+              ''
+          ) = constraint_definition
+    ) THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence constraint definition';
+    END IF;
+    IF NOT constraint_validated THEN
+        EXECUTE format(
+            'ALTER TABLE %I.qbit_pool_blocks '
+            'VALIDATE CONSTRAINT '
+            'qbit_pool_blocks_audit_publication_sequence_check',
+            table_namespace
+        );
+    END IF;
+END;
+$$;
+
+-- The validated CHECK above requires every confirmed row to carry a
+-- publication ordinal, but a pre-ordinal writer confirms with a plain
+-- chain_state UPDATE and a column DEFAULT only fires on INSERT. Assign the
+-- ordinal here for any confirming write that omits it so the constraint
+-- stays satisfiable under a code-only rollback; ordinal-aware writers set
+-- the value explicitly in the same UPDATE, making this a no-op for them.
+CREATE OR REPLACE FUNCTION qbit_pool_blocks_assign_publication_ordinal()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    publication_sequence pg_catalog.regclass;
+BEGIN
+    IF NEW.chain_state = 'confirmed'
+       AND NEW.audit_publication_sequence IS NULL
+    THEN
+        SELECT sequence.oid::pg_catalog.regclass
+        INTO publication_sequence
+        FROM pg_catalog.pg_class pool_blocks
+        JOIN pg_catalog.pg_class sequence
+          ON sequence.relnamespace = pool_blocks.relnamespace
+         AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+         AND sequence.relkind = 'S'
+        WHERE pool_blocks.oid = TG_RELID;
+        IF publication_sequence IS NULL THEN
+            RAISE EXCEPTION 'missing audit publication sequence';
+        END IF;
+        NEW.audit_publication_sequence :=
+            pg_catalog.nextval(publication_sequence);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+BEGIN
+    EXECUTE format(
+        'DROP TRIGGER IF EXISTS '
+        'qbit_pool_blocks_assign_publication_ordinal '
+        'ON %I.qbit_pool_blocks',
+        table_namespace
+    );
+    EXECUTE format(
+        'CREATE TRIGGER qbit_pool_blocks_assign_publication_ordinal '
+        'BEFORE INSERT OR UPDATE ON %I.qbit_pool_blocks '
+        'FOR EACH ROW '
+        'EXECUTE FUNCTION %I.qbit_pool_blocks_assign_publication_ordinal()',
+        table_namespace,
+        table_namespace
+    );
+END;
+$$;
+
+-- Sequence operations are nontransactional in PostgreSQL: a setval against a
+-- pre-existing sequence is NOT undone by a rollback of this transaction (only
+-- a sequence created inside it disappears with it). The sole allocator
+-- mutation therefore still runs last, after every row and catalog validation,
+-- so a rejected apply leaves an existing sequence's exact state untouched;
+-- if a later statement of the apply fails, the row assignments roll back but
+-- the setval persists. That residue is benign: this block only ever advances
+-- the sequence, so the next apply assigns higher ordinals, leaving gaps that
+-- no validation rejects. Do not move validation after the setval.
+DO $$
+DECLARE
+    maximum_sequence bigint;
+    raw_next_sequence numeric;
+    sequence_called boolean;
+    sequence_last bigint;
+    sequence_relation regclass;
+    table_namespace text := current_schema();
+BEGIN
+    SELECT sequence.oid::regclass
+    INTO sequence_relation
+    FROM pg_class sequence
+    JOIN pg_namespace namespace
+      ON namespace.oid = sequence.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+      AND sequence.relkind = 'S';
+    IF sequence_relation IS NULL THEN
+        RAISE EXCEPTION 'missing audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT COALESCE(MAX(audit_publication_sequence), 0) '
+        'FROM %I.qbit_pool_blocks',
+        table_namespace
+    ) INTO maximum_sequence;
+    EXECUTE format(
+        'SELECT last_value, is_called '
+        'FROM %I.qbit_audit_publication_sequence_seq',
+        table_namespace
+    ) INTO sequence_last, sequence_called;
+    raw_next_sequence := sequence_last::numeric
+        + CASE WHEN sequence_called THEN 1 ELSE 0 END;
+    IF maximum_sequence::numeric >= raw_next_sequence THEN
+        PERFORM setval(sequence_relation, maximum_sequence, true);
+    END IF;
+END;
+$$;
+
+CREATE TABLE IF NOT EXISTS qbit_pool_audit_bundles (
+    block_hash text PRIMARY KEY REFERENCES qbit_pool_blocks(block_hash),
+    audit_bundle jsonb NOT NULL,
+    audit_bundle_sha256 text NOT NULL,
+    coinbase_tx_hex text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Audit-body externalization. The audit_bundle JSONB re-embeds the full
+-- accepted-share snapshot per found block, so hot Postgres grows ~quadratically.
+-- New blocks store the body in an external content artifact (body_uri) and keep
+-- only metadata plus the scalar/array fields the read model and the
+-- by-commitment lookup need. Existing rows keep their inline audit_bundle; every
+-- reader falls back to it, so this migration loses no data.
+ALTER TABLE qbit_pool_audit_bundles
+    ADD COLUMN IF NOT EXISTS body_uri text,
+    ADD COLUMN IF NOT EXISTS audit_body_byte_len bigint,
+    ADD COLUMN IF NOT EXISTS schema_version text,
+    ADD COLUMN IF NOT EXISTS found_block_network_difficulty numeric(78,0),
+    ADD COLUMN IF NOT EXISTS found_block_bits text,
+    ADD COLUMN IF NOT EXISTS found_block_coinbase_value_sats bigint,
+    ADD COLUMN IF NOT EXISTS audit_commitment_leaves_hex jsonb,
+    ADD COLUMN IF NOT EXISTS witness_merkle_leaves_hex jsonb;
+
+ALTER TABLE qbit_pool_audit_bundles
+    ALTER COLUMN audit_bundle DROP NOT NULL;
+
+ALTER TABLE qbit_pool_audit_bundles
+    DROP CONSTRAINT IF EXISTS qbit_pool_audit_bundles_body_present_check;
+
+ALTER TABLE qbit_pool_audit_bundles
+    ADD CONSTRAINT qbit_pool_audit_bundles_body_present_check
+    CHECK (audit_bundle IS NOT NULL OR body_uri IS NOT NULL);
+
+ALTER TABLE qbit_pool_audit_bundles
+    DROP CONSTRAINT IF EXISTS qbit_pool_audit_bundles_audit_body_byte_len_check;
+
+ALTER TABLE qbit_pool_audit_bundles
+    ADD CONSTRAINT qbit_pool_audit_bundles_audit_body_byte_len_check
+    CHECK (audit_body_byte_len IS NULL OR audit_body_byte_len >= 0);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_commitment_leaves_idx
+    ON qbit_pool_audit_bundles USING gin (audit_commitment_leaves_hex);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_witness_leaves_idx
+    ON qbit_pool_audit_bundles USING gin (witness_merkle_leaves_hex);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_legacy_commitment_leaves_idx
+    ON qbit_pool_audit_bundles USING gin ((audit_bundle->'audit_commitment_leaves_hex'))
+    WHERE audit_bundle IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_legacy_witness_leaves_idx
+    ON qbit_pool_audit_bundles USING gin ((audit_bundle->'witness_merkle_leaves_hex'))
+    WHERE audit_bundle IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS qbit_ctv_fanout_sets (
+    block_hash text PRIMARY KEY REFERENCES qbit_pool_blocks(block_hash),
+    manifest_set_json text NOT NULL,
+    manifest_set jsonb NOT NULL,
+    manifest_set_sha256 text NOT NULL,
+    settlement_mode text NOT NULL
+        CHECK (settlement_mode IN ('hybrid_coinbase_ctv_fanout', 'ctv_fanout')),
+    parent_coinbase_txid text NOT NULL,
+    parent_coinbase_tx_hex text NOT NULL,
+    fanout_count integer NOT NULL CHECK (fanout_count > 0),
+    fanout_output_sum_sats bigint NOT NULL CHECK (fanout_output_sum_sats >= 0),
+    covenant_output_value_sats bigint NOT NULL CHECK (covenant_output_value_sats >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS qbit_ctv_fanout_artifacts (
+    fanout_txid text PRIMARY KEY,
+    block_hash text NOT NULL REFERENCES qbit_ctv_fanout_sets(block_hash),
+    manifest_set_sha256 text NOT NULL,
+    manifest_json text NOT NULL,
+    manifest jsonb NOT NULL,
+    manifest_sha256 text NOT NULL,
+    precommitment_sha256 text NOT NULL,
+    ctv_hash text NOT NULL,
+    commitment_witness_leaf_hex text NOT NULL,
+    chunk_index integer NOT NULL CHECK (chunk_index >= 0),
+    chunk_count integer NOT NULL CHECK (chunk_count > 0),
+    parent_coinbase_txid text NOT NULL,
+    parent_coinbase_vout integer NOT NULL CHECK (parent_coinbase_vout >= 0),
+    fanout_tx_template_hex text NOT NULL,
+    fanout_tx_hex text NOT NULL,
+    anchor_vout integer CHECK (anchor_vout >= 0),
+    covenant_output_value_sats bigint NOT NULL CHECK (covenant_output_value_sats >= 0),
+    fanout_output_sum_sats bigint NOT NULL CHECK (fanout_output_sum_sats >= 0),
+    settlement_status text NOT NULL DEFAULT 'awaiting_maturity'
+        CHECK (
+            settlement_status IN (
+                'awaiting_maturity',
+                'broadcastable',
+                'broadcast_submitted',
+                'confirmed',
+                'reorged',
+                'failed'
+            )
+        ),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (block_hash, chunk_index),
+    CHECK (chunk_index < chunk_count)
+);
+
+ALTER TABLE qbit_ctv_fanout_artifacts
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_detail_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS first_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_broadcast_attempt_status text,
+    ADD COLUMN IF NOT EXISTS last_broadcast_package_tx_hexes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_package_txids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_submit_result jsonb,
+    ADD COLUMN IF NOT EXISTS last_broadcast_error text,
+    ADD COLUMN IF NOT EXISTS broadcast_attempt_status_counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS next_broadcast_attempt_at timestamptz,
+    ADD COLUMN IF NOT EXISTS broadcast_retry_backoff_seconds bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE qbit_ctv_fanout_artifacts
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_count_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_detail_count_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_attempt_status_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_package_tx_hexes_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_last_broadcast_package_txids_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_attempt_status_counts_check,
+    DROP CONSTRAINT IF EXISTS qbit_ctv_fanout_artifacts_broadcast_retry_backoff_seconds_check;
+
+ALTER TABLE qbit_ctv_fanout_artifacts
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_count_check
+        CHECK (broadcast_attempt_count >= 0),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_detail_count_check
+        CHECK (broadcast_attempt_detail_count >= 0),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_attempt_status_check
+        CHECK (
+            last_broadcast_attempt_status IS NULL
+            OR last_broadcast_attempt_status IN ('planned', 'submitted', 'accepted', 'rejected', 'failed')
+        ),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_package_tx_hexes_check
+        CHECK (jsonb_typeof(last_broadcast_package_tx_hexes) = 'array'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_last_broadcast_package_txids_check
+        CHECK (jsonb_typeof(last_broadcast_package_txids) = 'array'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_attempt_status_counts_check
+        CHECK (jsonb_typeof(broadcast_attempt_status_counts) = 'object'),
+    ADD CONSTRAINT qbit_ctv_fanout_artifacts_broadcast_retry_backoff_seconds_check
+        CHECK (broadcast_retry_backoff_seconds >= 0);
+
+-- Anchorless, fee-bearing CTV fanouts store NULL here. Existing
+-- deployments created before the nullable schema need the startup repair.
+ALTER TABLE qbit_ctv_fanout_artifacts
+    ALTER COLUMN anchor_vout DROP NOT NULL;
+
+CREATE TABLE IF NOT EXISTS qbit_ctv_fanout_broadcast_attempts (
+    attempt_seq bigserial PRIMARY KEY,
+    fanout_txid text NOT NULL REFERENCES qbit_ctv_fanout_artifacts(fanout_txid),
+    attempted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempt_status text NOT NULL
+        CHECK (attempt_status IN ('planned', 'submitted', 'accepted', 'rejected', 'failed')),
+    package_tx_hexes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    package_txids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    submit_result jsonb,
+    error text,
+    CHECK (jsonb_typeof(package_tx_hexes) = 'array'),
+    CHECK (jsonb_typeof(package_txids) = 'array')
+);
+
+CREATE TABLE IF NOT EXISTS qbit_pool_payout_entries (
+    payout_entry_seq bigserial PRIMARY KEY,
+    block_hash text NOT NULL REFERENCES qbit_pool_blocks(block_hash),
+    block_height bigint NOT NULL CHECK (block_height >= 0),
+    miner_id text NOT NULL,
+    payout_order_key text NOT NULL,
+    p2mr_program bytea NOT NULL CHECK (octet_length(p2mr_program) = 32),
+    onchain_amount_sats bigint NOT NULL CHECK (onchain_amount_sats >= 0),
+    carry_forward_balance_sats numeric(78, 0) NOT NULL,
+    action text NOT NULL CHECK (action IN ('onchain', 'accrued')),
+    maturity_state text NOT NULL DEFAULT 'immature'
+        CHECK (maturity_state IN ('immature', 'mature', 'reversed')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_miner_idx
+    ON qbit_payout_carry_forward (miner_id, payout_order_key, carry_forward_seq DESC);
+
+CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_current_idx
+    ON qbit_payout_carry_forward (
+        miner_id,
+        payout_order_key,
+        p2mr_program,
+        block_height DESC,
+        carry_forward_seq DESC
+    )
+    WHERE maturity_state <> 'reversed';
+
+CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_maturity_idx
+    ON qbit_payout_carry_forward (maturity_state, block_height);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_blocks_maturity_idx
+    ON qbit_pool_blocks (maturity_state, block_height);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_audit_bundles_created_idx
+    ON qbit_pool_audit_bundles (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_block_idx
+    ON qbit_ctv_fanout_artifacts (block_hash, chunk_index);
+
+CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_status_idx
+    ON qbit_ctv_fanout_artifacts (settlement_status, block_hash);
+
+CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_artifacts_broadcast_candidate_idx
+    ON qbit_ctv_fanout_artifacts (settlement_status, next_broadcast_attempt_at, block_hash, chunk_index);
+
+CREATE INDEX IF NOT EXISTS qbit_ctv_fanout_broadcast_attempts_txid_idx
+    ON qbit_ctv_fanout_broadcast_attempts (fanout_txid, attempt_seq DESC);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_payout_entries_block_idx
+    ON qbit_pool_payout_entries (block_hash, payout_entry_seq);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_payout_entries_maturity_idx
+    ON qbit_pool_payout_entries (maturity_state, block_height);
+
+CREATE INDEX IF NOT EXISTS qbit_pool_blocks_public_recent_idx
+    ON qbit_pool_blocks (block_height DESC, found_at DESC)
+    INCLUDE (block_hash, payout_manifest_sha256, coinbase_txid, chain_state, maturity_state)
+    WHERE chain_state <> 'reversed';
+
+CREATE INDEX IF NOT EXISTS qbit_pool_payout_entries_miner_public_history_idx
+    ON qbit_pool_payout_entries (miner_id, block_height DESC, payout_entry_seq DESC)
+    INCLUDE (
+        block_hash,
+        payout_order_key,
+        p2mr_program,
+        onchain_amount_sats,
+        carry_forward_balance_sats,
+        action,
+        maturity_state,
+        created_at
+    )
+    WHERE maturity_state <> 'reversed';
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_accepted_window_idx
+    ON qbit_share_ledger (job_issued_at, share_seq DESC)
+    WHERE accepted;
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_template_height_idx
+    ON qbit_share_ledger (template_height, share_seq)
+    WHERE accepted;
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_accepted_recent_idx
+    ON qbit_share_ledger (accepted_at DESC)
+    INCLUDE (share_difficulty, miner_id, share_seq)
+    WHERE accepted;
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_accepted_miner_recent_idx
+    ON qbit_share_ledger (miner_id, accepted_at DESC)
+    INCLUDE (share_difficulty, share_seq, share_id, payout_order_key)
+    WHERE accepted;
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_accepted_seq_window_idx
+    ON qbit_share_ledger (share_seq DESC)
+    INCLUDE (
+        job_issued_at,
+        accepted_at,
+        miner_id,
+        payout_order_key,
+        p2mr_program,
+        share_difficulty,
+        share_id
+    )
+    WHERE accepted;
+
+CREATE INDEX IF NOT EXISTS qbit_share_ledger_accepted_block_suffix_idx
+    ON qbit_share_ledger ((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC)
+    INCLUDE (miner_id, share_difficulty, network_difficulty)
+    WHERE accepted AND length(share_id) >= 65;
+
+CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_miner_public_history_idx
+    ON qbit_payout_carry_forward (miner_id, block_height DESC, carry_forward_seq DESC)
+    INCLUDE (
+        block_hash,
+        payout_order_key,
+        p2mr_program,
+        gross_amount_sats,
+        onchain_amount_sats,
+        settlement_fee_sats,
+        carry_forward_balance_sats,
+        action,
+        maturity_state,
+        created_at
+    )
+    WHERE maturity_state <> 'reversed';
+
+CREATE INDEX IF NOT EXISTS qbit_payout_carry_forward_block_amount_idx
+    ON qbit_payout_carry_forward (block_hash)
+    INCLUDE (gross_amount_sats);
+
+DROP FUNCTION IF EXISTS qbit_audit_share_window(timestamptz, numeric);
+DROP FUNCTION IF EXISTS qbit_prism_window(timestamptz, numeric);
+
+CREATE OR REPLACE FUNCTION qbit_prism_window(
+    anchor_job_issued_at timestamptz,
+    window_weight numeric
+)
+RETURNS TABLE (
+    share_seq bigint,
+    share_id text,
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    share_difficulty numeric,
+    counted_difficulty numeric,
+    job_issued_at timestamptz,
+    accepted_at timestamptz,
+    credit_policy text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    -- Walk the accepted history newest-first in 4096-row index pages to find
+    -- the window cutoff in O(window) instead of one lateral probe per share,
+    -- then rank only the rows at or above the cutoff. The cutoff must be
+    -- consumed as a scalar subquery: joined in as a relation it degrades to a
+    -- post-join filter over the whole pkey walk, while the scalar form
+    -- becomes an InitPlan the index scan uses as its start bound.
+    --
+    -- The page-granular stop relies on share_difficulty being NOT NULL and
+    -- strictly positive (schema CHECK): positivity keeps the cumulative
+    -- weight strictly increasing, which guarantees the crossing row lies
+    -- inside the last fetched page. Relaxing that constraint requires
+    -- revisiting this walk and the matching one in lab/prism/share_ledger.py.
+    WITH RECURSIVE pages AS (
+        SELECT page.min_share_seq,
+               page.page_weight,
+               page.page_weight AS cumulative_weight
+        FROM LATERAL (
+            SELECT min(page_rows.share_seq) AS min_share_seq,
+                   COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+            FROM (
+                SELECT ledger.share_seq, ledger.share_difficulty
+                FROM qbit_share_ledger ledger
+                WHERE ledger.accepted
+                  AND ledger.job_issued_at <= anchor_job_issued_at
+                  AND ledger.accepted_at <= anchor_job_issued_at
+                ORDER BY ledger.share_seq DESC
+                LIMIT 4096
+            ) page_rows
+        ) page
+        UNION ALL
+        SELECT page.min_share_seq,
+               page.page_weight,
+               pages.cumulative_weight + page.page_weight
+        FROM pages
+        CROSS JOIN LATERAL (
+            SELECT min(page_rows.share_seq) AS min_share_seq,
+                   COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+            FROM (
+                SELECT ledger.share_seq, ledger.share_difficulty
+                FROM qbit_share_ledger ledger
+                WHERE ledger.accepted
+                  AND ledger.job_issued_at <= anchor_job_issued_at
+                  AND ledger.accepted_at <= anchor_job_issued_at
+                  AND ledger.share_seq < pages.min_share_seq
+                ORDER BY ledger.share_seq DESC
+                LIMIT 4096
+            ) page_rows
+        ) page
+        WHERE pages.cumulative_weight < window_weight
+          AND pages.min_share_seq IS NOT NULL
+    ),
+    page_cutoff AS (
+        SELECT min(min_share_seq) AS min_share_seq
+        FROM pages
+        WHERE min_share_seq IS NOT NULL
+    ),
+    ranked AS (
+        SELECT ledger.*,
+               sum(ledger.share_difficulty) OVER (
+                   ORDER BY ledger.share_seq DESC
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               )::numeric AS cumulative_difficulty
+        FROM qbit_share_ledger ledger
+        WHERE ledger.accepted
+          AND ledger.job_issued_at <= anchor_job_issued_at
+          AND ledger.accepted_at <= anchor_job_issued_at
+          AND ledger.share_seq >= (SELECT min_share_seq FROM page_cutoff)
+    )
+    SELECT
+        ranked.share_seq,
+        ranked.share_id,
+        ranked.miner_id,
+        ranked.payout_order_key,
+        ranked.p2mr_program,
+        ranked.share_difficulty,
+        CASE
+            WHEN ranked.cumulative_difficulty <= window_weight THEN ranked.share_difficulty
+            ELSE ranked.share_difficulty - (ranked.cumulative_difficulty - window_weight)
+        END AS counted_difficulty,
+        ranked.job_issued_at,
+        ranked.accepted_at,
+        ranked.credit_policy
+    FROM ranked
+    WHERE ranked.cumulative_difficulty - ranked.share_difficulty < window_weight
+    ORDER BY ranked.share_seq DESC;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_shares_since_template_height(
+    min_template_height bigint
+)
+RETURNS SETOF qbit_share_ledger
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT *
+    FROM qbit_share_ledger
+    WHERE accepted
+      AND template_height >= min_template_height
+    ORDER BY share_seq ASC;
+$$;
+
+-- Transactionally maintained current carry-forward balances.
+--
+-- qbit_current_carry_forward_balances() used to recompute
+-- SUM(gross_amount_sats - onchain_amount_sats) over every active
+-- qbit_payout_carry_forward row on each call. That read is O(history); on
+-- mainnet it crossed the one-second submitter statement budget at ~1.4M rows
+-- and wedged block landing (issue #188). An index-backed
+-- latest-row-per-recipient read is not an exact replacement: after a
+-- mid-history reversal the recorded carry_forward_balance_sats of later rows
+-- is stale until reconciliation (qbit_carry_forward_integrity_mismatches()
+-- flags exactly that state), while the recomputed aggregate stays correct.
+-- The exact O(active recipients) form is this summary table, maintained by
+-- triggers inside the same transaction as every write that changes the
+-- active carry set, so readers see a snapshot-consistent balance under
+-- concurrent settlement.
+--
+-- One row exists per (miner_id, payout_order_key, p2mr_program) partition
+-- that has ever contributed an active carry row. balance_sats tracks
+-- SUM(gross_amount_sats - onchain_amount_sats) and active_row_count the
+-- number of contributing rows, over exactly the rows the recomputed
+-- aggregate counts: carry.maturity_state <> 'reversed' joined to a pool
+-- block with chain_state = 'confirmed' AND maturity_state <> 'reversed'.
+-- Partitions with active_row_count = 0 are ignored by readers.
+--
+-- Write-path contract: a pool block must not be created with
+-- chain_state = 'confirmed' in the same statement that inserts its carry
+-- rows (both row-level triggers would then count the rows once each).
+-- Blocks are always inserted as 'prepared' and confirmed by
+-- qbit_confirm_pool_block, which preserves single counting.
+CREATE TABLE IF NOT EXISTS qbit_payout_carry_forward_current (
+    miner_id text NOT NULL,
+    payout_order_key text NOT NULL,
+    p2mr_program bytea NOT NULL CHECK (octet_length(p2mr_program) = 32),
+    balance_sats numeric(78, 0) NOT NULL,
+    active_row_count bigint NOT NULL CHECK (active_row_count >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (miner_id, payout_order_key, p2mr_program)
+);
+
+-- Update-first upsert: INSERT ... ON CONFLICT would evaluate the
+-- active_row_count >= 0 CHECK on the proposed tuple before conflict
+-- resolution, so a negative delta against an existing partition would fail.
+-- A negative delta against a missing partition is an accounting error and is
+-- meant to fail loudly on the INSERT's CHECK constraint.
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_apply_delta(
+    target_miner_id text,
+    target_payout_order_key text,
+    target_p2mr_program bytea,
+    delta_balance_sats numeric,
+    delta_active_rows bigint
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    LOOP
+        UPDATE qbit_payout_carry_forward_current
+        SET balance_sats = balance_sats + delta_balance_sats,
+            active_row_count = active_row_count + delta_active_rows,
+            updated_at = clock_timestamp()
+        WHERE miner_id = target_miner_id
+          AND payout_order_key = target_payout_order_key
+          AND p2mr_program = target_p2mr_program;
+        IF FOUND THEN
+            RETURN;
+        END IF;
+        BEGIN
+            INSERT INTO qbit_payout_carry_forward_current (
+                miner_id,
+                payout_order_key,
+                p2mr_program,
+                balance_sats,
+                active_row_count
+            )
+            VALUES (
+                target_miner_id,
+                target_payout_order_key,
+                target_p2mr_program,
+                delta_balance_sats,
+                delta_active_rows
+            );
+            RETURN;
+        EXCEPTION WHEN unique_violation THEN
+            -- Concurrent creation of the same partition row; retry the
+            -- additive update against it.
+        END;
+    END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_pool_block_counts_for_carry(target_block_hash text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM qbit_pool_blocks block
+        WHERE block.block_hash = target_block_hash
+          AND block.chain_state = 'confirmed'
+          AND block.maturity_state <> 'reversed'
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_rebuild_carry_forward_current_balances()
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    rebuilt_count bigint;
+BEGIN
+    DELETE FROM qbit_payout_carry_forward_current;
+    INSERT INTO qbit_payout_carry_forward_current (
+        miner_id,
+        payout_order_key,
+        p2mr_program,
+        balance_sats,
+        active_row_count
+    )
+    SELECT
+        carry.miner_id,
+        carry.payout_order_key,
+        carry.p2mr_program,
+        SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric),
+        COUNT(*)
+    FROM qbit_payout_carry_forward carry
+    JOIN qbit_pool_blocks block
+      ON block.block_hash = carry.block_hash
+    WHERE carry.maturity_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
+      AND block.maturity_state <> 'reversed'
+    GROUP BY
+        carry.miner_id,
+        carry.payout_order_key,
+        carry.p2mr_program;
+    GET DIAGNOSTICS rebuilt_count = ROW_COUNT;
+    RETURN rebuilt_count;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_payout_carry_forward_current_row_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Fast path: nothing that affects the active balance changed
+    -- (covers the immature -> mature maturity sweep).
+    IF TG_OP = 'UPDATE'
+       AND OLD.miner_id = NEW.miner_id
+       AND OLD.payout_order_key = NEW.payout_order_key
+       AND OLD.p2mr_program = NEW.p2mr_program
+       AND OLD.block_hash IS NOT DISTINCT FROM NEW.block_hash
+       AND OLD.gross_amount_sats = NEW.gross_amount_sats
+       AND OLD.onchain_amount_sats = NEW.onchain_amount_sats
+       AND (OLD.maturity_state = 'reversed') = (NEW.maturity_state = 'reversed')
+    THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE')
+       AND OLD.maturity_state <> 'reversed'
+       AND qbit_pool_block_counts_for_carry(OLD.block_hash)
+    THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            OLD.miner_id,
+            OLD.payout_order_key,
+            OLD.p2mr_program,
+            -(OLD.gross_amount_sats::numeric - OLD.onchain_amount_sats::numeric),
+            -1
+        );
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE')
+       AND NEW.maturity_state <> 'reversed'
+       AND qbit_pool_block_counts_for_carry(NEW.block_hash)
+    THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            NEW.miner_id,
+            NEW.payout_order_key,
+            NEW.p2mr_program,
+            NEW.gross_amount_sats::numeric - NEW.onchain_amount_sats::numeric,
+            1
+        );
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_payout_carry_forward_current_sync ON qbit_payout_carry_forward;
+CREATE TRIGGER qbit_payout_carry_forward_current_sync
+    AFTER INSERT OR UPDATE OR DELETE ON qbit_payout_carry_forward
+    FOR EACH ROW
+    EXECUTE FUNCTION qbit_payout_carry_forward_current_row_sync();
+
+CREATE OR REPLACE FUNCTION qbit_pool_blocks_carry_forward_current_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    old_counts boolean := TG_OP IN ('UPDATE', 'DELETE')
+        AND OLD.chain_state = 'confirmed'
+        AND OLD.maturity_state <> 'reversed';
+    new_counts boolean := TG_OP IN ('INSERT', 'UPDATE')
+        AND NEW.chain_state = 'confirmed'
+        AND NEW.maturity_state <> 'reversed';
+BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.block_hash = NEW.block_hash AND old_counts = new_counts THEN
+        RETURN NULL;
+    END IF;
+    IF old_counts THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            deltas.miner_id,
+            deltas.payout_order_key,
+            deltas.p2mr_program,
+            -deltas.balance_sats,
+            -deltas.active_rows
+        )
+        FROM (
+            SELECT
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program,
+                SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats,
+                COUNT(*) AS active_rows
+            FROM qbit_payout_carry_forward carry
+            WHERE carry.block_hash = OLD.block_hash
+              AND carry.maturity_state <> 'reversed'
+            GROUP BY
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program
+        ) AS deltas;
+    END IF;
+    IF new_counts THEN
+        PERFORM qbit_carry_forward_current_apply_delta(
+            deltas.miner_id,
+            deltas.payout_order_key,
+            deltas.p2mr_program,
+            deltas.balance_sats,
+            deltas.active_rows
+        )
+        FROM (
+            SELECT
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program,
+                SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats,
+                COUNT(*) AS active_rows
+            FROM qbit_payout_carry_forward carry
+            WHERE carry.block_hash = NEW.block_hash
+              AND carry.maturity_state <> 'reversed'
+            GROUP BY
+                carry.miner_id,
+                carry.payout_order_key,
+                carry.p2mr_program
+        ) AS deltas;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_pool_blocks_carry_forward_current_sync ON qbit_pool_blocks;
+CREATE TRIGGER qbit_pool_blocks_carry_forward_current_sync
+    AFTER INSERT OR UPDATE OR DELETE ON qbit_pool_blocks
+    FOR EACH ROW
+    EXECUTE FUNCTION qbit_pool_blocks_carry_forward_current_sync();
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_truncate_sync()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM qbit_rebuild_carry_forward_current_balances();
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS qbit_payout_carry_forward_current_truncate_sync ON qbit_payout_carry_forward;
+CREATE TRIGGER qbit_payout_carry_forward_current_truncate_sync
+    AFTER TRUNCATE ON qbit_payout_carry_forward
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
+
+DROP TRIGGER IF EXISTS qbit_pool_blocks_carry_forward_current_truncate_sync ON qbit_pool_blocks;
+CREATE TRIGGER qbit_pool_blocks_carry_forward_current_truncate_sync
+    AFTER TRUNCATE ON qbit_pool_blocks
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
+
+CREATE OR REPLACE FUNCTION qbit_current_carry_forward_balances()
+RETURNS TABLE (
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH balances AS (
+        SELECT
+            (array_agg(current_balance.miner_id ORDER BY current_balance.payout_order_key, current_balance.miner_id))[1] AS miner_id,
+            (array_agg(current_balance.payout_order_key ORDER BY current_balance.payout_order_key, current_balance.miner_id))[1] AS payout_order_key,
+            current_balance.p2mr_program,
+            SUM(current_balance.balance_sats) AS balance_sats
+        FROM qbit_payout_carry_forward_current current_balance
+        WHERE current_balance.active_row_count > 0
+        GROUP BY
+            current_balance.p2mr_program
+        HAVING SUM(current_balance.balance_sats) <> 0
+    )
+    SELECT
+        balances.miner_id,
+        balances.payout_order_key,
+        balances.p2mr_program,
+        balances.balance_sats
+    FROM balances
+    ORDER BY
+        balances.payout_order_key,
+        balances.miner_id,
+        balances.p2mr_program;
+$$;
+
+-- The original O(history) aggregate, retained as the independent
+-- recomputation used by equivalence tests and the integrity report's drift
+-- check. Must stay semantically identical to the summary-backed
+-- qbit_current_carry_forward_balances().
+CREATE OR REPLACE FUNCTION qbit_recomputed_carry_forward_balances()
+RETURNS TABLE (
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH balances AS (
+        SELECT
+            (array_agg(ledger.miner_id ORDER BY ledger.payout_order_key, ledger.miner_id))[1] AS miner_id,
+            (array_agg(ledger.payout_order_key ORDER BY ledger.payout_order_key, ledger.miner_id))[1] AS payout_order_key,
+            ledger.p2mr_program,
+            SUM(ledger.gross_amount_sats::numeric - ledger.onchain_amount_sats::numeric) AS balance_sats
+        FROM qbit_payout_carry_forward ledger
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = ledger.block_hash
+        WHERE ledger.maturity_state <> 'reversed'
+          AND block.chain_state = 'confirmed'
+          AND block.maturity_state <> 'reversed'
+        GROUP BY
+            ledger.p2mr_program
+        HAVING SUM(ledger.gross_amount_sats::numeric - ledger.onchain_amount_sats::numeric) <> 0
+    )
+    SELECT
+        balances.miner_id,
+        balances.payout_order_key,
+        balances.p2mr_program,
+        balances.balance_sats
+    FROM balances
+    ORDER BY
+        balances.payout_order_key,
+        balances.miner_id,
+        balances.p2mr_program;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_current_drift()
+RETURNS TABLE (
+    p2mr_program bytea,
+    current_miner_id text,
+    current_payout_order_key text,
+    current_balance_sats numeric,
+    recomputed_miner_id text,
+    recomputed_payout_order_key text,
+    recomputed_balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        COALESCE(current_row.p2mr_program, recomputed_row.p2mr_program) AS p2mr_program,
+        current_row.miner_id,
+        current_row.payout_order_key,
+        current_row.balance_sats,
+        recomputed_row.miner_id,
+        recomputed_row.payout_order_key,
+        recomputed_row.balance_sats
+    FROM qbit_current_carry_forward_balances() AS current_row
+    FULL OUTER JOIN qbit_recomputed_carry_forward_balances() AS recomputed_row
+      ON recomputed_row.p2mr_program = current_row.p2mr_program
+    WHERE current_row.balance_sats IS DISTINCT FROM recomputed_row.balance_sats
+       OR current_row.miner_id IS DISTINCT FROM recomputed_row.miner_id
+       OR current_row.payout_order_key IS DISTINCT FROM recomputed_row.payout_order_key
+    ORDER BY 1;
+$$;
+
+-- Seed or repair the summary from carry history whenever the summary
+-- disagrees with what it summarizes. This must run after the drift function
+-- above and after the sync triggers earlier in the file. A non-atomic apply
+-- (a per-statement autocommit psql run) can commit those triggers before
+-- this block runs; a live writer mutating carry state in that gap leaves a
+-- partial summary holding only post-trigger deltas. The previous guard
+-- seeded only when the summary was empty, so it treated that partial
+-- summary as already seeded and locked the damage in permanently on this
+-- apply and every later one, silently under-reporting every miner's balance
+-- by their pre-upgrade carry. Comparing the summary's active row-count
+-- total against the active carry history -- plus the drift check for
+-- balance-only divergence -- makes this a repair instead: an
+-- already-poisoned deployment is rebuilt from history by the next apply.
+-- Both counts come from one statement, so a concurrent commit cannot
+-- manufacture a false mismatch between them; a rebuild it triggers is
+-- correct by construction (it is the same recomputation the truncate
+-- triggers perform).
+DO $$
+DECLARE
+    summary_active_rows bigint;
+    ledger_active_rows bigint;
+BEGIN
+    SELECT
+        (SELECT COALESCE(SUM(active_row_count), 0)
+           FROM qbit_payout_carry_forward_current),
+        (SELECT COUNT(*)
+           FROM qbit_payout_carry_forward carry
+           JOIN qbit_pool_blocks block
+             ON block.block_hash = carry.block_hash
+          WHERE carry.maturity_state <> 'reversed'
+            AND block.chain_state = 'confirmed'
+            AND block.maturity_state <> 'reversed')
+    INTO summary_active_rows, ledger_active_rows;
+    IF summary_active_rows <> ledger_active_rows
+       OR EXISTS (SELECT 1 FROM qbit_carry_forward_current_drift())
+    THEN
+        PERFORM qbit_rebuild_carry_forward_current_balances();
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_current_owed_balances()
+RETURNS TABLE (
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    owed_balance_sats numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        balances.miner_id,
+        balances.payout_order_key,
+        balances.p2mr_program,
+        GREATEST(balances.balance_sats, 0) AS owed_balance_sats
+    FROM qbit_current_carry_forward_balances() AS balances;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_mismatches()
+RETURNS TABLE (
+    carry_forward_seq bigint,
+    block_hash text,
+    block_height bigint,
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    prior_balance_sats numeric,
+    expected_prior_balance_sats numeric,
+    gross_amount_sats bigint,
+    candidate_balance_sats numeric,
+    expected_candidate_balance_sats numeric,
+    onchain_amount_sats bigint,
+    settlement_fee_sats bigint,
+    carry_forward_balance_sats numeric,
+    expected_carry_forward_balance_sats numeric,
+    action text,
+    mismatch_reason text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH active AS (
+        SELECT ledger.*
+        FROM qbit_payout_carry_forward ledger
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = ledger.block_hash
+        WHERE ledger.maturity_state <> 'reversed'
+          AND block.chain_state = 'confirmed'
+          AND block.maturity_state <> 'reversed'
+    ),
+    checked AS (
+        SELECT
+            active.*,
+            COALESCE(
+                SUM(active.gross_amount_sats::numeric - active.onchain_amount_sats::numeric)
+                OVER (
+                    PARTITION BY active.miner_id, active.payout_order_key, active.p2mr_program
+                    ORDER BY active.block_height ASC, active.carry_forward_seq ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ),
+                0::numeric
+            ) AS expected_prior_balance_sats
+        FROM active
+    ),
+    expected AS (
+        SELECT
+            checked.*,
+            checked.expected_prior_balance_sats + checked.gross_amount_sats::numeric
+                AS expected_candidate_balance_sats,
+            checked.expected_prior_balance_sats + checked.gross_amount_sats::numeric
+                - checked.onchain_amount_sats::numeric
+                AS expected_carry_forward_balance_sats
+        FROM checked
+    )
+    SELECT
+        expected.carry_forward_seq,
+        expected.block_hash,
+        expected.block_height,
+        expected.miner_id,
+        expected.payout_order_key,
+        expected.p2mr_program,
+        expected.prior_balance_sats,
+        expected.expected_prior_balance_sats,
+        expected.gross_amount_sats,
+        expected.candidate_balance_sats,
+        expected.expected_candidate_balance_sats,
+        expected.onchain_amount_sats,
+        expected.settlement_fee_sats,
+        expected.carry_forward_balance_sats,
+        expected.expected_carry_forward_balance_sats,
+        expected.action,
+        concat_ws(
+            ',',
+            CASE
+                WHEN expected.prior_balance_sats <> expected.expected_prior_balance_sats
+                THEN 'prior_balance'
+            END,
+            CASE
+                WHEN expected.candidate_balance_sats <> expected.expected_candidate_balance_sats
+                THEN 'candidate_balance'
+            END,
+            CASE
+                WHEN expected.carry_forward_balance_sats <> expected.expected_carry_forward_balance_sats
+                THEN 'carry_forward_balance'
+            END
+        ) AS mismatch_reason
+    FROM expected
+    WHERE expected.prior_balance_sats <> expected.expected_prior_balance_sats
+       OR expected.candidate_balance_sats <> expected.expected_candidate_balance_sats
+       OR expected.carry_forward_balance_sats <> expected.expected_carry_forward_balance_sats
+    ORDER BY expected.block_height ASC, expected.carry_forward_seq ASC;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_report()
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'schema', 'qbit.prism.carry-forward-integrity.v1',
+        'checked_active_rows', (
+            SELECT count(*)
+            FROM qbit_payout_carry_forward ledger
+            JOIN qbit_pool_blocks block
+              ON block.block_hash = ledger.block_hash
+            WHERE ledger.maturity_state <> 'reversed'
+              AND block.chain_state = 'confirmed'
+              AND block.maturity_state <> 'reversed'
+        ),
+        'mismatch_count', (SELECT count(*) FROM qbit_carry_forward_integrity_mismatches()),
+        'current_drift_count', (SELECT count(*) FROM qbit_carry_forward_current_drift()),
+        'current_drift', COALESCE(
+            (
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'p2mr_program_hex', encode(drift.p2mr_program, 'hex'),
+                        'current_recipient_id', drift.current_miner_id,
+                        'current_order_key', drift.current_payout_order_key,
+                        'current_balance_sats', drift.current_balance_sats::text,
+                        'recomputed_recipient_id', drift.recomputed_miner_id,
+                        'recomputed_order_key', drift.recomputed_payout_order_key,
+                        'recomputed_balance_sats', drift.recomputed_balance_sats::text
+                    )
+                    ORDER BY encode(drift.p2mr_program, 'hex')
+                )
+                FROM qbit_carry_forward_current_drift() drift
+            ),
+            '[]'::jsonb
+        ),
+        'mismatches', COALESCE(
+            (
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'carry_forward_seq', mismatch.carry_forward_seq,
+                        'block_hash', mismatch.block_hash,
+                        'block_height', mismatch.block_height,
+                        'recipient_id', mismatch.miner_id,
+                        'order_key', mismatch.payout_order_key,
+                        'p2mr_program_hex', encode(mismatch.p2mr_program, 'hex'),
+                        'prior_balance_sats', mismatch.prior_balance_sats::text,
+                        'expected_prior_balance_sats', mismatch.expected_prior_balance_sats::text,
+                        'gross_amount_sats', mismatch.gross_amount_sats,
+                        'candidate_balance_sats', mismatch.candidate_balance_sats::text,
+                        'expected_candidate_balance_sats', mismatch.expected_candidate_balance_sats::text,
+                        'onchain_amount_sats', mismatch.onchain_amount_sats,
+                        'settlement_fee_sats', mismatch.settlement_fee_sats,
+                        'carry_forward_balance_sats', mismatch.carry_forward_balance_sats::text,
+                        'expected_carry_forward_balance_sats',
+                            mismatch.expected_carry_forward_balance_sats::text,
+                        'action', mismatch.action,
+                        'mismatch_reason', mismatch.mismatch_reason
+                    )
+                    ORDER BY mismatch.block_height ASC, mismatch.carry_forward_seq ASC
+                )
+                FROM qbit_carry_forward_integrity_mismatches() mismatch
+            ),
+            '[]'::jsonb
+        )
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_audit_share_window(
+    anchor_job_issued_at timestamptz,
+    network_difficulty numeric
+)
+RETURNS TABLE (
+    window_multiplier numeric,
+    requested_window_weight numeric,
+    share_seq bigint,
+    share_id text,
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    share_difficulty numeric,
+    counted_difficulty numeric,
+    job_issued_at timestamptz,
+    accepted_at timestamptz,
+    credit_policy text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        8::numeric AS window_multiplier,
+        network_difficulty * 8::numeric AS requested_window_weight,
+        ledger_window.share_seq,
+        ledger_window.share_id,
+        ledger_window.miner_id,
+        ledger_window.payout_order_key,
+        ledger_window.p2mr_program,
+        ledger_window.share_difficulty,
+        ledger_window.counted_difficulty,
+        ledger_window.job_issued_at,
+        ledger_window.accepted_at,
+        ledger_window.credit_policy
+    FROM qbit_prism_window(anchor_job_issued_at, network_difficulty * 8::numeric) AS ledger_window;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_audit_block_payouts(text);
+
+CREATE OR REPLACE FUNCTION qbit_audit_block_payouts(
+    target_block_hash text
+)
+RETURNS TABLE (
+    block_hash text,
+    block_height bigint,
+    coinbase_txid text,
+    payout_manifest_sha256 text,
+    chain_state text,
+    miner_id text,
+    payout_order_key text,
+    p2mr_program bytea,
+    onchain_amount_sats bigint,
+    carry_forward_balance_sats numeric,
+    action text,
+    maturity_state text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        block.block_hash,
+        block.block_height,
+        block.coinbase_txid,
+        block.payout_manifest_sha256,
+        block.chain_state,
+        payout.miner_id,
+        payout.payout_order_key,
+        payout.p2mr_program,
+        payout.onchain_amount_sats,
+        payout.carry_forward_balance_sats,
+        payout.action,
+        payout.maturity_state
+    FROM qbit_pool_blocks block
+    JOIN qbit_pool_payout_entries payout
+      ON payout.block_hash = block.block_hash
+    WHERE block.block_hash = target_block_hash
+    ORDER BY payout.payout_order_key, payout.miner_id, payout.p2mr_program;
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_audit_block_fanouts(
+    target_block_hash text
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COALESCE(
+        (
+            SELECT jsonb_build_object(
+                'schema', 'qbit.prism.ctv-fanout-recovery.v1',
+                'block_hash', fanout_set.block_hash,
+                'block_height', block.block_height,
+                'parent_hash', block.parent_hash,
+                'chain_state', block.chain_state,
+                'maturity_state', block.maturity_state,
+                'coinbase_txid', block.coinbase_txid,
+                'payout_manifest_sha256', block.payout_manifest_sha256,
+                'audit_bundle_sha256', bundle.audit_bundle_sha256,
+                'manifest_set_sha256', fanout_set.manifest_set_sha256,
+                'manifest_set_json', fanout_set.manifest_set_json,
+                'settlement_mode', fanout_set.settlement_mode,
+                'parent_coinbase_txid', fanout_set.parent_coinbase_txid,
+                'parent_coinbase_tx_hex', fanout_set.parent_coinbase_tx_hex,
+                'fanout_count', fanout_set.fanout_count,
+                'fanout_output_sum_sats', fanout_set.fanout_output_sum_sats,
+                'covenant_output_value_sats', fanout_set.covenant_output_value_sats,
+                'manifest_set', fanout_set.manifest_set,
+                'artifacts', COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'fanout_txid', artifact.fanout_txid,
+                                'manifest_json', artifact.manifest_json,
+                                'manifest_sha256', artifact.manifest_sha256,
+                                'manifest', artifact.manifest,
+                                'precommitment_sha256', artifact.precommitment_sha256,
+                                'ctv_hash', artifact.ctv_hash,
+                                'commitment_witness_leaf_hex', artifact.commitment_witness_leaf_hex,
+                                'chunk_index', artifact.chunk_index,
+                                'chunk_count', artifact.chunk_count,
+                                'parent_coinbase_txid', artifact.parent_coinbase_txid,
+                                'parent_coinbase_vout', artifact.parent_coinbase_vout,
+                                'fanout_tx_template_hex', artifact.fanout_tx_template_hex,
+                                'fanout_tx_hex', artifact.fanout_tx_hex,
+                                'anchor_vout', artifact.anchor_vout,
+                                'covenant_output_value_sats', artifact.covenant_output_value_sats,
+                                'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
+                                'settlement_status', artifact.settlement_status,
+                                'updated_at', artifact.updated_at::text,
+                                'broadcast_attempt_count', artifact.broadcast_attempt_count,
+                                'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+                                'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+                                'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+                                'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+                                'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                                'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+                                'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+                                'last_broadcast_error', artifact.last_broadcast_error,
+                                'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+                                'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+                                'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+                                'broadcast_attempt_summary', jsonb_build_object(
+                                    'attempt_count', artifact.broadcast_attempt_count,
+                                    'detail_count', artifact.broadcast_attempt_detail_count,
+                                    'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+                                    'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+                                    'last_attempt_status', artifact.last_broadcast_attempt_status,
+                                    'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                                    'last_package_txids', artifact.last_broadcast_package_txids,
+                                    'last_submit_result', artifact.last_broadcast_submit_result,
+                                    'last_error', artifact.last_broadcast_error,
+                                    'status_counts', artifact.broadcast_attempt_status_counts,
+                                    'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+                                    'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+                                )
+                            )
+                            ORDER BY artifact.chunk_index
+                        )
+                        FROM qbit_ctv_fanout_artifacts artifact
+                        WHERE artifact.block_hash = fanout_set.block_hash
+                    ),
+                    '[]'::jsonb
+                )
+            )
+            FROM qbit_ctv_fanout_sets fanout_set
+            JOIN qbit_pool_blocks block
+              ON block.block_hash = fanout_set.block_hash
+            LEFT JOIN qbit_pool_audit_bundles bundle
+              ON bundle.block_hash = fanout_set.block_hash
+            WHERE fanout_set.block_hash = target_block_hash
+        ),
+        'null'::jsonb
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_fanout_status(
+    target_fanout_txid text
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COALESCE(
+        (
+            SELECT jsonb_build_object(
+                'schema', 'qbit.prism.ctv-fanout-status.v1',
+                'fanout_txid', artifact.fanout_txid,
+                'block_hash', artifact.block_hash,
+                'block_height', block.block_height,
+                'parent_hash', block.parent_hash,
+                'chain_state', block.chain_state,
+                'maturity_state', block.maturity_state,
+                'coinbase_txid', block.coinbase_txid,
+                'payout_manifest_sha256', block.payout_manifest_sha256,
+                'audit_bundle_sha256', bundle.audit_bundle_sha256,
+                'manifest_set_sha256', artifact.manifest_set_sha256,
+                'manifest_json', artifact.manifest_json,
+                'manifest_sha256', artifact.manifest_sha256,
+                'manifest', artifact.manifest,
+                'precommitment_sha256', artifact.precommitment_sha256,
+                'ctv_hash', artifact.ctv_hash,
+                'commitment_witness_leaf_hex', artifact.commitment_witness_leaf_hex,
+                'chunk_index', artifact.chunk_index,
+                'chunk_count', artifact.chunk_count,
+                'parent_coinbase_txid', artifact.parent_coinbase_txid,
+                'parent_coinbase_vout', artifact.parent_coinbase_vout,
+                'fanout_tx_template_hex', artifact.fanout_tx_template_hex,
+                'fanout_tx_hex', artifact.fanout_tx_hex,
+                'anchor_vout', artifact.anchor_vout,
+                'covenant_output_value_sats', artifact.covenant_output_value_sats,
+                'fanout_output_sum_sats', artifact.fanout_output_sum_sats,
+                'settlement_status', artifact.settlement_status,
+                'updated_at', artifact.updated_at::text,
+                'broadcast_attempt_count', artifact.broadcast_attempt_count,
+                'broadcast_attempt_detail_count', artifact.broadcast_attempt_detail_count,
+                'first_broadcast_attempt_at', artifact.first_broadcast_attempt_at::text,
+                'last_broadcast_attempt_at', artifact.last_broadcast_attempt_at::text,
+                'last_broadcast_attempt_status', artifact.last_broadcast_attempt_status,
+                'last_broadcast_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                'last_broadcast_package_txids', artifact.last_broadcast_package_txids,
+                'last_broadcast_submit_result', artifact.last_broadcast_submit_result,
+                'last_broadcast_error', artifact.last_broadcast_error,
+                'broadcast_attempt_status_counts', artifact.broadcast_attempt_status_counts,
+                'next_broadcast_attempt_at', artifact.next_broadcast_attempt_at::text,
+                'broadcast_retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds,
+                'broadcast_attempt_summary', jsonb_build_object(
+                    'attempt_count', artifact.broadcast_attempt_count,
+                    'detail_count', artifact.broadcast_attempt_detail_count,
+                    'first_attempt_at', artifact.first_broadcast_attempt_at::text,
+                    'last_attempt_at', artifact.last_broadcast_attempt_at::text,
+                    'last_attempt_status', artifact.last_broadcast_attempt_status,
+                    'last_package_tx_hexes', artifact.last_broadcast_package_tx_hexes,
+                    'last_package_txids', artifact.last_broadcast_package_txids,
+                    'last_submit_result', artifact.last_broadcast_submit_result,
+                    'last_error', artifact.last_broadcast_error,
+                    'status_counts', artifact.broadcast_attempt_status_counts,
+                    'next_attempt_at', artifact.next_broadcast_attempt_at::text,
+                    'retry_backoff_seconds', artifact.broadcast_retry_backoff_seconds
+                ),
+                'broadcast_attempts', COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'attempt_seq', attempt.attempt_seq,
+                                'attempted_at', attempt.attempted_at::text,
+                                'attempt_status', attempt.attempt_status,
+                                'package_tx_hexes', attempt.package_tx_hexes,
+                                'package_txids', attempt.package_txids,
+                                'submit_result', attempt.submit_result,
+                                'error', attempt.error
+                            )
+                            ORDER BY attempt.attempt_seq ASC
+                        )
+                        FROM qbit_ctv_fanout_broadcast_attempts attempt
+                        WHERE attempt.fanout_txid = artifact.fanout_txid
+                    ),
+                    '[]'::jsonb
+                )
+            )
+            FROM qbit_ctv_fanout_artifacts artifact
+            JOIN qbit_pool_blocks block
+              ON block.block_hash = artifact.block_hash
+            LEFT JOIN qbit_pool_audit_bundles bundle
+              ON bundle.block_hash = artifact.block_hash
+            WHERE artifact.fanout_txid = target_fanout_txid
+        ),
+        'null'::jsonb
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION qbit_mark_mature_pool_payouts(
+    active_tip_height bigint
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    payout_count integer;
+BEGIN
+    UPDATE qbit_pool_blocks
+    SET maturity_state = 'mature',
+        matured_at = clock_timestamp()
+    WHERE maturity_state = 'immature'
+      AND chain_state = 'confirmed'
+      AND active_tip_height >= block_height + 1000;
+
+    UPDATE qbit_pool_payout_entries payout
+    SET maturity_state = 'mature'
+    FROM qbit_pool_blocks block
+    WHERE payout.block_hash = block.block_hash
+      AND block.chain_state = 'confirmed'
+      AND payout.maturity_state = 'immature'
+      AND active_tip_height >= payout.block_height + 1000;
+
+    GET DIAGNOSTICS payout_count = ROW_COUNT;
+
+    UPDATE qbit_payout_carry_forward carry
+    SET maturity_state = 'mature'
+    FROM qbit_pool_blocks block
+    WHERE carry.block_hash = block.block_hash
+      AND block.chain_state = 'confirmed'
+      AND carry.maturity_state = 'immature'
+      AND active_tip_height >= carry.block_height + 1000;
+
+    UPDATE qbit_ctv_fanout_artifacts artifact
+    SET settlement_status = 'broadcastable',
+        updated_at = clock_timestamp()
+    FROM qbit_pool_blocks block
+    WHERE artifact.block_hash = block.block_hash
+      AND block.chain_state = 'confirmed'
+      AND block.maturity_state = 'mature'
+      AND artifact.settlement_status = 'awaiting_maturity'
+      AND active_tip_height >= block.block_height + 1000;
+
+    RETURN payout_count;
+END;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_confirm_pool_block(text, bigint, text, bigint, text);
+
+CREATE OR REPLACE FUNCTION qbit_confirm_pool_block(
+    confirmed_block_hash text,
+    active_tip_height bigint,
+    active_writer_id text,
+    active_writer_epoch bigint,
+    active_writer_session_token text,
+    lease_duration interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lease_count integer;
+    confirmed_count integer;
+    publication_sequence pg_catalog.regclass;
+BEGIN
+    SELECT sequence.oid::pg_catalog.regclass
+    INTO publication_sequence
+    FROM pg_catalog.pg_class pool_blocks
+    JOIN pg_catalog.pg_class sequence
+      ON sequence.relnamespace = pool_blocks.relnamespace
+     AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+     AND sequence.relkind = 'S'
+    WHERE pool_blocks.oid = 'qbit_pool_blocks'::pg_catalog.regclass
+      AND pool_blocks.relkind = 'r';
+    IF publication_sequence IS NULL THEN
+        RAISE EXCEPTION 'missing audit publication sequence';
+    END IF;
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + lease_duration,
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = active_writer_id
+      AND writer_epoch = active_writer_epoch
+      AND writer_session_token = active_writer_session_token;
+    GET DIAGNOSTICS lease_count = ROW_COUNT;
+
+    IF lease_count = 0 THEN
+        RAISE EXCEPTION 'writer lease is not active';
+    END IF;
+
+    UPDATE qbit_pool_blocks
+    SET chain_state = 'confirmed',
+        audit_publication_sequence = pg_catalog.nextval(publication_sequence)
+    WHERE block_hash = confirmed_block_hash
+      AND block_height = active_tip_height
+      AND chain_state = 'prepared'
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS confirmed_count = ROW_COUNT;
+
+    -- The row is already confirmed at this (hash, height): this call changed
+    -- nothing. Report the distinct idempotent disposition (2) rather than 1.
+    -- 1 means exactly "this call flipped a prepared row", and only a flip
+    -- allocates an audit publication ordinal through the nextval above; the
+    -- replay below returns with the ordinal its original flip assigned and no
+    -- sequence burned. A caller must be able to tell the two apart: a
+    -- genuinely new confirmation has to publish payout state, while a replay
+    -- is already covered by the publication its flip produced, and
+    -- republishing it bumps the payout generation, wipes the job-bundle
+    -- cache, and aborts in-flight refreshes for identical state (issue #61).
+    -- This is the durable form of that distinction -- it is recorded in the
+    -- row, not inferred from process state -- so it survives reorg corners
+    -- that no in-memory discriminator can cover.
+    IF confirmed_count = 0
+       AND EXISTS (
+           SELECT 1
+           FROM qbit_pool_blocks
+           WHERE block_hash = confirmed_block_hash
+             AND block_height = active_tip_height
+             AND chain_state = 'confirmed'
+             AND maturity_state <> 'reversed'
+       ) THEN
+        RETURN 2;
+    END IF;
+
+    -- The candidate row was terminally disposed before this confirmation
+    -- arrived (reorg quarantine, rejection, or reversal). That is a routine
+    -- race, not corruption: report it as the distinct superseded disposition
+    -- (-1) so the caller can abandon the candidate without treating the
+    -- ledger as unexplained. A plain 0 keeps meaning: no row, or a live row
+    -- this confirmation does not match.
+    IF confirmed_count = 0
+       AND EXISTS (
+           SELECT 1
+           FROM qbit_pool_blocks
+           WHERE block_hash = confirmed_block_hash
+             AND (
+                 chain_state IN ('inactive', 'rejected', 'reversed')
+                 OR maturity_state = 'reversed'
+             )
+       ) THEN
+        RETURN -1;
+    END IF;
+
+    RETURN confirmed_count;
+END;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_mark_pool_block_inactive(text, bigint, text, bigint, text);
+
+CREATE OR REPLACE FUNCTION qbit_mark_pool_block_inactive(
+    disconnected_block_hash text,
+    active_tip_height bigint,
+    active_writer_id text,
+    active_writer_epoch bigint,
+    active_writer_session_token text,
+    lease_duration interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lease_count integer;
+    inactive_count integer;
+BEGIN
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + lease_duration,
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = active_writer_id
+      AND writer_epoch = active_writer_epoch
+      AND writer_session_token = active_writer_session_token;
+    GET DIAGNOSTICS lease_count = ROW_COUNT;
+
+    IF lease_count = 0 THEN
+        RAISE EXCEPTION 'writer lease is not active';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM qbit_pool_blocks
+        WHERE block_hash = disconnected_block_hash
+          AND chain_state IN ('confirmed', 'inactive')
+          AND maturity_state = 'mature'
+    ) THEN
+        RAISE EXCEPTION 'refusing to mark mature pool block inactive %', disconnected_block_hash;
+    END IF;
+
+    UPDATE qbit_pool_blocks
+    SET chain_state = 'inactive'
+    WHERE block_hash = disconnected_block_hash
+      AND chain_state = 'confirmed'
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS inactive_count = ROW_COUNT;
+
+    RETURN inactive_count;
+END;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_reactivate_pool_block(text, bigint, text, bigint, text);
+
+CREATE OR REPLACE FUNCTION qbit_reactivate_pool_block(
+    reconnected_block_hash text,
+    active_tip_height bigint,
+    active_writer_id text,
+    active_writer_epoch bigint,
+    active_writer_session_token text,
+    lease_duration interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lease_count integer;
+    reactivated_count integer;
+BEGIN
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + lease_duration,
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = active_writer_id
+      AND writer_epoch = active_writer_epoch
+      AND writer_session_token = active_writer_session_token;
+    GET DIAGNOSTICS lease_count = ROW_COUNT;
+
+    IF lease_count = 0 THEN
+        RAISE EXCEPTION 'writer lease is not active';
+    END IF;
+
+    UPDATE qbit_pool_blocks
+    SET chain_state = 'confirmed'
+    WHERE block_hash = reconnected_block_hash
+      AND block_height <= active_tip_height
+      AND chain_state = 'inactive'
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS reactivated_count = ROW_COUNT;
+
+    RETURN reactivated_count;
+END;
+$$;
+
+-- PL/pgSQL plans relation references on first execution. Pin confirmation
+-- ordinal allocation and reactivation to their installation schema, and list
+-- pg_temp last so a caller
+-- cannot redirect the lease, pool-block, or sequence names through its own
+-- search path or a temporary relation.
+DO $$
+DECLARE
+    installation_schema pg_catalog.text := pg_catalog.current_schema();
+BEGIN
+    EXECUTE pg_catalog.format(
+        'ALTER FUNCTION %I.qbit_confirm_pool_block('
+        'pg_catalog.text, pg_catalog.int8, pg_catalog.text, '
+        'pg_catalog.int8, pg_catalog.text, pg_catalog.interval) '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        installation_schema,
+        installation_schema
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER FUNCTION %I.qbit_reactivate_pool_block('
+        'pg_catalog.text, pg_catalog.int8, pg_catalog.text, '
+        'pg_catalog.int8, pg_catalog.text, pg_catalog.interval) '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        installation_schema,
+        installation_schema
+    );
+END;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_reject_prepared_pool_block(text, bigint, text, bigint, text);
+
+CREATE OR REPLACE FUNCTION qbit_reject_prepared_pool_block(
+    rejected_block_hash text,
+    active_tip_height bigint,
+    active_writer_id text,
+    active_writer_epoch bigint,
+    active_writer_session_token text,
+    lease_duration interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lease_count integer;
+    block_count integer;
+    payout_count integer;
+    carry_count integer;
+    fanout_count integer;
+BEGIN
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + lease_duration,
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = active_writer_id
+      AND writer_epoch = active_writer_epoch
+      AND writer_session_token = active_writer_session_token;
+    GET DIAGNOSTICS lease_count = ROW_COUNT;
+
+    IF lease_count = 0 THEN
+        RAISE EXCEPTION 'writer lease is not active';
+    END IF;
+
+    UPDATE qbit_pool_blocks
+    SET chain_state = 'rejected',
+        maturity_state = 'reversed',
+        disconnected_at = clock_timestamp()
+    WHERE block_hash = rejected_block_hash
+      AND chain_state = 'prepared'
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS block_count = ROW_COUNT;
+
+    IF block_count = 0 THEN
+        RETURN 0;
+    END IF;
+
+    UPDATE qbit_pool_payout_entries
+    SET maturity_state = 'reversed'
+    WHERE block_hash = rejected_block_hash
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS payout_count = ROW_COUNT;
+
+    UPDATE qbit_payout_carry_forward
+    SET maturity_state = 'reversed'
+    WHERE block_hash = rejected_block_hash
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS carry_count = ROW_COUNT;
+
+    UPDATE qbit_ctv_fanout_artifacts
+    SET settlement_status = 'reorged',
+        updated_at = clock_timestamp()
+    WHERE block_hash = rejected_block_hash
+      AND settlement_status <> 'confirmed';
+    GET DIAGNOSTICS fanout_count = ROW_COUNT;
+
+    RETURN block_count + payout_count + carry_count + fanout_count;
+END;
+$$;
+
+DROP FUNCTION IF EXISTS qbit_reverse_immature_pool_block(text, bigint);
+DROP FUNCTION IF EXISTS qbit_reverse_immature_pool_block(text, bigint, text, bigint, text);
+
+CREATE OR REPLACE FUNCTION qbit_reverse_immature_pool_block(
+    disconnected_block_hash text,
+    active_tip_height bigint,
+    active_writer_id text,
+    active_writer_epoch bigint,
+    active_writer_session_token text,
+    lease_duration interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lease_count integer;
+    block_count integer;
+    payout_count integer;
+    carry_count integer;
+    fanout_count integer;
+BEGIN
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + lease_duration,
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = active_writer_id
+      AND writer_epoch = active_writer_epoch
+      AND writer_session_token = active_writer_session_token;
+    GET DIAGNOSTICS lease_count = ROW_COUNT;
+
+    IF lease_count = 0 THEN
+        RAISE EXCEPTION 'writer lease is not active';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM qbit_pool_blocks
+        WHERE block_hash = disconnected_block_hash
+          AND chain_state IN ('confirmed', 'inactive')
+          AND (
+              maturity_state = 'mature'
+              OR active_tip_height >= block_height + 1000
+          )
+    ) THEN
+        RAISE EXCEPTION 'refusing to reverse mature pool block %', disconnected_block_hash;
+    END IF;
+
+    UPDATE qbit_pool_blocks
+    SET chain_state = 'reversed',
+        maturity_state = 'reversed',
+        disconnected_at = clock_timestamp()
+    WHERE block_hash = disconnected_block_hash
+      AND chain_state IN ('prepared', 'confirmed', 'inactive')
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS block_count = ROW_COUNT;
+
+    UPDATE qbit_pool_payout_entries
+    SET maturity_state = 'reversed'
+    WHERE block_hash = disconnected_block_hash
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS payout_count = ROW_COUNT;
+
+    UPDATE qbit_payout_carry_forward
+    SET maturity_state = 'reversed'
+    WHERE block_hash = disconnected_block_hash
+      AND maturity_state = 'immature';
+    GET DIAGNOSTICS carry_count = ROW_COUNT;
+
+    UPDATE qbit_ctv_fanout_artifacts
+    SET settlement_status = 'reorged',
+        updated_at = clock_timestamp()
+    WHERE block_hash = disconnected_block_hash
+      AND settlement_status <> 'confirmed';
+    GET DIAGNOSTICS fanout_count = ROW_COUNT;
+
+    RETURN block_count + payout_count + carry_count + fanout_count;
+END;
+$$;
+
+-- Durable retention of the last delivered, safe per-worker vardiff wire
+-- difficulty, keyed by listener lane plus exact Stratum username. Rows are
+-- operational preload hints for reconnecting sessions only: they never join
+-- share accounting or payout artifacts, and pruning them loses no canonical
+-- state. Exact usernames are public identities, not authentication secrets.
+--
+-- difficulty is an unconstrained numeric so the decimal wire value survives
+-- without lossy integer conversion; the CHECK pins it to a positive finite
+-- value (numeric NaN compares greater than every value including zero, and
+-- only the < 'Infinity' comparison excludes it, so both guards are
+-- load-bearing). evidence_at records when share-backed evidence last
+-- validated the value — the writer's upsert keeps it monotonic per key —
+-- while updated_at records the last write of any kind. The single index
+-- serves both the bounded newest-first preload (its column order matches the
+-- preload ORDER BY exactly) and the evidence_at range scan the prune uses.
+-- The key columns collate as "C": preload/prune tie-breaks are byte order,
+-- identical across deployments and to the in-memory store's code-point
+-- ordering, instead of drifting with the database's locale collation.
+-- This DDL block must stay byte-identical to WORKER_DIFFICULTY_SCHEMA_SQL in
+-- lab/prism/worker_difficulty_store.py; a contract test pins the match.
+CREATE TABLE IF NOT EXISTS qbit_worker_difficulty (
+    listener text COLLATE "C" NOT NULL CHECK (listener <> ''),
+    worker_username text COLLATE "C" NOT NULL CHECK (worker_username <> ''),
+    difficulty numeric NOT NULL CHECK (
+        difficulty > 0 AND difficulty < 'Infinity'::numeric
+    ),
+    evidence_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (listener, worker_username)
+);
+
+CREATE INDEX IF NOT EXISTS qbit_worker_difficulty_evidence_idx
+    ON qbit_worker_difficulty (evidence_at DESC, listener, worker_username);
+
+-- Incremental hashrate rollups for the public dashboard hashrate-series
+-- endpoint. qbit_share_ledger rows are immutable after insert and share_seq
+-- is append-only, so a single monotonically advancing watermark
+-- (qbit_hashrate_rollup_progress.last_share_seq) makes per-bucket
+-- accumulation exact: every share is folded into its (grain, bucket) rows
+-- exactly once, regardless of accepted_at ordering. Buckets are keyed by
+-- floor(extract(epoch FROM accepted_at) / grain)::bigint * grain -- the
+-- exact expression the serving query uses -- so rollup and raw bucketing
+-- can never disagree. Only the lease-holding coordinator maintains these
+-- tables; the public read tier only reads them. accepted_share_difficulty
+-- is unconstrained numeric: source rows are numeric(78, 0), but a bucket
+-- total sums many of them and may need more digits than any single share --
+-- a constrained aggregate column would make the maintenance upsert overflow
+-- on every retry and wedge the watermark. sum(numeric) in the raw scan is
+-- likewise unconstrained, so text renderings stay byte-identical.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_pool (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch)
+);
+
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_miner (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    miner_id text NOT NULL,
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch, miner_id)
+);
+
+-- Databases that applied the earlier constrained definition are widened in
+-- place; from numeric(78, 0) to unconstrained numeric this is a
+-- catalog-only change, and it is a no-op once the column is unconstrained.
+ALTER TABLE qbit_hashrate_rollup_pool
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
+ALTER TABLE qbit_hashrate_rollup_miner
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
+
+CREATE INDEX IF NOT EXISTS qbit_hashrate_rollup_miner_series_idx
+    ON qbit_hashrate_rollup_miner (miner_id, grain_seconds, bucket_epoch);
+
+-- Single-row watermark. A missing row means the rollups have never run:
+-- the serving query then degrades to the raw ledger scan, so a
+-- pre-migration database or a half-deployed writer stays correct. The
+-- first maintenance pass seeds the row itself and starts from sequence 0,
+-- which is also how a grown ledger backfills -- there is no separate
+-- migration path.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_progress (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    last_share_seq bigint NOT NULL CHECK (last_share_seq >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Pairs with the BEGIN at the top of the file: the apply is one transaction
+-- no matter which client performs it.
+COMMIT;

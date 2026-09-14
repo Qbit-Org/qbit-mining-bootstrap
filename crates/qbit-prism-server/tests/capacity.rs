@@ -150,11 +150,12 @@ fn binds_every_configuration_and_checks_vardiff_math() {
         ("PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN", "2"),
         ("PRISM_STRATUM_VARDIFF_EWMA_ALPHA", "0.5"),
         ("PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE", "0.3"),
-        ("PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS", "20"),
-        ("PRISM_SHARE_COMMIT_BATCH_SIZE", "32"),
-        ("PRISM_SHARE_COMMIT_LINGER_MILLISECONDS", "7"),
         ("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", "20"),
         ("PRISM_STRATUM_SEND_TIMEOUT_SECONDS", "25"),
+        ("PRISM_RUNTIME_WORKERS", "8"),
+        ("PRISM_DATABASE_MAX_CONNECTIONS", "32"),
+        ("PRISM_STRATUM_MAX_CONNECTIONS", "512"),
+        ("PRISM_JOB_BUILD_EXECUTOR_WORKERS", "2"),
     ];
     assert_eq!(alternatives.len(), capacity::CONFIGURATION_KEYS.len());
     for (key, value) in alternatives {
@@ -165,6 +166,8 @@ fn binds_every_configuration_and_checks_vardiff_math() {
             .insert(key.into(), value.into());
         reject(&qualification(), &o, &format!("configuration.{key}"));
     }
+    let over_permits = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+    let over_permits_message = format!("must be 1..={}", tokio::sync::Semaphore::MAX_PERMITS);
     for (key, value, expected) in [
         (
             "PRISM_STRATUM_VARDIFF_MAX_DIFF",
@@ -187,10 +190,142 @@ fn binds_every_configuration_and_checks_vardiff_math() {
             "must not exceed 1",
         ),
         ("PRISM_STRATUM_SHARE_DIFF", "1e-9", "lab-only 1e-9"),
+        ("PRISM_STRATUM_VARDIFF", "2", "must be 0..=1"),
+        ("PRISM_RUNTIME_WORKERS", "0", "must be a positive integer"),
+        ("PRISM_RUNTIME_WORKERS", "1025", "must be 1..=1024"),
+        ("PRISM_DATABASE_MAX_CONNECTIONS", "3", "must be 4..=1024"),
+        ("PRISM_DATABASE_MAX_CONNECTIONS", "1025", "must be 4..=1024"),
+        (
+            "PRISM_STRATUM_MAX_CONNECTIONS",
+            "0",
+            "must be a positive integer",
+        ),
+        (
+            "PRISM_STRATUM_MAX_CONNECTIONS",
+            over_permits.as_str(),
+            over_permits_message.as_str(),
+        ),
+        (
+            "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
+            "0",
+            "must be a positive integer",
+        ),
+        (
+            "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
+            "13",
+            "must be 1..=PRISM_RUNTIME_WORKERS + 8 (12)",
+        ),
     ] {
         let mut v = qualification();
         v["configuration"][key] = json!(value);
         reject(&v, &options(), expected);
+    }
+    // The build executor may use every blocking thread the runtime reserves.
+    let mut v = qualification();
+    v["configuration"]["PRISM_JOB_BUILD_EXECUTOR_WORKERS"] = json!(12);
+    let mut o = options();
+    o.expected_configuration
+        .as_mut()
+        .unwrap()
+        .insert("PRISM_JOB_BUILD_EXECUTOR_WORKERS".into(), "12".into());
+    capacity::validate_capacity_evidence(&v, &o).unwrap();
+}
+#[test]
+fn bound_configuration_uses_only_native_runtime_settings() {
+    let inventory = |text: &'static str| {
+        text.lines()
+            .filter(|line| line.starts_with("PRISM_"))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let native = inventory(include_str!("../src/config/native-settings.txt"));
+    let retired = inventory(include_str!("../src/config/retired-settings.txt"));
+    let fixture = example();
+    let fixture_keys = fixture["configuration"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        fixture_keys,
+        capacity::CONFIGURATION_KEYS.iter().copied().collect()
+    );
+    for key in capacity::CONFIGURATION_KEYS {
+        assert!(native.contains(key), "{key} is not a native setting");
+        assert!(!retired.contains(key), "{key} is a retired setting");
+    }
+    for key in capacity::RETIRED_CONFIGURATION_KEYS {
+        assert!(retired.contains(key), "{key} is not inventoried as retired");
+    }
+}
+#[test]
+fn rejects_retired_schemas_and_configuration_keys_by_name() {
+    for schema in [
+        "qbit-prism-capacity-evidence/v1",
+        "qbit-prism-capacity-evidence/v2",
+    ] {
+        let mut v = qualification();
+        v["schema"] = json!(schema);
+        reject(&v, &options(), &format!("schema '{schema}' is retired"));
+    }
+    for schema in [
+        "qbit-prism-capacity-evidence/v4",
+        "qbit-prism-capacity-evidence/v3.1",
+    ] {
+        let mut v = qualification();
+        v["schema"] = json!(schema);
+        reject(&v, &options(), &format!("schema '{schema}' is unsupported"));
+    }
+    let mut v = qualification();
+    v["schema"] = json!("unrelated");
+    reject(
+        &v,
+        &options(),
+        "schema must be 'qbit-prism-capacity-evidence/v3'",
+    );
+    for key in capacity::RETIRED_CONFIGURATION_KEYS {
+        let mut v = qualification();
+        v["configuration"][*key] = json!("5");
+        reject(&v, &options(), "retired configuration keys");
+        reject(&v, &options(), key);
+    }
+    // A v2 configuration block relabelled as v3 names every retired key at once.
+    let mut v = qualification();
+    let configuration = v["configuration"].as_object_mut().unwrap();
+    for key in [
+        "PRISM_RUNTIME_WORKERS",
+        "PRISM_DATABASE_MAX_CONNECTIONS",
+        "PRISM_STRATUM_MAX_CONNECTIONS",
+        "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
+    ] {
+        configuration.remove(key);
+    }
+    for key in capacity::RETIRED_CONFIGURATION_KEYS {
+        configuration.insert((*key).into(), json!("5"));
+    }
+    reject(
+        &v,
+        &options(),
+        &capacity::RETIRED_CONFIGURATION_KEYS.join(", "),
+    );
+    for key in capacity::RETIRED_CONFIGURATION_KEYS {
+        let error = capacity::run(capacity::Args {
+            evidence_file: "unused.json".into(),
+            expected: vec![format!("{key}=5")],
+            expect_coordinator_revision: None,
+            expect_coordinator_image_digest: None,
+            expect_postgres_server_version: None,
+            expect_database_profile_sha256: None,
+            forecast_peak_shares_per_second: None,
+            ack_p99_limit_milliseconds: None,
+            max_age_seconds: capacity::DEFAULT_MAX_AGE_SECONDS,
+            allow_example_evidence_for_tests: false,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("retired configuration key {key}")),
+            "got {error:#}"
+        );
     }
 }
 #[test]
