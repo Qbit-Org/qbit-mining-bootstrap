@@ -178,6 +178,107 @@ Automatic replacement fee bumps and abandoned-reservation release are not
 implemented; retain and reconcile the durable reservation when handling those
 cases manually.
 
+## Retry, replay and deadline contract
+
+The ledger never replays SQL automatically. After a `statement_timeout`
+(`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, default 15000), a `lock_timeout`
+(`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5000), a closed connection or a lost
+acknowledgement, the error reaches the caller and the ledger neither re-sends
+the statement nor re-runs the transaction. This is distinct from normal
+traversal: a paged read sends its page query repeatedly by design, and audit
+materialization reads the snapshot row and its share range through separate
+pool checkouts. A statement cancelled or a socket closed before `COMMIT`
+aborts the open transaction, so the claim and state that authorized the call
+remain as they were; that holds only when the transaction did not commit. A
+`CommandComplete` received before `COMMIT` proves execution, not durability. A
+`COMMIT` whose acknowledgement is lost leaves the outcome unknown to the
+caller: the transaction may or may not have committed. The caller's next
+observation must come from the durable claim and state, never from a replay.
+Every later attempt is a separate public operation with its own claim.
+
+| Operation (public API) | Class | Automatic re-execution | What runs later, and who authorizes it | Coverage |
+| --- | --- | --- | --- | --- |
+| Candidate terminal disposition: `finish_candidate`, `finish_candidate_at_revision` | never-retried mutation | none | The same live claim may invoke again after a reported error; otherwise the worker calls `retry_candidate`. A consumed claim is rejected and writes nothing. | dynamic: `candidate_terminal_timeout_executes_once` |
+| Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds. It does not re-run the failed terminal write. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim` |
+| CTV attempt journal: `finish_fanout` | never-retried mutation; one journal row per authorized claim | none | Every recorded attempt, `failed` included, releases the claim and schedules `next_broadcast_attempt_at` (10 s per attempt, at most 3600 s). A fresh `claim_fanout` after that time is the next attempt and its own journal row; the old token stays rejected. | dynamic: `fanout_journal_timeout_executes_once`, `broadcast_retry_requires_new_claim` |
+| Claims: `claim_candidate`, `claim_fanout`, `renew_candidate_claim`, `renew_fanout_claim` | public reinvocation | none | One token per block hash or fanout. Distinct hashes never share a lease; their dispositions meet only the short settlement lock. | dynamic: `distinct_hashes_hold_independent_claims` |
+| Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
+| Expired or lost claim across a halt | never revived | none | Clearing `fatal_error` restores authority for new work only; the token that expired during the halt is still rejected by every operation and a new claim is required. | dynamic: `restored_authority_requires_fresh_claim` |
+| Share append: `append`, `append_at_revision` | public reinvocation, idempotent by share identity | none | A miner or frontend resubmission is a new call; the share identity and proof-hash registry return the existing row without a second credit. | inventory: `ledger_postgres::global_duplicates_idempotence_and_config_fencing`, `postgres_failover` |
+| Page traversal: `read_window`, `snapshot`, audit materialization | normal page traversal | none | A page is not a retry. `read_window` pages inside one `REPEATABLE READ READ ONLY` transaction and reports an incomplete range as an error instead of a partial window. `snapshot` fixes its anchor and revision in one short transaction, then pages immutable rows at or before that anchor in a second one. Audit materialization reads the snapshot row and the share range through separate checkouts; the share count, snapshot digest and bundle digest authenticate the result, and a mismatch is an error. | inventory: `window_reference`, `window_read_oracle` |
+| Dependency reread or repair: `save_issued_job` with a repair payload, `backfill_ctv`, `import_legacy_audits` | dependency reread/repair | none | Cold-path calls that re-read the durable dependency and verify its identity, or rebuild a missing row idempotently. None replays a failed write. | inventory: `issued_job_dependency`, `ledger_postgres::ctv_artifacts_wait_for_maturity_and_claims_are_fenced`, `ledger_postgres::legacy_audit_import_validates_envelope_hash_and_pinned_key` |
+| Reconciliation: `pool_blocks_for_reconcile`, `reconcile_blocks`, `reconcile_blocks_at_revision`, `observe_fanout` | public reinvocation, revision fenced | none | Periodic calls. `pool_blocks_for_reconcile` is one query. A stale expected revision (for `observe_fanout`, when the observation carries one) is an error that changes nothing. | inventory: `ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced` |
+| Session reservation release: `SessionId::release`, drop cleanup | best-effort cleanup | none | A lost cleanup reply leaves the outcome unknown: the reservation may have been deleted or retained. A retained reservation is reclaimed once its owner is recorded as stopped. | inventory: `ledger_postgres::session_sequence` |
+
+"Dynamic" rows are exercised by
+`crates/qbit-prism-server/tests/ledger_single_execution.rs` against a disposable
+PostgreSQL. The two timeout tests route one ledger pool through a test-only
+protocol proxy that frames both directions of the wire and counts the
+targeted statement in `Execute` and `Query` frames across every connection,
+including a same-text replay the aborted transaction rejects and a second
+copy of the statement inside one simple `Query` frame. Server rejections are
+recorded separately from executions and every one in the observed window
+must be the targeted statement's own failure, so a replay under a different
+statement text, which the server refuses at `Parse` without any `Execute`,
+also fails the test. An execution whose statement text the proxy did not
+learn fails the test instead of escaping the count. The targeted statement
+is identified while it runs by a marker NOTICE from a statement-level
+fixture trigger on the durable table, not by its SQL text or its position.
+They seed a real server `statement_timeout` on the terminal write and a lost
+acknowledgement before and after `COMMIT`, and read the durable outcome back
+directly; a re-invocation after a lost acknowledgement is checked to run on
+a connection other than the one the fault closed. The durability of the
+lost-`COMMIT` case is proven by the proxy observing the server's `COMMIT`
+completion and by reading the state back, not by the caller's view.
+"Inventory" rows are a static review of the code, backed by the existing
+tests named; they were not re-tested for this contract.
+
+```sh
+PRISM_TEST_DATABASE_URL=postgresql://test_user@127.0.0.1:5432/test_db \
+  cargo test --locked -p qbit-prism-server --test ledger_single_execution -- --nocapture
+```
+
+### Deadlines
+
+The legacy writer's final-partial-batch and progress-between-batches deadline
+workflow has no native counterpart. There is no batch writer: each accepted
+share commits in its own transaction, so no deadline can expire inside a
+batch and no batch is retried as a unit. Two native mechanisms stand in for
+it:
+
+- Issued-job late expiry. `save_issued_job` checks the job's absolute
+  deadline after taking the shared settlement lock and before locking its
+  dependency row, and again just before commit, so a deadline that elapsed
+  while waiting on row locks is a reported error that retrying cannot reset,
+  and the job is not saved. `prune_expired_jobs` removes expired
+  rows in bounded batches.
+- Per-item import failure and restart. `import-audits` processes one legacy
+  audit at a time, each verified off the runtime threads and stored in its
+  own transaction. A failing item stops the command with an error; earlier
+  items stay imported, there is no partially imported item, and rerunning the
+  command resumes with the rows that still lack canonical bytes.
+
+### Native snapshot rejection and legacy segments
+
+A native audit body references an immutable share snapshot in
+`qbit_prism_audit_snapshots`. Landing rejects a snapshot that is empty, out of
+canonical order, or different from the ledger's rows for its range, before any
+obligation is recorded. Materialization verifies the share count, the
+reconstructed share digest and the canonical bundle digest, and returns an
+error instead of a repaired or substituted body. Imported canonical bytes are
+checked on both read paths: raw canonical-byte serving requires the declared
+digest and a JSON object, and materialization into a logical body
+additionally rejects an audit envelope and parses the bytes as a flat bundle.
+
+The legacy `audit-body-ref` and v2 segment envelopes are still parsed by the
+shared audit parser and the offline loaders, for import and verification. The
+legacy segment lifecycle (gap backfill from the ledger, quarantine of a
+segment when the ledger has no rows, and the conflicting-duplicate raise)
+belonged to the retired filesystem audit store and is not a native lifecycle:
+natively, a body is either reconstructed exactly from immutable rows or served
+from imported canonical bytes, and a mismatch is a read error to investigate,
+never a repair or quarantine step.
+
 ## HA database and shutdown
 
 Point every instance at the same writable primary endpoint. Do not route ledger
