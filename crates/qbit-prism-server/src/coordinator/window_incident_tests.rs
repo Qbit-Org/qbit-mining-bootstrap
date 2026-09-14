@@ -45,7 +45,7 @@ mod window_fixture;
 use window_fixture::WindowPlan;
 
 /// The ledger's advisory locks are cluster-wide constants, not schema-scoped.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 /// `candidate_lease_tests`' `SHORT_LEASE`.
 const SHORT_LEASE: CandidateLease = CandidateLease {
