@@ -59,9 +59,9 @@ pub struct CompactPrepared {
 /// template work: callers must use their admitted blocking build to create it.
 #[derive(Clone, Debug)]
 pub struct PreparedTemplate {
-    bytes: Vec<u8>,
-    digest: String,
-    parent: String,
+    pub(super) bytes: Vec<u8>,
+    pub(super) digest: String,
+    pub(super) parent: String,
 }
 
 impl PreparedTemplate {
@@ -107,7 +107,7 @@ pub struct StoredCompactPrepared {
 impl CompactPrepared {
     pub const FORMAT_VERSION: u16 = FORMAT_VERSION;
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.format_version == FORMAT_VERSION,
             "unsupported compact prepared format"
@@ -268,7 +268,7 @@ impl Ledger {
     }
 }
 
-async fn put_template(
+pub(super) async fn put_template(
     tx: &mut Transaction<'_, Postgres>,
     template: &PreparedTemplate,
 ) -> Result<()> {
@@ -298,7 +298,10 @@ async fn require_live(tx: &mut Transaction<'_, Postgres>, expires: DateTime<Utc>
     Ok(())
 }
 
-fn encode_record(record: &CompactPrepared, original_expires_at_ms: i64) -> Result<Value> {
+pub(super) fn encode_record(
+    record: &CompactPrepared,
+    original_expires_at_ms: i64,
+) -> Result<Value> {
     let mut payload = serde_json::to_value(record)?;
     payload["original_expires_at_ms"] = Value::from(original_expires_at_ms);
     let bytes = serde_json::to_vec(&payload)?;
@@ -309,7 +312,7 @@ fn encode_record(record: &CompactPrepared, original_expires_at_ms: i64) -> Resul
     Ok(payload)
 }
 
-fn digest_text(digest: &str) -> Result<()> {
+pub(super) fn digest_text(digest: &str) -> Result<()> {
     ensure!(
         digest.len() == 64
             && digest
@@ -320,7 +323,7 @@ fn digest_text(digest: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_columns(row: &PgRow, record: &CompactPrepared) -> Result<()> {
+pub(super) fn check_columns(row: &PgRow, record: &CompactPrepared) -> Result<()> {
     let range = record.window.shares;
     ensure!(
         row.try_get::<String, _>("parent_hash")? == record.parent_hash
