@@ -779,6 +779,188 @@ fn an_unknown_build_profile_needs_the_debug_override() -> Result<()> {
     Ok(())
 }
 
+// --- a minimal Stratum server -------------------------------------------
+
+/// The smallest Stratum server a session can complete a handshake with:
+/// subscribe, configure, authorize, one job, and `true` to every submit.
+/// `release_authorize` gates the authorize reply, which keeps a session
+/// inside its handshake for as long as a test needs.
+struct FakeStratum {
+    address: String,
+    release_authorize: tokio::sync::watch::Sender<bool>,
+    submits: Arc<std::sync::atomic::AtomicUsize>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+async fn fake_stratum(hold_authorize: bool) -> FakeStratum {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (release_authorize, release) = tokio::sync::watch::channel(!hold_authorize);
+    let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = submits.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(serve_stratum(socket, release.clone(), counter.clone()));
+        }
+    });
+    FakeStratum {
+        address,
+        release_authorize,
+        submits,
+        _task: task,
+    }
+}
+
+async fn serve_stratum(
+    socket: tokio::net::TcpStream,
+    mut release: tokio::sync::watch::Receiver<bool>,
+    submits: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (read, mut write) = socket.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    let (coinb1, coinb2) = coinbase_halves(8);
+    // Network target diff 1 (one hash in 2^32 solves a block), so a share
+    // search at difficulty 2^-26 finds a share in a few dozen hashes and
+    // rarely discards one as an unscheduled block solution.
+    let notify = json!({"id": null, "method": "mining.notify", "params": [
+        "job-1",
+        "00000000000000000001aabbccddeeff00112233445566778899aabbccddeeff",
+        hex::encode(&coinb1), hex::encode(&coinb2), [],
+        "20000000", "1d00ffff", "6b49d200", true
+    ]});
+    while let Ok(Some(line)) = lines.next_line().await {
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].clone();
+        let reply = match request["method"].as_str() {
+            Some("mining.subscribe") => json!({"id": id, "error": null, "result": [
+                [["mining.set_difficulty", "1"], ["mining.notify", "1"]], "deadbeef", 8
+            ]}),
+            Some("mining.configure") => {
+                json!({"id": id, "error": null, "result": {"version-rolling": false}})
+            }
+            Some("mining.authorize") => {
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        return;
+                    }
+                }
+                json!({"id": id, "error": null, "result": true})
+            }
+            Some("mining.submit") => {
+                submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"id": id, "error": null, "result": true})
+            }
+            _ => continue,
+        };
+        let authorized = request["method"] == "mining.authorize";
+        let mut bytes = serde_json::to_vec(&reply).unwrap();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() {
+            return;
+        }
+        if authorized {
+            let mut bytes = serde_json::to_vec(&notify).unwrap();
+            bytes.push(b'\n');
+            if write.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn session_config(index: usize) -> client::SessionConfig {
+    client::SessionConfig {
+        index,
+        username: format!("pload1test.s{index:05}"),
+        password: "x".into(),
+        // Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share
+        // search costs microseconds even in a debug build.
+        share_difficulty: 1.0 / 67_108_864.0,
+        version_rolling_mask: codec::VERSION_ROLLING_MASK,
+        connect_timeout: std::time::Duration::from_secs(5),
+        handshake_timeout: std::time::Duration::from_secs(20),
+    }
+}
+
+/// A phase's rate and its artifact must describe the same offers. An offer
+/// the scheduler places while the session cannot send it -- here, because
+/// the session is still inside its handshake -- is counted as dispatched in
+/// that phase, and has to be recorded under that phase even when the run has
+/// moved on by the time the session gets to send it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<()> {
+    let server = fake_stratum(true).await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("steady_state".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let handle = client::spawn_session(
+        session_config(0),
+        0,
+        server.address.clone(),
+        shared.clone(),
+        2,
+    );
+    let phase: Arc<str> = Arc::from("steady_state");
+    assert!(handle.try_offer(2, &phase));
+    assert!(handle.try_offer(2, &phase));
+    assert!(
+        !handle.try_offer(2, &phase),
+        "the outstanding limit bounds queued and in-flight offers together"
+    );
+    assert_eq!(
+        handle.outstanding.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+
+    // The phase ends with both offers still queued; the next one begins.
+    *shared.phase.write().unwrap() = "reconnect".to_owned();
+    server.release_authorize.send(true)?;
+
+    let mut records = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while records.len() < 2 {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the two submits are answered within the deadline")
+            .expect("the session is still running");
+        if let client::Event::Submit(record) = event {
+            records.push(*record);
+        }
+    }
+    assert_eq!(server.submits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for record in &records {
+        assert!(matches!(record.outcome, client::Outcome::Accepted));
+        assert_eq!(
+            record.phase, "steady_state",
+            "the offer was dispatched in steady_state and belongs there, not in the phase \
+             the run had reached when the session finally sent it"
+        );
+    }
+    // The session reports a submit a few instructions before it releases the
+    // slot, so give the counter a moment to settle.
+    let settled = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while handle.outstanding.load(std::sync::atomic::Ordering::SeqCst) != 0
+        && tokio::time::Instant::now() < settled
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        handle.outstanding.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "every slot is released exactly once"
+    );
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
+    Ok(())
+}
+
 // --- artifact -------------------------------------------------------------
 
 fn sample_inputs() -> ArtifactInputs {

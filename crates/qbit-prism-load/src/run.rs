@@ -1198,6 +1198,9 @@ async fn drive_phase(
     let started = Instant::now();
     let duration = Duration::from_secs(plan.seconds);
     let cursor = AtomicUsize::new(0);
+    // Every offer this loop places is stamped with this phase, however late
+    // the session gets to send it.
+    let phase: Arc<str> = Arc::from(plan.name.as_str());
     let mut outcome = PhaseOutcome {
         tokens: 0,
         dispatched: 0,
@@ -1273,7 +1276,7 @@ async fn drive_phase(
         let want = (seconds * plan.rate).floor() as u64;
         while outcome.tokens < want {
             outcome.tokens += 1;
-            if offer_round_robin(sessions, &cursor, args.max_outstanding_per_session) {
+            if offer_round_robin(sessions, &cursor, args.max_outstanding_per_session, &phase) {
                 outcome.dispatched += 1;
             } else {
                 outcome.shortfall += 1;
@@ -1374,11 +1377,16 @@ async fn drive_phase(
     Ok(outcome)
 }
 
-fn offer_round_robin(sessions: &[SessionHandle], cursor: &AtomicUsize, limit: usize) -> bool {
+fn offer_round_robin(
+    sessions: &[SessionHandle],
+    cursor: &AtomicUsize,
+    limit: usize,
+    phase: &Arc<str>,
+) -> bool {
     let count = sessions.len();
     for _ in 0..count {
         let index = cursor.fetch_add(1, Ordering::Relaxed) % count;
-        if sessions[index].try_offer(limit) {
+        if sessions[index].try_offer(limit, phase) {
             return true;
         }
     }

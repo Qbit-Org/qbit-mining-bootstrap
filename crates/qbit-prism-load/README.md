@@ -342,7 +342,9 @@ one and ships it beside the artifact.
 
 Schema `qbit.prism.load-harness.v1`. Everything the artifact cannot carry: the
 host, versions and build profiles, the redacted frontend environment, window
-sizes requested, computed and read back, per-phase measurements, the
+sizes requested, computed and read back, per-phase measurements (a submit
+belongs to the phase whose scheduler offered it, even when the session sent
+it after that phase's boundary), the
 reconciliation definition and results, rejections by `(code, reason_id,
 message)` per phase and frontend, reconnect statistics, time to usable work,
 the mid-flight-kill census, blocked-run records, the honest-value notes, the

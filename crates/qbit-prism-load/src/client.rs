@@ -269,7 +269,12 @@ pub enum Event {
 /// Work and control messages a session accepts.
 #[derive(Clone, Debug)]
 pub enum Work {
-    Submit,
+    /// One share to find and submit, stamped with the phase whose scheduler
+    /// offered it. The stamp travels with the item because a session may
+    /// send it after the phase boundary -- while reconnecting, or paused --
+    /// and the phase that counted it as dispatched is the phase it belongs
+    /// to (EP-STATE).
+    Submit { phase: Arc<str> },
 }
 
 #[derive(Clone, Debug)]
@@ -343,11 +348,19 @@ pub struct SessionHandle {
 
 impl SessionHandle {
     /// Offer one share to this session if it is under its outstanding limit.
-    pub fn try_offer(&self, limit: usize) -> bool {
+    /// `phase` is the phase making the offer; the record the session
+    /// eventually reports carries it whatever the phase is by then.
+    pub fn try_offer(&self, limit: usize, phase: &Arc<str>) -> bool {
         if self.outstanding.load(Ordering::Relaxed) >= limit {
             return false;
         }
-        if self.work.try_send(Work::Submit).is_ok() {
+        if self
+            .work
+            .try_send(Work::Submit {
+                phase: phase.clone(),
+            })
+            .is_ok()
+        {
             self.outstanding.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -535,7 +548,8 @@ async fn run_session(
                         // any other submit: its response goes through the same
                         // path, which releases the slot exactly once.
                         outstanding.fetch_add(1, Ordering::Relaxed);
-                        if let Err(error) = offer(active, &config, &shared, &frontend, true).await {
+                        let phase = shared.phase();
+                        if let Err(error) = offer(active, &config, &shared, &frontend, true, phase).await {
                             outstanding.fetch_sub(1, Ordering::Relaxed);
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
@@ -600,8 +614,9 @@ async fn run_session(
             offered = work.recv(), if can_submit => {
                 match offered {
                     None => { stopping = true; }
-                    Some(Work::Submit) => {
-                        if let Err(error) = offer(active, &config, &shared, &frontend, false).await {
+                    Some(Work::Submit { phase }) => {
+                        let phase = phase.to_string();
+                        if let Err(error) = offer(active, &config, &shared, &frontend, false, phase).await {
                             outstanding.fetch_sub(1, Ordering::Relaxed);
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
@@ -1048,13 +1063,15 @@ fn note_job(
     Ok(())
 }
 
-/// Search the newest job and send one submit.
+/// Search the newest job and send one submit, recorded under `phase`: the
+/// phase that offered it, not whatever phase the run is in when it is sent.
 async fn offer(
     connection: &mut Connection,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     frontend: &Arc<AtomicUsize>,
     scheduled_block: bool,
+    phase: String,
 ) -> Result<()> {
     let job = connection
         .jobs
@@ -1115,7 +1132,7 @@ async fn offer(
             ntime_hex,
             nonce_hex,
             frontend: frontend.load(Ordering::Relaxed),
-            phase: shared.phase(),
+            phase,
         },
     );
     if let Err(error) = write_line(&mut connection.writer, &request).await {
