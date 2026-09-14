@@ -162,7 +162,6 @@ qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::leased_c
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::the_rebuild_and_landing_never_wait_for_the_order_lock
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::window_read_failures_retry_with_an_alert_and_never_abandon
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
-qbit-prism-server::qbit_prism_server::tools::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace
 qbit-prism-server::readiness_rpc::cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
 qbit-prism-server::readiness_rpc::coordinator_reports_wrap_exhaustion_truthfully
