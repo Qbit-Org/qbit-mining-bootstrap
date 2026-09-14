@@ -12,10 +12,11 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    directory runs. There is no allowlist. The check is lexical:
    it reads direct ``python``/``python3``/``python3.N`` invocations, bare or
    by path (``/usr/bin/python3``), with their CPython option forms, quoted
-   interpreter names and targets (plain, ANSI-C ``$'…'`` or locale ``$"…"``
-   quotes), shell word concatenation of the interpreter and of the target
-   (``"python"3``, ``'pyth'on3``, ``"lab.prism."deleted``) and ``./``
-   prefixes, and does not follow ``cd``, ``PYTHONPATH`` or other environment
+   interpreter names, option words and targets (plain, ANSI-C ``$'…'`` or
+   locale ``$"…"`` quotes), shell word concatenation of the interpreter, of
+   an option word and of the target (``"python"3``, ``'pyth'on3``, ``"-"O``,
+   ``"-m"lab.prism.deleted``, ``"lab.prism."deleted``) and ``./`` prefixes,
+   and does not follow ``cd``, ``PYTHONPATH`` or other environment
    indirection, aliases, shell variables, or backslash escapes.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
@@ -62,17 +63,6 @@ RATCHET = {
 QUOTED_HISTORY_SUFFIXES = frozenset({".patch", ".diff"})
 
 
-def quoted(target: str, group: str = "quote") -> str:
-    """``target`` bare or in matching single or double quotes, which the shell strips.
-
-    A mismatched quote is a shell syntax error: the line runs nothing and
-    matches nothing. ``group`` names the capture that holds the quote, so a
-    pattern that uses this more than once can give each use its own name,
-    since ``re`` rejects a group name used twice.
-    """
-    return rf"(?P<{group}>['\"]?){target}\b(?P={group})"
-
-
 PATH_REFERENCE = re.compile(r"lab/prism(?:/[A-Za-z0-9_][A-Za-z0-9_.\-]*)*")
 MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
@@ -80,13 +70,9 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # target: clustered flag letters, `-W`/`-X` with an attached or following
 # argument, and `--check-hash-based-pycs <mode>` (CPython rejects the `=`
 # spelling). `-c cmd` runs its argument and ends the option list, so it is
-# deliberately not a prefix option. The interpreter name is read as a whole
-# shell word, see `PYTHON_COMMAND` below. An option argument may be quoted
-# the same way as a target, attached or following:
-# CPython 3.14 runs `-X 'dev'`, `-X"dev mode"`, `-W'error'` and
-# `--check-hash-based-pycs "always"` exactly as their bare spellings, since
-# the shell strips the quotes first. A bare argument therefore holds no quote
-# character at all: `-X 'dev"` is an unterminated shell string, not an option.
+# deliberately not a prefix option. The interpreter, every option word and
+# the target are each read as a whole shell word and unquoted before the
+# grammar sees them, see ``command_target`` and the option patterns below.
 # The flag letters are every single-letter option `python3 --help` lists on
 # CPython 3.14 other than `-c`, `-m`, `-h` with its alias `-?`, and `-V`.
 # `-h` and `-?` print the help text and `-V` the version, and CPython then
@@ -118,8 +104,8 @@ PYTHON_FLAG = r"[bBdEiIOPqRsSuvx]"
 # quote that opens no string: inside `sh -c "python3 -m lab.a.b"` the closing
 # `"` belongs to the enclosing string, and the inner command is read as
 # before. The quotes the shell strips, with their `$` prefix, are removed by
-# ``unquote`` before a word is read as a target. The backslash escapes
-# `$'…'` decodes are not: bash runs `python3 -m $'json\x2etool'` as
+# ``unquote`` before a word is read as an option or a target. The backslash
+# escapes `$'…'` decodes are not: bash runs `python3 -m $'json\x2etool'` as
 # `json.tool`, but this check follows no backslash escape (module docstring),
 # so an escape inside `$'…'` stays in the unquoted word, matches no target and
 # is not reported.
@@ -146,60 +132,91 @@ SHELL_WORD = shell_word(QUOTED_STRING)
 # quote of the `sh -c` string and hiding the `python3` inside it.
 INTERPRETER_STRING = r"\$?'[^'\s]*'|\$?\"[^\"\s]*\""
 INTERPRETER_WORD = shell_word(INTERPRETER_STRING)
-PYTHON_OPTION = (
-    rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
-    rf"|-{PYTHON_FLAG}*[WX](?:{SHELL_WORD}|\s+{SHELL_WORD})"  # -Xdev, -X 'dev', -uWerror
-    r"|--check-hash-based-pycs\s+" + quoted(r"(?:always|default|never)", group="pycs_quote")
-)
-# `-m` may close a flag cluster and take its module attached: CPython 3.12 runs
-# `-mlab.x`, `-Im lab.x`, `-OOm lab.x` and `-Imlab.x` alike, while `-Wm lab.x`
-# hands `m` to `-W` and treats `lab.x` as a script path.
-MODULE_OPTION = rf"-{PYTHON_FLAG}*m\s*"
+# The words after the interpreter are read one shell word at a time by
+# ``command_target``, each stripped of its matching quotes by ``unquote``
+# before the grammar below sees it, so an option word is as runnable quoted,
+# in pieces or ANSI-C quoted as bare: bash 3.2 and CPython 3.14 ran `python3
+# "-O" -m json.tool`, `python3 '-OO' -m json.tool`, `python3 $'-OO' -m
+# json.tool`, `python3 "-"O -m json.tool`, `python3 '-m' json.tool`,
+# `python3 "-m"json.tool`, `python3 -"m" json.tool`, `python3 "-X" dev -m
+# json.tool`, `python3 '-X'dev -m json.tool`, `python3 "-X"'dev' -m
+# json.tool`, `python3 "-W" error -m json.tool`, `python3 '-uW'error -m
+# json.tool` and `python3 "--check-hash-based-pycs" always -m json.tool`
+# exactly as their bare spellings, and `python3 '--' lab/gone.py` ran the
+# script, since the shell strips the quotes before CPython sees one
+# argument. A word with an unterminated or mismatched quote (`"-O'`, `-X
+# "dev'`) is no shell word: bash rejects the line with "unexpected EOF while
+# looking for matching `"'" before Python starts, so the command ends there
+# with no target, as it does at such a target word. The grammar, applied to
+# the unquoted word in this order:
+# - a flag cluster (`-O`, `-OO`, `-bb`, `-IsE`) is skipped;
+# - a `-W`/`-X` cluster takes its argument attached (`-Xdev`, `-uWerror`,
+#   `-X=dev`, which CPython 3.14 takes as an unknown `-X` value and runs on)
+#   or, with nothing attached, as the next word whatever it is (`-X dev`,
+#   `-X "dev mode"`; `python3 -X -m lab.x` hands `-m` to `-X` and then opens
+#   `lab.x` as a script). It is tried before the `-m` cluster, so `-Wm lab.x`
+#   and `-Xm lab.x` hand `m` to `-W`/`-X` and open `lab.x` as a script, which
+#   names no lab script, as CPython does;
+# - `--check-hash-based-pycs` takes the next word, which unquoted must be one
+#   of its three modes: CPython 3.14 rejects `--check-hash-based-pycs
+#   sometimes -m lab.x` ("must be one of 'default', 'always', or 'never'")
+#   before it runs anything, so that is no command;
+# - `-m` may close a flag cluster and takes its module attached or as the
+#   next word: CPython 3.12 runs `-mlab.x`, `-Im lab.x`, `-OOm lab.x` and
+#   `-Imlab.x` alike (`-Rm` on 3.14);
+# - `--` ends the options and the next word is the script path: `python3 --
+#   s.py` and `python3 -O -- s.py` run the script on CPython 3.14, while
+#   `python3 -- -m json.tool` fails with "can't open file '.../-m'", so its
+#   script target is `-m`, which names no lab script;
+# - any other word is the script path. `-c…`, `-h…`, `-?`, `-V…` and a
+#   `--long` option therefore end the command as its target word, which
+#   names no lab script, and what follows is left to the prose contract.
+FLAG_CLUSTER = re.compile(rf"-{PYTHON_FLAG}+")
+ARGUMENT_OPTION = re.compile(rf"-{PYTHON_FLAG}*[WX](?P<argument>.*)")
+MODULE_OPTION = re.compile(rf"-{PYTHON_FLAG}*m(?P<module>.*)")
+PYCS_OPTION = "--check-hash-based-pycs"
+PYCS_MODES = frozenset({"always", "default", "never"})
+OPTIONS_END = "--"
+# The next shell word after whitespace, where the tokenizer stands after the
+# interpreter or the word before; nothing at the end of the line or at a word
+# the shell would reject.
+NEXT_WORD = re.compile(rf"\s+(?P<word>{SHELL_WORD})")
 
 
 # The interpreter is read as a whole shell word (`INTERPRETER_WORD`), like
-# the target below: bash 3.2 runs `"python"3 -m json.tool`, `'pyth'on3 -m
-# json.tool`, `python"3" -m json.tool` and `"/usr/bin/pyth"on3 -m json.tool`
-# exactly as `python3`, so a name the shell assembles from pieces is as
-# runnable as a bare or a wholly quoted one. ``dead_commands`` strips the matching quotes, takes the
-# basename after the last `/` (`/usr/bin/python3` runs Python as `python3`
-# does) and accepts the word only if it is wholly `python`, `python3` or
-# `python3.N` (`INTERPRETER`): `mypython3`, `cpython3` and `python2` are
-# other programs, and bash answers `mypython3 -m json.tool` with "command not
-# found". A word starts where no unquoted word character precedes it, so
-# `env python3 …`, `docker exec "$c" python3 …`, `$(python3 …)`, inline-code
-# `` `python3 …` `` and the inner command of `sh -c "python3 …"` are read as
-# before, while `mypython3` is one word. A word may also start right after a
-# closing quote, so `"/usr/bin/"python3` and `"my"python3` are each one
-# candidate and their tail `python3` another; the command patterns are
-# therefore lookaheads that consume nothing, every word is a candidate
-# interpreter, and ``python_commands`` drops a candidate that starts inside
-# the interpreter word of the one before it. A word that opens a quote and
-# never closes it (`"python3' -m lab.a.b`) is a shell syntax error and
-# matches nothing, as before.
+# the option words and the target: bash 3.2 runs `"python"3 -m json.tool`,
+# `'pyth'on3 -m json.tool`, `python"3" -m json.tool` and `"/usr/bin/pyth"on3
+# -m json.tool` exactly as `python3`, so a name the shell assembles from
+# pieces is as runnable as a bare or a wholly quoted one. ``runs_python``
+# strips the matching quotes, takes the basename after the last `/`
+# (`/usr/bin/python3` runs Python as `python3` does) and accepts the word
+# only if it is wholly `python`, `python3` or `python3.N` (`INTERPRETER`):
+# `mypython3`, `cpython3` and `python2` are other programs, and bash answers
+# `mypython3 -m json.tool` with "command not found". A word starts where no
+# unquoted word character precedes it, so `env python3 …`, `docker exec "$c"
+# python3 …`, `$(python3 …)`, inline-code `` `python3 …` `` and the inner
+# command of `sh -c "python3 …"` are read as before, while `mypython3` is
+# one word. A word may also start right after a closing quote, so
+# `"/usr/bin/"python3` and `"my"python3` are each one candidate and their
+# tail `python3` another; the candidate pattern is therefore a lookahead
+# that consumes nothing, every word is a candidate interpreter, and
+# ``python_commands`` drops a candidate that starts inside the interpreter
+# word of the one before it. A word that opens a quote and never closes it
+# (`"python3' -m lab.a.b`) is a shell syntax error and matches nothing, as
+# before. ``command_target`` reads the words after a candidate that names
+# Python, and the reported command is the line from the interpreter word to
+# the target word.
 INTERPRETER = re.compile(r"python(?:3(?:\.\d+)?)?")
-PYTHON_COMMAND = (
-    rf"(?<![^{WORD_BREAK}'\"])(?P<interpreter>{INTERPRETER_WORD})"
-    rf"(?:\s+(?:{PYTHON_OPTION}))*"
-)
+INTERPRETER_CANDIDATE = re.compile(rf"(?=(?<![^{WORD_BREAK}'\"])(?P<interpreter>{INTERPRETER_WORD}))")
 # The `-m` target and the script path are read as whole shell words, since
 # bash hands `-m "lab.prism."deleted`, `-m lab."prism".deleted` and
 # `"./lab/prism/"deleted.py` over exactly as their bare spellings (verified
-# with `python3 -m "json."tool` on bash 3.2 and CPython 3.14). ``dead_commands``
-# strips the matching quotes and any `./` prefixes, which CPython resolves on
-# a script path, and only then reads the word against the target grammar: a
-# word that then names no `lab` module or script (`$VAR`, `json.tool`,
-# `lab.prism.` with nothing after the dot) is not a `lab` command.
-# The `--` terminator may precede a script path (`python3 -OO -- lab/a/b.py`
-# runs it on CPython 3.14) but never `-m`: after `--` CPython takes `-m` as a
-# script name and fails to open a file called `-m`, so `python3 -- -m lab.a.b`
-# runs nothing and is deliberately not a module command.
-MODULE_COMMAND = re.compile(
-    rf"(?=(?P<command>{PYTHON_COMMAND}\s+{MODULE_OPTION}(?P<word>{SHELL_WORD})))"
-)
-SCRIPT_COMMAND = re.compile(
-    rf"(?=(?P<command>{PYTHON_COMMAND}\s+(?:--\s+)?(?P<word>{SHELL_WORD})))"
-)
+# with `python3 -m "json."tool` on bash 3.2 and CPython 3.14).
+# ``command_target`` strips the matching quotes and ``dead_commands`` any
+# `./` prefixes, which CPython resolves on a script path, and only then reads
+# the word against the target grammar: a word that then names no `lab`
+# module or script (`$VAR`, `json.tool`, `lab.prism.` with nothing after the
+# dot) is not a `lab` command.
 MODULE_TARGET = re.compile(r"lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 SCRIPT_TARGET = re.compile(r"lab/[A-Za-z0-9_./\-]+\.py")
 DOT_SEGMENTS = re.compile(r"^(?:\./)+")
@@ -267,8 +284,8 @@ def runs_python(word: str) -> bool:
     return INTERPRETER.fullmatch(unquote(word).rsplit("/", 1)[-1]) is not None
 
 
-def python_commands(pattern: re.Pattern[str], line: str):
-    """Each match of ``pattern`` on ``line`` whose interpreter word names CPython.
+def python_commands(line: str):
+    """Each ``INTERPRETER_CANDIDATE`` match on ``line`` whose interpreter word names CPython.
 
     The pattern is a lookahead, so every word start is a candidate. One that
     starts inside the interpreter word of the candidate before it is the tail
@@ -277,12 +294,60 @@ def python_commands(pattern: re.Pattern[str], line: str):
     or not the whole word named Python.
     """
     end = 0
-    for match in pattern.finditer(line):
+    for match in INTERPRETER_CANDIDATE.finditer(line):
         if match.start() < end:
             continue
         end = match.end("interpreter")
         if runs_python(match.group("interpreter")):
             yield match
+
+
+def shell_words(line: str, position: int):
+    """Each ``NEXT_WORD`` match on ``line`` from ``position``, until no word follows.
+
+    The words end at the end of the line and at a word with an unterminated or
+    mismatched quote, which bash rejects before anything runs.
+    """
+    while (match := NEXT_WORD.match(line, position)) is not None:
+        yield match
+        position = match.end()
+
+
+def command_target(line: str, position: int) -> tuple[str, str, int] | None:
+    """``(kind, target, end)`` of the command whose interpreter word ends at ``position``.
+
+    Reads the words after the interpreter against the option grammar (see
+    ``FLAG_CLUSTER``) until one names the target: ``kind`` is ``"module"``
+    after ``-m`` and ``"script"`` otherwise, ``target`` is the word as the
+    shell hands it to CPython (matching quotes stripped, or the remainder of
+    an attached ``-m``), and ``end`` is where the target word ends on the
+    line. ``None`` when the words run out, at a word the shell rejects, or at
+    a ``--check-hash-based-pycs`` mode CPython rejects: nothing runs.
+    """
+    words = shell_words(line, position)
+    for match in words:
+        word = unquote(match.group("word"))
+        if FLAG_CLUSTER.fullmatch(word):
+            continue
+        if (option := ARGUMENT_OPTION.fullmatch(word)) is not None:
+            if not option.group("argument") and next(words, None) is None:
+                return None
+            continue
+        if word == PYCS_OPTION:
+            mode = next(words, None)
+            if mode is None or unquote(mode.group("word")) not in PYCS_MODES:
+                return None
+            continue
+        if (option := MODULE_OPTION.fullmatch(word)) is not None:
+            if option.group("module"):
+                return "module", option.group("module"), match.end()
+            target = next(words, None)
+            return None if target is None else ("module", unquote(target.group("word")), target.end())
+        if word == OPTIONS_END:
+            target = next(words, None)
+            return None if target is None else ("script", unquote(target.group("word")), target.end())
+        return "script", word, match.end()
+    return None
 
 
 def shell_lines(text: str) -> list[tuple[int, str]]:
@@ -300,23 +365,29 @@ def shell_lines(text: str) -> list[tuple[int, str]]:
 def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, str]]:
     """``(first line, command, missing path)`` for each runnable command with no target.
 
-    A dead ``-m`` command reports both paths that would make it runnable, joined
+    The command is the line from the interpreter word to the target word. A
+    dead ``-m`` command reports both paths that would make it runnable, joined
     by ``or``, so the reader is not sent to create ``lab/a/b.py`` beside a
     tracked ``lab/a/b/`` package that merely lacks ``__main__.py``.
     """
     found = []
     for number, line in shell_lines(text):
-        for match in python_commands(MODULE_COMMAND, line):
-            module = unquote(match.group("word"))
-            if not MODULE_TARGET.fullmatch(module):
+        for match in python_commands(line):
+            target = command_target(line, match.end("interpreter"))
+            if target is None:
                 continue
-            candidates = runnable_candidates(module)
-            if not any(candidate in tracked for candidate in candidates):
-                found.append((number, match.group("command"), " or ".join(candidates)))
-        for match in python_commands(SCRIPT_COMMAND, line):
-            script = DOT_SEGMENTS.sub("", unquote(match.group("word")))
-            if SCRIPT_TARGET.fullmatch(script) and script not in tracked:
-                found.append((number, match.group("command"), script))
+            kind, word, end = target
+            command = line[match.start("interpreter"):end]
+            if kind == "module":
+                if not MODULE_TARGET.fullmatch(word):
+                    continue
+                candidates = runnable_candidates(word)
+                if not any(candidate in tracked for candidate in candidates):
+                    found.append((number, command, " or ".join(candidates)))
+            else:
+                script = DOT_SEGMENTS.sub("", word)
+                if SCRIPT_TARGET.fullmatch(script) and script not in tracked:
+                    found.append((number, command, script))
     return found
 
 
@@ -1070,6 +1141,125 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.commands(f"python3 {option} lab.prism.x"), [])
                 self.assertEqual(self.commands(f"python3 {option}lab.prism.x"), [])
                 self.assertEqual(self.references(f"python3 {option} lab.prism.x"), ["lab.prism.x"])
+
+    # Each ran `json.tool` on bash 3.2 and CPython 3.14 exactly as its bare
+    # spelling: `python3 "-O" -m json.tool`, `python3 '-OO' -m json.tool`,
+    # `python3 $'-OO' -m json.tool`, `python3 "-"O -m json.tool`, `python3
+    # "-X" dev -m json.tool`, `python3 '-X'dev -m json.tool`, `python3
+    # "-X"'dev' -m json.tool`, `python3 "-W" error -m json.tool`, `python3
+    # '-uW'error -m json.tool` and `python3 "--check-hash-based-pycs" always
+    # -m json.tool`. The shell strips the quotes of an option word, attached
+    # or not, before CPython sees it, so a quoted option is as runnable as a
+    # bare one and, ahead of a missing target, as dead.
+    QUOTED_OPTION_WORDS = (
+        '"-O"',
+        "'-OO'",
+        "$'-OO'",
+        '"-"O',
+        '"-X" dev',
+        "'-X'dev",
+        "\"-X\"'dev'",
+        '"-W" error',
+        "'-uW'error",
+        '"--check-hash-based-pycs" always',
+    )
+    # `python3 '-m' json.tool`, `python3 "-m" json.tool`, `python3
+    # "-m"json.tool` and `python3 -"m" json.tool` each ran `json.tool` the
+    # same way, and `python3 '--' lab/gone.py` ran the script.
+    QUOTED_MODULE_OPTIONS = ("'-m' {}", '"-m" {}', '"-m"{}', '-"m" {}')
+
+    def test_quoted_option_words_with_missing_targets_are_caught(self) -> None:
+        for options in self.QUOTED_OPTION_WORDS:
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"python3 {options} -m lab.prism.process_telemetry rss-bound"),
+                    [self.TELEMETRY],
+                )
+                self.assertEqual(
+                    self.commands(f"python {options} lab/prism/storm.py --decide"),
+                    ["lab/prism/storm.py"],
+                )
+        for option in self.QUOTED_MODULE_OPTIONS:
+            with self.subTest(option=option):
+                module = option.format("lab.prism.process_telemetry")
+                self.assertEqual(self.commands(f"python3 {module} rss-bound"), [self.TELEMETRY])
+                self.assertEqual(self.commands(f"python3.12 -OO {module}"), [self.TELEMETRY])
+        self.assertEqual(self.commands("python3 '--' lab/prism/storm.py --decide"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("python3 \"-OO\" '--' './lab/prism/storm.py'"), ["lab/prism/storm.py"])
+        # The reported command runs from the interpreter word to the target
+        # word, quotes and all, so the reader finds it in the document.
+        self.assertEqual(
+            dead_commands('python3 "-O" -m lab.prism.process_telemetry rss-bound', self.TRACKED),
+            [(1, 'python3 "-O" -m lab.prism.process_telemetry', self.TELEMETRY)],
+        )
+        self.assertEqual(
+            dead_commands('python3 "-m"lab.prism.process_telemetry', self.TRACKED),
+            [(1, 'python3 "-m"lab.prism.process_telemetry', self.TELEMETRY)],
+        )
+
+    def test_quoted_option_words_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
+        for options in self.QUOTED_OPTION_WORDS:
+            with self.subTest(options=options):
+                text = (
+                    f"python3 {options} -m lab.prism.tool\npython3.12 {options} -m lab.pkg\n"
+                    f"python {options} lab/prism/tool.py"
+                )
+                self.assertEqual(dead_commands(text, tracked), [])
+        for option in self.QUOTED_MODULE_OPTIONS:
+            with self.subTest(option=option):
+                text = f"python3 {option.format('lab.prism.tool')}\npython3.12 {option.format('lab.pkg')}"
+                self.assertEqual(dead_commands(text, tracked), [])
+        text = "python3 '--' lab/prism/tool.py\npython3 \"-O\" \"--\" ./lab/prism/tool.py"
+        self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_quoted_option_words_are_caught_at_the_right_line(self) -> None:
+        text = "```bash\ncd repo\npython3 \\\n  \"-O\" \\\n  '-m' lab.prism.process_telemetry \\\n  rss-bound\n```"
+        self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
+        text = "python3.12 \"-X\" \\\n  dev \\\n  '--' \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    # Verified on CPython 3.14 with a `lab/gone.py` that raises
+    # `SystemExit("RAN")`: none of these printed RAN. `'-h' -m lab.gone` and
+    # `"-hm" lab.gone` print the help text and `"-V" lab/gone.py` the
+    # version, and exit 0; `"-Wm" lab.gone` and `"-Xm" lab.gone` hand `m` to
+    # `-W`/`-X` and fail to open a script called `lab.gone`;
+    # `"--check-hash-based-pycs" sometimes -m lab.gone` is rejected ("must be
+    # one of 'default', 'always', or 'never'") before anything runs; `'--' -m
+    # lab.gone` fails to open a file called `-m`; and `"-c" 'import lab.gone'`
+    # runs its argument as inline code exactly as bare `-c` does, which the
+    # command contract leaves alone. Quoting an option the guard leaves out
+    # therefore changes nothing, and the prose contract still sees the
+    # reference.
+    def test_quoted_non_command_options_are_not_a_command(self) -> None:
+        for text, reference in (
+            ("python3 \"-c\" 'import lab.prism.x'", "lab.prism.x"),
+            ("python3 '-h' -m lab.prism.x", "lab.prism.x"),
+            ('python3 "-V" lab/prism/x.py', "lab/prism/x.py"),
+            ('python3 "-hm" lab.prism.x', "lab.prism.x"),
+            ('python3 "-Wm" lab.prism.x', "lab.prism.x"),
+            ('python3 "-Xm" lab.prism.x', "lab.prism.x"),
+            ('python3 "--check-hash-based-pycs" sometimes -m lab.prism.x', "lab.prism.x"),
+            ("python3 '--' -m lab.prism.x", "lab.prism.x"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), [reference])
+
+    def test_mismatched_option_word_quotes_are_not_a_command(self) -> None:
+        # bash rejects `python3 "-O' -m lab.gone` and `python3 -X "dev' -m
+        # lab.gone` with "unexpected EOF while looking for matching `"'"
+        # before Python starts, so the line runs nothing; the prose contract
+        # still sees the reference.
+        for text, reference in (
+            ("python3 \"-O' -m lab.prism.x", "lab.prism.x"),
+            ("python3 -X \"dev' -m lab.prism.x", "lab.prism.x"),
+            ("python3 '-OO\" lab/prism/x.py", "lab/prism/x.py"),
+            ("python3 \"-m' lab.prism.x", "lab.prism.x"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), [reference])
 
 
 if __name__ == "__main__":
