@@ -35,9 +35,9 @@
 //! up as a late acknowledgement counted in
 //! `qbit_prism_late_confirmed_shares_total`, or at worst as
 //! `ledger-outcome-unknown`, and an "every share was accepted" check would
-//! pass with the stall still present. Once this base carries `e13051cf`,
-//! incident 2 must also assert that counter is zero and that no ACK is
-//! `ledger-outcome-unknown` (see the `TODO(#324 rebase)` below).
+//! pass with the stall still present. This base carries `e13051cf`, so
+//! incident 2 asserts that counter is zero on both frontends and that no ACK,
+//! the solve included, is `ledger-outcome-unknown`.
 //!
 //! # Settings
 //!
@@ -270,6 +270,8 @@ fn frontend_config(database_url: &str, node: &FakeNode, instance_id: &str) -> Re
         snapshot_interval: Duration::from_secs(3600),
         health_timeout: Duration::from_secs(3600),
         share_commit_timeout: SHARE_COMMIT_TIMEOUT,
+        share_commit_grace: Duration::from_secs(5),
+        block_only_ack_timeout: Duration::from_secs(60),
         extranonce2_size: EXTRANONCE2_SIZE,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),
@@ -796,10 +798,48 @@ async fn incident_2_body(
             }
         }
     }
-    // TODO(#324 rebase): once the base carries e13051cf, also assert that
-    // `qbit_prism_late_confirmed_shares_total` is zero on both frontends'
-    // metrics and that no ACK in either phase, the solve included, is
-    // `ledger-outcome-unknown`.
+    // #324's commit gate means a slow solve is never refused at the share
+    // deadline any more. It is answered late instead, counted in
+    // `qbit_prism_late_confirmed_shares_total`, or answered
+    // `ledger-outcome-unknown`. Either would satisfy the acceptance checks
+    // above while the serialization stall this test exists to catch was still
+    // present, so neither is allowed to pass quietly.
+    for (frontend, coordinator) in [(1, &one.coordinator), (2, &two.coordinator)] {
+        let late = coordinator
+            .metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix("qbit_prism_late_confirmed_shares_total "))
+            .map_or(0.0, |value| value.trim().parse::<f64>().unwrap_or(-1.0));
+        ensure!(
+            late == 0.0,
+            "frontend {frontend}: qbit_prism_late_confirmed_shares_total is {late}, so a share \
+             was confirmed only after its deadline had passed"
+        );
+    }
+    for (label, acks) in [
+        ("phase A, frontend 1", &phase_a[0]),
+        ("phase A, frontend 2", &phase_a[1]),
+        ("phase B, frontend 1", &phase_b[0]),
+        ("phase B, frontend 2", &phase_b[1]),
+    ] {
+        for ack in acks {
+            if let Err(error) = &ack.outcome {
+                ensure!(
+                    !error.starts_with("ledger-outcome-unknown"),
+                    "{label}: a share was answered {error} after {:.2} ms",
+                    ms(ack.latency())
+                );
+            }
+        }
+    }
+    if let Err(error) = &solve.outcome {
+        ensure!(
+            !error.starts_with("ledger-outcome-unknown"),
+            "the block-solving share was answered {error} after {:.2} ms",
+            ms(solve.latency())
+        );
+    }
     let during = |acks: &[Ack]| {
         Latency::of(
             acks.iter()
