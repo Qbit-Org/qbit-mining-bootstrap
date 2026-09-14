@@ -324,8 +324,8 @@ impl Ledger {
     /// and inserts the prepared bytes.
     pub async fn enqueue_candidate_once(&self, candidate: Candidate) -> Result<bool> {
         let prepared = prepare_candidate(&candidate)?;
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",
@@ -440,7 +440,7 @@ impl Ledger {
             "invalid candidate lease duration"
         );
         let token = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         // Empty polling does not use a scheduling slot. A racing SKIP LOCKED
         // selection can still leave a gap; this weighting is deliberately an
@@ -511,7 +511,7 @@ impl Ledger {
             (1..=600).contains(&lease_seconds),
             "invalid candidate lease duration"
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         // Evaluate expiry after obtaining the row lock: a blocked UPDATE can
         // otherwise have matched a live token before waiting past its expiry.
@@ -527,7 +527,7 @@ impl Ledger {
     }
 
     pub async fn retry_candidate(&self, claim: &CandidateClaim, error: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
         let result = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")

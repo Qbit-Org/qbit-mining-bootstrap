@@ -27,7 +27,7 @@ pub use candidates::{
     Candidate, CandidateClaim, CandidateCtv, ClaimParts, LandedAudit, SignerKeys,
 };
 mod connect;
-use connect::{lock, require_revision, writable};
+use connect::{require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
@@ -56,6 +56,10 @@ pub struct Ledger {
     pub pool: PgPool,
     pub instance_id: String,
     session_owner: std::sync::Arc<connect::SessionOwner>,
+    /// Native wait telemetry, when the process has a registry to record into.
+    /// Without a handle nothing is recorded and behaviour is identical, so
+    /// tools and tests keep using [`Ledger::connect`].
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
     /// back through [`Ledger::config_fingerprint`]. Shared across clones, so
     /// every handle to one frontend's ledger sees the same pinned value: the

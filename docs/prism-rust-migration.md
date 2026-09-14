@@ -280,8 +280,9 @@ and `qbit_prism_runtime_task_stalled`. Refresh impact uses
 count retain their names. Guard body-based rules with #277's
 `qbit_prism_metrics_snapshot_available` / `qbit_prism_metrics_snapshot_stale`
 and database/RSS rules with `qbit_prism_collector_available` so unknown -1 is
-never healthy zero. First-offer and advisory-lock histograms are declared with
-rules deferred to A/#266 and #283. D3's dedicated standby alerts require the
+never healthy zero. The first-offer histogram is declared without samples
+(A/#266); advisory-lock waits are recorded since #328; rules for both remain
+deferred. D3's dedicated standby alerts require the
 primary's deployment-provided PostgreSQL exporter, not public read replica data.
 Dashboard totals continue to derive from the shared database. The native
 `self-check` emits structured JSON and fails nonzero on an error instead of

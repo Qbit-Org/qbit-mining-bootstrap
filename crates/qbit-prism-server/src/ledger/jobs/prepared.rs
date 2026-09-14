@@ -168,8 +168,8 @@ impl Ledger {
             .context("prepared expiry out of range")?;
         let owned = record.clone();
         let payload = tokio::task::spawn_blocking(move || encode_record(&owned)).await??;
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_current_revision).await?;
         // Match the candidate writer's fence: configure/reset uses FOR UPDATE,
