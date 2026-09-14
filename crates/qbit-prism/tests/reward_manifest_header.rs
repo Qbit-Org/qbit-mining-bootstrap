@@ -150,6 +150,11 @@ fn restored_manifest_is_byte_identical_to_the_original() {
         );
 
         // Negative: one field of one rebuilt share moves the canonical sha256.
+        // The mutation lands on `reassembled`, whose window is the restored
+        // one, so this is about the window a read serves: the canonical
+        // digest a read checks last is sensitive to each of these fields of
+        // a rebuilt share. It is not a test of the rebuild itself; that is
+        // the equality with the original above.
         for (field, mutate) in [
             (
                 "counted_difficulty",
@@ -162,7 +167,7 @@ fn restored_manifest_is_byte_identical_to_the_original() {
                 share.credit_policy = Some("stale-grace".to_string());
             }),
         ] {
-            let mut tampered = original.clone();
+            let mut tampered = reassembled.clone();
             let index = tampered.reward_manifest.shares.len() / 2;
             mutate(&mut tampered.reward_manifest.shares[index]);
             let tampered_bytes = canonical_audit_bundle_bytes(&tampered).unwrap();

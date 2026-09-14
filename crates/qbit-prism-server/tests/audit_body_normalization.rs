@@ -4,8 +4,9 @@
 //! and minus `reward_manifest.shares`. The counted window is rebuilt on read
 //! from the immutable share ledger and proven byte-identical by the canonical
 //! digest. These tests cover the stored shape, the read path for both native
-//! shapes (normalized and pre-#267), and imported rows, which never enter the
-//! native reconstruction. An `#[ignore]` harness measures the stored body and
+//! shapes (normalized and pre-#267), imported rows, which never enter the
+//! native reconstruction, and the paged durable-range proof that runs before
+//! the settlement lock. An `#[ignore]` harness measures the stored body and
 //! the settlement-lock hold at a configurable window size.
 //!
 //! ```text
@@ -28,7 +29,9 @@ use qbit_prism::{
     build_audit_bundle, canonical_audit_bundle_bytes, verify_audit_bundle_with_ledger_public_key,
     AcceptedShare, AuditBundle, FoundBlock, PayoutPolicy,
 };
-use qbit_prism_server::ledger::{audit_canonical_bytes, Candidate, CandidateClaim, Ledger};
+use qbit_prism_server::ledger::{
+    audit_canonical_bytes, Candidate, CandidateClaim, Ledger, Snapshot,
+};
 use qbit_prism_test_gate as gate;
 use serde::Deserialize;
 use serde_json::Value;
@@ -185,7 +188,11 @@ impl Landed {
 }
 
 /// Append one share, snapshot, build a signed candidate, enqueue, claim and
-/// land it through the production path.
+/// land it through the production path. Then append a second share, so the
+/// ledger has moved past the block's anchored range before anything reads
+/// the row back: a read that rebuilt the window from present-day ledger
+/// state instead of the snapshot range would otherwise be indistinguishable
+/// from the correct one.
 async fn land_small_block(ledger: &Ledger, nonce: u32) -> Result<Landed> {
     ledger.append(share(1), None).await?;
     let snapshot = ledger.snapshot(100).await?;
@@ -212,6 +219,7 @@ async fn land_small_block(ledger: &Ledger, nonce: u32) -> Result<Landed> {
         .await?
         .context("no pending candidate to claim")?;
     ledger.land_candidate(&claim, &ledger_public_key()).await?;
+    ledger.append(share(2), None).await?;
     Ok(Landed {
         claim,
         canonical,
@@ -481,6 +489,197 @@ async fn imported_rows_serve_canonical_bytes_and_never_enter_native_reconstructi
         .execute(&ledger.pool)
         .await?;
     assert_serves(&ledger, &landed, "imported row with a poisoned inline body").await?;
+    db.close(vec![ledger]).await
+}
+
+// ---------------------------------------------------------------------------
+// The durable-range proof
+// ---------------------------------------------------------------------------
+
+/// Shares in the proof's window: two full pages of `VERIFY_PAGE_ROWS` (4096,
+/// `ledger/audit.rs`) and a partial third, so the page arithmetic runs at a
+/// full boundary and at the final short page. The smallest divisor of the
+/// fixture's window weight above two pages.
+const PROOF_WINDOW_SHARES: u64 = 10_000;
+/// `VERIFY_PAGE_ROWS`, the page the proof reads; the crate does not export it.
+const PROOF_PAGE_ROWS: usize = 4096;
+const _: () = assert!(PROOF_WINDOW_SHARES as usize > 2 * PROOF_PAGE_ROWS);
+/// What the proof fails a landing with. Asserted by name: a landing refused
+/// for any other reason, such as the audit signature check that runs first,
+/// is not the proof at work.
+const DIFFERS_FROM_HISTORY: &str = "audit share snapshot differs from canonical database history";
+
+/// A signed candidate over `window` for `snapshot`'s anchor, balances and
+/// revision. The bundle is built and signed over exactly this window, so it
+/// is internally consistent whatever the window holds: the audit signature
+/// check accepts it, and only the ledger can disagree with it.
+fn signed_candidate(
+    window: Vec<AcceptedShare>,
+    snapshot: &Snapshot,
+    plan: &WindowPlan,
+    nonce: u32,
+) -> Result<Candidate> {
+    let (coinbase_key, ledger_key) = keys();
+    let bundle = build_audit_bundle(
+        window,
+        FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 5_000_000_000,
+            network_difficulty: plan.window_network_difficulty(),
+            anchor_job_issued_at_ms: snapshot.anchor_ms,
+        },
+        snapshot.prior_balances.clone(),
+        PayoutPolicy::day_one_default(),
+        &coinbase_key,
+        &ledger_key,
+    )?;
+    candidate_with_bundle(bundle, snapshot.payout_revision, nonce)
+}
+
+/// Enqueue `candidate` and claim it back through the outbox.
+async fn claim_enqueued(ledger: &Ledger, candidate: Candidate) -> Result<CandidateClaim> {
+    let hash = candidate.block_hash.clone();
+    ledger.enqueue_candidate(candidate).await?;
+    let claim = ledger
+        .claim_candidate(60)
+        .await?
+        .context("no pending candidate to claim")?;
+    ensure!(
+        claim.candidate.block_hash == hash,
+        "claimed another candidate than the one just enqueued"
+    );
+    Ok(claim)
+}
+
+/// Whether a landing wrote the block or its audit row.
+async fn wrote_block_or_audit_row(pool: &PgPool, hash: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1) \
+         OR EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
+    )
+    .bind(hash)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The durable-range proof (`verify_durable_range` in `ledger/audit.rs`)
+/// runs before the settlement lock and compares the ledger's anchored range
+/// with the candidate window one page at a time. Its only input from the
+/// candidate is the window, and the share ledger is immutable by trigger, so
+/// every disagreement here is built on the claim side: each window is signed
+/// over as it is, the audit signature check that precedes the proof accepts
+/// it, and the proof is what refuses it, by name. The window is three pages:
+///
+/// - one field of the first share of the second page differs, so the second
+///   page is compared at the right positions, not only the first page;
+/// - one field of the last share of the final partial page differs, so the
+///   short page is compared too;
+/// - the window has a gap in the final page, so the durable page outruns the
+///   window slice and the bounded slice refuses it;
+/// - the window reaches past its anchor with a share the ledger accepted
+///   after it, so every page matches, the loop runs out of durable rows, and
+///   the final count refuses it.
+///
+/// A refused landing writes nothing. The unaltered window then lands and
+/// serves identical bytes, so the same fixture proves the loop accepts a
+/// correct multi-page window and the refusals are not trivially green.
+#[tokio::test]
+async fn durable_range_proof_refuses_a_window_that_differs_from_ledger_history_on_any_page(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("durable-range").await?;
+    let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
+    plan.load(&ledger.pool, "durable-range").await?;
+    let snapshot = ledger.snapshot(plan.window_network_difficulty()).await?;
+    ensure!(
+        snapshot.shares.len() == usize::try_from(PROOF_WINDOW_SHARES)?,
+        "snapshot window is {} shares, expected exactly {PROOF_WINDOW_SHARES}",
+        snapshot.shares.len()
+    );
+    let window = &snapshot.shares;
+    // The ledger accepts one more share after the anchor. `append` stamps it
+    // past the anchor and returns it as stored, so a window that claims it
+    // disagrees with the ledger about nothing but the anchor.
+    let beyond = ledger
+        .append(plan.share(PROOF_WINDOW_SHARES + 1), None)
+        .await?
+        .share;
+    ensure!(
+        beyond.share_seq == PROOF_WINDOW_SHARES + 1 && beyond.accepted_at_ms > snapshot.anchor_ms,
+        "the share appended after the snapshot is not past its anchor: {beyond:?}"
+    );
+
+    // `ntime` is not part of the counted share, so an altered `ntime` leaves
+    // the reward manifest, the signatures and the coinbase unchanged: the
+    // full equality over every field is the only thing that can notice it.
+    let altered = |index: usize| {
+        let mut window = window.clone();
+        window[index].ntime += 1;
+        window
+    };
+    let cases = [
+        (
+            "one field of the first share of the second page",
+            altered(PROOF_PAGE_ROWS),
+        ),
+        (
+            "one field of the last share of the final page",
+            altered(window.len() - 1),
+        ),
+        ("a gap in the final page", {
+            let mut window = window.clone();
+            window.remove(2 * PROOF_PAGE_ROWS + 1);
+            window
+        }),
+        ("a share accepted after the anchor", {
+            let mut window = window.clone();
+            window.push(beyond);
+            window
+        }),
+    ];
+    for (nonce, (what, window)) in (2674u32..).zip(cases) {
+        let candidate = signed_candidate(window, &snapshot, &plan, nonce)?;
+        let claim = claim_enqueued(&ledger, candidate).await?;
+        let error = ledger
+            .land_candidate(&claim, &ledger_public_key())
+            .await
+            .err()
+            .with_context(|| {
+                format!("{what}: the landing accepted a window the ledger does not hold")
+            })?;
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains(DIFFERS_FROM_HISTORY),
+            "{what}: refused for another reason than the durable-range proof: {text}"
+        );
+        ensure!(
+            !wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?,
+            "{what}: a refused landing wrote the block or its audit row"
+        );
+        ledger.finish_candidate(&claim, false, Some(what)).await?;
+    }
+
+    // Control: the same three pages, unaltered, land and serve.
+    let candidate = signed_candidate(window.clone(), &snapshot, &plan, 2680)?;
+    let canonical = canonical_audit_bundle_bytes(&candidate.bundle)?;
+    let claim = claim_enqueued(&ledger, candidate).await?;
+    ledger
+        .land_candidate(&claim, &ledger_public_key())
+        .await
+        .context("the unaltered multi-page window was refused")?;
+    let hash = &claim.candidate.block_hash;
+    let row = stored_row(&ledger.pool, hash).await?;
+    ensure!(
+        row.native && !row.top_shares && !row.manifest_shares,
+        "landed row is not a normalized native row: {row:?}"
+    );
+    let served = audit_canonical_bytes(&ledger.pool, hash).await?;
+    ensure!(
+        served.as_deref() == Some(canonical.as_slice()),
+        "served canonical bytes differ from the landed candidate's"
+    );
     db.close(vec![ledger]).await
 }
 

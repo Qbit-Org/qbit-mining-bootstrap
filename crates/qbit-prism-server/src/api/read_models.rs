@@ -173,9 +173,13 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         // digest is recomputed, both proportional to the window. That work
         // runs after the read connections are released, so it shares the
         // read concurrency through the same limit as an imported decode. The
-        // permit moves into the blocking job: a dropped request cannot free
-        // it before the rebuild ends. Waiting for it spends the request's
-        // own deadline.
+        // permit is taken here, before `materialize_audit_row`, so it also
+        // spans that call's snapshot lookup and window read, the two database
+        // round trips that precede the blocking job: the limit bounds a
+        // native row's database work as well as its CPU work. The permit
+        // moves into the blocking job: a dropped request cannot free it
+        // before the rebuild ends. Waiting for it spends the request's own
+        // deadline.
         let permit = state
             .audit_decodes
             .clone()
