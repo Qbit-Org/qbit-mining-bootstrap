@@ -4,14 +4,80 @@
 //! Production appends retain the transaction-scoped payout revision check.
 use super::*;
 use futures_util::future::BoxFuture;
+use std::sync::{atomic::AtomicU8, OnceLock};
+
+const OPEN: u8 = 0;
+const COMMITTING: u8 = 1;
+const CLOSED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GateState {
+    Open,
+    Committing,
+    Closed,
+}
+
+/// One-shot arbiter between an append's COMMIT and its acknowledgement
+/// deadline. Both transitions leave `Open` by compare-and-swap, so exactly one
+/// of them wins: an append sends COMMIT only after `begin_commit` succeeds,
+/// and once `close` succeeds it never will.
+#[derive(Default)]
+pub(super) struct CommitGate {
+    state: AtomicU8,
+    committing_since: OnceLock<Instant>,
+}
+
+impl CommitGate {
+    /// The append's pre-commit hook. `true` lets COMMIT be sent, and records
+    /// when it started.
+    pub(super) fn begin_commit(&self) -> bool {
+        let now = Instant::now();
+        let won = self
+            .state
+            .compare_exchange(OPEN, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            let _ = self.committing_since.set(now);
+        }
+        won
+    }
+
+    /// The acknowledgement deadline. `true` means COMMIT was not sent and never
+    /// will be; `false` means the gate was already `Committing`.
+    pub(super) fn close(&self) -> bool {
+        match self
+            .state
+            .compare_exchange(OPEN, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current == CLOSED,
+        }
+    }
+
+    pub(super) fn state(&self) -> GateState {
+        match self.state.load(Ordering::Acquire) {
+            OPEN => GateState::Open,
+            COMMITTING => GateState::Committing,
+            _ => GateState::Closed,
+        }
+    }
+
+    /// When COMMIT started, once the gate is `Committing`.
+    pub(super) fn committing_since(&self) -> Option<Instant> {
+        self.committing_since.get().copied()
+    }
+}
 
 pub(super) trait SubmitLedger: Send + Sync {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    /// Append at `revision`, sending COMMIT only if `gate.begin_commit()`
+    /// succeeds immediately before it.
     fn append_at_revision(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<bool>>;
 }
 
@@ -25,11 +91,15 @@ impl SubmitLedger for Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
-            Ok(Ledger::append_at_revision(self, share, candidate, revision)
-                .await?
-                .inserted)
+            let pre_commit = || gate.begin_commit();
+            Ok(
+                Ledger::append_at_revision_gated(self, share, candidate, revision, &pre_commit)
+                    .await?
+                    .inserted,
+            )
         })
     }
 }

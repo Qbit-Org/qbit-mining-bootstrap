@@ -5,12 +5,14 @@ use super::*;
 use axum::{extract::State, routing::post, Json, Router};
 use futures_util::future::BoxFuture;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64},
+    atomic::{AtomicBool, AtomicI64, AtomicUsize},
     Mutex as StdMutex,
 };
+use submit_ledger::CommitGate;
 
 mod admission_races;
 mod blockwait;
+mod commit_reconcile;
 mod config;
 mod credit;
 mod interleavings;
@@ -43,6 +45,79 @@ pub(crate) struct MemoryLedger {
     pub tip: StdMutex<Option<String>>,
     pub save_gate: StdMutex<Option<Arc<Gate>>>,
     pub fail_save: AtomicBool,
+    /// Holds an append after its gate reached `Committing` and before its
+    /// record is visible: COMMIT in flight.
+    pub commit_gate: StdMutex<Option<Arc<Gate>>>,
+    /// Fails the next COMMIT with an indeterminate error.
+    pub fail_commit: StdMutex<Option<FailCommit>>,
+    /// Appends dropped before they returned, as an aborted task is.
+    pub cancelled: AtomicUsize,
+}
+
+/// An indeterminate COMMIT failure: the reply was lost, before or after the
+/// commit became durable.
+#[derive(Clone, Copy)]
+pub(crate) enum FailCommit {
+    NotRecorded,
+    Recorded,
+}
+
+/// Counts a future dropped before it disarms the probe.
+struct CancelProbe<'a>(&'a AtomicUsize, bool);
+
+impl Drop for CancelProbe<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl MemoryLedger {
+    async fn append_gated(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        revision: i64,
+        commit: &CommitGate,
+    ) -> Result<bool> {
+        let gate = self.append_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        // Model the production atomic append fence, not share decisions.
+        ensure!(
+            revision == self.revision.load(Ordering::SeqCst),
+            "payout revision changed"
+        );
+        // Model the production pre-commit hook: every statement has run.
+        if !commit.begin_commit() {
+            return Err(crate::ledger::CommitGateClosed.into());
+        }
+        let gate = self.commit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let failure = self.fail_commit.lock().unwrap().take();
+        let lost = || sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into());
+        if matches!(failure, Some(FailCommit::NotRecorded)) {
+            return Err(lost().into());
+        }
+        let mut records = self.records.lock().unwrap();
+        if records
+            .iter()
+            .any(|(old, _, _)| old.share_id == share.share_id)
+        {
+            return Ok(false);
+        }
+        records.push((share, candidate, revision));
+        if matches!(failure, Some(FailCommit::Recorded)) {
+            return Err(lost().into());
+        }
+        Ok(true)
+    }
 }
 
 impl submit_ledger::SubmitLedger for MemoryLedger {
@@ -63,28 +138,54 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
-            let gate = self.append_gate.lock().unwrap().take();
-            if let Some(gate) = gate {
-                gate.entered.notify_one();
-                gate.release.notified().await;
-            }
-            // Model the production atomic append fence, not share decisions.
-            ensure!(
-                revision == self.revision.load(Ordering::SeqCst),
-                "payout revision changed"
-            );
-            let mut records = self.records.lock().unwrap();
-            if records
-                .iter()
-                .any(|(old, _, _)| old.share_id == share.share_id)
-            {
-                return Ok(false);
-            }
-            records.push((share, candidate, revision));
-            Ok(true)
+            let mut probe = CancelProbe(&self.cancelled, false);
+            let result = self.append_gated(share, candidate, revision, &gate).await;
+            probe.1 = true;
+            result
         })
+    }
+}
+
+/// A `tracing` sink tests can read back, to see the phase and share ID that
+/// an unknown answer logs for the operator.
+#[derive(Clone, Default)]
+pub(crate) struct SharedLog(Arc<StdMutex<Vec<u8>>>);
+
+impl SharedLog {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    pub fn dispatch(&self) -> tracing::Dispatch {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        )
+    }
+}
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }
 
@@ -156,6 +257,16 @@ impl Drop for Fixture {
 
 impl Fixture {
     pub async fn new(max_age: Duration) -> Self {
+        Self::build(max_age, |_| {}, None).await
+    }
+
+    /// A fixture whose configuration `tune` adjusts, with the ledger sessions'
+    /// effective `statement_timeout`.
+    pub async fn build(
+        max_age: Duration,
+        tune: impl FnOnce(&mut Config),
+        statement_timeout: Option<Duration>,
+    ) -> Self {
         let node = Arc::new(StdMutex::new(Node {
             tip: hash(1),
             parents: [(hash(1), hash(0)), (hash(2), hash(1)), (hash(3), hash(2))].into(),
@@ -172,6 +283,7 @@ impl Fixture {
         let store = Arc::new(MemoryLedger::default());
         let mut config = config::test_config();
         config.submit_tip_max_age = max_age;
+        tune(&mut config);
         let ledger = Arc::new(Ledger::offline_for_tests(
             sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
@@ -202,6 +314,7 @@ impl Fixture {
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
+            statement_timeout,
         });
         let fixture = Self {
             coordinator,

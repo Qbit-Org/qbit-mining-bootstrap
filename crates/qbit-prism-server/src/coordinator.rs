@@ -100,6 +100,10 @@ pub struct Coordinator {
     refresh_lock: Mutex<()>,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
+    /// The ledger sessions' effective `statement_timeout`, `None` when
+    /// disabled. A COMMIT that ran this long may be a cancelled synchronous
+    /// replication wait that committed only locally.
+    statement_timeout: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -327,6 +331,18 @@ impl Coordinator {
         ledger
             .configure(&config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?)
             .await?;
+        // Read through the ledger pool, so this is the value its sessions run
+        // with. PostgreSQL reports it in milliseconds; zero disables it.
+        let statement_timeout: i64 = sqlx::query_scalar(
+            "SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'",
+        )
+        .fetch_one(&ledger.pool)
+        .await
+        .context("reading the ledger sessions' statement_timeout")?;
+        let statement_timeout = u64::try_from(statement_timeout)
+            .ok()
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis);
         let (refresh, _) = watch::channel(0);
         Ok(Arc::new(Self {
             metrics,
@@ -348,6 +364,7 @@ impl Coordinator {
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
+            statement_timeout,
         }))
     }
 
@@ -1738,6 +1755,9 @@ pub(crate) mod miner_tests;
 
 #[cfg(test)]
 mod d2_below_target_tests;
+
+#[cfg(test)]
+mod commit_reconcile_tests;
 
 #[cfg(test)]
 mod d2_bootstrap_tests;

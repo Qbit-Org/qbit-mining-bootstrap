@@ -23,6 +23,8 @@ pub(super) fn test_config() -> Config {
         snapshot_interval: Duration::from_secs(60),
         health_timeout: Duration::from_secs(15),
         share_commit_timeout: Duration::from_secs(15),
+        share_commit_grace: Duration::from_secs(5),
+        block_only_ack_timeout: Duration::from_secs(60),
         extranonce2_size: 8,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),

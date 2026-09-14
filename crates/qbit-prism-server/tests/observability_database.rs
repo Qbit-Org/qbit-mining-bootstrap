@@ -84,6 +84,10 @@ async fn check(ledger: &Ledger) -> Result<()> {
             .as_deref(),
         Some("55P03")
     );
+    // Query failure follows a successful acquisition, and must not turn its
+    // observation into a failure or include the half-second query lock wait.
+    assert_eq!(pool_sample(&metrics, "success", "count"), 3.);
+    assert_eq!(pool_sample(&metrics, "failure", "count"), 0.);
     metrics.publish_database(None);
     let failed = metrics.render();
     assert_eq!(sample(&failed, "qbit_prism_block_candidates_pending"), -1.);
@@ -127,10 +131,35 @@ async fn check(ledger: &Ledger) -> Result<()> {
     for _ in 0..4 {
         held.push(ledger.pool.acquire().await?);
     }
+    let successful_acquires = pool_sample(&metrics, "success", "count");
+    let successful_wait = pool_sample(&metrics, "success", "sum");
+    assert_eq!(successful_acquires, 4.);
+    assert_eq!(pool_sample(&metrics, "failure", "count"), 0.);
     let attempt = metrics.begin_collection(qbit_prism_server::metrics::Collector::Database);
     let started = Instant::now();
-    assert!(collectors::database(&ledger.pool, &metrics).await.is_err());
-    assert!(started.elapsed() < Duration::from_secs(4));
+    let error = collectors::database(&ledger.pool, &metrics)
+        .await
+        .err()
+        .context("collector should exhaust its acquisition deadline")?;
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(3));
+    assert!(elapsed < Duration::from_secs(4));
+    assert_eq!(
+        error.to_string(),
+        "metrics database collection deadline exceeded"
+    );
+    assert!(error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some());
+    assert_eq!(pool_sample(&metrics, "failure", "count"), 1.);
+    let failed_wait = pool_sample(&metrics, "failure", "sum");
+    assert!(failed_wait >= 3.);
+    assert!(failed_wait <= elapsed.as_secs_f64());
+    assert_eq!(
+        pool_sample(&metrics, "success", "count"),
+        successful_acquires
+    );
+    assert_eq!(pool_sample(&metrics, "success", "sum"), successful_wait);
     attempt.publish_database(None);
     assert_eq!(
         sample(&metrics.render(), "qbit_prism_block_candidates_pending"),
@@ -150,13 +179,43 @@ async fn check(ledger: &Ledger) -> Result<()> {
     )
     .await??;
     assert_eq!(recovered.candidates, 0);
-    assert!(
-        sample(
-            &metrics.render(),
-            "qbit_prism_database_pool_acquire_seconds_count{result=\"success\"}"
-        ) >= 1.
+    assert_eq!(
+        pool_sample(&metrics, "success", "count"),
+        successful_acquires + 1.
+    );
+    assert!(pool_sample(&metrics, "success", "sum") >= successful_wait);
+    assert_eq!(pool_sample(&metrics, "failure", "count"), 1.);
+    assert_eq!(pool_sample(&metrics, "failure", "sum"), failed_wait);
+
+    // A completed SQLx acquisition error is preserved and also recorded once.
+    let closed_pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")?;
+    closed_pool.close().await;
+    let started = Instant::now();
+    let error = collectors::database(&closed_pool, &metrics)
+        .await
+        .err()
+        .context("collector should preserve a closed pool error")?;
+    assert!(matches!(
+        error.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::PoolClosed)
+    ));
+    assert_eq!(pool_sample(&metrics, "failure", "count"), 2.);
+    let completed_failure_wait = pool_sample(&metrics, "failure", "sum") - failed_wait;
+    assert!(completed_failure_wait >= 0.);
+    assert!(completed_failure_wait <= started.elapsed().as_secs_f64());
+    assert_eq!(
+        pool_sample(&metrics, "success", "count"),
+        successful_acquires + 1.
     );
     Ok(())
+}
+
+fn pool_sample(metrics: &Metrics, outcome: &str, suffix: &str) -> f64 {
+    sample(
+        &metrics.render(),
+        &format!("qbit_prism_database_pool_acquire_seconds_{suffix}{{result=\"{outcome}\"}}"),
+    )
 }
 
 fn sample(body: &str, key: &str) -> f64 {

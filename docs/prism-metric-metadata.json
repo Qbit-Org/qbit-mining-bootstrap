@@ -88,7 +88,7 @@
       "labels": {
         "result": "Outcome"
       },
-      "status": "Collector acquisitions only; ledger hot paths remain unwired."
+      "status": "Collector acquisition attempts, including cancellations as failure with elapsed pool wait (excluding subsequent transaction work). Ledger hot paths remain unwired."
     },
     "database_advisory_lock_wait_seconds": {
       "labels": {

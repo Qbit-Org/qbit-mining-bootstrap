@@ -56,6 +56,7 @@ impl Metrics {
             Family::Duplicate,
             Family::LowDifficulty,
             Family::Grace,
+            Family::LateConfirmed,
         ] {
             registry.register(family, vec![], 0.);
         }

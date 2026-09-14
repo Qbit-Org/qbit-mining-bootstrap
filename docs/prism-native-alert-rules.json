@@ -190,7 +190,7 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismRejectRatioByReasonHigh",
-      "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
+      "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
       "basis": "Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
@@ -207,7 +207,7 @@
       "uid": "qbit-prism-share-append-failures",
       "title": "PrismShareAppendFailures",
       "role": "run",
-      "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\",reason_id=\"ledger-confirmation-failed\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -218,10 +218,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismShareAppendFailures",
-      "description": "At least one share was rejected because its durable ledger confirmation failed in the five-minute window. This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
+      "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Any ledger-confirmation-failed rejection preserves the deployed low-volume total-write-failure coverage; measure alert volume in #291.",
+      "basis": "Any ledger rejection whose confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown) preserves the deployed low-volume total-write-failure coverage; measure alert volume in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L56",
         "crates/qbit-prism-server/src/metrics/registry.rs#L78",
@@ -521,10 +521,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismDatabasePoolWaitHigh",
-      "description": "Only actual collector PgPool::acquire waits are timed. Cancellation is covered by collector availability; no advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "description": "Collector PgPool::acquire attempts record one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait and exclude subsequent transaction work; collector availability remains a separate alert guard. No advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "basis": "Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L68",
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",
