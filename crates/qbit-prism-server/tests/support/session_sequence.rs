@@ -1,5 +1,5 @@
 use super::*;
-use qbit_prism_server::ledger::SessionAllocationExhausted;
+use qbit_prism_server::ledger::{HeartbeatStatus, SessionAllocationExhausted};
 
 async fn wrap(pool: &PgPool) -> Result<()> {
     sqlx::query("SELECT setval('qbit_prism_session_sequence',4294967295,true)")
@@ -30,17 +30,33 @@ async fn stopped_guard_blocks_cleanup_and_owner_filter_preserves_other_reservati
         .fetch_one(&other.pool).await?;
     sqlx::query("INSERT INTO qbit_prism_session_reservations(extranonce1,instance_id,owner_token,reservation_token) VALUES(100,'other-owner',$1,'other')")
         .bind(other_token).execute(&other.pool).await?;
-    let stopped = ledger.heartbeat(json!({"state":"stopped"})).await;
+    let stopped = ledger.heartbeat(HeartbeatStatus::Stopped).await;
     assert!(
         stopped.is_err(),
         "stopped must fail while a guard is active"
+    );
+    let mixed_health = HeartbeatStatus::Health(serde_json::from_value(json!({
+        "schema":"qbit.prism.audit-health.v1", "ready":false, "state":"stopped"
+    }))?);
+    assert!(
+        ledger.heartbeat(mixed_health).await.is_err(),
+        "health payloads must not publish a reclaimable stopped marker with active sessions"
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT status->>'state' FROM qbit_prism_instances WHERE instance_id='shutdown-guard'",
+    )
+    .fetch_one(&ledger.pool)
+    .await?;
+    assert_eq!(
+        state, "starting",
+        "failed shutdown must not change the stored marker"
     );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
         .fetch_one(&ledger.pool)
         .await?;
     assert_eq!(count, 3, "failed shutdown retains all reservations");
     held.release().await?;
-    ledger.heartbeat(json!({"state":"stopped"})).await?;
+    ledger.heartbeat(HeartbeatStatus::Stopped).await?;
     ledger.release_session_owner_reservations().await?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
         .fetch_one(&ledger.pool)
@@ -172,7 +188,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, vec![2, 3, 4, 5, 8, 9]);
+    assert_eq!(versions, vec![2, 3, 4, 5, 8, 9, 10]);
     let cycled: bool = sqlx::query_scalar(
         "SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass",
     )
@@ -279,13 +295,13 @@ async fn only_stopped_owners_are_reclaimed_and_old_cleanup_cannot_release_a_repl
     skipped.release().await?;
     let (owner_token, old_token): (String, String) = sqlx::query_as("SELECT owner_token,reservation_token FROM qbit_prism_session_reservations WHERE extranonce1=1")
         .fetch_one(&a.pool).await?;
-    assert!(a.heartbeat(json!({"state":"stopped"})).await.is_err());
+    assert!(a.heartbeat(HeartbeatStatus::Stopped).await.is_err());
     held.release().await?;
     // Recreate a missed cleanup after the actual guard has ended. A stopped
     // heartbeat must never be published while that live guard still exists.
     sqlx::query("INSERT INTO qbit_prism_session_reservations(extranonce1,instance_id,owner_token,reservation_token) VALUES(1,'a',$1,$2)")
         .bind(owner_token).bind(&old_token).execute(&a.pool).await?;
-    a.heartbeat(json!({"state":"stopped"})).await?;
+    a.heartbeat(HeartbeatStatus::Stopped).await?;
     seed_job(&a.pool, "stopped-live-job", "00000001", true).await?;
     wrap(&a.pool).await?;
     let skipped = b.new_session_id().await?;
@@ -333,18 +349,15 @@ async fn stopped_requires_no_pending_or_live_sessions_and_cannot_reclaim_another
     let other_incarnation = db.ledger("reused-instance-id").await?;
     let allocator = db.ledger("allocator").await?;
     assert!(
-        a.heartbeat(json!({"state":"stopped"})).await.is_err(),
+        a.heartbeat(HeartbeatStatus::Stopped).await.is_err(),
         "a live session prevents stopped"
     );
     assert!(
-        a.clone()
-            .heartbeat(json!({"state":"stopped"}))
-            .await
-            .is_err(),
+        a.clone().heartbeat(HeartbeatStatus::Stopped).await.is_err(),
         "Ledger clones share admission state"
     );
     other_incarnation
-        .heartbeat(json!({"state":"stopped"}))
+        .heartbeat(HeartbeatStatus::Stopped)
         .await?;
     wrap(&a.pool).await?;
     let next = allocator.new_session_id().await?;
@@ -365,12 +378,12 @@ async fn stopped_requires_no_pending_or_live_sessions_and_cannot_reclaim_another
             .is_err()
     );
     assert!(
-        a.heartbeat(json!({"state":"stopped"})).await.is_err(),
+        a.heartbeat(HeartbeatStatus::Stopped).await.is_err(),
         "an allocation awaiting a connection also prevents stopped"
     );
     drop(pending);
     drop(connections);
-    a.heartbeat(json!({"state":"stopped"})).await?;
+    a.heartbeat(HeartbeatStatus::Stopped).await?;
     let error = a.new_session_id().await.unwrap_err();
     assert!(
         error.to_string().contains("allocator is stopped"),

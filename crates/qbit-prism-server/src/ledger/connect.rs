@@ -15,7 +15,7 @@ struct SessionOwnerState {
 
 #[derive(Debug)]
 pub(super) struct SessionOwner {
-    token: String,
+    pub(super) token: String,
     state: std::sync::Mutex<SessionOwnerState>,
 }
 
@@ -37,7 +37,7 @@ impl SessionOwner {
         Ok(ActiveSession(self.clone()))
     }
 
-    fn stop(&self) -> Result<()> {
+    pub(super) fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         ensure!(
             state.active == 0,
@@ -164,6 +164,31 @@ impl Ledger {
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
     ) -> Result<Self> {
+        Self::connect_inner(url, instance_id, max_connections, initialize, metrics, true).await
+    }
+
+    /// Operator tools must be usable during a halt without registering a
+    /// frontend. Ordinary ledger mutations still enforce the write guard.
+    pub async fn connect_operator(url: &str, initialize: bool) -> Result<Self> {
+        Self::connect_inner(
+            url,
+            "fatal-state-operator".into(),
+            2,
+            initialize,
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        url: &str,
+        instance_id: String,
+        max_connections: u32,
+        initialize: bool,
+        metrics: Option<std::sync::Arc<Metrics>>,
+        register: bool,
+    ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
             let millis = std::env::var(name)
@@ -288,6 +313,16 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
+            if !versions.contains(&10) {
+                sqlx::raw_sql(include_str!(
+                    "../../migrations/010_fatal_state_recovery.sql"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(10)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
             tx.commit().await?;
         }
         let ledger = Self {
@@ -299,12 +334,12 @@ impl Ledger {
             }),
             metrics,
         };
-        let mut tx = ledger.begin().await?;
-        writable(&mut tx).await?;
-        tx.commit().await?;
-        ledger
-            .heartbeat(serde_json::json!({"state":"starting"}))
-            .await?;
+        if register {
+            let mut tx = ledger.begin().await?;
+            writable(&mut tx).await?;
+            tx.commit().await?;
+            ledger.heartbeat(HeartbeatStatus::Starting).await?;
+        }
         Ok(ledger)
     }
 
@@ -330,25 +365,6 @@ impl Ledger {
                 .await?;
         }
         tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn heartbeat(&self, mut status: Value) -> Result<()> {
-        // The stopped marker is proof about this process incarnation only.
-        // Closing admission and checking pending/active guards happen under
-        // one local mutex, before awaiting SQL; no new session can race it.
-        if status.get("state").and_then(Value::as_str) == Some("stopped") {
-            self.session_owner.stop()?;
-        }
-        status
-            .as_object_mut()
-            .context("heartbeat status must be an object")?
-            .insert(
-                "session_owner_token".into(),
-                self.session_owner.token.clone().into(),
-            );
-        sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status")
-            .bind(&self.instance_id).bind(status).execute(&self.pool).await?;
         Ok(())
     }
 

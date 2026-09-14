@@ -2,7 +2,7 @@
 use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     api::{router, ApiConfig, ApiState},
-    ledger::Ledger,
+    ledger::{HeartbeatHealth, HeartbeatStatus, Ledger},
     metrics::{collectors, Metrics},
 };
 use qbit_prism_test_gate as gate;
@@ -75,7 +75,10 @@ async fn check_live_pool_scrapes(ledger: &Ledger, metrics: Arc<Metrics>) -> Resu
         let _ = publisher_ledger.payout_revision().await;
         publisher_state.publish_metrics(publisher_metrics.render())?;
         let _ = publisher_ledger
-            .heartbeat(serde_json::json!({"ok": false}))
+            .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+                false,
+                serde_json::Map::from_iter([("ok".into(), false.into())]),
+            )))
             .await;
         let _ = publisher_ledger.prune_expired_jobs().await;
         anyhow::Ok(())
