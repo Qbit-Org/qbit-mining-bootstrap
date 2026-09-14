@@ -100,18 +100,74 @@ pub async fn observe_replication(pool: &PgPool, label: &str) -> Result<Replicati
     })
 }
 
-/// Detect what replication is actually configured, for external databases.
-/// Never assumed from a flag.
-pub async fn detect_replication(pool: &PgPool) -> Result<Replication> {
-    let observation = observe_replication(pool, "detect").await?;
-    if observation.rows.is_empty() {
-        return Ok(Replication::None);
+/// What `detect_replication` saw: a mode, or the reason it could not tell.
+///
+/// The unreadable case used to come back as `none`, a definite value for
+/// something the harness had not read. It is its own state, with the
+/// reason, and the run treats it as a contradicted premise: a run that
+/// cannot tell whether its standby exists has not established the
+/// conditions it claims (EP-OBSERVABILITY).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ObservedReplication {
+    Observed { mode: Replication },
+    Unknown { reason: String },
+}
+
+impl ObservedReplication {
+    /// The mode's name, or `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Observed { mode } => mode.as_str(),
+            Self::Unknown { .. } => "unknown",
+        }
     }
-    Ok(if observation.rows.iter().any(|r| r.sync_state == "sync") {
-        Replication::Sync
-    } else {
-        Replication::Async
-    })
+
+    /// Why the mode could not be observed, when it could not.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Observed { .. } => None,
+            Self::Unknown { reason } => Some(reason),
+        }
+    }
+}
+
+/// Detect what replication is actually configured. Never assumed from a
+/// flag, and never guessed: a `pg_stat_replication` that cannot be read, or
+/// whose rows hide `sync_state` from this role, is `Unknown` with the
+/// reason rather than `none` in one direction or `async` in the other.
+pub async fn detect_replication(pool: &PgPool) -> ObservedReplication {
+    let states: std::result::Result<Vec<Option<String>>, sqlx::Error> =
+        sqlx::query_scalar("SELECT sync_state FROM pg_stat_replication")
+            .fetch_all(pool)
+            .await;
+    match states {
+        Err(error) => ObservedReplication::Unknown {
+            reason: format!("pg_stat_replication could not be read: {error}"),
+        },
+        Ok(states) if states.is_empty() => ObservedReplication::Observed {
+            mode: Replication::None,
+        },
+        // PostgreSQL shows a role without pg_read_all_stats the rows but not
+        // their state columns: a standby exists, and whether it is
+        // synchronous cannot be told.
+        Ok(states) if states.iter().any(Option::is_none) => ObservedReplication::Unknown {
+            reason: format!(
+                "{} pg_stat_replication row(s) are visible but their sync_state is null, \
+                 which PostgreSQL shows a role without pg_read_all_stats: a standby exists \
+                 and whether it is synchronous cannot be told",
+                states.len()
+            ),
+        },
+        Ok(states) if states.iter().any(|state| state.as_deref() == Some("sync")) => {
+            ObservedReplication::Observed {
+                mode: Replication::Sync,
+            }
+        }
+        Ok(_) => ObservedReplication::Observed {
+            mode: Replication::Async,
+        },
+    }
 }
 
 struct Cluster {

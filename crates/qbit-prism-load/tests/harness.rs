@@ -1227,6 +1227,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
     use qbit_prism_load::run::{
         difficulty_premise_contradiction, premise_block, withhold_decision, RunOutcome,
     };
+    let replication = agreed_replication();
 
     // The observation: a session reports the disagreement with the values
     // on both sides, and still connects and holds work.
@@ -1290,11 +1291,11 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         reason.contains(&format!("{}", configured / 2.0)),
         "{reason}"
     );
-    let block = premise_block(Some(&reason), &[mismatch]);
+    let block = premise_block(Some(&reason), &[mismatch], &replication);
     assert_eq!(block["contradicted"], json!(true));
     assert_eq!(block["share_difficulty_agreed"], json!(false));
     assert_eq!(block["difficulty_mismatches"][0]["session"], json!(0));
-    let agreed = premise_block(None, &[]);
+    let agreed = premise_block(None, &[], &replication);
     assert_eq!(agreed["contradicted"], json!(false));
     assert!(agreed["error"].is_null());
 
@@ -1341,6 +1342,169 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
     assert!(printed.contains("session 0"), "{printed}");
     assert!(stale_artifact_removed);
     assert!(!path.exists());
+    Ok(())
+}
+
+/// A replication premise that agrees with itself, for tests about the other
+/// premise.
+fn agreed_replication() -> run::ReplicationPremise {
+    use qbit_prism_load::cluster::{ObservedReplication, Replication};
+    run::ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: ObservedReplication::Observed {
+            mode: Replication::Async,
+        },
+        after_load: None,
+    }
+}
+
+/// The run recorded the declared replication mode and the observed one and
+/// did nothing when they disagreed: a run that declared an asynchronous
+/// standby and observed none validated an artifact for conditions it never
+/// established. Worse, `detect_replication` swallowed a read error into
+/// `none`, a definite value for something it had not read. A disagreement
+/// is now a contradicted premise -- artifact withheld, exit 8, through the
+/// same block as the difficulty check -- and the unreadable case is its own
+/// state, `unknown` with the reason, contradicted the same way rather than
+/// guessed in either direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replication_mode_other_than_the_declared_one_refuses_qualification() -> Result<()> {
+    use qbit_prism_load::artifact::Withhold;
+    use qbit_prism_load::cluster::{detect_replication, ObservedReplication, Replication};
+    use qbit_prism_load::run::{
+        premise_block, premise_contradiction, withhold_decision, ReplicationPremise, RunOutcome,
+    };
+    use std::time::Duration;
+
+    // The unreadable case: a pool that cannot serve the query. It is closed
+    // before it ever connects, so the failure is immediate and touches no
+    // socket; this used to come back as `none`.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy("postgresql://nobody@127.0.0.1:1/nothing")?;
+    pool.close().await;
+    let unreadable = detect_replication(&pool).await;
+    let ObservedReplication::Unknown {
+        reason: unreadable_reason,
+    } = &unreadable
+    else {
+        panic!("an unreadable pg_stat_replication is unknown, not a mode: {unreadable:?}");
+    };
+    assert!(
+        unreadable_reason.contains("pg_stat_replication could not be read"),
+        "the reason names what could not be read: {unreadable_reason}"
+    );
+    assert_eq!(unreadable.as_str(), "unknown");
+    assert_eq!(unreadable.reason(), Some(unreadable_reason.as_str()));
+
+    // Agreement is nothing.
+    let agreed = agreed_replication();
+    assert_eq!(agreed.contradiction(), None);
+    assert!(agreed.agreed());
+    let sync = ReplicationPremise {
+        declared: Replication::Sync,
+        at_entry: ObservedReplication::Observed {
+            mode: Replication::Sync,
+        },
+        after_load: Some(ObservedReplication::Observed {
+            mode: Replication::Sync,
+        }),
+    };
+    assert_eq!(sync.contradiction(), None);
+
+    // A declared standby that was not observed contradicts the premise, and
+    // the reason names both modes and when.
+    let missing = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: ObservedReplication::Observed {
+            mode: Replication::None,
+        },
+        after_load: None,
+    };
+    let reason = missing
+        .contradiction()
+        .expect("a declared standby that is not there contradicts the premise");
+    assert!(reason.contains("declared replication async"), "{reason}");
+    assert!(reason.contains("observed none"), "{reason}");
+    assert!(reason.contains("at entry"), "{reason}");
+
+    // The check runs again after the load: a standby that vanished while
+    // the load ran is the same contradiction seen late.
+    let vanished = ReplicationPremise {
+        after_load: Some(ObservedReplication::Observed {
+            mode: Replication::None,
+        }),
+        ..agreed.clone()
+    };
+    let late = vanished.contradiction().expect("a standby that vanished");
+    assert!(late.contains("after the load"), "{late}");
+    assert!(!late.contains("at entry"), "{late}");
+
+    // Unknown is contradicted too, with the reason, and is not read as
+    // either mode.
+    let unknown = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: unreadable.clone(),
+        after_load: None,
+    };
+    let unknown_reason = unknown
+        .contradiction()
+        .expect("a mode that could not be observed contradicts the premise");
+    assert!(
+        unknown_reason.contains("could not observe"),
+        "{unknown_reason}"
+    );
+    assert!(
+        unknown_reason.contains(unreadable_reason.as_str()),
+        "{unknown_reason}"
+    );
+    let none_declared = ReplicationPremise {
+        declared: Replication::None,
+        ..unknown.clone()
+    };
+    assert!(
+        none_declared.contradiction().is_some(),
+        "unknown is not none: declaring none does not make an unreadable view agree"
+    );
+
+    // The premise block carries the replication facts beside the
+    // difficulty ones, and the two premises combine into one reason.
+    let block = premise_block(Some(&unknown_reason), &[], &unknown);
+    assert_eq!(block["contradicted"], json!(true));
+    assert_eq!(block["share_difficulty_agreed"], json!(true));
+    assert_eq!(block["replication_agreed"], json!(false));
+    assert_eq!(block["replication"]["declared"], json!("async"));
+    assert_eq!(block["replication"]["observed_at_entry"], json!("unknown"));
+    assert_eq!(
+        block["replication"]["observed_at_entry_reason"],
+        json!(unreadable_reason)
+    );
+    assert_eq!(block["replication"]["checked_after_load"], json!(false));
+    assert!(block["replication"]["observed_after_load"].is_null());
+    assert_eq!(block["replication"]["agreed"], json!(false));
+    let clean = premise_block(None, &[], &agreed);
+    assert_eq!(clean["replication_agreed"], json!(true));
+    assert_eq!(clean["replication"]["observed_at_entry"], json!("async"));
+    assert!(clean["replication"]["observed_at_entry_reason"].is_null());
+    assert_eq!(premise_contradiction(None, None), None);
+    assert_eq!(
+        premise_contradiction(None, Some("r".into())).as_deref(),
+        Some("r")
+    );
+    let both = premise_contradiction(Some("d".into()), Some("r".into())).expect("both");
+    assert!(both.contains('d') && both.contains('r'), "{both}");
+
+    // The withholding: the same block, the same code.
+    let withheld = withhold_decision(None, Some(&reason), None).expect("withheld");
+    assert_eq!(withheld, Withhold::PremiseContradicted(reason.clone()));
+    let outcome = RunOutcome {
+        withhold: Some(&withheld),
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     Ok(())
 }
 

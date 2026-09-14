@@ -65,10 +65,13 @@ pub struct Args {
     #[arg(long)]
     pub pg_bin_dir: Option<PathBuf>,
     /// Use an existing database instead of managing clusters. No standby is
-    /// created; the replication mode is detected.
+    /// created; the replication mode is detected and must be the one
+    /// `--replication` declares, or the run exits 8.
     #[arg(long)]
     pub database_url: Option<String>,
-    /// `async`, `sync` or `none`.
+    /// `async`, `sync` or `none`: the replication mode the run declares. A
+    /// managed cluster is built to it; an external database is checked
+    /// against it, at entry and after the load.
     #[arg(long, default_value = "async")]
     pub replication: String,
 

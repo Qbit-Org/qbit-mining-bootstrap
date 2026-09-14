@@ -89,8 +89,8 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--allow-unverified-server-revision` | off | Run a server binary that cannot be tied to this checkout's HEAD (no Cargo dep-info beside it, or a source or manifest newer than it); forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
-| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block. The libpq-style `host`, `hostaddr` and `port` parameters are honoured for the proxy's upstream and dropped from the URL the frontends receive, because SQLx applies them over the authority and they would otherwise route every frontend around the proxy; every other option is kept |
-| `--replication` | `async` | `async`, `sync` or `none` |
+| `--database-url` | none | Use an existing database; no standby is managed, and the replication mode is detected, never assumed: it must be the one `--replication` declares, at entry and again after the load, or the run exits 8. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block. The libpq-style `host`, `hostaddr` and `port` parameters are honoured for the proxy's upstream and dropped from the URL the frontends receive, because SQLx applies them over the authority and they would otherwise route every frontend around the proxy; every other option is kept |
+| `--replication` | `async` | `async`, `sync` or `none`: the replication mode the run declares. A managed cluster is built to it; an external database is checked against it |
 | `--frontends` | 1 | 1, 2 or 4 |
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
 | `--window-shares` | 20000 | Shares pre-seeded into the payout window |
@@ -368,7 +368,7 @@ target/release/qbit-prism-load \
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
-| 8 | A premise of the measurement was contradicted: a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF`. The client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names. Checked once every session holds work, before any phase, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every mismatch with its session, advertised and configured values |
+| 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
 
 ## Outputs
 
@@ -677,6 +677,19 @@ The side report repeats all of this under `honest_value_notes`.
   `premise` block says which sessions saw what, and the exit code is 8 --
   once every session holds work, before a phase runs, and again after the
   load in case the value moved mid-run.
+- **The replication mode is a premise too, and unknown is not `none`.** The
+  run declares a mode in `--replication` and observes one in
+  `pg_stat_replication`, at entry before a frontend is launched and again
+  after the load. A run that declares an asynchronous standby and observes
+  none is not measuring what it says, so a disagreement refuses
+  qualification the same way: artifact withheld, `premise.replication`
+  saying what was declared and what was observed when, exit 8. A view the
+  role cannot read, or whose rows hide `sync_state`, is observed as
+  `unknown` with the reason rather than as `none` in one direction or
+  `async` in the other, and it is a contradicted premise as well: a run
+  that cannot tell whether its standby exists has not established the
+  conditions it claims. `database.replication` in the side report carries
+  the same observations.
 
 ## Reconciliation
 

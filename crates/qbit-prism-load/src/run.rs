@@ -10,7 +10,7 @@ use crate::{
         self, Event, NotifySighting, Outcome, SessionConfig, SessionHandle, SessionShared,
         SubmitRecord, TipSighting,
     },
-    cluster::{self, ManagedPostgres, Replication},
+    cluster::{self, ManagedPostgres, ObservedReplication, Replication},
     digest,
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     measure::{self, LockSampler, ProcessSampler},
@@ -131,25 +131,118 @@ pub fn difficulty_premise_contradiction(mismatches: &[(usize, f64, f64)]) -> Opt
     ))
 }
 
-/// What the side report says beside the difficulty mismatches.
+/// The replication mode the run declared and the one it observed.
+///
+/// The declared mode is a premise of the measurement the same way the share
+/// difficulty is: a run that declares an asynchronous standby and observes
+/// none is not measuring what it says, and an artifact that validated
+/// anyway would name conditions the run did not establish. The run used to
+/// record both and do nothing when they disagreed (EP-OBSERVABILITY).
+#[derive(Clone, Debug)]
+pub struct ReplicationPremise {
+    pub declared: Replication,
+    /// What `detect_replication` saw at entry, before any frontend ran.
+    pub at_entry: ObservedReplication,
+    /// The same detection after the load stopped, once the run reached it.
+    pub after_load: Option<ObservedReplication>,
+}
+
+impl ReplicationPremise {
+    /// Why the observed replication contradicts the declared one, when it
+    /// does. An observation that could not be made contradicts it too: the
+    /// run cannot tell whether its standby exists, and does not guess.
+    pub fn contradiction(&self) -> Option<String> {
+        let checks = [
+            ("at entry", Some(&self.at_entry)),
+            ("after the load", self.after_load.as_ref()),
+        ];
+        let reasons: Vec<String> = checks
+            .into_iter()
+            .filter_map(|(when, observed)| match observed? {
+                ObservedReplication::Observed { mode } if *mode == self.declared => None,
+                ObservedReplication::Observed { mode } => Some(format!(
+                    "the run declared replication {} and observed {} {when}",
+                    self.declared.as_str(),
+                    mode.as_str()
+                )),
+                ObservedReplication::Unknown { reason } => Some(format!(
+                    "the run declared replication {} and could not observe the replication \
+                     mode {when}, so it cannot tell whether that is what it measured: {reason}",
+                    self.declared.as_str()
+                )),
+            })
+            .collect();
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        }
+    }
+
+    /// Whether every observation made agrees with the declaration.
+    pub fn agreed(&self) -> bool {
+        self.contradiction().is_none()
+    }
+
+    /// The `replication` entry of the side report's `premise` block.
+    pub fn block(&self) -> Value {
+        json!({
+            "declared": self.declared.as_str(),
+            "observed_at_entry": self.at_entry.as_str(),
+            "observed_at_entry_reason": self.at_entry.reason(),
+            "observed_after_load": self.after_load.as_ref().map(ObservedReplication::as_str),
+            "observed_after_load_reason": self.after_load.as_ref()
+                .and_then(ObservedReplication::reason),
+            "checked_after_load": self.after_load.is_some(),
+            "agreed": self.agreed(),
+        })
+    }
+}
+
+/// The one contradiction the run reports, from the premises it checks. Each
+/// check produces its own reason, and a run can fail more than one.
+pub fn premise_contradiction(
+    difficulty: Option<String>,
+    replication: Option<String>,
+) -> Option<String> {
+    let reasons: Vec<String> = [difficulty, replication].into_iter().flatten().collect();
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+/// What the side report says beside the premise checks.
 pub const PREMISE_NOTE: &str =
     "the share difficulty is a premise of the whole measurement: the window arithmetic, each \
      share's weight and the artifact's rate assume the frontends serve the configured target. \
      A frontend that advertised another value was measured at a different amount of work per \
      share, so its numbers are not evidence for the configuration the artifact would name: the \
      artifact is withheld and the run exits 8. Checked once every session holds work, before \
-     any phase, and again after the load stops.";
+     any phase, and again after the load stops. The replication mode is a premise the same \
+     way: the run declares one and observes one at entry and again after the load, and a \
+     disagreement withholds the artifact and exits 8 too. So does an observation that could \
+     not be made -- a pg_stat_replication this role cannot read -- because a run that cannot \
+     tell whether its standby exists has not established the conditions it claims, and the \
+     harness does not guess in either direction.";
 
 /// The side report's `premise` block.
-pub fn premise_block(contradiction: Option<&str>, mismatches: &[(usize, f64, f64)]) -> Value {
+pub fn premise_block(
+    contradiction: Option<&str>,
+    mismatches: &[(usize, f64, f64)],
+    replication: &ReplicationPremise,
+) -> Value {
     json!({
-        "share_difficulty_agreed": contradiction.is_none(),
+        "share_difficulty_agreed": difficulty_premise_contradiction(mismatches).is_none(),
+        "replication_agreed": replication.agreed(),
         "contradicted": contradiction.is_some(),
         "error": contradiction,
         "difficulty_mismatches": mismatches.iter()
             .map(|(session, advertised, configured)| json!({
                 "session": session, "advertised": advertised, "configured": configured}))
             .collect::<Vec<_>>(),
+        "replication": replication.block(),
         "note": PREMISE_NOTE,
     })
 }
@@ -634,7 +727,29 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .execute(&side)
             .await;
     }
-    let observed_replication = cluster::detect_replication(&side).await?;
+    // The declared replication mode is a premise, checked here before a
+    // frontend is launched: a run that declares a standby and observes
+    // none, or cannot observe at all, is refused now rather than after the
+    // load, and checked again once the load stops.
+    let entry_replication = ReplicationPremise {
+        declared: ctx.declared_replication,
+        at_entry: cluster::detect_replication(&side).await,
+        after_load: None,
+    };
+    if let Some(reason) = entry_replication.contradiction() {
+        return finish_early(
+            args,
+            &ctx,
+            Vec::new(),
+            Vec::new(),
+            &entry_replication,
+            EarlyExit::PremiseContradicted {
+                reason,
+                difficulty_mismatches: Vec::new(),
+            },
+        )
+        .await;
+    }
 
     // --- delay proxy ------------------------------------------------------
     // The upstream is `host:port` as the URL wrote it; a hostname is resolved
@@ -700,6 +815,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 &ctx,
                 frontends,
                 blocked,
+                &entry_replication,
                 EarlyExit::Blocked(error.to_string()),
             )
             .await;
@@ -710,7 +826,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         blocked.extend(scan_logs(&child.read_stderr()));
     }
     if let Some(text) = hard_block_line(&blocked) {
-        return finish_early(args, &ctx, frontends, blocked, EarlyExit::Blocked(text)).await;
+        return finish_early(
+            args,
+            &ctx,
+            frontends,
+            blocked,
+            &entry_replication,
+            EarlyExit::Blocked(text),
+        )
+        .await;
     }
 
     // --- samplers ---------------------------------------------------------
@@ -841,7 +965,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             for sampler in &process_samplers {
                 sampler.stop();
             }
-            return finish_early(args, &ctx, frontends, blocked, EarlyExit::Blocked(text)).await;
+            return finish_early(
+                args,
+                &ctx,
+                frontends,
+                blocked,
+                &entry_replication,
+                EarlyExit::Blocked(text),
+            )
+            .await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -872,6 +1004,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &ctx,
             frontends,
             blocked,
+            &entry_replication,
             EarlyExit::PremiseContradicted {
                 reason,
                 difficulty_mismatches: early_mismatches,
@@ -1124,9 +1257,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // blocked, as it would have at startup, with the whole side report
     // (EP-OBSERVABILITY).
     let late_hard_block = hard_block_line(&blocked);
-    // The premise check again, over the whole run: a set_difficulty that
-    // arrived after the startup check is the same contradiction seen late.
-    let premise_contradiction = difficulty_premise_contradiction(&collected.difficulty_mismatches);
+    // The premise checks again, over the whole run: a set_difficulty that
+    // arrived after the startup check is the same contradiction seen late,
+    // and so is a standby that vanished, appeared or became unreadable
+    // while the load ran.
+    let replication_premise = ReplicationPremise {
+        after_load: Some(cluster::detect_replication(&side).await),
+        ..entry_replication
+    };
+    let premise_contradiction = premise_contradiction(
+        difficulty_premise_contradiction(&collected.difficulty_mismatches),
+        replication_premise.contradiction(),
+    );
     let withhold = withhold_decision(
         late_hard_block.as_deref(),
         premise_contradiction.as_deref(),
@@ -1178,7 +1320,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let host = measure::host_facts();
     let replication_rows = json!({
         "declared": ctx.declared_replication.as_str(),
-        "observed": observed_replication.as_str(),
+        "observed": replication_premise.at_entry.as_str(),
+        "observed_reason": replication_premise.at_entry.reason(),
+        "observed_after_load": replication_premise.after_load.as_ref()
+            .map(ObservedReplication::as_str),
+        "observed_after_load_reason": replication_premise.after_load.as_ref()
+            .and_then(ObservedReplication::reason),
+        "agreed_with_declared": replication_premise.agreed(),
         "standby_name": cluster::STANDBY_NAME,
         "slot": cluster::STANDBY_SLOT,
         "standby_url_present": ctx.managed_standby.is_some(),
@@ -1488,6 +1636,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "premise": premise_block(
             premise_contradiction.as_deref(),
             &collected.difficulty_mismatches,
+            &replication_premise,
         ),
         "client": {
             "discarded_block_solutions": collected.discarded_block_solutions,
@@ -2794,7 +2943,8 @@ enum EarlyExit {
     /// No frontend served work, or a log showed a hard refusal.
     Blocked(String),
     /// A frontend advertised a share difficulty other than the configured
-    /// one, so nothing that would have been measured could be evidence.
+    /// one, or the observed replication mode is not the declared one, so
+    /// nothing that would have been measured could be evidence.
     PremiseContradicted {
         reason: String,
         difficulty_mismatches: Vec<(usize, f64, f64)>,
@@ -2806,13 +2956,14 @@ async fn finish_early(
     ctx: &RunContext,
     mut frontends: Vec<Frontend>,
     blocked: Vec<BlockedLog>,
+    replication: &ReplicationPremise,
     exit: EarlyExit,
 ) -> Result<i32> {
     let report_path = args.out.join("load-harness-report.json");
     let (blocked_error, premise, line, code) = match &exit {
         EarlyExit::Blocked(error) => (
             Some(error.as_str()),
-            premise_block(None, &[]),
+            premise_block(None, &[], replication),
             format!("run blocked: {error}"),
             EXIT_BLOCKED,
         ),
@@ -2821,7 +2972,7 @@ async fn finish_early(
             difficulty_mismatches,
         } => (
             None,
-            premise_block(Some(reason), difficulty_mismatches),
+            premise_block(Some(reason), difficulty_mismatches, replication),
             format!("premise contradicted, artifact withheld: {reason}"),
             EXIT_PREMISE_CONTRADICTED,
         ),
