@@ -2730,6 +2730,99 @@ async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
     Ok(())
 }
 
+/// search_path resolves the unqualified name past a schema that lost its
+/// table to a later schema's declaration. The history gate bound the history
+/// to current_schema(); the capability read binds there too, or a version-1
+/// row elsewhere would start a server on a database whose own declaration
+/// is gone.
+#[tokio::test]
+async fn native_capabilities_resolved_from_a_later_schema_are_refused() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let earlier = db.ledger("earlier").await?;
+    let later = format!("{}_later", db.schema);
+    sqlx::raw_sql(&format!("CREATE SCHEMA {later}; CREATE TABLE {later}.qbit_prism_schema_capabilities(capability text PRIMARY KEY,capability_value integer NOT NULL,updated_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO {later}.qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1); ALTER TABLE qbit_prism_schema_capabilities RENAME TO operator_real_capabilities"))
+        .execute(&pool).await?;
+    let objects = schema_objects(&pool).await?;
+    let later_objects_sql = "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace";
+    let later_objects: i64 = sqlx::query_scalar(later_objects_sql)
+        .bind(&later)
+        .fetch_one(&pool)
+        .await?;
+    let mut url = url::Url::parse(&db.url)?;
+    let base_query: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "options")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(base_query)
+        .append_pair("options", &format!("-csearch_path={},{later}", db.schema));
+    for initialize in [false, true] {
+        let error = Ledger::connect(url.as_str(), "capability-check".into(), 8, initialize)
+            .await
+            .err()
+            .with_context(|| {
+                format!("trusted the later schema's declaration (initialize={initialize})")
+            })?;
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&format!("{later}.qbit_prism_schema_capabilities")),
+            "{error}"
+        );
+        assert!(error.contains(&db.schema), "{error}");
+        if initialize {
+            assert!(
+                error.contains("refusing to migrate before any DDL"),
+                "{error}"
+            );
+        } else {
+            assert!(error.contains("outside the current schema"), "{error}");
+        }
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(later_objects_sql)
+                .bind(&later)
+                .fetch_one(&pool)
+                .await?,
+            later_objects
+        );
+    }
+    // Without the later schema on search_path the loss is named as a loss.
+    let error = Ledger::connect(&db.url, "capability-check".into(), 8, false)
+        .await
+        .err()
+        .context("started without a capability declaration")?;
+    assert!(
+        format!("{error:#}").contains("has no qbit_prism_schema_capabilities"),
+        "{error:#}"
+    );
+    // The current schema's own declaration is read, later schema or not.
+    sqlx::raw_sql(
+        "ALTER TABLE operator_real_capabilities RENAME TO qbit_prism_schema_capabilities",
+    )
+    .execute(&pool)
+    .await?;
+    let restored = Ledger::connect(url.as_str(), "capability-check".into(), 8, false).await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(later_objects_sql)
+            .bind(&later)
+            .fetch_one(&pool)
+            .await?,
+        later_objects
+    );
+    sqlx::raw_sql(&format!("DROP SCHEMA {later} CASCADE"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    db.close(vec![earlier, restored]).await
+}
+
 #[tokio::test]
 async fn native_capabilities_with_row_level_security_are_refused_before_writes() -> Result<()> {
     let Some(db) = Database::open().await? else {

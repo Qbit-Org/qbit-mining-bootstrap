@@ -430,20 +430,8 @@ pub(super) async fn inspect_source_schema(
             present[*index] = value;
         }
     }
-    let base = regclass_present(
-        tx,
-        &[
-            "qbit_share_ledger".to_owned(),
-            OUTBOX.to_owned(),
-            "qbit_prism_schema_capabilities".to_owned(),
-        ],
-    )
-    .await?;
-    let capabilities = if base[2] {
-        Some(read_capabilities(&mut **tx).await?)
-    } else {
-        None
-    };
+    let base = regclass_present(tx, &["qbit_share_ledger".to_owned(), OUTBOX.to_owned()]).await?;
+    let capabilities = read_capabilities(&mut **tx).await?;
     Ok(SourceInventory {
         share_ledger: base[0],
         outbox: base[1],
@@ -473,16 +461,37 @@ pub(super) fn classify_source(inventory: &SourceInventory) -> SourceVerdict {
     }
 }
 
-async fn read_capabilities<'e, E>(executor: E) -> Result<Vec<(String, i32)>>
+/// The capability rows current_schema() declares, or `None` when it has no
+/// capability relation. The unqualified name follows search_path and can
+/// resolve past a schema that lost its table to a later schema's, whose
+/// declaration describes another ledger: `require_migration_history` bound
+/// the history to current_schema(), and the declaration must come from the
+/// same schema, or a version-1 row elsewhere would clear a database whose
+/// own declaration is gone. Migrate refuses such resolution before any DDL;
+/// connect refuses it here, naming both schemas.
+async fn read_capabilities<'e, E>(executor: E) -> Result<Option<Vec<(String, i32)>>>
 where
     E: sqlx::Acquire<'e, Database = Postgres>,
 {
     let mut connection = executor.acquire().await?;
-    let (kind, enabled, forced): (String, bool, bool) = sqlx::query_as(
-        "SELECT relkind::text,relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='qbit_prism_schema_capabilities'::regclass",
+    let Some(relation) = sqlx::query(
+        "SELECT n.nspname::text AS schema,current_schema()::text AS current,c.relkind::text AS kind,c.relrowsecurity AS enabled,c.relforcerowsecurity AS forced FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass('qbit_prism_schema_capabilities')",
     )
-    .fetch_one(&mut *connection)
-    .await?;
+    .fetch_optional(&mut *connection)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let schema: String = relation.try_get("schema")?;
+    let current: Option<String> = relation.try_get("current")?;
+    ensure!(
+        current.as_deref() == Some(schema.as_str()),
+        "qbit_prism_schema_capabilities resolves to {schema}.qbit_prism_schema_capabilities, outside the current schema {} whose migration history was verified; refusing to trust another schema's capability declaration for this database. Restore the current schema's capability table from the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create it from migrations/006_source_schema.sql, or set search_path to the intended ledger schema, then start or migrate again",
+        current.as_deref().unwrap_or("(none)")
+    );
+    let kind: String = relation.try_get("kind")?;
+    let enabled: bool = relation.try_get("enabled")?;
+    let forced: bool = relation.try_get("forced")?;
     ensure!(
         kind == "r",
         "qbit_prism_schema_capabilities must be an ordinary table (found relation kind {kind}); refusing to trust substituted capability rows. Restore the original capability table from the full backup before starting or migrating this database"
@@ -493,9 +502,11 @@ where
     );
     let rows = sqlx::query("SELECT capability,capability_value FROM qbit_prism_schema_capabilities ORDER BY capability")
         .fetch_all(&mut *connection).await?;
-    rows.iter()
+    let rows: Vec<(String, i32)> = rows
+        .iter()
         .map(|row| Ok((row.try_get("capability")?, row.try_get("capability_value")?)))
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(Some(rows))
 }
 
 /// A capability this binary does not know, or a known one beyond the value
@@ -2685,23 +2696,16 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
 /// The connect-time gate: the database must declare its capabilities, and
 /// every capability or storage version it declares must be one the binary
 /// understands. Every start runs it, with or without `initialize`, after
-/// `require_schema_version` has established that 006 ran, so a missing
-/// table or row is a dropped or deleted declaration, never a legacy state;
-/// `migrate_schema` refused the same database before any DDL.
+/// `require_schema_version` has established that 006 ran in
+/// current_schema(), so a missing table or row is a dropped or deleted
+/// declaration, never a legacy state, and a table resolved from another
+/// schema is refused rather than read; `migrate_schema` refused the same
+/// database before any DDL.
 pub(super) async fn require_known_capabilities<'e, E>(executor: E) -> Result<()>
 where
     E: sqlx::Acquire<'e, Database = Postgres>,
 {
-    let mut connection = executor.acquire().await?;
-    let declared: bool =
-        sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_capabilities') IS NOT NULL")
-            .fetch_one(&mut *connection)
-            .await?;
-    let rows = if declared {
-        Some(read_capabilities(&mut *connection).await?)
-    } else {
-        None
-    };
+    let rows = read_capabilities(executor).await?;
     require_declared_capabilities(rows.as_deref())?;
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)
 }

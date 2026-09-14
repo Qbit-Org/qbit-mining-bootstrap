@@ -447,6 +447,12 @@ views, foreign tables and partitioned relations cannot substitute for it.
 Its catalog kind is checked before any capability rows are read, at startup
 and before migration DDL. Restore the original table from the full backup
 if a selective restore replaced it.
+The declaration must also belong to the current schema, where the migration
+history was verified: `search_path` resolves an unqualified name past a
+schema that lost its table to a later schema's, and that declaration
+describes another ledger. Startup refuses it, naming both schemas, instead
+of trusting a version-1 row from elsewhere; `migrate` already refuses any
+`qbit_` object resolved from another schema before any DDL.
 A database at 6 must declare its capabilities: 006 created
 `qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
 nothing native removes them, so a start refuses a database missing either,
