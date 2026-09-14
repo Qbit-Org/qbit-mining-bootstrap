@@ -18,12 +18,30 @@ SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
     'chain_state', chain_state, 'maturity_state', maturity_state))
 FROM qbit_pool_blocks ORDER BY block_hash COLLATE "C";
 
--- Import adds body storage and derived metadata, never changes these identities.
+-- Import authenticates added bytes against the declared digest. Normalize
+-- absent bytes to that digest so frozen, migrated and imported rows agree.
+-- Hash bytea directly rather than copying potentially large bodies into JSON.
 -- Native reconstruction inputs are fingerprinted separately below.
+SELECT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_attribute
+    WHERE attrelid = to_regclass('qbit_pool_audit_bundles')
+      AND attname = 'canonical_audit_bytes' AND NOT attisdropped
+) OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL AS has_canonical_audit_bytes
+\gset
+\if :has_canonical_audit_bytes
 SELECT jsonb_build_object('kind', 'audits', 'row', jsonb_build_object(
     'block_hash', block_hash, 'audit_bundle_sha256', audit_bundle_sha256,
-    'coinbase_tx_hex', coinbase_tx_hex))
+    'coinbase_tx_hex', coinbase_tx_hex,
+    'canonical_audit_bytes_sha256', COALESCE(
+        encode(pg_catalog.sha256(canonical_audit_bytes), 'hex'), audit_bundle_sha256)))
 FROM qbit_pool_audit_bundles ORDER BY block_hash COLLATE "C";
+\else
+SELECT jsonb_build_object('kind', 'audits', 'row', jsonb_build_object(
+    'block_hash', block_hash, 'audit_bundle_sha256', audit_bundle_sha256,
+    'coinbase_tx_hex', coinbase_tx_hex,
+    'canonical_audit_bytes_sha256', audit_bundle_sha256))
+FROM qbit_pool_audit_bundles ORDER BY block_hash COLLATE "C";
+\endif
 
 SELECT jsonb_build_object('kind', 'carry', 'row', to_jsonb(c))
 FROM qbit_payout_carry_forward c ORDER BY carry_forward_seq;

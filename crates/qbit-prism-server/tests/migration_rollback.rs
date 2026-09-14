@@ -157,12 +157,14 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         );
         let archive = recovery::backup(&source, pg_bin).await?;
         let ledger = Ledger::connect_operator(&source.url, true).await?;
+        ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
         ensure!(recovery::import_cli(&source, artifacts_dir.path())
             .await?
             .contains("Imported 3 audit bodies"));
         recovery::assert_artifacts(&source.pool, &artifacts).await?;
         ensure!(recovery::accounting_state(&source.pool).await? == before);
         ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
+        assert_canonical_audit_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path()).await?;
         recovery::restore(&archive, &source, &restored, pg_bin).await?;
         ensure!(recovery::accounting_state(&restored.pool).await? == before);
         ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
@@ -436,6 +438,69 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
     source.close().await?;
     restored.close().await?;
     result
+}
+
+async fn assert_canonical_audit_fingerprints(
+    source: &recovery::Database,
+    pg_bin: &std::path::Path,
+    artifacts: &[recovery::Artifact],
+    artifacts_dir: &std::path::Path,
+) -> Result<()> {
+    use qbit_prism_server::ledger::{audit_canonical_bytes, audit_completeness};
+
+    let baseline = recovery::evidence(source, pg_bin).await?;
+    let accounting = recovery::accounting_state(&source.pool).await?;
+    for artifact in artifacts {
+        // Even valid JSON with only extra whitespace violates the published
+        // byte digest. Empty and non-UTF-8 bytea must also be fingerprinted.
+        let mut changed = artifact.canonical.clone();
+        changed.push(b' ');
+        for bytes in [changed, Vec::new(), vec![0xff, 0x00, 0x80]] {
+            sqlx::query(
+                "UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2 WHERE block_hash=$1",
+            )
+            .bind(&artifact.block_hash)
+            .bind(bytes)
+            .execute(&source.pool)
+            .await?;
+            audit_completeness(&source.pool).await?.require_complete()?;
+            ensure!(recovery::import_cli(source, artifacts_dir)
+                .await?
+                .contains("Imported 0 audit bodies"));
+            let error = audit_canonical_bytes(&source.pool, &artifact.block_hash)
+                .await
+                .expect_err("corrupt canonical bytes must fail artifact authentication");
+            ensure!(error
+                .to_string()
+                .contains("stored canonical audit bytes have a digest mismatch"));
+            ensure!(recovery::accounting_state(&source.pool).await? == accounting);
+            let current = recovery::evidence(source, pg_bin).await?;
+            ensure!(
+                current["records"]["audits"]["count"] == baseline["records"]["audits"]["count"]
+            );
+            ensure!(
+                current["records"]["audits"]["sha256"] != baseline["records"]["audits"]["sha256"],
+                "corrupted stored canonical audit bytes were invisible to recovery evidence"
+            );
+            ensure!(recovery::evidence_with_bytea(source, pg_bin, "escape").await? == current);
+            let mut unchanged = current;
+            unchanged["records"]["audits"] = baseline["records"]["audits"].clone();
+            ensure!(unchanged == baseline, "unrelated recovery evidence changed");
+            sqlx::query(
+                "UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2 WHERE block_hash=$1",
+            )
+            .bind(&artifact.block_hash)
+            .bind(&artifact.canonical)
+            .execute(&source.pool)
+            .await?;
+            ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+            ensure!(
+                audit_canonical_bytes(&source.pool, &artifact.block_hash).await?
+                    == Some(artifact.canonical.clone())
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> Result<()> {
