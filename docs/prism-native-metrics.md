@@ -56,7 +56,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
 | `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`. | none |
-| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by instrumented coordinator ledger transactions; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness. | none |
+| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and by instrumented coordinator ledger transactions and selected direct ledger queries, including payout-revision reads and heartbeats. Non-transactional coverage remains partial under #352; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
 | `qbit_prism_grace_credited_shares_total` | counter | none | run | Durably accepted shares credited by stale grace. | `qbit_prism_grace_credited_shares_total` |
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
@@ -159,9 +159,11 @@ Pool timing pre-registers both result labels at count zero. Each started
 collector acquisition records one observation: success when acquired, or failure
 on acquisition error or cancellation, including the three-second overall
 deadline. Since #328 instrumented coordinator ledger transactions record
-acquisition the same way, including one abandoned by cancellation. Rollup worker
-transactions, public API queries and other pool traffic outside these acquisition
-paths are not timed. Duration is the monotonic elapsed pool wait until
+acquisition the same way, including one abandoned by cancellation. Selected direct
+ledger queries now use the same boundary, including payout-revision reads and
+heartbeats; [the acquisition guide](prism-pool-acquire-metrics.md) lists the covered
+callers and remaining #352 work. Rollup worker transactions, public API queries
+and other pool traffic outside these acquisition paths are not timed. Duration is the monotonic elapsed pool wait until
 acquisition completes or is cancelled; subsequent transaction work is excluded.
 Collector status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
@@ -191,8 +193,9 @@ First-offer timing remains **declared, not yet populated**; A/#266 wires it.
 Since #328, instrumented coordinator ledger transactions record into
 `database_pool_acquire_seconds`, and the coordinator's migration, order and
 settlement advisory-lock acquisitions record into
-`database_advisory_lock_wait_seconds`; the CPFP funding lock and
-non-transaction pool queries are not timed. The native alert specification
+`database_advisory_lock_wait_seconds`; the CPFP funding lock is not timed.
+Selected non-transaction ledger queries are timed through `Ledger::acquire`,
+with remaining caller coverage tracked in #352; this is not an acquisition census. The native alert specification
 attaches no firing rule to first-offer or advisory-lock timing.
 `PrismDatabasePoolWaitHigh` describes both collector and instrumented ledger
 acquisitions, including cancellation observations from #328 and #345. The collector

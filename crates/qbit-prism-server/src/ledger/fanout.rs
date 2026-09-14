@@ -82,7 +82,7 @@ impl Ledger {
             "SELECT to_jsonb(p) FROM qbit_prism_cpfp_packages p WHERE fanout_txid=$1",
         )
         .bind(fanout_txid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.acquire().await?)
         .await?)
     }
 
@@ -133,7 +133,7 @@ impl Ledger {
 
     pub async fn retired_cpfp_funding(&self, fanout_txid: &str) -> Result<Vec<Value>> {
         Ok(sqlx::query_scalar("SELECT to_jsonb(r) FROM qbit_prism_cpfp_retired_funding r WHERE fanout_txid=$1 AND NOT wallet_lock_released ORDER BY updated_at,funding_txid,funding_vout LIMIT 16")
-            .bind(fanout_txid).fetch_all(&self.pool).await?)
+            .bind(fanout_txid).fetch_all(&mut *self.acquire().await?).await?)
     }
 
     pub async fn record_retired_cpfp_wallet_cleanup(

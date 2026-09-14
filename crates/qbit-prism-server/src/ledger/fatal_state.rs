@@ -20,16 +20,20 @@ impl Ledger {
             })
             .connect(url)
             .await?;
-        let state = Self::read_fatal_state(&pool).await;
+        let state = Self::read_fatal_state(pool.acquire()).await;
         pool.close().await;
         state
     }
 
     pub async fn fatal_state(&self) -> Result<Value> {
-        Self::read_fatal_state(&self.pool).await
+        Self::read_fatal_state(self.acquire()).await
     }
 
-    async fn read_fatal_state(pool: &PgPool) -> Result<Value> {
+    async fn read_fatal_state(
+        acquisition: impl std::future::Future<
+            Output = sqlx::Result<sqlx::pool::PoolConnection<Postgres>>,
+        >,
+    ) -> Result<Value> {
         // to_jsonb also works before migration 010: an unavailable timestamp is
         // unknown, rather than the cluster's unrelated last-update timestamp.
         let mut state: Value = sqlx::query_scalar(
@@ -37,7 +41,7 @@ impl Ledger {
              'set_at', to_jsonb(c)->'fatal_error_set_at') \
              FROM qbit_prism_cluster c WHERE singleton",
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *acquisition.await?)
         .await?;
         let (block, fanout) = fatal_subject(state["fatal_error"].as_str());
         state["block_hash"] = json!(block);
