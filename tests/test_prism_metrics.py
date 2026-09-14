@@ -1761,6 +1761,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(reference_initial_delivery_metrics_lines(server))
     lines.extend(server.progress_health_metrics_lines())
     lines.extend(reference_accepted_preview_attribution_metrics_lines(server))
+    lines.extend(MetricsRenderer(server).window_ownership_metrics_lines())
     lines.extend(reference_gc_pause_metrics_lines(server))
     lines.extend(reference_process_heap_metrics_lines(PINNED_HEAP_SAMPLE))
     lines.extend(reference_component_cardinality_metrics_lines(server))

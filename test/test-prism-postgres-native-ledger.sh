@@ -90,7 +90,9 @@ from lab.prism.share_ledger import (
     PendingShare,
     PsqlShareLedger,
 )
-from tests.prism_window_rows_reference import assert_rows_match_aggregate
+from tests.prism_window_rows_reference import (
+    assert_rows_match_aggregate, assert_isolated_oracle_matches_snapshot,
+)
 
 
 def pending(
@@ -408,6 +410,7 @@ ANALYZE qbit_share_ledger;
 bulk_anchor_ms = 1_700_001_010_000
 assert_equal(ledger.execution_backend, "psycopg-pool", "oracle check runs on the pooled client")
 for weight in (1, 512, 1023, 1024, 1025, 3000, 6000, 10**9):
+    assert_isolated_oracle_matches_snapshot(ledger, bulk_anchor_ms, weight)
     assert_rows_match_aggregate(
         ledger,
         lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),

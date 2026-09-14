@@ -17,6 +17,7 @@ import re
 from typing import Any, Callable
 
 from lab.prism.share_ledger import AcceptedShareRecord, PsqlShareLedger
+from lab.prism.window_oracle import snapshot_window
 
 _ROW_PROJECTION = re.compile(
     r"SELECT (?P<object>json_build_object\(.*?\))\nFROM rows\nORDER BY share_seq ASC;",
@@ -95,3 +96,14 @@ def assert_rows_match_aggregate(
     if expected_len is not None and len(records) != expected_len:
         raise SystemExit(f"{label}: expected {expected_len} records, got {len(records)}")
     return records
+
+
+def assert_isolated_oracle_matches_snapshot(
+    ledger: PsqlShareLedger, anchor: int, weight: int,
+) -> None:
+    """Qualify the real spool/helper path against the live SQL window oracle."""
+    expected = ledger.snapshot_at_job_issue(anchor, window_weight=weight)
+    isolated = snapshot_window(ledger, anchor=anchor, weight=weight)
+    actual = list(isolated.window.json_records())
+    if actual != [record.to_prism_json() for record in expected]:
+        raise AssertionError("isolated payout oracle differs from live PostgreSQL snapshot")

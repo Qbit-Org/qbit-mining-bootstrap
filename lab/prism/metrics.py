@@ -749,6 +749,7 @@ class MetricsRenderer:
         lines.extend(self.initial_delivery_metrics_lines())
         lines.extend(self.port.progress_health_metrics_lines())
         lines.extend(self.accepted_preview_attribution_metrics_lines())
+        lines.extend(self.window_ownership_metrics_lines())
         lines.extend(self.gc_pause_metrics_lines())
         lines.extend(self.process_heap_metrics_lines())
         lines.extend(self.component_cardinality_metrics_lines())
@@ -1092,6 +1093,20 @@ class MetricsRenderer:
             f"qbit_prism_process_malloc_mmapped_bytes {int(sample.malloc_mmapped_bytes)}",
         ]
 
+    def window_ownership_metrics_lines(self) -> list[str]:
+        from lab.prism.window_ownership import window_ownership_snapshot
+
+        lines = []
+        for name, value in window_ownership_snapshot().items():
+            metric = f"qbit_prism_window_ownership_{name}"
+            kind = "counter" if name.endswith("_total") else "gauge"
+            lines.extend((
+                f"# HELP {metric} Weakly tracked window ownership {name}; aliases counted once; incomplete if observations_dropped_total is nonzero.",
+                f"# TYPE {metric} {kind}",
+                f"{metric} {value}",
+            ))
+        return lines
+
     def component_cardinality_metrics_lines(self) -> list[str]:
         """Issue #226 (and #185's gauge list): retained entries per component.
 
@@ -1135,24 +1150,25 @@ class MetricsRenderer:
         window = cached_window.window if cached_window is not None else None
         window_pages = window_records = window_canonical_bytes = 0
         mirror_records = mirror_bytes = 0
-        # Exactly one component accounts for the cached window, because these
-        # gauges exist to attribute resident bytes and an operator summing the
-        # family must not count the same object twice. The two backings are
-        # mutually exclusive -- the mirror *is* the cached window on the Rust
-        # path -- so a mirror-backed window reports zero pages, records, and
-        # canonical bytes under payout_window_*, and its size appears only
-        # under daemon_window_mirror_*. Which pair is non-zero is also how an
-        # operator reads the backing off /metrics.
+        # Mirror bytes and page bytes are separate representations; a cache
+        # may legitimately retain both through different views. The weak
+        # ownership family additionally accounts for historical/in-flight
+        # mirrors, sequences and pages throughout the process.
         if isinstance(window, DaemonShareWindowMirror):
             mirror_records = int(window.record_count)
             mirror_bytes = len(window.canonical_items)
-        elif window is not None:
-            pages = window.pages
-            window_pages = len(pages)
-            window_records = sum(len(page.records) for page in pages)
-            window_canonical_bytes = sum(
-                len(page.canonical_json_items) for page in pages
-            )
+        # shares_json can still own an older page representation, even when
+        # window is a mirror. Count actual backing, deduplicating page aliases.
+        pages = {
+            id(page): page
+            for owner in (window, cached_window.shares_json if cached_window is not None else None)
+            for page in getattr(owner, "pages", ())
+        }
+        window_pages = len(pages)
+        window_records = sum(len(page.records) for page in pages.values())
+        window_canonical_bytes = sum(
+            len(page.canonical_json_items) for page in pages.values()
+        )
         with port.lock:
             port._ensure_evicted_job_state()
             graveyard_entries = len(port.evicted_job_graveyard)
