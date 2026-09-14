@@ -392,6 +392,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: prism-gate-shard-${{ matrix.shard }}
+          # Retried uploads can receive a lower ID; downloads choose the
+          # highest ID per name, so replace the previous attempt's evidence.
+          overwrite: true
           path: |
             ${{ env.PRISM_TEST_GATE_MANIFEST }}
             ${{ env.PRISM_TEST_LOG }}
@@ -429,6 +432,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: prism-gate-manifest
+          overwrite: true
           path: prism-gate-manifest.txt
           if-no-files-found: error
 
