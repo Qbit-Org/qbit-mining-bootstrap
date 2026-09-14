@@ -58,6 +58,7 @@ qbit-prism-server::ledger_postgres::two_x::frozen_pre_258_source_refuses_pending
 qbit-prism-server::ledger_postgres::two_x::imported_audit_decode_limit_outlives_a_dropped_request
 qbit-prism-server::ledger_postgres::two_x::imported_ctv_audit_backfills_and_links_without_the_legacy_file
 qbit-prism-server::ledger_postgres::two_x::imported_external_audit_is_served_from_canonical_bytes_without_the_legacy_file
+qbit-prism-server::ledger_postgres::two_x::incoming_foreign_key_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::inheritance_involving_a_release_table_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::inline_only_legacy_audit_import_keeps_its_body_and_serves_canonical_bytes
 qbit-prism-server::ledger_postgres::two_x::legacy_2x_failed_native_migration_rolls_back_seed_repair_and_all_ddl

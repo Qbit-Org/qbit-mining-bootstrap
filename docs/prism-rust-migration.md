@@ -240,7 +240,10 @@ triggers run. Rules on operator-only tables are kept.
 An extra constraint on a release table is also drift:
 `CHECK (writer_epoch > 0)` accepts legacy shares but rejects native shares,
 so migration refuses it by name and definition, regardless of validation or
-enforcement state. Constraints on the operator's own tables are kept.
+enforcement state. Foreign keys from operator tables into release tables are
+also refused, including owners in other schemas: their internal triggers can
+block native updates or deletes, such as pruning old fanout broadcast attempts.
+Constraints involving only operator tables are kept.
 An extra `NOT NULL` column on a release table without a default, identity
 or generated expression is also drift: native inserts omit it and would
 fail. Extra defaults, identities and generated expressions are also refused:

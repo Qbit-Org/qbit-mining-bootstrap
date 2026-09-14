@@ -738,6 +738,17 @@ struct SequenceDefinition {
     cycle: bool,
 }
 
+/// A foreign key can constrain a release table even when its owner lives in
+/// another schema. Local release-owned constraints are compared by definition;
+/// all other incoming references to release tables must be refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncomingForeignKey {
+    owner: String,
+    owner_in_schema: bool,
+    name: String,
+    referenced_table: String,
+}
+
 /// Every table, column, constraint, index, trigger, function, sequence,
 /// rewrite rule and row-level security policy of one schema, as the server
 /// renders them,
@@ -753,6 +764,8 @@ struct SchemaFingerprint {
     /// Table, then constraint definition (`constraint_key`), to the name the
     /// constraint carries and its validation state.
     constraints: BTreeMap<String, BTreeMap<String, ConstraintDefinition>>,
+    /// References into this schema, including owners in other schemas.
+    incoming_foreign_keys: Vec<IncomingForeignKey>,
     /// Indexes that do not back a constraint, by name; the constraint
     /// comparison covers the others under whatever name they were given.
     indexes: BTreeMap<String, IndexDefinition>,
@@ -1017,6 +1030,16 @@ async fn fingerprint_schema(
                 validated: row.try_get("validated")?,
                 enforcement: row.try_get("enforcement")?,
             });
+    }
+    let rows = sqlx::query("SELECT CASE WHEN owner_ns.nspname=$1 THEN owner.relname::text ELSE quote_ident(owner_ns.nspname)||'.'||quote_ident(owner.relname) END AS owner,owner_ns.nspname=$1 AS owner_in_schema,k.conname::text AS name,target.relname::text AS referenced_table FROM pg_constraint k JOIN pg_class owner ON owner.oid=k.conrelid JOIN pg_namespace owner_ns ON owner_ns.oid=owner.relnamespace JOIN pg_class target ON target.oid=k.confrelid JOIN pg_namespace target_ns ON target_ns.oid=target.relnamespace WHERE k.contype='f' AND target_ns.nspname=$1 ORDER BY 1,3")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        fingerprint.incoming_foreign_keys.push(IncomingForeignKey {
+            owner: row.try_get("owner")?,
+            owner_in_schema: row.try_get("owner_in_schema")?,
+            name: row.try_get("name")?,
+            referenced_table: row.try_get("referenced_table")?,
+        });
     }
     let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid,x.indisunique AS unique,x.indexprs IS NOT NULL AS expression,x.indpred IS NOT NULL AS partial FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
@@ -1620,6 +1643,16 @@ fn compare_fingerprints(
                     constraint.name
                 ));
             }
+        }
+    }
+    for foreign_key in &found.incoming_foreign_keys {
+        if expected.tables.contains_key(&foreign_key.referenced_table)
+            && !(foreign_key.owner_in_schema && expected.tables.contains_key(&foreign_key.owner))
+        {
+            comparison.drift.push(format!(
+                "foreign key {} on {} references release table {}; its enforcement can affect native updates or deletes",
+                foreign_key.name, foreign_key.owner, foreign_key.referenced_table
+            ));
         }
     }
     for (name, index) in &expected.indexes {
@@ -3125,6 +3158,38 @@ mod tests {
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
+    }
+
+    #[test]
+    fn incoming_foreign_keys_from_nonrelease_tables_are_drift() {
+        let mut expected = SchemaFingerprint::default();
+        expected
+            .tables
+            .insert("t".into(), table(&[("a", column("bigint", true))]));
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        for (owner, local, target, drift) in [
+            ("operator_notes", true, "t", true),
+            ("other.t", false, "t", true),
+            ("t", true, "t", false),
+            ("operator_notes", true, "operator_other", false),
+            ("other.notes", false, "operator_other", false),
+        ] {
+            found.incoming_foreign_keys = vec![IncomingForeignKey {
+                owner: owner.into(),
+                owner_in_schema: local,
+                name: "operator_fk".into(),
+                referenced_table: target.into(),
+            }];
+            let comparison = compare_fingerprints(&expected, &found);
+            if drift {
+                assert_eq!(comparison.drift, vec![format!("foreign key operator_fk on {owner} references release table {target}; its enforcement can affect native updates or deletes")]);
+            } else {
+                assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+            }
+        }
     }
 
     #[test]

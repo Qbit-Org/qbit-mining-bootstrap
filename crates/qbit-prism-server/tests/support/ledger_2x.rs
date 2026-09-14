@@ -1901,6 +1901,90 @@ async fn extra_rewrite_rule_is_refused_naming_it_and_rolls_back() -> Result<()> 
     Ok(())
 }
 
+/// Foreign keys owned elsewhere still constrain deletes on release tables.
+#[tokio::test]
+async fn incoming_foreign_key_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for external in [false, true] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            insert_share_as_writer(&pool, "legacy:1", 1).await?;
+            let operator_schema = format!("{}_operator", db.schema);
+            let owner = if external {
+                sqlx::raw_sql(&format!("CREATE SCHEMA {operator_schema}"))
+                    .execute(&pool)
+                    .await?;
+                // The same relation name in another schema is still an extra.
+                format!("{operator_schema}.qbit_share_ledger")
+            } else {
+                "operator_refs".to_owned()
+            };
+            sqlx::raw_sql(&format!("CREATE TABLE {owner}(share_seq bigint CONSTRAINT operator_share_fk REFERENCES qbit_share_ledger(share_seq), attempt_seq bigint CONSTRAINT operator_attempt_fk REFERENCES qbit_ctv_fanout_broadcast_attempts(attempt_seq)); INSERT INTO {owner}(share_seq) SELECT share_seq FROM qbit_share_ledger; CREATE TABLE operator_notes(note_id bigint PRIMARY KEY); CREATE TABLE operator_own_refs(note_id bigint CONSTRAINT operator_own_fk REFERENCES operator_notes(note_id))"))
+                .execute(&pool).await?;
+            let refused = sqlx::query("DELETE FROM qbit_share_ledger WHERE share_id='legacy:1'")
+                .execute(&pool)
+                .await
+                .err()
+                .context("incoming foreign key allowed the referenced delete")?
+                .to_string();
+            assert!(refused.contains("operator_share_fk"), "{refused}");
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> =
+                sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?;
+            let constraints_sql = "SELECT k.oid::bigint,pg_get_constraintdef(k.oid) FROM pg_constraint k JOIN pg_class target ON target.oid=k.confrelid WHERE target.relnamespace=current_schema()::regnamespace ORDER BY 1";
+            let constraints: Vec<(i64, String)> =
+                sqlx::query_as(constraints_sql).fetch_all(&pool).await?;
+            let error = db
+                .ledger("a")
+                .await
+                .err()
+                .context("migration accepted an incoming foreign key")?
+                .to_string();
+            assert!(
+                error.contains("refusing to migrate a drifted 001 source"),
+                "{error}"
+            );
+            assert!(error.contains(&format!("foreign key operator_share_fk on {owner} references release table qbit_share_ledger")), "{error}");
+            assert!(error.contains(&format!("foreign key operator_attempt_fk on {owner} references release table qbit_ctv_fanout_broadcast_attempts")), "{error}");
+            assert!(!error.contains("operator_own_fk"), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert!(native_tables_absent(&pool).await?);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_as::<_, (i64, String)>(constraints_sql)
+                    .fetch_all(&pool)
+                    .await?,
+                constraints
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?,
+                rows
+            );
+            sqlx::raw_sql(&format!("ALTER TABLE {owner} DROP CONSTRAINT operator_share_fk, DROP CONSTRAINT operator_attempt_fk"))
+                .execute(&pool).await?;
+            let ledger = db.ledger("a").await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            exercise_native_writers(&ledger, 1, 6901).await?;
+            assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='operator_own_refs'::regclass AND conname='operator_own_fk')").fetch_one(&pool).await?);
+            if external {
+                sqlx::raw_sql(&format!("DROP SCHEMA {operator_schema} CASCADE"))
+                    .execute(&pool)
+                    .await?;
+            }
+            pool.close().await;
+            db.close(vec![ledger]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// The operator's own triggers, as `table.trigger=state`.
 async fn operator_triggers(pool: &PgPool) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT c.relname::text||'.'||t.tgname::text||'='||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal AND t.tgname LIKE 'operator%' ORDER BY 1")
