@@ -20,7 +20,8 @@
 //!
 //! The runner is resumable. An interrupted build leaves an invalid index
 //! behind, still maintained by every insert; the next run drops it and
-//! builds again. An index that already exists under a reserved name is
+//! builds again only if its table and definition match the migration.
+//! An index that already exists under a reserved name is
 //! adopted when it is valid and its definition is exactly the one the file
 //! declares (an earlier run built it), and refused, naming it, when it is
 //! anything else: an operator's index under that name is theirs to judge,
@@ -150,11 +151,16 @@ async fn apply(
         match live_relation(connection, name).await? {
             LiveRelation::Absent => plan.push(Step::Build(name, expected)),
             LiveRelation::Index {
-                valid: true,
+                valid,
                 definition,
-                ..
-            } if definition == expected.definition => plan.push(Step::Keep(name)),
-            LiveRelation::Index { valid: false, .. } => plan.push(Step::Rebuild(name, expected)),
+                table,
+            } if table == expected.table && definition == expected.definition => {
+                plan.push(if valid {
+                    Step::Keep(name)
+                } else {
+                    Step::Rebuild(name, expected)
+                });
+            }
             LiveRelation::Index {
                 definition, table, ..
             } => bail!(

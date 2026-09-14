@@ -271,25 +271,100 @@ async fn migration_012_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     let error = Ledger::connect(&db.url, "cold".into(), 8, false)
         .await
         .err()
-        .context("a non-initializing start accepted a database at 10")?
+        .context("a non-initializing start accepted a database at 11")?
         .to_string();
     assert!(error.contains("missing migration(s) 12"), "{error}");
-    // An interrupted build: a unique build over duplicate miners fails and
-    // leaves the reserved name behind as an invalid index.
-    let failed = sqlx::raw_sql(&format!(
-        "CREATE UNIQUE INDEX CONCURRENTLY {SEQ_WALK} ON qbit_share_ledger (miner_id)"
-    ))
+    // Invalid indexes with another definition or on another table belong
+    // to the operator too. Refuse them before building or dropping anything.
+    sqlx::raw_sql(
+        "CREATE TABLE operator_shares (miner_id text); INSERT INTO operator_shares VALUES ('alice'), ('alice')",
+    )
     .execute(&pool)
-    .await;
-    assert!(failed.is_err(), "duplicate miners must fail a unique build");
+    .await?;
+    for table in ["qbit_share_ledger", "operator_shares"] {
+        let failed = sqlx::raw_sql(&format!(
+            "CREATE UNIQUE INDEX CONCURRENTLY {SEQ_WALK} ON {table} (miner_id)"
+        ))
+        .execute(&pool)
+        .await;
+        assert!(failed.is_err(), "duplicate miners must fail a unique build");
+        let index_state = "SELECT pg_get_indexdef(indexrelid),indisvalid,indexrelid::text FROM pg_index WHERE indexrelid=to_regclass($1)";
+        let foreign: (String, bool, String) = sqlx::query_as(index_state)
+            .bind(SEQ_WALK)
+            .fetch_one(&pool)
+            .await?;
+        assert!(!foreign.1, "the failed build's index must be invalid");
+        let before = ledger_indexes(&pool).await?;
+        let error = db
+            .ledger("foreign-invalid")
+            .await
+            .err()
+            .context("the online migration rebuilt a foreign invalid index")?
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "index {SEQ_WALK} on {table} already exists with a different definition"
+            )),
+            "{error}"
+        );
+        let after: (String, bool, String) = sqlx::query_as(index_state)
+            .bind(SEQ_WALK)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(after, foreign, "the operator's index was changed");
+        assert_eq!(ledger_indexes(&pool).await?, before);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
+            .execute(&pool)
+            .await?;
+    }
+    // Interrupt the declared build while it waits for an open writer.
+    // Only this matching invalid index is safe for the migrator to rebuild.
+    let mut writer = pool.begin().await?;
+    insert_share(&mut *writer, 3, "alice").await?;
+    let mut builder = pool.acquire().await?;
+    sqlx::query("SET statement_timeout='500ms'")
+        .execute(&mut *builder)
+        .await?;
+    let failed = sqlx::raw_sql(&SEQ_WALK_DEFINITION.replacen(
+        "CREATE INDEX ",
+        "CREATE INDEX CONCURRENTLY ",
+        1,
+    ))
+    .execute(&mut *builder)
+    .await
+    .expect_err("the concurrent build must time out behind the writer");
+    assert_eq!(
+        failed
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("57014"),
+        "{failed}"
+    );
+    sqlx::query("SET statement_timeout=0")
+        .execute(&mut *builder)
+        .await?;
+    drop(builder);
+    writer.rollback().await?;
     let leftover = ledger_indexes(&pool)
         .await?
         .into_iter()
         .find(|(name, ..)| name == SEQ_WALK)
         .context("the failed build left no index")?;
     assert!(!leftover.2, "the failed build's index must be invalid");
+    assert_eq!(leftover.1, SEQ_WALK_DEFINITION);
     let resumed = db.ledger("resumed").await?;
-    assert_trimmed(&pool).await?;
+    let rebuilt = assert_trimmed(&pool).await?;
+    assert_ne!(
+        rebuilt
+            .iter()
+            .find(|(name, ..)| name == SEQ_WALK)
+            .unwrap()
+            .3,
+        leftover.3,
+        "the interrupted build's invalid index was not replaced"
+    );
     // A valid index under a reserved name with another definition is
     // refused, naming it; nothing is built, dropped or recorded.
     undo_012(&pool).await?;
