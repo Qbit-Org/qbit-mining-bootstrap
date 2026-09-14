@@ -945,21 +945,23 @@ async fn assert_candidate_payload_fingerprints(
             let block = [0_u8; 81];
             let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
             hash.reverse();
-            let bundle: qbit_prism::AuditBundle = serde_json::from_slice(&artifact.canonical)?;
-            let mut bootstrap = recovery::share(1);
-            bootstrap.share_id = "bootstrap-share".into();
-            bootstrap.job_id = "bootstrap-job".into();
+            for seq in [1_i64, 5, 8] {
+                sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1,false)")
+                    .bind(seq).execute(&source.pool).await?;
+                let mut share = recovery::share(seq as u64);
+                share.job_issued_at_ms = 1;
+                ledger.append(share, None).await?;
+            }
+            let snapshot = ledger.snapshot(100).await?;
+            let mut bundle: qbit_prism::AuditBundle = serde_json::from_slice(&artifact.canonical)?;
+            bundle.found_block.anchor_job_issued_at_ms = snapshot.anchor_ms;
             let candidate = Candidate {
                 block_hash: hex::encode(hash),
                 block_sha256: Candidate::block_digest_hex(&block),
                 job_id: "recovery-candidate".into(),
-                payout_revision: 0,
-                window: WindowRef {
-                    shares: None,
-                    prior_balances_digest: qbit_prism::prior_balances_digest(&[]),
-                    anchor_ms: bundle.found_block.anchor_job_issued_at_ms,
-                },
-                bootstrap_share: Some(bootstrap),
+                payout_revision: snapshot.payout_revision,
+                window: WindowRef::from_snapshot(&snapshot)?,
+                bootstrap_share: None,
                 found_block: bundle.found_block,
                 payout_policy: bundle.payout_policy,
                 ctv: None,
@@ -978,6 +980,11 @@ async fn assert_candidate_payload_fingerprints(
             let body = serde_json::to_value(&candidate)?;
             let digest = hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?));
             ledger.enqueue_candidate(candidate.clone()).await?;
+            const WINDOW_COLUMNS: &str = "window_anchor_ms,window_prior_balances_sha256,\
+                window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256";
+            let window_columns: serde_json::Value = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(w) FROM (SELECT {WINDOW_COLUMNS} FROM qbit_block_candidate_outbox WHERE block_hash=$1) w"
+            )).bind(&candidate.block_hash).fetch_one(&source.pool).await?;
             let baseline = recovery::evidence(&source, pg_bin).await?;
             ensure!(baseline["pending_candidates"] == 1);
             let claim = ledger.claim_candidate(60).await?.expect("pending candidate");
@@ -996,6 +1003,12 @@ async fn assert_candidate_payload_fingerprints(
                 "candidate=jsonb_set(candidate,'{found_block,network_difficulty}','101')",
                 "candidate='null'::jsonb",
                 "storage_version=3",
+                "window_anchor_ms=window_anchor_ms+1",
+                "window_prior_balances_sha256=repeat('ab',32)",
+                "window_first_share_seq=window_first_share_seq+1",
+                "window_last_share_seq=window_last_share_seq-1",
+                "window_share_count=window_share_count-1",
+                "window_snapshot_sha256=repeat('ab',32)",
             ] {
                 sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET {mutation} WHERE block_hash=$1"))
                     .bind(&candidate.block_hash).execute(&source.pool).await?;
@@ -1009,8 +1022,9 @@ async fn assert_candidate_payload_fingerprints(
                 let mut unchanged = current;
                 unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
                 ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
-                sqlx::query("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1,block_bytes=$3 WHERE block_hash=$1")
-                    .bind(&candidate.block_hash).bind(&body).bind(&candidate.block_bytes)
+                sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1,block_bytes=$3,\
+                    ({WINDOW_COLUMNS})=(SELECT {WINDOW_COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$4)) WHERE block_hash=$1"))
+                    .bind(&candidate.block_hash).bind(&body).bind(&candidate.block_bytes).bind(&window_columns)
                     .execute(&source.pool).await?;
                 ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
             }

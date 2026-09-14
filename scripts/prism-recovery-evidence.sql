@@ -183,6 +183,12 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'candidate_sha256', candidate_sha256, 'state', state,
     'candidate', candidate,
     'block_bytes', to_jsonb(o)->'block_bytes',
+    'window_anchor_ms', to_jsonb(o)->'window_anchor_ms',
+    'window_prior_balances_sha256', to_jsonb(o)->'window_prior_balances_sha256',
+    'window_first_share_seq', to_jsonb(o)->'window_first_share_seq',
+    'window_last_share_seq', to_jsonb(o)->'window_last_share_seq',
+    'window_share_count', to_jsonb(o)->'window_share_count',
+    'window_snapshot_sha256', to_jsonb(o)->'window_snapshot_sha256',
     'storage_version', COALESCE(to_jsonb(o)->'storage_version', '1'::jsonb)))
 FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
