@@ -1831,6 +1831,99 @@ async fn executable_extra_column_is_refused_naming_it_and_rolls_back() -> Result
     Ok(())
 }
 
+/// Discovery in a later schema must never create a parallel empty ledger.
+#[tokio::test]
+async fn migration_refuses_source_objects_resolved_from_a_later_schema() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for native in [false, true] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            insert_share_as_writer(&pool, "legacy:1", 1).await?;
+            let earlier = if native {
+                Some(db.ledger("earlier-build").await?)
+            } else {
+                None
+            };
+            let empty = format!("{}_empty", db.schema);
+            sqlx::raw_sql(&format!("CREATE SCHEMA {empty}"))
+                .execute(&pool)
+                .await?;
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> =
+                sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?;
+            let mut url = url::Url::parse(&db.url)?;
+            let base_query: Vec<(String, String)> = url
+                .query_pairs()
+                .filter(|(key, _)| key != "options")
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(base_query.clone())
+                .append_pair("options", &format!("-csearch_path={empty},{}", db.schema));
+            let error = Ledger::connect(url.as_str(), "wrong-schema".into(), 8, true)
+                .await
+                .err()
+                .context("migration shadowed the legacy ledger with a parallel schema")?
+                .to_string();
+            assert!(
+                error.contains("refusing to migrate before any DDL"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("current schema {empty}")),
+                "{error}"
+            );
+            assert!(error.contains(&db.schema), "{error}");
+            assert!(error.contains("search_path"), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            let empty_objects: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace",
+            )
+            .bind(&empty)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(empty_objects, 0, "migration wrote to the empty schema");
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?,
+                rows
+            );
+            // A multi-schema path is supported when the source is first.
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(base_query)
+                .append_pair("options", &format!("-csearch_path={},{}", db.schema, empty));
+            let migrated = Ledger::connect(url.as_str(), "right-schema".into(), 8, true).await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM qbit_share_ledger WHERE share_id='legacy:1'"
+                )
+                .fetch_one(&migrated.pool)
+                .await?,
+                1
+            );
+            exercise_native_writers(&migrated, 1, 7201).await?;
+            sqlx::raw_sql(&format!("DROP SCHEMA {empty}"))
+                .execute(&pool)
+                .await?;
+            pool.close().await;
+            let mut ledgers = vec![migrated];
+            ledgers.extend(earlier);
+            db.close(ledgers).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Domain checks and nullability are not represented by attnotnull.
 #[tokio::test]
 async fn domain_extra_column_is_refused_naming_it_and_rolls_back() -> Result<()> {

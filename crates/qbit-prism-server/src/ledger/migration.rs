@@ -353,8 +353,26 @@ async fn owned_present(
         .await?)
 }
 
+/// Unqualified reads can resolve past current_schema(), while unqualified
+/// DDL creates in it. Refuse that mismatch before even creating the migration
+/// record: otherwise an empty first schema can shadow a later ledger's data.
+async fn require_source_schema_resolution(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    let schema =
+        schema.context("refusing to migrate before any DDL: search_path has no current schema")?;
+    let foreign_objects: Vec<String> = sqlx::query_scalar("SELECT format('relation %I.%I',n.nspname,c.relname) AS object FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname<>$1 AND left(c.relname,5)='qbit_' AND pg_table_is_visible(c.oid) UNION ALL SELECT format('function %I.%I(%s)',n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)) AS object FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname<>$1 AND left(p.proname,5)='qbit_' AND pg_function_is_visible(p.oid) ORDER BY 1")
+        .bind(&schema).fetch_all(&mut **tx).await?;
+    ensure!(foreign_objects.is_empty(),
+        "refusing to migrate before any DDL: current schema {schema}, but search_path resolves {} qbit_ object(s) in another schema: {}. Unqualified DDL would create objects in {schema} and could hide existing accounting history. Nothing was changed. Set search_path to the intended ledger schema first, without qbit_ objects resolved from other schemas, then migrate again",
+        foreign_objects.len(), named_objects(&foreign_objects));
+    Ok(())
+}
+
 /// Ask the catalog, not the data, which 002 objects exist. `to_regclass` and
-/// `to_regproc` follow the connection's search path exactly as the DDL did.
+/// `to_regproc` follow search_path; migrate first verifies that visible
+/// qbit_ objects resolve in current_schema(), where its DDL creates objects.
 /// On a native database the same inventory carries the capability rows and
 /// the outbox columns the native checks read, taken once, before any DDL.
 pub(super) async fn inspect_source_schema(
@@ -2303,6 +2321,7 @@ pub(super) async fn migrate_schema(
     instance_id: &str,
 ) -> Result<()> {
     lock(tx, MIGRATION_LOCK).await?;
+    require_source_schema_resolution(tx).await?;
     sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
     // Each applied migration is tracked on its own, not as a high-water mark:
     // 007 is reserved by an independent workstream, so a later number must
