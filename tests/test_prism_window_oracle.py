@@ -211,6 +211,54 @@ class WindowOracleTests(unittest.TestCase):
             oracle._ADMISSION.release()
         self.assertEqual(ledger.reads, [])
 
+    def test_record_count_observes_deadline_and_supersession_before_finishing(self):
+        rows = [row_payload(i) for i in range(1, 9)]
+        raw_decode = json.JSONDecoder.raw_decode
+        temporary = tempfile.TemporaryFile
+        for reason in ("deadline", "supersession"):
+            with self.subTest(reason=reason):
+                clock = FakeClock()
+                parsed, files = [], []
+                superseded = TemplateRefreshSuperseded("cancelled during record count")
+
+                def decode(decoder, text, idx=0):
+                    record, end = raw_decode(decoder, text, idx)
+                    if isinstance(record, dict) and "share_id" in record:
+                        parsed.append(record["share_id"])
+                        if reason == "deadline":
+                            clock.now += oracle.WINDOW_ORACLE_TIMEOUT_SECONDS / 2 + 1
+                    return record, end
+
+                def check():
+                    if reason == "supersession" and len(parsed) >= 2:
+                        raise superseded
+
+                def opened(*args, **kwargs):
+                    file = temporary(*args, **kwargs)
+                    files.append(file)
+                    return file
+
+                error = oracle.WindowOracleError if reason == "deadline" else TemplateRefreshSuperseded
+                with patch.object(oracle, "time", clock), patch.object(
+                    json.JSONDecoder, "raw_decode", decode,
+                ), patch.object(oracle.tempfile, "TemporaryFile", side_effect=opened):
+                    with self.assertRaises(error) as raised:
+                        oracle.snapshot_window(
+                            StreamLedger(rows), anchor=99999, weight=len(rows) * 4096,
+                            check=check,
+                        )
+                if reason == "deadline":
+                    self.assertIn("deadline exceeded", str(raised.exception))
+                else:
+                    self.assertIs(raised.exception, superseded)
+                self.assertEqual(len(parsed), 2, "counting must stop before decoding the remaining records")
+                self.assertEqual(len(files), 3)
+                self.assertTrue(all(file.closed for file in files))
+                acquired = oracle._ADMISSION.acquire(blocking=False)
+                if acquired:
+                    oracle._ADMISSION.release()
+                self.assertTrue(acquired, "cancelled record count must release oracle admission")
+
     def test_daemon_prepare_splices_canonical_items_without_parsing(self):
         result = oracle.snapshot_window(StreamLedger([row_payload(1)]), anchor=9999, weight=4096)
         shares = result.window.json_records()

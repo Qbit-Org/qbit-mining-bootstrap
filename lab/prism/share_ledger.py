@@ -697,6 +697,7 @@ def _walk_canonical_items(
     *,
     chunk_bytes: int | None = None,
     share_keys: bool = True,
+    check: Callable[[], None] | None = None,
 ) -> Iterator[dict[str, object]]:
     """Yield each record of one canonical items span; return the trailing flag.
 
@@ -782,6 +783,8 @@ def _walk_canonical_items(
                 f"{text[position]!r} where a record was expected"
             )
         while True:
+            if check is not None:
+                check()
             try:
                 record, end = decoder.raw_decode(text, position)
             except ValueError as exc:
@@ -811,13 +814,15 @@ def _walk_canonical_items(
         after_separator = True
 
 
-def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
+def _canonical_items_layout(
+    fragment: bytes, *, check: Callable[[], None] | None = None,
+) -> tuple[int, bool]:
     """Record count and trailing-separator flag for one canonical items span.
 
     Walks the span record by record (see :func:`_walk_canonical_items`),
     counting what the bytes actually hold and discarding each parsed record.
     """
-    walker = _walk_canonical_items(fragment, share_keys=False)
+    walker = _walk_canonical_items(fragment, share_keys=False, check=check)
     count = 0
     while True:
         try:
@@ -827,9 +832,11 @@ def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
         count += 1
 
 
-def _canonical_items_record_count(fragment: bytes) -> int:
+def _canonical_items_record_count(
+    fragment: bytes, *, check: Callable[[], None] | None = None,
+) -> int:
     """Record count of one complete canonical items stream."""
-    count, trailing = _canonical_items_layout(fragment)
+    count, trailing = _canonical_items_layout(fragment, check=check)
     if trailing:
         raise DaemonWindowMirrorDivergence(
             "daemon window mirror items end on a record separator"

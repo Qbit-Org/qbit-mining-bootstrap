@@ -180,7 +180,7 @@ def _read_result(output: Any, request: dict[str, int], check: Callable[[], None]
         # Structural verification walks one record at a time and retains no
         # parsed graph. Membership, sorting and the weight fold run only in
         # the independent child. This also rejects a corrupted count header.
-        if _canonical_items_record_count(items) != count:
+        if _canonical_items_record_count(items, check=check) != count:
             raise ValueError("canonical record count mismatch")
         check()
         window = DaemonShareWindowMirror(
