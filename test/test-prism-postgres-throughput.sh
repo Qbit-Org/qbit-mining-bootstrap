@@ -68,8 +68,12 @@ test_name=share_append_throughput_floor_full_size
 # Release, unlike the CI-sized run: this is the "how fast can this host go"
 # measurement, and a debug build would report the compiler's overhead as the
 # ledger's. The CI floor is calibrated separately, in debug.
+# Without the leading `test`: the direct call below adds it, and
+# `prism-native-tests.sh cargo-args` runs `cargo test "$@"` itself. Passing
+# `test` here too would make the second one a test-name filter, and the run
+# would select nothing and exit 0 having measured nothing.
 cargo_args=(
-  test --locked --release -p qbit-prism-server --test throughput_floor --
+  --locked --release -p qbit-prism-server --test throughput_floor --
   --ignored --exact "${test_name}" --nocapture
 )
 
@@ -79,7 +83,7 @@ cargo_args=(
 # status is re-raised immediately afterwards.
 status=0
 if [[ -n "${PRISM_TEST_DATABASE_URL:-}" ]]; then
-  cargo "${cargo_args[@]}" || status=$?
+  cargo test "${cargo_args[@]}" || status=$?
 else
   # prism-native-tests.sh initdb's a throwaway cluster on a random loopback
   # port, exports PRISM_TEST_DATABASE_URL for the command it runs, and stops

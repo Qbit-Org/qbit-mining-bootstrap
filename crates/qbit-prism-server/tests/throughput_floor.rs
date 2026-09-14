@@ -401,6 +401,17 @@ struct Config {
     report_path: PathBuf,
 }
 
+/// How the test was selected, which decides what a missing database means.
+///
+/// `Ci` is the test CI runs unasked: with no database it skips, and the gate
+/// still fails it in the native job. `Explicit` is the `#[ignore]`d run an
+/// operator selects by name, which must fail rather than skip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Selection {
+    Ci,
+    Explicit,
+}
+
 /// Per-test defaults, overridden by the `QBIT_PRISM_THROUGHPUT_*` variables.
 #[derive(Clone, Copy, Debug)]
 struct Defaults {
@@ -864,8 +875,9 @@ async fn read_lock_statements(pool: &PgPool) -> Value {
         "caveat".to_owned(),
         Value::from(
             "pg_stat_statements normalizes MIGRATION_LOCK, ORDER_LOCK and SETTLEMENT_LOCK to one \
-             statement; the counters are reset immediately before each level, after the schema \
-             has been created, so they are dominated by ORDER_LOCK",
+             statement; a level's figures are the difference of two reads taken around it, so \
+             they cover whatever that level's appends took, and the other two keys contribute \
+             only if something else took them meanwhile",
         ),
     );
     let unavailable = |object: &mut Map<String, Value>, reason: String| {
@@ -943,15 +955,50 @@ async fn lock_statements_namespace(pool: &PgPool) -> Result<Option<String>, sqlx
     .await
 }
 
-/// Best-effort reset before a level. A failure is not fatal: the extension may
-/// be absent, or the role may lack the privilege, and either way the level's
-/// `pg_stat_statements` block reports what it could read.
-async fn reset_lock_statements(pool: &PgPool) {
-    if let Ok(Some(namespace)) = lock_statements_namespace(pool).await {
-        let _ = sqlx::query(&format!("SELECT {namespace}.pg_stat_statements_reset()"))
-            .execute(pool)
-            .await;
+/// The counters a level added, as the difference of two reads.
+///
+/// Resetting `pg_stat_statements` would clear the whole server's statistics,
+/// including other databases and applications; an operator who points this run
+/// at a shared server has not agreed to that. A difference costs nothing and
+/// measures the same thing, so long as the report says so.
+fn lock_statement_delta(before: &Value, after: &Value) -> Value {
+    let mut object = match after.as_object() {
+        Some(object) => object.clone(),
+        None => return after.clone(),
+    };
+    object.insert(
+        "method".to_owned(),
+        Value::from(
+            "the difference of pg_stat_statements counters read before and after the level; the \
+             server's statistics are never reset, so an unrelated workload's history cannot be \
+             destroyed by a measurement",
+        ),
+    );
+    let number = |value: &Value, key: &str| value.get(key).and_then(Value::as_f64);
+    match (
+        number(before, "calls"),
+        number(after, "calls"),
+        number(before, "total_exec_time_milliseconds"),
+        number(after, "total_exec_time_milliseconds"),
+    ) {
+        (Some(calls_before), Some(calls_after), Some(time_before), Some(time_after)) => {
+            object.insert(
+                "calls".to_owned(),
+                Value::from((calls_after - calls_before).max(0.0) as i64),
+            );
+            object.insert(
+                "total_exec_time_milliseconds".to_owned(),
+                json_f64((time_after - time_before).max(0.0)),
+            );
+        }
+        _ => {
+            // One of the two reads could not produce a counter, so the
+            // difference is unknown rather than zero (EP-OBSERVABILITY).
+            object.insert("calls".to_owned(), Value::Null);
+            object.insert("total_exec_time_milliseconds".to_owned(), Value::Null);
+        }
     }
+    Value::Object(object)
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,7 +1237,7 @@ async fn run_level(
         .connect(&db.url)
         .await
         .context("opening the ORDER_LOCK sampling connection")?;
-    reset_lock_statements(&sampler_pool).await;
+    let statements_before = read_lock_statements(&sampler_pool).await;
     let stop = Arc::new(SamplerStop::default());
     let sampler = tokio::spawn(sample_order_lock(
         sampler_pool.clone(),
@@ -1233,8 +1280,11 @@ async fn run_level(
             Ok::<(), anyhow::Error>(())
         }));
     }
-    barrier.wait().await;
+    // Before the barrier, not after: the appenders are released the moment the
+    // main participant arrives, and a task the runtime resumes first would
+    // otherwise do work outside the measured window and inflate the rate.
     let started = Instant::now();
+    barrier.wait().await;
     let mut failure: Option<anyhow::Error> = None;
     for handle in handles {
         // Every appender is awaited even after one has failed, so the level
@@ -1260,7 +1310,10 @@ async fn run_level(
             ..LockWaitSummary::default()
         },
     };
-    let statements = read_lock_statements(&sampler_pool).await;
+    let statements = lock_statement_delta(
+        &statements_before,
+        &read_lock_statements(&sampler_pool).await,
+    );
     sampler_pool.close().await;
     if let Some(error) = failure {
         return Err(error.context(format!("level of {appenders} appender(s) failed")));
@@ -1633,14 +1686,21 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
 // Test bodies
 // ---------------------------------------------------------------------------
 
-async fn run_floor(test_name: &str, defaults: Defaults) -> Result<()> {
+async fn run_floor(test_name: &str, defaults: Defaults, selection: Selection) -> Result<()> {
     // Configuration is validated first, so a malformed variable costs nothing:
     // no connection, no schema, no seeding. Nothing below this line can run
     // with an out-of-range sampling interval or an uncomparable floor
     // (EP-VALIDATION).
     let config = Config::from_env(test_name, defaults)?;
-    let Some(raw) = gate::database_url(gate::site!())? else {
-        return Ok(());
+    // An explicitly selected `#[ignore]`d run must never skip: the gate crate
+    // provides `required_database_url` for exactly that, and a silent success
+    // here would look like a measurement that simply found nothing to say.
+    let raw = match selection {
+        Selection::Ci => match gate::database_url(gate::site!())? {
+            Some(url) => url,
+            None => return Ok(()),
+        },
+        Selection::Explicit => gate::required_database_url(gate::site!())?,
     };
     println!(
         "throughput_floor: window={} shares/level={} appenders={:?} floor={:.1} ({}) \
@@ -1732,6 +1792,7 @@ async fn share_append_throughput_floor() -> Result<()> {
             window_shares: 20_000,
             shares_per_level: 2_000,
         },
+        Selection::Ci,
     )
     .await
 }
@@ -1748,6 +1809,7 @@ async fn share_append_throughput_floor_full_size() -> Result<()> {
             window_shares: 100_000,
             shares_per_level: 20_000,
         },
+        Selection::Explicit,
     )
     .await
 }
