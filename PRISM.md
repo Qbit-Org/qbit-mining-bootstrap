@@ -191,7 +191,10 @@ Both runtime roles serve `/metrics` with HTTP 200 and freshness headers, even
 before the first observation or when it is stale. Read `X-Prism-Metrics-State`
 alongside readiness from `/healthz`; see the [metrics freshness contract and
 inspection command](docs/prism-ledger-ops.md#health-diagnostics-and-validation)
-and the [native metric inventory](docs/prism-native-metrics.md).
+and the [generated metric inventory for both roles](docs/prism-native-metrics.md).
+Use the [deployed-alert migration and rules-file diff](docs/prism-alert-migration.md)
+when cutting over from Python; it maps every retired alert to its native rule or
+explains why there is no replacement.
 
 ## Run and operate
 
@@ -263,11 +266,15 @@ cargo run --locked --release -p qbit-prism-server -- benchmark \
 ```
 
 The native test wrapper uses a supplied `PRISM_TEST_DATABASE_URL` or starts an
-isolated local PostgreSQL cluster. Its default database mode runs all server
-targets and then explicitly runs the ignored database collector test, matching
-the CI invocation. Live tests use real qbitd regtest and bounded
-CPU mining. The builder benchmark measures synthetic build-and-verify work;
-complete Stratum-to-durable-commit capacity requires separate load evidence.
+isolated local PostgreSQL cluster. Its default mode runs the whole workspace and
+the two explicit `--ignored` database runs, matching the CI job, and once
+`qbitd` and the PostgreSQL server tools are present it requires every gated
+test to execute and checks the gate's manifest against
+`test/prism-gated-tests.txt`; see
+[the integration test gate](docs/prism-integration-test-gate.md). Live tests
+use real qbitd regtest and bounded CPU mining. The builder benchmark measures
+synthetic build-and-verify work; complete Stratum-to-durable-commit capacity
+requires separate load evidence.
 
 - [Migration and multi-instance deployment](docs/prism-rust-migration.md)
 - [Ledger operations and recovery](docs/prism-ledger-ops.md)

@@ -26,7 +26,7 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone)]
 pub struct ApiConfig {
@@ -109,6 +109,9 @@ pub struct ApiState {
     client: reqwest::Client,
     cache: ResponseCache,
     public_pool: PgPool,
+    /// Imported audit decodes run after their read connection is released,
+    /// so they share the read pool's concurrency through this limit instead.
+    audit_decodes: Arc<Semaphore>,
     public_service: Option<Arc<public_service::ServiceState>>,
 }
 #[derive(Clone, Debug)]
@@ -132,13 +135,14 @@ impl Payload {
 }
 impl ApiState {
     pub fn new(pool: PgPool, config: ApiConfig, registry: Arc<crate::metrics::Metrics>) -> Self {
-        let public_pool = public_service::read_pool(
-            pool.connect_options().as_ref().clone(),
+        let (public_pool, audit_decodes) = read_limits(
+            &pool,
             env_num("PRISM_POSTGRES_READ_CONCURRENCY", 4).clamp(1, 1024) as u32,
         );
         Self {
             pool,
             public_pool,
+            audit_decodes,
             public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
@@ -154,6 +158,16 @@ impl ApiState {
                 .expect("HTTP client"),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+    /// Resize the public read pool and the audit decode limit together.
+    pub fn with_read_concurrency(mut self, concurrency: u32) -> Self {
+        (self.public_pool, self.audit_decodes) = read_limits(&self.pool, concurrency);
+        self
+    }
+    /// The shared imported-audit decode limit, observed by the tests.
+    #[doc(hidden)]
+    pub fn audit_decode_limit(&self) -> Arc<Semaphore> {
+        self.audit_decodes.clone()
     }
     pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
         self.registry.clone()
@@ -197,6 +211,14 @@ impl ApiState {
         }
         Ok(payload["result"].clone())
     }
+}
+/// One read concurrency bounds both the public read pool and the imported
+/// audit decodes that continue after their connection is back in that pool.
+fn read_limits(pool: &PgPool, concurrency: u32) -> (PgPool, Arc<Semaphore>) {
+    (
+        public_service::read_pool(pool.connect_options().as_ref().clone(), concurrency),
+        Arc::new(Semaphore::new(concurrency as usize)),
+    )
 }
 pub fn router(state: ApiState) -> Router {
     Router::new().fallback(any(handle)).with_state(state)

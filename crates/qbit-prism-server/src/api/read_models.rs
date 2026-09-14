@@ -192,6 +192,46 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         })
         .await
         .map_err(|_| ApiError::internal())??;
+    } else if value["has_canonical_audit_bytes"] == true {
+        // Imported canonical bytes are authoritative over any inline or
+        // filesystem copy, so the query above projected no inline body for
+        // them. A corrupt value refuses the row; it never falls back to
+        // body_uri, even when that file still exists.
+        //
+        // The bytes and their decode outlive the read connection, so the
+        // read concurrency bounds them here. The permit moves into the
+        // blocking decode: a dropped request cannot free it before the
+        // decode ends. Waiting for it spends the request's own deadline.
+        let permit = state
+            .audit_decodes
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        let canonical: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        )
+        .bind(
+            value["block_hash"]
+                .as_str()
+                .ok_or_else(ApiError::internal)?,
+        )
+        .fetch_optional(&state.pool)
+        .await?
+        .flatten();
+        if let Some(bytes) = canonical {
+            let expected = value["audit_bundle_sha256"]
+                .as_str()
+                .ok_or_else(ApiError::internal)?
+                .to_string();
+            value["audit_bundle"] =
+                crate::ledger::decode_canonical_audit_body(bytes, expected, Some(permit))
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%error,"imported canonical audit decode failed");
+                        audit_read_error(error)
+                    })?;
+        }
     }
     if value["audit_bundle"].is_null() {
         let uri = value["body_uri"]
@@ -230,11 +270,14 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         .await
         .map_err(|_| ApiError::internal())??;
     }
-    value.as_object_mut().unwrap().remove("body_uri");
-    value
-        .as_object_mut()
-        .unwrap()
-        .remove("share_snapshot_sha256");
+    let object = value.as_object_mut().unwrap();
+    for internal in [
+        "body_uri",
+        "share_snapshot_sha256",
+        "has_canonical_audit_bytes",
+    ] {
+        object.remove(internal);
+    }
     Ok(value)
 }
 pub(super) async fn manifest_set(state: &ApiState, hash: &str) -> ApiResult<Value> {

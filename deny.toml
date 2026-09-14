@@ -1,0 +1,59 @@
+# cargo-deny configuration. CI runs `cargo deny check` with the version that
+# .github/scripts/install-pinned-tool.sh pins; run the same locally with
+# `cargo deny check` once cargo-deny is on PATH.
+#
+# Every ignore below names its reason. Add to a list only with one.
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RustSec advisories: any vulnerability, unmaintained crate, or yanked
+# version in the lock file fails the check.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every crate in the graph must carry one of these licenses. The list is what
+# the workspace's dependency tree actually uses; extend it with a reason.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # webpki-roots ships Mozilla's CA certificate bundle as data under the
+    # Community Data License Agreement (permissive); it reaches the graph
+    # through rustls in reqwest and sqlx.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# Duplicate versions of one crate are reported but do not fail the check;
+# the workspace does not yet hold its tree to one version per crate.
+multiple-versions = "warn"
+# A dependency with no version requirement is refused, except the workspace's
+# own path dependencies, which Cargo resolves to the one local copy.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io. A git or alternative-registry dependency needs a reason
+# and an entry here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

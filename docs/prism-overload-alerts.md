@@ -2,8 +2,10 @@
 
 Historical specification for the removed Python coordinator. Its scheduler,
 delivery, and backlog metric names do not describe the native runtime. Use the
-current metric inventory in [PRISM.md](../PRISM.md) when adapting deployment
-alerts for Rust. The remaining document records the original rationale.
+current [native metric inventory](prism-native-metrics.md) and
+[deployed-alert migration](prism-alert-migration.md) when adapting deployment
+alerts for Rust. The remaining document records the original rationale;
+its undeployed rules are not the native alert specification.
 
 Issue #188. This document specifies the alerting rules for PRISM's
 landing-path, delivery, and backlog overload classes. It is a
@@ -692,8 +694,9 @@ warning or the 5 s accepted-parent child wait budget
   still-exact accepted-share window (`force_prior_balances_read=True`,
   `force_full_window_rescan=False`) instead of the O(window) oracle rescan.
   This rests on the verified invariant that reconciliation never writes
-  `qbit_share_ledger` (proved in `test/test-prism-postgres-ledger.sh`,
-  `share-ledger-identity=inactive+reactivate+mature`). Every other full
+  `qbit_share_ledger` (proved on 2.x.x in `test/test-prism-postgres-ledger.sh`,
+  `share-ledger-identity=inactive+reactivate+mature`; the 3.x.x native ledger
+  suite runs through `make test-prism-postgres`). Every other full
   rescan trigger is unchanged, including the fail-closed one below.
 - The landing, the reconciler and the payout-window oracle record
   fixed-cardinality attribution families (below). Every label is a closed

@@ -15,6 +15,7 @@ use qbit_prism_server::{
     },
     ledger::Ledger,
 };
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -35,7 +36,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn open() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;

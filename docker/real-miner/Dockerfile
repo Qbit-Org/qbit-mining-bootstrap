@@ -8,6 +8,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG CPUMINER_GIT_URL
 ARG CPUMINER_GIT_REF
 
+# Package versions follow the image's Ubuntu release rather than pins that
+# rot with every security update; the runtime and its base are not this
+# workstream's to change (#288 owns container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf \
     automake \
@@ -39,6 +43,10 @@ RUN ./autogen.sh \
 FROM ubuntu:${UBUNTU_VERSION}
 
 ARG DEBIAN_FRONTEND=noninteractive
+# Package versions follow the image's Ubuntu release rather than pins that
+# rot with every security update; the runtime and its base are not this
+# workstream's to change (#288 owns container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \

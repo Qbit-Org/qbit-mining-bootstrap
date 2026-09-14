@@ -1,6 +1,7 @@
 //! Real PostgreSQL ownership tests with short leases and deliberately blocked work.
 use super::*;
 use axum::{extract::State, routing::post, Json, Router};
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
@@ -124,8 +125,7 @@ struct Fixture {
 
 impl Fixture {
     async fn open() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("set PRISM_TEST_DATABASE_URL for candidate lease integration");
+        let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;
@@ -160,6 +160,8 @@ impl Fixture {
             expected_genesis_hash: None,
             min_peers: 1,
             template_max_age: Duration::from_secs(120),
+            submit_tip_max_age: Duration::from_secs(10),
+            template_refresh_failure_exit: Duration::from_secs(120),
             rpc_url,
             rpc_user: "test".into(),
             rpc_password: "test".into(),
@@ -203,7 +205,7 @@ impl Fixture {
             .ledger
             .observe_chain_view(&"aa".repeat(32), 100, "01")
             .await?;
-        *coordinator.observed_tip.write().await = Some("aa".repeat(32));
+        *coordinator.observed_tip.write().await = TipState::baseline("aa".repeat(32));
         coordinator
             .ledger
             .append(
@@ -534,7 +536,7 @@ async fn early_chain_probe_skips_only_proven_stale_work_and_recovers_active_bloc
                 node.height = 101;
                 node.chainwork = "02".into();
             }
-            *fixture.coordinator.observed_tip.write().await = None;
+            *fixture.coordinator.observed_tip.write().await = TipState::default();
             let mut process = fixture.process(SHORT_LEASE);
             if active {
                 fixture.wait_for_renewal().await?;

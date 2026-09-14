@@ -178,11 +178,34 @@ pub async fn run(config: Config) -> Result<()> {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
-    coordinator
+    // SessionOwner::stop() verifies that no active or pending guard remains.
+    // Publish stopped first; only then is it safe to release this token's
+    // reservations. On failure, retain reservations and close without a
+    // stopped marker so a replacement cannot reclaim live IDs.
+    if let Err(error) = coordinator
         .ledger
         .heartbeat(serde_json::json!({"state":"stopped"}))
-        .await?;
+        .await
+    {
+        coordinator.ledger.pool.close().await;
+        if let Some(failure) = failure {
+            return Err(anyhow::anyhow!(
+                "shutdown marker failed: {error}; original failure: {failure}"
+            ));
+        }
+        return Err(error);
+    }
+    let cleanup_error = coordinator
+        .ledger
+        .release_session_owner_reservations()
+        .await
+        .err();
     coordinator.ledger.pool.close().await;
+    if let Some(error) = cleanup_error {
+        return Err(anyhow::anyhow!(
+            "session reservation cleanup failed after stopped marker: {error}"
+        ));
+    }
     if let Some(error) = failure {
         return Err(error);
     }

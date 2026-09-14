@@ -243,7 +243,9 @@ pub fn merkle_branch_for_coinbase(transactions: &[Vec<u8>]) -> Result<Vec<[u8; 3
             level.push(*level.last().unwrap());
         }
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| double_sha256(&[p[0].as_slice(), p[1].as_slice()].concat()))
             .collect();
     }
@@ -346,7 +348,7 @@ impl Job {
             "previousblockhash must be 32 bytes"
         );
         prevhash_bytes.reverse();
-        for word in prevhash_bytes.chunks_exact_mut(4) {
+        for word in prevhash_bytes.as_chunks_mut::<4>().0 {
             word.reverse();
         }
         let nbits = parse_u32_hex(template["bits"].as_str().context("template bits missing")?)?;

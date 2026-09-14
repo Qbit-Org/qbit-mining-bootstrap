@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use qbit_prism_server::api::{router, ApiConfig, ApiState};
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -38,8 +39,7 @@ async fn rpc(Json(input): Json<Value>) -> Json<Value> {
 
 #[tokio::test]
 async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
-    let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("PRISM_TEST_DATABASE_URL not set; database contract test skipped");
+    let Some(url) = gate::database_url(gate::site!()).expect("integration gate") else {
         return;
     };
     let admin = PgPool::connect(&url).await.unwrap();
@@ -359,8 +359,7 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
 
 #[tokio::test]
 async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
-    let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("PRISM_TEST_DATABASE_URL not set; accepted-block contract test skipped");
+    let Some(url) = gate::database_url(gate::site!()).expect("integration gate") else {
         return;
     };
     let admin = PgPool::connect(&url).await.unwrap();

@@ -3,6 +3,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{verify_audit_bundle_against_coinbase_tx_hex, AuditBundle};
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::{
@@ -59,6 +60,8 @@ struct Fixture {
     servers: Vec<Process>,
     miners: Vec<Process>,
     node: Process,
+    /// The `qbitd` executable the node was started from, for restarts.
+    qbitd: String,
     client: reqwest::Client,
     address: String,
     ctv: bool,
@@ -92,11 +95,7 @@ where
 
 impl Fixture {
     async fn open(ctv: bool) -> Result<Option<Self>> {
-        let (Ok(binary), Ok(database)) = (
-            std::env::var("QBITD_BIN"),
-            std::env::var("PRISM_TEST_DATABASE_URL"),
-        ) else {
-            eprintln!("skipping live regtest; set QBITD_BIN and PRISM_TEST_DATABASE_URL");
+        let Some((binary, database)) = gate::qbitd_and_database_url(gate::site!())? else {
             return Ok(None);
         };
         let directory = tempfile::tempdir()?;
@@ -111,7 +110,7 @@ impl Fixture {
         let database_url = url.to_string();
         let pool = PgPool::connect(&database_url).await?;
         let rpc_port = free_port()?;
-        let mut node_command = Command::new(binary);
+        let mut node_command = Command::new(&binary);
         node_command
             .args([
                 "-regtest",
@@ -141,6 +140,7 @@ impl Fixture {
             servers: Vec::new(),
             miners: Vec::new(),
             node,
+            qbitd: binary,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(45))
                 .build()?,

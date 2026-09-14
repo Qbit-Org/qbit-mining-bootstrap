@@ -1,0 +1,343 @@
+{
+  "reviewed_base": "5355b69462663e9b9e666589147f74e7aeb268dc",
+  "reviewed_head": "3f4caa9896c1b8b412d6e8d75df0dd1f6f1bc278",
+  "stakes": "normal: alert docs/specs/test tooling, no runtime or financial-state mutation",
+  "lanes": {
+    "code-review-cli": {
+      "status": "completed",
+      "note": "local Codex CLI review command at medium effort; installed code-review skill unavailable",
+      "model": "gpt-6-astra",
+      "reasoning_effort": "medium",
+      "result": "No actionable regressions; generators checked, Cargo/PromQL not rerun by this lane"
+    },
+    "codex-adv": {
+      "status": "completed",
+      "model": "gpt-5.6-sol",
+      "result": "Two major findings: idle standby false alert and network connected-client threshold changed to per-instance"
+    },
+    "fable-adv": {
+      "status": "requested from coordinator, not executed locally"
+    },
+    "thermo": {
+      "status": "pending coordinator routing",
+      "note": "Read installed /Users/dan/.claude/skills/thermo-nuclear-code-quality-review/SKILL.md after coordinator supplied exact path; no independent thermo lane executed locally"
+    },
+    "github-ci-bots": {
+      "status": "not executed; no push or PR authorized"
+    },
+    "codex-adv-corrections": {
+      "status": "completed",
+      "model": "gpt-5.6-sol",
+      "requested_diff": "3f4caa9..8e5e8d8",
+      "result": "Two major findings: disabled native UID survives (also found locally and corrected as d1d6c81); synchronous topology can look healthy (subsequently corrected as 2bf64f2)",
+      "final_async_correction_independent_review": "not executed; coordinator and Fable/thermo review remain pending"
+    }
+  },
+  "findings": [
+    {
+      "id": "coordinator-d3-idle-and-stalled-replay",
+      "source": "coordinator",
+      "claim": "NULL replay_lag is valid on healthy idle standby, and last-reported replay latency cannot establish current stalled-backlog age",
+      "file": "docs/prism-postgres-exporter-queries.yaml:9",
+      "disposition": "open",
+      "evidence": "PostgreSQL 16.14 disposable async primary/standby: healthy idle replay_lag=NULL with equal LSNs; paused replay 104-byte backlog with latency 0.00014 to 8.007 seconds; recovered equal LSNs retain latency 9.21 seconds",
+      "sources": [
+        "coordinator",
+        "codex-adv"
+      ],
+      "local_status": "implemented-and-verified",
+      "local_commit": "8e5e8d8c8020de95863cb7a6e723093f8e177260",
+      "remaining": "Coordinator and independent review, then authorized publication; disposition remains open while unpushed",
+      "severity": "major"
+    },
+    {
+      "id": "codex-adv-connected-client-network-floor",
+      "source": "codex-adv",
+      "claim": "Ten-client network-wide floor became a per-instance floor; two healthy instances with six each incorrectly alert twice",
+      "file": "docs/prism-native-alert-rules.json:55",
+      "disposition": "open",
+      "evidence": "Frozen deployed rule sums all qbit_prism_connected_clients for the network; native replacement compares each connections sample to 10",
+      "local_status": "implemented-and-verified",
+      "local_commit": "b85a13740f12c439596fe1243d48e940db700a3b",
+      "remaining": "Coordinator and independent review, then authorized publication; disposition remains open while unpushed",
+      "severity": "major"
+    },
+    {
+      "id": "local-review-disabled-native-uid-survives",
+      "source": "local review",
+      "claim": "Disabled native gate omits a reused legacy UID but fixed deletion list leaves its persisted legacy rule active",
+      "file": "scripts/generate_prism_alerts.py:161",
+      "disposition": "open",
+      "local_status": "implemented-and-verified",
+      "local_commit": "d1d6c818a4dbe68731d0e8604b9eeee91b06deb2",
+      "evidence": "Added rendered UID-set regression failed on all-disabled settings before correction; all ten gate combinations pass after conditional native UID deletion; external definitions identical",
+      "remaining": "Coordinator and independent review, then authorized publication; disposition remains open while unpushed",
+      "sources": [
+        "local review",
+        "codex-adv-corrections"
+      ],
+      "severity": "major"
+    },
+    {
+      "id": "codex-corrective-sync-topology-healthy",
+      "source": "codex-adv-corrections",
+      "claim": "A streaming caught-up synchronous standby satisfies the D3 health predicate although the required topology is asynchronous",
+      "file": "docs/prism-postgres-exporter-queries.yaml:13 (reviewed 8e5e8d8)",
+      "disposition": "open",
+      "local_status": "implemented-and-verified",
+      "local_commit": "2bf64f2fbf6861320e05e62e07a9c741abd5953e",
+      "evidence": "Four synthetic PromQL cases returned healthy zero before correction; all pass with explicit fresh async gauge validation, and real PostgreSQL tests cover selected synchronous standby, synchronous requirement on another standby, and restored async configuration without hiding known WAL positions",
+      "remaining": "Final correction needs coordinator/independent review and authorized publication",
+      "severity": "major"
+    }
+  ],
+  "local_head": "2bf64f2fbf6861320e05e62e07a9c741abd5953e",
+  "publication": "not pushed; no PR; coordinator final review required",
+  "sql_evidence": {
+    "postgres": "postgres (PostgreSQL) 16.14 (Homebrew)",
+    "exporter": "not started; status inputs controlled by harness",
+    "wrong_role_query": "failed as expected",
+    "cases": [
+      {
+        "name": "SQL healthy idle NULL lag has caught-up WAL proof",
+        "sample": 6,
+        "expect": [
+          0,
+          0
+        ],
+        "alerts": [
+          false,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 8.047,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429760,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429760,
+            "replay_lag": 0
+          },
+          "raw_replay_lag": null
+        }
+      },
+      {
+        "name": "SQL recent write remains inside five-second allowance",
+        "sample": 10,
+        "expect": [
+          0,
+          0
+        ],
+        "alerts": [
+          false,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 12.126,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429864,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429760,
+            "replay_lag": 3.004356
+          },
+          "raw_replay_lag": 3.004356
+        }
+      },
+      {
+        "name": "SQL paused replay exceeds allowance but not dwell",
+        "sample": 13,
+        "expect": [
+          1,
+          0
+        ],
+        "alerts": [
+          false,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 15.142,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429864,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429760,
+            "replay_lag": 6.00784
+          },
+          "raw_replay_lag": 6.00784
+        }
+      },
+      {
+        "name": "SQL paused replay passes one-minute dwell",
+        "sample": 75,
+        "expect": [
+          1,
+          0
+        ],
+        "alerts": [
+          true,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 77.371,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429760,
+            "replay_lag": 67.459052
+          },
+          "raw_replay_lag": 67.459052
+        }
+      },
+      {
+        "name": "SQL resumed replay is caught up despite old reported latency",
+        "sample": 76,
+        "expect": [
+          0,
+          0
+        ],
+        "alerts": [
+          false,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 78.396,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429920,
+            "replay_lag": 0
+          },
+          "raw_replay_lag": 62.843997
+        }
+      },
+      {
+        "name": "SQL synchronous standby violates required asynchronous topology",
+        "sample": 78,
+        "expect": [
+          1,
+          0
+        ],
+        "alerts": null,
+        "observation": {
+          "elapsed_seconds": 80.498,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 0,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429920,
+            "replay_lag": 0
+          },
+          "raw_replay_lag": null
+        }
+      },
+      {
+        "name": "SQL primary waiting for another standby also violates topology",
+        "sample": 80,
+        "expect": [
+          1,
+          0
+        ],
+        "alerts": null,
+        "observation": {
+          "elapsed_seconds": 82.595,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 0,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429920,
+            "replay_lag": 0
+          },
+          "raw_replay_lag": null
+        }
+      },
+      {
+        "name": "SQL asynchronous topology restored",
+        "sample": 81,
+        "expect": [
+          0,
+          0
+        ],
+        "alerts": [
+          false,
+          false
+        ],
+        "observation": {
+          "elapsed_seconds": 83.654,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 1,
+            "async": 1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": 0,
+            "replay_lsn_lo": 50429920,
+            "replay_lag": 0
+          },
+          "raw_replay_lag": null
+        }
+      },
+      {
+        "name": "SQL disconnected standby is unknown and unavailable",
+        "sample": 83,
+        "expect": [
+          1,
+          1
+        ],
+        "alerts": null,
+        "observation": {
+          "elapsed_seconds": 85.833,
+          "metrics": {
+            "application_name": "prism_standby_1",
+            "count": 0,
+            "async": -1,
+            "primary_flush_lsn_hi": 0,
+            "primary_flush_lsn_lo": 50429920,
+            "replay_lsn_hi": -1,
+            "replay_lsn_lo": -1,
+            "replay_lag": -1
+          },
+          "raw_replay_lag": null
+        }
+      }
+    ]
+  },
+  "checks": {
+    "observability": "executed-and-passed: 12 tests; none skipped",
+    "promql_synthetic": "executed-and-passed: 38 scenarios, 86 predicates, 12 alert states",
+    "promql_sql": "executed-and-passed: 9 scenarios, 18 predicates, 12 alert states",
+    "provisioning": "executed-and-passed: 10 gate combinations; patch check and application; external equality; conditional deletion",
+    "format_and_diff": "executed-and-passed",
+    "400k_regression_500k_headroom": "not executed; qualification targets preserved",
+    "live_exporter_grafana": "not executed; integration remains #281/#291"
+  },
+  "verification_head": "2bf64f2fbf6861320e05e62e07a9c741abd5953e",
+  "review_outputs": {
+    "code-review-cli": "No actionable regressions were identified in the alert specifications, deployment-patch generator, or inventory tests. Both generators passed their consistency checks, including comparison against the frozen deployment snapshot; Cargo and PromQL tests were not rerun.",
+    "codex-adv": "FINDING 1: A healthy, caught-up PostgreSQL standby is reported as unknown and triggers the replay-lag alert during normal idle periods.\nFILE: docs/prism-postgres-exporter-queries.yaml:9\nSCENARIO: `pg_stat_replication` contains `prism_standby_1`, but PostgreSQL sets `replay_lag=NULL` after the caught-up standby has been idle \u2192 SQL converts it to `-1`; `docs/prism-postgres-alert-rules.json:6` treats `< 0` as failure and fires `PrismHAStandbyReplayLagHigh` after one minute despite `count=1` and `pg_up=1`.\nSEVERITY: major\n\nFINDING 2: The connected-client migration changes the threshold from a network-wide total to a per-instance minimum.\nFILE: docs/prism-native-alert-rules.json:55\nSCENARIO: Two fresh `qbit-prism` instances report six connections each \u2192 the deployed expression removed at `docs/prism-alert-rules-qbit-tools.patch:212` sums to 12 and remains healthy, while the replacement at patch line 224 evaluates `6 < 10` independently for both instances and emits two alerts after three minutes. All committed scenarios use a single instance, so this regression passes.\nSEVERITY: major",
+    "codex-adv-corrections": "FINDING 1: Gate-independent deletion generation leaves disabled, previously provisioned alerts active in Grafana.\nFILE: scripts/generate_prism_alerts.py:113\nSCENARIO: Grafana already contains `qbit-prism-connected-clients`; render with `qbit_monitoring_stack_prism_alert_connected_clients_enabled=false` \u2192 line 141 removes the rule from `groups`, but its UID remains in `kept_uids`, so no `deleteRules` entry is emitted and Grafana retains the active legacy alert. The deployment test still passes because line 91 compares against the same gate-independent UID set.\nSEVERITY: major\n\nFINDING 2: D3 reports a synchronous standby as healthy despite requiring an asynchronous topology.\nFILE: docs/prism-postgres-exporter-queries.yaml:13\nSCENARIO: Set `synchronous_standby_names='FIRST 1 (prism_standby_1)'` while the single standby is streaming and caught up \u2192 `count=1`, `known=true`, positions match, and both D3 alerts return healthy because `sync_state` is never queried. PRISM acknowledgements now wait for that standby and can stall when it disappears, contradicting the required asynchronous money-path behavior without any alert.\nSEVERITY: major"
+  }
+}

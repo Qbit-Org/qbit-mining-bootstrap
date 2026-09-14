@@ -4,15 +4,14 @@ use qbit_prism_server::{
     ledger::Ledger,
     metrics::{collectors, Metrics},
 };
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; required CI runs --test observability_database -- --ignored"]
 async fn collector_uses_real_schema_pending_rows_and_failed_read_semantics() -> Result<()> {
-    let raw = std::env::var("PRISM_TEST_DATABASE_URL").context(
-        "PRISM_TEST_DATABASE_URL is required for this explicitly selected database test",
-    )?;
+    let raw = gate::required_database_url(gate::site!())?;
     let admin = PgPool::connect(&raw).await?;
     let schema = format!("prism_metrics_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE SCHEMA {schema}"))

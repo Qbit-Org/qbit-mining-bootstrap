@@ -49,3 +49,5 @@ are in [Validation](validation.md).
 - [Stacked PRs](stacked-prs.md): publication order and reconstruction rules.
 - [A1 audit artifacts](a1-audit-artifacts.md): durable storage contract.
 - [B3 decision](b3-decision.md): finalization concurrency evidence.
+- [Window reference](window-ref.md): `WindowRef` and `Ledger::read_window`
+  design for the native server (#264).

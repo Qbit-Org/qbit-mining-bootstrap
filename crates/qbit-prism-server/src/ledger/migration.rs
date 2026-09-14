@@ -49,8 +49,8 @@ impl Ledger {
             let source_hash = hash.clone();
             let source_digest = expected_digest.clone();
             let key = ledger_key.to_owned();
-            let (bundle, canonical_bytes) =
-                tokio::task::spawn_blocking(move || -> Result<(AuditBundle, Vec<u8>)> {
+            let (metadata, canonical_bytes) =
+                tokio::task::spawn_blocking(move || -> Result<(ImportedAudit, Vec<u8>)> {
                     let sidecar = legacy_canonical_sidecar(
                         root.as_deref(),
                         source_uri.as_deref(),
@@ -104,19 +104,37 @@ impl Ledger {
                         hex::encode(Sha256::digest(&canonical_bytes)) == source_digest,
                         "legacy canonical audit bytes mismatch"
                     );
-                    Ok((bundle, canonical_bytes))
+                    // The parsed window is dropped here, off the runtime
+                    // threads and before the write transaction opens.
+                    Ok((
+                        ImportedAudit {
+                            schema: bundle.schema,
+                            network_difficulty: bundle.found_block.network_difficulty.to_string(),
+                            coinbase_value_sats: i64::try_from(
+                                bundle.found_block.coinbase_value_sats,
+                            )?,
+                            audit_commitment_leaves_hex: serde_json::to_value(
+                                &bundle.audit_commitment_leaves_hex,
+                            )?,
+                            witness_merkle_leaves_hex: serde_json::to_value(
+                                &bundle.witness_merkle_leaves_hex,
+                            )?,
+                        },
+                        canonical_bytes,
+                    ))
                 })
                 .await??;
-            let value = serde_json::to_value(&bundle)?;
             let mut tx = self.pool.begin().await?;
             lock(&mut tx, SETTLEMENT_LOCK).await?;
             writable(&mut tx).await?;
-            // Retain legacy inline shape on import, including valid historical
-            // snapshots whose ledger history was archived before Rust cutover.
-            // Newly mined bodies use the normalized range-backed representation.
-            let updated = sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,schema_version=$3,found_block_network_difficulty=$4::text::numeric,found_block_coinbase_value_sats=$5,audit_commitment_leaves_hex=$6,witness_merkle_leaves_hex=$7,canonical_audit_bytes=$10 WHERE block_hash=$1 AND canonical_audit_bytes IS NULL AND body_uri IS NOT DISTINCT FROM $8 AND audit_bundle_sha256=$9")
-                .bind(&hash).bind(value).bind(&bundle.schema).bind(bundle.found_block.network_difficulty.to_string()).bind(i64::try_from(bundle.found_block.coinbase_value_sats)?)
-                .bind(serde_json::to_value(&bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&bundle.witness_merkle_leaves_hex)?).bind(&uri).bind(expected_digest).bind(canonical_bytes).execute(&mut *tx).await?.rows_affected();
+            // Store the exact canonical bytes and the non-share metadata only;
+            // readers decode the bytes. A two-copy inline JSONB body would cross
+            // PostgreSQL's container limit at production window sizes. Inline
+            // bodies already stored on rows without a body_uri are left as they
+            // are: the body-present CHECK needs one of the two.
+            let updated = sqlx::query("UPDATE qbit_pool_audit_bundles SET schema_version=$2,found_block_network_difficulty=$3::text::numeric,found_block_coinbase_value_sats=$4,audit_commitment_leaves_hex=$5,witness_merkle_leaves_hex=$6,canonical_audit_bytes=$9 WHERE block_hash=$1 AND canonical_audit_bytes IS NULL AND body_uri IS NOT DISTINCT FROM $7 AND audit_bundle_sha256=$8")
+                .bind(&hash).bind(&metadata.schema).bind(&metadata.network_difficulty).bind(metadata.coinbase_value_sats)
+                .bind(&metadata.audit_commitment_leaves_hex).bind(&metadata.witness_merkle_leaves_hex).bind(&uri).bind(expected_digest).bind(canonical_bytes).execute(&mut *tx).await?.rows_affected();
             tx.commit().await?;
             imported += usize::try_from(updated)?;
         }
@@ -177,6 +195,16 @@ impl Ledger {
         }
         Ok(repaired)
     }
+}
+
+/// The non-share metadata the legacy import stores beside an audit's
+/// canonical bytes, so the parsed window need not outlive verification.
+struct ImportedAudit {
+    schema: String,
+    network_difficulty: String,
+    coinbase_value_sats: i64,
+    audit_commitment_leaves_hex: Value,
+    witness_merkle_leaves_hex: Value,
 }
 
 fn legacy_canonical_sidecar(

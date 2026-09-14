@@ -122,6 +122,31 @@ async fn large_resource_budgets_fail_instead_of_truncating_or_panicking() {
     ] {
         rejects(false, &[(name, value)], name).await;
     }
+    for name in [
+        "PRISM_SUBMIT_TIP_MAX_AGE_SECONDS",
+        "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
+    ] {
+        for value in ["-1", "86401", "NaN", "inf", "1e309"] {
+            rejects(false, &[(name, value)], name).await;
+        }
+    }
+    for name in [
+        "PRISM_SUBMIT_TIP_MAX_AGE_SECONDS",
+        "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
+    ] {
+        let output = check(false, &[(name, "0")]).await;
+        assert!(
+            output.status.success(),
+            "zero {name} rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    rejects(
+        true,
+        &[("PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS", "0")],
+        "production mode requires a positive PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
+    )
+    .await;
 }
 
 #[tokio::test]

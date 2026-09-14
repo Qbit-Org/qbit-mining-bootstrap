@@ -13,7 +13,7 @@ shared local filesystem.
 | Blocks, payouts, carry-forward, maturity/reorg state | Permanent PostgreSQL accounting history |
 | Native audit share snapshots | Permanent range/count/anchor/digest metadata referencing immutable shares |
 | Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL |
-| Imported legacy audits | Verified logical inline body in PostgreSQL; original backup retained |
+| Imported legacy audits | Digest-checked canonical bytes (bytea) plus non-share metadata in PostgreSQL; an inline body survives only on inline-only rows; original backup retained |
 | CTV manifests, transactions, outcomes | Durable PostgreSQL recovery and audit state |
 | CPFP funding reservations and signed child packages | Durable recovery records; retain until reconciled |
 | Pending block candidates and deferred credit | Durable until resolved; retained identity/status afterward |

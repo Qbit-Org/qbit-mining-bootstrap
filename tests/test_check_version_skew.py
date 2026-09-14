@@ -153,7 +153,8 @@ class CheckVersionSkewTests(unittest.TestCase):
         result = run_check(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "matches every workspace crate: qbit-pool-builder, qbit-prism, qbit-prism-server",
+            "matches every workspace crate: qbit-pool-builder, qbit-prism, "
+            "qbit-prism-server, qbit-prism-test-gate",
             result.stdout,
         )
 

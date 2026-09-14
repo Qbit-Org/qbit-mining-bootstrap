@@ -343,11 +343,8 @@ fn numeric(value: &Value) -> Option<f64> {
         .filter(|n| n.is_finite())
 }
 
-pub fn router(mut state: ApiState, config: ServiceConfig) -> (Router, Arc<ServiceState>) {
-    state.public_pool = read_pool(
-        state.pool.connect_options().as_ref().clone(),
-        config.read_concurrency,
-    );
+pub fn router(state: ApiState, config: ServiceConfig) -> (Router, Arc<ServiceState>) {
+    let mut state = state.with_read_concurrency(config.read_concurrency);
     let service = Arc::new(ServiceState {
         config,
         pool: state.public_pool.clone(),
@@ -544,7 +541,9 @@ mod tests {
     }
     #[tokio::test]
     async fn every_sql_statement_uses_the_remaining_request_budget() {
-        let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        let Some(url) = qbit_prism_test_gate::database_url(qbit_prism_test_gate::site!())
+            .expect("integration gate")
+        else {
             return;
         };
         let pool = read_pool(PgConnectOptions::from_str(&url).unwrap(), 1);

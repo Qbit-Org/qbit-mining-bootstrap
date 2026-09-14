@@ -19,20 +19,24 @@ use uuid::Uuid;
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
-pub use audit::{audit_canonical_bytes, materialize_audit_row};
+pub use audit::{audit_canonical_bytes, decode_canonical_audit_body, materialize_audit_row};
 mod candidates;
 use candidates::persist_candidate;
 pub use candidates::{Candidate, CandidateClaim};
 mod connect;
 use connect::{lock, require_revision, writable};
+pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
 mod jobs;
+pub use jobs::{IssuedJobSave, PreparedDependency};
 mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;
 use window::{read_prior_balances, share_from_row};
-pub use window::{AppendResult, Snapshot};
+pub use window::{
+    AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
+};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -43,4 +47,5 @@ const SELECT_SHARE: &str = "SELECT share_seq,share_id,miner_id,payout_order_key,
 pub struct Ledger {
     pub pool: PgPool,
     pub instance_id: String,
+    session_owner: std::sync::Arc<connect::SessionOwner>,
 }

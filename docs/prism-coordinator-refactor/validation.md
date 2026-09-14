@@ -57,15 +57,14 @@ Run when a milestone touches persistence, payout, shares, audit, candidates,
 vardiff, or finalization:
 
 ```sh
-make test-prism-postgres-ledger
+make test-prism-postgres
 cargo test -p qbit-prism
 ```
 
 At the concurrency/finalization and final milestones, run:
 
 ```sh
-make test-prism-stratum-regtest-live
-make test-prism-stratum-postgres-regtest-live
+make test-prism-regtest
 ```
 
 If qbitd, qbit-cli, PostgreSQL, Docker, Rust, credentials, or another real
@@ -121,7 +120,7 @@ root; Docker-backed checks ran via `sudo`.
 | --- | --- |
 | PRISM Python discovery (`test_prism_*.py`) | 1,601 passed |
 | full Python discovery | 1,956 passed, 2 skipped (ckpool binary absent); `GIT_CONFIG_GLOBAL=/dev/null` was scoped only to this command |
-| PostgreSQL ledger integration | passed via `sudo bash test/test-prism-postgres-ledger.sh`, including the typed share-replay assertions, the #120 carry-forward equivalence/drift checks, and the three A1 publication gates (transition parity, migration M0-M11, cross-process fencing C1-C3) |
+| PostgreSQL ledger integration | passed via `sudo bash test/test-prism-postgres-ledger.sh` (the 2.x.x script; on 3.x.x the native suite is `make test-prism-postgres`), including the typed share-replay assertions, the #120 carry-forward equivalence/drift checks, and the three A1 publication gates (transition parity, migration M0-M11, cross-process fencing C1-C3) |
 | Rust workspace | 222 passed (`cargo test --locked --workspace --all-targets`), including the audit CLI canonicalizer round-trip regressions |
 | Docker Python compile | passed |
 | Docker Ruff (`E4,E7,E9,F`) | 54 findings, all F821 on lazily evaluated type annotations that deliberately reference coordinator-owned types without importing them (never evaluated at runtime under `from __future__ import annotations`); every removable finding was cleaned in the final ownership layer |
@@ -130,6 +129,7 @@ root; Docker-backed checks ran via `sudo`.
 | structural and target diff audit | passed; see [Structure](structure.md) |
 
 `make test-prism-stratum-regtest-live` and
-`make test-prism-stratum-postgres-regtest-live` are `UNAVAILABLE`: their
+`make test-prism-stratum-postgres-regtest-live` (2.x.x targets; on 3.x.x both
+are `make test-prism-regtest`) are `UNAVAILABLE`: their
 doctor stops at `Required executable not found: qbitd` before either live
 test can run. `qbitd` and `qbit-cli` are absent from the host path.

@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1-bookworm AS build
+# The builder is the toolchain pinned in rust-toolchain.toml, by version and by
+# the multi-arch index digest of that tag on Docker Hub; the docker-builds CI
+# job asserts the stage's cargo reports the pin, and
+# scripts/check_toolchain_pin.py holds the version here to the pin.
+FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
@@ -9,6 +13,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
 
 FROM debian:bookworm-slim
+# The runtime base floats on bookworm-slim, and Debian drops superseded package
+# versions from its archive, so exact apt pins would break the build at the
+# next point or security release; pinning this stage's base and packages
+# belongs to #288 (container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

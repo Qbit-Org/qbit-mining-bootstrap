@@ -1,0 +1,5 @@
+# actionlint configuration: the workflow runs on Blacksmith runners, whose
+# labels actionlint does not know.
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404

@@ -167,7 +167,10 @@ fn signed_carry_total_equals_prior_total_across_blocks() {
     let net_diff = 2_000_001u128;
     let prior_balances: Vec<CarryForwardBalance> = Vec::new();
 
-    for block_index in 0..4_u64 {
+    // The loop this case grew from broke after its first block, so it only ever
+    // checked block 0; the single case is kept as written.
+    let block_index = 0_u64;
+    {
         let base_ms = 10_000 + (block_index as i64 * 100);
         let shares = vec![
             share(
@@ -226,7 +229,6 @@ fn signed_carry_total_equals_prior_total_across_blocks() {
             prior_total, 0,
             "no failed block should mutate signed prior balances"
         );
-        break;
     }
 }
 

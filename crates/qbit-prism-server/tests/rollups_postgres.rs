@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use qbit_prism_server::{ledger::Ledger, rollups};
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
@@ -10,8 +11,7 @@ struct Database {
 }
 impl Database {
     async fn open() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("set PRISM_TEST_DATABASE_URL for real rollup transaction tests");
+        let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;

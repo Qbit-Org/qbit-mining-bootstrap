@@ -572,7 +572,7 @@ fn witness_merkle_root(extra_witness_leaves: &[[u8; 32]]) -> [u8; 32] {
 
 fn merkle_root(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
     while hashes.len() > 1 {
-        let mut next = Vec::with_capacity((hashes.len() + 1) / 2);
+        let mut next = Vec::with_capacity(hashes.len().div_ceil(2));
         for pair in hashes.chunks(2) {
             let left = pair[0];
             let right = if pair.len() == 2 { pair[1] } else { pair[0] };

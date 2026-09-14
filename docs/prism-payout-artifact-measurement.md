@@ -118,11 +118,13 @@ observed results.
 ## JSONB ceiling gate and 400k-share baselines
 
 PostgreSQL refuses a JSONB container whose elements exceed 268,435,455 bytes.
-Four native writes still embed the whole payout window and therefore grow
+Three native writes still embed the whole payout window and therefore grow
 linearly with the share count, so the payout window has a hard storage ceiling
 that arrives well before any capacity limit. The gate at
 `crates/qbit-prism-server/tests/jsonb_ceiling_gate.rs` measures those writes and
-holds the line while they are being removed.
+holds the line while they are being removed. The legacy audit import was a
+fourth until #265. It now stores only the canonical bytes, as `bytea`, and
+writes no JSONB value.
 
 ### Running it
 
@@ -455,6 +457,16 @@ refresh, refused at 200,000, keeps 50,000 and 100,000:
 | enqueue | 494,920,433 B | 498,734,288 B | 0.76% |
 | import | 494,919,351 B | 498,733,206 B | 0.76% |
 | landing | 233,066,529 B | 236,373,666 B | 1.40% |
+
+### After #265's import change
+
+The baseline above predates #265, whose import stores the canonical audit
+bytes instead of an inline JSONB body. With that change, at 400,000 shares the
+import writes no JSONB value: it ran in 129.5 s with 18.7 MB of WAL, and
+`canonical_audit_bytes` holds 445,390,610 B (bytea, reported only). The ratchet
+holds with three known violations. This run was measured on a different host
+from the baseline (Apple M-series, debug build, PostgreSQL 16), so compare its
+timings with the tables above only loosely.
 
 ### Fixture
 

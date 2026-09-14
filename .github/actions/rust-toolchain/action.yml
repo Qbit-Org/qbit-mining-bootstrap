@@ -1,0 +1,22 @@
+name: Set up the pinned Rust toolchain
+description: >-
+  Install the toolchain that rust-toolchain.toml pins and assert that the
+  active rustc and cargo report exactly that version. The file is the one
+  source of the pin; scripts/check_toolchain_pin.py holds Cargo.toml's
+  rust-version and the lab/prism/Dockerfile builder image to it.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the toolchain named in rust-toolchain.toml
+      shell: bash
+      run: |
+        set -euo pipefail
+        # rustup 1.28 and later read rust-toolchain.toml when no toolchain is
+        # named, installing the pinned channel with its profile and components.
+        rustup toolchain install --no-self-update
+        rustup show active-toolchain
+
+    - name: Assert the active toolchain is the pin
+      shell: bash
+      run: python3 scripts/check_toolchain_pin.py --installed

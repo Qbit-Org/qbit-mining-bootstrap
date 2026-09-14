@@ -39,6 +39,35 @@ pub(super) async fn scrape(state: &ApiState) -> String {
     )
     .unwrap()
 }
+
+/// Exercise the same role routers over a real, ephemeral HTTP listener. Public
+/// counters with lazy label sets need a request before their first sample.
+pub(super) async fn running_scrape(app: axum::Router, warmup: &[&str]) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for path in warmup {
+        client
+            .get(format!("http://{address}{path}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let response = client
+        .get(format!("http://{address}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    body
+}
 pub(super) fn sample(body: &str, key: &str) -> f64 {
     let values: Vec<_> = body
         .lines()
@@ -115,7 +144,7 @@ async fn startup_scrape_renders_registry_without_fabricating_publication() {
     }
 }
 
-fn assert_complete_registry(body: &str) {
+pub(super) fn assert_complete_registry(body: &str) {
     let expected: BTreeSet<_> = metrics::descriptors().map(|d| d.name).collect();
     let mut helps = BTreeMap::new();
     let mut types = BTreeMap::new();

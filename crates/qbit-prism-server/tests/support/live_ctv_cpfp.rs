@@ -272,7 +272,7 @@ async fn restart_node(fixture: &mut Fixture, wallet: bool, height: u64) -> Resul
         )
     })
     .await?;
-    let mut node = Command::new(std::env::var("QBITD_BIN")?);
+    let mut node = Command::new(&fixture.qbitd);
     node.args([
         "-regtest",
         "-server=1",

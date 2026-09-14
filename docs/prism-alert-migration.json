@@ -1,0 +1,997 @@
+{
+  "source_commit": "a007a14260548cb93e277882672d788fe9a3f95e",
+  "deployed_alerts": [
+    {
+      "uid": "qbit-prism-metrics-nodata",
+      "title": "PrismMetricsNoData",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismMetricsNoData"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-metrics-endpoint-down",
+      "title": "PrismMetricsEndpointDown",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismMetricsEndpointDown"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-connected-clients",
+      "title": "PRISM Connected Clients",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PRISM Connected Clients"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-stratum-nodata",
+      "title": "PrismStratumHealthNoData",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismStratumHealthNoData"
+      ],
+      "reason": "No native replacement needed: deployment-owned Stratum sidecar rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-stratum-down-warning",
+      "title": "PrismStratumUnavailableWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismStratumUnavailableWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned Stratum sidecar rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-stratum-down",
+      "title": "PrismStratumUnavailable",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismStratumUnavailable"
+      ],
+      "reason": "No native replacement needed: deployment-owned Stratum sidecar rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-stratum-failure-rate",
+      "title": "PrismStratumCheckFailureRateHigh",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismStratumCheckFailureRateHigh"
+      ],
+      "reason": "No native replacement needed: deployment-owned Stratum sidecar rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-share-writer-backlog",
+      "title": "PrismShareWriterBacklog",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismShareAckP99High",
+        "PrismDatabasePoolWaitHigh"
+      ],
+      "reason": "Native shares are durably written before ACK; Python append-queue depth has no native counterpart. Replace latency/pressure intent, not queue semantics."
+    },
+    {
+      "uid": "qbit-prism-share-writer-backlog-critical",
+      "title": "PrismShareWriterBacklogCritical",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismShareAckP99High",
+        "PrismRejectRatioByReasonHigh"
+      ],
+      "reason": "No native 100k volatile ACKed-share queue or overflow-loss threshold; use ACK/rejection impact, with no unqualified critical page."
+    },
+    {
+      "uid": "qbit-prism-block-candidate-backlog",
+      "title": "PrismBlockCandidateBacklog",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismBlockCandidateBacklog"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-shares-recovered-to-disk",
+      "title": "PrismSharesRecoveredToDisk",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native has no local Python append spool/recovery-file producer; D3 spool follow-up is an open A decision."
+    },
+    {
+      "uid": "qbit-prism-share-append-failures",
+      "title": "PrismShareAppendFailures",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismShareAppendFailures"
+      ],
+      "reason": "Native ledger-confirmation-failed reason IDs preserve the deployed any-failure signal, including a 60/60 low-volume write outage, without requiring the reject-ratio volume floor."
+    },
+    {
+      "uid": "qbit-prism-shares-replayed",
+      "title": "PrismSharesReplayed",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: no native Python recovery-file replay counter or local spool."
+    },
+    {
+      "uid": "qbit-prism-job-build-orphan-evicted",
+      "title": "PrismJobBuildOrphanEvictions",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native job delivery has no Python executor orphan-eviction state."
+    },
+    {
+      "uid": "qbit-prism-stats-reconcile-stale",
+      "title": "PrismAcceptedStatsReconcileStale",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native process counters are not Python accepted-statistics reconciliation; rollup metrics deferred from #278."
+    },
+    {
+      "uid": "qbit-prism-lease-proven-age",
+      "title": "PrismWriterLeaseServerProvenAgeNearCap",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: PostgreSQL coordination replaces the Python writer lease; server-proven-cap policy does not exist."
+    },
+    {
+      "uid": "qbit-prism-lease-monitor-wake",
+      "title": "PrismWriterLeaseMonitorWakeDelayHigh",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismRuntimeLagHigh"
+      ],
+      "reason": "Same runtime-stall intent; native runtime wake, retained poll and progress-budget observations replace Python lease-monitor timing."
+    },
+    {
+      "uid": "qbit-prism-lease-monitor-guarantee",
+      "title": "PrismWriterLeaseMonitorExitGuaranteeBreached",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: no native Python monitor exit-before-adoption guarantee or breach counter; runtime delay has its own alert."
+    },
+    {
+      "uid": "qbit-prism-lease-surplus-invalid",
+      "title": "PrismWriterLeaseStabilitySurplusExhausted",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: no Python lease stability-surplus policy in the native runtime."
+    },
+    {
+      "uid": "qbit-prism-preview-publish-latency",
+      "title": "PrismAcceptedPreviewPublicationLatencyHigh",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+    },
+    {
+      "uid": "qbit-prism-preview-publish-latency-crit",
+      "title": "PrismAcceptedPreviewPublicationLatencyCritical",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+    },
+    {
+      "uid": "qbit-prism-preview-publish-degraded",
+      "title": "PrismAcceptedPreviewPublicationDegraded",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+    },
+    {
+      "uid": "qbit-prism-parent-preview-timeouts",
+      "title": "PrismAcceptedParentPreviewWaitTimeouts",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+    },
+    {
+      "uid": "qbit-prism-parent-preview-timeouts-crit",
+      "title": "PrismAcceptedParentPreviewWaitTimeoutsCritical",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-depth",
+      "title": "PrismUnresolvedParentDepthNonzero",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent transition cache and its depth/cap/age contract are absent; durable pending-candidate alerts do not claim equivalent semantics."
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-near-cap",
+      "title": "PrismUnresolvedParentDepthNearCap",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent transition cache and its depth/cap/age contract are absent; durable pending-candidate alerts do not claim equivalent semantics."
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-at-cap",
+      "title": "PrismUnresolvedParentDepthAtCap",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent transition cache and its depth/cap/age contract are absent; durable pending-candidate alerts do not claim equivalent semantics."
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-age",
+      "title": "PrismUnresolvedParentAgeOverBudget",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent transition cache and its depth/cap/age contract are absent; durable pending-candidate alerts do not claim equivalent semantics."
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-age-crit",
+      "title": "PrismUnresolvedParentAgeCritical",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent transition cache and its depth/cap/age contract are absent; durable pending-candidate alerts do not claim equivalent semantics."
+    },
+    {
+      "uid": "qbit-prism-candidate-backlog-critical",
+      "title": "PrismBlockCandidateBacklogCritical",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismBlockCandidateBacklogCritical"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-block-candidate-oldest",
+      "title": "PrismBlockCandidateOldestPending",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismBlockCandidateOldestPending"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-candidate-oldest-critical",
+      "title": "PrismBlockCandidateOldestPendingCritical",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismBlockCandidateOldestPendingCritical"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-candidate-metrics-unavailable",
+      "title": "PrismBlockCandidateMetricsUnavailable",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismBlockCandidateMetricsUnavailable"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-depth",
+      "title": "PrismCollapseCleanupBacklog",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python collapse-cleanup retry queue/backpressure producer is absent; do not reinterpret native pending candidate rows as cleanup state."
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-oldest",
+      "title": "PrismCollapseCleanupBacklogOldest",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python collapse-cleanup retry queue/backpressure producer is absent; do not reinterpret native pending candidate rows as cleanup state."
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-near-bound",
+      "title": "PrismCollapseCleanupBacklogNearBound",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python collapse-cleanup retry queue/backpressure producer is absent; do not reinterpret native pending candidate rows as cleanup state."
+    },
+    {
+      "uid": "qbit-prism-cleanup-backpressure-active",
+      "title": "PrismCollapseCleanupBackpressure",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python collapse-cleanup retry queue/backpressure producer is absent; do not reinterpret native pending candidate rows as cleanup state."
+    },
+    {
+      "uid": "qbit-prism-cleanup-backpressure-engaged",
+      "title": "PrismCollapseCleanupBackpressureEngaged",
+      "external": false,
+      "disposition": "no-replacement",
+      "replacement": [],
+      "reason": "No replacement: Python collapse-cleanup retry queue/backpressure producer is absent; do not reinterpret native pending candidate rows as cleanup state."
+    },
+    {
+      "uid": "qbit-prism-semantic-work-coverage",
+      "title": "PrismSemanticWorkCoverageLoss",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismSemanticWorkCoverageLoss"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-semantic-coverage-critical",
+      "title": "PrismSemanticWorkCoverageLossCritical",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismSemanticWorkCoverageLossCritical"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-refresh-pending",
+      "title": "PrismRefreshPendingPastDeadline",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismTimeToUsableWorkHigh",
+        "PrismCurrentWorkGapHigh"
+      ],
+      "reason": "Observe the effect on usable work; native refresh has no Python pending-deadline state."
+    },
+    {
+      "uid": "qbit-prism-refresh-pending-critical",
+      "title": "PrismRefreshPendingPastDeadlineCritical",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismTimeToUsableWorkHigh",
+        "PrismSemanticWorkCoverageLossCritical"
+      ],
+      "reason": "Coverage and first-work delay replace miner-impact intent; native thresholds require #291 measurement."
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-stale",
+      "title": "PrismMetricsSnapshotStale",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismMetricsSnapshotStale"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-unavailable",
+      "title": "PrismMetricsSnapshotUnavailable",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismMetricsSnapshotUnavailable"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-age",
+      "title": "PrismMetricsSnapshotAgeHigh",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismMetricsSnapshotAgeHigh"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-public-staleness-refusal",
+      "title": "PrismPublicStalenessRefusalsIncreasing",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismPublicStalenessRefusalsIncreasing"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-public-ledger-unready",
+      "title": "PrismPublicLedgerUnready",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismPublicLedgerUnready"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-public-5xx-sustained",
+      "title": "PrismPublic5xxSustained",
+      "external": false,
+      "disposition": "migrated",
+      "replacement": [
+        "PrismPublic5xxSustained"
+      ],
+      "reason": "Native producer is populated; preserve the deployed signal with the explicit native bounds and guards in the specification."
+    },
+    {
+      "uid": "qbit-prism-backup-metrics-nodata",
+      "title": "PrismBackupMetricsNoData",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupMetricsNoData"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-collector-stale",
+      "title": "PrismBackupCollectorStale",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupCollectorStale"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-full-stale-warning",
+      "title": "PrismBackupFullStaleWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupFullStaleWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-full-stale-critical",
+      "title": "PrismBackupFullStaleCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupFullStaleCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-diff-stale-warning",
+      "title": "PrismBackupDifferentialStaleWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupDifferentialStaleWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-diff-stale-critical",
+      "title": "PrismBackupDifferentialStaleCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupDifferentialStaleCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-check-warning",
+      "title": "PrismBackupCheckWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupCheckWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-check-critical",
+      "title": "PrismBackupCheckCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupCheckCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-stale-warning",
+      "title": "PrismBackupWalArchiveStaleWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalArchiveStaleWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-stale-critical",
+      "title": "PrismBackupWalArchiveStaleCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalArchiveStaleCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-fail-warning",
+      "title": "PrismBackupWalArchiveFailureWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalArchiveFailureWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-fail-critical",
+      "title": "PrismBackupWalArchiveFailureCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalArchiveFailureCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-space-warning",
+      "title": "PrismBackupWalFilesystemSpaceWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalFilesystemSpaceWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-space-critical",
+      "title": "PrismBackupWalFilesystemSpaceCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalFilesystemSpaceCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-stale-warning",
+      "title": "PrismBackupAuditSnapshotStaleWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditSnapshotStaleWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-stale-critical",
+      "title": "PrismBackupAuditSnapshotStaleCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditSnapshotStaleCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-slow-warning",
+      "title": "PrismBackupAuditDurationWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditDurationWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-slow-critical",
+      "title": "PrismBackupAuditDurationCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditDurationCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-job-fail-warning",
+      "title": "PrismBackupScheduledJobFailureWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupScheduledJobFailureWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-job-fail-critical",
+      "title": "PrismBackupScheduledJobFailureCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupScheduledJobFailureCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-coverage-critical",
+      "title": "PrismBackupCombinedCoverageCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupCombinedCoverageCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-db-growth-warning",
+      "title": "PrismBackupDatabaseGrowthWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupDatabaseGrowthWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-db-growth-critical",
+      "title": "PrismBackupDatabaseGrowthCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupDatabaseGrowthCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-growth-warning",
+      "title": "PrismBackupAuditGrowthWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditGrowthWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-audit-growth-critical",
+      "title": "PrismBackupAuditGrowthCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupAuditGrowthCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-growth-warning",
+      "title": "PrismBackupWalGenerationGrowthWarning",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalGenerationGrowthWarning"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-backup-wal-growth-critical",
+      "title": "PrismBackupWalGenerationGrowthCritical",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismBackupWalGenerationGrowthCritical"
+      ],
+      "reason": "No native replacement needed: deployment-owned backup/node-exporter rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-coordinator-collector-stale",
+      "title": "PrismCoordinatorCollectorStale",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismCoordinatorCollectorStale"
+      ],
+      "reason": "No native replacement needed: deployment-owned Docker lifecycle textfile rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-coordinator-restart",
+      "title": "PrismCoordinatorUnexpectedRestart",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismCoordinatorUnexpectedRestart"
+      ],
+      "reason": "No native replacement needed: deployment-owned Docker lifecycle textfile rule and producer are retained byte-for-byte."
+    },
+    {
+      "uid": "qbit-prism-coordinator-restart-loop",
+      "title": "PrismCoordinatorRestartLoop",
+      "external": true,
+      "disposition": "unchanged-external",
+      "replacement": [
+        "PrismCoordinatorRestartLoop"
+      ],
+      "reason": "No native replacement needed: deployment-owned Docker lifecycle textfile rule and producer are retained byte-for-byte."
+    }
+  ],
+  "retired_names": [
+    {
+      "name": "qbit_prism_accepted_block_landing_phase_seconds",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_landing_phase_seconds_count",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_landing_phase_seconds_max",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_landing_phase_seconds_sum",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_preview_publication_seconds",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_preview_publication_seconds_bucket",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_block_preview_publication_seconds_count",
+      "replacement": [],
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+    },
+    {
+      "name": "qbit_prism_accepted_parent_preview_wait_timeouts_total",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+    },
+    {
+      "name": "qbit_prism_accepted_parent_unresolved_depth_max",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+    },
+    {
+      "name": "qbit_prism_accepted_parent_unresolved_oldest_seconds",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+    },
+    {
+      "name": "qbit_prism_accepted_parent_unresolved_transitions",
+      "replacement": [],
+      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_backpressure_active",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_backpressure_total",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_retry_backlog",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_retry_backlog_max",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_retry_oldest_seconds",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_retry_pending_share_holders",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_collapse_total",
+      "replacement": [],
+      "reason": "No replacement: Python collapse/cleanup retry holders, pins and backpressure state have no native producer."
+    },
+    {
+      "name": "qbit_prism_block_candidate_oldest_pending_seconds",
+      "replacement": [
+        "qbit_prism_block_candidate_oldest_pending_seconds"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    },
+    {
+      "name": "qbit_prism_block_candidates_pending",
+      "replacement": [
+        "qbit_prism_block_candidates_pending"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    },
+    {
+      "name": "qbit_prism_block_ledger_call_timeouts_total",
+      "replacement": [],
+      "reason": "No replacement: Python ledger timeout/submitter backoff series are absent; candidate age retains backlog intent without claiming cause."
+    },
+    {
+      "name": "qbit_prism_block_submitter_retry_backoff_active",
+      "replacement": [],
+      "reason": "No replacement: Python ledger timeout/submitter backoff series are absent; candidate age retains backlog intent without claiming cause."
+    },
+    {
+      "name": "qbit_prism_ledger_read_calls_total",
+      "replacement": [],
+      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times collector acquisition only and cannot replace query/lock/gate timing."
+    },
+    {
+      "name": "qbit_prism_ledger_read_execute_seconds_total",
+      "replacement": [],
+      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times collector acquisition only and cannot replace query/lock/gate timing."
+    },
+    {
+      "name": "qbit_prism_ledger_read_execute_timeouts_total",
+      "replacement": [],
+      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times collector acquisition only and cannot replace query/lock/gate timing."
+    },
+    {
+      "name": "qbit_prism_ledger_read_gate_timeouts_total",
+      "replacement": [],
+      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times collector acquisition only and cannot replace query/lock/gate timing."
+    },
+    {
+      "name": "qbit_prism_ledger_read_gate_wait_seconds_total",
+      "replacement": [],
+      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times collector acquisition only and cannot replace query/lock/gate timing."
+    },
+    {
+      "name": "qbit_prism_metrics_snapshot_age_seconds",
+      "replacement": [
+        "qbit_prism_metrics_snapshot_age_seconds"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    },
+    {
+      "name": "qbit_prism_metrics_snapshot_available",
+      "replacement": [
+        "qbit_prism_metrics_snapshot_available"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    },
+    {
+      "name": "qbit_prism_metrics_snapshot_stale",
+      "replacement": [
+        "qbit_prism_metrics_snapshot_stale"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    },
+    {
+      "name": "qbit_prism_payout_artifact_events_total",
+      "replacement": [],
+      "reason": "No replacement: payout artifact/rescan/balance-read instrumentation is outside trimmed #278; no deployed rule to rewrite."
+    },
+    {
+      "name": "qbit_prism_payout_window_full_rescan_seconds",
+      "replacement": [],
+      "reason": "No replacement: payout artifact/rescan/balance-read instrumentation is outside trimmed #278; no deployed rule to rewrite."
+    },
+    {
+      "name": "qbit_prism_payout_window_full_rescan_seconds_count",
+      "replacement": [],
+      "reason": "No replacement: payout artifact/rescan/balance-read instrumentation is outside trimmed #278; no deployed rule to rewrite."
+    },
+    {
+      "name": "qbit_prism_prior_balances_reads_total",
+      "replacement": [],
+      "reason": "No replacement: payout artifact/rescan/balance-read instrumentation is outside trimmed #278; no deployed rule to rewrite."
+    },
+    {
+      "name": "qbit_prism_refresh_pending",
+      "replacement": [
+        "qbit_prism_stratum_oldest_pending_initial_job_seconds",
+        "qbit_prism_stratum_current_tip_coverage_gap_seconds"
+      ],
+      "reason": "Replacement for alert intent only: time to usable work, not Python refresh-task state."
+    },
+    {
+      "name": "qbit_prism_refresh_pending_age_seconds",
+      "replacement": [
+        "qbit_prism_stratum_oldest_pending_initial_job_seconds",
+        "qbit_prism_stratum_current_tip_coverage_gap_seconds"
+      ],
+      "reason": "Replacement for alert intent only: time to usable work, not Python refresh-task state."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_errors_total",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_lookups_total",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_pass_seconds",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_pass_seconds_count",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_pass_seconds_sum",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_step_seconds",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_reorg_reconcile_step_seconds_sum",
+      "replacement": [],
+      "reason": "No replacement: Python reconciler pass/step/error series are outside trimmed native instrumentation; do not add undeployed historical rules."
+    },
+    {
+      "name": "qbit_prism_stratum_authorized_connections",
+      "replacement": [
+        "qbit_prism_authorized_clients"
+      ],
+      "reason": "Native local authorized clients; update semantic-coverage joins."
+    },
+    {
+      "name": "qbit_prism_stratum_semantic_current_work_ratio",
+      "replacement": [
+        "qbit_prism_stratum_semantic_current_work_ratio"
+      ],
+      "reason": "Same name retained by #278/#277; use native documented meaning and unknown/staleness guards."
+    }
+  ]
+}

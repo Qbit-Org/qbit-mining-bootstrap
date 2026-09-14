@@ -156,8 +156,8 @@ Useful entrypoints:
 - `make up-auxpow-pool`
 - `make up-prism-pool`
 - `make prism-self-check`
+- `make test-prism-postgres`
 - `make test-prism-regtest`
-- `make test-prism-stratum-regtest-live`
 - `make up-dual-pools`
 - `make test-auxpow`
 - `make test-auxpow-stratum`
