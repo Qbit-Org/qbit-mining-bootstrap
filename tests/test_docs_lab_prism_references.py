@@ -107,8 +107,7 @@ PYTHON_FLAG = r"[bBdEiIOPqRsSuvx]"
 # ``unquote`` before a word is read as an option or a target. The backslash
 # escapes `$'…'` decodes are not: bash runs `python3 -m $'json\x2etool'` as
 # `json.tool`, but this check follows no backslash escape (module docstring),
-# so ``literal_word`` rejects a module word containing such an escape and
-# the script grammar likewise excludes it.
+# so ``literal_word`` rejects a target word containing such an escape.
 WORD_BREAK = r"\s|&;()<>`"
 UNQUOTED_CHARACTER = rf"[^{WORD_BREAK}'\"$]|\$(?!['\"])"
 QUOTED_STRING = r"\$?'[^']*'|\$?\"[^\"]*\""
@@ -223,7 +222,9 @@ INTERPRETER_CANDIDATE = re.compile(rf"(?=(?<![^{WORD_BREAK}'\"])(?P<interpreter>
 # escapes before this grammar sees a module, preserving quoted literal `$`
 # and backslash characters. Paths still stay outside this lexical check.
 MODULE_TARGET = re.compile(r"lab(?:\.[^./\x00]+)+")
-SCRIPT_TARGET = re.compile(r"lab/[A-Za-z0-9_./\-]+\.py")
+# Script filenames may also contain literal spaces, dollars, backslashes or
+# glob characters when quoted. Expansion checks happen before this grammar.
+SCRIPT_TARGET = re.compile(r"lab/[^\x00]+\.py")
 DOT_SEGMENTS = re.compile(r"^(?:\./)+")
 MATCHING_QUOTES = re.compile(QUOTED_STRING)
 WORD_PART = re.compile(rf"{QUOTED_STRING}|(?:{UNQUOTED_CHARACTER})+")
@@ -285,13 +286,15 @@ def unquote(word: str) -> str:
     return MATCHING_QUOTES.sub(lambda match: match.group(0).removeprefix("$")[1:-1], word)
 
 
-def literal_word(word: str) -> str | None:
+def literal_word(word: str, *, script: bool = False) -> str | None:
     """Unquote a validated shell word only when its parts need no expansion or decoding.
 
     Single quotes preserve every character; ANSI-C quotes preserve dollars
     but require decoding for backslashes. Double quotes still expand dollars
     and backticks, and escape `$`, backticks, double quotes and backslashes.
     A backslash before any other character in double quotes is literal.
+    Script paths also exclude unquoted glob and brace syntax, whose expansion
+    depends on the shell and filesystem; quoting preserves those characters.
     """
     parts = []
     for match in WORD_PART.finditer(word):
@@ -307,6 +310,8 @@ def literal_word(word: str) -> str | None:
             if part.endswith("\\") or re.search(r'[$`]|\\[$`"\\]', part):
                 return None
         elif any(character in part for character in "$\\`"):
+            return None
+        elif script and any(character in part for character in "*?[]{}"):
             return None
         parts.append(part)
     return "".join(parts)
@@ -355,8 +360,8 @@ def command_target(line: str, position: int) -> tuple[str, str, int] | None:
     shell hands it to CPython (matching quotes stripped, or the remainder of
     an attached ``-m``), and ``end`` is where the target word ends on the
     line. ``None`` when the words run out, at a word the shell rejects, or at
-    a ``--check-hash-based-pycs`` mode CPython rejects, or when a module
-    word requires shell expansion or escape decoding outside this check.
+    a ``--check-hash-based-pycs`` mode CPython rejects, or when a
+    target word requires shell expansion or escape decoding outside this check.
     """
     words = shell_words(line, position)
     for match in words:
@@ -382,8 +387,11 @@ def command_target(line: str, position: int) -> tuple[str, str, int] | None:
             return "module", module, target.end()
         if word == OPTIONS_END:
             target = next(words, None)
-            return None if target is None else ("script", unquote(target.group("word")), target.end())
-        return "script", word, match.end()
+        else:
+            target = match
+        if target is None or (script := literal_word(target.group("word"), script=True)) is None:
+            return None
+        return "script", script, target.end()
     return None
 
 
@@ -686,6 +694,49 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(len(self.references(prose)), len(self.references(command)))
                 relative = f"lab/prism/{name}"
                 self.assertEqual(self.commands(command), [f"{relative}.py or {relative}/__main__.py"])
+
+    def test_quoted_literal_script_targets_are_caught(self) -> None:
+        for name in ("deleted$file", r"deleted\file", "deleted`file", "deleted file", "déleted", "deleted[ab]*?{x,y}"):
+            path = f"lab/prism/{name}.py"
+            for word in (f"'{path}'", f"./lab/prism/'{name}'.py", f'"./lab/prism/"\'{name}.py\''):
+                for options in ("", "-OO ", "-- ", "-O -- "):
+                    with self.subTest(word=word, options=options):
+                        command = f"python3 {options}{word}"
+                        self.assertEqual(dead_commands(command, self.TRACKED), [(1, command, path)])
+                        self.assertEqual(dead_commands(command, self.TRACKED | {path}), [])
+
+    def test_other_quotes_preserve_only_literal_script_characters(self) -> None:
+        for word, path in (
+            ("$'lab/prism/deleted$file.py'", "lab/prism/deleted$file.py"),
+            (r'"lab/prism/deleted\file.py"', r"lab/prism/deleted\file.py"),
+            (r'$"lab/prism/deleted\file.py"', r"lab/prism/deleted\file.py"),
+            ('"lab/prism/deleted*.py"', "lab/prism/deleted*.py"),
+        ):
+            for options in ("", "-- "):
+                with self.subTest(word=word, options=options):
+                    command = f"python3 {options}{word}"
+                    self.assertEqual(dead_commands(command, self.TRACKED), [(1, command, path)])
+                    self.assertEqual(dead_commands(command, self.TRACKED | {path}), [])
+
+    def test_script_expansions_and_escapes_are_not_literal_targets(self) -> None:
+        for word in (
+            "lab/prism/deleted$file.py", '"lab/prism/deleted$file.py"',
+            r"lab/prism/deleted\file.py", r"$'lab/prism/deleted\file.py'",
+            r'"lab/prism/deleted\\file.py"', r'"lab/prism/deleted\$file.py"',
+            '"lab/prism/deleted`file`.py"', "lab/prism/deleted*.py",
+            "lab/prism/deleted?.py", "lab/prism/deleted[ab].py", "lab/prism/deleted{a,b}.py",
+            "'lab/prism/deleted'$FILE.py",
+        ):
+            for options in ("", "-- "):
+                with self.subTest(word=word, options=options):
+                    self.assertEqual(self.commands(f"python3 {options}{word}"), [])
+
+    def test_wrapped_literal_script_cannot_hide_within_reference_ratchet(self) -> None:
+        path = "lab/prism/deleted$file.py"
+        command = f"python3 -- \\\n  '{path}'"
+        prose = "The retired script `lab/prism/deleted.py` is historical."
+        self.assertEqual(len(self.references(prose)), len(self.references(command)))
+        self.assertEqual(self.located(f"```sh\n{command}\n```"), [(2, path)])
 
     # Verified on CPython 3.14: `python3 -m lab.pkg` with only `lab/pkg/__init__.py`,
     # or with a bare `lab/pkg/` directory, prints "No module named
