@@ -4,7 +4,7 @@ use super::*;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy, SettlementModeConfig};
 use qbit_prism_server::{
     codec,
-    ledger::{BlockObservation, Candidate, Ledger},
+    ledger::{BlockObservation, Candidate, CandidateCtv, Ledger, SignerKeys, WindowRef},
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -70,8 +70,9 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
         }
         let solved=solved.context("regtest proof search exhausted")?;
         let block_hash=solved.block_hash_hex.clone();
-        ledger.enqueue_candidate(Candidate {block_hash:block_hash.clone(),block_hex:solved.block_hex.clone(),job_id:"legacy-cpfp".into(),payout_revision:snapshot.payout_revision,bundle,coinbase_suffix_hex:None,deferred_share:None}).await?;
-        let candidate=ledger.claim_candidate(60).await?.context("candidate claim missing")?;
+        let block_bytes=hex::decode(&solved.block_hex)?;
+        ledger.enqueue_candidate(Candidate {block_hash:block_hash.clone(),block_sha256:Candidate::block_digest_hex(&block_bytes),job_id:"legacy-cpfp".into(),payout_revision:snapshot.payout_revision,window:WindowRef::from_snapshot(&snapshot)?,bootstrap_share:None,found_block:bundle.found_block.clone(),payout_policy:PayoutPolicy::day_one_default(),ctv:Some(CandidateCtv {direct_floor_sats:u64::MAX,settlement_config:SettlementModeConfig::default(),fanout_fee_policy:None}),audit_builder_version:qbit_prism::AUDIT_BUILDER_VERSION,signer_keys:SignerKeys::of(&manifest_key,&ledger_key),leased:false,coinbase_suffix_hex:"00".repeat(12),deferred_share:None,block_bytes,as_issued_balances:Vec::new()}).await?;
+        let candidate=ledger.claim_candidate(60).await?.context("candidate claim missing")?.with_bundle(bundle);
         ledger.land_candidate(&candidate,&ledger_key.public_key_hex()).await?;
         ensure!(fixture.rpc("submitblock",json!([solved.block_hex])).await?.is_null(),"legacy CTV coinbase rejected");
         ledger.finish_candidate_at_revision(&candidate,true,None,snapshot.payout_revision).await?;

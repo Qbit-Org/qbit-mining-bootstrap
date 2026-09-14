@@ -389,7 +389,13 @@ impl Ledger {
 
     /// Every server in a cluster must agree on consensus, payout and signing
     /// configuration. The fingerprint excludes local ports and instance IDs.
-    pub async fn configure(&self, fingerprint: &str) -> Result<()> {
+    ///
+    /// `signer_keys` are this frontend's public signing keys. Writing a
+    /// fingerprint onto a reset (NULL) one is a rotation, and it is refused
+    /// in the same transaction while any pending outbox row stores other
+    /// keys: no frontend with the new keys could rebuild such a candidate,
+    /// and the rotation procedure drains and stops the old frontends first.
+    pub async fn configure(&self, fingerprint: &str, signer_keys: &SignerKeys) -> Result<()> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         let saved: Option<String> = sqlx::query_scalar(
@@ -403,6 +409,19 @@ impl Ledger {
                 "cluster configuration fingerprint mismatch"
             );
         } else {
+            let foreign: Vec<String> = sqlx::query_scalar(
+                "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND (candidate->'signer_keys'->>'manifest_key_hex' IS DISTINCT FROM $1 OR candidate->'signer_keys'->>'ledger_key_hex' IS DISTINCT FROM $2) ORDER BY block_hash",
+            )
+            .bind(&signer_keys.manifest_key_hex)
+            .bind(&signer_keys.ledger_key_hex)
+            .fetch_all(&mut *tx)
+            .await?;
+            ensure!(
+                foreign.is_empty(),
+                "refusing to pin a new cluster fingerprint: pending block candidates {} were signed with other keys. \
+                 Drain the outbox with the frontends that hold those keys, stop them, and only then reset the fingerprint",
+                foreign.join(", ")
+            );
             sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1 WHERE singleton")
                 .bind(fingerprint)
                 .execute(&mut *tx)

@@ -399,6 +399,17 @@ impl Ledger {
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
+        // The ACK path is the incident path. A block-solving share's candidate
+        // is serialized, digested and checked here, before the transaction
+        // opens, so `ORDER_LOCK` is held only for the share append and the
+        // insert of the prepared bytes, whatever the window size.
+        if let Some(candidate) = &candidate {
+            ensure!(
+                candidate.deferred_share.is_none(),
+                "credited candidates cannot also contain a deferred share"
+            );
+        }
+        let prepared = candidate.as_ref().map(prepare_candidate).transpose()?;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
@@ -410,12 +421,9 @@ impl Ledger {
             );
         }
         let result = self.append_in(&mut tx, share).await?;
-        if let Some(candidate) = candidate {
-            ensure!(
-                candidate.deferred_share.is_none(),
-                "credited candidates cannot also contain a deferred share"
-            );
-            persist_candidate(&mut tx, &candidate, Some(&result.share.share_id)).await?;
+        if let Some(prepared) = &prepared {
+            self.persist_prepared_candidate(&mut tx, prepared, Some(&result.share.share_id))
+                .await?;
         }
         if pre_commit.is_some_and(|allow| !allow()) {
             // Release ORDER_LOCK before the refusal is observed.

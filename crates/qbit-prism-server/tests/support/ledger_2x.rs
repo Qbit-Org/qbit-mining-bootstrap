@@ -130,8 +130,8 @@ async fn native_publication_ordinal_survives_reactivation_and_excludes_rejected_
     let ledger = db.ledger("a").await?;
     ledger.append(share(1), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 3001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -179,8 +179,8 @@ async fn native_publication_ordinal_survives_reactivation_and_excludes_rejected_
         .await?;
     assert!(sqlx::query_scalar::<_,bool>("SELECT inactive_since IS NULL AND audit_publication_sequence=$2 FROM qbit_pool_blocks WHERE block_hash=$1").bind(&block.block_hash).bind(ordinal).fetch_one(&ledger.pool).await?);
     let rejected = candidate(&ledger.snapshot(100).await?, 3002)?;
-    ledger.enqueue_candidate(rejected.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(rejected.candidate.clone()).await?;
+    let claim = rejected.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -199,8 +199,8 @@ async fn canonical_2x_sidecar_import_preserves_exact_bytes_and_fails_closed() ->
     let ledger = db.ledger("a").await?;
     ledger.append(share(1), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 4001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     let report = ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -372,8 +372,8 @@ async fn audit_range_query_uses_deadline_remaining_after_delayed_snapshot() -> R
     let ledger = db.ledger("audit-deadline").await?;
     ledger.append(share(9001), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 9001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     let report = ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -464,14 +464,15 @@ async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_au
     let canonical = qbit_prism::canonical_audit_bundle_bytes(&block.bundle)?;
     // Deliberately asymmetric compact bytes prove display endianness. Their
     // value is independent of the audit's scaled network-difficulty integer.
-    let mut bytes = hex::decode(&block.block_hex)?;
+    let mut bytes = block.block_bytes.clone();
     bytes[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
     let mut hash = Sha256::digest(Sha256::digest(&bytes[..80])).to_vec();
     hash.reverse();
     block.block_hash = hex::encode(hash);
-    block.block_hex = hex::encode(bytes);
-    a.enqueue_candidate(block.clone()).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    block.block_sha256 = Candidate::block_digest_hex(&bytes);
+    block.block_bytes = bytes;
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     let report = a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     assert_eq!(
         sqlx::query_scalar::<_, String>(
@@ -493,8 +494,8 @@ async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_au
         .execute(&a.pool)
         .await?;
     sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1").bind(&block.block_hash).execute(&a.pool).await?;
-    let recovered = b.claim_candidate(60).await?.unwrap();
-    assert_eq!(recovered.candidate.block_hex, block.block_hex);
+    let recovered = block.claim(b.claim_candidate(60).await?.unwrap());
+    assert_eq!(recovered.candidate.block_bytes, block.block_bytes);
     let recovered_report = b
         .land_candidate(&recovered, &keys().1.public_key_hex())
         .await?;
