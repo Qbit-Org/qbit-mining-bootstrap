@@ -35,30 +35,57 @@ before migration.
    alone is not an audit backup. Preserve recorded file paths or plan a mount at
    the original absolute path for import. Include the `2.x.x` canonical
    `prism-audit-bundle-canonical-*.json.gz` sidecars.
+6. **Pre-migration canonical backfill rehearsal (required).** On an isolated
+   restore of the source database and artifact backup, run the native `migrate`
+   and `import-audits` commands in the recovery procedure below. Native import
+   is also the canonical backfill: if a sidecar never existed, it reconstructs
+   bytes from a recoverable inline bundle or external body/segments, verifies
+   the trusted ledger signature, recorded coinbase, and existing published SHA,
+   then stores the bytes. Both completeness counts must be zero before the
+   production migration. A missing body or a digest mismatch stops cutover;
+   recover the original evidence rather than changing the published SHA. This
+   uses the native equivalent, not the `2.x.x` canonical-backfill command, so
+   it does not depend on #174/#176 or mutate historical public content on the
+   source. Record restore, migrate, import, verification times and history size
+   on a production-sized copy; #291 supplies the release rehearsal evidence.
 
 ## Drain and migrate
 
-Remove the Python frontends from new connection routing, stop the Python
+1. Remove the Python frontends from new connection routing, stop the Python
 coordinators, public read services, and standalone CTV broadcaster daemons, and wait for admitted
 writes and candidate accounting to finish. Inspect pending candidate state and
 resolve it while the old runtime is still available. Confirm every old process
 has stopped and its writer lease has been released or expired. A paused old
 process is not a completed shutdown.
 
-Take the final consistent database backup after draining, along with the audit
+2. Take the final consistent database backup after draining, along with the audit
 filesystem backup and securely retained key/configuration recovery material.
 Retain the old pinned image for recovery. Rehearse restoring this backup into an
 isolated database before the production change.
 
-Run the following with the reviewed operator environment exported, using the
+3. Run the following with the reviewed operator environment exported, using the
 new executable and the existing database:
 
 ```sh
 qbit-prism-server check-config
 qbit-prism-server migrate
 qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
-qbit-prism-server backfill-ctv
 ```
+
+4. Before admitting native traffic, compare the source and migrated recovery
+   evidence using the numbered procedure below, before running
+   `qbit-prism-server backfill-ctv`; record any intentional CTV repair delta
+   separately afterward. `import-audits` must report
+   `missing_stored_bodies: 0` and `missing_canonical_bytes: 0`. Run production
+   `self-check` with the intended services available and retain its JSON and
+   exit status. A missing body or canonical representation makes it fail in
+   production; lab mode reports the counts without failing for incompleteness.
+   Native normalized audits use their stored metadata and immutable snapshot
+   for canonical reconstruction, so they do not require a duplicate full byte
+   copy. These counts check availability; import and artifact reads authenticate
+   the contents. Fetch representative historical artifacts through the actual
+   public edge, including the oldest history, a sidecar-only import and a
+   reconstructed body. Require the exact SHA and matching ETag, as below.
 
 `migrate` applies the existing schema and additive native migration under a
 transaction lock. It preserves share sequence/history, balances, audit metadata,
@@ -853,14 +880,138 @@ separate from those original published payout inputs.
 
 ## Recovery and rollback
 
-Before native traffic is admitted, a failed cutover can be recovered by restoring
-the complete pre-migration database and artifact backup and restarting the
-pinned old image in isolation from the migrated database. Do not drop native
-migration guards and point Python at the changed live schema.
+D5 declares a **one-way migration with forward repair and isolated-restore
+reconciliation**. There are no down-migrations for native 002–010, including
+006/007/008, or permission to remove migration guards. The legacy publication
+ordinal revert refuses native schemas and points here. The following boundary
+matches the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md):
 
-After native shares have been acknowledged, restoring an older database loses
-those accepted records. Prefer repair or a compatible native binary while
-preserving the latest durable state. Any rollback that discards acknowledged
-history requires an explicit accounting reconciliation and recovery decision;
-it is not an ordinary image rollback. Keep every native frontend stopped while
-performing an isolated restore/recovery operation against its replacement DB.
+> Before the first native share is acknowledged, restore the complete
+> pre-migration database and artifact backup and restart the pinned old image
+> in isolation from the migrated database. After the first native share is
+> acknowledged, restoring an older database loses those accepted records.
+> Any rollback that discards acknowledged history requires an explicit
+> accounting reconciliation and recovery decision; it is not an ordinary
+> image rollback. Keep every native frontend stopped while performing an
+> isolated restore/recovery operation against its replacement database.
+
+The ACK boundary does not prove that nothing else committed: a committed share
+can lose its reply, and candidate/CTV work can progress before admission. Always
+compare the complete evidence and retain the latest database. Prefer forward
+repair or a compatible native image preserving all durable history.
+
+1. **Establish isolation and retain evidence.** Stop every native frontend,
+   public service, candidate worker and CTV broadcaster, and confirm no old
+   Python writer is running. Block their network access to the restore. Keep
+   the latest database and WAL, the drained pre-migration database backup, all
+   external bodies/segments, pinned images, and key/configuration recovery
+   material. Never restore over the current database. Record whether any native
+   share was acknowledged; an unknown boundary is treated as post-ACK.
+2. **Capture the drained source baseline before migration.** Configure named
+   libpq services `prism-source`, `prism-current`, and `prism-restore` for the
+   distinct databases, with the intended ledger schema first in `search_path`.
+   Keep credentials in protected libpq files, not the evidence. The export is a
+   single repeatable-read, read-only transaction. Reserve disk for ordered share
+   history; the summary hashes it a row at a time. With writers still stopped:
+
+   ```sh
+   umask 077
+   PGSERVICE=prism-source pg_dump --format=custom --file=pre-native.dump
+   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 \
+     -f scripts/prism-recovery-evidence.sql > source.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
+   ```
+
+   Keep the filesystem backup from the same drained boundary. Require
+   `pending_candidates` zero and both integrity mismatch counts zero. The
+   summary records ordered share counts/digests, accepted count and high-water
+   sequence, block/publication order, audit SHA identities, payout/carry and CTV
+   state. `audit_head_sha256` is the exact `2.x.x` active carry hash chain. The
+   SQL integrity function alone does **not** calculate that head; the companion
+   Python summarizer does. Compare it with the previously mirrored legacy head.
+   The checked-in SQL contains the exact reconciliation queries.
+3. **Restore and verify the pre-ACK recovery path.** Provision a new empty
+   database behind `prism-restore` on an isolated host with the matching
+   PostgreSQL version, roles and extensions. Restore the full backup (not a
+   selected table dump) and its filesystem backup at the original paths:
+
+   ```sh
+   pg_restore --exit-on-error --single-transaction \
+     --dbname='service=prism-restore' pre-native.dump
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+     -f scripts/prism-recovery-evidence.sql > restored.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py restored.rows.jsonl > restored.summary.json
+   cmp source.summary.json restored.summary.json
+   ```
+
+   Require exact equality. Only after it passes may the pinned old image be
+   started against this isolated legacy database for recovery verification.
+   Keep miner routing and broadcast access disabled. Stop it before rehearsing
+   the native migration. Never point the old image at a native schema.
+4. **Rehearse forward migration and canonical repair.** Set the native tool's
+   `PRISM_DATABASE_URL` to the isolated restore, verify that endpoint, mount the
+   recovered artifacts, and supply the original trusted
+   `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`. The import does not need signing seeds:
+
+   ```sh
+   time qbit-prism-server migrate
+   time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+     -f scripts/prism-recovery-evidence.sql > migrated.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py migrated.rows.jsonl > migrated.summary.json
+   cmp source.summary.json migrated.summary.json
+   ```
+
+   Import must exit zero with both completeness counts zero; it reconstructs
+   canonical bytes when recoverable bodies have no sidecar. A present corrupt
+   sidecar is an error, not permission to use a different body. It commits one
+   verified audit at a time; after restoring missing evidence, rerun it safely.
+   Check equality before running `backfill-ctv`, which can intentionally repair
+   missing CTV rows; retain and explain that repair's later evidence delta.
+5. **Verify canonical reads and the public edge.** On the isolated public API,
+   fetch stored artifact SHA values from the audit export. Compare downloaded
+   bytes with the source backup, their SHA-256, and the quoted SHA ETag. After
+   actual cutover repeat through the configured public edge, not only origin:
+
+   ```sh
+   # PUBLIC_EDGE is the reviewed HTTPS public endpoint; SHA is a recorded audit SHA.
+   curl --fail --silent --show-error -D artifact.headers \
+     "$PUBLIC_EDGE/public/v1/artifacts/$SHA" -o artifact.json
+   printf '%s  artifact.json\n' "$SHA" | shasum -a 256 -c -
+   rg -i "^etag: \"$SHA\"" artifact.headers
+   ```
+
+   Require no `x-prism-artifact-canonical-state: missing` fallback header.
+   Successful canonical responses omit that header. If the edge still serves a cached
+   missing response, invalidate that affected cache entry and verify again
+   before admission. Published canonical bytes and hashes must not change.
+6. **Reconcile the post-ACK boundary.** Export `prism-current` with the same SQL
+   and summarizer into `current.rows.jsonl` and `current.summary.json`. Compare
+   with `restored.summary.json`, retaining the ordered JSONL when a digest
+   differs. The following exact query on the current database identifies the
+   accepted share tail beyond the source high-water mark; substitute the
+   recorded integer as the psql variable `source_last_share_seq`:
+
+   ```sql
+   SELECT share_seq, share_id, miner_id, share_difficulty, credit_policy
+   FROM qbit_share_ledger
+   WHERE accepted AND share_seq > :source_last_share_seq
+   ORDER BY share_seq;
+   SELECT state, count(*) FROM qbit_block_candidate_outbox GROUP BY state ORDER BY state;
+   SELECT qbit_carry_forward_integrity_report();
+   ```
+
+   Tail counts alone cannot prove equality: reconcile changed block states,
+   carry balances/head, payouts, pending candidates and CTV broadcasts against
+   chain evidence too. A nonempty native tail demonstrates records an older
+   restore would discard. Preserve that database and repair forward. Do not
+   copy rows into the legacy schema or resume miners until the accounting owner
+   has approved a documented plan preserving or explicitly reconciling every
+   difference, including any proposed loss of acknowledged history.
+7. **Complete the rehearsal and release gate.** Record backup/restore/migration/
+   import/verification durations, row counts, retained evidence locations,
+   artifact samples, image digests and the measured outage window. With the
+   intended native services available, run production `self-check`; require
+   zero completeness and integrity counts and successful readiness. #291 must
+   repeat this procedure on production-sized history and retain this exact data
+   loss boundary when completing `doc/release-notes-3.0.0.md` before rollout is approved.

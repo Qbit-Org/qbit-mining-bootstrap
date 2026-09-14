@@ -78,15 +78,33 @@ they fixed or configured no longer exists on this line:
 - There is no production release of the Rust server. The Postgres-backed and
   live-regtest Rust suites need a PostgreSQL server and a `qbitd` binary; see
   `test/prism-native-tests.sh`. They are not part of this note's verification.
-- Real release notes are #291. The tree reads 3.0.0, but nothing on this
-  line has been released under that version; `doc/release-notes-3.0.0.md` and
-  the rollout notes are written there.
+- Final release notes are #291. The tree reads 3.0.0, but nothing on this
+  line has been released under that version; `doc/release-notes-3.0.0.md`
+  currently records only the unreleased D5 recovery contract. #291 completes
+  those notes and the rollout record.
 - Native candidate recovery is #268.
 
 ## Upgrade and rollback
 
-None is supported. Do not point a production database at this line. The Rust
+No production cutover is supported yet. Do not point a production database at this line. The Rust
 migrator refuses to start against a live legacy Python writer lease and
 against an undrained legacy block outbox, but that is a guard against
-accidental cutover, not a supported migration path. There is no rollback
-procedure from a database this line has migrated.
+accidental cutover, not release approval.
+
+Decision D5 in #260 declares one-way native migration with forward repair and
+isolated-restore reconciliation, without down-migrations. #287 supplies the
+numbered procedures and exact queries in `docs/prism-rust-migration.md` and
+`docs/prism-ledger-ops.md`, and enforces audit import through production
+`self-check`. #291 must rehearse the procedure on production-sized history,
+record restore/import timings, and include the following identical data-loss
+boundary already recorded in the [unreleased 3.0.0 notes](release-notes-3.0.0.md)
+when preparing the actual release:
+
+> Before the first native share is acknowledged, restore the complete
+> pre-migration database and artifact backup and restart the pinned old image
+> in isolation from the migrated database. After the first native share is
+> acknowledged, restoring an older database loses those accepted records.
+> Any rollback that discards acknowledged history requires an explicit
+> accounting reconciliation and recovery decision; it is not an ordinary
+> image rollback. Keep every native frontend stopped while performing an
+> isolated restore/recovery operation against its replacement database.

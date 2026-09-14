@@ -1,6 +1,55 @@
 use super::*;
 use qbit_prism::FoundBlock;
 
+/// Audit history available from shared PostgreSQL storage, without relying on
+/// a filesystem mount on the public tier. This checks presence, not integrity:
+/// the import and read paths still authenticate the bytes and reconstructed
+/// native snapshots before serving an artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditCompleteness {
+    pub missing_stored_bodies: i64,
+    /// Native bodies with an existing immutable snapshot can reconstruct the
+    /// bytes and do not need `canonical_audit_bytes` to be stored separately.
+    pub missing_canonical_bytes: i64,
+}
+
+impl AuditCompleteness {
+    pub fn require_complete(&self) -> Result<()> {
+        ensure!(
+            self.missing_stored_bodies == 0 && self.missing_canonical_bytes == 0,
+            "audit history is incomplete: {} rows lack stored bodies and {} rows lack canonical bytes; run import-audits and repair any remaining rows before production cutover",
+            self.missing_stored_bodies,
+            self.missing_canonical_bytes,
+        );
+        Ok(())
+    }
+}
+
+/// Count each missing representation in one database snapshot. A legacy body
+/// stored inline needs canonical import; an external-only legacy body needs
+/// both. Imported canonical bytes themselves are a stored body. Native bodies
+/// need their referenced snapshot to make canonical reconstruction available.
+pub async fn audit_completeness<'e>(
+    executor: impl sqlx::Executor<'e, Database = Postgres>,
+) -> Result<AuditCompleteness> {
+    let (missing_stored_bodies, missing_canonical_bytes) = sqlx::query_as(
+        "SELECT \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object'), \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' \
+                 OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s \
+                     WHERE s.snapshot_sha256=a.share_snapshot_sha256))) \
+         FROM qbit_pool_audit_bundles a",
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(AuditCompleteness {
+        missing_stored_bodies,
+        missing_canonical_bytes,
+    })
+}
+
 /// Exact content-addressed bytes for the public artifact route. Imported
 /// legacy bytes are authoritative; missing legacy sidecars permit the old
 /// logical-JSON fallback. Native bodies are reproducible from their immutable
