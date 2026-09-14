@@ -24,7 +24,20 @@
 //! reply. It leaves out socket I/O, JSON framing and Stratum session work, and
 //! both frontends share this test's tokio runtime rather than running as two
 //! processes. The comparison is between phases of the same run, so both
-//! omissions are the same on each side of it.
+//! omissions are the same on each side of it. #342 (`qbit-prism-load`) adds a
+//! socket-level harness; these tests do not depend on it.
+//!
+//! # Acceptance is not the assertion
+//!
+//! The latency percentiles are. From #324 (`e13051cf`) on, a share-pass append
+//! carrying a found-block candidate has its own `block_only_ack_timeout`, so
+//! a slow solve no longer shows up as `ledger-confirmation-failed`; it shows
+//! up as a late acknowledgement counted in
+//! `qbit_prism_late_confirmed_shares_total`, or at worst as
+//! `ledger-outcome-unknown`, and an "every share was accepted" check would
+//! pass with the stall still present. Once this base carries `e13051cf`,
+//! incident 2 must also assert that counter is zero and that no ACK is
+//! `ledger-outcome-unknown` (see the `TODO(#324 rebase)` below).
 //!
 //! # Settings
 //!
@@ -783,6 +796,10 @@ async fn incident_2_body(
             }
         }
     }
+    // TODO(#324 rebase): once the base carries e13051cf, also assert that
+    // `qbit_prism_late_confirmed_shares_total` is zero on both frontends'
+    // metrics and that no ACK in either phase, the solve included, is
+    // `ledger-outcome-unknown`.
     let during = |acks: &[Ack]| {
         Latency::of(
             acks.iter()
