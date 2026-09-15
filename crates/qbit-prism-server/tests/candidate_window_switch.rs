@@ -289,6 +289,88 @@ async fn claim_error(ledger: &Ledger) -> Result<String> {
     }
 }
 
+/// The outbox columns a parking may change. Everything else in the row (the
+/// document, its digest, the block bytes, the window columns, the lifecycle
+/// state and offer record) is evidence it must leave exactly as it was.
+const PARKING_COLUMNS: [&str; 7] = [
+    "claim_token",
+    "claim_instance_id",
+    "claim_expires_at",
+    "last_error",
+    "next_attempt_at",
+    "updated_at",
+    "attempt_count",
+];
+
+/// Claim the one tampered row and check that the claim parked it (#387): the
+/// error keeps the diagnosis under the parked outcome, `last_error` names the
+/// row's database hash and the validation kind, the claim token, instance and
+/// expiry are cleared, `next_attempt_at` is infinity, the evidence is
+/// unchanged, and neither frontend's next poll attempts the row again.
+async fn claim_parks(
+    db: &Database,
+    ledger: &Ledger,
+    other: &Ledger,
+    hash: &str,
+    kind: &str,
+    expected: &str,
+) -> Result<()> {
+    let evidence = |mut row: Value| {
+        let columns = row.as_object_mut().expect("an outbox row is an object");
+        for column in PARKING_COLUMNS {
+            columns.remove(column);
+        }
+        row
+    };
+    let before = outbox_row(&db.pool, hash).await?;
+    let error = claim_error(ledger).await?;
+    ensure!(error.contains(expected), "claim error: {error}");
+    ensure!(
+        error.starts_with(&format!(
+            "candidate {hash} failed validation and was parked"
+        )),
+        "claim error: {error}"
+    );
+    let after = outbox_row(&db.pool, hash).await?;
+    let reason = after["last_error"]
+        .as_str()
+        .context("the parked row records no reason")?;
+    ensure!(
+        reason.starts_with(&format!("candidate {hash}: validation {kind}: ")),
+        "reason: {reason}"
+    );
+    ensure!(
+        reason.contains(expected) && reason.len() <= 1024,
+        "reason: {reason}"
+    );
+    ensure!(
+        after["claim_token"].is_null()
+            && after["claim_instance_id"].is_null()
+            && after["claim_expires_at"].is_null(),
+        "the parked row keeps its claim: {after}"
+    );
+    ensure!(
+        after["next_attempt_at"] == json!("infinity"),
+        "the row was not parked: {after}"
+    );
+    ensure!(after["attempt_count"] == json!(1), "{after}");
+    ensure!(
+        evidence(after) == evidence(before),
+        "parking changed the row's evidence"
+    );
+    for poller in [ledger, other] {
+        ensure!(
+            poller.claim_candidate(60).await?.is_none(),
+            "a parked row was claimed again"
+        );
+    }
+    ensure!(
+        outbox_row(&db.pool, hash).await?["attempt_count"] == json!(1),
+        "a parked row was attempted again"
+    );
+    Ok(())
+}
+
 /// Captured `tracing` output for one test body, on the runtime thread.
 #[derive(Clone, Default)]
 struct Logs(Arc<Mutex<Vec<u8>>>);
@@ -672,12 +754,15 @@ async fn candidate_preparation_never_waits_for_the_order_lock() -> Result<()> {
 /// Every disagreement between a pending row and its document is refused at
 /// claim: the typed columns, the document digest, the block bytes, the header,
 /// a NULL anchor (a pre-007 row), a missing suffix, and an inline pre-007
-/// document. After 007 there is no compatibility decode.
+/// document. After 007 there is no compatibility decode. Each refusal parks
+/// the row (#387) with a durable reason naming it and the validation kind,
+/// leaves its evidence untouched, and is not attempted again by a later poll.
 #[tokio::test]
 async fn claim_refuses_every_row_that_disagrees_with_its_document() -> Result<()> {
     run(|db| {
         Box::pin(async move {
             let ledger = db.ledger("decode").await?;
+            let other = db.ledger("decode-other").await?;
             for id in 1..=3 {
                 ledger.append(appended_share(id), None).await?;
             }
@@ -688,53 +773,62 @@ async fn claim_refuses_every_row_that_disagrees_with_its_document() -> Result<()
             let document = serde_json::to_value(candidate)?;
 
             // Column tampering on a row the enqueue wrote.
-            let tampered: Vec<(&str, &str, &str)> = vec![
+            let tampered: Vec<(&str, &str, &str, &str)> = vec![
                 (
                     "anchor column",
                     "UPDATE qbit_block_candidate_outbox SET window_anchor_ms=window_anchor_ms+1 WHERE block_hash=$1",
+                    "window_columns",
                     "anchor column disagrees",
                 ),
                 (
                     "balances digest column",
                     "UPDATE qbit_block_candidate_outbox SET window_prior_balances_sha256=repeat('0',64) WHERE block_hash=$1",
+                    "window_columns",
                     "balances digest column disagrees",
                 ),
                 (
                     "range column",
                     "UPDATE qbit_block_candidate_outbox SET window_last_share_seq=window_last_share_seq+1 WHERE block_hash=$1",
+                    "window_columns",
                     "range columns disagree",
                 ),
                 (
                     "range columns on an empty-window document",
                     "UPDATE qbit_block_candidate_outbox SET window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL WHERE block_hash=$1",
+                    "window_columns",
                     "range columns disagree",
                 ),
                 (
                     "document digest",
                     "UPDATE qbit_block_candidate_outbox SET candidate_sha256=repeat('0',64) WHERE block_hash=$1",
+                    "document_digest",
                     "digest mismatch",
                 ),
                 (
                     "block bytes",
                     "UPDATE qbit_block_candidate_outbox SET block_bytes=block_bytes||'\\x00'::bytea WHERE block_hash=$1",
+                    "block",
                     "do not hash to the document's block_sha256",
                 ),
                 (
                     "missing block bytes",
                     "UPDATE qbit_block_candidate_outbox SET block_bytes=NULL WHERE block_hash=$1",
+                    "block",
                     "carries no block bytes",
                 ),
                 (
                     "NULL anchor on a pending row",
                     "UPDATE qbit_block_candidate_outbox SET window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL WHERE block_hash=$1",
+                    "window_reference",
                     "pre-007 frontend",
                 ),
             ];
-            for (name, statement, expected) in tampered {
+            for (name, statement, kind, expected) in tampered {
                 ledger.enqueue_candidate(candidate.clone()).await?;
                 sqlx::query(statement).bind(&hash).execute(&db.pool).await?;
-                let error = claim_error(&ledger).await.with_context(|| name.to_owned())?;
-                ensure!(error.contains(expected), "{name}: {error}");
+                claim_parks(db, &ledger, &other, &hash, kind, expected)
+                    .await
+                    .with_context(|| name.to_owned())?;
                 delete_row(&db.pool, &hash).await?;
             }
 
@@ -749,21 +843,82 @@ async fn claim_refuses_every_row_that_disagrees_with_its_document() -> Result<()
                 &digest_of(&header_forged)?,
             )
             .await?;
-            let error = claim_error(&ledger).await.context("forged header")?;
-            ensure!(
-                error.contains("header does not hash to block_hash"),
-                "forged header: {error}"
-            );
+            claim_parks(db, &ledger, &other, &hash, "block", "header does not hash to block_hash")
+                .await
+                .context("forged header")?;
+            delete_row(&db.pool, &hash).await?;
+
+            let mut truncated = candidate.clone();
+            truncated.block_bytes.truncate(80);
+            truncated.block_sha256 = Candidate::block_digest_hex(&truncated.block_bytes);
+            insert_raw(
+                &db.pool,
+                &truncated,
+                &serde_json::to_value(&truncated)?,
+                &digest_of(&truncated)?,
+            )
+            .await?;
+            claim_parks(db, &ledger, &other, &hash, "block", "candidate block is truncated")
+                .await
+                .context("truncated block")?;
             delete_row(&db.pool, &hash).await?;
 
             let mut without_suffix = document.clone();
             without_suffix.as_object_mut().unwrap().remove("coinbase_suffix_hex");
             insert_raw(&db.pool, candidate, &without_suffix, &digest_of(candidate)?).await?;
-            let error = claim_error(&ledger).await.context("missing suffix")?;
-            ensure!(
-                error.contains("invalid persisted candidate"),
-                "missing suffix: {error}"
-            );
+            claim_parks(db, &ledger, &other, &hash, "document", "invalid persisted candidate")
+                .await
+                .context("missing suffix")?;
+            delete_row(&db.pool, &hash).await?;
+
+            let mut empty_suffix = candidate.clone();
+            empty_suffix.coinbase_suffix_hex = String::new();
+            insert_raw(
+                &db.pool,
+                &empty_suffix,
+                &serde_json::to_value(&empty_suffix)?,
+                &digest_of(&empty_suffix)?,
+            )
+            .await?;
+            claim_parks(db, &ledger, &other, &hash, "coinbase_suffix", "suffix must be non-empty hex")
+                .await
+                .context("empty suffix")?;
+            delete_row(&db.pool, &hash).await?;
+
+            // The document, digested as production would, names another block
+            // than the row it is stored in.
+            let mut renamed = candidate.clone();
+            renamed.block_hash = "ff".repeat(32);
+            insert_raw(
+                &db.pool,
+                candidate,
+                &serde_json::to_value(&renamed)?,
+                &digest_of(&renamed)?,
+            )
+            .await?;
+            claim_parks(db, &ledger, &other, &hash, "document_identity", &format!("names block {} in row {hash}", "ff".repeat(32)))
+                .await
+                .context("renamed document")?;
+            delete_row(&db.pool, &hash).await?;
+
+            // A document range the bigint columns cannot hold, beside valid columns.
+            let mut unrepresentable = candidate.clone();
+            unrepresentable
+                .window
+                .shares
+                .as_mut()
+                .context("the candidate references a range")?
+                .last_share_seq = u64::MAX;
+            insert_raw(
+                &db.pool,
+                candidate,
+                &serde_json::to_value(&unrepresentable)?,
+                &digest_of(&unrepresentable)?,
+            )
+            .await?;
+            claim_parks(db, &ledger, &other, &hash, "window_columns", "not representable in the range columns")
+                .await
+                .context("unrepresentable range")?;
             delete_row(&db.pool, &hash).await?;
 
             let mut inconsistent = candidate.clone();
@@ -775,11 +930,9 @@ async fn claim_refuses_every_row_that_disagrees_with_its_document() -> Result<()
                 &digest_of(&inconsistent)?,
             )
             .await?;
-            let error = claim_error(&ledger).await.context("anchor invariant")?;
-            ensure!(
-                error.contains("anchor disagrees with its window reference"),
-                "anchor invariant: {error}"
-            );
+            claim_parks(db, &ledger, &other, &hash, "reference_invariants", "anchor disagrees with its window reference")
+                .await
+                .context("anchor invariant")?;
             delete_row(&db.pool, &hash).await?;
 
             // A legacy inline candidate on the post-007 schema, with columns a
@@ -793,11 +946,9 @@ async fn claim_refuses_every_row_that_disagrees_with_its_document() -> Result<()
                 "coinbase_suffix_hex": "00".repeat(12),
             });
             insert_raw(&db.pool, candidate, &legacy, &digest_of(candidate)?).await?;
-            let error = claim_error(&ledger).await.context("inline document")?;
-            ensure!(
-                error.contains("inline pre-007 document"),
-                "inline document: {error}"
-            );
+            claim_parks(db, &ledger, &other, &hash, "document", "inline pre-007 document")
+                .await
+                .context("inline document")?;
             delete_row(&db.pool, &hash).await?;
 
             // The untouched row decodes.
