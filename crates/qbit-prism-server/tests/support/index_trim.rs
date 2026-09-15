@@ -12,9 +12,10 @@
 //! before the version is recorded.
 use super::*;
 use anyhow::ensure;
-use qbit_prism_server::ledger::REQUIRED_SCHEMA_VERSIONS;
+use qbit_prism_server::{ledger::REQUIRED_SCHEMA_VERSIONS, metrics::Metrics};
 use sqlx::Row;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
@@ -203,6 +204,46 @@ async fn migration_013_replaces_the_release_indexes_of_a_frozen_2x_source_and_ke
     db.close(vec![ledger]).await
 }
 
+// Only the pool checkout family: advisory-lock observations are separate.
+fn acquire_family(metrics: &Metrics) -> Vec<String> {
+    metrics
+        .render()
+        .lines()
+        .filter(|line| line.contains("qbit_prism_database_pool_acquire_seconds"))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assert_acquire_counts(metrics: &Metrics, success: u64, failure: u64) {
+    let body = metrics.render();
+    for (outcome, expected) in [("success", success), ("failure", failure)] {
+        let key =
+            format!("qbit_prism_database_pool_acquire_seconds_count{{result=\"{outcome}\"}} ");
+        let samples: Vec<_> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(&key))
+            .collect();
+        assert_eq!(samples.len(), 1, "missing or duplicate {outcome} series");
+        assert_eq!(samples[0].parse::<u64>().unwrap(), expected, "{outcome}");
+    }
+}
+
+async fn waiting_build_pid(pool: &PgPool) -> Result<i32> {
+    timeout(Duration::from_secs(60), async {
+        loop {
+            // The relation OID scopes this to this test's private schema.
+            let pid: Option<i32> = sqlx::query_scalar("SELECT a.pid FROM pg_stat_activity a WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.wait_event_type='Lock' AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.locktype='relation' AND l.relation='qbit_share_ledger'::regclass AND l.granted)")
+                .fetch_optional(pool).await?;
+            if let Some(pid) = pid {
+                return Ok(pid);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the concurrent build never waited for the open writer")?
+}
+
 #[tokio::test]
 async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -217,53 +258,94 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
     let mut writer = pool.begin().await?;
     insert_share(&mut *writer, 1, "alice").await?;
     assert_eq!(share_count(&pool).await?, 0);
-    // The migration runs on this task, polled alongside the observer below;
-    // `finished` says whether it returned before the writer committed.
-    let finished = AtomicBool::new(false);
-    let migrate = async {
-        let ledger = Ledger::connect(&db.url, "online".into(), 8, true).await;
-        finished.store(true, Ordering::SeqCst);
-        ledger
-    };
-    let observe = async {
-        // The concurrent build waits for the open writer before it can
-        // finish.
-        timeout(Duration::from_secs(60), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.wait_event_type='Lock' AND l.locktype='relation' AND l.relation='qbit_share_ledger'::regclass AND l.granted)")
-                    .fetch_one(&pool)
-                    .await?;
-                if waiting {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                ensure!(
-                    !finished.load(Ordering::SeqCst),
-                    "the online migration finished while a writer transaction was open"
-                );
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .context("the concurrent build never waited for the open writer")??;
-        // Appends keep landing while it waits.
-        timeout(Duration::from_secs(5), async {
-            let mut tx = pool.begin().await?;
-            insert_share(&mut *tx, 2, "bob").await?;
-            tx.commit().await?;
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("an append blocked behind the online index build")??;
-        ensure!(!finished.load(Ordering::SeqCst));
-        writer.commit().await?;
+    let metrics = Arc::new(Metrics::default());
+    let mut migrate = Box::pin(Ledger::connect_with_metrics(
+        &db.url,
+        "online".into(),
+        8,
+        true,
+        Some(metrics.clone()),
+    ));
+    tokio::select! {
+        result = &mut migrate => anyhow::bail!("migration finished before the writer committed: {:?}", result.err()),
+        result = waiting_build_pid(&pool) => { result?; }
+    }
+    // Exactly two checkouts so far: migrate_schema's transaction and the
+    // online runner's detached connection. DDL has not completed yet.
+    assert_acquire_counts(&metrics, 2, 0);
+    let acquired = acquire_family(&metrics);
+    sleep(Duration::from_millis(75)).await;
+    assert_eq!(
+        acquire_family(&metrics),
+        acquired,
+        "index wait extended checkout timing"
+    );
+    // Appends keep landing while the build waits.
+    timeout(Duration::from_secs(5), async {
+        let mut tx = pool.begin().await?;
+        insert_share(&mut *tx, 2, "bob").await?;
+        tx.commit().await?;
         Ok::<_, anyhow::Error>(())
-    };
-    let (online, observed) = tokio::join!(migrate, observe);
-    observed?;
-    let online = online?;
+    })
+    .await
+    .context("an append blocked behind the online index build")??;
+    writer.commit().await?;
+    let online = timeout(Duration::from_secs(60), migrate).await??;
+    // Only registration's transaction and heartbeat acquire afterward. The
+    // online version-recording transaction reuses its detached connection.
+    assert_acquire_counts(&metrics, 4, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
-    db.close(vec![first, online]).await
+
+    // Cancel the runner's real SQL after checkout, then resume without metrics.
+    // This is distinct from cancelling a checkout future (shared helper tests).
+    undo_013(&pool).await?;
+    let mut writer = pool.begin().await?;
+    insert_share(&mut *writer, 3, "alice").await?;
+    let mut migrate = Box::pin(Ledger::connect_with_metrics(
+        &db.url,
+        "cancelled-online".into(),
+        8,
+        true,
+        Some(metrics.clone()),
+    ));
+    let pid = tokio::select! {
+        result = &mut migrate => anyhow::bail!("migration finished before SQL cancellation: {:?}", result.err()),
+        result = waiting_build_pid(&pool) => result?,
+    };
+    assert_acquire_counts(&metrics, 6, 0);
+    let acquired = acquire_family(&metrics);
+    let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await?;
+    assert!(cancelled);
+    let error = timeout(Duration::from_secs(10), migrate)
+        .await?
+        .err()
+        .context("cancelled online build succeeded")?;
+    assert_eq!(
+        error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("57014"),
+        "{error:#}"
+    );
+    assert_eq!(
+        acquire_family(&metrics),
+        acquired,
+        "SQL cancellation relabeled or observed checkout twice"
+    );
+    writer.rollback().await?;
+    // The runner awaits close on SQL error; its session lock must be released
+    // so the metrics-None restart can rebuild the interrupted index.
+    let resumed = timeout(Duration::from_secs(60), db.ledger("resumed-no-metrics")).await??;
+    assert_eq!(acquire_family(&metrics), acquired);
+    assert_trimmed(&pool).await?;
+    assert_eq!(share_count(&pool).await?, 2);
+    db.close(vec![first, online, resumed]).await
 }
 
 #[tokio::test]
