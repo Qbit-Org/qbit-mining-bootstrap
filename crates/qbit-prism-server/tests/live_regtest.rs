@@ -314,15 +314,27 @@ impl Fixture {
         }
     }
 
+    /// Stop the miners and wait until no block candidate is still being
+    /// worked on. Since 011 a claim passes through `offer_reserved` and
+    /// `offered` before its landing, so the SIGKILL in the failover test can
+    /// leave such a row, or a `reconciliation` row it was recovering, under a
+    /// real 120-second lease; the surviving process reclaims it through the
+    /// production expiry path, lands it, and finishes it or releases it into
+    /// `reconciliation` with a backoff. Drained therefore means: no row is
+    /// `pending`, `offer_reserved` or `offered`, no row holds a live claim,
+    /// and every remaining `reconciliation` row was released by its attempt
+    /// (its `next_attempt_at` is in the future, or it is parked). Such rows
+    /// may stay: a rejected block, or one the chain never activates, is
+    /// retried on read-only observations and never terminalizes, so waiting
+    /// for it would wait forever. A row that is due and unclaimed is between
+    /// attempts and still counts as work.
     async fn quiesce(&mut self) -> Result<()> {
         for miner in &mut self.miners {
             miner.stop();
         }
-        // SIGKILL leaves a real 120-second candidate lease behind. Let the
-        // surviving process reclaim it through the production expiry path.
         until("candidate outbox drain", 140, || async {
             Ok(sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state='pending'",
+                "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered') OR (state='reconciliation' AND (claim_expires_at>clock_timestamp() OR next_attempt_at<=clock_timestamp()))",
             )
             .fetch_one(&self.pool)
             .await?

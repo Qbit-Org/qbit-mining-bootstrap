@@ -318,6 +318,7 @@ impl Fixture {
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
+            offer_probe: Default::default(),
         });
         let fixture = Self {
             coordinator,

@@ -21,10 +21,11 @@ pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
 pub use audit::{audit_canonical_bytes, decode_canonical_audit_body, materialize_audit_row};
 mod candidates;
-use candidates::prepare_candidate;
+use candidates::prepare_candidate_observed;
 pub use candidates::{
     authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
-    Candidate, CandidateClaim, CandidateCtv, ClaimParts, LandedAudit, SignerKeys,
+    Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimLifecycle, ClaimParts,
+    LandedAudit, OfferOutcome, OfferRecord, SignerKeys,
 };
 mod connect;
 use connect::{require_revision, writable};

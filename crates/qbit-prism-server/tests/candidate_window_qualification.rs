@@ -741,8 +741,13 @@ async fn incident_2_body(
             if state == "submitted" {
                 break;
             }
+            // Between the offer and the confirmation the row is reserved,
+            // offered or reconciling (#266); only a terminal state other
+            // than submitted, or the ceiling, ends the wait.
             ensure!(
-                state == "pending" && Instant::now() < ceiling,
+                ["pending", "offer_reserved", "offered", "reconciliation"]
+                    .contains(&state.as_str())
+                    && Instant::now() < ceiling,
                 "the solved candidate finished as {state}, or not within 30 s of submitblock"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;

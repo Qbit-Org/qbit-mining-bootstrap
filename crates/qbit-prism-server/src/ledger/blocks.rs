@@ -1,5 +1,5 @@
 use super::audit::{persist_audit_snapshot, verify_durable_range, AuditSnapshotWrite};
-use super::candidates::{header_bits_hex, ClaimParts};
+use super::candidates::{header_bits_hex, CandidateState, ClaimParts};
 use super::*;
 use qbit_prism::{verify_audit_parts, AuditVerificationReport};
 use std::sync::Arc;
@@ -33,6 +33,15 @@ impl Ledger {
     /// the solved block before recording any obligations. Prepared rows do not
     /// contribute to carry balances until an active-chain observation confirms
     /// them. The transaction also publishes all recovery fanout artifacts.
+    ///
+    /// The evidence is as issued (migration 011): the payout and carry rows
+    /// are the accounts of the immutable payout manifest the block's coinbase
+    /// commits to, whose prior balances are the candidate's window reference,
+    /// whatever the canonical balances are when the block lands. The block
+    /// row is marked with that audit's digest in the same transaction, and
+    /// `qbit_carry_forward_integrity_mismatches()` validates marked rows
+    /// against that manifest instead of the chain-ordered running sum. The
+    /// current balances are unaffected: they sum the active per-block deltas.
     pub async fn land_candidate(
         &self,
         claim: &CandidateClaim,
@@ -116,7 +125,7 @@ impl Ledger {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
-        require_claim(&mut tx, claim).await?;
+        let state = require_claim(&mut tx, claim).await?;
         if let Some(expected) = expected_revision {
             require_revision(&mut tx, expected).await?;
         }
@@ -153,20 +162,38 @@ impl Ledger {
             revision == expected_revision.unwrap_or(candidate.payout_revision),
             "candidate payout revision was superseded"
         );
-        // The current canonical balances must still be the set the parts were
-        // built on. Both sides are compared through the semantic digest, which
-        // sorts internally, so the comparison does not depend on the order a
-        // read returned them in: the current read keeps its SQL order, and an
-        // as-issued set decodes in the writer's canonical order.
+        // The parts were built on the as-issued set the reference names
+        // (`landing_from_parts` proved the digest tie), which is the set the
+        // block's coinbase commits to. Whether the current canonical balances
+        // must still be that set depends on the row's state as the database
+        // holds it under the claim lock, never on the claim's memory of it.
+        // A `pending` row has not been offered: its landing keeps the fence,
+        // because a divergent pending block is superseded work the caller
+        // may still abandon. A row in the offer lifecycle (reserved, offered,
+        // adopted or reconciling) is a block the node has or may have, and
+        // it lands with its issued accounts however the balances have moved:
+        // a miner paid on chain twice against one balance carries the
+        // difference as debt in the additive current balance. That divergence
+        // is reported, and the marker written below records the provenance
+        // the integrity validator checks marked rows by.
         let prior = read_prior_balances(&mut tx).await?;
         let current =
             tokio::task::spawn_blocking(move || qbit_prism::prior_balances_digest(&prior)).await?;
-        ensure!(
-            current == landing.prior_balances_digest,
-            "candidate prior balances differ from current canonical balances"
-        );
-        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,$2,$3,$4,$5)")
-            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).execute(&mut *tx).await?;
+        if current != landing.prior_balances_digest {
+            ensure!(
+                state != CandidateState::Pending,
+                "candidate prior balances differ from current canonical balances"
+            );
+            tracing::warn!(
+                block = %candidate.block_hash,
+                state = state.as_str(),
+                as_issued_balances = %hex::encode(landing.prior_balances_digest),
+                current_balances = %hex::encode(current),
+                "ALERT: landing an as-issued audit whose prior balances differ from the current canonical balances; the block's issued accounts are recorded as evidence and the additive balances carry the difference"
+            );
+        }
+        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,as_issued_audit_sha256) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).bind(&report.audit_bundle_sha256_hex).execute(&mut *tx).await?;
         let snapshot_digest = persist_audit_snapshot(&mut tx, &landing.snapshot).await?;
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")
             .bind(&candidate.block_hash).bind(sqlx::types::Json(&*landing.body)).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
@@ -187,6 +214,9 @@ impl Ledger {
     /// `submitted` means the caller proved this block is on the active chain.
     /// A successful submitblock RPC alone is insufficient. Ambiguous network
     /// errors use retry_candidate and retain every recovery artifact.
+    /// `abandoned` is reachable from `pending` only: a row the node was
+    /// offered is never abandoned, it stays in reconciliation with its
+    /// evidence (`Ledger::reconcile_candidate`).
     pub async fn finish_candidate(
         &self,
         claim: &CandidateClaim,
@@ -217,7 +247,7 @@ impl Ledger {
             revision == expected_revision,
             "payout revision changed while observing candidate disposition"
         );
-        require_claim(&mut tx, claim).await?;
+        let state = require_claim(&mut tx, claim).await?;
         if submitted {
             let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
             let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND chain_state='confirmed')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
@@ -231,6 +261,11 @@ impl Ledger {
                 bump_revision(&mut tx).await?;
             }
         } else {
+            ensure!(
+                state == CandidateState::Pending,
+                "cannot abandon a candidate in state {}: an offered block keeps its evidence in reconciliation",
+                state.as_str()
+            );
             let mature:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND maturity_state='mature')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(!mature, "cannot abandon a mature candidate");
             let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=CASE WHEN chain_state='confirmed' THEN clock_timestamp() ELSE inactive_since END WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
@@ -243,6 +278,8 @@ impl Ledger {
         // and the document go NULL in one statement, so retention's
         // `window_anchor_ms IS NOT NULL` predicate is exactly the live set and
         // the outbox does not keep every submitted or abandoned block forever.
+        // The offer record (reservation, call time, outcome) is small and
+        // stays on a submitted row as the evidence of its one offer.
         sqlx::query("UPDATE qbit_block_candidate_outbox SET state=$3,candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2")
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -489,8 +526,10 @@ impl std::io::Write for CountingWriter {
 /// All of landing's whole-window work, in one blocking call over the parts.
 ///
 /// For a non-empty window the share snapshot digest **must equal the
-/// reference's `snapshot_sha256`**: the parts landing stores are the window
-/// the candidate names, or nothing lands.
+/// reference's `snapshot_sha256`**, and the parts' prior balances **must
+/// hash to the reference's `prior_balances_digest`**: the parts landing
+/// stores are the window and the as-issued balances the candidate names,
+/// which are what its coinbase commits to, or nothing lands.
 fn landing_from_parts(
     parts: &ClaimParts,
     window: WindowRef,
@@ -500,6 +539,13 @@ fn landing_from_parts(
     let body = &parts.body;
     let shares = &parts.shares;
     let report = verify_audit_parts(body, shares, ledger_public_key)?;
+    let prior_balances_digest = qbit_prism::prior_balances_digest(&body.prior_balances);
+    ensure!(
+        prior_balances_digest == window.prior_balances_digest,
+        "rebuilt audit prior balances {} differ from the candidate's window reference {}",
+        hex::encode(prior_balances_digest),
+        hex::encode(window.prior_balances_digest)
+    );
     // The stored body drops the one copy of the window it still carries:
     // `reward_manifest.shares`, a pure fold over the snapshot. #267 removes it
     // so stored bodies stop growing with the window, and reads rebuild the
@@ -568,7 +614,7 @@ fn landing_from_parts(
         audit_commitment_leaves: serde_json::to_value(&body.audit_commitment_leaves_hex)?,
         witness_merkle_leaves: serde_json::to_value(&body.witness_merkle_leaves_hex)?,
         accounts: serde_json::to_value(&body.payout_policy_manifest.accounts)?,
-        prior_balances_digest: qbit_prism::prior_balances_digest(&body.prior_balances),
+        prior_balances_digest,
         snapshot: AuditSnapshotWrite {
             digest,
             first_share_seq: first,
@@ -581,7 +627,14 @@ fn landing_from_parts(
     })
 }
 
-async fn require_claim(tx: &mut Transaction<'_, Postgres>, claim: &CandidateClaim) -> Result<()> {
+/// Prove the claim live under the row lock and return the row's lifecycle
+/// state as the database holds it now. Callers decide by this state, never
+/// by the claim's in-memory `lifecycle`, which describes the row as it was
+/// claimed: the same attempt may have reserved, offered or adopted it since.
+async fn require_claim(
+    tx: &mut Transaction<'_, Postgres>,
+    claim: &CandidateClaim,
+) -> Result<CandidateState> {
     // Block takeover (FOR UPDATE), while allowing the owner to renew the
     // non-key lease columns throughout a long audit-persistence transaction.
     sqlx::query(
@@ -590,10 +643,12 @@ async fn require_claim(tx: &mut Transaction<'_, Postgres>, claim: &CandidateClai
     .bind(&claim.candidate.block_hash)
     .fetch_optional(&mut **tx)
     .await?;
-    let valid: Option<bool> = sqlx::query_scalar("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state='pending' FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+    let row: Option<(bool, String)> = sqlx::query_as(&format!("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state IN {},state FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL))
         .bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&mut **tx).await?;
-    ensure!(valid == Some(true), "candidate claim was lost or expired");
-    Ok(())
+    match row {
+        Some((true, state)) => CandidateState::parse(&state),
+        _ => bail!("candidate claim was lost or expired"),
+    }
 }
 
 async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {

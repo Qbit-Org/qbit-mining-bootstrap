@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -37,7 +37,13 @@ pub fn schema_version_list(versions: &[i32]) -> String {
 const SOURCE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 2)];
 /// Formats the native claim lane can process. Migration 006 records the
 /// old declaration as provenance and declares this runtime format atomically.
-const NATIVE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 1)];
+const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
+    ("candidate_storage_version", 1),
+    // 011: the offer-before-landing outbox lifecycle. A binary without this
+    // entry refuses the migrated database at connect, which is what keeps a
+    // pre-011 frontend off rows the reservation lifecycle owns.
+    ("candidate_offer_lifecycle", 1),
+];
 
 /// How many blocking outbox rows a drain refusal names.
 const BLOCKING_ROWS_NAMED: usize = 16;
@@ -1999,6 +2005,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         10,
         include_str!("../../migrations/010_fatal_state_recovery.sql"),
     ),
+    (
+        11,
+        include_str!("../../migrations/011_offer_before_landing.sql"),
+    ),
 ];
 
 /// The SQL of one native migration, by the version it records.
@@ -2800,6 +2810,59 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
+    if !versions.contains(&11) {
+        refuse_unquiesced_outbox(tx).await?;
+        sqlx::raw_sql(native_migration(11))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(11)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// 011's own quiesce check, before any of its DDL runs. A pending row whose
+/// claim is still live belongs to a pre-011 frontend that may be mid-offer:
+/// the reservation lifecycle cannot take over a row an old frontend may
+/// still send. And 011 quarantines every attempted pending row as an
+/// unknown-delivery reconciliation row, which must carry the evidence the
+/// lifecycle payload rule requires (the document, the block bytes and the
+/// window reference); a parked chunked row or a pre-007 row cannot be
+/// quarantined and is refused by name, exactly as 007 refused it.
+async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let outbox: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_block_candidate_outbox') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !outbox {
+        return Ok(());
+    }
+    let live: Vec<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND claim_expires_at>clock_timestamp() ORDER BY block_hash",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        live.is_empty(),
+        "migration 011 refuses to run while pending block candidates hold a live claim: {}. \
+         A pre-011 frontend may be offering them. Stop every pre-011 frontend, wait for their \
+         claims to expire (at most 120 s), then migrate again; nothing was changed",
+        named_objects(&live)
+    );
+    let bare: Vec<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND attempt_count>0 AND (candidate IS NULL OR block_bytes IS NULL OR window_anchor_ms IS NULL OR window_prior_balances_sha256 IS NULL) ORDER BY block_hash",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        bare.is_empty(),
+        "migration 011 refuses undrained attempted block candidates without a block and window reference: {}. \
+         They were attempted by a pre-007 frontend or parked as chunked rows, and 011 cannot quarantine them. \
+         Drain them with the frontend that wrote them (or the 2.x.x image for a parked chunked row), stop it, \
+         then migrate again; nothing was changed",
+        named_objects(&bare)
+    );
     Ok(())
 }
 

@@ -215,6 +215,11 @@ impl Coordinator {
         submission: codec::Submission,
         stale_grace: StaleGrace,
     ) -> Result<(), StratumError> {
+        // The proof-observation boundary of the first-offer latency: this
+        // frontend's wall clock as the locally validated block proof enters
+        // the coordinator, before any await. Recorded on the candidate row
+        // at enqueue; a clock before the epoch leaves it unknown.
+        let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
         let (last_poll, readiness_generation) = {
             let readiness = self.readiness.read().await;
             let last_poll = readiness.last_poll.ok_or_else(|| {
@@ -347,7 +352,9 @@ impl Coordinator {
             // The slim candidate: the window reference `refresh_once`
             // already computed, the stored inputs the job was built with,
             // and the block as bytes. Nothing here walks the window, clones
-            // the bundle or reads configuration.
+            // the bundle or reads configuration. The as-issued balances,
+            // O(recipients), travel beside the document so the enqueue can
+            // write the snapshot the post-offer landing rebuilds from.
             let inputs = &context.prepared.inputs;
             let block_bytes = hex::decode(&submission.block_hex)?;
             anyhow::Ok(Some(Candidate {
@@ -366,17 +373,17 @@ impl Coordinator {
                 coinbase_suffix_hex: suffix,
                 deferred_share: (!share_pass).then(|| share.clone()),
                 block_bytes,
-                as_issued_balances: Vec::new(),
+                as_issued_balances: context.prepared.snapshot.prior_balances.clone(),
             }))
         })();
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
-                self.persist_share_pass(share, candidate, revision, start)
+                self.persist_share_pass(share, candidate, proof_observed_at_ms, revision, start)
                     .await
             }
             Ok(candidate) => {
-                self.persist_block_only(&share, candidate, &block_hash, start)
+                self.persist_block_only(&share, candidate, proof_observed_at_ms, &block_hash, start)
                     .await
             }
         };
@@ -435,6 +442,7 @@ impl Coordinator {
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         revision: i64,
         start: tokio::time::Instant,
     ) -> SaveOutcome {
@@ -448,7 +456,13 @@ impl Coordinator {
         let mut task = AppendTask {
             handle: Some(tokio::spawn(async move {
                 let result = ledger
-                    .append_at_revision(share, candidate, revision, task_gate.clone())
+                    .append_at_revision_observed(
+                        share,
+                        candidate,
+                        proof_observed_at_ms,
+                        revision,
+                        task_gate.clone(),
+                    )
                     .await;
                 // Measured here, not at the join: a coordinator task that is
                 // scheduled late must not turn a durable commit into unknown.
@@ -513,6 +527,7 @@ impl Coordinator {
         &self,
         share: &AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         block_hash: &str,
         start: tokio::time::Instant,
     ) -> SaveOutcome {
@@ -548,8 +563,11 @@ impl Coordinator {
         // so a degraded database cannot hold the acknowledgement past `bound`.
         let mut phase = "candidate-pending";
         let ledger = self.ledger.clone();
-        let mut enqueue =
-            tokio::spawn(async move { ledger.enqueue_candidate_once(candidate).await });
+        let mut enqueue = tokio::spawn(async move {
+            ledger
+                .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+                .await
+        });
         match tokio::time::timeout_at(bound, &mut enqueue).await {
             Ok(Ok(Ok(true))) => {}
             Ok(Ok(Ok(false))) => return SaveOutcome::Duplicate,
@@ -592,8 +610,8 @@ impl Coordinator {
             // finalization cannot fall between two separate reads.
             let poll = tokio::time::timeout_at(
                 bound,
-                sqlx::query_as::<_, (bool, Option<String>)>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)
@@ -602,17 +620,23 @@ impl Coordinator {
             .await;
             match poll {
                 Err(_) => break,
-                Ok(Ok((true, _))) => return SaveOutcome::Accepted,
-                // D2b's answer for an abandoned candidate. It is not a proof:
-                // reconciliation still credits the deferred share if the block
-                // later becomes active.
-                Ok(Ok((false, Some(state)))) if state != "pending" => {
+                Ok(Ok((true, _, _))) => return SaveOutcome::Accepted,
+                // D2b's answer for a candidate the pre-offer probe abandoned
+                // as superseded, or one the node refused after the offer
+                // (kept in reconciliation with the rejected outcome). It is
+                // not a proof: reconciliation still credits the deferred
+                // share if the block later becomes active.
+                Ok(Ok((false, Some(state), outcome)))
+                    if state == "abandoned"
+                        || (state == CandidateState::Reconciliation.as_str()
+                            && outcome.as_deref() == Some(OfferOutcome::Rejected.as_str())) =>
+                {
                     return SaveOutcome::Failed(anyhow::anyhow!(
                         "block-only proof was not accepted on the active chain"
                     ))
                 }
-                Ok(Ok((false, Some(_)))) => phase = "candidate-pending",
-                Ok(Ok((false, None))) => {}
+                Ok(Ok((false, Some(_), _))) => phase = "candidate-pending",
+                Ok(Ok((false, None, _))) => {}
                 // The candidate is already durable, so a failed read proves
                 // nothing about its credit.
                 Ok(Err(error)) => {

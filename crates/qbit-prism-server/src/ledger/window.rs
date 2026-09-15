@@ -360,7 +360,8 @@ impl Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, None, None).await
+        self.append_checked(share, candidate, None, None, None)
+            .await
     }
 
     pub async fn append_at_revision(
@@ -369,7 +370,7 @@ impl Ledger {
         candidate: Option<Candidate>,
         expected_revision: i64,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, Some(expected_revision), None)
+        self.append_checked(share, candidate, None, Some(expected_revision), None)
             .await
     }
 
@@ -388,14 +389,42 @@ impl Ledger {
         expected_revision: i64,
         pre_commit: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, Some(expected_revision), Some(pre_commit))
-            .await
+        self.append_checked(
+            share,
+            candidate,
+            None,
+            Some(expected_revision),
+            Some(pre_commit),
+        )
+        .await
+    }
+
+    /// [`Ledger::append_at_revision_gated`], recording when the candidate's
+    /// locally validated proof was observed (a wall clock, UNIX ms); see
+    /// `ClaimLifecycle::proof_observed_at_ms`.
+    pub async fn append_at_revision_gated_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
+        expected_revision: i64,
+        pre_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<AppendResult> {
+        self.append_checked(
+            share,
+            candidate,
+            proof_observed_at_ms,
+            Some(expected_revision),
+            Some(pre_commit),
+        )
+        .await
     }
 
     async fn append_checked(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
@@ -409,7 +438,10 @@ impl Ledger {
                 "credited candidates cannot also contain a deferred share"
             );
         }
-        let prepared = candidate.as_ref().map(prepare_candidate).transpose()?;
+        let prepared = candidate
+            .as_ref()
+            .map(|candidate| prepare_candidate_observed(candidate, proof_observed_at_ms))
+            .transpose()?;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;

@@ -198,6 +198,7 @@ impl TestCandidate {
             claim_token: token,
             // A conflicting claim is never landed, so it needs no rebuilt parts.
             parts: None,
+            lifecycle: Default::default(),
         }
     }
 }
