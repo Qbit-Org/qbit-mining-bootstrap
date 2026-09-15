@@ -568,7 +568,7 @@ mod diagnostics {
     pub const ENCODED_RUN: usize = 32;
     /// The seed bytes the server accepts as test signing seeds when
     /// `PRISM_ALLOW_TEST_SIGNING_SEEDS=1` is in its environment.
-    const TEST_SEED_BYTES: [&str; 4] = ["11", "22", "42", "43"];
+    const TEST_SEED_BYTES: [u8; 4] = [0x11, 0x22, 0x42, 0x43];
 
     pub fn report(children: &[(String, Option<&Process>)], database_url: Option<&str>) -> String {
         let mut secrets: Vec<String> = children
@@ -749,7 +749,10 @@ mod diagnostics {
             add_url(&mut secrets, value);
             if name == "PRISM_ALLOW_TEST_SIGNING_SEEDS" && value != "0" {
                 for byte in TEST_SEED_BYTES {
-                    add(&mut secrets, &byte.repeat(32));
+                    let seed = [byte; 32];
+                    add(&mut secrets, &format!("{byte:02x}").repeat(32));
+                    add(&mut secrets, &format!("{seed:?}"));
+                    add(&mut secrets, &format!("{seed:x?}"));
                 }
             }
         }
@@ -762,36 +765,66 @@ mod diagnostics {
             .any(|flag| value.trim().eq_ignore_ascii_case(flag))
     }
 
+    /// A value as written and as the inside of the Rust `{:?}` and JSON
+    /// string literals a child might print it in.
     fn add(secrets: &mut Vec<String>, value: &str) {
         let value = value.trim();
-        if !value.is_empty() && !secrets.iter().any(|known| known == value) {
-            secrets.push(value.into());
+        if value.is_empty() {
+            return;
+        }
+        let debug = format!("{value:?}");
+        let json = serde_json::Value::from(value).to_string();
+        // Both literals are quoted, so the inner slice is at ASCII boundaries.
+        for form in [value, &debug[1..debug.len() - 1], &json[1..json.len() - 1]] {
+            if !secrets.iter().any(|known| known == form) {
+                secrets.push(form.into());
+            }
         }
     }
 
-    /// A URL with a password, its password as written, decoded, and
+    /// A URL with a password, and each password as written, decoded, and
     /// re-encoded in the percent and form encodings a child might print.
+    /// Passwords are the userinfo password and, for the PostgreSQL URLs PRISM
+    /// accepts, every query parameter SQLx reads as `password`: its
+    /// form-decoded name matches exactly, and its value is form-decoded.
     fn add_url(secrets: &mut Vec<String>, value: &str) {
         let Ok(url) = url::Url::parse(value.trim()) else {
             return;
         };
-        let Some(password) = url.password().filter(|password| !password.is_empty()) else {
+        let mut passwords = Vec::new();
+        if let Some(password) = url.password() {
+            let decoded = percent_decode_str(password).decode_utf8_lossy();
+            passwords.push((password.to_owned(), decoded.into_owned()));
+        }
+        if matches!(url.scheme(), "postgres" | "postgresql") {
+            for pair in url.query().unwrap_or_default().split('&') {
+                let Some((name, decoded)) = url::form_urlencoded::parse(pair.as_bytes()).next()
+                else {
+                    continue;
+                };
+                if name == "password" {
+                    let written = pair.split_once('=').map_or("", |(_, written)| written);
+                    passwords.push((written.to_owned(), decoded.into_owned()));
+                }
+            }
+        }
+        passwords.retain(|(written, decoded)| !written.is_empty() && !decoded.is_empty());
+        if passwords.is_empty() {
             return;
-        };
-        let decoded = percent_decode_str(password)
-            .decode_utf8_lossy()
-            .into_owned();
+        }
         add(secrets, value);
-        add(secrets, password);
-        add(secrets, &decoded);
-        add(
-            secrets,
-            &utf8_percent_encode(&decoded, NON_ALPHANUMERIC).to_string(),
-        );
-        add(
-            secrets,
-            &url::form_urlencoded::byte_serialize(decoded.as_bytes()).collect::<String>(),
-        );
+        for (written, decoded) in &passwords {
+            add(secrets, written);
+            add(secrets, decoded);
+            add(
+                secrets,
+                &utf8_percent_encode(decoded, NON_ALPHANUMERIC).to_string(),
+            );
+            add(
+                secrets,
+                &url::form_urlencoded::byte_serialize(decoded.as_bytes()).collect::<String>(),
+            );
+        }
     }
 
     fn credential_name(name: &str) -> bool {
@@ -1573,6 +1606,151 @@ mod startup_diagnostics_tests {
                 "tab-flag-9",
             ],
         );
+    }
+
+    /// The sanitized lines a child's collector report shows after the child
+    /// wrote `lines`, with `database_url` and test signing seeds enabled in
+    /// the child's command.
+    fn planted_report_lines(database_url: &str, lines: &[String]) -> Result<Vec<String>> {
+        let directory = tempfile::tempdir()?;
+        let planted = directory.path().join("planted.txt");
+        std::fs::write(&planted, format!("{}\n", lines.join("\n")))?;
+        let child = Process::spawn(
+            Command::new("/bin/cat")
+                .arg(&planted)
+                .env("PRISM_DATABASE_URL", database_url)
+                .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1"),
+            directory.path().join("server-0.log"),
+        )?;
+        child.child.lock().wait()?;
+        let text = report(&[("server-0".into(), Some(&child))], Some(database_url));
+        Ok(text.lines().skip(1).map(String::from).collect())
+    }
+
+    #[test]
+    fn sanitizer_removes_query_passwords_escaped_values_and_seed_arrays() -> Result<()> {
+        let strings = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
+        let plain = "postgres://prism:plain-Pw0rd@db/prism";
+        let control = "tab\tpw7\u{1}z";
+        // (label, database URL, planted lines, expected sanitized lines)
+        let mut cases: Vec<(String, &str, Vec<String>, Vec<String>)> = vec![
+            (
+                "bare query password".into(),
+                "postgres://prism@db/prism?password=QpS3cretValue",
+                strings(&["auth failed using QpS3cretValue"]),
+                strings(&["auth failed using [redacted]"]),
+            ),
+            (
+                "percent-encoded query name and value".into(),
+                "postgres://prism@db/prism?pass%77ord=enc%2Bpw9",
+                strings(&["decoded enc+pw9", "written enc%2Bpw9"]),
+                strings(&["decoded [redacted]", "written [redacted]"]),
+            ),
+            (
+                "form-decoded plus in a query password".into(),
+                "postgres://prism@db/prism?password=two+words9",
+                strings(&["saw two words9 and two+words9"]),
+                strings(&["saw [redacted] and [redacted]"]),
+            ),
+            (
+                "repeated query password".into(),
+                "postgres://prism@db/prism?password=first-pw1&password=second-pw2",
+                strings(&["first-pw1 then second-pw2"]),
+                strings(&["[redacted] then [redacted]"]),
+            ),
+            (
+                "userinfo and query passwords as string literals".into(),
+                "postgres://prism:Pa%22ss%5Cw0rd@db/prism?password=qp%22x%5Cy",
+                strings(&[r#"user "Pa\"ss\\w0rd""#, r#"query "qp\"x\\y""#]),
+                strings(&[r#"user "[redacted]""#, r#"query "[redacted]""#]),
+            ),
+            (
+                "control characters as Debug and JSON escapes".into(),
+                "postgres://prism:tab%09pw7%01z@db/prism",
+                vec![
+                    format!("debug {control:?}"),
+                    format!("json {}", serde_json::to_string(control)?),
+                ],
+                strings(&[r#"debug "[redacted]""#, r#"json "[redacted]""#]),
+            ),
+            (
+                "malformed percent escape in a query password".into(),
+                "postgres://prism@db/prism?password=%zz9q",
+                strings(&["bad escape %zz9q"]),
+                strings(&["bad escape [redacted]"]),
+            ),
+            (
+                "non-ASCII password as a Debug literal".into(),
+                "postgres://prism:p%C3%A9%22wd9x@db/prism",
+                vec![format!("debug {:?}", "pé\"wd9x")],
+                strings(&[r#"debug "[redacted]""#]),
+            ),
+            (
+                "empty and valueless password parameters".into(),
+                "postgres://prism@db/prism?password=&password",
+                strings(&["password rejected for user prism at port 5432"]),
+                strings(&["password rejected for user prism at port 5432"]),
+            ),
+            (
+                "parameters SQLx does not read as a password".into(),
+                "postgres://prism@db/prism?passwordx=keepme1&PASSWORD=keepme2&pass=keepme3",
+                strings(&["keepme1 keepme2 keepme3"]),
+                strings(&["keepme1 keepme2 keepme3"]),
+            ),
+            (
+                "query password in a URL PRISM does not accept as a database".into(),
+                "https://example.test/status?password=keepme5",
+                strings(&["keepme5 stays visible"]),
+                strings(&["keepme5 stays visible"]),
+            ),
+            (
+                "database URL without a password".into(),
+                "postgres://prism@db/prism",
+                strings(&["prism connected without a password"]),
+                strings(&["prism connected without a password"]),
+            ),
+            (
+                "malformed database URL".into(),
+                "not a url ?password=nope-pw",
+                strings(&["nope-pw stays visible"]),
+                strings(&["nope-pw stays visible"]),
+            ),
+            (
+                "short arrays and identifiers".into(),
+                plain,
+                strings(&["ids [1, 2, 3] [17, 17, 3] abc123 0x7f port 5432"]),
+                strings(&["ids [1, 2, 3] [17, 17, 3] abc123 0x7f port 5432"]),
+            ),
+        ];
+        for byte in [0x11_u8, 0x22, 0x42, 0x43] {
+            let seed = [byte; 32];
+            for (format, rendering) in [
+                ("{:?}", format!("{seed:?}")),
+                ("{:x?}", format!("{seed:x?}")),
+            ] {
+                cases.push((
+                    format!("test seed 0x{byte:02x} as {format}"),
+                    plain,
+                    vec![format!("seed {rendering} end")],
+                    strings(&["seed [redacted] end"]),
+                ));
+            }
+        }
+        let mut failures = Vec::new();
+        for (label, database_url, lines, expected) in &cases {
+            let shown = planted_report_lines(database_url, lines)?;
+            if &shown != expected {
+                failures.push(format!("{label}: {shown:?}"));
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "{} of {} case(s) failed:\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+        Ok(())
     }
 
     #[test]
