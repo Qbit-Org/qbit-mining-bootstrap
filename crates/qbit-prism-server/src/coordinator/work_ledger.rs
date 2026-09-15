@@ -1,8 +1,10 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
+#[cfg(test)]
+use crate::ledger::PreparedDependency;
 use crate::ledger::{
     CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
-    PreparedDependency, PreparedTemplate, StoredCompactPrepared,
+    PreparedTemplate, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -51,6 +53,7 @@ pub(super) trait WorkLedger: Send + Sync {
         height: u64,
         revision: i64,
     ) -> BoxFuture<'a, Result<()>>;
+    #[cfg(test)]
     fn save_job<'a>(
         &'a self,
         id: &'a str,
@@ -60,6 +63,7 @@ pub(super) trait WorkLedger: Send + Sync {
         ttl: i64,
     ) -> BoxFuture<'a, Result<()>>;
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn save_issued_job<'a>(
         &'a self,
         id: &'a str,
@@ -154,6 +158,7 @@ impl WorkLedger for Ledger {
             revision,
         ))
     }
+    #[cfg(test)]
     fn save_job<'a>(
         &'a self,
         id: &'a str,
@@ -164,6 +169,7 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(Ledger::save_job(self, id, payload, revision, parent, ttl))
     }
+    #[cfg(test)]
     fn save_issued_job<'a>(
         &'a self,
         id: &'a str,

@@ -115,9 +115,9 @@ impl Coordinator {
         let owned = prepared_storage::compact::CompactOwner::new((prepared, permit));
         let config = self.config.clone();
         let output = owned
-            .spawn_blocking(move |(prepared, permit)| {
+            .spawn_blocking(move |(source, permit)| {
                 let admission = permit;
-                let prepared = prepared;
+                let prepared = source;
                 let snapshot = prepared.bootstrap_snapshot()?;
                 let (body, bootstrap) = bundle_build::build_body(
                     &config,

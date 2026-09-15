@@ -34,6 +34,9 @@ mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
 mod submit_ledger;
+// The reviewed authority facade retains legacy entrypoints exercised by
+// compatibility fixtures; activation uses the opaque issuance-proof API.
+#[cfg_attr(not(test), allow(dead_code))]
 mod tip_observation;
 mod work_ledger;
 pub use compact_runtime::{PreparedBundle, PreparedSnapshot};
@@ -89,6 +92,7 @@ impl BundleInputs {
     /// Check the policy and actual signer identities recorded in the bundle.
     /// Resume also compares the persisted inputs, since a bundle alone cannot
     /// prove its CTV configuration or builder version.
+    #[cfg(test)]
     fn describes(&self, bundle: &AuditBundle) -> bool {
         bundle.payout_policy == self.payout_policy
             && bundle
@@ -139,6 +143,7 @@ pub struct Prepared {
     pub parent_of_tip: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Serialize, Deserialize)]
 struct StoredPrepared {
     template: Value,
@@ -159,10 +164,12 @@ struct StoredPrepared {
     coinbase_suffix: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl StoredPrepared {
     /// Legacy rows cannot prove their CTV inputs or builder version. A resumed
     /// candidate (including bootstrap work) must use the exact issued inputs,
     /// and any stored bundle must agree with their policy and signer keys.
+    #[cfg(test)]
     fn issued_inputs(&self, config: &Config) -> Result<Option<&BundleInputs>> {
         let Some(inputs) = self.inputs.as_ref() else {
             return Ok(None);
@@ -974,6 +981,7 @@ impl Coordinator {
     /// keys `inputs.signer_keys` already names. With `bootstrap` set, the
     /// window is the one synthetic share fabricated from that worker, which
     /// is returned beside the bundle so the job can carry it verbatim.
+    #[cfg(test)]
     async fn build_bundle(
         &self,
         snapshot: Arc<Snapshot>,
@@ -1766,13 +1774,15 @@ impl MiningBackend for Coordinator {
         minimum_difficulty: f64,
     ) -> Result<MiningJob<JobContext>, StratumError> {
         let build = async {
-            let readiness_epoch = self.readiness.read().await.generation;
-            let prepared = self
+            let initial = self.authority_view().await;
+            let readiness_epoch = initial.readiness.generation;
+            let published_tip = initial.tip.publication_stamp();
+            let prepared = initial
                 .prepared
-                .read()
-                .await
-                .clone()
+                .as_ref()
+                .cloned()
                 .context("no current template")?;
+            drop(initial);
             let mut issuance_authority = self
                 .begin_issuance_authority(
                     tip_observation::PreparedIdentity::of(&prepared),
@@ -1781,6 +1791,10 @@ impl MiningBackend for Coordinator {
                 )
                 .await?
                 .context("payout snapshot stale")?;
+            ensure!(
+                self.observed_tip.read().await.publication_stamp() == published_tip,
+                "work publication changed during work admission"
+            );
             self.ensure_job_fee_current(prepared.fee).await?;
             let (base, bundle, bootstrap_share) = self
                 .materialize_wire(
@@ -1837,7 +1851,10 @@ impl MiningBackend for Coordinator {
         job_id: &str,
     ) -> Result<Option<MiningJob<JobContext>>, StratumError> {
         let resume = async {
-            let readiness_epoch = self.readiness.read().await.generation;
+            let initial = self.authority_view().await;
+            let readiness_epoch = initial.readiness.generation;
+            let published_tip = initial.tip.publication_stamp();
+            drop(initial);
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
@@ -1865,110 +1882,126 @@ impl MiningBackend for Coordinator {
             if !deadline.live() {
                 return Ok(None);
             }
-            let flight = self
-                .resume_flights
-                .join(self, &stored.prepared_key, stored.extranonce2_size)
-                .await;
-            let Some(metadata) = flight.metadata.clone().await? else {
-                return Ok(None);
-            };
-            let identity = tip_observation::PreparedIdentity::from_compact(
-                &stored.prepared_key,
-                &metadata.record,
-            );
-            let Some(mut issuance_authority) = self
-                .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
-                .await?
-            else {
-                return Ok(None);
-            };
-            if !deadline.live() {
-                return Ok(None);
-            }
-            self.ensure_job_fee_current(metadata.record.fee).await?;
-            let prepared = flight
-                .reconstruction(
-                    self,
-                    stored.prepared_key.clone(),
-                    metadata,
-                    stored.extranonce2_size,
-                )
-                .await?;
-            if !deadline.live()
-                || self
-                    .revalidate_issuance_authority(
-                        &mut issuance_authority,
-                        Some(stored.expires_at_ms),
-                    )
+            // This is the same absolute child deadline translated before
+            // any coalescer, permit or reconstruction wait. An expired waiter
+            // releases only its own shared handle; siblings keep their proof.
+            let recovery = async {
+                let flight = self
+                    .resume_flights
+                    .join(self, &stored.prepared_key, stored.extranonce2_size)
+                    .await;
+                let Some(metadata) = flight.metadata.clone().await? else {
+                    return Ok(None);
+                };
+                let identity = tip_observation::PreparedIdentity::from_compact(
+                    &stored.prepared_key,
+                    &metadata.record,
+                );
+                let Some(mut issuance_authority) = self
+                    .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
                     .await?
-                    .is_none()
-            {
-                return Ok(None);
-            }
-            let target = num_bigint::BigUint::parse_bytes(stored.share_target_hex.as_bytes(), 16)
-                .context("invalid stored share target")?;
-            ensure!(
-                target.bits() > 0 && target.bits() <= 256,
-                "stored target out of range"
-            );
-            ensure!(
-                stored.share_difficulty.is_finite() && stored.share_difficulty > 0.0,
-                "invalid stored difficulty"
-            );
-            ensure!(
-                stored.extranonce1.len() == 8 && hex::decode(&stored.extranonce1)?.len() == 4,
-                "invalid stored extranonce1"
-            );
-            let (base, bundle, bootstrap_share) = self
-                .materialize_wire(
-                    prepared.clone(),
-                    stored.worker.clone(),
-                    stored.extranonce2_size,
-                )
-                .await?;
-            let mut wire = base.reassign(
-                job_id.into(),
-                &stored.extranonce1,
-                stored.share_difficulty,
-                0.0,
-            )?;
-            wire.clean_jobs = false;
-            wire.share_target = target;
-            wire.share_difficulty = stored.share_difficulty;
-            wire.version_mask = stored.version_mask;
-            wire.refresh_generation = prepared.generation;
-            wire.payout_revision = prepared.snapshot.payout_revision;
-            if !deadline.live()
-                || self
-                    .revalidate_issuance_authority(
-                        &mut issuance_authority,
-                        Some(stored.expires_at_ms),
+                else {
+                    return Ok(None);
+                };
+                // Coalescer/metadata waits precede the identity-specific
+                // proof. They cannot borrow a publication that superseded the
+                // operation's original admission while those waits ran.
+                if self.observed_tip.read().await.publication_stamp() != published_tip {
+                    return Ok(None);
+                }
+                if !deadline.live() {
+                    return Ok(None);
+                }
+                self.ensure_job_fee_current(metadata.record.fee).await?;
+                let prepared = flight
+                    .reconstruction(
+                        self,
+                        stored.prepared_key.clone(),
+                        metadata,
+                        stored.extranonce2_size,
                     )
-                    .await?
-                    .is_none()
-            {
-                return Ok(None);
-            }
-            if !deadline.live() {
-                return Ok(None);
-            }
-            wire.resume_expires_at = Some(
-                issuance_authority
-                    .deadline()
-                    .map_or(deadline.instant(), |original| {
-                        original.min(deadline.instant())
+                    .await?;
+                if !deadline.live()
+                    || self
+                        .revalidate_issuance_authority(
+                            &mut issuance_authority,
+                            Some(stored.expires_at_ms),
+                        )
+                        .await?
+                        .is_none()
+                {
+                    return Ok(None);
+                }
+                let target =
+                    num_bigint::BigUint::parse_bytes(stored.share_target_hex.as_bytes(), 16)
+                        .context("invalid stored share target")?;
+                ensure!(
+                    target.bits() > 0 && target.bits() <= 256,
+                    "stored target out of range"
+                );
+                ensure!(
+                    stored.share_difficulty.is_finite() && stored.share_difficulty > 0.0,
+                    "invalid stored difficulty"
+                );
+                ensure!(
+                    stored.extranonce1.len() == 8 && hex::decode(&stored.extranonce1)?.len() == 4,
+                    "invalid stored extranonce1"
+                );
+                let (base, bundle, bootstrap_share) = self
+                    .materialize_wire(
+                        prepared.clone(),
+                        stored.worker.clone(),
+                        stored.extranonce2_size,
+                    )
+                    .await?;
+                let mut wire = base.reassign(
+                    job_id.into(),
+                    &stored.extranonce1,
+                    stored.share_difficulty,
+                    0.0,
+                )?;
+                wire.clean_jobs = false;
+                wire.share_target = target;
+                wire.share_difficulty = stored.share_difficulty;
+                wire.version_mask = stored.version_mask;
+                wire.refresh_generation = prepared.generation;
+                wire.payout_revision = prepared.snapshot.payout_revision;
+                if !deadline.live()
+                    || self
+                        .revalidate_issuance_authority(
+                            &mut issuance_authority,
+                            Some(stored.expires_at_ms),
+                        )
+                        .await?
+                        .is_none()
+                {
+                    return Ok(None);
+                }
+                if !deadline.live() {
+                    return Ok(None);
+                }
+                wire.resume_expires_at = Some(
+                    issuance_authority
+                        .deadline()
+                        .map_or(deadline.instant(), |original| {
+                            original.min(deadline.instant())
+                        }),
+                );
+                Ok(Some(MiningJob {
+                    wire,
+                    context: Arc::new(JobContext {
+                        prepared,
+                        worker: stored.worker,
+                        bundle,
+                        bootstrap_share,
+                        issuance_authority: Some(Arc::new(issuance_authority)),
                     }),
-            );
-            Ok(Some(MiningJob {
-                wire,
-                context: Arc::new(JobContext {
-                    prepared,
-                    worker: stored.worker,
-                    bundle,
-                    bootstrap_share,
-                    issuance_authority: Some(Arc::new(issuance_authority)),
-                }),
-            }))
+                }))
+            };
+            match tokio::time::timeout_at(deadline.instant().into(), recovery).await {
+                Ok(result) => result,
+                Err(_) => Ok(None), // the original issued lease expired
+            }
         };
         resume.await.map_err(|error| {
             tracing::warn!(%error,"job resume unavailable");

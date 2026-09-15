@@ -26,6 +26,7 @@ impl From<&CompactPrepared> for BundleInputs {
 }
 
 impl CompactPrepared {
+    #[cfg(test)]
     fn from_original_build(
         stored: &StoredPrepared,
         window: WindowRef,
@@ -129,6 +130,7 @@ impl CompactBuildProof {
 /// original owner keeps all large inputs alive through later validation.
 pub(in crate::coordinator) struct ReservedCompact<'a> {
     captured: &'a CapturedCompactPrepared,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub inserted: bool,
     deadline: AbsoluteDeadline,
 }
@@ -191,6 +193,7 @@ impl CanonicalCompactBalances {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, thiserror::Error)]
 pub(in crate::coordinator) enum IncompatibleCompactBuild {
     #[error("original compact window reference differs from snapshot bounds")]
@@ -206,6 +209,7 @@ pub(in crate::coordinator) enum IncompatibleCompactBuild {
 /// key is already reserved and cannot authorize this unpublished-build handoff.
 /// Keep the builder's nonoptional inputs beside its durable representation,
 /// just as Prepared does; neither path substitutes current configuration.
+#[cfg(test)]
 pub(in crate::coordinator) struct OriginalPreparedBuild {
     storage_key: String,
     stored: Arc<StoredPrepared>,
@@ -219,6 +223,7 @@ pub(in crate::coordinator) struct OriginalPreparedBuild {
     drop_probe: Option<CompactDropProbe>,
 }
 
+#[cfg(test)]
 impl OriginalPreparedBuild {
     /// Call on the coordinator runtime with the exact locals used by the
     /// original build, including its suffix and inputs, never current config.
@@ -280,8 +285,10 @@ impl OriginalPreparedBuild {
 /// A later builder must move this permit into its blocking owner, not call
 /// build_bundle (which acquires another slot). Compare the rebuilt hashes with
 /// record.audit_hashes, then revalidate authority and the issued deadline.
+#[cfg(test)]
 pub(in crate::coordinator) type AdmittedCompactInputs = CompactOwner<CompactInputs>;
 
+#[cfg(test)]
 pub(in crate::coordinator) struct CompactInputs {
     pub record: CompactPrepared,
     pub template: Value,
@@ -456,9 +463,13 @@ impl Coordinator {
         source: CompactOwner<(RefreshBuild, tokio::sync::OwnedSemaphorePermit)>,
     ) -> Result<CompactOwner<CapturedCompactPrepared>> {
         let config = self.config.clone();
+        #[cfg(test)]
+        let drop_probe = self.work_ledger.compact_drop_probe();
         let result = source
             .spawn_blocking(move |(source, permit)| {
                 let admission = permit;
+                #[cfg(test)]
+                let _cleanup = drop_probe;
                 let mut source = source;
                 source.snapshot.prior_balances = CanonicalCompactBalances::prepare(
                     std::mem::take(&mut source.snapshot.prior_balances),
@@ -750,6 +761,7 @@ impl Coordinator {
     /// the issued worker/session; a client-supplied issued key is never looked
     /// up as compact work. Lookup/reader failures stay errors, not cache misses.
     /// This adds no timeout: the caller's outer deadline includes every wait.
+    #[cfg(test)]
     pub(in crate::coordinator) async fn hydrate_compact_inputs(
         &self,
         issued: &StoredJob,
@@ -833,6 +845,7 @@ impl Coordinator {
     /// hashing, even if the async waiter is cancelled. No nested build_bundle.
     /// Capture the explicit original-build handoff before persistence. Reading
     /// the publication here would select a key already reserved inline.
+    #[cfg(test)]
     pub(in crate::coordinator) async fn capture_compact_prepared(
         &self,
         source: CompactOwner<OriginalPreparedBuild>,
@@ -963,6 +976,7 @@ impl Coordinator {
     /// Cold callers instead use begin_compact_build before construction,
     /// reserve_fresh_compact after capture, and lock_compact_publication to
     /// install the checked result under their one outer deadline.
+    #[cfg(test)]
     pub(in crate::coordinator) async fn save_captured_compact(
         &self,
         captured: &CapturedCompactPrepared,

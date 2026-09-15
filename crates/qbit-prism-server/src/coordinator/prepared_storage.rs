@@ -84,10 +84,10 @@ impl Coordinator {
         let probe = prepared.repair_probe.lock().unwrap().clone();
         let admitted = compact::CompactOwner::new((original, repair, permit));
         let encoded = admitted
-            .spawn_blocking(move |(original, repair, permit)| {
+            .spawn_blocking(move |(source, repair, permit)| {
                 let admission = permit;
                 let repair_guard = repair;
-                let original = original;
+                let original = source;
                 #[cfg(test)]
                 if let Some(probe) = probe {
                     probe.block();

@@ -168,11 +168,15 @@ async fn reconstruct(
     };
     let (metadata, permit) = owned.into_inner();
     let owned = CompactOwner::new((metadata, window, permit));
+    #[cfg(test)]
+    let drop_probe = ledger.compact_drop_probe();
     let result = owned
-        .spawn_blocking(move |(metadata, window, permit)| {
+        .spawn_blocking(move |(source_metadata, source_window, permit)| {
             let admission = permit;
-            let metadata = metadata;
-            let window = window;
+            #[cfg(test)]
+            let _cleanup = drop_probe;
+            let metadata = source_metadata;
+            let window = source_window;
             let snapshot = Snapshot {
                 anchor_ms: metadata.record.window.anchor_ms,
                 share_seq: metadata.record.share_seq,

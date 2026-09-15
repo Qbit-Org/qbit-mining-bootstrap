@@ -48,8 +48,7 @@ pub(super) fn build_body(
         Some(share) => std::slice::from_ref(share),
         None => &snapshot.shares,
     };
-    let witnesses =
-        codec::witness_merkle_leaves_hex(&codec::transactions_from_template(&template)?);
+    let witnesses = codec::witness_merkle_leaves_hex(&codec::transactions_from_template(template)?);
     let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
     let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
     ensure!(
