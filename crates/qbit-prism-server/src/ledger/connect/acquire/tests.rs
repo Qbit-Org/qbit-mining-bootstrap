@@ -1,4 +1,6 @@
 use super::*;
+use crate::metrics::Metrics;
+use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 
 fn sample(metrics: &Metrics, outcome: &str, suffix: &str) -> f64 {
@@ -17,102 +19,6 @@ fn counts(metrics: &Metrics) -> (f64, f64) {
         sample(metrics, "success", "count"),
         sample(metrics, "failure", "count"),
     )
-}
-
-#[tokio::test]
-async fn success_preserves_value_and_stops_before_later_work() {
-    let metrics = Metrics::default();
-    let value = Box::new(42);
-    let address = std::ptr::from_ref(&*value);
-    let result = observe(Some(&metrics), async { Ok(value) }).await.unwrap();
-    assert_eq!(std::ptr::from_ref(&*result), address);
-    assert_eq!(counts(&metrics), (1., 0.));
-    let sum = sample(&metrics, "success", "sum");
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    drop(result);
-    assert_eq!(counts(&metrics), (1., 0.));
-    assert_eq!(sample(&metrics, "success", "sum"), sum);
-}
-
-#[tokio::test]
-async fn failure_preserves_original_error() {
-    let metrics = Metrics::default();
-    let error = sqlx::Error::Io(std::io::Error::from_raw_os_error(123));
-    let error = observe::<()>(Some(&metrics), async { Err(error) })
-        .await
-        .unwrap_err();
-    assert!(matches!(error, sqlx::Error::Io(ref error) if error.raw_os_error() == Some(123)));
-    assert_eq!(counts(&metrics), (0., 1.));
-    let sum = sample(&metrics, "failure", "sum");
-    drop(error);
-    assert_eq!(sample(&metrics, "failure", "sum"), sum);
-}
-
-#[tokio::test]
-async fn dropping_a_polled_wait_records_once_and_drops_the_operation() {
-    let metrics = Metrics::default();
-    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
-    let started = std::time::Instant::now();
-    let mut future = Box::pin(observe(Some(&metrics), async move {
-        receiver.await.unwrap();
-        Ok(())
-    }));
-    assert!(futures_util::poll!(&mut future).is_pending());
-    let waiting = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let waited = waiting.elapsed();
-    drop(future);
-    let elapsed = started.elapsed();
-    assert!(
-        sender.is_closed(),
-        "cancelled acquisition must release its resources"
-    );
-    assert_eq!(counts(&metrics), (0., 1.));
-    let sum = sample(&metrics, "failure", "sum");
-    assert!((waited.as_secs_f64()..=elapsed.as_secs_f64()).contains(&sum));
-    assert_eq!(counts(&metrics), (0., 1.));
-    assert_eq!(sample(&metrics, "failure", "sum"), sum);
-}
-
-#[tokio::test]
-async fn dropping_an_unpolled_wait_records_nothing() {
-    let metrics = Metrics::default();
-    let future = observe(Some(&metrics), std::future::pending::<sqlx::Result<()>>());
-    drop(future);
-    assert_eq!(counts(&metrics), (0., 0.));
-}
-
-#[tokio::test]
-async fn unattached_observation_preserves_both_results() {
-    assert_eq!(observe(None, async { Ok(42) }).await.unwrap(), 42);
-    assert!(matches!(
-        observe::<()>(None, async { Err(sqlx::Error::PoolClosed) }).await,
-        Err(sqlx::Error::PoolClosed)
-    ));
-}
-
-#[tokio::test]
-async fn concurrent_observations_keep_every_outcome() {
-    let metrics = Arc::new(Metrics::default());
-    let mut tasks = tokio::task::JoinSet::new();
-    for index in 0..32 {
-        let metrics = metrics.clone();
-        tasks.spawn(async move {
-            observe(Some(&metrics), async {
-                tokio::task::yield_now().await;
-                if index % 2 == 0 {
-                    Ok(())
-                } else {
-                    Err(sqlx::Error::PoolClosed)
-                }
-            })
-            .await
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        let _ = result.unwrap();
-    }
-    assert_eq!(counts(&metrics), (16., 16.));
 }
 
 #[tokio::test]
@@ -258,6 +164,8 @@ async fn postgres_cases(url: &str, pools: &mut Vec<PgPool>) -> anyhow::Result<()
     assert_eq!(counts(&metrics), before);
     assert_eq!(sample(&metrics, "success", "sum"), acquired_sum);
 
+    postgres_begin_boundaries(&ledger, &metrics).await?;
+
     ledger.pool.close().await;
     let before = counts(&metrics);
     assert!(matches!(
@@ -266,4 +174,63 @@ async fn postgres_cases(url: &str, pools: &mut Vec<PgPool>) -> anyhow::Result<()
     ));
     assert_eq!(counts(&metrics), (before.0, before.1 + 1.));
     Ok(())
+}
+
+async fn postgres_begin_boundaries(ledger: &Ledger, metrics: &Metrics) -> anyhow::Result<()> {
+    // These custom statements delay or refuse SQLx's BEGIN operation itself,
+    // after the shared checkout boundary. Production BEGIN SQL stays unchanged.
+    let connection = ledger.acquire().await?;
+    let acquired = pool_family(metrics);
+    let started = std::time::Instant::now();
+    let transaction =
+        sqlx::Transaction::begin(connection, Some("BEGIN; SELECT pg_sleep(0.1)".into())).await?;
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(pool_family(metrics), acquired);
+    transaction.rollback().await?;
+    assert_eq!(pool_family(metrics), acquired);
+
+    let connection = ledger.acquire().await?;
+    let acquired = pool_family(metrics);
+    let error = sqlx::Transaction::begin(
+        connection,
+        Some("BEGIN ISOLATION LEVEL invalid_test_level".into()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("42601")
+    );
+    assert_eq!(pool_family(metrics), acquired);
+
+    let connection = ledger.acquire().await?;
+    let acquired = pool_family(metrics);
+    let error = tokio::time::timeout(
+        Duration::from_millis(75),
+        sqlx::Transaction::begin(connection, Some("BEGIN; SELECT pg_sleep(0.2)".into())),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "deadline has elapsed");
+    assert_eq!(pool_family(metrics), acquired);
+
+    // A failed/cancelled BEGIN must not retain the only pool slot or change the
+    // earlier checkout's successful observation. Subsequent BEGIN adds one.
+    let before = counts(metrics);
+    let transaction = tokio::time::timeout(Duration::from_secs(3), ledger.begin()).await??;
+    assert_eq!(counts(metrics), (before.0 + 1., before.1));
+    transaction.rollback().await?;
+    Ok(())
+}
+
+fn pool_family(metrics: &Metrics) -> String {
+    metrics
+        .render()
+        .lines()
+        .filter(|line| line.contains("qbit_prism_database_pool_acquire_seconds"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

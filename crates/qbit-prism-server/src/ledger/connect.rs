@@ -1,5 +1,5 @@
 use super::*;
-use crate::metrics::{LockKind, Metrics, Outcome};
+use crate::metrics::{time_pool_acquire, LockKind, Metrics, Outcome};
 
 mod acquire;
 
@@ -375,14 +375,7 @@ impl Ledger {
     }
 }
 
-/// Which wait a [`WaitGuard`] is timing, and the label it records under.
-#[derive(Clone, Copy)]
-enum WaitKind {
-    AdvisoryLock(LockKind),
-    PoolAcquire,
-}
-
-/// Times one wait and records exactly one observation for it.
+/// Times one advisory-lock wait and records exactly one observation for it.
 ///
 /// A wait that ends normally is recorded by [`WaitGuard::complete`], which also
 /// disarms the guard. A wait whose future is dropped first — a cancelled share
@@ -393,14 +386,14 @@ enum WaitKind {
 /// taken only after the wait has ended, never across an `.await`.
 struct WaitGuard<'a> {
     metrics: Option<&'a Metrics>,
-    kind: WaitKind,
+    kind: LockKind,
     started: std::time::Instant,
 }
 
 impl<'a> WaitGuard<'a> {
     /// Start the clock. Callers construct a guard only when a handle exists,
     /// so an unattached ledger reads no clock and records nothing.
-    fn arm(metrics: &'a Metrics, kind: WaitKind) -> Self {
+    fn arm(metrics: &'a Metrics, kind: LockKind) -> Self {
         Self {
             metrics: Some(metrics),
             kind,
@@ -413,7 +406,7 @@ impl<'a> WaitGuard<'a> {
     fn complete(mut self, result: Outcome) {
         let elapsed = self.started.elapsed();
         if let Some(metrics) = self.metrics.take() {
-            record(metrics, self.kind, result, elapsed);
+            metrics.observe_advisory_lock(self.kind, result, elapsed);
         }
     }
 }
@@ -422,15 +415,8 @@ impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
         if let Some(metrics) = self.metrics.take() {
-            record(metrics, self.kind, Outcome::Failure, elapsed);
+            metrics.observe_advisory_lock(self.kind, Outcome::Failure, elapsed);
         }
-    }
-}
-
-fn record(metrics: &Metrics, kind: WaitKind, result: Outcome, elapsed: std::time::Duration) {
-    match kind {
-        WaitKind::AdvisoryLock(lock) => metrics.observe_advisory_lock(lock, result, elapsed),
-        WaitKind::PoolAcquire => metrics.observe_pool_acquire(result, elapsed),
     }
 }
 
@@ -460,7 +446,7 @@ pub(super) async fn lock(
     // Time the advisory lock statement and nothing else: the clock starts
     // immediately before the wait begins.
     let guard = match (metrics, lock_kind(key)) {
-        (Some(metrics), Some(kind)) => Some(WaitGuard::arm(metrics, WaitKind::AdvisoryLock(kind))),
+        (Some(metrics), Some(kind)) => Some(WaitGuard::arm(metrics, kind)),
         _ => None,
     };
     let acquired = sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -488,7 +474,7 @@ async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-    Transaction::begin(acquire::acquire(pool, metrics).await?, None).await
+    Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
