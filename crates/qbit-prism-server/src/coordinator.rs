@@ -2318,6 +2318,9 @@ mod candidate_lease_tests;
 pub(crate) mod miner_tests;
 
 #[cfg(test)]
+mod compact_decode_tests;
+
+#[cfg(test)]
 mod d2_below_target_tests;
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
-    PreparedTemplate, StoredCompactPrepared,
+    BlockingDrop, CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState,
+    PoolBlock, PreparedTemplate, ReadAdmission, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -32,11 +32,16 @@ pub(super) trait WorkLedger: Send + Sync {
         expected_current_revision: i64,
         expires_at_ms: i64,
     ) -> BoxFuture<'a, Result<bool>>;
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn compact_prepared<'a>(
         &'a self,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>>;
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<BlockingDrop<StoredCompactPrepared>>>>;
     fn observe_chain_view<'a>(
         &'a self,
         tip: &'a str,
@@ -111,11 +116,21 @@ impl WorkLedger for Ledger {
             expires_at_ms,
         ))
     }
+    #[cfg(test)]
     fn compact_prepared<'a>(
         &'a self,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>> {
         Box::pin(Ledger::compact_prepared(self, key))
+    }
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<BlockingDrop<StoredCompactPrepared>>>> {
+        Box::pin(Ledger::compact_prepared_with_admission(
+            self, key, completion,
+        ))
     }
     fn observe_chain_view<'a>(
         &'a self,

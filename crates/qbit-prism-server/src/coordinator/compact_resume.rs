@@ -1,6 +1,6 @@
 //! Bounded, waiter-owned reconstruction. No detached task gets a new deadline.
 use super::*;
-use crate::ledger::{PreparedTemplate, StoredCompactPrepared};
+use crate::ledger::{BlockingDrop, PreparedTemplate, ReadAdmission, StoredCompactPrepared};
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
 use prepared_storage::compact::{
@@ -21,19 +21,18 @@ impl std::error::Error for SharedFailure {
     }
 }
 type Metadata = Shared<
-    BoxFuture<'static, Result<Option<Arc<CompactOwner<StoredCompactPrepared>>>, SharedFailure>>,
+    BoxFuture<'static, Result<Option<Arc<BlockingDrop<StoredCompactPrepared>>>, SharedFailure>>,
 >;
 type Rebuild = Shared<BoxFuture<'static, Result<Arc<Prepared>, SharedFailure>>>;
 
 pub(super) struct ResumeFlight {
     pub metadata: Metadata,
     rebuild: StdMutex<Option<Rebuild>>,
-    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    _admission: ReadAdmission,
     changed: Arc<Notify>,
 }
 impl Drop for ResumeFlight {
     fn drop(&mut self) {
-        drop(self.slot.take());
         self.changed.notify_waiters();
     }
 }
@@ -72,15 +71,19 @@ impl ResumeFlights {
                     return flight;
                 }
                 if let Ok(slot) = self.slots.clone().try_acquire_owned() {
+                    let admission = ReadAdmission::notifying(slot, self.changed.clone());
+                    let decoder_admission = admission.clone();
                     let ledger = coordinator.work_ledger.clone();
                     let config = coordinator.config.clone();
                     let lookup = key.0.clone();
                     let metadata = async move {
                         let result = async {
-                            let Some(stored) = ledger.compact_prepared(&lookup).await? else {
+                            let Some(stored) = ledger
+                                .compact_prepared_with_admission(&lookup, decoder_admission)
+                                .await?
+                            else {
                                 return Ok(None);
                             };
-                            let stored = CompactOwner::new(stored);
                             if stored.record.audit_builder_version
                                 != qbit_prism::AUDIT_BUILDER_VERSION
                                 || stored.record.signer_keys != local_signer_keys(&config)?
@@ -97,7 +100,7 @@ impl ResumeFlights {
                     let flight = Arc::new(ResumeFlight {
                         metadata,
                         rebuild: StdMutex::new(None),
-                        slot: Some(slot),
+                        _admission: admission,
                         changed: self.changed.clone(),
                     });
                     entries.insert(key.clone(), Arc::downgrade(&flight));
@@ -115,7 +118,7 @@ impl ResumeFlight {
         &self,
         coordinator: &Coordinator,
         key: String,
-        metadata: Arc<CompactOwner<StoredCompactPrepared>>,
+        metadata: Arc<BlockingDrop<StoredCompactPrepared>>,
         extra_size: usize,
     ) -> Rebuild {
         let mut shared = self.rebuild.lock().unwrap();
@@ -151,7 +154,7 @@ async fn reconstruct(
     window_reads: Arc<Semaphore>,
     config: Arc<Config>,
     key: String,
-    metadata: Arc<CompactOwner<StoredCompactPrepared>>,
+    metadata: Arc<BlockingDrop<StoredCompactPrepared>>,
     extra_size: usize,
 ) -> Result<Arc<Prepared>> {
     let permit = build_slots.acquire_owned().await?;

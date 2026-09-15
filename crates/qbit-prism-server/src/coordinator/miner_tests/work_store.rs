@@ -217,6 +217,18 @@ impl work_ledger::WorkLedger for MemoryLedger {
             Ok(scripted.unwrap_or(inserted))
         })
     }
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: crate::ledger::ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<crate::ledger::BlockingDrop<StoredCompactPrepared>>>> {
+        Box::pin(async move {
+            Ok(self
+                .compact_prepared(key)
+                .await?
+                .map(|stored| completion.own(stored)))
+        })
+    }
     fn compact_prepared<'a>(
         &'a self,
         key: &'a str,

@@ -2,7 +2,7 @@ use super::*;
 
 mod payout_state;
 pub use payout_state::PayoutState;
-mod blocking_drop;
+pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 
 #[derive(Clone, Debug)]

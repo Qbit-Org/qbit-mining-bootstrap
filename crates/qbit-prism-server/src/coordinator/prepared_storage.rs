@@ -164,7 +164,7 @@ pub(super) struct RepairProbe {
 
 #[cfg(test)]
 impl RepairProbe {
-    fn block(&self) {
+    pub(super) fn block(&self) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let mut released = self.released.lock().unwrap();
