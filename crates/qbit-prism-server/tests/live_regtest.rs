@@ -17,6 +17,9 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
+#[path = "support/live_compact_runtime.rs"]
+mod compact_runtime_tests;
+
 #[path = "support/live_highdiff.rs"]
 mod highdiff_tests;
 
@@ -110,6 +113,10 @@ where
 
 impl Fixture {
     async fn open(ctv: bool) -> Result<Option<Self>> {
+        Self::open_with_servers(ctv, true).await
+    }
+
+    async fn open_with_servers(ctv: bool, start_servers: bool) -> Result<Option<Self>> {
         let Some((binary, database)) = gate::qbitd_and_database_url(gate::site!())? else {
             return Ok(None);
         };
@@ -182,6 +189,9 @@ impl Fixture {
         fixture
             .rpc("generatetoaddress", json!([1, fixture.address]))
             .await?;
+        if !start_servers {
+            return Ok(Some(fixture));
+        }
         for index in 0..2 {
             let process = fixture.start_server(index)?;
             fixture.servers.push(process);

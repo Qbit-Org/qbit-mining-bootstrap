@@ -210,6 +210,16 @@ pub fn coordinator_config(
     node: &FakeNode,
     instance_id: &str,
 ) -> Result<Config> {
+    coordinator_config_at(database_url, node.url.clone(), instance_id)
+}
+
+/// Same explicit test configuration for an actual node RPC endpoint.
+/// This constructor never reads environment variables or starts a fake node.
+pub fn coordinator_config_at(
+    database_url: String,
+    rpc_url: String,
+    instance_id: &str,
+) -> Result<Config> {
     Ok(Config {
         database_url,
         instance_id: instance_id.to_owned(),
@@ -221,7 +231,7 @@ pub fn coordinator_config(
         template_max_age: Duration::from_secs(120),
         submit_tip_max_age: Duration::from_secs(10),
         template_refresh_failure_exit: Duration::from_secs(120),
-        rpc_url: node.url.clone(),
+        rpc_url,
         rpc_user: "test".into(),
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(30),
