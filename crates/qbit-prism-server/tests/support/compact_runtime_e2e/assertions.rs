@@ -1,7 +1,6 @@
 use super::*;
 use qbit_prism_server::ledger::{CompactPrepared, PreparedTemplate};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 pub fn same_job(original: &MiningJob<JobContext>, resumed: &MiningJob<JobContext>) -> Result<()> {
     let (a, b) = (&original.wire, &resumed.wire);
@@ -45,7 +44,7 @@ pub fn same_job(original: &MiningJob<JobContext>, resumed: &MiningJob<JobContext
     ensure!(
         serde_json::to_vec(&*original.context.bundle)?
             == serde_json::to_vec(&*resumed.context.bundle)?,
-        "signed payout/audit bundle changed"
+        "submission metadata changed"
     );
     ensure!(
         b.resume_expires_at.is_some(),
@@ -131,32 +130,13 @@ pub async fn compact_storage(f: &Fixture, job: &MiningJob<JobContext>) -> Result
             && record.audit_builder_version == prepared.inputs.audit_builder_version,
         "compact original inputs changed"
     );
-    if prepared.window.shares.is_some() {
-        let bundle = &job.context.bundle;
-        let hashes = record
-            .audit_hashes
-            .as_ref()
-            .context("nonempty compact record omitted audit hashes")?;
-        ensure!(
-            hashes.audit_bundle_sha256
-                == hex::encode(Sha256::digest(qbit_prism::canonical_audit_bundle_bytes(
-                    bundle
-                )?)),
-            "audit bundle digest changed"
-        );
-        ensure!(
-            hashes.coinbase_manifest_sha256
-                == hex::encode(Sha256::digest(qbit_pool_builder::canonical_manifest_bytes(
-                    &bundle.signed_coinbase_manifest.manifest
-                )?)),
-            "coinbase manifest digest changed"
-        );
-    } else {
+    if prepared.window.shares.is_none() {
         ensure!(
             record.audit_hashes.is_none() && record.window.shares.is_none(),
             "bootstrap stored shared worker hashes or shares"
         );
     }
+    super::audit::prove_original_audit(f, job, stored).await?;
     let row = sqlx::query("SELECT count(*)::bigint AS writes, max(uncompressed_jsonb_bytes) AS maximum FROM runtime_job_writes WHERE job_id=$1").bind(&prepared.storage_key).fetch_one(f.pool()).await?;
     let writes: i64 = row.try_get("writes")?;
     let maximum: Option<i32> = row.try_get("maximum")?;

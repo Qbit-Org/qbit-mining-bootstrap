@@ -14,6 +14,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::timeout;
 
 pub mod assertions;
+mod audit;
 #[path = "../ledger_execution_proxy.rs"]
 pub mod execution;
 #[allow(dead_code)]
@@ -153,6 +154,19 @@ impl Fixture {
                 prepared.window.shares.map_or(0, |range| range.share_count)
                     == if nonempty { SHARES } else { 0 },
                 "refresh selected the wrong window"
+            );
+            // This is setup verification, outside every runtime measurement
+            // bracket. Slim prepared metadata is not proof of retained rows.
+            let window = frontend
+                .ledger
+                .read_window(
+                    &prepared.window,
+                    qbit_prism_server::ledger::BalanceSource::AsIssued,
+                )
+                .await?;
+            ensure!(
+                window.shares.len() as u64 == if nonempty { SHARES } else { 0 },
+                "refresh reference did not read the original rows"
             );
         }
         Ok(())

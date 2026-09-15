@@ -49,21 +49,18 @@ or a WAL measurement. Missing measurements fail rather than becoming zero.
 
 ## Remaining qualification
 
-- Run on the qualified integrated activation head, including compact corruption
-  and retained-blob checks that are unreachable on the inline baseline.
 - Add the cached unchanged-refresh/blocked-persistence race when the shared
   proxy can pause delivery of a completed COMMIT acknowledgement. Holding an
   advisory or prepared-row lock cannot reproduce that boundary: persistence
   holds SETTLEMENT while waiting, so refresh must also wait. This gap remains
   explicit; the existing cancellation test does not claim that coverage.
-- Execute the cold dependency repair and retained range/balance integrity
-  assertions that are blocked at the inline baseline's compact prerequisite.
 - Core qualification owns internal admission/read/rebuild/cleanup deadline
   proofs and the 400k/500k memory/WAL runs. This 16-share fixture makes no scale
   claims and does not qualify replacement-lease authority by cross-frontend
   substitution.
 - Full deep-review lanes require the final qualified activation diff and are
-  launched by the coordinator. No standalone red PR is ready for review or merge.
+  launched by the coordinator. This test branch is intended for integration
+  into that activation PR; no standalone PR or overall merge readiness is claimed.
 
 ## Approved-helper follow-up
 
@@ -85,6 +82,36 @@ The complete helper-backed inline run reports **8 passed, 6 expected failures,
 0 ignored**, including the three inherited WindowPlan unit tests. All six
 failures remain at the compact-format prerequisite. Clippy passes with
 `cargo clippy --locked -p qbit-prism-server --test compact_runtime_e2e -- -D warnings`.
+
+## Integrated functional run, 2026-09-15
+
+Activation base: `a154eb5969e1fe64b180914c099dc257b701cf50`. Only the new E2E
+files were replayed onto this exact committed head; production, shared support,
+and gate-manifest files remain the activation owner's versions. The original
+inline-red commits and evidence remain preserved on their separate branch.
+
+The adapted suite reports **14 passed, 0 failed, 0 ignored** in the same durable
+PostgreSQL 16.14 fixture: 11 runtime cases and 3 inherited WindowPlan unit tests.
+Strict Clippy also passes. The previously blocked corruption, reference-row
+authentication, blob retention, and original-dependency repair cases now execute
+and pass. Observed prepared-row maxima are 1,518 uncompressed JSONB bytes for
+the 16-share window and 1,146 bytes for the empty bootstrap window.
+
+`PreparedBundle` is now treated solely as submission metadata. On an independent
+blocking test task, the oracle reads original `StoredCompactPrepared` inputs
+and actual `Ledger::read_window(..., BalanceSource::AsIssued)` rows, then invokes
+the public borrowing native-audit builders. It verifies BOTH original stored
+audit/coinbase-manifest hashes and the issued coinbase against the rebuilt
+artifact. Builder options come from the stored record, and the fixture signing
+seeds must match its recorded public keys. Setup also reads the actual referenced
+window outside measurement brackets; it never assumes retained snapshot arrays.
+
+Bootstrap workers prove distinct actual coinbases and synthetic payout shares,
+and each coinbase is independently reconstructed. The real-socket replacement
+listener advertises a harder target and negotiates no rolling mask; the old
+job still submits under its original target, entropy, and mask exactly once.
+That strengthened socket case passes separately after the full integrated run.
+The 16-row fixture does not claim enabled-CTV or large-window qualification.
 
 ## Gate IDs for activation-owner registration
 
