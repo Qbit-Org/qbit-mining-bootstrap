@@ -252,19 +252,20 @@ async fn a_refresh_publishes_the_reference_for_the_window_it_captured() -> Resul
         seed(&fixture.coordinator.ledger, 5).await?;
         fixture.coordinator.refresh_once().await?;
         let prepared = fixture.prepared().await?;
+        let snapshot = d2_test_support::original_snapshot(&fixture.coordinator, &prepared).await?;
         ensure!(
             prepared.bundle.is_some(),
             "the refresh did not select the seeded window"
         );
         ensure!(
-            prepared.window == WindowRef::from_snapshot(&prepared.snapshot)?,
+            prepared.window == WindowRef::from_snapshot(&snapshot)?,
             "Prepared.window is not the reference for the published snapshot"
         );
         let range = prepared
             .window
             .shares
             .context("a window of five shares must carry a range")?;
-        let shares = &prepared.snapshot.shares;
+        let shares = &snapshot.shares;
         ensure!(
             range
                 == ShareRange {
@@ -281,7 +282,7 @@ async fn a_refresh_publishes_the_reference_for_the_window_it_captured() -> Resul
         );
         ensure!(
             prepared.window.prior_balances_digest
-                == qbit_prism::prior_balances_digest(&prepared.snapshot.prior_balances),
+                == qbit_prism::prior_balances_digest(&snapshot.prior_balances),
             "the reference carries a different balances digest than the snapshot"
         );
         Ok(())
@@ -302,8 +303,9 @@ async fn a_refresh_over_an_empty_ledger_publishes_an_empty_window_reference() ->
     let outcome = async {
         fixture.coordinator.refresh_once().await?;
         let prepared = fixture.prepared().await?;
+        let snapshot = d2_test_support::original_snapshot(&fixture.coordinator, &prepared).await?;
         ensure!(
-            prepared.bundle.is_none() && prepared.snapshot.shares.is_empty(),
+            prepared.bundle.is_none() && snapshot.shares.is_empty(),
             "the ledger was empty, so the refresh should have published no window bundle"
         );
         ensure!(
@@ -312,12 +314,12 @@ async fn a_refresh_over_an_empty_ledger_publishes_an_empty_window_reference() ->
             prepared.window.shares
         );
         ensure!(
-            prepared.window == WindowRef::from_snapshot(&prepared.snapshot)?,
+            prepared.window == WindowRef::from_snapshot(&snapshot)?,
             "Prepared.window is not the reference for the published empty snapshot"
         );
         ensure!(
             prepared.window.prior_balances_digest
-                == qbit_prism::prior_balances_digest(&prepared.snapshot.prior_balances),
+                == qbit_prism::prior_balances_digest(&snapshot.prior_balances),
             "the empty reference carries a different balances digest than the snapshot"
         );
         Ok(())

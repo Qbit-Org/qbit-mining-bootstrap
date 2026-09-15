@@ -868,9 +868,9 @@ async fn pipeline_body(
             .as_ref()
             .context("refresh produced no prepared job")?;
         ensure!(
-            prepared.snapshot.shares.len() as u64 == n,
+            prepared.window.shares.map_or(0, |range| range.share_count) == n,
             "refresh saw a {}-share window, expected exactly {n}",
-            prepared.snapshot.shares.len()
+            prepared.window.shares.map_or(0, |range| range.share_count)
         );
         format!(
             "prepared job {} with a {n}-share window",
