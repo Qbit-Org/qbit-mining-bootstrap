@@ -1352,6 +1352,49 @@ async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -
     Ok(())
 }
 
+/// A disconnected session must discard queued offers on Pause, then forward
+/// the census marker. Receiving the marker alone is not acknowledgement:
+/// only applying it in the collector releases the driver.
+#[tokio::test]
+async fn a_disconnected_session_flushes_its_census_through_the_collector() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("mid_flight_kill".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let handle = client::spawn_session(session_config(0), 0, "127.0.0.1:1".into(), shared, 1);
+    assert!(handle.try_offer(1, &Arc::from("mid_flight_kill")));
+    handle.paused.store(true, Ordering::Relaxed);
+    handle.control.send(client::Control::Pause)?;
+    let (ack, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
+    handle.control.send(client::Control::CensusBarrier(ack))?;
+    let mut collected = run::Collected::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await?
+            .unwrap();
+        let barrier = matches!(&event, client::Event::CensusBarrier(_));
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "the session cannot acknowledge the collector"
+        );
+        collected.apply(event);
+        if barrier {
+            break;
+        }
+    }
+    assert_eq!(handle.outstanding.load(Ordering::Relaxed), 0);
+    assert_eq!(collected.discarded_offers, 1);
+    assert_eq!(ack_rx.try_recv(), Ok(()));
+    handle.control.send(client::Control::Stop)?;
+    tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
+    Ok(())
+}
+
 /// A re-offer or a scheduled block that reaches a session while it has no
 /// connection cannot be held until there is one, and used to be dropped
 /// without a trace: a re-offer never sent and one the server never answered
@@ -5061,7 +5104,7 @@ async fn a_drained_restart_never_stalls_the_scheduler() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     use qbit_prism_load::client::Outcome;
-    use qbit_prism_load::kill::{KillDriver, RELAUNCH_DELAY, SETTLE};
+    use qbit_prism_load::kill::{KillDriver, RELAUNCH_DELAY};
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -5094,11 +5137,18 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
         .unwrap()
         .apply(client::Event::Submit(Box::new(earlier)));
 
-    let mut driver = KillDriver::start(1, Duration::from_secs(20), &collected);
+    let mut driver = KillDriver::start(
+        1,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        &collected,
+    );
     let started = Instant::now();
     let mut longest_poll = Duration::ZERO;
     let mut polls = 0usize;
     let mut reported = false;
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut paused = false;
     let record = loop {
         let poll_started = Instant::now();
         let progress = driver.poll(&sessions, &mut frontends, &[], &collected)?;
@@ -5107,13 +5157,30 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
         if let Some(record) = progress {
             break record;
         }
+        // Model a slow victim and then a slow collector independently. A
+        // three-second timer would finish before either has caught up.
+        if !paused {
+            assert!(matches!(
+                victim_control.try_recv(),
+                Ok(client::Control::Pause)
+            ));
+            paused = true;
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::CensusBarrier(ack) => {
+                    events.send(client::Event::CensusBarrier(ack)).unwrap();
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        assert!(sessions[1].paused.load(Ordering::Relaxed));
         // Once the process is gone, the victim's session reports the
         // no-response the kill produced, as the real session's reader would
         // on end of stream; a session on the other frontend closing its
         // own socket in the same window is not the kill's.
-        if !reported && frontends[1].restarts >= 1 {
+        if !reported && started.elapsed() >= Duration::from_millis(4500) {
             reported = true;
-            let mut state = collected.lock().unwrap();
             let lost = client::SubmitRecord {
                 share_id: "pload1abc.s00001:lost".into(),
                 session: 1,
@@ -5136,8 +5203,15 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
                     },
                 )
             };
-            state.apply(client::Event::Submit(Box::new(lost)));
-            state.apply(client::Event::Submit(Box::new(other)));
+            events.send(client::Event::Submit(Box::new(lost))).unwrap();
+            events.send(client::Event::Submit(Box::new(other))).unwrap();
+            // The session has emitted its records; Collected is still behind.
+            sessions[1].outstanding.store(0, Ordering::Relaxed);
+        }
+        if started.elapsed() >= Duration::from_secs(5) {
+            while let Ok(event) = event_rx.try_recv() {
+                collected.lock().unwrap().apply(event);
+            }
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
@@ -5147,8 +5221,8 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     };
     let total = started.elapsed();
     assert!(
-        total >= RELAUNCH_DELAY + SETTLE,
-        "the kill paused before the relaunch and settled after the retarget: {total:?}"
+        total >= Duration::from_secs(5) && total >= RELAUNCH_DELAY,
+        "the kill waited for the slow session AND its queued records: {total:?}"
     );
     assert!(
         longest_poll < Duration::from_millis(100),
@@ -5214,6 +5288,63 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     Ok(())
 }
 
+/// Neither an unfinished victim nor a stalled collector may turn a partial
+/// census into a successful run. Both waits share the configured deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_census_times_out_on_unfinished_sessions_or_uncollected_records() -> Result<()> {
+    use qbit_prism_load::kill::KillDriver;
+    use std::sync::{atomic::Ordering, Mutex};
+    use std::time::{Duration, Instant};
+
+    for collector_stalled in [false, true] {
+        let dir = ScratchDir::new("kill-census-timeout");
+        let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+        let (audit_port, _audit) = stand_in_audit_port().await;
+        let mut frontends = vec![stand_in_frontend(&server, dir.path(), 0, audit_port)];
+        let (victim, mut control) = detached_session(0, 0, 1);
+        let sessions = vec![victim];
+        let collected = Mutex::new(run::Collected::default());
+        let mut driver = KillDriver::start(
+            0,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            &collected,
+        );
+        let started = Instant::now();
+        let mut held_barrier = None;
+        let error = loop {
+            match driver.poll(&sessions, &mut frontends, &[], &collected) {
+                Ok(None) => {}
+                Ok(Some(record)) => panic!("incomplete accounting produced a census: {record:?}"),
+                Err(error) => break error.to_string(),
+            }
+            while let Ok(message) = control.try_recv() {
+                match message {
+                    client::Control::Pause => {
+                        if collector_stalled {
+                            sessions[0].outstanding.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    client::Control::CensusBarrier(ack) => held_barrier = Some(ack),
+                    other => panic!("incomplete census resumed the session: {other:?}"),
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert!(error.contains("census timed out"), "{error}");
+        if collector_stalled {
+            assert!(held_barrier.is_some());
+            assert!(error.contains("session barriers not collected"), "{error}");
+        } else {
+            assert!(error.contains("1 submits still outstanding"), "{error}");
+        }
+        assert!(sessions[0].paused.load(Ordering::Relaxed));
+        assert!(control.try_recv().is_err(), "no partial re-offers");
+    }
+    Ok(())
+}
+
 /// A kill whose relaunch never answers is reported as a failure the phase
 /// aborts on, not waited for past its limit, and the scheduler is not
 /// stalled while the limit runs.
@@ -5232,7 +5363,12 @@ async fn a_kill_whose_relaunch_never_answers_is_reported_within_its_limit() -> R
     let (victim, _victim_control) = detached_session(1, 1, 1);
     let sessions = vec![victim];
     let collected = Arc::new(Mutex::new(run::Collected::default()));
-    let mut driver = KillDriver::start(1, Duration::from_millis(800), &collected);
+    let mut driver = KillDriver::start(
+        1,
+        Duration::from_millis(800),
+        Duration::from_secs(10),
+        &collected,
+    );
     let started = Instant::now();
     let mut longest_poll = Duration::ZERO;
     let error = loop {

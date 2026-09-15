@@ -531,6 +531,9 @@ pub struct Collected {
 impl Collected {
     pub fn apply(&mut self, event: Event) {
         match event {
+            Event::CensusBarrier(ack) => {
+                let _ = ack.send(());
+            }
             Event::Submit(record) => self.submits.push(*record),
             Event::Reconnect(record) => self.reconnects.push(record),
             Event::Tip(sighting) => self.tips.push(sighting),
@@ -2132,7 +2135,12 @@ pub async fn drive_phase(
         if !kill_done && seconds >= duration.as_secs_f64() / 3.0 {
             kill_done = true;
             let index = if frontends.len() >= 2 { 1 } else { 0 };
-            kill = Some(KillDriver::start(index, restart_ready_limit, collected));
+            kill = Some(KillDriver::start(
+                index,
+                restart_ready_limit,
+                restart_drain_limit,
+                collected,
+            ));
         }
         if let Some(driver) = kill.as_mut() {
             match driver.poll(sessions, frontends, samplers, collected) {

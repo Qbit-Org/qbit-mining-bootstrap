@@ -245,6 +245,8 @@ pub struct NotifySighting {
 /// Everything a session reports back.
 #[derive(Debug)]
 pub enum Event {
+    /// Acknowledge only after the collector has applied this session's prior events.
+    CensusBarrier(mpsc::UnboundedSender<()>),
     Submit(Box<SubmitRecord>),
     Reconnect(ReconnectRecord),
     /// The first time this session saw work built on a tip.
@@ -351,6 +353,8 @@ pub enum Work {
 
 #[derive(Clone, Debug)]
 pub enum Control {
+    /// Forward a barrier through the event queue after prior session work.
+    CensusBarrier(mpsc::UnboundedSender<()>),
     /// Quiesce outstanding submits, close, reconnect and re-authorize. The
     /// record it produces is stamped with `phase`, the phase that asked for
     /// it: a reconnect started near the end of the `reconnect` phase and
@@ -634,7 +638,13 @@ async fn run_session(
                                     address = next;
                                     paused.store(false, Ordering::Relaxed);
                                 }
-                                Some(Control::Pause) => paused.store(true, Ordering::Relaxed),
+                                Some(Control::Pause) => {
+                                    paused.store(true, Ordering::Relaxed);
+                                    drain_work(&mut work, &outstanding, &shared, config.index);
+                                }
+                                Some(Control::CensusBarrier(ack)) => {
+                                    let _ = shared.events.send(Event::CensusBarrier(ack));
+                                }
                                 // Already reconnecting: the request is being
                                 // honoured, under the phase that was stamped
                                 // when the connection went.
@@ -687,6 +697,9 @@ async fn run_session(
             biased;
             message = control.recv() => {
                 match message {
+                    Some(Control::CensusBarrier(ack)) => {
+                        let _ = shared.events.send(Event::CensusBarrier(ack));
+                    }
                     None | Some(Control::Stop) => {
                         stopping = true;
                         drain_work(&mut work, &outstanding, &shared, config.index);

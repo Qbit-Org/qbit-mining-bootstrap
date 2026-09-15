@@ -23,11 +23,12 @@ use crate::{
     restart::ReadyWait,
     run::{indeterminate_after_kill, Collected},
 };
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::{
     sync::{atomic::Ordering, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 
 /// How long the kill waits for the target frontend to hold work. A kill with
 /// nothing in flight tears down an idle socket and proves nothing, so the
@@ -35,9 +36,6 @@ use std::{
 pub const WORK_WAIT: Duration = Duration::from_secs(20);
 /// The pause between the kill and the relaunch.
 pub const RELAUNCH_DELAY: Duration = Duration::from_millis(500);
-/// How long the retargeted sessions are given to report the no-responses
-/// the kill produced before the census is taken and the re-offers go out.
-pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// What a completed kill produced.
 #[derive(Clone, Debug)]
@@ -52,10 +50,21 @@ pub struct KillRecord {
 }
 
 enum Stage {
-    WaitingForWork { deadline: Instant },
-    Killed { relaunch_at: Instant },
+    WaitingForWork {
+        deadline: Instant,
+    },
+    Killed {
+        relaunch_at: Instant,
+    },
     WaitingReady(ReadyWait),
-    Settling { until: Instant },
+    Settling {
+        deadline: Instant,
+    },
+    Collecting {
+        deadline: Instant,
+        acknowledgements: mpsc::UnboundedReceiver<()>,
+        remaining: usize,
+    },
     Done,
 }
 
@@ -67,6 +76,7 @@ pub struct KillDriver {
     submits_before: usize,
     outstanding_at_kill: Option<usize>,
     ready_limit: Duration,
+    census_limit: Duration,
 }
 
 fn outstanding_on(sessions: &[SessionHandle], index: usize) -> usize {
@@ -80,7 +90,13 @@ fn outstanding_on(sessions: &[SessionHandle], index: usize) -> usize {
 impl KillDriver {
     /// Begin: wait for `index` to hold work, for up to [`WORK_WAIT`].
     /// `ready_limit` bounds the relaunched process's start-up.
-    pub fn start(index: usize, ready_limit: Duration, collected: &Mutex<Collected>) -> Self {
+    /// `census_limit` is the configured share-commit timeout plus drain margin.
+    pub fn start(
+        index: usize,
+        ready_limit: Duration,
+        census_limit: Duration,
+        collected: &Mutex<Collected>,
+    ) -> Self {
         let submits_before = collected.lock().expect("collector lock").submits.len();
         Self {
             index,
@@ -90,6 +106,7 @@ impl KillDriver {
             submits_before,
             outstanding_at_kill: None,
             ready_limit,
+            census_limit,
         }
     }
 
@@ -114,6 +131,19 @@ impl KillDriver {
                     let outstanding = outstanding_on(sessions, index);
                     if outstanding == 0 && Instant::now() < *deadline {
                         return Ok(None);
+                    }
+                    // Freeze new offers, but do not drain before killing: the
+                    // scenario must interrupt real pending submits. Pause also
+                    // discards queued offers that were never sent.
+                    self.submits_before = collected.lock().expect("collector lock").submits.len();
+                    for session in sessions {
+                        if session.frontend.load(Ordering::Relaxed) == index {
+                            session.paused.store(true, Ordering::Relaxed);
+                            session
+                                .control
+                                .send(client::Control::Pause)
+                                .context("pausing a killed session for its census")?;
+                        }
                     }
                     // SIGKILL and reap: synchronous, milliseconds.
                     frontends[index].kill();
@@ -141,29 +171,79 @@ impl KillDriver {
                     if !wait.poll(&mut frontends[index])? {
                         return Ok(None);
                     }
-                    let address = frontends[index].stratum_address();
-                    for session in sessions {
-                        if session.frontend.load(Ordering::Relaxed) == index {
-                            let _ = session.control.send(client::Control::Retarget {
-                                frontend: index,
-                                address: address.clone(),
-                                reconnect: false,
-                            });
-                        }
-                    }
                     self.stage = Stage::Settling {
-                        until: Instant::now() + SETTLE,
+                        deadline: Instant::now() + self.census_limit,
                     };
                     return Ok(None);
                 }
-                Stage::Settling { until } => {
-                    if Instant::now() < *until {
+                Stage::Settling { deadline } => {
+                    let outstanding = outstanding_on(sessions, index);
+                    if Instant::now() >= *deadline {
+                        bail!("mid-flight kill census timed out after {:?}: {outstanding} submits still outstanding", self.census_limit);
+                    }
+                    if outstanding != 0 {
                         return Ok(None);
+                    }
+                    // A zero counter means the session sent its records, not
+                    // that Collected has applied them. Each paused session
+                    // forwards a marker on that same FIFO event channel. The
+                    // collector acknowledges it after applying prior records.
+                    let (ack, acknowledgements) = mpsc::unbounded_channel();
+                    let mut remaining = 0;
+                    for session in sessions {
+                        if session.frontend.load(Ordering::Relaxed) == index {
+                            session
+                                .control
+                                .send(client::Control::CensusBarrier(ack.clone()))
+                                .context("requesting a killed session's census barrier")?;
+                            remaining += 1;
+                        }
+                    }
+                    self.stage = Stage::Collecting {
+                        deadline: *deadline,
+                        acknowledgements,
+                        remaining,
+                    };
+                    return Ok(None);
+                }
+                Stage::Collecting {
+                    deadline,
+                    acknowledgements,
+                    remaining,
+                } => {
+                    while *remaining > 0 {
+                        match acknowledgements.try_recv() {
+                            Ok(()) => *remaining -= 1,
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                if Instant::now() >= *deadline {
+                                    bail!("mid-flight kill census timed out after {:?}: {remaining} session barriers not collected", self.census_limit);
+                                }
+                                return Ok(None);
+                            }
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                bail!("mid-flight kill census lost a session or its collector before accounting completed");
+                            }
+                        }
                     }
                     let indeterminate = {
                         let state = collected.lock().expect("collector lock");
                         indeterminate_after_kill(&state.submits, self.submits_before, index)
                     };
+                    // Only now resume these sessions. Resuming at /healthz
+                    // allowed new work to hide whether old work had settled.
+                    let address = frontends[index].stratum_address();
+                    for session in sessions {
+                        if session.frontend.load(Ordering::Relaxed) == index {
+                            session
+                                .control
+                                .send(client::Control::Retarget {
+                                    frontend: index,
+                                    address: address.clone(),
+                                    reconnect: false,
+                                })
+                                .context("resuming a killed session after its census")?;
+                        }
+                    }
                     for record in &indeterminate {
                         if let Some(session) = sessions.get(record.session) {
                             let _ = session.control.send(client::Control::Reoffer {
