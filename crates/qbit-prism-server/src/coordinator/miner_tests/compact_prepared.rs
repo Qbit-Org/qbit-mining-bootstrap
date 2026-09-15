@@ -644,11 +644,9 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
         report.coinbase_manifest_sha256_hex
     );
 
-    // The original payout is still leased while the DB's transaction fence advances.
-    f.node.lock().unwrap().tip = hash(2);
-    f.node.lock().unwrap().fail = Some("getblocktemplate".into());
-    assert!(f.coordinator.refresh_once().await.is_err());
-    f.store.revision.store(7, Ordering::SeqCst);
+    // This is a new, unpublished dependency, so it uses ordinary current
+    // authority. Only the exact published key can borrow a replacement lease;
+    // that original/current revision split is covered by the live lease tests.
     f.store
         .compact
         .saves
@@ -673,7 +671,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
         assert_eq!(saved.record, captured.record);
         assert_eq!(saved.template_sha256, captured.template.sha256());
         assert_eq!(saved.balances, original.snapshot.prior_balances);
-        assert_eq!(saved.current_revision, 7);
+        assert_eq!(saved.current_revision, 0);
         assert_eq!(saved.record.payout_revision, 0);
         assert_eq!(saved.original_expires_at_ms, 130_000);
     }

@@ -1,13 +1,14 @@
 //! Original compact inputs, not authority to publish miner work.
 //!
 //! This additive seam does not switch the inline runtime. Activation still
-//! needs atomic typed issued-save/repair and post-build authority checks under
-//! the existing outer operation deadline. The storage migration requires all
+//! needs atomic typed issued-save/repair and wiring of these authority checks
+//! under the existing outer operation deadline. The storage migration requires all
 //! frontends stopped and old candidates drained; this is not a rolling writer.
 //! A future refresh caller must prepare CanonicalCompactBalances before its
 //! original bundle build. Existing SQL-order legacy builds remain unchanged;
 //! completed noncanonical bundles cannot be converted by rewriting their hash.
 use super::*;
+use crate::coordinator::tip_observation::PreparedIdentity;
 use crate::ledger::{CompactPrepared, PreparedAuditHashes, PreparedTemplate};
 
 /// Successful reads still own potentially large inputs. Keep abandonment off
@@ -61,6 +62,73 @@ pub(in crate::coordinator) struct CapturedCompactPrepared {
     pub record: CompactPrepared,
     pub template: PreparedTemplate,
     pub original_expires_at_ms: i64,
+    build_proof: Option<CompactBuildProof>,
+}
+
+/// Capture before the original build. This stamp cannot authorize publication
+/// by itself: reservation and publication each require fresh external checks.
+pub(in crate::coordinator) struct CompactBuildProof {
+    readiness_epoch: u64,
+    publication: Option<PreparedIdentity>,
+    published_tip: Option<(String, u64)>,
+}
+
+/// An idempotently persisted dependency, still unavailable to miners. The
+/// original owner keeps all large inputs alive through later validation.
+pub(in crate::coordinator) struct ReservedCompact<'a> {
+    captured: &'a CapturedCompactPrepared,
+    pub inserted: bool,
+}
+
+struct ReservationClock {
+    now_ms: i64,
+    requested_at: tokio::time::Instant,
+}
+
+impl ReservationClock {
+    fn ensure_live(&self, expires_at_ms: i64) -> Result<()> {
+        // Count time spent waiting for the clock reply too, conservatively.
+        let elapsed_ms = i64::try_from(self.requested_at.elapsed().as_millis())
+            .context("reservation clock overflow")?;
+        ensure!(
+            self.now_ms
+                .checked_add(elapsed_ms)
+                .is_some_and(|now| now < expires_at_ms),
+            "prepared reservation deadline elapsed"
+        );
+        Ok(())
+    }
+}
+
+/// A short, synchronous installation boundary. All I/O finished before these
+/// ordered locks were acquired. Dropping it publishes nothing.
+#[must_use]
+pub(in crate::coordinator) struct CompactPublicationGuard<'a> {
+    prepared: tokio::sync::RwLockWriteGuard<'a, Option<Arc<Prepared>>>,
+    readiness: tokio::sync::RwLockWriteGuard<'a, ReadinessState>,
+    tip: tokio::sync::RwLockWriteGuard<'a, TipState>,
+    refresh: &'a watch::Sender<u64>,
+    captured: &'a CapturedCompactPrepared,
+    clock: ReservationClock,
+    template_max_age: Duration,
+}
+
+impl CompactPublicationGuard<'_> {
+    /// No runtime caller is wired in this prerequisite slice. Future callers
+    /// install immediately, under their original outer operation deadline.
+    pub fn publish(mut self) -> Result<()> {
+        self.clock
+            .ensure_live(self.captured.original_expires_at_ms)?;
+        crate::readiness::validate_template_age(
+            &self.captured.original.template,
+            self.template_max_age,
+        )?;
+        self.tip.publish(&self.captured.record.parent_hash)?;
+        *self.prepared = Some(self.captured.original.clone());
+        self.readiness.last_poll = Some(Instant::now());
+        self.refresh.send_replace(self.captured.original.generation);
+        Ok(())
+    }
 }
 
 /// Original-build input, prepared before any bundle or audit hash exists.
@@ -112,6 +180,7 @@ pub(in crate::coordinator) struct OriginalPreparedBuild {
     window: WindowRef,
     inputs: BundleInputs,
     created: Instant,
+    build_proof: Option<CompactBuildProof>,
     #[cfg(test)]
     capture_probe: Option<Arc<RepairProbe>>,
     #[cfg(test)]
@@ -134,11 +203,26 @@ impl OriginalPreparedBuild {
             window,
             inputs,
             created: Instant::now(),
+            build_proof: None,
             #[cfg(test)]
             capture_probe: None,
             #[cfg(test)]
             drop_probe: None,
         })
+    }
+
+    /// The proof was obtained before these original build inputs were used.
+    /// Consume it here; never substitute a post-build readiness generation.
+    pub fn from_proven_original_build(
+        proof: CompactBuildProof,
+        storage_key: String,
+        stored: Arc<StoredPrepared>,
+        window: WindowRef,
+        inputs: BundleInputs,
+    ) -> CompactOwner<Self> {
+        let mut source = Self::from_original_build(storage_key, stored, window, inputs);
+        source.value.as_mut().unwrap().build_proof = Some(proof);
+        source
     }
 
     #[cfg(test)]
@@ -244,6 +328,176 @@ fn canonical_json_sha256(value: &impl serde::Serialize) -> Result<String> {
 }
 
 impl Coordinator {
+    /// Begin before the original build, including on a cold/default frontend.
+    /// This captures revocation/publication identity without creating readiness.
+    /// The caller's one outer deadline covers this, build, reserve and install.
+    pub(in crate::coordinator) async fn begin_compact_build(&self) -> CompactBuildProof {
+        let prepared = self.prepared.read().await;
+        let readiness = self.readiness.read().await;
+        let tip = self.observed_tip.read().await;
+        CompactBuildProof {
+            readiness_epoch: readiness.generation,
+            publication: prepared.as_deref().map(PreparedIdentity::of),
+            published_tip: tip.publication_stamp(),
+        }
+    }
+
+    fn check_compact_build_stamp(
+        proof: &CompactBuildProof,
+        prepared: Option<&Prepared>,
+        readiness: &ReadinessState,
+        tip: &TipState,
+    ) -> Result<()> {
+        ensure!(
+            readiness.generation == proof.readiness_epoch,
+            "node readiness changed during compact build"
+        );
+        ensure!(
+            prepared.map(PreparedIdentity::of) == proof.publication
+                && tip.publication_stamp() == proof.published_tip,
+            "work publication changed during compact build"
+        );
+        Ok(())
+    }
+
+    async fn check_compact_build_current(&self, proof: &CompactBuildProof) -> Result<()> {
+        let prepared = self.prepared.read().await;
+        let readiness = self.readiness.read().await;
+        let tip = self.observed_tip.read().await;
+        Self::check_compact_build_stamp(proof, prepared.as_deref(), &readiness, &tip)
+    }
+
+    async fn prove_fresh_compact(
+        &self,
+        captured: &CapturedCompactPrepared,
+    ) -> Result<ReservationClock> {
+        let proof = captured
+            .build_proof
+            .as_ref()
+            .context("pre-build authority proof missing")?;
+        self.check_compact_build_current(proof).await?;
+        let original = &captured.original;
+        let parent = &captured.record.parent_hash;
+        self.ensure_template_fresh(&original.template).await?;
+        let height = original.template["height"]
+            .as_u64()
+            .and_then(|height| height.checked_sub(1))
+            .context("invalid compact template height")?;
+        let info = self.ready_tip(parent).await?;
+        ensure!(
+            info["blocks"].as_u64() == Some(height),
+            "compact template height changed"
+        );
+        let revision = self
+            .work_ledger
+            .observe_chain_view(
+                parent,
+                height,
+                info["chainwork"]
+                    .as_str()
+                    .context("node chainwork missing")?,
+            )
+            .await?;
+        ensure!(
+            revision == captured.record.payout_revision,
+            "payout snapshot stale"
+        );
+        let requested_at = tokio::time::Instant::now();
+        let clock = ReservationClock {
+            now_ms: self.work_ledger.now_ms().await?,
+            requested_at,
+        };
+        // A slow database lookup cannot leave the earlier node proof in force.
+        // These calls may revoke readiness; never hold its lock across them.
+        let info = self.ready_tip(parent).await?;
+        ensure!(
+            info["blocks"].as_u64() == Some(height),
+            "compact template height changed"
+        );
+        // Match refresh's final economic fence after node I/O: balances or
+        // revision may have changed while that second node proof waited.
+        let state = self.work_ledger.payout_state().await?;
+        ensure!(
+            state.payout_revision == captured.record.payout_revision
+                && state.prior_balances_digest == captured.record.window.prior_balances_digest,
+            "payout snapshot stale"
+        );
+        self.ensure_template_fresh(&original.template).await?;
+        let prepared = self.prepared.read().await;
+        let readiness = self.readiness.read().await;
+        let tip = self.observed_tip.read().await;
+        Self::check_compact_build_stamp(proof, prepared.as_deref(), &readiness, &tip)?;
+        ensure!(
+            tip.as_deref() == Some(parent),
+            "compact tip observation superseded"
+        );
+        clock.ensure_live(captured.original_expires_at_ms)?;
+        Ok(clock)
+    }
+
+    /// Reserve without a readiness or replacement-lease shortcut. A revocation
+    /// after the transaction may leave an unexposed immutable dependency; it
+    /// never publishes work, and retries keep the same absolute expiry.
+    pub(in crate::coordinator) async fn reserve_fresh_compact<'a>(
+        &self,
+        captured: &'a CapturedCompactPrepared,
+    ) -> Result<ReservedCompact<'a>> {
+        self.prove_fresh_compact(captured).await?;
+        let inserted = self
+            .work_ledger
+            .save_compact_prepared(
+                &captured.original.storage_key,
+                &captured.record,
+                &captured.template,
+                &captured.original.stored.snapshot.prior_balances,
+                captured.record.payout_revision,
+                captured.original_expires_at_ms,
+            )
+            .await?;
+        self.prove_fresh_compact(captured).await?;
+        Ok(ReservedCompact { captured, inserted })
+    }
+
+    /// Revalidate after every reservation/caller wait, then take the existing
+    /// atomic publication lock order. No RPC or database wait holds these locks.
+    pub(in crate::coordinator) async fn lock_compact_publication<'a>(
+        &'a self,
+        reserved: ReservedCompact<'a>,
+    ) -> Result<CompactPublicationGuard<'a>> {
+        let captured = reserved.captured;
+        let clock = self.prove_fresh_compact(captured).await?;
+        let prepared = self.prepared.write().await;
+        let readiness = self.readiness.write().await;
+        let tip = self.observed_tip.write().await;
+        Self::check_compact_build_stamp(
+            captured
+                .build_proof
+                .as_ref()
+                .context("pre-build authority proof missing")?,
+            prepared.as_deref(),
+            &readiness,
+            &tip,
+        )?;
+        ensure!(
+            tip.as_deref() == Some(captured.record.parent_hash.as_str()),
+            "compact tip observation superseded"
+        );
+        clock.ensure_live(captured.original_expires_at_ms)?;
+        crate::readiness::validate_template_age(
+            &captured.original.template,
+            self.config.template_max_age,
+        )?;
+        Ok(CompactPublicationGuard {
+            prepared,
+            readiness,
+            tip,
+            refresh: &self.refresh,
+            captured,
+            clock,
+            template_max_age: self.config.template_max_age,
+        })
+    }
+
     /// Follow a decoded issued row's prepared link. The caller still validates
     /// the issued worker/session; a client-supplied issued key is never looked
     /// up as compact work. Lookup/reader failures stay errors, not cache misses.
@@ -461,6 +715,7 @@ impl Coordinator {
                         record,
                         template,
                         original_expires_at_ms,
+                        build_proof: original_source.build_proof,
                     },
                     _permit,
                 )))
@@ -482,14 +737,9 @@ impl Coordinator {
     /// last_poll; this path cannot bootstrap or restore revoked readiness.
     /// Never set last_poll early or publish work to satisfy this precondition.
     ///
-    /// A future cold-reservation path must carry the readiness epoch from
-    /// before the original build (not Prepared.generation). After capture it
-    /// must freshly check node/tip readiness, template freshness and current
-    /// chain payout revision against the original, without a replacement-lease
-    /// fallback, and verify the epoch is unchanged. Persistence still uses
-    /// transactional revision/configuration fences and the fixed absolute
-    /// expiry. The caller must revalidate after persistence before atomic
-    /// publication establishes last_poll, under its one outer deadline.
+    /// Cold callers instead use begin_compact_build before construction,
+    /// reserve_fresh_compact after capture, and lock_compact_publication to
+    /// install the checked result under their one outer deadline.
     pub(in crate::coordinator) async fn save_captured_compact(
         &self,
         captured: &CapturedCompactPrepared,

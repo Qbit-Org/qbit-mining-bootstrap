@@ -1984,6 +1984,7 @@ impl MiningBackend for Coordinator {
         job_id: &str,
     ) -> Result<Option<MiningJob<JobContext>>, StratumError> {
         let resume = async {
+            let readiness_epoch = self.readiness.read().await.generation;
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
@@ -2016,7 +2017,20 @@ impl MiningBackend for Coordinator {
                 .await
                 .clone()
                 .context("no current template")?;
-            if self.issued_work_revision(&current).await?.is_none() {
+            let identity = tip_observation::PreparedIdentity::from_stored(
+                &stored.prepared_key,
+                &prepared,
+                window,
+            );
+            if self
+                .work_authority_revision_in_epoch(
+                    &identity,
+                    Some(stored.expires_at_ms),
+                    readiness_epoch,
+                )
+                .await?
+                .is_none()
+            {
                 return Ok(None);
             }
             if current.template["previousblockhash"] != prepared.template["previousblockhash"]
@@ -2100,13 +2114,31 @@ impl MiningBackend for Coordinator {
             wire.version_mask = stored.version_mask;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
+            let clock_started = Instant::now();
             let now_ms = self.work_ledger.now_ms().await?;
             if now_ms >= stored.expires_at_ms {
                 return Ok(None);
             }
-            wire.resume_expires_at = Some(
-                Instant::now() + Duration::from_millis((stored.expires_at_ms - now_ms) as u64),
-            );
+            let resume_expires_at =
+                clock_started + Duration::from_millis((stored.expires_at_ms - now_ms) as u64);
+            // Decode, fee checks and reconstruction may wait. A stored job
+            // cannot borrow a superseding publication's replacement lease,
+            // or recover authority revoked during those waits.
+            if self
+                .work_authority_revision_in_epoch(
+                    &identity,
+                    Some(stored.expires_at_ms),
+                    readiness_epoch,
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            if Instant::now() >= resume_expires_at {
+                return Ok(None);
+            }
+            wire.resume_expires_at = Some(resume_expires_at);
             // The absolute DB expiry is translated once to monotonic time;
             // moving the session between hosts never extends its work lease.
             let prepared = Arc::new(Prepared {

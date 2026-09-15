@@ -11,6 +11,76 @@ pub(super) fn tip_hash(value: &Value) -> Option<&str> {
 pub(super) struct SubmitAdmission {
     pub current: Arc<Prepared>,
     pub tip: TipView,
+    pub lease: Option<PublishedLease>,
+}
+
+/// The coherent revision authenticated with the original balance digest. It
+/// is a transaction fence, never a replacement for the job's issued revision.
+pub(super) struct PublishedLease {
+    identity: PreparedIdentity,
+    published_tip: Option<(String, u64)>,
+    readiness_epoch: u64,
+    current_revision: i64,
+}
+
+impl PublishedLease {
+    pub(super) fn revision_for(&self, identity: &PreparedIdentity) -> Option<i64> {
+        (self.identity == *identity).then_some(self.current_revision)
+    }
+}
+
+/// Immutable publication identity, including reconstructed copies of the same
+/// dependency. A same-parent/revision payout alone cannot borrow its lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PreparedIdentity {
+    key: String,
+    generation: u64,
+    fingerprint: String,
+    window: WindowRef,
+    revision: i64,
+    parent: Option<String>,
+}
+
+impl PreparedIdentity {
+    pub(super) fn from_stored(key: &str, prepared: &StoredPrepared, window: WindowRef) -> Self {
+        Self {
+            key: key.into(),
+            generation: prepared.generation,
+            fingerprint: prepared.fingerprint.clone(),
+            window,
+            revision: prepared.snapshot.payout_revision,
+            parent: prepared.template["previousblockhash"]
+                .as_str()
+                .map(str::to_owned),
+        }
+    }
+
+    pub(super) fn of(prepared: &Prepared) -> Self {
+        Self {
+            key: prepared.storage_key.clone(),
+            generation: prepared.generation,
+            fingerprint: prepared.fingerprint.clone(),
+            window: prepared.window,
+            revision: prepared.snapshot.payout_revision,
+            parent: prepared.template["previousblockhash"]
+                .as_str()
+                .map(str::to_owned),
+        }
+    }
+
+    /// Activation can construct the same slim authority view without retaining
+    /// a Prepared, Snapshot or AuditBundle. Expiry stays a separate fixed input.
+    #[allow(dead_code)]
+    pub(super) fn from_compact(key: &str, record: &crate::ledger::CompactPrepared) -> Self {
+        Self {
+            key: key.into(),
+            generation: record.generation,
+            fingerprint: record.fingerprint.clone(),
+            window: record.window,
+            revision: record.payout_revision,
+            parent: Some(record.parent_hash.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +103,12 @@ pub struct TipState {
 }
 
 impl TipState {
+    pub(super) fn publication_stamp(&self) -> Option<(String, u64)> {
+        self.published
+            .as_ref()
+            .map(|tip| (tip.hash.clone(), tip.sequence))
+    }
+
     /// A startup baseline fences work but cannot open stale grace.
     pub fn baseline(hash: String) -> Self {
         let mut state = Self::default();
@@ -163,50 +239,155 @@ impl Coordinator {
     /// replacement lease. Persistence still locks the *current* DB revision;
     /// as-issued payloads retain their original economic snapshot.
     pub(super) async fn issued_work_revision(&self, prepared: &Prepared) -> Result<Option<i64>> {
+        self.work_authority_revision(&PreparedIdentity::of(prepared), None)
+            .await
+    }
+
+    /// A slim original authority view plus an optional absolute issued expiry.
+    /// The caller owns its original deadline; no stage creates a new budget.
+    pub(super) async fn work_authority_revision(
+        &self,
+        identity: &PreparedIdentity,
+        expires_at_ms: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let readiness_epoch = self.readiness.read().await.generation;
+        self.work_authority_revision_in_epoch(identity, expires_at_ms, readiness_epoch)
+            .await
+    }
+
+    pub(super) async fn work_authority_revision_in_epoch(
+        &self,
+        identity: &PreparedIdentity,
+        expires_at_ms: Option<i64>,
+        readiness_epoch: u64,
+    ) -> Result<Option<i64>> {
+        let clock = if let Some(expires) = expires_at_ms {
+            let requested_at = MonotonicInstant::now();
+            let now = self.work_ledger.now_ms().await?;
+            if now >= expires {
+                return Ok(None);
+            }
+            Some((now, requested_at, expires))
+        } else {
+            None
+        };
         let revision = self.work_ledger.payout_revision().await?;
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
         let published_work = self.prepared.read().await;
+        let readiness = self.readiness.read().await;
         let selected = self.observed_tip.read().await;
-        let parent = prepared.template["previousblockhash"]
-            .as_str()
-            .context("job parent missing")?;
+        ensure!(
+            readiness.generation == readiness_epoch,
+            "node readiness changed during work admission"
+        );
+        let parent = identity.parent.as_deref().context("job parent missing")?;
         let leased = selected
             .authority(
                 self.config.submit_tip_max_age,
                 self.config.template_refresh_failure_exit,
             )
-            .is_some_and(|tip| tip.hash == parent && tip.share_lease)
-            && published_work.as_ref().is_some_and(|current| {
-                current.snapshot.payout_revision == prepared.snapshot.payout_revision
-                    && current.template["previousblockhash"].as_str() == Some(parent)
-            });
-        ensure!(
-            selected.as_deref() == Some(parent) || leased,
-            "new tip work is pending"
-        );
-        drop(selected);
-        drop(published_work);
-        let last_poll = self
-            .readiness
-            .read()
-            .await
-            .last_poll
-            .context("tip polling unavailable")?;
+            .is_some_and(|tip| tip.hash == parent && tip.share_lease);
+        let last_poll = readiness.last_poll.context("tip polling unavailable")?;
+        if leased
+            && !published_work
+                .as_deref()
+                .is_some_and(|p| PreparedIdentity::of(p) == *identity)
+        {
+            return Ok(None);
+        }
+        if selected.as_deref() != Some(parent) && !leased {
+            // A known retired parent is a miss. It must not turn Stratum's
+            // retained-job fallback into an apparent backend outage.
+            return Ok(None);
+        }
         ensure!(
             last_poll.elapsed() < self.config.health_timeout || leased,
             "tip polling stale"
         );
+        let published_tip = selected.publication_stamp();
+        drop(selected);
+        drop(readiness);
+        drop(published_work);
+        let admitted_revision = if leased {
+            self.prove_published_lease(identity.clone(), published_tip, readiness_epoch)
+                .await?
+                .map(|(_, _, lease)| lease.current_revision)
+        } else {
+            (identity.revision == revision).then_some(revision)
+        };
+        if let Some((now, requested_at, expires)) = clock {
+            let elapsed_ms = i64::try_from(requested_at.elapsed().as_millis())
+                .context("issued expiry clock overflow")?;
+            if now.checked_add(elapsed_ms).is_none_or(|now| now >= expires) {
+                return Ok(None);
+            }
+        }
         // A known superseded payout is an unknown/retired resumable job,
         // not a failed database lookup. Keep that outcome distinct.
-        Ok((prepared.snapshot.payout_revision == revision || leased).then_some(revision))
+        Ok(admitted_revision)
+    }
+
+    async fn prove_published_lease(
+        &self,
+        identity: PreparedIdentity,
+        published_tip: Option<(String, u64)>,
+        readiness_epoch: u64,
+    ) -> Result<Option<(Arc<Prepared>, TipView, PublishedLease)>> {
+        let state = self.work_ledger.payout_state().await?;
+        let lease = PublishedLease {
+            identity,
+            published_tip,
+            readiness_epoch,
+            current_revision: state.payout_revision,
+        };
+        let selected = self.select_validated_lease(&lease).await?;
+        if state.prior_balances_digest != lease.identity.window.prior_balances_digest {
+            return Ok(None);
+        }
+        Ok(selected.map(|(current, tip)| (current, tip, lease)))
+    }
+
+    async fn select_validated_lease(
+        &self,
+        lease: &PublishedLease,
+    ) -> Result<Option<(Arc<Prepared>, TipView)>> {
+        let prepared = self.prepared.read().await;
+        let readiness = self.readiness.read().await;
+        let selected = self.observed_tip.read().await;
+        ensure!(
+            readiness.generation == lease.readiness_epoch && readiness.last_poll.is_some(),
+            "node readiness changed during replacement lease admission"
+        );
+        let Some(current) = prepared
+            .as_ref()
+            .filter(|p| PreparedIdentity::of(p) == lease.identity)
+        else {
+            return Ok(None);
+        };
+        if selected.publication_stamp() != lease.published_tip {
+            return Ok(None);
+        }
+        let tip = selected
+            .authority(
+                self.config.submit_tip_max_age,
+                self.config.template_refresh_failure_exit,
+            )
+            .filter(|tip| {
+                tip.share_lease && Some(tip.hash.as_str()) == lease.identity.parent.as_deref()
+            });
+        Ok(tip.map(|tip| (current.clone(), tip)))
+    }
+
+    pub(super) async fn revalidate_published_lease(&self, lease: &PublishedLease) -> Result<bool> {
+        Ok(self.select_validated_lease(lease).await?.is_some())
     }
 
     pub(super) async fn submit_admission(&self) -> Result<SubmitAdmission, StratumError> {
         // Match publication order. A tip's lease belongs to the payout selected
         // with it, never a prepared snapshot captured before an awaited lookup.
         // Readiness is checked separately; never take it after observed_tip.
-        {
+        let lease_candidate = {
             let prepared = self.prepared.read().await;
             let current = prepared
                 .clone()
@@ -216,8 +397,35 @@ impl Coordinator {
                 self.config.submit_tip_max_age,
                 self.config.template_refresh_failure_exit,
             ) {
-                return Ok(SubmitAdmission { current, tip });
+                if !tip.share_lease {
+                    return Ok(SubmitAdmission {
+                        current,
+                        tip,
+                        lease: None,
+                    });
+                }
+                Some((PreparedIdentity::of(&current), state.publication_stamp()))
+            } else {
+                None
             }
+        };
+        if let Some((identity, published_tip)) = lease_candidate {
+            let readiness_epoch = self.readiness.read().await.generation;
+            let (current, tip, lease) = self
+                .prove_published_lease(identity, published_tip, readiness_epoch)
+                .await
+                .map_err(|_| {
+                    protocol_error(
+                        "backend-rpc-unavailable",
+                        "current payout state is unavailable",
+                    )
+                })?
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?;
+            return Ok(SubmitAdmission {
+                current,
+                tip,
+                lease: Some(lease),
+            });
         }
         let result = self
             .rpc
@@ -256,7 +464,11 @@ impl Coordinator {
                 sequence: 0,
             });
         tip.share_lease = false;
-        Ok(SubmitAdmission { current, tip })
+        Ok(SubmitAdmission {
+            current,
+            tip,
+            lease: None,
+        })
     }
 
     #[cfg(test)]

@@ -234,6 +234,7 @@ impl Coordinator {
         let tip_observation::SubmitAdmission {
             current,
             tip: selected,
+            lease,
         } = self.submit_admission().await?;
         if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
             return Err(protocol_error(
@@ -241,12 +242,20 @@ impl Coordinator {
                 "current chain state is unavailable",
             ));
         }
-        let revision = self.submit_ledger.payout_revision().await.map_err(|_| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current payout state is unavailable",
-            )
-        })?;
+        let revision = if let Some(lease) = &lease {
+            // Re-reading only a revision here would pair a newer transaction
+            // fence with the older balance digest checked by lease admission.
+            lease
+                .revision_for(&tip_observation::PreparedIdentity::of(&context.prepared))
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?
+        } else {
+            self.submit_ledger.payout_revision().await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current payout state is unavailable",
+                )
+            })?
+        };
         let parent_stale = selected.hash != job.wire.previousblockhash;
         let grace =
             parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
@@ -315,6 +324,16 @@ impl Coordinator {
                     "backend-rpc-unavailable",
                     "current chain state is unavailable",
                 ));
+            }
+        }
+        if let Some(lease) = &lease {
+            if !self.revalidate_published_lease(lease).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })? {
+                return Err(protocol_error("stale-job", "stale job"));
             }
         }
         // Both acknowledgement bounds are measured from here.

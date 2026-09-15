@@ -11,8 +11,10 @@ use std::sync::{
 use submit_ledger::CommitGate;
 
 mod admission_races;
+mod authority_lease;
 mod blockwait;
 mod commit_reconcile;
+mod compact_authority;
 mod compact_prepared;
 mod config;
 mod credit;
