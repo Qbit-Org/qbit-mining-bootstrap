@@ -598,7 +598,31 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 break
             if not option.startswith("-"):
                 break
-            index += 2 if option in WRAPPER_ARGUMENTS.get(program, ()) else 1
+            arguments = WRAPPER_ARGUMENTS.get(program, ())
+            index += 1
+            if option.startswith("--"):
+                if option in arguments:
+                    index += 1  # `--user nobody`; `--user=nobody` is one word
+                continue
+            # A short cluster is read letter by letter, as getopt reads it for
+            # env, sudo and bash's exec: the first letter that takes an
+            # argument takes the rest of the cluster (`-unobody`; `-pu nobody`
+            # gives p the prompt "u" and runs `nobody`) or, when it ends the
+            # cluster, the next word (`-nu nobody`). sudo 1.9.15p5 ran `id
+            # -un` as nobody for `sudo -nu nobody`, `sudo -nunobody` and
+            # `sudo -nHu nobody`, answered `sudo -pu nobody id` with "nobody:
+            # command not found" and `sudo -un nobody id` with "unknown user
+            # n"; GNU coreutils 9.4 ran `env -iu FOO echo hi` and `env -iC
+            # /tmp pwd` but `env -ui FOO echo hi` failed to run `FOO`; bash
+            # 5.2.21 ran `exec -ca zzz echo hi` and `exec -cazzz echo hi`,
+            # while `exec -ac zzz echo hi` found no `zzz`. docker was not
+            # installed on the inspected host; its `-e`, `-u` and `-w` are
+            # read as the same clusters.
+            for position, letter in enumerate(option[1:], 1):
+                if f"-{letter}" in arguments:
+                    if position == len(option) - 1:
+                        index += 1  # nothing attached: the next word is the argument
+                    break
         if program == "docker":
             index += 1  # container name
         elif program == "env" or (program == "sudo" and not terminated):
@@ -2790,6 +2814,57 @@ class ScannerTests(unittest.TestCase):
                     self.commands(f"sudo {options} python3 lab/prism/storm.py"),
                     ["lab/prism/storm.py"],
                 )
+
+    def test_clustered_wrapper_options_consume_their_operands(self) -> None:
+        # getopt reads a short cluster letter by letter: the first letter
+        # that takes an argument takes the rest of the cluster or, at its
+        # end, the next word. sudo 1.9.15p5 ran `id -un` as nobody for
+        # `sudo -nu nobody`, `sudo -nunobody` and `sudo -nHu nobody`; GNU
+        # coreutils 9.4 ran `env -iu FOO echo hi` and `env -iC /tmp pwd`;
+        # bash 5.2.21 ran `exec -ca zzz echo hi` and `exec -cazzz echo hi`.
+        for text in (
+            "sudo -nu nobody {}", "sudo -nunobody {}", "sudo -nHu nobody {}", "sudo -Hnu nobody {}",
+            "sudo -bnu nobody {}", "sudo -ng wheel {}", "sudo -nh host {}", "sudo -np Prompt {}",
+            "sudo -nC 3 {}", "sudo -nD /tmp {}", "sudo -nR / {}", "sudo -nr admin {}",
+            "sudo -nt unconfined_t {}", "sudo -nT 30 {}", "sudo -Enu nobody -g wheel {}",
+            "sudo '-nu' nobody {}", "sudo -nu nobody -- {}", "sudo -nu nobody FOO=x {}",
+            "env -iu FOO {}", "env -vu FOO {}", "env -iC /tmp {}", "env -iuFOO {}", "env -ivu FOO -i {}",
+            "env -iu FOO BAR=y {}", "exec -ca name {}", "exec -la name {}", "exec -cla name {}",
+            "exec -caname {}", "docker exec -ite FOO=x c {}", "docker exec -itu root c {}",
+            "docker exec -itw /tmp c {}", "docker exec -iteFOO=x c {}", "podman exec -du root c {}",
+            "nohup sudo -nu nobody env -iu FOO {}",
+        ):
+            for command, missing in (
+                ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+                ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+            ):
+                with self.subTest(text=text.format(command)):
+                    self.assertEqual(self.located(text.format(command)), [(1, missing)])
+                    self.assertEqual(dead_commands(text.format(command), {"lab/example/deleted.py"}), [])
+        text = "```sh\nsudo -nu \\\n  nobody \\\n  python3 lab/example/deleted.py\n```"
+        self.assertEqual(self.located(text), [(2, "lab/example/deleted.py")])
+        self.assertEqual(self.commands("sudo -nu nobody sh -c 'python3 lab/prism/storm.py'"), ["lab/prism/storm.py"])
+
+    def test_clustered_wrapper_operands_end_at_the_first_argument_letter(self) -> None:
+        # `-pu nobody` gives p the prompt "u" and runs `nobody` (sudo 1.9.15p5:
+        # "nobody: command not found"), `-un nobody` sets the user `n`
+        # ("unknown user n"), `env -ui FOO` unsets `i` and runs `FOO`, and
+        # `exec -ac zzz` names the process `c` and runs `zzz`: the word after
+        # such a cluster is the program, so the Python after it never runs.
+        # `-nv` and `-nvu nobody` still validate credentials and run nothing.
+        for text in (
+            "sudo -pu nobody", "sudo -un nobody", "sudo -ug nobody", "sudo -Du nobody", "sudo -nuv nobody",
+            "sudo -nv", "sudo -nvu nobody", "sudo -nu",
+            "env -ui FOO", "env -Cu /tmp", "env -iu",
+            "exec -ac name", "exec -ca",
+            "docker exec -ei FOO c", "docker exec -itu c",
+        ):
+            for argument in ("python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py"):
+                with self.subTest(text=text, argument=argument):
+                    line = f"{text} {argument}"
+                    self.assertEqual(self.commands(line), [])
+                    self.assertEqual(len(self.references(line)), 1)
+                    self.assertEqual(self.commands(line + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
         for quote in ("'", '"'):
