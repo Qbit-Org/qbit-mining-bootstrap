@@ -3,8 +3,9 @@ use crate::{
     config::Config,
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
-        BlockObservation, Candidate, CandidateClaim, CandidateCtv, ClaimParts, HeartbeatHealth,
-        Ledger, SignerKeys, Snapshot, Window, WindowError, WindowRef,
+        BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
+        HeartbeatHealth, Ledger, OfferOutcome, SignerKeys, Snapshot, Window, WindowError,
+        WindowRef,
     },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
@@ -29,10 +30,11 @@ use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod miner_submit;
 mod prepared_storage;
+mod publication_authority;
 mod submit_ledger;
 mod tip_observation;
 mod work_ledger;
-pub use tip_observation::TipState;
+pub use tip_observation::{IssuanceAuthority, TipState};
 
 pub struct JobContext {
     pub prepared: Arc<Prepared>,
@@ -44,6 +46,9 @@ pub struct JobContext {
     /// worker and the template the issuing frontend saw, which a claiming
     /// frontend cannot re-derive.
     pub bootstrap_share: Option<AcceptedShare>,
+    /// Original admission for Coordinator-built/recovered work. Internal
+    /// contexts not built by Coordinator start their proof at persistence.
+    pub issuance_authority: Option<Arc<IssuanceAuthority>>,
 }
 
 /// The builder inputs a job was built with, other than the window, captured
@@ -197,18 +202,21 @@ pub struct Coordinator {
     pub ledger: Arc<Ledger>,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub rpc: Rpc,
-    pub prepared: RwLock<Option<Arc<Prepared>>>,
+    pub prepared: Arc<RwLock<Option<Arc<Prepared>>>>,
     pub refresh: watch::Sender<u64>,
     pub wake: Notify,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
-    readiness: RwLock<ReadinessState>,
-    pub observed_tip: RwLock<TipState>,
+    readiness: Arc<RwLock<ReadinessState>>,
+    pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     pub last_error: RwLock<Option<String>>,
-    build_slots: Arc<Semaphore>,
+    /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
+    /// them. Public so a test can saturate build capacity and prove the offer
+    /// never waits for it.
+    pub build_slots: Arc<Semaphore>,
     /// Bounds how many `Ledger::read_window` calls hold a pool connection at
     /// once. `build_slots` alone does not: `PRISM_JOB_BUILD_EXECUTOR_WORKERS`
     /// may exceed `PRISM_DATABASE_MAX_CONNECTIONS`, and the pool is shared with
@@ -222,6 +230,60 @@ pub struct Coordinator {
     /// disabled. A COMMIT that ran this long may be a cancelled synchronous
     /// replication wait that committed only locally.
     statement_timeout: Option<Duration>,
+    /// A test seam between the offer reservation and the token fence that
+    /// precedes the `submitblock` call, so a test can take the row away in
+    /// exactly the window the fence guards.
+    #[cfg(test)]
+    offer_probe: std::sync::Mutex<Option<Arc<OfferProbe>>>,
+}
+
+/// See `Coordinator::offer_probe`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct OfferProbe {
+    pub(crate) entered: Notify,
+    pub(crate) release: Notify,
+}
+
+/// The wall clock as UNIX milliseconds. Every proof-to-first-offer sample is
+/// the difference of two such readings, one taken by the enqueuing frontend
+/// and one by the offering frontend; neither is the ledger clock, and the
+/// two hosts' clocks may disagree, which the observer treats as skew.
+pub(crate) fn unix_ms_now() -> Result<i64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("wall clock is before the UNIX epoch")?;
+    i64::try_from(elapsed.as_millis()).context("wall clock overflow")
+}
+
+/// Classify the one `submitblock` reply. `null` is acceptance on some chain,
+/// a string is the node's rejection reason, and anything else, a transport
+/// failure or a timeout included, leaves delivery unknown: the block may or
+/// may not have reached the node, and the row is reconciled against the
+/// chain rather than offered again.
+fn classify_offer(result: &Result<Value>) -> (OfferOutcome, Option<String>) {
+    match result {
+        Ok(Value::Null) => (OfferOutcome::Accepted, None),
+        Ok(Value::String(reason)) => (OfferOutcome::Rejected, Some(reason.clone())),
+        Ok(other) => (
+            OfferOutcome::Unknown,
+            Some(format!("unexpected submitblock reply {other}")),
+        ),
+        Err(error) => (OfferOutcome::Unknown, Some(format!("{error:#}"))),
+    }
+}
+
+fn describe_offer(outcome: OfferOutcome, reply: Option<&str>) -> String {
+    match (outcome, reply) {
+        (OfferOutcome::Accepted, _) => "node accepted the offer".into(),
+        (OfferOutcome::Rejected, reply) => {
+            format!("node rejected the offer: {}", reply.unwrap_or("no reason"))
+        }
+        (OfferOutcome::Unknown, reply) => format!(
+            "offer outcome unknown: {}",
+            reply.unwrap_or("no reply was recorded")
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -255,17 +317,22 @@ const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     rebuild_deadline: Duration::from_secs(60),
 };
 
-/// Why a claim's window read or rebuild did not produce parts, and what the
-/// claim does about it. Every variant is recoverable: the row is rescheduled
-/// through `retry_candidate` or finished only after `observe_candidate`
-/// proves the block superseded; nothing here abandons a candidate.
+/// Why a claim's window read or rebuild did not produce parts. Every variant
+/// is recoverable and none abandons a candidate: after the offer the attempt
+/// settles in `reconciliation` with the reason and is retried without any
+/// RPC; before the offer (an active block found by the pre-offer probe) the
+/// row is rescheduled through `retry_candidate`.
 #[derive(Debug)]
 enum RebuildFailure {
-    /// Fail this attempt with an alert and reschedule the row.
+    /// Fail this attempt with a reason; a later attempt may succeed.
     Retry(String),
-    /// The current balances are not the reference's: the candidate is
-    /// superseded, or it is the pool's own block. `observe_candidate` decides.
+    /// Under a `Current` read, the current balances are not the reference's,
+    /// so the current set is not the one the block's coinbase commits to.
     PriorBalancesChanged,
+    /// Under an `AsIssued` read, no snapshot row holds the reference's set.
+    /// The caller may fall back to a `Current` read, which proves the digest
+    /// itself before it returns any balances.
+    BalanceSnapshotMissing,
 }
 
 /// Map a window read error to the claim's action. A database error is not
@@ -273,6 +340,7 @@ enum RebuildFailure {
 fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
     Ok(match error {
         WindowError::PriorBalancesChanged { .. } => RebuildFailure::PriorBalancesChanged,
+        WindowError::BalanceSnapshotMissing { .. } => RebuildFailure::BalanceSnapshotMissing,
         WindowError::Incomplete { expected, got } => RebuildFailure::Retry(format!(
             "window range incomplete: expected {expected} shares, read {got}; rows pruned or missing, or a different predicate (#268 owns recovery)"
         )),
@@ -286,10 +354,6 @@ fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
         WindowError::Decode(error) => {
             RebuildFailure::Retry(format!("window decode error: {error:#}; corruption"))
         }
-        WindowError::BalanceSnapshotMissing { digest } => RebuildFailure::Retry(format!(
-            "as-issued balance snapshot {} is missing; pruned or never written",
-            hex::encode(digest)
-        )),
         // A cancelled or panicked blocking hand-off found nothing wrong with
         // any row or digest: retryable, with its own alert, and never the
         // corruption or abandon path.
@@ -579,18 +643,20 @@ impl Coordinator {
             ledger,
             rpc,
             refresh,
-            prepared: RwLock::new(None),
+            prepared: Arc::new(RwLock::new(None)),
             wake: Notify::new(),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
-            readiness: RwLock::new(ReadinessState::default()),
-            observed_tip: RwLock::new(TipState::default()),
+            readiness: Arc::new(RwLock::new(ReadinessState::default())),
+            observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
+            #[cfg(test)]
+            offer_probe: Default::default(),
         }))
     }
 
@@ -839,7 +905,10 @@ impl Coordinator {
                     readiness.generation == readiness_generation,
                     "node readiness changed during work reuse"
                 );
-                self.observed_tip.write().await.publish(parent)?;
+                self.observed_tip
+                    .write()
+                    .await
+                    .refresh_publication(parent)?;
                 readiness.last_poll = Some(Instant::now());
                 return Ok(());
             }
@@ -1284,6 +1353,10 @@ impl Coordinator {
         // database row lock while a renewal waits for that same transaction.
         let initially_renewed = tokio::time::Instant::now();
         self.renew_candidate(claim, lease).await?;
+        let live_token_query = format!(
+            "SELECT CASE WHEN state IN {} AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            CandidateState::UNFINISHED_SQL
+        );
         let heartbeat = async {
             let mut valid_until = initially_renewed + Duration::from_secs(lease.seconds as u64);
             let mut delay = lease.interval;
@@ -1326,9 +1399,14 @@ impl Coordinator {
                         let budget = lease
                             .timeout
                             .min(valid_until.saturating_duration_since(observed));
-                        let remaining = tokio::time::timeout(budget,sqlx::query_scalar::<_,Option<i64>>(
-                            "SELECT CASE WHEN state='pending' AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1"
-                        ).bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&self.ledger.pool)).await;
+                        let remaining = tokio::time::timeout(
+                            budget,
+                            sqlx::query_scalar::<_, Option<i64>>(&live_token_query)
+                                .bind(&claim.candidate.block_hash)
+                                .bind(&claim.claim_token)
+                                .fetch_optional(&self.ledger.pool),
+                        )
+                        .await;
                         let Ok(Ok(Some(Some(remaining)))) = remaining else {
                             return Err(error);
                         };
@@ -1363,30 +1441,26 @@ impl Coordinator {
         }
     }
 
-    /// Fail this attempt with an alert and reschedule the row. Never abandons.
-    async fn retry_with_alert(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
-        tracing::error!(
-            block = %claim.candidate.block_hash,
-            reason,
-            "ALERT: candidate attempt failed; the row is rescheduled, never abandoned"
-        );
-        self.ledger.retry_candidate(claim, reason).await
-    }
-
     /// Whether the block's audit has already landed and, if so, whether the
     /// landed row is the audit of this block: authenticated against the
-    /// candidate's block bytes, never read back as a body.
-    async fn landed_audit_authenticated(&self, claim: &CandidateClaim) -> Result<bool> {
+    /// candidate's block bytes, never read back as a body. `None` when no
+    /// audit has landed; `Some(Err(reason))` when one has and it is not this
+    /// block's, which is a refusal for the caller to settle, never a rebuild
+    /// over the existing evidence. Only database errors propagate.
+    async fn landed_audit_authenticated(
+        &self,
+        claim: &CandidateClaim,
+    ) -> Result<Option<Result<(), String>>> {
         let candidate = &claim.candidate;
         let Some(landed) = self.ledger.landed_audit(&candidate.block_hash).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        authenticate_landed_audit(candidate, &landed).with_context(|| {
-            format!(
-                "landed audit for block {} does not authenticate against the candidate's block",
+        if let Err(error) = authenticate_landed_audit(candidate, &landed) {
+            return Ok(Some(Err(format!(
+                "landed audit for block {} does not authenticate against the candidate's block: {error:#}",
                 candidate.block_hash
-            )
-        })?;
+            ))));
+        }
         if landed.found_block_bits.is_none() {
             self.ledger
                 .record_landed_audit_bits(
@@ -1395,7 +1469,7 @@ impl Coordinator {
                 )
                 .await?;
         }
-        Ok(true)
+        Ok(Some(Ok(())))
     }
 
     /// The stored builder version and signer keys must be this binary's, or
@@ -1484,50 +1558,80 @@ impl Coordinator {
         }
     }
 
-    /// Rebuild the claim's parts, or settle the attempt. `Ok(None)` means the
-    /// attempt is over: the row was rescheduled or finished as superseded.
-    async fn rebuilt_claim(
+    /// The reason a rebuild failure gives the row.
+    fn rebuild_reason(candidate: &Candidate, failure: RebuildFailure) -> String {
+        match failure {
+            RebuildFailure::Retry(reason) => reason,
+            RebuildFailure::PriorBalancesChanged => format!(
+                "as-issued balance snapshot {} is missing and the current balances are no longer the reference's; the audit the block commits to cannot be rebuilt here",
+                hex::encode(candidate.window.prior_balances_digest)
+            ),
+            RebuildFailure::BalanceSnapshotMissing => format!(
+                "as-issued balance snapshot {} is missing; pruned or never written",
+                hex::encode(candidate.window.prior_balances_digest)
+            ),
+        }
+    }
+
+    /// Land the audit the block commits to, or say why that could not be
+    /// done. `Ok(Ok(()))` means the audit is durable: an earlier attempt
+    /// landed it and the row authenticates against the block, or it was
+    /// rebuilt now from the as-issued balances and landed at the revision
+    /// observed immediately before the landing transaction. The builder
+    /// admission, the rebuild, the signature and coinbase verification and
+    /// the landing's own fences all run here, after the offer. Every refusal
+    /// is returned as its reason so the caller settles the row; only node and
+    /// database errors propagate.
+    ///
+    /// The rebuild reads `AsIssued`: the snapshot every enqueue writes for
+    /// its reference. A row enqueued without one (a bare caller) falls back
+    /// to a `Current` read, which proves the current set still hashes to the
+    /// reference before returning it, so it is the as-issued set exactly
+    /// when it succeeds; if the balances have moved the audit cannot be
+    /// rebuilt anywhere and the reason says so. The revision is observed
+    /// after the rebuild, so however long the wait for build capacity was,
+    /// a block that confirmed meanwhile does not fail the fence.
+    async fn land_offered(
         &self,
         claim: &CandidateClaim,
-        balances: BalanceSource,
         lease: CandidateLease,
-        parent: &str,
-    ) -> Result<Option<OffRuntime<CandidateClaim>>> {
+    ) -> Result<Result<(), String>> {
         let candidate = &claim.candidate;
-        if let Some(reason) = self.stored_inputs_mismatch(candidate)? {
-            self.retry_with_alert(claim, &reason).await?;
-            return Ok(None);
+        match self.landed_audit_authenticated(claim).await? {
+            Some(Ok(())) => return Ok(Ok(())),
+            Some(Err(reason)) => return Ok(Err(reason)),
+            None => {}
         }
-        match self.rebuild_claim_parts(claim, balances, lease).await? {
-            Ok(parts) => Ok(Some(OffRuntime::new(claim.clone().with_parts(parts)))),
-            Err(RebuildFailure::Retry(reason)) => {
-                self.retry_with_alert(claim, &reason).await?;
-                Ok(None)
-            }
-            Err(RebuildFailure::PriorBalancesChanged) => {
-                // Not a supersession by itself: the pool's own block reaching
-                // the tip moves the balances too. Finish only a block that is
-                // not active and whose revision or parent moved; an active
-                // block stays recoverable and is retried.
-                let (active, revision, tip) = self.observe_candidate(claim).await?;
-                if !active && (revision != candidate.payout_revision || tip != parent) {
-                    self.ledger
-                        .finish_candidate_at_revision(
-                            claim,
-                            false,
-                            Some("payout revision or parent superseded"),
-                            revision,
-                        )
-                        .await?;
-                } else {
-                    self.retry_with_alert(
-                        claim,
-                        "prior balances changed since the candidate was written while its block is still active or its revision unchanged; retrying",
-                    )
-                    .await?;
+        if let Some(reason) = self.stored_inputs_mismatch(candidate)? {
+            return Ok(Err(reason));
+        }
+        let parts = match self
+            .rebuild_claim_parts(claim, BalanceSource::AsIssued, lease)
+            .await?
+        {
+            Ok(parts) => parts,
+            Err(RebuildFailure::BalanceSnapshotMissing) => {
+                match self
+                    .rebuild_claim_parts(claim, BalanceSource::Current, lease)
+                    .await?
+                {
+                    Ok(parts) => parts,
+                    Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
                 }
-                Ok(None)
             }
+            Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
+        };
+        // The rebuilt window is released off the runtime once the landing
+        // returns, whichever way it went.
+        let rebuilt = OffRuntime::new(claim.clone().with_parts(parts));
+        let (_, revision, _) = self.observe_candidate(claim).await?;
+        match self
+            .ledger
+            .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
+            .await
+        {
+            Ok(_) => Ok(Ok(())),
+            Err(error) => Ok(Err(format!("{error:#}"))),
         }
     }
 
@@ -1536,19 +1640,63 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
+        match claim.lifecycle.state {
+            CandidateState::Pending => self.offer_candidate(claim, lease).await,
+            // A reservation this or another frontend took and never recorded
+            // an outcome for: the call may or may not have been made. Never
+            // offered again; reconciled against the chain as unknown.
+            CandidateState::OfferReserved => {
+                let reserved_by = claim
+                    .lifecycle
+                    .offer
+                    .reserved_by
+                    .as_deref()
+                    .unwrap_or("an unknown instance");
+                let reply = format!(
+                    "offer reservation recovered from {reserved_by}: the submitblock call may or may not have been made and its outcome was never recorded; delivery unknown"
+                );
+                self.settle_offered_candidate(claim, lease, OfferOutcome::Unknown, Some(reply))
+                    .await
+            }
+            CandidateState::Offered | CandidateState::Reconciliation => {
+                let outcome = claim
+                    .lifecycle
+                    .offer
+                    .outcome
+                    .context("offered candidate row records no offer outcome")?;
+                let reply = claim.lifecycle.offer.reply.clone();
+                self.settle_offered_candidate(claim, lease, outcome, reply)
+                    .await
+            }
+        }
+    }
+
+    /// The offer phase of a pending candidate: the minimum before the one
+    /// `submitblock` call. The proof was validated in Stratum and the row was
+    /// authenticated at claim. An ordinary candidate passes the cached
+    /// staleness screen; a leased candidate skips it (#350: its lease covered
+    /// the work, and its block is offered before any supersession check).
+    /// Then the durable reservation is taken, the strictly-live token is
+    /// fenced immediately before the bounded RPC, and the node's answer is
+    /// recorded. Builder admission, the rebuild, verification, landing and
+    /// confirmation all follow in the post-offer phase.
+    async fn offer_candidate(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<()> {
         let candidate = &claim.candidate;
         let parent = header_parent(&candidate.block_bytes)?;
-        if candidate.leased {
-            return self.process_leased_candidate(claim, lease, &parent).await;
-        }
-        if self.observed_tip.read().await.as_deref() != Some(parent.as_str())
-            || self.ledger.payout_revision().await? != candidate.payout_revision
+        if !candidate.leased
+            && (self.observed_tip.read().await.as_deref() != Some(parent.as_str())
+                || self.ledger.payout_revision().await? != candidate.payout_revision)
         {
-            // Backlogged work commonly becomes stale before reaching scarce
-            // build capacity. Cached hints only trigger this authoritative
-            // probe; an already-active block still needs its audit recovered.
+            // Backlogged work commonly becomes stale before it is offered.
+            // Cached hints only trigger this authoritative probe. A block
+            // that is already active needs no offer, only its audit and its
+            // confirmation; a superseded one is the one proven pre-offer
+            // rejection that may abandon.
             let (active, revision, tip) = self.observe_candidate(claim).await?;
-            if !active && (revision != candidate.payout_revision || tip != parent) {
+            if active {
+                return self.adopt_active_candidate(claim, lease, &tip).await;
+            }
+            if revision != candidate.payout_revision || tip != parent {
                 self.ledger
                     .finish_candidate_at_revision(
                         claim,
@@ -1560,145 +1708,200 @@ impl Coordinator {
                 return Ok(());
             }
         }
-        // An earlier claim may have landed the audit and lost its lease. The
-        // landed row is authenticated against the block, not read back; a
-        // landed audit is not a submitted block, so the claim continues to
-        // observe, renew and submit exactly as one that landed it now.
-        let landed = self.landed_audit_authenticated(claim).await?;
-        let rebuilt = if landed {
-            None
-        } else {
-            match self
-                .rebuilt_claim(claim, BalanceSource::Current, lease, &parent)
-                .await?
-            {
-                Some(rebuilt) => Some(rebuilt),
-                None => return Ok(()),
-            }
-        };
-        let (active, revision, tip) = self.observe_candidate(claim).await?;
-        if active {
-            if let Some(rebuilt) = &rebuilt {
-                self.ledger
-                    .land_candidate_at_revision(rebuilt, &self.config.ledger_public_key, revision)
-                    .await?;
-            }
-            self.ledger
-                .finish_candidate_at_revision(claim, true, None, revision)
-                .await?;
-            self.wake.notify_one();
-            return Ok(());
-        }
-        if revision != candidate.payout_revision || tip != parent {
-            // Another claim may have sent this block before expiring. Landed
-            // inactive records and deferred credit survive terminal outbox
-            // disposition, so a late acceptance remains reconcilable.
-            self.ledger
-                .finish_candidate_at_revision(
-                    claim,
-                    false,
-                    Some("payout revision or parent superseded"),
-                    revision,
-                )
-                .await?;
-            return Ok(());
-        }
-        // This verified prepared record precedes the external RPC, so a
-        // crash after node acceptance is recoverable by any cluster member.
-        if let Some(rebuilt) = &rebuilt {
-            self.ledger
-                .land_candidate(rebuilt, &self.config.ledger_public_key)
-                .await?;
-        }
-        // The rebuilt window has done its work; release it off the runtime
-        // before the node round trips.
-        drop(rebuilt);
-        let (active, revision, tip) = self.observe_candidate(claim).await?;
-        if active || revision != candidate.payout_revision || tip != parent {
-            self.ledger
-                .finish_candidate_at_revision(
-                    claim,
-                    active,
-                    (!active).then_some("parent changed before submission"),
-                    revision,
-                )
-                .await?;
-            return Ok(());
-        }
+        // The request is prepared here, before the reservation and the
+        // fence, so nothing but the fence and the send itself sits between
+        // the strictly-live token check and the node. A wall clock the
+        // offer boundary cannot be read from is refused now, while the row
+        // is still pending, rather than after the reservation.
+        let params = json!([hex::encode(&candidate.block_bytes)]);
+        unix_ms_now().context("the first-offer boundary needs the wall clock")?;
+        // The durable reservation: once it commits, no claim on any
+        // frontend, this one included after a crash, offers the block again.
+        self.ledger.reserve_offer(claim).await?;
+        #[cfg(test)]
+        self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
-        let result = self.submit_block(claim).await?;
-        // A null response can still describe a known side-chain block; use
-        // active-chain evidence before advancing the shared payout state.
-        let (active, revision, _) = self.observe_candidate(claim).await?;
-        self.finish_after_submit(claim, active, revision, &result)
+        let (result, offered_at_ms) = self.submit_block(params).await?;
+        // The one sample, emitted once the one call has returned, from the
+        // start time captured immediately before it: a crash during the call
+        // loses the sample (the approved unknown-timing exception), and no
+        // sample is ever emitted for a call that never began.
+        self.observe_first_offer(claim, offered_at_ms);
+        let (outcome, reply) = classify_offer(&result);
+        self.ledger
+            .record_offer(claim, offered_at_ms, outcome, reply.as_deref())
+            .await?;
+        self.settle_offered_candidate(claim, lease, outcome, reply)
             .await
     }
 
-    /// A leased candidate (#273's replacement lease covered the work its
-    /// block was found on) is submitted before any terminal disposition and
-    /// before any rebuild: its balances are as issued, so a `Current` read
-    /// would report them changed and retry forever, and the pre-submit
-    /// supersession checks would discard the block. Only after `submitblock`
-    /// does it observe the chain, and it lands its audit, rebuilt from the
-    /// as-issued balances unless it has already landed, before it takes any
-    /// terminal outcome, whether the block is active or not.
-    async fn process_leased_candidate(
+    /// A pending block the chain already holds, found by the pre-offer
+    /// probe: a frontend offered it and lost the outcome before this
+    /// lifecycle existed, or reconciliation confirmed it. It needs no offer.
+    /// Before anything lands it is adopted, durably, into the
+    /// no-resubmission lifecycle with the node's evidence: a crash after this
+    /// point recovers it as a reconciliation row that never offers, a later
+    /// reorg cannot abandon it, and its landing runs under the post-offer
+    /// rules, as-issued. The original offer's time is unknown and stays so.
+    async fn adopt_active_candidate(
         &self,
         claim: &CandidateClaim,
         lease: CandidateLease,
-        parent: &str,
+        tip: &str,
     ) -> Result<()> {
-        self.renew_candidate(claim, lease).await?;
-        let result = self.submit_block(claim).await?;
-        let (active, revision, _) = self.observe_candidate(claim).await?;
-        if !self.landed_audit_authenticated(claim).await? {
-            let Some(rebuilt) = self
-                .rebuilt_claim(claim, BalanceSource::AsIssued, lease, parent)
-                .await?
-            else {
-                return Ok(());
-            };
-            self.ledger
-                .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
-                .await?;
-        }
-        self.finish_after_submit(claim, active, revision, &result)
+        let evidence = format!(
+            "node reports block {} active at height {} with tip {tip}",
+            claim.candidate.block_hash, claim.candidate.found_block.block_height
+        );
+        let reason = format!(
+            "adopted before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
+        );
+        tracing::warn!(block = %claim.candidate.block_hash, %reason, "adopting an active pending block");
+        self.ledger
+            .adopt_active_candidate(claim, &evidence, &reason)
+            .await?;
+        self.settle_offered_candidate(claim, lease, OfferOutcome::Unknown, Some(evidence))
             .await
     }
 
-    async fn submit_block(&self, claim: &CandidateClaim) -> Result<Value> {
-        self.rpc
-            .call_timeout(
-                "submitblock",
-                json!([hex::encode(&claim.candidate.block_bytes)]),
-                Some(self.config.block_submit_timeout),
-            )
-            .await
-    }
-
-    async fn finish_after_submit(
+    /// The post-offer phase, for the attempt that offered and for every
+    /// recovery of an offered, reserved or adopted row: observe the chain,
+    /// land the audit the block commits to at the observed revision, observe
+    /// again, and finish the row as submitted once the block is proven active
+    /// now. Nothing here offers, and nothing here abandons: a block that is
+    /// not active, a landing that was refused, and a node or database error
+    /// after the offer all settle the row in reconciliation with the reason
+    /// and keep every piece of evidence, to be retried with read-only chain
+    /// observations and never another `submitblock`. Only
+    /// when even that settlement cannot be written (the database is
+    /// unavailable, or the claim was lost) does the error propagate, and the
+    /// row keeps its reservation or offer record for a later recovery.
+    async fn settle_offered_candidate(
         &self,
         claim: &CandidateClaim,
-        active: bool,
-        revision: i64,
-        result: &Value,
+        lease: CandidateLease,
+        outcome: OfferOutcome,
+        reply: Option<String>,
     ) -> Result<()> {
+        let block = &claim.candidate.block_hash;
+        let offer = describe_offer(outcome, reply.as_deref());
+        let error = match self.settle_offered_inner(claim, lease, &offer).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let reason = format!("post-offer processing failed ({offer}): {error:#}");
+        match self.ledger.reconcile_candidate(claim, &reason).await {
+            Ok(()) => {
+                tracing::error!(
+                    %block,
+                    %reason,
+                    "ALERT: offered candidate could not be processed; kept for reconciliation, never offered again"
+                );
+                Ok(())
+            }
+            Err(settlement) => Err(error.context(format!(
+                "and the row could not be settled in reconciliation either ({settlement:#}); it keeps its offer record for recovery"
+            ))),
+        }
+    }
+
+    async fn settle_offered_inner(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        offer: &str,
+    ) -> Result<()> {
+        let block = &claim.candidate.block_hash;
+        if let Err(reason) = self.land_offered(claim, lease).await? {
+            let reason = format!("landing failed after the offer ({offer}): {reason}");
+            tracing::error!(
+                %block,
+                %reason,
+                "ALERT: offered candidate could not land; kept for reconciliation, never offered again"
+            );
+            return self.ledger.reconcile_candidate(claim, &reason).await;
+        }
+        // A null reply can still describe a known side-chain block, and the
+        // landing may have taken long: only active-chain evidence observed
+        // now, at a revision proven now, advances the shared payout state.
+        let (active, revision, _) = self.observe_candidate(claim).await?;
         if active {
             self.ledger
                 .finish_candidate_at_revision(claim, true, None, revision)
                 .await?;
             self.blocks.fetch_add(1, Ordering::Relaxed);
             self.wake.notify_one();
-        } else if result.is_string() {
-            self.ledger
-                .finish_candidate_at_revision(claim, false, result.as_str(), revision)
-                .await?;
-        } else {
-            anyhow::bail!("block submission outcome unresolved");
+            return Ok(());
         }
-        Ok(())
+        let reason = format!(
+            "block is not on the active chain after the offer ({offer}); kept for reconciliation, never offered again"
+        );
+        tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
+        self.ledger.reconcile_candidate(claim, &reason).await
+    }
+
+    /// The one proof-to-first-offer sample for a block, emitted by the
+    /// attempt that holds the reservation once its `submitblock` call has
+    /// returned, from the start time captured immediately before the call,
+    /// and never anywhere else: a recovered reservation does not reach this
+    /// point, so no second frontend can observe the same offer. Provenance:
+    /// `proof_observed_at_ms` is the enqueuing frontend's wall clock and
+    /// `offered_at_ms` this frontend's, so the interval spans two hosts' wall
+    /// clocks and a negative one is skew, dropped with a warning rather than
+    /// clamped to zero. A row without a proof time, written before 011 or by
+    /// a bare enqueue, yields no sample. The durable `offered_at_ms` the
+    /// outcome commit records is the marker of the sample this process took;
+    /// a crash during the call or before that commit loses the sample with
+    /// the process, and the recovery records none, which is the approved
+    /// at-most-once exception.
+    fn observe_first_offer(&self, claim: &CandidateClaim, offered_at_ms: i64) {
+        let block = &claim.candidate.block_hash;
+        let Some(proof_ms) = claim.lifecycle.proof_observed_at_ms else {
+            tracing::info!(
+                %block,
+                "first offer: the proof observation time is unknown for this row; no latency sample"
+            );
+            return;
+        };
+        match u64::try_from(offered_at_ms.saturating_sub(proof_ms)) {
+            Ok(millis) => self
+                .metrics
+                .observe_first_offer(Duration::from_millis(millis)),
+            Err(_) => tracing::warn!(
+                %block,
+                proof_observed_at_ms = proof_ms,
+                offered_at_ms,
+                "first offer: the offering frontend's wall clock is behind the enqueuing frontend's; skew, no latency sample"
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    async fn offer_probe(&self) {
+        let probe = self.offer_probe.lock().unwrap().clone();
+        if let Some(probe) = probe {
+            probe.entered.notify_one();
+            probe.release.notified().await;
+        }
+    }
+
+    /// The one bounded `submitblock` call of a prepared request. The wall
+    /// clock is read immediately before the request is sent, after the token
+    /// fence and after the request was prepared: the actual call boundary,
+    /// which is what `offered_at_ms` records and where the sample starts.
+    async fn submit_block(&self, params: Value) -> Result<(Result<Value>, i64)> {
+        let offered_at_ms = unix_ms_now()?;
+        let result = self
+            .rpc
+            .call_timeout(
+                "submitblock",
+                params,
+                Some(self.config.block_submit_timeout),
+            )
+            .await;
+        Ok((result, offered_at_ms))
     }
 
     pub async fn submit_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
@@ -1918,13 +2121,19 @@ impl MiningBackend for Coordinator {
         minimum_difficulty: f64,
     ) -> Result<MiningJob<JobContext>, StratumError> {
         let build = async {
+            let readiness_epoch = self.readiness.read().await.generation;
             let prepared = self
                 .prepared
                 .read()
                 .await
                 .clone()
                 .context("no current template")?;
-            self.issued_work_revision(&prepared)
+            let mut issuance_authority = self
+                .begin_issuance_authority(
+                    tip_observation::PreparedIdentity::of(&prepared),
+                    readiness_epoch,
+                    None,
+                )
                 .await?
                 .context("payout snapshot stale")?;
             self.ensure_job_fee_current(prepared.fee).await?;
@@ -1975,6 +2184,9 @@ impl MiningBackend for Coordinator {
             };
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
+            self.revalidate_issuance_authority(&mut issuance_authority, None)
+                .await?
+                .context("payout snapshot stale")?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -1982,6 +2194,7 @@ impl MiningBackend for Coordinator {
                     worker: worker.clone(),
                     bundle,
                     bootstrap_share,
+                    issuance_authority: Some(Arc::new(issuance_authority)),
                 }),
             })
         };
@@ -2011,6 +2224,7 @@ impl MiningBackend for Coordinator {
         job_id: &str,
     ) -> Result<Option<MiningJob<JobContext>>, StratumError> {
         let resume = async {
+            let readiness_epoch = self.readiness.read().await.generation;
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
@@ -2043,9 +2257,17 @@ impl MiningBackend for Coordinator {
                 .await
                 .clone()
                 .context("no current template")?;
-            if self.issued_work_revision(&current).await?.is_none() {
+            let identity = tip_observation::PreparedIdentity::from_stored(
+                &stored.prepared_key,
+                &prepared,
+                window,
+            );
+            let Some(mut issuance_authority) = self
+                .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
+                .await?
+            else {
                 return Ok(None);
-            }
+            };
             if current.template["previousblockhash"] != prepared.template["previousblockhash"]
                 || prepared.snapshot.payout_revision != current.snapshot.payout_revision
             {
@@ -2113,12 +2335,35 @@ impl MiningBackend for Coordinator {
             wire.version_mask = stored.version_mask;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
+            let clock_started = tokio::time::Instant::now();
             let now_ms = self.work_ledger.now_ms().await?;
-            if now_ms >= stored.expires_at_ms {
+            let deadline = publication_authority::AbsoluteDeadline::from_database(
+                now_ms,
+                clock_started,
+                stored.expires_at_ms,
+            )?;
+            if !deadline.live() {
+                return Ok(None);
+            }
+            // Decode, fee checks and reconstruction may wait. A stored job
+            // cannot borrow a superseding publication's replacement lease,
+            // or recover authority revoked during those waits.
+            if self
+                .revalidate_issuance_authority(&mut issuance_authority, Some(stored.expires_at_ms))
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            if !deadline.live() {
                 return Ok(None);
             }
             wire.resume_expires_at = Some(
-                Instant::now() + Duration::from_millis((stored.expires_at_ms - now_ms) as u64),
+                issuance_authority
+                    .deadline()
+                    .map_or(deadline.instant(), |original| {
+                        original.min(deadline.instant())
+                    }),
             );
             // The absolute DB expiry is translated once to monotonic time;
             // moving the session between hosts never extends its work lease.
@@ -2147,6 +2392,7 @@ impl MiningBackend for Coordinator {
                     worker: stored.worker,
                     bundle,
                     bootstrap_share,
+                    issuance_authority: Some(Arc::new(issuance_authority)),
                 }),
             }))
         };

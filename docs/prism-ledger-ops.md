@@ -59,22 +59,236 @@ deferred share at network difficulty; a losing candidate receives no credit.
 ## Durable block candidates
 
 `qbit_block_candidate_outbox` stores complete candidate evidence before a node
-submission can be lost to a process crash. Workers claim pending rows with
+submission can be lost to a process crash. Workers claim unfinished rows with
 expiring, token-fenced database claims. Multiple instances may process different
 candidates; a stale claimant cannot overwrite a successor's accounting result.
-
-The worker submits the preserved block bytes, observes the active chain, and
-persists verified block/audit/payout state transactionally. Transient failures
-leave durable retry work. A lost RPC reply is resolved by querying the chain or
-re-offering the same block; an accepted duplicate does not create another payout.
 Terminal candidates retain the evidence needed for replay identity while large
-pending payloads can be released. Deferred below-share-target credit is tied to
-the same durable candidate lifecycle.
+payloads are released. Deferred below-share-target credit is tied to the same
+durable candidate lifecycle.
 
-PostgreSQL and qbitd do not share a transaction. Duplicate node offers are
-possible after an interrupted attempt; accounting effects are idempotent and
-claim-fenced. Do not infer active-chain acceptance from a socket write or a
-missing RPC reply.
+Since migration 011 a claim runs in two phases, the node offer first and the
+accounting after it, and the row records where the block is between them:
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
+| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. |
+| `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
+| `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned. |
+| `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. |
+| `abandoned` | Reachable from `pending` only. |
+
+**Offer phase.** The minimum before the one `submitblock` call: the proof was
+validated at Stratum admission and the row authenticated at claim (document
+digest, block digest, window reference); an ordinary candidate passes the
+cached staleness screen, where a stale cached tip or payout revision triggers
+one authoritative chain probe that abandons a proven-superseded block or, for
+a block the chain already holds, adopts the row into `reconciliation` with the
+node's evidence and lands it without any offer; a leased candidate (#350)
+skips the screen and is offered as issued. The request is prepared, the
+reservation is committed, the strictly-live claim token is renewed
+immediately before the bounded RPC, the call is made and its outcome
+recorded. Nothing here waits for a builder permit or a window read, and on
+the cached fast path nothing here takes the settlement lock; only the
+authoritative probe a stale cached tip or revision triggers observes the
+chain, which records the observation under `SETTLEMENT_LOCK` before the
+reservation. That screen is kept: it is what keeps proven-superseded backlog
+off the node.
+
+**Queue and measurement.** Each frontend runs one submit loop, and it
+processes claims serially: a claim's whole post-offer phase, its landing
+included, completes before the loop takes the next claim, so a block found
+while another is being settled waits in the outbox to be claimed, and on a
+single frontend every block admitted in that time waits behind it. The offer
+phase bound above is measured from the claim, on the cached fast path, with
+isolated sequential blocks (`tests/offer_latency.rs`, which holds the builder
+permits and the landing while it measures); it excludes the time a candidate
+spends in the outbox before it is claimed and establishes neither
+proof-to-offer latency under load nor concurrent throughput, both of which
+include the serial loop's queue delay. A stale cached tip or revision never
+shortens that path: the authoritative probe keeps its chain observation under
+`SETTLEMENT_LOCK` and its abandon-or-adopt decision under the claim. The
+ordinary payout-revision screen applies to every never-offered candidate; an
+issued lease (#350) is its one approved exception. That queue has a material
+economic window: the offer precedes the accounting confirmation, so an
+ordinary candidate found on the offered block's tip and queued while that
+block is being settled carries the revision current at its admission, and
+when the settlement's confirmation advances the payout revision the screen
+abandons the queued candidate as superseded work, even though its parent is
+still the active tip. The screen stays: valid proof of work on a superseded
+payout snapshot is not authorization to offer it, and only an issued lease is
+exempt. More frontends can reduce the queue delay, with no throughput
+guarantee; removing it, by settling one claim's post-offer phase while the
+next claim is offered, is a separate concurrency change and not part of 011.
+
+**Post-offer phase.** Builder admission, the audit rebuild from the as-issued
+balance snapshot (or, for a row enqueued without one, from the current
+balances when they still hash to the reference), signature and coinbase
+verification, the durable range proof, the landing at the chain revision
+observed after the rebuild, and a fresh observation of the chain before the
+row is finished as `submitted`. A failure here (a stored builder version or
+signer pair this binary cannot rebuild, a window read failure, a landed audit
+that does not authenticate against the block, a landing refused by its fences,
+a node or database error, a block not on the active chain) settles the row in
+`reconciliation` with its reason and every piece of evidence. No post-offer
+error returns a row to `pending` or abandons it. Only when that settlement
+itself cannot be written does the error propagate, and the row keeps its
+reservation or offer record for the next claim.
+
+**Recovery.** Every unfinished state is claimable once its lease expires, on
+any frontend, and counts toward the candidate backlog and retention. A
+recovered `offer_reserved` row is delivery unknown: the call may or may not
+have been made, so it is never offered again even when the node reports the
+block unknown; it lands its audit and waits in `reconciliation` for the chain.
+A recovered `offered` or `reconciliation` row lands its audit, or
+authenticates an already-landed audit against the block rather than rebuilding
+over it, and is finished once the block is active. A duplicate offer is
+therefore impossible across crashes and takeovers. The price is that a crash
+between the reservation commit and the call loses that delivery; the row
+reports it as unknown and reconciles rather than retrying.
+
+**Parked candidates.** A claim parks a row it must not use instead of
+retrying it. Two cases park: an unsupported `storage_version`, or a version-1
+row without its JSONB body (#285); and, since #387, a supported row whose
+persisted input fails the claim's validation. That covers a missing window
+reference or an inline pre-007 document, and JSON that is not a supported
+candidate. It covers a `candidate_sha256` or document block hash that
+disagrees with the row, and window columns that disagree with the document
+or cannot hold its range. It also covers missing, truncated or mis-hashed
+block bytes, an empty or non-hex coinbase suffix, stored inputs that
+contradict the window reference, and an offer outcome this binary does not
+know, persisted on a claimed unfinished row. (A claim selects only the four
+unfinished states, so a row in an unknown state is never claimed and never
+reaches this path.) The decode runs after the claim commits, and parking is
+one `UPDATE` in a follow-up transaction behind the writer fence. That update
+matches the row's database block hash, the claim's token and the state the
+claim selected, so a replacement owner's claim, or a row that has since moved
+to another state, is never parked. It clears `claim_token`,
+`claim_instance_id` and `claim_expires_at`, records the reason in
+`last_error` and sets `next_attempt_at` to `infinity`. The state, document,
+digest, block bytes, window columns and offer record stay unchanged, and
+`attempt_count` keeps the claim's increment. A validation reason reads
+`candidate <block_hash>: validation <kind>: <diagnosis>`, at most 1024 bytes,
+where `<kind>` is one of `lifecycle`, `window_reference`, `document`,
+`document_digest`, `document_identity`, `window_columns`, `block`,
+`coinbase_suffix` or `reference_invariants`. The claim still fails, so the
+submit loop logs `candidate polling failed`. The ledger logs the full
+diagnosis with one of three messages, and only the first means the row is
+parked:
+
+| Log message | Meaning |
+| --- | --- |
+| `parked a candidate that failed validation; operator action required` | The update matched exactly one row and its commit succeeded. |
+| `a candidate failed validation and was not parked` | Nothing was committed: the transaction could not begin, the writer fence refused, the claim was no longer this attempt's, or the transaction failed before its commit. A row still held by that claim is claimed again after its lease and parking is retried. |
+| `a candidate failed validation and whether it was parked is unknown; inspect the row` | The commit returned an error, so the outcome is unknown. |
+
+Nothing else parks a row. A claim or decode failure that is not one of these
+validation failures is not evidence about the stored candidate: a database or
+connection error while claiming, an executor or join failure, a column that
+cannot be read, or an error serializing the parsed document. Such a claim
+parks nothing and is left to expire and be retried. A failure of the parking
+transaction itself is reported as in the table above; in particular, a
+parking commit error can leave the row durably parked with an unknown
+outcome.
+
+Find parked rows and their reasons with:
+
+```sql
+SELECT block_hash, state, storage_version, attempt_count, last_error, updated_at
+FROM qbit_block_candidate_outbox
+WHERE state IN ('pending', 'offer_reserved', 'offered', 'reconciliation')
+  AND next_attempt_at = 'infinity'
+ORDER BY updated_at;
+```
+
+Nothing unparks a row automatically. No binary resets `next_attempt_at`,
+whether it is the one that parked the row or an earlier release. Reverting
+the binary therefore leaves every parked row parked, because a claim selects
+only due rows. Recovery is explicit operator work, and there is no recovery
+command for it yet (#268 tracks listing and abandonment). First preserve the
+row, from a backup or with `SELECT to_jsonb(o) FROM
+qbit_block_candidate_outbox o WHERE block_hash = '<hash>'`. Then establish
+why the stored evidence disagrees. Never edit the document, its digest, the
+block bytes or the window columns to make a row pass: they are what the
+claim authenticates. Once the cause is resolved, an operator may return the
+row to the claim lanes with `UPDATE qbit_block_candidate_outbox SET
+next_attempt_at = clock_timestamp() WHERE block_hash = '<hash>' AND
+next_attempt_at = 'infinity'`. A row that still fails validation is parked
+again with a fresh reason. Resetting the schedule of an `offer_reserved`,
+`offered` or `reconciliation` row never grants another offer (see
+**Recovery** above).
+
+**Timing.** `proof_observed_at_ms` is the enqueuing frontend's wall clock as
+the locally validated block proof entered the coordinator; `offered_at_ms` is
+the offering frontend's wall clock immediately before its `submitblock` call.
+`qbit_prism_block_submit_seconds` observes their difference once per block,
+on the frontend that made the call, after the call returned; that difference
+includes the wait in the outbox before the claim, which the claim-to-offer
+bound above excludes. The reservation
+time is never substituted for the call time; a row without a proof time
+(written before 011, or by a bare enqueue) yields no sample; a negative
+interval is clock skew between the two hosts and yields none; a recovery on
+another frontend records none. A crash between the call and the outcome
+commit may lose that block's sample with the process (unless a scrape had
+already read it), and the recovery never emits one, so the histogram is at
+most once per block, not exactly once across crashes.
+
+**Rolling upgrade and quiesce.** A pre-011 frontend keeps a row `pending`
+through its whole attempt and offers it after landing, or before landing for
+a leased candidate; a post-011 frontend would reserve and offer such a row
+again. The two must never share an outbox. Stop every pre-011 frontend and
+let their claims expire (at most the 120 s lease) before migrating. Keep
+supervisors and automatic restarts disabled throughout the cutover. Every
+`qbit_prism_instances` row must explicitly report `stopped` or `drained`;
+011 names and refuses any other instance, even with an empty outbox or a
+stale heartbeat. Heartbeat age proves only that reporting stopped, not that
+an idle or paused frontend cannot resume. Resolve blockers through graceful
+shutdown; do not edit or delete instance evidence to bypass the check.
+The scan holds a table lock through migration commit to serialize heartbeat
+registration and updates. 011 also refuses any pending row with a live claim,
+refuses an attempted
+pending row that lacks its block bytes or window reference, quarantines every
+pending row a pre-011 frontend attempted as `reconciliation` with an unknown
+outcome (recovered without any offer, confirmed if the chain holds the block,
+otherwise kept with its evidence for the operator), leaves never-attempted
+rows pending, and declares the `candidate_offer_lifecycle` capability, which
+a pre-011 binary refuses at connect and a post-011 binary requires at every
+start and before any migration DDL: a database at 011 whose declaration is
+missing or holds another value (a selectively restored capability table) is
+refused with nothing changed, the refusal names the remedy, and the server
+never repairs the declaration itself. 011 replaces only the lifecycle rules it
+knows (001's state and payload rules, or #258's dual-format rule), recognised
+by their definitions rather than their names; every other CHECK constraint on
+the outbox that references neither `state` nor `completed_at` (by the
+catalog's column dependencies) is kept exactly as it is, and one that
+references either column, or a foreign constraint under one of 011's own
+names, is refused by name with nothing changed, for the operator to drop and,
+if it still holds for the offer lifecycle, re-create after the migration.
+This conservative catalog policy writes no synthetic rows and executes no
+operator predicate; it does not prove a kept CHECK compatible with later
+writes, and a kept CHECK that rejects the quarantine or a lifecycle write
+fails that write's transaction as any CHECK would. Signer rotation is
+refused while any unfinished row stores other keys, in every unfinished
+state.
+
+**Startup fence (012).** The instance-table lock alone cannot reject an old
+startup queued behind migration. Migration 012 adds a database CHECK that
+requires `candidate_offer_lifecycle: 1` in every `starting` heartbeat. This
+binary writes that marker; a pre-011 binary cannot finish registering even
+if it checked capabilities before the cutover. The constraint is checked
+after the lock wait, including an upsert that would reuse a stopped instance
+ID. Shutdown and historical health evidence are retained. Migration 012 and
+011 commit together on a pre-011 database. A database already at 011 must
+also stop all frontends gracefully before applying 012; it uses the same
+explicit shutdown check. Restart with this binary after cutover. The new
+`instance_offer_startup = 1` capability rejects earlier binaries at their
+ordinary startup gate, and this binary refuses a missing or changed
+012 declaration. Recovery exports require the same schema and declaration.
+
+PostgreSQL and qbitd do not share a transaction. Accounting effects are
+idempotent and claim-fenced. Do not infer active-chain acceptance from a
+socket write or a missing RPC reply: an offered block is confirmed only by a
+fresh active-chain observation.
 
 ## Blocks, balances, and reorgs
 
@@ -97,6 +311,23 @@ and carry values against replay. The legacy operator report added
 `audit_head_sha256` over active carry rows; the SQL function alone does not
 calculate it. The recovery export below reproduces that exact head. Preserve it
 with independent release/recovery records.
+
+A landing writes the block's payout and carry rows from the immutable payout
+manifest of the audit its coinbase commits to, whatever the canonical balances
+are when it lands, and since migration 011 marks the block with that audit's
+digest (`qbit_pool_blocks.as_issued_audit_sha256`) in the same transaction. A
+pending, never-offered candidate whose reference balances are no longer
+current is refused (it is superseded work); an offered block lands as issued.
+Current balances still sum the active per-block `(gross − onchain)` deltas, so
+a block that lands after another block moved a miner's balance adds its own
+issued deltas, and a miner paid a carried balance on chain by both blocks
+carries the difference as visible debt; nothing is paid a third time and no
+commitment is rebuilt. `qbit_carry_forward_integrity_mismatches()` validates a
+marked block against that manifest: the arithmetic of every manifest account,
+fee recipients included; each carry row field by field against the matching
+miner account; and the payout entries against every account. A marked block
+whose audit or manifest is missing is a finding by itself. Blocks landed before
+011 keep the sequential rule. `qbit_carry_forward_current_drift()` is unchanged.
 
 Coinbase maturity is 1,000 blocks: a height-H payout becomes mature only at tip
 height H+1,000 or later. An immature disconnected block is marked inactive, so
@@ -201,7 +432,8 @@ Every later attempt is a separate public operation with its own claim.
 | Operation (public API) | Class | Automatic re-execution | What runs later, and who authorizes it | Coverage |
 | --- | --- | --- | --- | --- |
 | Candidate terminal disposition: `finish_candidate`, `finish_candidate_at_revision` | never-retried mutation | none | The same live claim may invoke again after a reported error; otherwise the worker calls `retry_candidate`. A consumed claim is rejected and writes nothing. | dynamic: `candidate_terminal_timeout_executes_once` |
-| Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds. It does not re-run the failed terminal write. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim` |
+| Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds, or `min(3600, 10 × attempt_count)` for a `reconciliation` row. It does not re-run the failed write and never changes the row's lifecycle state. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim`; `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once` |
+| Offer lifecycle: `reserve_offer`, `record_offer`, `adopt_active_candidate`, `reconcile_candidate` | never-retried mutations, claim-fenced | none | Each is one state transition of the live claim's row (`pending` to `offer_reserved`, `offer_reserved` to `offered`, `pending` to `reconciliation`, an offered state to `reconciliation`) and is rejected once the claim is lost or the row has moved on. A reported error after `reserve_offer` leaves the reservation in place: the next claim, on any frontend, treats the row as delivery unknown and never calls `submitblock` for it. | `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once`, `candidate_lease_tests::token_loss_between_heartbeats_is_fenced_immediately_before_submitblock`, `candidate_lease_tests::crash_after_offer_before_landing_recovers_on_another_frontend_without_a_second_offer` |
 | CTV attempt journal: `finish_fanout` | never-retried mutation; one journal row per authorized claim | none | Every recorded attempt, `failed` included, releases the claim and schedules `next_broadcast_attempt_at` (10 s per attempt, at most 3600 s). A fresh `claim_fanout` after that time is the next attempt and its own journal row; the old token stays rejected. | dynamic: `fanout_journal_timeout_executes_once`, `broadcast_retry_requires_new_claim` |
 | Claims: `claim_candidate`, `claim_fanout`, `renew_candidate_claim`, `renew_fanout_claim` | public reinvocation | none | One token per block hash or fanout. Distinct hashes have independent leases. Candidate terminal dispositions acquire the shared `SETTLEMENT_LOCK`, then `ORDER_LOCK`. The cited test verifies that a disposition does not touch a sibling candidate's locked outbox row; it does not establish concurrent execution of dispositions. | dynamic: `distinct_hashes_hold_independent_claims` |
 | Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
@@ -381,7 +613,7 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    CTV state in one read-only snapshot. The [streaming summarizer](../scripts/prism-recovery-evidence.py)
    records counts and digests and reproduces the legacy `audit_head_sha256`;
    compare that head to the mirrored pre-cutover report. It refuses incomplete
-   exports and carry mismatches/drift. Require `pending_candidates` zero. Protect
+   exports and carry mismatches/drift. Require `unfinished_candidates` zero. Protect
    the evidence as accounting data and budget disk for the share export.
 4. **Exercise the isolated pre-ACK restore.** Provision a separate empty
    database with compatible PostgreSQL, roles and extensions. Restore the full

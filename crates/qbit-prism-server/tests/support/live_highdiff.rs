@@ -242,7 +242,7 @@ async fn real_highdiff_block_only_proof_waits_for_active_chain_credit() -> Resul
         let credits:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE share_id=$1").bind(&rejected_share_id).fetch_one(&fixture.pool).await?;
         ensure!(credits==0,"rejected block-only proof inflated share accounting");
         let disposition=sqlx::query("SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1").bind(&rejected_hash).fetch_one(&fixture.pool).await?;
-        ensure!(disposition.try_get::<String,_>("state")?=="abandoned","rejected candidate not terminal");
+        ensure!(disposition.try_get::<String,_>("state")?=="reconciliation","a candidate the node rejected after its offer stays in reconciliation with its evidence, never abandoned");
         ensure!(disposition.try_get::<Option<String>,_>("last_error")?.is_some_and(|e|e.contains("time-too-new")),"test did not reach node timestamp rejection");
         fixture.integrity().await?;
         eprintln!("live highdiff: withheld ACK until durable active-chain credit; credited exactly {network_work} network work; rejected future block received no ACK/credit");
@@ -350,6 +350,7 @@ async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
             worker: job.context.worker.clone(),
             bundle: std::sync::Arc::new(bundle),
             bootstrap_share: job.context.bootstrap_share.clone(),
+            issuance_authority: job.context.issuance_authority.clone(),
         });
         let rejected = coordinator
             .submit(&worker, &malformed, submission.clone(), false.into())

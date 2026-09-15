@@ -345,6 +345,13 @@ pub async fn restore(
         .replace(&source.schema, &target.schema);
     let mut transaction = target.pool.begin().await?;
     sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+    // pg_restore's SQL clears search_path. Return this pooled connection to
+    // the fixture's schema before reusing it: qualifying an outer DELETE is
+    // insufficient when its trigger body resolves unqualified ledger tables.
+    sqlx::query("SELECT pg_catalog.set_config('search_path',$1,false)")
+        .bind(&target.schema)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(())
 }

@@ -7,7 +7,7 @@ observations, with the pool-acquisition histogram, collector measurements,
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **39 coordinator
+The generated table below is the sole inventory for both roles: **42 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -47,9 +47,9 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
 | `qbit_prism_authorized_with_current_work` | gauge | none | run | Authorized connections holding the current semantic work generation. | `qbit_prism_stratum_clients_with_current_tip_jobs` |
-| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. | `qbit_prism_block_candidate_oldest_pending_seconds` |
-| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. | `qbit_prism_block_candidates_pending` |
-| `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Declared, rule deferred to A/#266; no production observations yet. | `qbit_prism_block_submit_seconds` |
+| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidate_oldest_pending_seconds` |
+| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidates_pending` |
+| `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule. | `qbit_prism_block_submit_seconds` |
 | `qbit_prism_blocks_total` | counter | none | run | Blocks confirmed by this instance since process start. Native confirmed-block process counter; not the legacy node-acceptance accounting boundary. | `qbit_prism_blocks_accepted_total` |
 | `qbit_prism_collector_age_seconds` | gauge | `collector=database,process` | run | Monotonic age of the last successful collector observation, or -1 before success. | none |
 | `qbit_prism_collector_available` | gauge | `collector=database,process` | run | Whether a collector has a complete successful observation. | none |
@@ -91,7 +91,10 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_runtime_task_stalled` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Whether an active poll or operation exceeds its progress budget. | none |
 | `qbit_prism_runtime_workers` | gauge | none | run | Configured Tokio runtime worker threads. | none |
 | `qbit_prism_share_ack_seconds` | histogram | `result=accepted,rejected` | run | Complete mining.submit frame arrival to completed response write, by outcome. | `qbit_prism_share_ack_seconds` |
+| `qbit_prism_stale_job_rejections_total` | counter | `cause=resume_expired,fee_floor,parent_grace,payout_revision` | run | Stale-job share rejections by the internal decision that refused them. Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id="stale-job"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero. | none |
 | `qbit_prism_stale_shares_total` | counter | none | run | Shares rejected as stale or unknown jobs. | `qbit_prism_stale_shares_total` |
+| `qbit_prism_stratum_connection_limit` | gauge | none | run | Configured global Stratum connection limit, not currently available permits; -1 before a listener starts. Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`. | none |
+| `qbit_prism_stratum_connection_refusals_total` | counter | `reason=global_limit,username_limit` | run | Stratum connections refused by an existing admission limit, by closed reason. `global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. Same-username reauthorization and reuse of a retained username permit never count. Authorization refusals are not share rejections. Process-local; both series start at zero. | none |
 | `qbit_prism_stratum_current_tip_coverage_gap_seconds` | gauge | none | run | Continuous age of native current-generation coverage below 95 percent, or -1 before observation. | `qbit_prism_stratum_current_tip_coverage_gap_seconds` |
 | `qbit_prism_stratum_oldest_pending_initial_job_seconds` | gauge | none | run | Oldest first usable work wait, or -1 before observation. | `qbit_prism_stratum_oldest_pending_initial_job_seconds` |
 | `qbit_prism_stratum_pending_initial_jobs` | gauge | none | run | Authorized clients awaiting first usable work, or -1 before observation. | `qbit_prism_stratum_pending_initial_jobs` |
@@ -186,6 +189,36 @@ are known; the fixture deliberately identifies unmapped legacy fields: `ready_mi
 No new configuration setting is introduced. Worker slots, per-worker series,
 node gauges, rollup-lag series, cardinality/privacy qualification, payout build
 and landing-phase instrumentation are outside this trimmed change.
+
+## Diagnosing Stratum admission saturation
+
+These signals observe the existing limits; they do not add limits or change
+readiness.
+
+- `qbit_prism_stratum_connection_limit` is the configured
+  `PRISM_STRATUM_MAX_CONNECTIONS`, shared by the primary and high-difficulty
+  listeners, or -1 until a listener starts. It is capacity, not free permits:
+  compare it with `qbit_prism_connections` to see the remaining room.
+- `qbit_prism_stratum_connection_refusals_total{reason="global_limit"}`
+  increases when a new TCP connection is closed at the limit. The miner sees an
+  accepted connection closed without any JSON-RPC response. A rising count with
+  `qbit_prism_connections` at the limit is admission saturation.
+- `reason="username_limit"` increases when `mining.authorize` returns
+  `[20,"too many connections for username",null]` under
+  `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. The connection stays open and
+  keeps any earlier authorization. Work still retained for that username keeps
+  its slot until it expires, so a quick reconnect can be refused briefly.
+  Same-username reauthorization is never counted.
+- Reconnects with no refusal increase, and connections below the limit, point
+  to the transport path or the miner rather than server admission.
+- Readiness (`qbit_prism_health_state`, `mining.get_health`) says whether this
+  instance can serve work to miners already connected. It does not reserve
+  spare connection capacity: a ready instance at its limit still refuses new
+  sockets.
+
+Both counters are process-local, start at zero for every reason so `increase()`
+sees the first refusal, and appear in the cached body with the other Stratum
+series at its next publication. Neither count is a share rejection.
 
 ## Follow-up ownership
 

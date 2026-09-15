@@ -67,17 +67,19 @@
       "replaces": [
         "qbit_prism_block_submit_seconds"
       ],
-      "status": "Declared, rule deferred to A/#266; no production observations yet."
+      "status": "Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule."
     },
     "block_candidates_pending": {
       "replaces": [
         "qbit_prism_block_candidates_pending"
-      ]
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
     },
     "block_candidate_oldest_pending_seconds": {
       "replaces": [
         "qbit_prism_block_candidate_oldest_pending_seconds"
-      ]
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
     },
     "process_resident_memory_bytes": {
       "replaces": [
@@ -175,6 +177,21 @@
         "qbit_prism_blocks_accepted_total"
       ],
       "status": "Native confirmed-block process counter; not the legacy node-acceptance accounting boundary."
+    },
+    "stratum_connection_refusals_total": {
+      "labels": {
+        "reason": "ConnectionRefusalReason"
+      },
+      "status": "`global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. Same-username reauthorization and reuse of a retained username permit never count. Authorization refusals are not share rejections. Process-local; both series start at zero."
+    },
+    "stratum_connection_limit": {
+      "status": "Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`."
+    },
+    "stale_job_rejections_total": {
+      "labels": {
+        "cause": "StaleJobCause"
+      },
+      "status": "Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id=\"stale-job\"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero."
     }
   },
   "public": {

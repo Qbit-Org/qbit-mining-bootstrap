@@ -365,7 +365,11 @@ drain, for instance) is parked, not retried: the lane records why in
 no lease expiry offers it again. Find parked rows with
 `SELECT block_hash, storage_version, last_error FROM qbit_block_candidate_outbox
 WHERE state = 'pending' AND next_attempt_at = 'infinity'` and drain them with
-the `2.x.x` image as above; resetting `next_attempt_at` re-offers a row.
+the `2.x.x` image as above. That replay advice applies to the legacy pending
+rows being drained before migration. After 011, changing `next_attempt_at`
+only reschedules reconciliation for a reserved or offered row; it never
+grants another offer. Follow [the offer lifecycle recovery guidance](prism-ledger-ops.md)
+for those rows and retain their evidence.
 
 **A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
 development line with no supported production upgrade, but a database an
@@ -458,11 +462,15 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2, 3, 4, 5, 6,
-8, 9 and 10, each checked on its own rather than as a high-water mark: 007 is
-reserved by another workstream, so 008 or 009 being present never stands in
-for a missing 006. A database missing any of them is refused at connect, naming
-the gap, before any accounting statement runs, and so is one declaring a
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 11,
+each checked on its own rather than as a high-water mark: a later migration
+being present never stands in for an earlier missing migration. Stop all
+older frontends before applying 011; it refuses live pre-upgrade claims and
+quarantines previously attempted candidates for reconciliation without
+another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
+for the quiesce and recovery steps. A database missing any of them is refused
+at connect, naming the gap, before any accounting statement runs, and so is
+one declaring a
 capability or a runtime `candidate_storage_version` other than 1. A native
 version-2 declaration is refused before the server can claim and park a
 newer writer's candidate; a #258 migration records its source version of 2
@@ -921,7 +929,7 @@ repair or a compatible native image preserving all durable history.
    ```
 
    Keep the filesystem backup from the same drained boundary. Require
-   `pending_candidates` zero and both integrity mismatch counts zero. The
+   `unfinished_candidates` zero and both integrity mismatch counts zero. The
    summary records ordered share counts/digests, accepted count and high-water
    sequence, block/publication order, audit SHA identities, payout/carry and CTV
    state. `audit_head_sha256` is the exact `2.x.x` active carry hash chain. The

@@ -1,50 +1,12 @@
+use super::test_support::{counts, family as pool_family, sample, with_database};
 use super::*;
 use crate::metrics::Metrics;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 
-fn sample(metrics: &Metrics, outcome: &str, suffix: &str) -> f64 {
-    let key = format!("qbit_prism_database_pool_acquire_seconds_{suffix}{{result=\"{outcome}\"}} ");
-    let body = metrics.render();
-    let values: Vec<_> = body
-        .lines()
-        .filter_map(|line| line.strip_prefix(&key))
-        .collect();
-    assert_eq!(values.len(), 1, "expected one rendered series for {key}");
-    values[0].parse().unwrap()
-}
-
-fn counts(metrics: &Metrics) -> (f64, f64) {
-    (
-        sample(metrics, "success", "count"),
-        sample(metrics, "failure", "count"),
-    )
-}
-
 #[tokio::test]
 async fn postgres_checkout_boundaries_and_callers() -> anyhow::Result<()> {
-    use qbit_prism_test_gate as gate;
-    let Some(raw) = gate::database_url(gate::site!())? else {
-        return Ok(());
-    };
-    let admin = PgPool::connect(&raw).await?;
-    let schema = format!("prism_acquire_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-    let mut url = url::Url::parse(&raw)?;
-    url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    let mut pools = Vec::new();
-    let result = postgres_cases(url.as_str(), &mut pools).await;
-    for pool in pools {
-        pool.close().await;
-    }
-    let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin)
-        .await;
-    admin.close().await;
-    result.and(cleanup.map(|_| ()).map_err(Into::into))
+    with_database(|url, pools| Box::pin(postgres_cases(url, pools))).await
 }
 
 async fn postgres_cases(url: &str, pools: &mut Vec<PgPool>) -> anyhow::Result<()> {
@@ -224,13 +186,4 @@ async fn postgres_begin_boundaries(ledger: &Ledger, metrics: &Metrics) -> anyhow
     assert_eq!(counts(metrics), (before.0 + 1., before.1));
     transaction.rollback().await?;
     Ok(())
-}
-
-fn pool_family(metrics: &Metrics) -> String {
-    metrics
-        .render()
-        .lines()
-        .filter(|line| line.contains("qbit_prism_database_pool_acquire_seconds"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }

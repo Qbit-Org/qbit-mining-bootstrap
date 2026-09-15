@@ -105,6 +105,11 @@ impl<'de> Deserialize<'de> for HeartbeatStatus {
 impl Ledger {
     pub async fn heartbeat(&self, status: HeartbeatStatus) -> Result<()> {
         let mut status = serde_json::to_value(status)?;
+        if status["state"] == "starting" {
+            // Migration 012 checks this at the write, after any migration
+            // lock wait. Pre-011 binaries cannot register past the cutover.
+            status["candidate_offer_lifecycle"] = serde_json::json!(1);
+        }
         // The stopped marker is proof about this process incarnation only.
         // Closing admission and checking pending/active guards happen under
         // one local mutex, before awaiting SQL; no new session can race it.
@@ -535,6 +540,9 @@ mod live_instance_tests {
             assert_eq!(stored["session_owner_token"], ledger.session_owner.token);
             let mut expected = serde_json::to_value(&status)?;
             expected["session_owner_token"] = json!(ledger.session_owner.token);
+            if matches!(status, HeartbeatStatus::Starting) {
+                expected["candidate_offer_lifecycle"] = json!(1);
+            }
             assert_eq!(stored, expected);
             let (at, rows) = sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
                 .fetch_one(&pool)
