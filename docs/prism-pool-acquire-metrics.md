@@ -28,17 +28,37 @@ acquisitions, the shared ledger helper covers these direct statements:
 - `payout_revision` and `release_session_owner_reservations`;
 - `worker_difficulty` and `share_accepted_at_ms`;
 - `cpfp_package` and `retired_cpfp_funding`;
-- `heartbeat` and the attached ledger's `fatal_state` read.
+- `heartbeat` and the attached ledger's `fatal_state` read;
+- `audit_bundle`'s initial representation read;
+- the existing-audit probe before candidate landing and each page of its
+  durable-range proof, released before the page's blocking comparison;
+- `pool_blocks_for_reconcile`;
+- `migration_source`, the one-row pages of `import_legacy_audits` (including
+  the final empty read), and `backfill_ctv`'s initial audit list.
+
+The migration-source lookup keeps schema resolution and the provenance read
+on one checkout. Acquiring through an existing connection or transaction is
+not another pool checkout. Import reads release before filesystem and audit
+verification work, then acquire separately for each write transaction.
 
 Recording requires an attached metrics handle. Operator-only connections and
 ledgers created without telemetry continue to work without observations.
 
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
-Other direct job, coordinator, audit, startup and session-reservation cleanup
-queries still acquire without this helper. The separate rollup transaction
-also remains untimed. Public API read pools and the public role's export
+Other direct job, coordinator, candidate, startup and session-reservation
+cleanup queries still acquire without this helper. Audit reconstruction
+(`audit_canonical_bytes`, the snapshot lookup in `materialize_audit_row`, and
+its range read) remains untimed, including when `audit_bundle` invokes it.
+The separate rollup transaction also remains untimed. Public API read pools and the public role's export
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
+
+Remaining coordinator/job sites are `job`, `prune_expired_jobs`,
+`compact_prepared`, coordinator startup checks, candidate lease/terminal
+reconciliation, miner-submit issued-job checks, and `WorkLedger::now_ms`.
+At this revision `ledger/window.rs` takes transactions through `Ledger::begin`
+and passes existing connections to its range/probe readers; those readers
+must not be counted as fresh checkouts.
 
 ## Adding a caller
 

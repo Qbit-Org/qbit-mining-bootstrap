@@ -2874,9 +2874,15 @@ async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSou
 where
     E: sqlx::Acquire<'e, Database = Postgres>,
 {
+    let mut connection = executor.acquire().await?;
+    read_migration_source_connection(&mut connection).await
+}
+
+async fn read_migration_source_connection(
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<MigrationSource>> {
     // Keep resolution and the read on one connection, and qualify the read
     // with the verified schema so provenance cannot come from another ledger.
-    let mut connection = executor.acquire().await?;
     let relation = sqlx::query("SELECT n.nspname::text AS schema,current_schema()::text AS current,c.relkind::text AS kind,format('%I.%I',n.nspname,c.relname) AS qualified FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass('qbit_prism_migration_source')")
         .fetch_optional(&mut *connection).await?
         .context("qbit_prism_migration_source is missing from the current schema")?;
@@ -2947,7 +2953,8 @@ impl Ledger {
     /// What the database came from, as recorded by the migration that
     /// accepted it; `None` before migration 006 has run.
     pub async fn migration_source(&self) -> Result<Option<MigrationSource>> {
-        read_migration_source(&self.pool).await
+        let mut connection = self.acquire().await?;
+        read_migration_source_connection(&mut connection).await
     }
 
     pub async fn import_legacy_audits(
@@ -2961,7 +2968,7 @@ impl Ledger {
             // Decode only one historical window at a time, even when importing
             // years of inline JSON and canonical sidecars.
             let row = sqlx::query("SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT 1")
-                .bind(&cursor).fetch_optional(&self.pool).await?;
+                .bind(&cursor).fetch_optional(&mut *self.acquire().await?).await?;
             let Some(row) = row else { break };
             let hash: String = row.try_get("block_hash")?;
             cursor = hash.clone();
@@ -3069,7 +3076,7 @@ impl Ledger {
     /// Recover missing sets or individual fanouts from trusted audit evidence.
     /// Return the number of blocks repaired; matching existing rows are no-ops.
     pub async fn backfill_ctv(&self, ledger_key: &str) -> Result<usize> {
-        let rows = sqlx::query("SELECT block_hash,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles ORDER BY created_at,block_hash").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT block_hash,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles ORDER BY created_at,block_hash").fetch_all(&mut *self.acquire().await?).await?;
         let mut repaired = 0;
         for row in rows {
             let hash: String = row.try_get("block_hash")?;
