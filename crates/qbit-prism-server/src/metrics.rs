@@ -69,6 +69,7 @@ impl Metrics {
             Family::Candidates,
             Family::CandidateAge,
             Family::Rss,
+            Family::ConnectionLimit,
         ] {
             registry.register(family, vec![], -1.);
         }
@@ -80,6 +81,21 @@ impl Metrics {
         }
         for result in Outcome::ALL {
             registry.register(Family::PoolAcquire, label("result", result.as_str()), 0.);
+        }
+        // Zero samples make the first refusal visible to `increase()`.
+        for reason in ConnectionRefusalReason::ALL {
+            registry.register(
+                Family::ConnectionRefusals,
+                label("reason", reason.as_str()),
+                0.,
+            );
+        }
+        for cause in StaleJobCause::ALL {
+            registry.register(
+                Family::StaleJobRejections,
+                label("cause", cause.as_str()),
+                0.,
+            );
         }
         // Owner-dependent hooks are declared without inventing observations.
         for family in [Family::FirstOffer, Family::LockWait] {

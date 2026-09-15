@@ -1,7 +1,9 @@
 //! Scoped allocation counts cover only event hooks, excluding construction,
 //! rendering, and test/thread setup. Run with `cargo test --release --locked
 //! -p qbit-prism-server --test metrics_allocation` as well as the debug suite.
-use qbit_prism_server::metrics::{AckResult, LockKind, Metrics, Outcome, RejectReason};
+use qbit_prism_server::metrics::{
+    AckResult, ConnectionRefusalReason, LockKind, Metrics, Outcome, RejectReason, StaleJobCause,
+};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -77,6 +79,13 @@ fn increment_all(metrics: &Metrics) {
         metrics.record_rejection(*reason);
     }
     metrics.record_grace_credit();
+    for reason in ConnectionRefusalReason::ALL {
+        metrics.record_connection_refusal(*reason);
+    }
+    for cause in StaleJobCause::ALL {
+        metrics.record_stale_job_rejection(*cause);
+    }
+    metrics.set_stratum_connection_limit(384);
 }
 
 #[test]
@@ -163,6 +172,21 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
             2048.
         );
     }
+    for reason in ConnectionRefusalReason::ALL {
+        let key = format!(
+            "qbit_prism_stratum_connection_refusals_total{{reason=\"{}\"}}",
+            reason.as_str()
+        );
+        assert_eq!(sample(&body, &key), 2048.);
+    }
+    for cause in StaleJobCause::ALL {
+        let key = format!(
+            "qbit_prism_stale_job_rejections_total{{cause=\"{}\"}}",
+            cause.as_str()
+        );
+        assert_eq!(sample(&body, &key), 2048.);
+    }
+    assert_eq!(sample(&body, "qbit_prism_stratum_connection_limit"), 384.);
     for (name, count) in [
         ("stale", 4096.),
         ("duplicate", 2048.),
