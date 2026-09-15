@@ -22,9 +22,12 @@ metadata, including families declared without samples. The public role retains
 its existing untyped exposition; the inventory records the counter/gauge intent
 from its producer. Public response/cache label sets are lazy and appear after a
 request; replica gauges appear only with `PRISM_PUBLIC_REPLICA_MODE=require`.
-Histogram boundaries in
-seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, and +Inf.
-Histograms also export `_sum` and `_count`.
+Default histogram boundaries in seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+1, 2.5, 5, 10, 30, and +Inf. Only `qbit_prism_share_ack_seconds` adds 15 and 20.
+Histograms also export `_sum` and `_count`. See the
+[histogram consumer guide](prism-metrics-histogram-consumers.md) for the five
+added series per process, elapsed-time attribution, quantile changes and
+mixed-version queries.
 Bucket samples add `le`; the table lists producer labels. `job`, `instance` and
 `network` are deployment scrape labels, not native metric dimensions. See the
 [deployed-alert migration and draft diff](prism-alert-migration.md) for the
@@ -84,13 +87,13 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_public_responses_total` | counter | `status` (HTTP status code) | public-api | HTTP responses by status, including health probes; appears after the first response. | `qbit_prism_public_responses_total` |
 | `qbit_prism_public_staleness_refusals_total` | counter | none | public-api | Responses refused for exceeding an endpoint cache-age budget. | `qbit_prism_public_staleness_refusals_total` |
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
-| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown` | run | Share rejections by canonical bounded reason ID. | `qbit_prism_rejections_total` |
+| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised` | run | Share rejections by canonical bounded reason ID. Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. | `qbit_prism_rejections_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
 | `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
 | `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Oldest active operation time since progress; zero when idle. | none |
 | `qbit_prism_runtime_task_stalled` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Whether an active poll or operation exceeds its progress budget. | none |
 | `qbit_prism_runtime_workers` | gauge | none | run | Configured Tokio runtime worker threads. | none |
-| `qbit_prism_share_ack_seconds` | histogram | `result=accepted,rejected` | run | Complete mining.submit frame arrival to completed response write, by outcome. | `qbit_prism_share_ack_seconds` |
+| `qbit_prism_share_ack_seconds` | histogram | `result=accepted,rejected` | run | Complete mining.submit frame arrival to completed response write, by outcome. Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines. | `qbit_prism_share_ack_seconds` |
 | `qbit_prism_stale_job_rejections_total` | counter | `cause=resume_expired,fee_floor,parent_grace,payout_revision` | run | Stale-job share rejections by the internal decision that refused them. Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id="stale-job"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero. | none |
 | `qbit_prism_stale_shares_total` | counter | none | run | Shares rejected as stale or unknown jobs. | `qbit_prism_stale_shares_total` |
 | `qbit_prism_stratum_connection_limit` | gauge | none | run | Configured global Stratum connection limit, not currently available permits; -1 before a listener starts. Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`. | none |
@@ -103,8 +106,26 @@ rendering the startup registry does not create a publication timestamp.
 <!-- generated-inventory:end -->
 
 Reject and task labels come from the closed enums rendered in the table above.
-Unknown internal rejection reason IDs map to `internal-error`; protocol responses
-are unchanged.
+Present but unrecognised rejection reason IDs, including an empty string, map
+to `unrecognised`; arbitrary input cannot create more than the 14 closed reason
+series. Explicit `internal-error` and missing (`None`) reason IDs retain the
+`internal-error` label. Every reason counter is initialized to zero, so the first
+event is observable by `increase()`. The fallback counts an actual rejection;
+it is a label-drift signal, never an accepted share or proof of health.
+
+Normalization happens only in the submit observation path. The current
+reason-less username-limit refusal belongs to `mining.authorize`, so it is
+counted by connection-refusal telemetry and never by share-rejection or ACK
+metrics. Missing reasons supplied by a submit backend retain their prior
+classification. Protocol error codes, messages and reason metadata are unchanged.
+
+Reason-filtered consumers of `internal-error` now exclude present unknown IDs;
+use `unrecognised` to identify reasons the enum does not recognize. Summing all
+reasons still counts the same rejections, and the checked-in per-reason rejection
+ratio includes the new label automatically. Its grouping can now split a former
+`internal-error` total, so the per-reason alert decision can change. The explicit
+ledger-confirmation reason filter retains its two existing reasons. No alert
+rules are added by this follow-up.
 
 Session futures and server-owned background futures are monitored. Only the
 health publisher currently registers an explicit operation-progress budget,
