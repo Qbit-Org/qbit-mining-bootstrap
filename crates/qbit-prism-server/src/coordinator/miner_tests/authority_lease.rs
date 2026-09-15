@@ -256,9 +256,19 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
         "unchanged",
         "lease-renewal",
         "epoch",
-        "same-arc-publication",
+        "cached-refresh",
+        "superseding-publication",
     ] {
-        let f = Fixture::new(Duration::from_secs(10)).await;
+        let f = Fixture::build(
+            Duration::from_secs(10),
+            |config| {
+                if changed == "superseding-publication" {
+                    config.snapshot_interval = Duration::ZERO;
+                }
+            },
+            None,
+        )
+        .await;
         f.coordinator.refresh_once().await.unwrap();
         let first_departure = if changed == "lease-renewal" {
             f.detect(2).await;
@@ -294,18 +304,21 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
                 f.detect(1).await;
                 f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
             }
-            "same-arc-publication" => {
-                tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            "cached-refresh" | "superseding-publication" => {
+                for _ in 0..2 {
+                    tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
             }
             _ => {}
         }
-        assert!(Arc::ptr_eq(
-            f.coordinator.prepared.read().await.as_ref().unwrap(),
-            &original
-        ));
+        let current = f.coordinator.prepared.read().await.clone().unwrap();
+        assert_eq!(
+            Arc::ptr_eq(&current, &original),
+            changed != "superseding-publication"
+        );
         assert_eq!(f.store.revision.load(Ordering::SeqCst), revision);
         assert_eq!(
             f.coordinator.readiness.read().await.generation != epoch,
@@ -313,15 +326,16 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
         );
         assert_eq!(
             f.coordinator.observed_tip.read().await.publication_stamp() != publication,
-            changed == "same-arc-publication"
+            changed == "superseding-publication"
         );
         let result = tokio::time::timeout(Duration::from_secs(5), persist(&f, &job))
             .await
             .unwrap();
-        assert_eq!(result.is_ok(), changed == "unchanged", "{changed}");
+        let allowed = matches!(changed, "unchanged" | "cached-refresh");
+        assert_eq!(result.is_ok(), allowed, "{changed}");
         assert_eq!(
             f.store.jobs.lock().unwrap().contains_key(&job.wire.job_id),
-            changed == "unchanged",
+            allowed,
             "{changed}: stale issuance must be refused before its first save"
         );
 
@@ -329,7 +343,7 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
             .await
             .unwrap();
         assert_ne!(fresh.wire.job_id, job.wire.job_id);
-        assert!(Arc::ptr_eq(&fresh.context.prepared, &original));
+        assert!(Arc::ptr_eq(&fresh.context.prepared, &current));
         tokio::time::timeout(Duration::from_secs(5), persist(&f, &fresh))
             .await
             .unwrap()
@@ -337,6 +351,86 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
         let rows = f.store.jobs.lock().unwrap();
         assert_eq!(rows[&fresh.wire.job_id].revision, revision);
         assert_eq!(rows[&fresh.wire.job_id].expires_at_ms, 130_000);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_issuance_waits_distinguish_cached_refresh_from_superseding_publication() {
+    for operation in ["issue", "persist", "resume"] {
+        for superseding in [false, true] {
+            let f = Fixture::build(
+                Duration::from_secs(10),
+                |config| {
+                    if superseding {
+                        config.snapshot_interval = Duration::ZERO;
+                    }
+                },
+                None,
+            )
+            .await;
+            f.coordinator.refresh_once().await.unwrap();
+            let job = issued(&f).await;
+            if operation == "resume" {
+                persist(&f, &job).await.unwrap();
+            }
+            let original = job.context.prepared.clone();
+            let stamp = f.coordinator.observed_tip.read().await.publication_stamp();
+            let gate = Arc::new(Gate::default());
+            *f.store.revision_gate.lock().unwrap() = Some(gate.clone());
+            let c = f.coordinator.clone();
+            let pending = tokio::spawn(async move {
+                match operation {
+                    "issue" => c
+                        .build_job(&job.context.worker, "00000001", 1e-12, 0.0)
+                        .await
+                        .is_ok(),
+                    "persist" => c
+                        .persist_issued_job(
+                            &job.context.worker,
+                            &job,
+                            0x1fffe000,
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        .is_ok(),
+                    "resume" => c
+                        .resume_job(&job.context.worker, &job.wire.job_id)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    _ => unreachable!(),
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                Arc::ptr_eq(
+                    f.coordinator.prepared.read().await.as_ref().unwrap(),
+                    &original
+                ),
+                !superseding
+            );
+            gate.release.notify_one();
+            let admitted = tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                admitted, !superseding,
+                "{operation}, superseding={superseding}"
+            );
+            assert_eq!(
+                f.coordinator.observed_tip.read().await.publication_stamp() == stamp,
+                !superseding
+            );
+        }
     }
 }
 

@@ -468,35 +468,60 @@ async fn cold_publication_guard_rechecks_expiry_at_installation() {
 }
 
 #[tokio::test]
-async fn cached_same_arc_republication_invalidates_original_build_proof() {
-    let f = Fixture::new(Duration::from_secs(10)).await;
-    f.coordinator.refresh_once().await.unwrap();
-    let original = f.coordinator.prepared.read().await.clone().unwrap();
-    let published_tip = f.coordinator.observed_tip.read().await.publication_stamp();
-    let proof = f.coordinator.begin_compact_build().await;
-    let captured = build_original(&f, proof, false, None).await;
-    f.coordinator.refresh_once().await.unwrap();
-    let republished = f.coordinator.prepared.read().await.clone().unwrap();
-    assert!(
-        Arc::ptr_eq(&original, &republished),
-        "exercise cached reuse"
-    );
-    assert_ne!(
-        published_tip,
-        f.coordinator.observed_tip.read().await.publication_stamp()
-    );
-    let error = f
-        .coordinator
-        .reserve_fresh_compact(&captured)
-        .await
-        .err()
-        .expect("cached publication must invalidate the earlier proof");
-    assert!(error.to_string().contains("publication changed"));
-    assert!(f.store.compact.save_calls.lock().unwrap().is_empty());
-    assert!(Arc::ptr_eq(
-        f.coordinator.prepared.read().await.as_ref().unwrap(),
-        &republished
-    ));
+async fn compact_build_proof_distinguishes_cached_refresh_from_superseding_publication() {
+    for superseding in [false, true] {
+        let f = Fixture::build(
+            Duration::from_secs(10),
+            |config| {
+                if superseding {
+                    config.snapshot_interval = Duration::ZERO;
+                }
+            },
+            None,
+        )
+        .await;
+        f.coordinator.refresh_once().await.unwrap();
+        let original = f.coordinator.prepared.read().await.clone().unwrap();
+        let stamp = f.coordinator.observed_tip.read().await.publication_stamp();
+        let proof = f.coordinator.begin_compact_build().await;
+        let captured = build_original(&f, proof, false, None).await;
+        for _ in 0..2 {
+            f.coordinator.refresh_once().await.unwrap();
+        }
+        let current = f.coordinator.prepared.read().await.clone().unwrap();
+        assert_eq!(Arc::ptr_eq(&original, &current), !superseding);
+        f.store.compact.saves.lock().unwrap().push_back(Ok(true));
+        let reserved = f.coordinator.reserve_fresh_compact(&captured).await;
+        assert_eq!(reserved.is_ok(), !superseding, "superseding={superseding}");
+        assert_eq!(
+            stamp == f.coordinator.observed_tip.read().await.publication_stamp(),
+            !superseding
+        );
+        if superseding {
+            let error = reserved
+                .err()
+                .expect("real publication must invalidate the original proof");
+            assert!(error.to_string().contains("publication changed"));
+            assert!(f.store.compact.save_calls.lock().unwrap().is_empty());
+            assert!(Arc::ptr_eq(
+                f.coordinator.prepared.read().await.as_ref().unwrap(),
+                &current
+            ));
+        } else {
+            let guard = f
+                .coordinator
+                .lock_compact_publication(reserved.unwrap())
+                .await
+                .unwrap();
+            guard
+                .publish()
+                .expect("unchanged refresh must preserve the original proof");
+            assert!(!Arc::ptr_eq(
+                f.coordinator.prepared.read().await.as_ref().unwrap(),
+                &current
+            ));
+        }
+    }
 }
 
 #[tokio::test]

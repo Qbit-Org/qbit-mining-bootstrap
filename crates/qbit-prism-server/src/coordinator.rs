@@ -843,7 +843,10 @@ impl Coordinator {
                     readiness.generation == readiness_generation,
                     "node readiness changed during work reuse"
                 );
-                self.observed_tip.write().await.publish(parent)?;
+                self.observed_tip
+                    .write()
+                    .await
+                    .refresh_publication(parent)?;
                 readiness.last_poll = Some(Instant::now());
                 return Ok(());
             }

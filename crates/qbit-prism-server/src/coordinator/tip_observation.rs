@@ -180,13 +180,16 @@ pub struct TipState {
     published: Option<TipView>,
     divergence_started: Option<MonotonicInstant>,
     requested: u64,
+    // Observation ordering changes on every poll; this generation changes
+    // only when a prepared publication is installed or replaced.
+    publication_generation: u64,
 }
 
 impl TipState {
     pub(super) fn publication_stamp(&self) -> Option<(String, u64)> {
         self.published
             .as_ref()
-            .map(|tip| (tip.hash.clone(), tip.sequence))
+            .map(|tip| (tip.hash.clone(), self.publication_generation))
     }
 
     /// Freeze the selected lease interval before waiting on its economic
@@ -274,6 +277,26 @@ impl TipState {
     /// Called while holding the prepared-publication lock, only after work
     /// construction, persistence and the final chain/revision checks succeed.
     pub(super) fn publish(&mut self, hash: &str) -> Result<()> {
+        let generation = self
+            .publication_generation
+            .checked_add(1)
+            .context("prepared publication generation exhausted")?;
+        self.update_published_tip(hash)?;
+        self.publication_generation = generation;
+        Ok(())
+    }
+
+    /// A cached refresh revalidates the same prepared work. Update its tip
+    /// freshness without revoking proofs captured before the poll.
+    pub(super) fn refresh_publication(&mut self, hash: &str) -> Result<()> {
+        ensure!(
+            self.published.as_ref().is_some_and(|tip| tip.hash == hash),
+            "cached work publication changed"
+        );
+        self.update_published_tip(hash)
+    }
+
+    fn update_published_tip(&mut self, hash: &str) -> Result<()> {
         let mut current = self
             .current
             .clone()
