@@ -283,15 +283,15 @@ impl Ledger {
     pub async fn configure(&self, fingerprint: &str, signer_keys: &SignerKeys) -> Result<()> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
-        let saved: Option<String> = sqlx::query_scalar(
-            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+        let (saved, revision): (Option<String>, i64) = sqlx::query_as(
+            "SELECT config_fingerprint,payout_revision FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
         )
         .fetch_one(&mut *tx)
         .await?;
         if let Some(saved) = saved {
             ensure!(
                 saved == fingerprint,
-                "cluster configuration fingerprint mismatch"
+                "cluster configuration fingerprint mismatch at payout revision {revision}; use the active policy (see qbit_prism_policy_transitions)"
             );
         } else {
             let foreign: Vec<String> = sqlx::query_scalar(&format!(

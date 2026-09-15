@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
     applied integer[];
     missing integer[];
     metadata text;
@@ -428,7 +428,9 @@ SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
        (to_regclass('qbit_prism_cluster') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
        (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events,
+       (to_regclass('qbit_prism_policy_transitions') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions
 \gset
 -- Native replay protection must survive recovery. Frozen 2.x exports the
 -- exact mapping migration 002 will backfill, including its duplicate rule.
@@ -519,6 +521,16 @@ SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
     'sequence', 'qbit_prism_fatal_state_events_event_id_seq',
     'last_value', last_value, 'is_called', is_called))
 FROM qbit_prism_fatal_state_events_event_id_seq WHERE is_called OR last_value <> 1;
+\endif
+\if :has_policy_transitions
+SELECT jsonb_build_object('kind', 'policy_transitions', 'row', to_jsonb(t))
+FROM qbit_prism_policy_transitions t ORDER BY transition_id;
+-- Preserve journal allocation, including gaps from rolled-back transitions.
+-- Omit only the untouched native default, as for fatal-state history above.
+SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
+    'sequence', 'qbit_prism_policy_transitions_transition_id_seq',
+    'last_value', last_value, 'is_called', is_called))
+FROM qbit_prism_policy_transitions_transition_id_seq WHERE is_called OR last_value <> 1;
 \endif
 
 -- Exact row shape/order used by 2.x _carry_forward_audit_head_locked.

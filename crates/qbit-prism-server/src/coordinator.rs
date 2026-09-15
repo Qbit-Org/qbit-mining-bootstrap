@@ -493,12 +493,12 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 }
 
 #[derive(Debug)]
-struct ValidatedFeePolicy {
+pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
 }
 
-async fn validated_ctv_fee_policy(
+pub(crate) async fn validated_ctv_fee_policy(
     rpc: &Rpc,
     configured: Option<FanoutFeeRatePolicy>,
     premium_bps: u64,
@@ -611,6 +611,9 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
+        // Keep the initial heartbeat non-quiescent if configuration fails.
+        // Another live incarnation may share this instance ID, so this
+        // rejected startup cannot safely publish `stopped` for the shared row.
         ledger
             .configure(
                 &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,
