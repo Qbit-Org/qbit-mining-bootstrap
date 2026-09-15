@@ -109,7 +109,10 @@ pub(super) async fn undo_012(pool: &PgPool) -> Result<()> {
         sql.push(';');
     }
     sqlx::raw_sql(&sql).execute(pool).await?;
-    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        schema_versions(pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     Ok(())
 }
 
@@ -383,7 +386,10 @@ async fn migration_012_resumes_an_interrupted_build_keeps_its_own_index_and_refu
             .await?;
         assert_eq!(after, foreign, "the operator's index was changed");
         assert_eq!(ledger_indexes(&pool).await?, before);
-        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            schema_versions(&pool).await?,
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
             .execute(&pool)
             .await?;
@@ -458,7 +464,10 @@ async fn migration_012_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     );
     assert!(error.contains("migrate again"), "{error}");
     assert_eq!(ledger_indexes(&pool).await?, before);
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        schema_versions(&pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     // The declared definition under the reserved name is an earlier build
     // of the migration's own: kept as it is, not rebuilt.
     sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}; {SEQ_WALK_DEFINITION}"))
@@ -639,7 +648,10 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
             );
         }
     }
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        schema_versions(&pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both builds
     // and finishes the drops.
@@ -715,7 +727,10 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
         moved.3, leftover.3,
         "the invalid index was not merely renamed"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        schema_versions(&pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
     ))
@@ -789,7 +804,10 @@ async fn migration_012_refuses_to_record_when_a_kept_index_moved_while_it_built(
         "{error}"
     );
     assert!(error.contains("migrate again"), "{error}");
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        schema_versions(&pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     let after_refusal = ledger_indexes(&pool).await?;
     let mut expected: Vec<&str> = KEPT.to_vec();
     expected.extend([MINER_HISTORY, "operator_kept"]);

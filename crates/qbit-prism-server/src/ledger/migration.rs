@@ -5074,7 +5074,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.starts_with("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 before any DDL: database is at schema migration 11 but"),
+            error.starts_with(&format!(
+                "refusing to migrate a native database at schema migrations {} before any DDL: database is at schema migration 11 but",
+                schema_version_list(REQUIRED_SCHEMA_VERSIONS)
+            )),
             "{error}"
         );
         // 11 without 6 was restored selectively: checked all the same, the
