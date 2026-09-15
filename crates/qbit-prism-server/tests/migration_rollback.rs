@@ -713,6 +713,83 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
                     "{schema} candidate retry state restore diverged from baseline"
                 );
             }
+            // Same-height audits sharing a commitment leaf are served by
+            // creation order: the by-commitment lookup and the latest-evidence
+            // read both break the height tie on created_at, so a restore that
+            // swaps two such rows' creation times serves a different public
+            // artifact while every row keeps its identity, bytes and metadata.
+            // Copy the newest block and its audit under a sibling hash at the
+            // same height, swap the two creation times in place, swap them
+            // back, then remove the sibling again.
+            let origin = "52".repeat(32);
+            let sibling = "53".repeat(32);
+            let latest = format!(
+                "SELECT a.block_hash FROM {0}.qbit_pool_audit_bundles a JOIN {0}.qbit_pool_blocks b USING(block_hash) \
+                 WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1",
+                db.schema
+            );
+            let served: String = sqlx::query_scalar(&latest).fetch_one(&db.pool).await?;
+            ensure!(served == origin, "{schema} latest evidence is not the newest audited block");
+            sqlx::query(&format!(
+                "INSERT INTO {0}.qbit_pool_blocks SELECT (r).* FROM (SELECT jsonb_populate_record(b, jsonb_build_object( \
+                 'block_hash',$1::text,'audit_publication_sequence',(SELECT max(audit_publication_sequence)+1 FROM {0}.qbit_pool_blocks))) r \
+                 FROM {0}.qbit_pool_blocks b WHERE block_hash=$2) s",
+                db.schema
+            ))
+            .bind(&sibling).bind(&origin).execute(&db.pool).await?;
+            sqlx::query(&format!(
+                "INSERT INTO {0}.qbit_pool_audit_bundles SELECT (r).* FROM (SELECT jsonb_populate_record(a, jsonb_build_object( \
+                 'block_hash',$1::text,'created_at',a.created_at+interval '1 hour')) r \
+                 FROM {0}.qbit_pool_audit_bundles a WHERE block_hash=$2) s",
+                db.schema
+            ))
+            .bind(&sibling).bind(&origin).execute(&db.pool).await?;
+            let tied: bool = sqlx::query_scalar(&format!(
+                "SELECT count(DISTINCT (b.block_height,a.audit_bundle_sha256))=1 AND count(DISTINCT a.created_at)=2 \
+                 FROM {0}.qbit_pool_audit_bundles a JOIN {0}.qbit_pool_blocks b USING(block_hash) WHERE a.block_hash IN ($1,$2)",
+                db.schema
+            ))
+            .bind(&origin).bind(&sibling).fetch_one(&db.pool).await?;
+            ensure!(tied, "sibling audits must share a height and a bundle but not a creation time");
+            let served: String = sqlx::query_scalar(&latest).fetch_one(&db.pool).await?;
+            ensure!(served == sibling, "{schema} latest evidence ignored the newer sibling audit");
+            let paired = recovery::evidence(db, pg_bin).await?;
+            let mut unchanged = paired.clone();
+            for kind in ["blocks", "audits"] {
+                ensure!(paired["records"][kind]["count"].as_u64()
+                    == baseline["records"][kind]["count"].as_u64().map(|n| n + 1));
+                unchanged["records"][kind] = baseline["records"][kind].clone();
+            }
+            ensure!(unchanged == baseline, "unrelated evidence changed with a sibling audit");
+            let swap = format!(
+                "UPDATE {0}.qbit_pool_audit_bundles a SET created_at=p.created_at FROM {0}.qbit_pool_audit_bundles p \
+                 WHERE a.block_hash IN ($1,$2) AND p.block_hash IN ($1,$2) AND p.block_hash<>a.block_hash",
+                db.schema
+            );
+            sqlx::query(&swap).bind(&origin).bind(&sibling).execute(&db.pool).await?;
+            let served: String = sqlx::query_scalar(&latest).fetch_one(&db.pool).await?;
+            ensure!(served == origin, "{schema} swapped audit creation order left the served artifact unchanged");
+            let swapped = recovery::evidence(db, pg_bin).await?;
+            ensure!(swapped["records"]["audits"]["count"] == paired["records"]["audits"]["count"]);
+            ensure!(
+                swapped["records"]["audits"]["sha256"] != paired["records"]["audits"]["sha256"],
+                "{schema} swapped audit creation order was invisible to recovery evidence"
+            );
+            let mut unchanged = swapped;
+            unchanged["records"]["audits"] = paired["records"]["audits"].clone();
+            ensure!(unchanged == paired, "unrelated evidence changed with swapped audit creation order");
+            sqlx::query(&swap).bind(&origin).bind(&sibling).execute(&db.pool).await?;
+            ensure!(
+                recovery::evidence(db, pg_bin).await? == paired,
+                "{schema} restored audit creation order diverged from the paired baseline"
+            );
+            for table in ["qbit_pool_audit_bundles", "qbit_pool_blocks"] {
+                sqlx::query(&format!("DELETE FROM {}.{table} WHERE block_hash=$1", db.schema))
+                    .bind(&sibling)
+                    .execute(&db.pool)
+                    .await?;
+            }
+            ensure!(recovery::evidence(db, pg_bin).await? == baseline);
         }
         ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
