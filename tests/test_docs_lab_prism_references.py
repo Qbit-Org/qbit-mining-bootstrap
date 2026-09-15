@@ -616,6 +616,28 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 # -nv validates, while -pv gives p the prompt "v". Lowercase
                 # -k resets credentials but still permits a command to run.
                 return None
+            if program == "sudo" and (
+                re.fullmatch(r"-[ABbEHkNnPSis]+h", option)
+                or option == "-h" and (
+                    index + 1 == len(words)
+                    or unquote(words[index + 1]).startswith("-")
+                    or SHELL_ASSIGNMENT.match(unquote(words[index + 1]))
+                )
+            ):
+                # sudo's -h takes an optional argument. Attached, it is the
+                # host (`-hhost`, `-nhhost`; `-nhu nobody` reads the host `u`
+                # and the command `nobody`); as the whole word `-h` it takes
+                # the next word when that is neither an option nor an
+                # assignment; otherwise it is the help mode, whatever
+                # follows. sudo 1.9.15p5 went on to the command, as far as
+                # the sudoers plugin lets a remote host be named, for `sudo
+                # -h host id`, `sudo -hhost id`, `sudo -nhhost id`, `sudo -n
+                # -h host id` and `sudo -h host -u nobody id`, and printed
+                # its usage and ran nothing for `sudo -nh host id`, `sudo -Hh
+                # host id`, `sudo -ih host id`, `sudo -nh`, `sudo -h`, `sudo
+                # -h -u nobody id`, `sudo -h -- id` and `sudo -h FOO=x id`.
+                # Its own assignment test is the wider one noted below.
+                return None
             if program == "command" and option in {"-v", "-V"}:
                 return None  # executable lookup prints information; it runs nothing
             if option == "--":
@@ -3005,7 +3027,7 @@ class ScannerTests(unittest.TestCase):
         # bash 5.2.21 ran `exec -ca zzz echo hi` and `exec -cazzz echo hi`.
         for text in (
             "sudo -nu nobody {}", "sudo -nunobody {}", "sudo -nHu nobody {}", "sudo -Hnu nobody {}",
-            "sudo -bnu nobody {}", "sudo -ng wheel {}", "sudo -nh host {}", "sudo -np Prompt {}",
+            "sudo -bnu nobody {}", "sudo -ng wheel {}", "sudo -nhhost {}", "sudo -np Prompt {}",
             "sudo -nC 3 {}", "sudo -nD /tmp {}", "sudo -nR / {}", "sudo -nr admin {}",
             "sudo -nt unconfined_t {}", "sudo -nT 30 {}", "sudo -Enu nobody -g wheel {}",
             "sudo '-nu' nobody {}", "sudo -nu nobody -- {}", "sudo -nu nobody FOO=x {}",
@@ -3046,6 +3068,52 @@ class ScannerTests(unittest.TestCase):
                     self.assertEqual(self.commands(line), [])
                     self.assertEqual(len(self.references(line)), 1)
                     self.assertEqual(self.commands(line + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+
+    def test_sudo_host_flag_reads_a_host_only_attached_or_as_the_lone_option(self) -> None:
+        # sudo's -h takes an optional argument, so a cluster ending in `h`
+        # with nothing attached is the help mode, as is a lone `-h` followed
+        # by nothing, an option or an assignment: sudo 1.9.15p5 printed its
+        # usage and ran nothing for `sudo -nh host id`, `sudo -Hh host id`,
+        # `sudo -ih host id`, `sudo -nh`, `sudo -h -u nobody id`, `sudo -h --
+        # id` and `sudo -h FOO=x id`, while `sudo -h host id`, `sudo -hhost
+        # id`, `sudo -nhhost id` and `sudo -n -h host id` went on to the
+        # command, and `sudo -nhu nobody id` read the host `u` and the
+        # command `nobody`.
+        for options in (
+            "-nh host", "-Hh host", "-nHh host", "-kh host", "-bh host", "-Sh host", "-Eh host", "-ih host", "-sh host",
+            "'-nh' host", "-nh", "-h", "-h -u nobody", "-h -n", "-h --", "-h FOO=x", "-n -h -u nobody", "-nh FOO=x",
+            "-nh --",
+        ):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py", "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                with self.subTest(options=options, argument=argument):
+                    text = f"sudo {options} {argument}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(len(self.references(text)), 1)
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for text in (
+            "sudo -h host {}", "sudo -hhost {}", "sudo -nhhost {}", "sudo -n -h host {}", "sudo -nu nobody -h host {}",
+            "sudo -h host -u nobody {}", "sudo -h 'host' {}", "sudo '-h' host {}", "sudo -h host -- {}",
+            "sudo --host host {}", "sudo --host=host {}", "sudo -h =host {}",
+        ):
+            for command, missing in (
+                ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+                ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+            ):
+                with self.subTest(text=text.format(command)):
+                    self.assertEqual(self.located(text.format(command)), [(1, missing)])
+                    self.assertEqual(dead_commands(text.format(command), {"lab/example/deleted.py"}), [])
+        # Any letter attached to the `h` is the host, and `-ph` gives p the
+        # prompt "h": the word after it is the program.
+        for text in ("sudo -nhu nobody", "sudo -hn host", "sudo -hh host", "sudo -ph host"):
+            for argument in ("python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py"):
+                with self.subTest(text=text, argument=argument):
+                    line = f"{text} {argument}"
+                    self.assertEqual(self.commands(line), [])
+                    self.assertEqual(self.commands(line + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        text = "```sh\nsudo -nh \\\n  host \\\n  python3 lab/example/deleted.py\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(5, "lab/prism/storm.py")])
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
         for quote in ("'", '"'):
