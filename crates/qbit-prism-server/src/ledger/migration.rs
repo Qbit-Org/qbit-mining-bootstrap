@@ -12,7 +12,9 @@ mod online;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 
 /// The schema migrations every native start requires, each checked on its
-/// own. Add every new migration file here. `Ledger::connect` refuses a
+/// own. Add every new migration file here and to the `required_versions`
+/// of `scripts/prism-recovery-evidence.sql`, whose export refuses the
+/// databases startup refuses. `Ledger::connect` refuses a
 /// database missing any of them even without `initialize`, so a newer binary
 /// never reaches the claim path on a database it has not migrated, and a
 /// later number never hides an earlier gap: 007 landed after 008, 009 and 010. A migration this
@@ -5103,6 +5105,37 @@ mod tests {
             assert!(!sql.trim().is_empty(), "migration {version} is empty");
             assert_eq!(native_migration(*version), *sql);
         }
+    }
+
+    /// The recovery-evidence export mirrors this gate so that a database
+    /// startup refuses yields no evidence, but its PL/pgSQL constant shares
+    /// nothing with `REQUIRED_SCHEMA_VERSIONS`: read the declaration back
+    /// and compare, so a migration added to one and not the other fails here
+    /// rather than only in the PostgreSQL-gated recovery regression.
+    #[test]
+    fn recovery_evidence_requires_the_migrations_startup_requires() {
+        let script = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+        let declarations: Vec<&str> = script
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("required_versions constant integer[] := ARRAY[")
+                    .and_then(|rest| rest.strip_suffix("];"))
+            })
+            .collect();
+        let [declaration] = declarations[..] else {
+            panic!("expected one required_versions declaration, found {declarations:?}");
+        };
+        let versions: Vec<i32> = declaration
+            .split(',')
+            .map(|version| {
+                version
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|error| panic!("version {version:?}: {error}"))
+            })
+            .collect();
+        assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
     }
 
     #[test]

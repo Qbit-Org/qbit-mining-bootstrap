@@ -116,8 +116,9 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'native migration history must have the native logged-table, version primary-key and applied_at definitions, without extra columns, constraints, indexes, triggers, rules, inheritance or row security' USING HINT = hint;
     END IF;
-    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS. The
-    -- regression removes each version declared by the server in turn.
+    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS: a migration
+    -- unit test compares the two, and the recovery regression removes each
+    -- version declared by the server in turn.
     EXECUTE format('SELECT array_agg(version ORDER BY version) FROM %s', history) INTO applied;
     SELECT array_agg(version ORDER BY version) INTO missing
     FROM unnest(required_versions) AS required(version)
