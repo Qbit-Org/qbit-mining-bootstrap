@@ -147,6 +147,77 @@ therefore impossible across crashes and takeovers. The price is that a crash
 between the reservation commit and the call loses that delivery; the row
 reports it as unknown and reconciles rather than retrying.
 
+**Parked candidates.** A claim parks a row it must not use instead of
+retrying it. Two cases park: an unsupported `storage_version`, or a version-1
+row without its JSONB body (#285); and, since #387, a supported row whose
+persisted input fails the claim's validation. That covers a missing window
+reference or an inline pre-007 document, and JSON that is not a supported
+candidate. It covers a `candidate_sha256` or document block hash that
+disagrees with the row, and window columns that disagree with the document
+or cannot hold its range. It also covers missing, truncated or mis-hashed
+block bytes, an empty or non-hex coinbase suffix, stored inputs that
+contradict the window reference, and an offer outcome this binary does not
+know, persisted on a claimed unfinished row. (A claim selects only the four
+unfinished states, so a row in an unknown state is never claimed and never
+reaches this path.) The decode runs after the claim commits, and parking is
+one `UPDATE` in a follow-up transaction behind the writer fence. That update
+matches the row's database block hash, the claim's token and the state the
+claim selected, so a replacement owner's claim, or a row that has since moved
+to another state, is never parked. It clears `claim_token`,
+`claim_instance_id` and `claim_expires_at`, records the reason in
+`last_error` and sets `next_attempt_at` to `infinity`. The state, document,
+digest, block bytes, window columns and offer record stay unchanged, and
+`attempt_count` keeps the claim's increment. A validation reason reads
+`candidate <block_hash>: validation <kind>: <diagnosis>`, at most 1024 bytes,
+where `<kind>` is one of `lifecycle`, `window_reference`, `document`,
+`document_digest`, `document_identity`, `window_columns`, `block`,
+`coinbase_suffix` or `reference_invariants`. The claim still fails, so the
+submit loop logs `candidate polling failed`. The ledger logs the full
+diagnosis with one of three messages, and only the first means the row is
+parked:
+
+| Log message | Meaning |
+| --- | --- |
+| `parked a candidate that failed validation; operator action required` | The update matched exactly one row and its commit succeeded. |
+| `a candidate failed validation and was not parked` | Nothing was committed: the transaction could not begin, the writer fence refused, the claim was no longer this attempt's, or the transaction failed before its commit. A row still held by that claim is claimed again after its lease and parking is retried. |
+| `a candidate failed validation and whether it was parked is unknown; inspect the row` | The commit returned an error, so the outcome is unknown. |
+
+Nothing else parks a row. A claim or decode failure that is not one of these
+validation failures is not evidence about the stored candidate: a database or
+connection error while claiming, an executor or join failure, a column that
+cannot be read, or an error serializing the parsed document. Such a claim
+parks nothing and is left to expire and be retried. A failure of the parking
+transaction itself is reported as in the table above; in particular, a
+parking commit error can leave the row durably parked with an unknown
+outcome.
+
+Find parked rows and their reasons with:
+
+```sql
+SELECT block_hash, state, storage_version, attempt_count, last_error, updated_at
+FROM qbit_block_candidate_outbox
+WHERE state IN ('pending', 'offer_reserved', 'offered', 'reconciliation')
+  AND next_attempt_at = 'infinity'
+ORDER BY updated_at;
+```
+
+Nothing unparks a row automatically. No binary resets `next_attempt_at`,
+whether it is the one that parked the row or an earlier release. Reverting
+the binary therefore leaves every parked row parked, because a claim selects
+only due rows. Recovery is explicit operator work, and there is no recovery
+command for it yet (#268 tracks listing and abandonment). First preserve the
+row, from a backup or with `SELECT to_jsonb(o) FROM
+qbit_block_candidate_outbox o WHERE block_hash = '<hash>'`. Then establish
+why the stored evidence disagrees. Never edit the document, its digest, the
+block bytes or the window columns to make a row pass: they are what the
+claim authenticates. Once the cause is resolved, an operator may return the
+row to the claim lanes with `UPDATE qbit_block_candidate_outbox SET
+next_attempt_at = clock_timestamp() WHERE block_hash = '<hash>' AND
+next_attempt_at = 'infinity'`. A row that still fails validation is parked
+again with a fresh reason. Resetting the schedule of an `offer_reserved`,
+`offered` or `reconciliation` row never grants another offer (see
+**Recovery** above).
+
 **Timing.** `proof_observed_at_ms` is the enqueuing frontend's wall clock as
 the locally validated block proof entered the coordinator; `offered_at_ms` is
 the offering frontend's wall clock immediately before its `submitblock` call.
@@ -166,8 +237,16 @@ most once per block, not exactly once across crashes.
 through its whole attempt and offers it after landing, or before landing for
 a leased candidate; a post-011 frontend would reserve and offer such a row
 again. The two must never share an outbox. Stop every pre-011 frontend and
-let their claims expire (at most the 120 s lease) before migrating. 011
-refuses to run while any pending row holds a live claim, refuses an attempted
+let their claims expire (at most the 120 s lease) before migrating. Keep
+supervisors and automatic restarts disabled throughout the cutover. Every
+`qbit_prism_instances` row must explicitly report `stopped` or `drained`;
+011 names and refuses any other instance, even with an empty outbox or a
+stale heartbeat. Heartbeat age proves only that reporting stopped, not that
+an idle or paused frontend cannot resume. Resolve blockers through graceful
+shutdown; do not edit or delete instance evidence to bypass the check.
+The scan holds a table lock through migration commit to serialize heartbeat
+registration and updates. 011 also refuses any pending row with a live claim,
+refuses an attempted
 pending row that lacks its block bytes or window reference, quarantines every
 pending row a pre-011 frontend attempted as `reconciliation` with an unknown
 outcome (recovered without any offer, confirmed if the chain holds the block,
@@ -191,6 +270,20 @@ writes, and a kept CHECK that rejects the quarantine or a lifecycle write
 fails that write's transaction as any CHECK would. Signer rotation is
 refused while any unfinished row stores other keys, in every unfinished
 state.
+
+**Startup fence (012).** The instance-table lock alone cannot reject an old
+startup queued behind migration. Migration 012 adds a database CHECK that
+requires `candidate_offer_lifecycle: 1` in every `starting` heartbeat. This
+binary writes that marker; a pre-011 binary cannot finish registering even
+if it checked capabilities before the cutover. The constraint is checked
+after the lock wait, including an upsert that would reuse a stopped instance
+ID. Shutdown and historical health evidence are retained. Migration 012 and
+011 commit together on a pre-011 database. A database already at 011 must
+also stop all frontends gracefully before applying 012; it uses the same
+explicit shutdown check. Restart with this binary after cutover. The new
+`instance_offer_startup = 1` capability rejects earlier binaries at their
+ordinary startup gate, and this binary refuses a missing or changed
+012 declaration. Recovery exports require the same schema and declaration.
 
 PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
