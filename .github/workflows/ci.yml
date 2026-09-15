@@ -72,6 +72,9 @@ jobs:
       - name: Check PRISM setting inventories and retired-setting guidance
         run: python3 scripts/check_prism_settings.py
 
+      - name: Test the pinned-tool installer's outage and integrity guards
+        run: bash .github/scripts/test-install-pinned-tool.sh
+
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
 
