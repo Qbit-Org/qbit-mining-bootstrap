@@ -47,6 +47,8 @@ impl Ledger {
             statement_deadline(&mut tx, deadline).await?;
             self.lock(&mut tx, ORDER_LOCK).await?;
             statement_deadline(&mut tx, deadline).await?;
+            writable(&mut tx).await?;
+            statement_deadline(&mut tx, deadline).await?;
             let jobs = sqlx::query(EXPIRED_JOBS)
                 .execute(&mut *tx).await?.rows_affected();
 

@@ -267,6 +267,38 @@ async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor(
 }
 
 #[tokio::test]
+async fn halted_cluster_refuses_cleanup_without_mutation_or_cursor_progress() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            seed(db, true).await?;
+            expire(db).await?;
+            let before = snapshot(db).await?;
+            sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='injected halted cluster'")
+                .execute(&db.ledger.pool)
+                .await?;
+            let mut cursor = BlobPruneCursor::default();
+            let error = sweep(db, &mut cursor).await.unwrap_err();
+            ensure!(format!("{error:#}").contains("cluster halted: injected halted cluster"));
+            ensure!(cursor == BlobPruneCursor::default() && snapshot(db).await? == before);
+            // Test-only recovery lets the same cursor retry the unmodified page.
+            sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL")
+                .execute(&db.ledger.pool)
+                .await?;
+            ensure!(
+                sweep(db, &mut cursor).await?
+                    == JobPruneResult {
+                        jobs: 1,
+                        templates: 1,
+                        balances: 1
+                    }
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
 async fn stricter_database_timeout_survives_failure_and_success() -> Result<()> {
     run(|db| Box::pin(async move {
         seed(db, false).await?;
