@@ -2,6 +2,41 @@
 //! Only ledger and node I/O are replaced by the shared in-memory fixture.
 use super::*;
 
+type Edit<T> = fn(&mut T);
+
+#[test]
+fn issued_inputs_preserve_stored_identity_and_config_errors() {
+    let mut config = config::test_config();
+    let inputs = BundleInputs::capture(&config, None).unwrap();
+    let mut stored = StoredPrepared {
+        template: Value::Null,
+        snapshot: Arc::new(Snapshot {
+            anchor_ms: 0,
+            share_seq: 0,
+            payout_revision: 0,
+            shares: vec![],
+            prior_balances: vec![],
+        }),
+        bundle: None,
+        inputs: Some(inputs),
+        fee: None,
+        fingerprint: String::new(),
+        generation: 0,
+        parent_of_tip: String::new(),
+        coinbase_suffix: String::new(),
+    };
+    assert!(std::ptr::eq(
+        stored.issued_inputs(&config).unwrap().unwrap(),
+        stored.inputs.as_ref().unwrap(),
+    ));
+    stored.inputs.as_mut().unwrap().audit_builder_version += 1;
+    assert!(stored.issued_inputs(&config).unwrap().is_none());
+    config.manifest_seed = "invalid".into();
+    assert!(stored.issued_inputs(&config).is_err());
+    stored.inputs = None;
+    assert!(stored.issued_inputs(&config).unwrap().is_none());
+}
+
 async fn issue(ctv: bool, bootstrap: bool) -> (Fixture, MiningJob<JobContext>) {
     let f = Fixture::build(
         Duration::from_secs(10),
@@ -138,18 +173,20 @@ async fn stored_builder_version_mismatch_is_a_resume_miss() {
 
 #[tokio::test]
 async fn changed_ctv_configuration_is_a_stored_job_resume_miss() {
+    let changes: [(bool, Edit<Config>); 4] = [
+        (false, |config| config.ctv_enabled = true),
+        (true, |config| config.ctv_enabled = false),
+        (true, |config| config.ctv_direct_floor += 1),
+        (true, |config| {
+            config.ctv_config.reserved_coinbase_outputs += 1
+        }),
+    ];
     for bootstrap in [false, true] {
-        for change in ["enable", "disable", "floor", "settlement"] {
-            let (mut f, issued) = issue(change != "enable", bootstrap).await;
+        for (ctv, change) in changes {
+            let (mut f, issued) = issue(ctv, bootstrap).await;
             let config =
                 Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
-            match change {
-                "enable" => config.ctv_enabled = true,
-                "disable" => config.ctv_enabled = false,
-                "floor" => config.ctv_direct_floor += 1,
-                "settlement" => config.ctv_config.reserved_coinbase_outputs += 1,
-                _ => unreachable!(),
-            }
+            change(config);
             assert_miss(&f, &issued).await;
         }
     }
@@ -177,32 +214,28 @@ async fn legacy_prepared_rows_without_inputs_are_resume_misses() {
 
 #[tokio::test]
 async fn malformed_stored_inputs_and_legacy_records_remain_resume_errors() {
-    for corruption in [
-        "null",
-        "partial",
-        "missing ctv",
-        "bad ctv",
-        "legacy snapshot",
-    ] {
+    let corruptions: [(&str, Edit<Value>); 5] = [
+        ("null", |payload| payload["inputs"] = Value::Null),
+        ("partial", |payload| {
+            payload["inputs"]
+                .as_object_mut()
+                .unwrap()
+                .remove("audit_builder_version");
+        }),
+        ("missing ctv", |payload| {
+            payload["inputs"].as_object_mut().unwrap().remove("ctv");
+        }),
+        ("bad ctv", |payload| {
+            payload["inputs"]["ctv"] = json!({"direct_floor_sats":"invalid"});
+        }),
+        ("legacy snapshot", |payload| {
+            payload.as_object_mut().unwrap().remove("inputs");
+            payload["snapshot"] = Value::Null;
+        }),
+    ];
+    for (corruption, edit) in corruptions {
         let (f, issued) = issue(false, false).await;
-        edit_prepared(&f, &issued, |payload| match corruption {
-            "null" => payload["inputs"] = Value::Null,
-            "partial" => {
-                payload["inputs"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("audit_builder_version");
-            }
-            "missing ctv" => {
-                payload["inputs"].as_object_mut().unwrap().remove("ctv");
-            }
-            "bad ctv" => payload["inputs"]["ctv"] = json!({"direct_floor_sats":"invalid"}),
-            "legacy snapshot" => {
-                payload.as_object_mut().unwrap().remove("inputs");
-                payload["snapshot"] = Value::Null;
-            }
-            _ => unreachable!(),
-        });
+        edit_prepared(&f, &issued, edit);
         let error = match f
             .coordinator
             .resume_job(&issued.context.worker, &issued.wire.job_id)
@@ -217,35 +250,35 @@ async fn malformed_stored_inputs_and_legacy_records_remain_resume_errors() {
 
 #[tokio::test]
 async fn stored_job_resume_preserves_current_policy_and_signer_checks() {
-    for change in ["policy", "manifest", "ledger"] {
+    let changes: [Edit<Config>; 3] = [
+        |config| config.payout_policy.safety_multiplier += 1,
+        |config| config.manifest_seed = hash(0x33),
+        |config| config.ledger_seed = hash(0x44),
+    ];
+    for change in changes {
         let (mut f, issued) = issue(false, false).await;
         let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
-        match change {
-            "policy" => config.payout_policy.safety_multiplier += 1,
-            "manifest" => config.manifest_seed = hash(0x33),
-            "ledger" => config.ledger_seed = hash(0x44),
-            _ => unreachable!(),
-        }
+        change(config);
         assert_miss(&f, &issued).await;
     }
 }
 
 #[tokio::test]
 async fn matching_stored_inputs_still_require_the_original_bundle_policy_and_signers() {
-    for change in ["policy", "manifest", "ledger"] {
+    let changes: [Edit<Value>; 3] = [
+        |payload| payload["bundle"]["payout_policy"]["safety_multiplier"] = json!(999),
+        |payload| {
+            payload["bundle"]["signed_coinbase_manifest"]["signature"]["public_key_hex"] =
+                json!(hash(0x33));
+        },
+        |payload| {
+            payload["bundle"]["ledger_window_attestation"]["signature"]["public_key_hex"] =
+                json!(hash(0x44));
+        },
+    ];
+    for change in changes {
         let (f, issued) = issue(false, false).await;
-        edit_prepared(&f, &issued, |payload| match change {
-            "policy" => payload["bundle"]["payout_policy"]["safety_multiplier"] = json!(999),
-            "manifest" => {
-                payload["bundle"]["signed_coinbase_manifest"]["signature"]["public_key_hex"] =
-                    json!(hash(0x33))
-            }
-            "ledger" => {
-                payload["bundle"]["ledger_window_attestation"]["signature"]["public_key_hex"] =
-                    json!(hash(0x44))
-            }
-            _ => unreachable!(),
-        });
+        edit_prepared(&f, &issued, change);
         assert_miss(&f, &issued).await;
     }
 }

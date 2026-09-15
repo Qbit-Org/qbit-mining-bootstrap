@@ -56,6 +56,7 @@ pub struct BundleInputs {
     pub payout_policy: PayoutPolicy,
     /// `Some` exactly when the CTV builder was used; its presence selects
     /// the builder at a rebuild in place of `config.ctv_enabled`.
+    /// The key is required: explicit null means no CTV; omission is corruption.
     #[serde(deserialize_with = "Option::deserialize")]
     pub ctv: Option<CandidateCtv>,
     /// The public keys of the seeds the bundle was signed with.
@@ -120,6 +121,8 @@ pub struct Prepared {
     pub window: WindowRef,
     /// What `bundle` was built with, other than the window. A per-worker
     /// bootstrap build uses the same inputs, and a candidate copies them.
+    /// This nonoptional view copies the original build's or validated stored
+    /// inputs; callers never need to handle the legacy storage-only absence.
     pub inputs: BundleInputs,
     pub bundle: Option<Arc<AuditBundle>>,
     pub base_wire: Option<codec::Job>,
@@ -152,6 +155,24 @@ struct StoredPrepared {
 }
 
 impl StoredPrepared {
+    /// Legacy rows cannot prove their CTV inputs or builder version. A resumed
+    /// candidate (including bootstrap work) must use the exact issued inputs,
+    /// and any stored bundle must agree with their policy and signer keys.
+    fn issued_inputs(&self, config: &Config) -> Result<Option<&BundleInputs>> {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return Ok(None);
+        };
+        if inputs != &BundleInputs::capture(config, self.fee)?
+            || self
+                .bundle
+                .as_ref()
+                .is_some_and(|bundle| !inputs.describes(bundle))
+        {
+            return Ok(None);
+        }
+        Ok(Some(inputs))
+    }
+
     fn deserialize_inputs<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Option<BundleInputs>, D::Error> {
@@ -2030,21 +2051,9 @@ impl MiningBackend for Coordinator {
             {
                 return Ok(None);
             }
-            // Legacy rows cannot prove their CTV inputs or builder version.
-            // A candidate must carry the inputs used at issue, including for
-            // a bootstrap rebuild; current configuration cannot supply them.
-            let Some(inputs) = prepared.inputs.as_ref() else {
+            let Some(inputs) = prepared.issued_inputs(&self.config)? else {
                 return Ok(None);
             };
-            let current_inputs = BundleInputs::capture(&self.config, prepared.fee)?;
-            if inputs != &current_inputs
-                || prepared
-                    .bundle
-                    .as_ref()
-                    .is_some_and(|bundle| !inputs.describes(bundle))
-            {
-                return Ok(None);
-            }
             // Incompatible work is a miss, never a rebuild of a nonempty
             // window or a new deadline. Compatible work retains its live fee
             // admission check and carries the exact persisted inputs onward.
