@@ -11,7 +11,7 @@ pub(crate) struct ReadAdmission {
 }
 
 struct AdmissionOwner {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
     changed: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -26,6 +26,10 @@ impl Drop for AdmissionOwner {
 
 impl ReadAdmission {
     pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self::shared(Arc::new(permit))
+    }
+
+    pub(crate) fn shared(permit: Arc<OwnedSemaphorePermit>) -> Self {
         Self {
             _owner: Some(Arc::new(AdmissionOwner {
                 permit: Some(permit),
@@ -42,7 +46,7 @@ impl ReadAdmission {
     ) -> Self {
         Self {
             _owner: Some(Arc::new(AdmissionOwner {
-                permit: Some(permit),
+                permit: Some(Arc::new(permit)),
                 changed: Some(changed),
             })),
         }
@@ -91,6 +95,20 @@ impl<T: Send + 'static> BlockingDrop<T> {
             })
             .await
             .map_err(WindowError::TaskFailed)?
+    }
+
+    /// The generic ledger readers retain their existing anyhow/source contract.
+    pub(crate) async fn map_anyhow<U: Send + 'static>(
+        self,
+        map: impl FnOnce(T) -> anyhow::Result<U> + Send + 'static,
+    ) -> anyhow::Result<BlockingDrop<U>> {
+        self.map(move |value| map(value).map_err(WindowError::Decode))
+            .await
+            .map_err(|error| match error {
+                WindowError::Decode(error) => error,
+                WindowError::TaskFailed(error) => error.into(),
+                error => error.into(),
+            })
     }
 }
 

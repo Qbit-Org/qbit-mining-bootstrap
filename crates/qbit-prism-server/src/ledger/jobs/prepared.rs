@@ -289,20 +289,14 @@ impl Ledger {
         let decode_hook = self.compact_decode_hook.lock().unwrap().clone();
         let decoded = completion
             .own(row)
-            .map(move |row| {
+            .map_anyhow(move |row| {
                 #[cfg(test)]
                 if let Some(hook) = decode_hook {
                     hook();
                 }
-                decode_row(row).map_err(WindowError::Decode)
+                decode_row(row)
             })
-            .await
-            .map_err(|error| match error {
-                // Preserve the public reader's original error/source contract.
-                WindowError::Decode(error) => error,
-                WindowError::TaskFailed(error) => error.into(),
-                error => error.into(),
-            })?;
+            .await?;
         // Synchronous handoff retains the same admission; no unowned await.
         Ok(decoded.into_inner().map(|stored| completion.own(stored)))
     }

@@ -953,8 +953,14 @@ impl Coordinator {
                     .context("prepared TTL overflow")?,
             )
             .context("prepared expiry overflow")?;
-        let permit = self.build_slots.clone().acquire_owned().await?;
-        let snapshot = self.work_ledger.snapshot(network).await?;
+        let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
+        let snapshot = self
+            .work_ledger
+            .snapshot_with_admission(
+                network,
+                crate::ledger::ReadAdmission::shared(permit.clone()),
+            )
+            .await?;
         let admitted = prepared_storage::compact::CompactOwner::new((snapshot, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
@@ -978,7 +984,7 @@ impl Coordinator {
             proof,
             key: storage_key,
             template,
-            snapshot,
+            snapshot: snapshot.into_inner(),
             inputs,
             fee,
             fingerprint,

@@ -460,7 +460,7 @@ impl Coordinator {
     /// owner. Cancellation never drops a large successful build on the runtime.
     pub(in crate::coordinator) async fn capture_refresh(
         &self,
-        source: CompactOwner<(RefreshBuild, tokio::sync::OwnedSemaphorePermit)>,
+        source: CompactOwner<(RefreshBuild, Arc<tokio::sync::OwnedSemaphorePermit>)>,
     ) -> Result<CompactOwner<CapturedCompactPrepared>> {
         let config = self.config.clone();
         #[cfg(test)]

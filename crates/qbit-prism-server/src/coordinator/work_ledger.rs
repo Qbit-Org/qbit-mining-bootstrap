@@ -48,7 +48,11 @@ pub(super) trait WorkLedger: Send + Sync {
         height: u64,
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>>;
-    fn snapshot(&self, network: u128) -> BoxFuture<'_, Result<Snapshot>>;
+    fn snapshot_with_admission(
+        &self,
+        network: u128,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>>;
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>>;
     fn reconcile<'a>(
         &'a self,
@@ -140,8 +144,12 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(Ledger::observe_chain_view(self, tip, height, chainwork))
     }
-    fn snapshot(&self, network: u128) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(Ledger::snapshot(self, network))
+    fn snapshot_with_admission(
+        &self,
+        network: u128,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>> {
+        Box::pin(Ledger::snapshot_with_admission(self, network, completion))
     }
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>> {
         Box::pin(Ledger::pool_blocks_for_reconcile(self))

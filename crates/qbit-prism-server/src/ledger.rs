@@ -82,7 +82,12 @@ pub struct Ledger {
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
     #[cfg(test)]
     pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
+    #[cfg(test)]
+    pub(crate) snapshot_decode_hook: std::sync::Arc<std::sync::Mutex<Option<SnapshotDecodeHook>>>,
 }
 
 #[cfg(test)]
 type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
