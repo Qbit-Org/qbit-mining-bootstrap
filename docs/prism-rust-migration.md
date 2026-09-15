@@ -320,13 +320,11 @@ The check reads outbox rows, not the capability row: 002 declares
    otherwise) and let its block submitter finish every pending candidate; it
    replays every durable pending row on start.
 2. For a block that is already accepted on the active chain but cannot complete
-   through normal replay, run the `2.x.x` offline recovery command from the
-   `2.x.x` image, with the managed coordinator stopped:
-
-   ```sh
-   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH"          # plan
-   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH" --apply  # drain
-   ```
+   through normal replay, follow the
+   [pinned `2.x.x` offline recovery procedure](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/504846cc0b72e8f86ed17f896d4ccbbe196a31dc/docs/prism-ledger-ops.md#L372-L399)
+   from the `2.x.x` image, with the managed coordinator and its restart
+   supervisor stopped. Select the exact hashes with `--block-hash` and inspect
+   the read-only plan first; repeat the same allowlist with `--apply` to drain.
 
    That command was removed from `3.x.x` with the Python runtime; it only
    exists in the `2.x.x` image.

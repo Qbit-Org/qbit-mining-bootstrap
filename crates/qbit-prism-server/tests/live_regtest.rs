@@ -24,6 +24,19 @@ mod highdiff_tests;
 #[path = "support/live_ctv_cpfp.rs"]
 mod cpfp_tests;
 
+/// Each fixture starts a regtest `qbitd` and two servers, and a server binds
+/// its listeners only after coordinator startup: the schema migrations, which
+/// the second server of a fixture waits for under the migrations table lock,
+/// and the node handshake. libtest ran two fixtures at once on the two-vCPU CI
+/// runner, and the readiness wait below, a 30-second setup budget rather than
+/// behaviour under test, timed out four times on one branch while the sibling
+/// fixture mined and restarted its node; the failover test's 20-second
+/// reconnection wait timed out twice more under the same load, and every rerun
+/// passed. The tests of this binary therefore run one at a time, as the ledger
+/// suites do: the guard lives in the fixture, so the next one opens only after
+/// cleanup has stopped every process.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Process {
     child: ChildHandle,
     log: PathBuf,
@@ -90,6 +103,8 @@ struct Fixture {
     client: reqwest::Client,
     address: String,
     ctv: bool,
+    /// Declared last, so it is released after the processes and pools above.
+    _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
 /// The child executables a fixture starts.
@@ -116,6 +131,9 @@ struct Startup {
     database_url: Option<String>,
     node: Option<Process>,
     fixture: Option<Fixture>,
+    /// The `SERIAL` guard until the fixture takes it. Declared last, so a
+    /// failed startup releases it only after its children are stopped.
+    serial: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 impl Startup {
@@ -191,7 +209,10 @@ impl Fixture {
             server: env!("CARGO_BIN_EXE_qbit-prism-server").into(),
             ctv,
         };
-        let mut startup = Startup::default();
+        let mut startup = Startup {
+            serial: Some(SERIAL.lock().await),
+            ..Startup::default()
+        };
         let result = Self::start(&database, launch, &mut startup).await;
         startup.finish(result).map(Some)
     }
@@ -258,6 +279,8 @@ impl Fixture {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()?;
+        // Moved, never released: the fixture now holds it through cleanup.
+        let serial = startup.serial.take().context("serial guard missing")?;
         let fixture = startup.fixture.insert(Self {
             directory: startup.directory.take().expect("directory checked above"),
             admin: database.admin,
@@ -276,6 +299,7 @@ impl Fixture {
             client,
             address: String::new(),
             ctv: launch.ctv,
+            _serial: serial,
         });
         until("qbit RPC", 30, || async {
             Ok(fixture
@@ -300,15 +324,19 @@ impl Fixture {
             fixture.servers.push(process);
         }
         for index in 0..2 {
-            until("PRISM HTTP readiness", 30, || async {
-                Ok(fixture
-                    .client
-                    .get(format!("http://127.0.0.1:{}/healthz", fixture.api[index]))
-                    .send()
-                    .await?
-                    .status()
-                    .is_success())
-            })
+            until(
+                &format!("PRISM HTTP readiness of server {index}"),
+                30,
+                || async {
+                    Ok(fixture
+                        .client
+                        .get(format!("http://127.0.0.1:{}/healthz", fixture.api[index]))
+                        .send()
+                        .await?
+                        .status()
+                        .is_success())
+                },
+            )
             .await?;
         }
         Ok(())
@@ -1165,14 +1193,19 @@ mod startup_diagnostics_tests {
         })
     }
 
-    fn startup() -> Result<(Startup, PathBuf)> {
+    /// A startup holding the guard of its own mutex rather than `SERIAL`, so
+    /// these tests neither wait for nor block a live fixture; the returned
+    /// mutex shows when the guard is released.
+    fn startup() -> Result<(Startup, PathBuf, &'static tokio::sync::Mutex<()>)> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().to_path_buf();
+        let serial = Box::leak(Box::new(tokio::sync::Mutex::new(())));
         let startup = Startup {
             directory: Some(directory),
+            serial: Some(serial.try_lock()?),
             ..Startup::default()
         };
-        Ok((startup, path))
+        Ok((startup, path, serial))
     }
 
     async fn read_witness(path: &Path) -> Result<String> {
@@ -1238,7 +1271,7 @@ mod startup_diagnostics_tests {
                 record_arguments(&arguments)
             ),
         )?;
-        let (mut startup, directory) = startup()?;
+        let (mut startup, directory, serial) = startup()?;
         let node = tokio::spawn(serve_fake_node(arguments, Some("createwallet")));
         let launch = Launch {
             qbitd,
@@ -1246,12 +1279,14 @@ mod startup_diagnostics_tests {
             ctv: false,
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
+        assert!(serial.try_lock().is_err(), "guard released before cleanup");
         let error = startup
             .finish(result)
             .err()
             .context("startup unexpectedly succeeded")?;
         node.abort();
 
+        assert!(serial.try_lock().is_ok(), "failed startup kept the guard");
         assert!(
             error
                 .root_cause()
@@ -1288,7 +1323,7 @@ mod startup_diagnostics_tests {
             "server",
             "echo \"server $PRISM_INSTANCE_ID database $PRISM_DATABASE_URL\"\nexec sleep 60\n",
         )?;
-        let (mut startup, directory) = startup()?;
+        let (mut startup, directory, serial) = startup()?;
         let node = tokio::spawn(serve_fake_node(arguments, None));
         let launch = Launch {
             qbitd,
@@ -1296,12 +1331,14 @@ mod startup_diagnostics_tests {
             ctv: false,
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
+        assert!(serial.try_lock().is_err(), "guard released before cleanup");
         let error = startup
             .finish(result)
             .err()
             .context("startup unexpectedly succeeded")?;
         node.abort();
 
+        assert!(serial.try_lock().is_ok(), "failed startup kept the guard");
         let io = error
             .root_cause()
             .downcast_ref::<std::io::Error>()
@@ -1340,7 +1377,7 @@ mod startup_diagnostics_tests {
                 "echo \"SCOUT385-STARTED-SERVER $PRISM_INSTANCE_ID\"\necho \"PRISM_DATABASE_URL=$PRISM_DATABASE_URL\"\necho \"connecting to $PRISM_DATABASE_URL with $QBIT_RPC_PASSWORD\"\necho \"manifest seed {SEED_11}\"\necho \"$PRISM_AUDIT_PORT\" > \"{api}/api-$PRISM_INSTANCE_ID.tmp\" && mv \"{api}/api-$PRISM_INSTANCE_ID.tmp\" \"{api}/api-$PRISM_INSTANCE_ID\"\nexec sleep 60\n"
             ),
         )?;
-        let (mut startup, directory) = startup()?;
+        let (mut startup, directory, serial) = startup()?;
         let helpers = [
             tokio::spawn(serve_fake_node(arguments, None)),
             tokio::spawn(serve_fake_health(scratch.path().join("api-live-0"))),
@@ -1353,6 +1390,7 @@ mod startup_diagnostics_tests {
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
         let mut fixture = startup.finish(result)?;
+        assert!(serial.try_lock().is_err(), "fixture did not take the guard");
         // Nothing listens on the Stratum port, so the real miner exits.
         fixture.start_miner(0)?;
         until("miner exit", 20, || {
@@ -1397,12 +1435,13 @@ mod startup_diagnostics_tests {
             helper.abort();
         }
         assert!(!directory.exists(), "cleanup left the fixture directory");
+        assert!(serial.try_lock().is_ok(), "cleanup kept the guard");
         Ok(())
     }
 
     #[tokio::test]
     async fn unreadable_node_log_before_fixture_keeps_original_error_and_cleans_up() -> Result<()> {
-        let (mut startup, directory) = startup()?;
+        let (mut startup, directory, serial) = startup()?;
         let log = directory.join("qbit.log");
         let node = Process::spawn(
             Command::new("/bin/sh").args(["-c", "echo gone; exec sleep 60"]),
@@ -1415,6 +1454,7 @@ mod startup_diagnostics_tests {
         startup.database_url = Some("postgres://u:pw-secret@db/prism".into());
 
         let error = startup.fail(anyhow::anyhow!("original startup failure"));
+        assert!(serial.try_lock().is_ok(), "failed startup kept the guard");
         assert_eq!(error.root_cause().to_string(), "original startup failure");
         let text = format!("{error:?}");
         assert!(
@@ -1946,7 +1986,7 @@ mod startup_diagnostics_tests {
 
     #[test]
     fn multibyte_url_separator_in_a_child_log_keeps_original_error_and_witness() -> Result<()> {
-        let (mut startup, directory) = startup()?;
+        let (mut startup, directory, serial) = startup()?;
         let node = Process::spawn(
             Command::new("/bin/sh").args([
                 "-c",
@@ -1958,6 +1998,7 @@ mod startup_diagnostics_tests {
         startup.node = Some(node);
 
         let error = startup.fail(anyhow::anyhow!("original unicode failure"));
+        assert!(serial.try_lock().is_ok(), "failed startup kept the guard");
         assert_eq!(error.root_cause().to_string(), "original unicode failure");
         let text = format!("{error:?}");
         assert!(!text.contains("collector panicked"), "{text}");
