@@ -21,8 +21,8 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    indirection, aliases, shell variables, or backslash escapes. Shell comments,
    ordinary arguments and heredoc bodies run no command of their own. Command
    positions include shell lists, brace groups and loop conditions/bodies,
-   the env/sudo/nohup/command/exec and docker/podman exec wrappers, and literal
-   sh/bash/dash/ksh/zsh ``-c`` strings.
+   the env/sudo/nohup/command/exec/builtin and docker/podman exec wrappers,
+   and literal sh/bash/dash/ksh/zsh ``-c`` strings.
    Other launcher grammars, shell evaluation of stdin, and expansions inside
    quoted arguments or heredocs are outside this lexical check.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
@@ -482,7 +482,9 @@ def shell_tokens(line: str):
 
 
 SHELLS = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
-LAUNCHERS = frozenset({"env", "sudo", "nohup", "command", "exec", "docker", "podman"})
+LAUNCHERS = frozenset({"env", "sudo", "nohup", "command", "exec", "builtin", "docker", "podman"})
+# The launchers that are shell builtins, the only ones `builtin` can name.
+SHELL_BUILTIN_LAUNCHERS = frozenset({"command", "exec", "builtin"})
 WRAPPER_ARGUMENTS = {
     "env": {"-u", "--unset", "-C", "--chdir"},
     "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-R", "--chroot", "-r", "--role", "-t", "--type", "-T", "--command-timeout"},
@@ -565,6 +567,38 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 return None
             program = "docker"
             index += 1
+        if program == "builtin":
+            # `builtin [shell-builtin [arg ...]]` runs its argument as a shell
+            # builtin and nothing else, so Python is reached through it only
+            # by way of a builtin this check reads: `command`, `exec` or
+            # `builtin` itself. bash 5.2.21 ran `echo hi` for `builtin
+            # command echo hi`, `builtin exec echo hi`, `builtin builtin
+            # command echo hi`, `builtin -- command echo hi`, `builtin
+            # 'command' echo hi`, `command builtin command echo hi`, `command
+            # -p builtin command echo hi` and `FOO=x builtin command echo hi`,
+            # and printed `echo` for `builtin command -v echo hi`; it answered
+            # `builtin python3 -c 1`, `builtin env echo hi`, `builtin sudo
+            # echo hi`, `builtin nohup echo hi`, `builtin docker exec c echo
+            # hi`, `builtin bash -c 'echo hi'`, `builtin /usr/bin/env echo
+            # hi`, `builtin ./command echo hi`, `builtin FOO=x command echo
+            # hi` and `builtin -- -- command echo hi` with "not a shell
+            # builtin", ran nothing for `builtin` and `builtin --` alone,
+            # rejected `-x`, `-p`, `-pv`, `--foo` and `--version` as invalid
+            # options and printed its help for `--help`, running nothing in
+            # each case; the next command on the line ran after every
+            # failure. `--` is its one option word, taken once. `exec` after
+            # it still looks its own argument up as a program, so `builtin
+            # exec command echo hi` failed with "exec: command: not found" as
+            # `exec command echo hi` does. dash 0.5.12 has no `builtin` and
+            # answered "not found", running nothing. A `builtin` after env,
+            # sudo, nohup, exec or docker exec is looked up as a program and
+            # not found, as `command` and `exec` are there; that shared gap
+            # is outside this check.
+            if index < len(words) and unquote(words[index]) == "--":
+                index += 1
+            if index == len(words) or unquote(words[index]) not in SHELL_BUILTIN_LAUNCHERS:
+                return None
+            continue
         terminated = False
         while index < len(words):
             option = unquote(words[index])
@@ -3194,6 +3228,58 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.commands("sudo command -pv python3 lab/prism/storm.py"), [])
         self.assertEqual(self.commands("command -pv sudo python3 lab/prism/storm.py"), [])
         text = "```sh\ncommand -pv \\\n  python3 lab/prism/deleted.py\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_builtin_runs_only_the_shell_builtins_the_check_reads(self) -> None:
+        # bash 5.2.21 ran `echo hi` for `builtin command echo hi`, `builtin
+        # exec echo hi`, `builtin builtin command echo hi`, `builtin --
+        # command echo hi`, `builtin 'command' echo hi`, `command builtin
+        # command echo hi`, `command -p builtin command echo hi` and `FOO=x
+        # builtin command echo hi`.
+        for prefix in (
+            "builtin command", "builtin exec", "builtin builtin command", "builtin builtin exec",
+            "builtin -- command", "builtin -- exec", "builtin 'command'", 'builtin com"mand"',
+            "command builtin command", "command -p builtin command", "builtin command -p",
+            "builtin command --", "builtin exec -a name", "builtin -- builtin -- command",
+            "FOO=x builtin command", "time builtin exec", "if builtin command",
+        ):
+            for command, missing in (
+                ("python3 -m lab.prism.deleted", "lab/prism/deleted.py or lab/prism/deleted/__main__.py"),
+                ("python3 lab/prism/deleted.py", "lab/prism/deleted.py"),
+                ("sh -c 'python3 lab/prism/deleted.py'", "lab/prism/deleted.py"),
+            ):
+                with self.subTest(prefix=prefix, command=command):
+                    self.assertEqual(self.commands(f"{prefix} {command}"), [missing])
+                    self.assertEqual(list(dead_commands(f"{prefix} python3 lab/prism/tool.py", {"lab/prism/tool.py"})), [])
+        text = "```sh\nbuiltin -- command \\\n  python3 lab/prism/deleted.py\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(2, "lab/prism/deleted.py"), (4, "lab/prism/storm.py")])
+        # bash 5.2.21 answered `builtin python3 -c 1`, `builtin env echo hi`,
+        # `builtin sudo echo hi`, `builtin nohup echo hi`, `builtin docker
+        # exec c echo hi`, `builtin bash -c 'echo hi'`, `builtin /usr/bin/env
+        # echo hi`, `builtin ./command echo hi`, `builtin FOO=x command echo
+        # hi` and `builtin -- -- command echo hi` with "not a shell builtin",
+        # ran nothing for `builtin` and `builtin --`, rejected `-x`, `-p`,
+        # `-pv`, `--foo` and `--version` as invalid options and printed its
+        # help for `--help`, and ran the next command on the line after each;
+        # dash 0.5.12 has no `builtin` at all.
+        for prefix in (
+            "builtin", "builtin --", "builtin env", "builtin sudo", "builtin nohup", "builtin -- env",
+            "builtin docker exec c", "builtin podman exec c", "builtin sh -c", "builtin bash -c",
+            "builtin /usr/bin/env", "builtin ./command", "builtin /bin/command", "builtin FOO=x command",
+            "builtin -x command", "builtin -p command", "builtin -pv command", "builtin --foo command",
+            "builtin --version command", "builtin --help command", "builtin -- -- command",
+            "builtin -- -x command", "builtin '' command", "builtin command -v", "builtin -- command -V",
+            "command builtin env", "builtin builtin sudo", "sudo builtin python3", "builtin builtin",
+        ):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py", "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                with self.subTest(prefix=prefix, argument=argument):
+                    text = f"{prefix} {argument}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(len(self.references(text)), 1)
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        text = "```sh\nbuiltin python3 \\\n  -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
         self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
