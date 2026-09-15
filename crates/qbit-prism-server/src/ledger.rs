@@ -19,7 +19,10 @@ use uuid::Uuid;
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
-pub use audit::{audit_canonical_bytes, decode_canonical_audit_body, materialize_audit_row};
+pub use audit::{
+    audit_canonical_bytes, audit_completeness, decode_canonical_audit_body, materialize_audit_row,
+    AuditCompleteness,
+};
 mod candidates;
 use candidates::prepare_candidate;
 pub use candidates::{

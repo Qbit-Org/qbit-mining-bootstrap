@@ -93,8 +93,10 @@ Core durable tables remain:
 Current balances replay active confirmed carry-forward deltas. Zero net balances
 need no current row; negative balances remain visible debt offsetting future
 rewards. `qbit_carry_forward_integrity_report()` checks stored prior, candidate,
-and carry values against replay and publishes `audit_head_sha256`. Preserve that
-head with independent release/recovery records.
+and carry values against replay. The legacy operator report added
+`audit_head_sha256` over active carry rows; the SQL function alone does not
+calculate it. The recovery export below reproduces that exact head. Preserve it
+with independent release/recovery records.
 
 Coinbase maturity is 1,000 blocks: a height-H payout becomes mature only at tip
 height H+1,000 or later. An immature disconnected block is marked inactive, so
@@ -118,7 +120,7 @@ or share-compaction command exists. Keep the canonical share history and all
 referenced snapshot rows. A future archive design must preserve exact range
 reconstruction and verification before relaxing this invariant.
 
-Imported historical external audits retain their verified inline bundle body;
+Imported historical external audits retain their verified canonical bytes;
 they are not silently rewritten into references to potentially incomplete
 legacy share history. Import preserves their published canonical SHA. Legacy
 body-ref and v2 segment formats remain supported by the Rust offline loaders.
@@ -325,6 +327,124 @@ external audit bodies/segments. Use independent base backups plus WAL archives
 for point-in-time recovery; replication is not a replacement for backups.
 Restore into isolation and verify share order, audit hashes, carry-forward
 integrity, CTV state, and API reads before declaring recovery complete.
+
+## One-way migration and isolated-restore reconciliation
+
+Decision D5 in #260 chooses one-way native migration with forward repair. No
+down-migrations are provided for native 002–010, including 006/007/008. Never
+remove native guards to run a legacy writer. The publication-ordinal revert
+refuses native schemas and names this recovery path. The data-loss boundary,
+matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is:
+
+> Before the first native share is acknowledged, restore the complete
+> pre-migration database and artifact backup and restart the pinned old image
+> in isolation from the migrated database. After the first native share is
+> acknowledged, restoring an older database loses those accepted records.
+> Any rollback that discards acknowledged history requires an explicit
+> accounting reconciliation and recovery decision; it is not an ordinary
+> image rollback. Keep every native frontend stopped while performing an
+> isolated restore/recovery operation against its replacement database.
+
+1. **Preconditions and stop boundary.** Pin the source/native image digests and
+   retain keys, configuration, database backups/WAL and every external audit
+   body/segment. Before an actual cutover, drain legacy candidates with the
+   supported source release as described in the [migration guide](prism-rust-migration.md#supported-2xx-source-schemas).
+   Stop all Python/native frontends, public services and CTV/candidate workers;
+   block their access to the isolated restore. Keep the latest database intact.
+   Treat an unknown first-ACK boundary as post-ACK. Lost replies and background
+   settlement can leave committed work even before a successful native ACK.
+2. **Numbered pre-migration canonical backfill rehearsal.** Restore a source
+   copy and artifact backup in isolation, then run native `migrate` and
+   `import-audits --root /var/lib/qbit-prism/audit` there. This is the native
+   canonical backfill: it reconstructs bytes from recoverable inline or
+   external bodies when the sidecar never existed, preserving the published
+   SHA and verifying the trusted ledger key and coinbase. Require zero
+   `missing_stored_bodies` and `missing_canonical_bytes` before migrating the
+   real source. A corrupt present sidecar fails closed. Restore missing
+   evidence and rerun import; do not invent replacement history. This uses
+   the native equivalent and does not run the `2.x.x` command blocked by
+   #174/#176. Record timings and history size; use a production-sized copy.
+3. **Save and compare exact accounting evidence.** Configure protected libpq
+   services `prism-source`, `prism-current` and `prism-restore` for distinct
+   databases with the correct ledger `search_path`. With the source drained:
+
+   ```sh
+   umask 077
+   PGSERVICE=prism-source pg_dump --format=custom --file=pre-native.dump
+   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 \
+     -f scripts/prism-recovery-evidence.sql > source.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
+   ```
+
+   The [exact SQL](../scripts/prism-recovery-evidence.sql) exports ordered share
+   rows, block/publication order, audit SHAs, payouts, carry rows, candidate and
+   CTV state in one read-only snapshot. The [streaming summarizer](../scripts/prism-recovery-evidence.py)
+   records counts and digests and reproduces the legacy `audit_head_sha256`;
+   compare that head to the mirrored pre-cutover report. It refuses incomplete
+   exports and carry mismatches/drift. Require `pending_candidates` zero. Protect
+   the evidence as accounting data and budget disk for the share export.
+4. **Exercise the isolated pre-ACK restore.** Provision a separate empty
+   database with compatible PostgreSQL, roles and extensions. Restore the full
+   database and artifact backup, never over the current database:
+
+   ```sh
+   pg_restore --exit-on-error --single-transaction \
+     --dbname='service=prism-restore' pre-native.dump
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+     -f scripts/prism-recovery-evidence.sql > restored.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py restored.rows.jsonl > restored.summary.json
+   cmp source.summary.json restored.summary.json
+   ```
+
+   Only exact equality permits testing the pinned old image on the isolated
+   legacy database, with mining and broadcasting disabled. Stop it again before
+   migrating the restore. For a post-ACK incident, continue to step 6 even if
+   this pre-migration comparison passes.
+5. **Repair forward and enforce import.** Verify `PRISM_DATABASE_URL` targets
+   the isolated restore and set the original trusted
+   `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`; no signing seed is needed for import.
+   Run `time qbit-prism-server migrate` then
+   `time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit`.
+   Repeat the export as `migrated.rows.jsonl`/`migrated.summary.json` and require
+   `cmp source.summary.json migrated.summary.json` to pass. Both import
+   completeness counts must be zero. Native snapshot-backed audits count as
+   canonical available without duplicating their share window as stored bytes.
+   Availability counts do not replace digest/signature verification. Run
+   `backfill-ctv` only after this comparison and explain any intentional CTV
+   repair delta in later evidence.
+6. **Reconcile all post-ACK differences.** Export `prism-current` using the same
+   SQL to `current.rows.jsonl`/`current.summary.json`. Compare against the
+   restored summary and inspect the ordered rows for every changed digest.
+   Run these queries against current state, supplying the source summary's
+   integer `last_share_seq` as the psql variable `source_last_share_seq`:
+
+   ```sql
+   SELECT share_seq, share_id, miner_id, share_difficulty, credit_policy
+   FROM qbit_share_ledger
+   WHERE accepted AND share_seq > :source_last_share_seq ORDER BY share_seq;
+   SELECT state, count(*) FROM qbit_block_candidate_outbox GROUP BY state ORDER BY state;
+   SELECT qbit_carry_forward_integrity_report();
+   ```
+
+   A native share tail is accepted history the older restore would lose. Also
+   reconcile block states, the carry head/balances, payouts and CTV broadcasts
+   against chain evidence; share counts alone are insufficient. Preserve the
+   current database and prefer forward repair with a compatible native image.
+   Any plan discarding acknowledged history requires an explicit accounting
+   owner's recovery decision. Do not copy rows ad hoc into the legacy schema.
+7. **Verify service and record the rehearsal.** Sample exact canonical artifact
+   bytes/SHA/ETag through the isolated public API, then repeat through the actual
+   public edge after cutover. Use the exact `curl`, `shasum`, and ETag commands
+   in [recovery step 5](prism-rust-migration.md#recovery-and-rollback); require no
+   missing-canonical fallback header. Include old history, sidecar-only and
+   reconstructed imports. Resolve stale missing edge cache entries before
+   admission. Run production `self-check` with the intended services available;
+   its JSON must show zero audit-completeness and integrity failures and its
+   exit status must be zero. Lab mode reports incomplete audits without making
+   that condition fatal; production mode refuses them. Retain every duration,
+   row count, comparison, artifact sample and image digest. #291 rehearses this
+   on production-sized history and retains the exact data-loss boundary when
+   completing the 3.0.0 release notes before approving rollout.
 
 ## Fatal-state recovery
 
