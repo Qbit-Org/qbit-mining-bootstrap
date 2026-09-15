@@ -9,8 +9,8 @@
 //!   Two `Coordinator`s share one schema and one fake node that adopts the
 //!   blocks it is sent. Both submit ordinary shares at a fixed rate through
 //!   `MiningBackend::submit`; frontend 1 then submits a block-solving share
-//!   whose window holds N shares, and its own `submit_loop` claims, rebuilds,
-//!   lands and submits that block while both keep submitting.
+//!   whose window holds N shares, and its own `submit_loop` claims, offers,
+//!   rebuilds and lands that block while both keep submitting.
 //! * **`ORDER_LOCK` hold time on a solve does not depend on the window size.**
 //!   A sampler on a connection outside every frontend pool watches `pg_locks`
 //!   for `ORDER_LOCK` while a block-solving share is appended, at two window
@@ -589,10 +589,10 @@ const PHASE_A: Duration = Duration::from_secs(4);
 /// Phase B submits for this long before the solve, so both frontends are at
 /// their steady rate when it arrives.
 const PHASE_B_LEAD: Duration = Duration::from_millis(500);
-/// The longest phase B may wait for the solved block to reach the node. An
+/// The longest phase B may wait for the solved block to settle. An
 /// unoptimized build rebuilds a 20,000-share window in about 20 s.
 const PHASE_B_CEILING: Duration = Duration::from_secs(600);
-/// Fewer frontend-2 samples than this between the solve and `submitblock`
+/// Fewer frontend-2 samples than this between the solve and settlement
 /// cannot support a p99.
 const MIN_PHASE_B_SAMPLES: usize = 5;
 
@@ -678,7 +678,7 @@ async fn incident_2_body(
             })
             .await?;
         // Phase B: frontend 1 solves while both keep submitting.
-        let ((solve_started, solve), phase_b) = run_phase_until([&one, &two], pools_b, async {
+        let ((solve_started, solve, completed), phase_b) = run_phase_until([&one, &two], pools_b, async {
             tokio::time::sleep(PHASE_B_LEAD).await;
             let started = Instant::now();
             let outcome = one.submit(solving.clone()).await;
@@ -687,16 +687,30 @@ async fn incident_2_body(
                 finished: Instant::now(),
                 outcome,
             };
-            // Keep both frontends submitting until the block reaches the node:
-            // the claim's window read and rebuild all happen before that.
+            // #266 offers before the expensive read and rebuild. Keep load
+            // running through settlement so phase B measures that work even
+            // when the node receives the block before five samples arrive.
             let ceiling = Instant::now() + PHASE_B_CEILING;
             loop {
-                if node.chain.lock().await.adopted_at.is_some() {
-                    break;
-                }
                 if solve.outcome.is_err() {
                     break;
                 }
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+                )
+                .bind(&solving.block_hash_hex)
+                .fetch_one(&first.ledger.pool)
+                .await?;
+                if state == "submitted" {
+                    break;
+                }
+                let adopted = node.chain.lock().await.adopted_at;
+                ensure!(
+                    ["pending", "offer_reserved", "offered", "reconciliation"]
+                        .contains(&state.as_str())
+                        && adopted.is_none_or(|at| at.elapsed() < Duration::from_secs(30)),
+                    "the solved candidate finished as {state}, or not within 30 s of submitblock"
+                );
                 if Instant::now() >= ceiling || submit_loop.is_finished() {
                     let row: Option<(String, Option<String>)> = sqlx::query_as(
                         "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
@@ -705,21 +719,21 @@ async fn incident_2_body(
                     .fetch_optional(&first.ledger.pool)
                     .await?;
                     bail!(
-                        "the solved block did not reach the node within {} s (submit loop running: {}); outbox row: {row:?}",
+                        "the solved block did not settle within {} s (submit loop running: {}); outbox row: {row:?}",
                         PHASE_B_CEILING.as_secs(),
                         !submit_loop.is_finished()
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            Ok((started, solve))
+            Ok((started, solve, Instant::now()))
         })
         .await?;
-        Ok::<_, anyhow::Error>((phase_a, solve_started, solve, phase_b))
+        Ok::<_, anyhow::Error>((phase_a, solve_started, solve, phase_b, completed))
     }
     .await;
     let settled = async {
-        let (phase_a, solve_started, solve, phase_b) = measured?;
+        let (phase_a, solve_started, solve, phase_b, completed) = measured?;
         solve
             .outcome
             .clone()
@@ -730,34 +744,12 @@ async fn incident_2_body(
             .await
             .adopted_at
             .context("the block never reached the node")?;
-        let ceiling = Instant::now() + Duration::from_secs(30);
-        loop {
-            let state: String = sqlx::query_scalar(
-                "SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1",
-            )
-            .bind(&solving.block_hash_hex)
-            .fetch_one(&first.ledger.pool)
-            .await?;
-            if state == "submitted" {
-                break;
-            }
-            // Between the offer and the confirmation the row is reserved,
-            // offered or reconciling (#266); only a terminal state other
-            // than submitted, or the ceiling, ends the wait.
-            ensure!(
-                ["pending", "offer_reserved", "offered", "reconciliation"]
-                    .contains(&state.as_str())
-                    && Instant::now() < ceiling,
-                "the solved candidate finished as {state}, or not within 30 s of submitblock"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        Ok::<_, anyhow::Error>((phase_a, solve_started, solve, phase_b, adopted))
+        Ok::<_, anyhow::Error>((phase_a, solve_started, solve, phase_b, adopted, completed))
     }
     .await;
     let _ = shutdown.send(true);
     let stopped = tokio::time::timeout(Duration::from_secs(30), submit_loop).await;
-    let (phase_a, solve_started, solve, phase_b, adopted) = settled?;
+    let (phase_a, solve_started, solve, phase_b, adopted, completed) = settled?;
     stopped.context("the submit loop did not stop within 30 s")??;
 
     // Every phase-A ACK, and every phase-B ACK that finished before the block
@@ -783,7 +775,7 @@ async fn incident_2_body(
         );
     }
     for (frontend, acks) in phase_b.iter().enumerate() {
-        for ack in acks.iter().filter(|ack| ack.started < adopted) {
+        for ack in acks {
             match &ack.outcome {
                 Ok(()) => {}
                 Err(error)
@@ -848,7 +840,7 @@ async fn incident_2_body(
     let during = |acks: &[Ack]| {
         Latency::of(
             acks.iter()
-                .filter(|ack| ack.started >= solve_started && ack.started < adopted)
+                .filter(|ack| ack.started >= solve_started && ack.started < completed)
                 .map(Ack::latency),
         )
     };
@@ -858,22 +850,23 @@ async fn incident_2_body(
         .context("frontend 2 made no phase-A calls")?;
     let b1 = during(&phase_b[0]);
     let b2 = during(&phase_b[1]);
-    let window = adopted - solve_started;
+    let window = completed - solve_started;
     println!("[n={n}] incident 2, in-process ACK latency (MiningBackend::submit wall clock; no socket harness):");
     println!("  {}", Latency::line("phase A frontend 1", Some(a1)));
     println!("  {}", Latency::line("phase A frontend 2", Some(a2)));
     println!(
-        "  block-solving share ACK (frontend 1): {:.2} ms; solve to submitblock {:.2} ms",
+        "  block-solving share ACK (frontend 1): {:.2} ms; solve to submitblock {:.2} ms; solve to settlement {:.2} ms",
         ms(solve.latency()),
+        ms(adopted - solve_started),
         ms(window)
     );
     println!(
         "  {}",
-        Latency::line("phase B frontend 1 (solve to submitblock)", b1)
+        Latency::line("phase B frontend 1 (solve to settlement)", b1)
     );
     println!(
         "  {}",
-        Latency::line("phase B frontend 2 (solve to submitblock)", b2)
+        Latency::line("phase B frontend 2 (solve to settlement)", b2)
     );
     println!(
         "  bounds: solve ACK <= {:.2} ms, frontend 2 phase-B p99 <= {:.2} ms, every ACK < {} ms",
@@ -884,15 +877,26 @@ async fn incident_2_body(
 
     let b2 = b2.with_context(|| {
         format!(
-            "frontend 2 made no call between the solve and submitblock ({:.2} ms)",
+            "frontend 2 made no call between the solve and settlement ({:.2} ms)",
             ms(window)
         )
     })?;
     ensure!(
         b2.count >= MIN_PHASE_B_SAMPLES,
-        "frontend 2 made only {} calls in the {:.2} ms between the solve and submitblock; a p99 needs {MIN_PHASE_B_SAMPLES}",
+        "frontend 2 made only {} calls in the {:.2} ms between the solve and settlement; a p99 needs {MIN_PHASE_B_SAMPLES}",
         b2.count,
         ms(window)
+    );
+    // A fast stale-job response must not masquerade as an append under
+    // rebuild load. The bystander must still accept real post-offer shares.
+    let accepted_after_offer = phase_b[1]
+        .iter()
+        .filter(|ack| ack.started >= adopted && ack.started < completed && ack.outcome.is_ok())
+        .count();
+    println!("  frontend 2 accepted {accepted_after_offer} post-offer shares before settlement");
+    ensure!(
+        accepted_after_offer >= MIN_PHASE_B_SAMPLES,
+        "frontend 2 accepted only {accepted_after_offer} post-offer shares before settlement; expected at least {MIN_PHASE_B_SAMPLES} real appends during rebuild"
     );
     ensure!(
         solve.latency() <= latency_bound(a1.p99),
@@ -934,7 +938,7 @@ async fn incident_2_body(
     );
     ensure!(
         landed == 1,
-        "the claim did not land the rebuilt audit before submitblock"
+        "the claim did not land the rebuilt audit before settlement"
     );
     ensure!(
         node.chain.lock().await.submissions == 1,

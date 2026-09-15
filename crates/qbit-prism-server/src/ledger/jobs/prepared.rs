@@ -48,6 +48,9 @@ pub struct CompactPrepared {
     pub generation: u64,
     pub coinbase_suffix_hex: String,
     pub payout_policy: PayoutPolicy,
+    /// Explicit null means no CTV; omission is corruption, as in BundleInputs.
+    /// The storage reader also requires an exact canonical payload round-trip.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub ctv: Option<CandidateCtv>,
     pub fee: Option<FanoutFeeRatePolicy>,
     pub audit_builder_version: u16,
