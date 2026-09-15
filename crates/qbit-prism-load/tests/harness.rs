@@ -3036,6 +3036,17 @@ fn a_re_offer_the_server_called_a_duplicate_that_postgres_lacks_is_its_own_outco
     assert!(!summary_text(&report, &withheld, &[]).contains("mid-flight kill:"));
 }
 
+/// One phase as `classify_gaps` takes it, with the kill's census.
+fn driven(name: &str, kill_indeterminate: &[&str]) -> run::DrivenPhase {
+    run::DrivenPhase {
+        name: name.to_owned(),
+        kill_indeterminate: kill_indeterminate
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect(),
+    }
+}
+
 #[test]
 fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_it() {
     use qbit_prism_load::client::Outcome;
@@ -3145,7 +3156,7 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
     let attribution =
         digest::attribute_unexpected(&committed, &[("steady_state".to_owned(), &reconciliation)]);
     let gaps = classify_gaps(
-        &[("steady_state".to_owned(), false)],
+        &[driven("steady_state", &[])],
         &[("steady_state".to_owned(), reconciliation)],
         &attribution,
         std::slice::from_ref(&record),
@@ -3195,8 +3206,9 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
         .expect("a no-response commit is explained");
     assert!(explanation.contains("no response"), "{explanation}");
     assert!(explanation.contains("nothing lost"), "{explanation}");
-    // The mid-flight kill's own indeterminate shares are still its own
-    // business: the exemption is unchanged.
+    // The mid-flight kill's own indeterminate shares are its own business:
+    // one in its census is reported there, under `mid_flight_kill`, and in
+    // none of these buckets.
     let committed = set(&[record.share_id.as_str()]);
     let reconciliation = digest::reconcile(committed.clone(), set(&[]), &committed);
     let attribution = digest::attribute_unexpected(
@@ -3204,7 +3216,7 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
         &[("mid_flight_kill".to_owned(), &reconciliation)],
     );
     let gaps = classify_gaps(
-        &[("mid_flight_kill".to_owned(), true)],
+        &[driven("mid_flight_kill", &[record.share_id.as_str()])],
         &[("mid_flight_kill".to_owned(), reconciliation)],
         &attribution,
         std::slice::from_ref(&record),
@@ -3212,6 +3224,142 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
     );
     assert_eq!(gaps.findings, json!([]));
     assert!(gaps.no_response_commits.is_empty());
+}
+
+/// With `--mid-flight-kill` the reconciliation analysis skipped the kill
+/// phase entirely, not just the no-responses the kill produced. A share
+/// that phase acknowledged in the ordinary way -- before the kill, on the
+/// healthy frontend, or after the relaunch -- and that PostgreSQL then lost
+/// sat in `reconciliation.missing`, reached no durability finding, and the
+/// run could exit 0: a false negative on the one thing the harness exists
+/// to catch. The exemption is now exactly the kill's census, the shares its
+/// re-offers and its `mid_flight_kill` report account for. Everything else
+/// in the phase is classified as it is in every other phase.
+#[test]
+fn a_kill_phase_does_not_hide_an_acknowledged_share_the_database_lost() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{classify_gaps, RunOutcome};
+    use std::collections::BTreeSet;
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    let no_response = || Outcome::NoResponse {
+        reason: "socket closed: end of stream".into(),
+    };
+    let with = |id: &str, frontend: usize, outcome: Outcome| client::SubmitRecord {
+        share_id: id.to_owned(),
+        frontend,
+        ..submit_record("mid_flight_kill", outcome)
+    };
+    // `kept` and `lost` were acknowledged in the ordinary way; PostgreSQL
+    // holds only `kept`. `killed` is the one submit the kill destroyed:
+    // its answer never came, it is in the census, and PostgreSQL holds it.
+    // `other` got no response on the healthy frontend, a socket closing for
+    // its own reasons in the same phase, and PostgreSQL holds it too.
+    // `refused` was rejected as a harness bug and is nonetheless committed,
+    // which nothing explains.
+    let records = vec![
+        with("kept", 0, Outcome::Accepted),
+        with("lost", 0, Outcome::Accepted),
+        with("killed", 1, no_response()),
+        with("other", 0, no_response()),
+        with(
+            "refused",
+            0,
+            Outcome::Rejected(rejection(
+                23,
+                Some("low-difficulty"),
+                "low difficulty share",
+            )),
+        ),
+    ];
+    let committed = set(&["kept", "killed", "other", "refused"]);
+    let (offered, acknowledged) = run::offered_and_acknowledged(&records, "mid_flight_kill");
+    assert_eq!(
+        offered,
+        set(&["kept", "lost", "killed", "other", "refused"])
+    );
+    assert_eq!(acknowledged, set(&["kept", "lost"]));
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    assert_eq!(reconciliation.missing, set(&["lost"]));
+    let attribution = digest::attribute_unexpected(
+        &committed,
+        &[("mid_flight_kill".to_owned(), &reconciliation)],
+    );
+    let gaps = classify_gaps(
+        &[driven("mid_flight_kill", &["killed"])],
+        &[("mid_flight_kill".to_owned(), reconciliation)],
+        &attribution,
+        &records,
+        15.0,
+    );
+    let findings = gaps
+        .findings
+        .as_array()
+        .expect("durability_findings is a list");
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert_eq!(findings[0]["phase"], json!("mid_flight_kill"));
+    assert_eq!(
+        findings[0]["kind"],
+        json!("acknowledged share missing from PostgreSQL")
+    );
+    assert_eq!(findings[0]["count"], json!(1));
+    assert_eq!(findings[0]["sample"], json!(["lost"]));
+    assert_eq!(findings[1]["phase"], json!("mid_flight_kill"));
+    assert_eq!(
+        findings[1]["kind"],
+        json!("committed share that was never acknowledged")
+    );
+    assert_eq!(findings[1]["sample"], json!(["refused"]));
+    // The healthy frontend's own no-response is transport-indeterminate, as
+    // it would be in any phase; the kill's is left to the kill's census.
+    assert_eq!(
+        gaps.no_response_commits.len(),
+        1,
+        "{:?}",
+        gaps.no_response_commits
+    );
+    assert_eq!(gaps.no_response_commits[0]["share_id"], json!("other"));
+    assert_eq!(gaps.no_response_commits[0]["window_ended"], json!(false));
+    assert!(gaps.divergences.is_empty() && gaps.unknown_outcome_commits.is_empty());
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: findings.len(),
+        harness_bug_rejections: 1,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: 1,
+        no_response_commits_mid_run: 1,
+    };
+    assert_eq!(
+        outcome.exit_code(),
+        run::EXIT_DURABILITY,
+        "a loss in the kill phase weighs what a loss anywhere weighs"
+    );
+
+    // A kill that found nothing outstanding has an empty census and exempts
+    // nothing: the phase is then an ordinary phase, and its `killed` row,
+    // committed with no answer read, is a no-response commit like `other`.
+    let (offered, acknowledged) = run::offered_and_acknowledged(&records, "mid_flight_kill");
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution = digest::attribute_unexpected(
+        &committed,
+        &[("mid_flight_kill".to_owned(), &reconciliation)],
+    );
+    let gaps = classify_gaps(
+        &[driven("mid_flight_kill", &[])],
+        &[("mid_flight_kill".to_owned(), reconciliation)],
+        &attribution,
+        &records,
+        15.0,
+    );
+    assert_eq!(
+        gaps.no_response_commits
+            .iter()
+            .map(|share| share["share_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("killed"), json!("other")]
+    );
+    assert_eq!(gaps.findings.as_array().map(Vec::len), Some(2));
 }
 
 /// `reconciliation.unexpected_outside_phases` counted the run-prefixed rows
@@ -3233,13 +3381,13 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
         |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
     // One phase offered and was acknowledged `a`; the database also holds
     // `z`, which no phase offered. A mid-flight kill phase ran too: its
-    // exemption covers its own indeterminate rows, not rows outside every
+    // census covers its own indeterminate rows, not rows outside every
     // phase.
     let committed = set(&["a", "z"]);
     let reconciliation = digest::reconcile(set(&["a"]), set(&["a"]), &committed);
     let phases = vec![
-        ("steady_state".to_owned(), false),
-        ("mid_flight_kill".to_owned(), true),
+        driven("steady_state", &[]),
+        driven("mid_flight_kill", &["k"]),
     ];
     let reconciliations = vec![("steady_state".to_owned(), reconciliation.clone())];
     let attribution =

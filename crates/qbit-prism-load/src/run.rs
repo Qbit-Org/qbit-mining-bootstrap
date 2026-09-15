@@ -1647,9 +1647,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .filter(|record| !record.reoffer && bug_rejection(record))
         .collect();
-    let driven: Vec<(String, bool)> = runs
+    let driven: Vec<DrivenPhase> = runs
         .iter()
-        .map(|phase| (phase.plan.name.clone(), phase.plan.mid_flight_kill))
+        .map(|phase| DrivenPhase {
+            name: phase.plan.name.clone(),
+            kill_indeterminate: phase
+                .mid_flight_indeterminate
+                .iter()
+                .map(|record| record.share_id.clone())
+                .collect(),
+        })
         .collect();
     let gaps = classify_gaps(
         &driven,
@@ -3185,9 +3192,19 @@ pub fn outside_phases_finding(rows: &[String]) -> Option<Value> {
     }))
 }
 
-/// `phases` is every phase the run drove, as `(name, mid_flight_kill)`.
+/// One phase the run drove, as `classify_gaps` needs it: its name, and the
+/// shares its mid-flight kill made indeterminate. That set is the kill's
+/// census, empty for every other phase and for a kill that found nothing
+/// outstanding, and it is the only thing the kill exempts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DrivenPhase {
+    pub name: String,
+    pub kill_indeterminate: BTreeSet<String>,
+}
+
+/// `phases` is every phase the run drove.
 pub fn classify_gaps(
-    phases: &[(String, bool)],
+    phases: &[DrivenPhase],
     reconciliations: &[(String, digest::Reconciliation)],
     attribution: &digest::UnexpectedAttribution,
     submits: &[SubmitRecord],
@@ -3202,12 +3219,22 @@ pub fn classify_gaps(
         .filter(|record| !record.reoffer)
         .map(|record| (record.share_id.as_str(), record))
         .collect();
-    for (phase_name, mid_flight_kill) in phases {
-        // Only a phase that deliberately tears a socket down can legitimately
-        // produce an indeterminate share; everywhere else a gap is a finding.
-        if *mid_flight_kill {
-            continue;
-        }
+    for DrivenPhase {
+        name: phase_name,
+        kill_indeterminate,
+    } in phases
+    {
+        // The mid-flight kill destroys the answers to the submits outstanding
+        // on the frontend it kills, and those shares are its census:
+        // re-offered, and reported under `mid_flight_kill` with the server's
+        // answer and whether PostgreSQL holds each. They are all the kill
+        // explains. The whole phase used to be skipped here, so a share it
+        // acknowledged in the ordinary way and PostgreSQL then lost stayed in
+        // `reconciliation.missing`, reached no finding, and the run could
+        // exit 0: a false negative on the one thing the harness exists to
+        // catch (EP-ERRORS). Now only a committed row whose submit is in the
+        // census is left to the census; every other gap in the phase is what
+        // it would be anywhere else.
         let Some((_, reconciliation)) = reconciliations.iter().find(|(name, _)| name == phase_name)
         else {
             continue;
@@ -3257,6 +3284,10 @@ pub fn classify_gaps(
                         unknown_outcomes.push(detail);
                     }
                 }
+                // The kill's own: its re-offer and its PostgreSQL outcome are
+                // in the `mid_flight_kill` census, and the lost answer is the
+                // scenario, not a transport accident the run answers for.
+                GapKind::NoResponseCommitted if kill_indeterminate.contains(share) => {}
                 GapKind::NoResponseCommitted => {
                     let reason = record.and_then(|record| match &record.outcome {
                         Outcome::NoResponse { reason } => Some(reason.clone()),
@@ -3285,8 +3316,8 @@ pub fn classify_gaps(
             }));
         }
     }
-    // The rows no phase claims are not any phase's, so the mid-flight
-    // exemption above cannot cover them: they are findings in every run.
+    // The rows no phase claims are not any phase's, so no kill's census can
+    // cover them: they are findings in every run.
     findings.extend(outside_phases_finding(&attribution.outside_phases));
     GapReport {
         findings: json!(findings),

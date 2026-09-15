@@ -109,7 +109,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--slow-database-seconds` | 60 | `slow_database` phase length |
 | `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
 | `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
-| `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase. That phase runs under the same proxy delay as `slow_database` and the kill waits for the target frontend to actually hold work, because with no delay an acknowledgement takes a few milliseconds and the scenario would quietly not happen. The report carries `submits_outstanding_at_kill`, and zero there means it did not exercise. The kill, the relaunch, the readiness wait and the re-offers are driven from the scheduler loop without stalling it, as the `reconnect` phase's restart is, so the other frontends keep receiving their scheduled load throughout; a relaunch that exits or never answers `/healthz` within `--work-timeout` aborts the run (exit 6) |
+| `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase. That phase runs under the same proxy delay as `slow_database` and the kill waits for the target frontend to actually hold work, because with no delay an acknowledgement takes a few milliseconds and the scenario would quietly not happen. The report carries `submits_outstanding_at_kill`, and zero there means it did not exercise. Only the shares the kill made indeterminate are exempt from reconciliation; an acknowledged share this phase loses is a durability finding (exit 4) as in every other phase. The kill, the relaunch, the readiness wait and the re-offers are driven from the scheduler loop without stalling it, as the `reconnect` phase's restart is, so the other frontends keep receiving their scheduled load throughout; a relaunch that exits or never answers `/healthz` within `--work-timeout` aborts the run (exit 6) |
 | `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of rebuild-pending rejections on every frontend afterwards. With `--cadence dense` this is instead the dense phase's landing budget, and `steady_state` schedules none |
 | `--cadence` | `none` | `none`, or `dense` for the dense-cadence side phase (#271 criterion 6) |
 | `--cadence-seconds` | 240 | Length of the `dense_cadence` phase |
@@ -848,6 +848,21 @@ and ignored. The printed summary names the possible losses. None of this
 changes the exit code, because the mid-flight kill is a deliberate side
 scenario in which indeterminate shares are legitimate, but it is never
 dropped.
+
+That census is the whole of what the kill exempts from the classification
+above. The `mid_flight_kill` phase used to be skipped by it entirely, so a
+share the phase acknowledged in the ordinary way -- before the kill, on the
+healthy frontend, or after the relaunch -- that PostgreSQL then lost sat in
+that phase's `reconciliation.missing` and reached no finding, and the run could
+exit 0. Now every gap in the phase is classified as it is in every other
+phase: an acknowledged share missing from PostgreSQL, or a committed row that
+nothing explains, is in `durability_findings` under `mid_flight_kill` and
+exits 4; a committed row whose submit got no response that the kill did not
+cause -- a socket on the healthy frontend closing for its own reasons -- is in
+`no_response_commits` and can exit 5. Only a committed row whose submit is one
+of the kill's indeterminate shares is left to the census, where its re-offer
+and its PostgreSQL outcome already are. A kill that found nothing outstanding
+has an empty census and exempts nothing.
 
 ## Measurement hygiene
 
