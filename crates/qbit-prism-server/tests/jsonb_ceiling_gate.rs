@@ -163,19 +163,9 @@ struct Violation {
     phase: &'static str,
 }
 
-/// The two known window-carrying writes at this base commit. Each entry names
-/// the issue that removes it; when that lands, the gate fails until the entry
-/// is deleted. The candidate enqueue (`qbit_block_candidate_outbox.candidate`)
-/// was removed by #265: the row stores a window reference and its block as
-/// `bytea`, so the JSONB document is O(1) in the window.
-const KNOWN_VIOLATIONS: &[Violation] = &[
-    // 3 window copies (2 x AcceptedShare + 1 x CountedShare). Removed by #273.
-    Violation {
-        table: "qbit_prism_jobs",
-        column: "payload",
-        phase: PHASE_REFRESH,
-    },
-];
+/// No measured write still embeds the payout window. Compact refresh (#273)
+/// removed the last exception; any future crossing write fails the gate.
+const KNOWN_VIOLATIONS: &[Violation] = &[];
 
 /// Phases the gate is knowingly unable to drive. Empty at this base commit:
 /// every phase runs against the in-process fake node and the ledger API, so
