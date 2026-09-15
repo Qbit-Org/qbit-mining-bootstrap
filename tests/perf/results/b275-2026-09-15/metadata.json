@@ -1,0 +1,85 @@
+{
+  "tested_sha": "3d4775cacc8c6f8376df0ce028d1083bda738746",
+  "runtime_baseline_sha": "1b0d409344c1b99f5f4bd04970890b9b034a9eeb",
+  "git_tree": "f2063cc1c9f255c248001c8a797b16898c651e93",
+  "hardware": "hw.model: Mac16,6\nhw.ncpu: 14\nhw.memsize: 38654705664\nmachdep.cpu.brand_string: Apple M4 Max\nkern.maxfiles: 276480\nkern.maxfilesperproc: 138240\n",
+  "os": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5.1\nBuildVersion:\t\t25F80\n",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)\n",
+  "profile": "test: unoptimized + debuginfo; existing compiled target reused without build",
+  "binary_relative_path": "target/debug/deps/b275_persistence_measure-696abc204732aa70",
+  "binary_sha256": "12218b5a4d018fa15cd27a1e6fbea8ad0a6d40402da5114d02cd198fc57ab02c",
+  "binary_mtime_utc": "2026-09-15T20:57:38.653790+00:00",
+  "nofile_soft": 16384,
+  "nofile_hard": 9223372036854775807,
+  "database_url": "postgresql://dan@127.0.0.1:55475/b275_measure",
+  "postgres_data_directory": "/private/tmp/b275-pg16.P6sp0H/data",
+  "coordination": "Runtime author ctx_72c6082ed9b1 confirmed quiet at 21:18:21Z; refresh-prep ctx_3b5412438b9f completed per coordinator; separate build observed at preflight was allowed to finish.",
+  "command": [
+    "target/debug/deps/b275_persistence_measure-696abc204732aa70",
+    "measure_2000_sessions_one_and_two_frontends",
+    "--ignored",
+    "--exact",
+    "--test-threads=2",
+    "--nocapture"
+  ],
+  "environment": {
+    "PRISM_TEST_REQUIRE_INTEGRATION": "1",
+    "PRISM_TEST_DATABASE_URL": "postgresql://dan@127.0.0.1:55475/b275_measure",
+    "RUST_BACKTRACE": "1"
+  },
+  "test_deadlines_seconds": {
+    "login": 30,
+    "delivery": 120,
+    "per_topology_body": 240
+  },
+  "qualification": "debug 16-share synthetic-node fanout baseline; not production-shaped qualification",
+  "repetitions": [
+    {
+      "repetition": 1,
+      "started_utc": "2026-09-15T22:03:44.241232+00:00",
+      "exit_code": 0,
+      "completed_utc": "2026-09-15T22:03:51.325499+00:00",
+      "wall_seconds": 7.084219915792346,
+      "measurement_count": 2,
+      "durability_lines": [
+        "B275_DURABILITY frontends=1 sessions=2000 verified=true",
+        "B275_DURABILITY frontends=2 sessions=2000 verified=true"
+      ]
+    },
+    {
+      "repetition": 2,
+      "started_utc": "2026-09-15T22:03:57.148865+00:00",
+      "exit_code": 0,
+      "completed_utc": "2026-09-15T22:04:03.260772+00:00",
+      "wall_seconds": 6.111863083671778,
+      "measurement_count": 2,
+      "durability_lines": [
+        "B275_DURABILITY frontends=1 sessions=2000 verified=true",
+        "B275_DURABILITY frontends=2 sessions=2000 verified=true"
+      ]
+    },
+    {
+      "repetition": 3,
+      "started_utc": "2026-09-15T22:04:08.932168+00:00",
+      "exit_code": 0,
+      "completed_utc": "2026-09-15T22:04:16.093855+00:00",
+      "wall_seconds": 7.1616638749837875,
+      "measurement_count": 2,
+      "durability_lines": [
+        "B275_DURABILITY frontends=1 sessions=2000 verified=true",
+        "B275_DURABILITY frontends=2 sessions=2000 verified=true"
+      ]
+    }
+  ],
+  "postgres_settings": {
+    "database": "b275_measure",
+    "data_directory": "/private/tmp/b275-pg16.P6sp0H/data",
+    "server_version_num": "160014",
+    "fsync": "on",
+    "full_page_writes": "on",
+    "synchronous_commit": "on",
+    "recovery": false
+  },
+  "remaining_schemas": []
+}
