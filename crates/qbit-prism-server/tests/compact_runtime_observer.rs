@@ -1,5 +1,4 @@
-//! Independent observer/HTTP controls for later compact runtime qualification.
-//! These tests run existing Coordinator and Ledger entry points; no activation.
+//! Independent PostgreSQL/HTTP controls for real compact runtime qualification.
 use anyhow::{ensure, Context, Result};
 use futures_util::{future::LocalBoxFuture, FutureExt};
 use qbit_prism_server::{
@@ -346,4 +345,46 @@ async fn node_pause_preserves_captured_reply_and_releases_cancelled_guards() -> 
     node.set_template(None);
     ensure!(rpc(node.url.clone(), "getblocktemplate").await?["result"]["height"] == 102);
     Ok(())
+}
+
+#[tokio::test]
+async fn completed_commit_pause_releases_database_locks_before_reply_delivery() -> Result<()> {
+    run(|db| async move {
+        sqlx::raw_sql("CREATE TABLE paused_commits(id integer PRIMARY KEY);
+            CREATE FUNCTION mark_paused_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE NOTICE 'prism-execution-marker paused_commits INSERT'; RETURN NULL; END $$;
+            CREATE TRIGGER mark_paused_commit AFTER INSERT ON paused_commits
+            FOR EACH STATEMENT EXECUTE FUNCTION mark_paused_commit()")
+            .execute(&db.direct).await?;
+        for release_explicitly in [false, true] {
+            let pause = db.proxy.pause_after_commit("paused_commits", "INSERT")?;
+            let mut tx = db.ledger.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(427301)").execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO paused_commits VALUES($1)")
+                .bind(i32::from(release_explicitly)).execute(&mut *tx).await?;
+            let mut commit = Box::pin(tx.commit());
+            let seq = tokio::select! {
+                entered = tokio::time::timeout(Duration::from_secs(5), pause.entered()) => entered?,
+                result = &mut commit => { result?; anyhow::bail!("commit reply escaped its delivery pause"); }
+            };
+            let observed = db.proxy.executions_since(seq - 1)?;
+            let completed = observed.iter().find(|execution| execution.seq == seq).context("missing commit")?;
+            ensure!(completed.is_commit() && !completed.delivered());
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM paused_commits").fetch_one(&db.direct).await?;
+            ensure!(count == 1 + i64::from(release_explicitly), "committed row must be visible before the reply");
+            let mut independent = db.direct.begin().await?;
+            let unlocked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(427301)")
+                .fetch_one(&mut *independent).await?;
+            ensure!(unlocked, "completed transaction must release its locks");
+            independent.rollback().await?;
+            ensure!(tokio::time::timeout(Duration::from_millis(10), &mut commit).await.is_err(),
+                "reply must remain paused after unrelated SQL completes");
+            if release_explicitly { pause.release(); }
+            drop(pause);
+            tokio::time::timeout(Duration::from_secs(5), commit).await??;
+            let observed = db.proxy.executions_since(seq - 1)?;
+            ensure!(observed.iter().find(|execution| execution.seq == seq).context("missing delivered commit")?.delivered());
+        }
+        Ok(())
+    }.boxed_local()).await
 }

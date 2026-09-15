@@ -45,11 +45,12 @@
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Start of the NOTICE message a fixture trigger raises:
@@ -230,6 +231,49 @@ pub struct Fault {
     pub phase: FaultPhase,
 }
 
+/// Holds a completed COMMIT reply after PostgreSQL has released transaction
+/// locks. Dropping the handle releases delivery, including on test cancellation.
+pub struct CommitPause(Arc<CommitPauseState>);
+
+#[derive(Default)]
+struct CommitPauseState {
+    entered: Notify,
+    release: Notify,
+    seq: AtomicU64,
+    released: AtomicBool,
+}
+
+impl CommitPause {
+    pub async fn entered(&self) -> u64 {
+        loop {
+            let entered = self.0.entered.notified();
+            tokio::pin!(entered);
+            entered.as_mut().enable();
+            let seq = self.0.seq.load(Ordering::SeqCst);
+            if seq != 0 {
+                return seq;
+            }
+            entered.await;
+        }
+    }
+    pub fn release(&self) {
+        self.0.released.store(true, Ordering::SeqCst);
+        self.0.release.notify_waiters();
+    }
+}
+
+impl Drop for CommitPause {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct PausePlan {
+    table: String,
+    op: String,
+    control: Arc<CommitPauseState>,
+}
+
 #[derive(Default)]
 struct State {
     executions: Vec<Execution>,
@@ -239,6 +283,8 @@ struct State {
     armed: Option<u64>,
     /// Sequence number of the execution whose acknowledgement was withheld.
     fired: Option<u64>,
+    pause_plan: Option<PausePlan>,
+    pause_armed: Option<u64>,
 }
 
 struct Shared {
@@ -369,6 +415,24 @@ impl ExecutionProxy {
         state.plan = Some(fault);
         state.armed = None;
         state.fired = None;
+    }
+
+    /// Pause only the completed COMMIT following the next marked mutation.
+    /// The observer reports completed-but-undelivered until forwarding succeeds.
+    pub fn pause_after_commit(&self, table: &str, op: &str) -> Result<CommitPause> {
+        let mut state = self.shared.state.lock().expect("proxy state");
+        ensure!(
+            state.plan.is_none() && state.pause_plan.is_none(),
+            "proxy already has a delivery plan"
+        );
+        let control = Arc::new(CommitPauseState::default());
+        state.pause_plan = Some(PausePlan {
+            table: table.into(),
+            op: op.into(),
+            control: control.clone(),
+        });
+        state.pause_armed = None;
+        Ok(CommitPause(control))
     }
 
     /// Sequence number of the execution whose acknowledgement the last
@@ -684,6 +748,10 @@ async fn pump_client(
 enum Action {
     Forward,
     Sever,
+    Pause {
+        index: usize,
+        control: Arc<CommitPauseState>,
+    },
 }
 
 async fn pump_server(
@@ -735,6 +803,23 @@ async fn pump_server(
         match action {
             Action::Forward => to.write_all(&frame(kind, &body)?).await?,
             Action::Sever => return Ok(()),
+            Action::Pause { index, control } => {
+                // No observer lock or PostgreSQL transaction lock is held here.
+                loop {
+                    let release = control.release.notified();
+                    tokio::pin!(release);
+                    release.as_mut().enable();
+                    if control.released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    release.await;
+                }
+                to.write_all(&frame(kind, &body)?).await?;
+                let mut state = shared.state.lock().expect("proxy state");
+                if let Outcome::Completed { delivered, .. } = &mut state.executions[index].outcome {
+                    *delivered = true;
+                }
+            }
         }
     }
     Ok(())
@@ -791,6 +876,8 @@ fn complete(
         plan,
         armed,
         fired,
+        pause_plan,
+        pause_armed,
     } = &mut *state;
     let execution = &mut executions[index];
     if let Some(count) = tag.strip_prefix("SELECT ") {
@@ -814,10 +901,26 @@ fn complete(
             _ => {}
         }
     }
+    let mut pause = None;
+    if !sever {
+        if let Some(plan) = pause_plan.as_ref() {
+            if execution.marked(&plan.table, &plan.op) {
+                *pause_armed = Some(id);
+            } else if *pause_armed == Some(id) && tag == "COMMIT" {
+                pause = Some(plan.control.clone());
+                *pause_plan = None;
+                *pause_armed = None;
+            }
+        }
+    }
     execution.outcome = Outcome::Completed {
         tag,
-        delivered: !sever,
+        delivered: !sever && pause.is_none(),
     };
+    if let Some(control) = &pause {
+        control.seq.store(execution.seq, Ordering::SeqCst);
+        control.entered.notify_waiters();
+    }
     if sever {
         *fired = Some(execution.seq);
         *plan = None;
@@ -829,6 +932,8 @@ fn complete(
     }
     if sever {
         Ok(Action::Sever)
+    } else if let Some(control) = pause {
+        Ok(Action::Pause { index, control })
     } else {
         Ok(Action::Forward)
     }
@@ -936,6 +1041,9 @@ fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Optio
         let mut state = shared.state.lock().expect("proxy state");
         if state.armed == Some(id) && state.fired.is_none() {
             state.armed = None;
+        }
+        if state.pause_armed == Some(id) {
+            state.pause_armed = None;
         }
     }
 }
