@@ -448,6 +448,12 @@ SELECT jsonb_build_object('kind', 'chain_checkpoint', 'row', jsonb_build_object(
 FROM qbit_prism_cluster c
 WHERE best_chainwork <> 0 OR best_tip_hash IS NOT NULL OR best_tip_height IS NOT NULL
 ORDER BY singleton;
+-- Ledger::configure pins the frontend's consensus, payout and signing
+-- configuration onto a NULL fingerprint and rejects a mismatch otherwise, so
+-- a restore that loses the pin must be visible. NULL is the migration default.
+SELECT jsonb_build_object('kind', 'cluster_config', 'row', jsonb_build_object(
+    'config_fingerprint', config_fingerprint))
+FROM qbit_prism_cluster c WHERE config_fingerprint IS NOT NULL ORDER BY singleton;
 \endif
 \if :has_fatal_state_events
 SELECT jsonb_build_object('kind', 'fatal_state_events', 'row', to_jsonb(e))

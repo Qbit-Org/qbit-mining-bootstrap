@@ -19,7 +19,8 @@ def summarize(lines):
         "ctv_sets", "ctv_artifacts", "ctv_checkpoints", "ctv_retry_progress",
         "ctv_broadcast_attempts",
         "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
-        "fatal_state", "fatal_state_events", "chain_checkpoint", "active_carry",
+        "fatal_state", "fatal_state_events", "chain_checkpoint", "cluster_config",
+        "active_carry",
     )
     hashes = {kind: hashlib.sha256() for kind in kinds}
     counts = dict.fromkeys(kinds, 0)

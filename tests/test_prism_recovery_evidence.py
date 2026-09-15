@@ -117,6 +117,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
         baseline = module.summarize(iter(closing()))
         fatal = {"fatal_error": "fanout disconnected", "fatal_error_set_at": None}
         checkpoint = {"best_chainwork": "2", "best_tip_hash": "aa" * 32, "best_tip_height": 7}
+        config = {"config_fingerprint": "fingerprint-one"}
         event = {
             "event_id": 1, "cleared_at": "2026-09-14T21:00:00+00:00",
             "operator_identity": "operator", "database_role": "prism",
@@ -124,7 +125,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
             "instances": [], "reconciliation": {"blocks_checked": 1},
         }
         for kind, row in (("fatal_state", fatal), ("fatal_state_events", event),
-                          ("chain_checkpoint", checkpoint)):
+                          ("chain_checkpoint", checkpoint), ("cluster_config", config)):
             with self.subTest(kind=kind):
                 self.assertEqual(baseline["records"][kind]["count"], 0)
                 added = module.summarize(iter([record(kind, row)] + closing()))

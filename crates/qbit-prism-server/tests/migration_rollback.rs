@@ -146,7 +146,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         for kind in [
             "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
-            "fatal_state", "fatal_state_events",
+            "fatal_state", "fatal_state_events", "cluster_config",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
         }
@@ -368,6 +368,30 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             ensure!(unchanged == prior, "unrelated accounting changed with chain checkpoint");
             prior = current;
         }
+        // Ledger::configure pins whatever configuration a frontend supplies
+        // onto a NULL fingerprint, so a restore that loses or changes the pin
+        // must be visible even when every accounting row is unchanged.
+        ensure!(prior["records"]["cluster_config"]["count"] == 0);
+        let before_config = prior.clone();
+        for (value, count) in [("'fingerprint-one'", 1), ("'fingerprint-two'", 1), ("NULL", 0)] {
+            sqlx::query(&format!("UPDATE qbit_prism_cluster SET config_fingerprint={value}"))
+                .execute(&source.pool).await?;
+            let current = recovery::evidence(&source, pg_bin).await?;
+            ensure!(current["records"]["cluster_config"]["count"] == count);
+            ensure!(current["records"]["cluster_config"]["sha256"]
+                != prior["records"]["cluster_config"]["sha256"],
+                "cluster configuration change was invisible to recovery evidence: {value}");
+            let mut unchanged = current.clone();
+            unchanged["records"]["cluster_config"] = prior["records"]["cluster_config"].clone();
+            ensure!(unchanged == prior, "unrelated accounting changed with cluster configuration");
+            prior = current;
+        }
+        ensure!(prior == before_config);
+        // Leave a pinned configuration for the native backup roundtrip below.
+        sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint='recovery-fingerprint'")
+            .execute(&source.pool).await?;
+        prior = recovery::evidence(&source, pg_bin).await?;
+        ensure!(prior["records"]["cluster_config"]["count"] == 1);
         let before_halt = prior.clone();
         for mutation in [
             "fatal_error='deep confirmed CTV fanout disconnected: test; manual reconciliation required'",
