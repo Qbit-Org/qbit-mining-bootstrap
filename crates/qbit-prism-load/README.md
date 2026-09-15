@@ -856,10 +856,11 @@ believes it has a share the database does not), `reoffer-rejected` and
 `reoffer-unanswered`. The two in which the server and the database disagree
 are `possible_losses`, and the duplicate case is also reported on its own
 under `duplicate_not_in_postgres` with its share ids; it used to be recorded
-and ignored. The printed summary names the possible losses. None of this
-changes the exit code, because the mid-flight kill is a deliberate side
-scenario in which indeterminate shares are legitimate, but it is never
-dropped.
+and ignored. The printed summary names the possible losses. An accepted
+re-offer is a new acknowledgement: if its row is missing, it also appears
+in `durability_findings` and the run exits 4. A duplicate or unanswered
+re-offer does not create an acknowledgement and keeps its existing census
+classification without changing the exit code.
 
 That census is the whole of what the kill exempts from the classification
 above. The `mid_flight_kill` phase used to be skipped by it entirely, so a

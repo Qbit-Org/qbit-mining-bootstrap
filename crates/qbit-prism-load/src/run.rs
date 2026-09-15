@@ -2530,6 +2530,9 @@ fn rejected_valid_count(records: &[SubmitRecord], phase: &str) -> u64 {
 /// to lose is not an offered valid share: it never reaches PostgreSQL, and the
 /// full census is in the side report. Everything else the harness offered and
 /// did not get acknowledged stays in O, so the artifact cannot hide it.
+/// Accepted re-offers belong to both sets too: the kill explains a missing
+/// original answer, but not a missing row after a later acknowledgement.
+/// Share IDs are deduplicated, so retrying never counts a share twice.
 pub fn offered_and_acknowledged(
     records: &[SubmitRecord],
     phase: &str,
@@ -2537,7 +2540,7 @@ pub fn offered_and_acknowledged(
     let mut offered = BTreeSet::new();
     let mut acknowledged = BTreeSet::new();
     for record in records.iter().filter(|record| record.phase == phase) {
-        if record.reoffer {
+        if record.reoffer && !matches!(record.outcome, Outcome::Accepted) {
             continue;
         }
         match &record.outcome {
@@ -2720,7 +2723,7 @@ pub enum ReofferOutcome {
     /// re-offer got it in.
     ReofferAcceptedAndCommitted,
     /// The re-offer was accepted and PostgreSQL does not hold the share: an
-    /// acknowledged share with no row, a possible loss.
+    /// acknowledged share with no row, also a durability finding (exit 4).
     ReofferAcceptedNotInPostgres,
     /// The server called the re-offer a duplicate and PostgreSQL holds the
     /// share: the original had committed before the kill, and only its

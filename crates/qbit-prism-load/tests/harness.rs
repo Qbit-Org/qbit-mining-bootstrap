@@ -3500,6 +3500,109 @@ fn a_kill_phase_does_not_hide_an_acknowledged_share_the_database_lost() {
     assert_eq!(gaps.findings.as_array().map(Vec::len), Some(2));
 }
 
+/// Losing the original answer during a deliberate kill is permitted; losing
+/// a share after its re-offer was acknowledged is still a durability failure.
+#[test]
+fn an_acknowledged_reoffer_missing_from_postgres_is_a_durability_loss() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{classify_gaps, RunOutcome};
+    use std::collections::BTreeSet;
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    let ids = ["accepted-kept", "accepted-lost", "duplicate", "unanswered"];
+    let originals: Vec<_> = ids
+        .iter()
+        .map(|id| client::SubmitRecord {
+            share_id: (*id).to_owned(),
+            ..submit_record(
+                "mid_flight_kill",
+                Outcome::NoResponse {
+                    reason: "socket closed during kill".into(),
+                },
+            )
+        })
+        .collect();
+    let mut records = originals.clone();
+    for (original, outcome) in originals.iter().zip([
+        Outcome::Accepted,
+        Outcome::Accepted,
+        Outcome::Rejected(rejection(22, Some("duplicate-share"), "duplicate share")),
+        Outcome::NoResponse {
+            reason: "socket closed".into(),
+        },
+    ]) {
+        records.push(client::SubmitRecord {
+            reoffer: true,
+            outcome,
+            ..original.clone()
+        });
+    }
+    // Duplicate accepted responses do not inflate set counts.
+    records.push(records[4].clone());
+    for lost in [true, false] {
+        let committed = if lost {
+            set(&["accepted-kept"])
+        } else {
+            set(&["accepted-kept", "accepted-lost"])
+        };
+        let (offered, acknowledged) = run::offered_and_acknowledged(&records, "mid_flight_kill");
+        assert_eq!(offered, set(&ids));
+        assert_eq!(acknowledged, set(&["accepted-kept", "accepted-lost"]));
+        let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+        assert_eq!(
+            reconciliation.missing,
+            if lost {
+                set(&["accepted-lost"])
+            } else {
+                BTreeSet::new()
+            }
+        );
+        let attribution = digest::attribute_unexpected(
+            &committed,
+            &[("mid_flight_kill".to_owned(), &reconciliation)],
+        );
+        let gaps = classify_gaps(
+            &[driven("mid_flight_kill", &ids)],
+            &[("mid_flight_kill".to_owned(), reconciliation)],
+            &attribution,
+            &records,
+            15.0,
+        );
+        let findings = gaps.findings.as_array().unwrap();
+        assert_eq!(findings.len(), usize::from(lost));
+        if lost {
+            assert_eq!(
+                findings[0]["kind"],
+                json!("acknowledged share missing from PostgreSQL")
+            );
+            assert_eq!(findings[0]["sample"], json!(["accepted-lost"]));
+        }
+        assert!(gaps.divergences.is_empty());
+        assert!(gaps.unknown_outcome_commits.is_empty());
+        assert!(gaps.no_response_commits.is_empty());
+        let outcome = RunOutcome {
+            withhold: None,
+            durability_findings: findings.len(),
+            harness_bug_rejections: 0,
+            divergences: 0,
+            unknown_outcome_commits: 0,
+            no_response_commits: 0,
+            no_response_commits_mid_run: 0,
+        };
+        assert_eq!(
+            outcome.exit_code(),
+            if lost { run::EXIT_DURABILITY } else { 0 }
+        );
+        // The detailed census still keeps both accepted losses and duplicate
+        // anomalies, but only the actual acknowledgement causes exit 4.
+        let census = run::mid_flight_census(&originals, &records, &committed);
+        assert_eq!(
+            census["possible_losses"]["count"],
+            json!(1 + usize::from(lost))
+        );
+    }
+}
+
 /// `reconciliation.unexpected_outside_phases` counted the run-prefixed rows
 /// PostgreSQL holds that no phase claims, and nothing read the count: a run
 /// holding such a row reconciled clean and exited 0. Every share the harness
@@ -3944,11 +4047,12 @@ fn only_entitled_races_are_kept_out_of_the_offered_set() {
         acknowledged.iter().map(String::as_str).collect::<Vec<_>>(),
         vec!["accepted"]
     );
-    // A re-offer is never an offer of its own.
+    // An accepted re-offer is still an acknowledgement that must reconcile.
     let mut with_reoffer = records.clone();
     with_reoffer[0].reoffer = true;
-    let (offered, _) = run::offered_and_acknowledged(&with_reoffer, "steady_state");
-    assert!(!offered.contains("accepted"));
+    let (offered, acknowledged) = run::offered_and_acknowledged(&with_reoffer, "steady_state");
+    assert!(offered.contains("accepted"));
+    assert!(acknowledged.contains("accepted"));
 }
 
 /// A refusal is not an acknowledgement. The server answers one in
