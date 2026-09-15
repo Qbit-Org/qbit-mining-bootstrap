@@ -1,10 +1,10 @@
-//! Additive storage for the coordinated compact-prepared cutover (#273).
+//! Storage for the coordinated compact-prepared runtime cutover (#273).
 //!
-//! No runtime caller uses these APIs yet. Before enabling them, drain candidates
+//! Before enabling this runtime, drain candidates
 //! with compatible pre-007 frontends, stop ALL frontends, and verify zero pending
 //! candidates. Apply the coordinated migrations, then start compatible binaries.
-//! This is not a rolling old/new-writer contract. The generic job APIs keep
-//! their existing inline representation until the caller integration lands.
+//! This is not a rolling old/new-writer contract. Coordinator uses these typed
+//! APIs; generic job APIs remain available for their existing non-runtime callers.
 //!
 //! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
 //! ORDER_LOCK before inspecting references and deleting blobs. Prepared writers
@@ -87,6 +87,13 @@ impl PreparedTemplate {
 
     pub fn sha256(&self) -> &str {
         &self.digest
+    }
+
+    /// The in-memory decision fixture observes the typed encoder's exact
+    /// input without exposing blob bytes or adding a production decode API.
+    #[cfg(test)]
+    pub(crate) fn value_for_test(&self) -> Result<Value> {
+        Ok(serde_json::from_slice(&self.bytes)?)
     }
 }
 

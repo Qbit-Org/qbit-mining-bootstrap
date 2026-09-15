@@ -48,6 +48,9 @@ pub(crate) struct MemoryLedger {
     pub compact: work_store::CompactStore,
     pub clock_offset_ms: AtomicI64,
     pub snapshot: StdMutex<Option<Snapshot>>,
+    /// Full originals belong to the fixture, never to runtime Prepared views.
+    originals: StdMutex<HashMap<String, Arc<StoredPrepared>>>,
+    pub snapshots: StdMutex<Vec<Snapshot>>,
     pub tip: StdMutex<Option<String>>,
     pub save_gate: StdMutex<Option<Arc<Gate>>>,
     pub fail_save: AtomicBool,
@@ -334,6 +337,7 @@ impl Fixture {
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
             refresh_lock: Mutex::new(()),
+            resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -345,7 +349,8 @@ impl Fixture {
             server,
         };
         let job = fixture.job(1, 0, "original.worker");
-        *fixture.store.snapshot.lock().unwrap() = Some((*job.context.prepared.snapshot).clone());
+        *fixture.store.snapshot.lock().unwrap() =
+            Some((*fixture.original(&job.context.prepared).snapshot).clone());
         *fixture.coordinator.prepared.write().await = Some(job.context.prepared.clone());
         fixture
     }
@@ -369,7 +374,8 @@ impl Fixture {
             .map(|prepared| prepared.snapshot.payout_revision)
             .unwrap_or_default();
         let job = self.job(tip, revision, "original.worker");
-        *self.store.snapshot.lock().unwrap() = Some((*job.context.prepared.snapshot).clone());
+        *self.store.snapshot.lock().unwrap() =
+            Some((*self.original(&job.context.prepared).snapshot).clone());
         *self.coordinator.prepared.write().await = Some(job.context.prepared.clone());
         self.coordinator
             .observed_tip
@@ -432,7 +438,7 @@ impl Fixture {
             .unwrap(),
         );
         let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_800_000_000u32,
-            "previousblockhash":hash(tip),"transactions":[]});
+            "previousblockhash":hash(tip),"transactions":[],"height":101,"coinbasevalue":500_000_000u64});
         let mut wire = codec::Job::from_manifest(
             "issued-job".into(),
             &template,
@@ -457,33 +463,69 @@ impl Fixture {
             ),
             audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
         };
-        let prepared = Arc::new(Prepared {
-            stored: Arc::new(StoredPrepared {
-                template: template.clone(),
-                snapshot: snapshot.clone(),
-                bundle: Some(bundle.clone()),
-                inputs: Some(inputs.clone()),
-                fee: None,
-                fingerprint: "fixture".into(),
-                generation: 1,
-                parent_of_tip: hash(tip.saturating_sub(1)),
-                coinbase_suffix: "00".repeat(12),
-            }),
-            repair: Arc::new(Mutex::new(())),
-            repair_probe: Default::default(),
-            window: WindowRef::from_snapshot(&snapshot).expect("fixture window reference"),
-            inputs,
-            template,
-            snapshot,
+        let stored = Arc::new(StoredPrepared {
+            template: template.clone(),
+            snapshot: snapshot.clone(),
             bundle: Some(bundle.clone()),
-            base_wire: None,
-            storage_key: "fixture".into(),
+            inputs: Some(inputs.clone()),
             fee: None,
             fingerprint: "fixture".into(),
             generation: 1,
-            created: Instant::now(),
             parent_of_tip: hash(tip.saturating_sub(1)),
+            coinbase_suffix: "00".repeat(12),
         });
+        let key = format!(
+            "prepared:fixture:{}",
+            hex::encode(&Sha256::digest(format!("{tip}:{revision}"))[..16])
+        );
+        self.store
+            .originals
+            .lock()
+            .unwrap()
+            .insert(key.clone(), stored.clone());
+        let window = WindowRef::from_snapshot(&snapshot).expect("fixture window reference");
+        let encoded = crate::ledger::PreparedTemplate::encode(&template).unwrap();
+        let record = crate::ledger::CompactPrepared::from_original_build(
+            &stored,
+            window,
+            &inputs,
+            &encoded,
+            Some(crate::ledger::PreparedAuditHashes {
+                audit_bundle_sha256: prepared_storage::compact::canonical_json_sha256(&bundle)
+                    .unwrap(),
+                coinbase_manifest_sha256: prepared_storage::compact::canonical_json_sha256(
+                    &bundle.signed_coinbase_manifest.manifest,
+                )
+                .unwrap(),
+            }),
+        )
+        .unwrap();
+        let captured = prepared_storage::compact::assemble_captured(
+            key,
+            record,
+            encoded,
+            template,
+            snapshot.prior_balances.clone(),
+            Some(PreparedBundle::from(&*bundle)),
+            Some(wire.clone()),
+            self.store.database_now() + 86_400_000,
+            Instant::now(),
+            None,
+        )
+        .unwrap();
+        let prepared = captured.original;
+        assert!(tip_observation::PreparedIdentity::from_stored(
+            &prepared.storage_key,
+            &stored,
+            window
+        )
+        .matches(&prepared));
+        assert!(tip_observation::PreparedIdentity::from_compact(
+            &prepared.storage_key,
+            &prepared.reservation.record
+        )
+        .matches(&prepared));
+        let bundle = prepared.bundle.clone().unwrap();
         MiningJob {
             wire,
             context: Arc::new(JobContext {
@@ -494,6 +536,82 @@ impl Fixture {
                 issuance_authority: None,
             }),
         }
+    }
+
+    /// The fixture, not Prepared, owns full originals used by legacy codec and
+    /// corruption controls. A runtime refresh can be observed from its exact
+    /// captured window and reservation without changing production retention.
+    fn original(&self, prepared: &Prepared) -> Arc<StoredPrepared> {
+        if let Some(original) = self
+            .store
+            .originals
+            .lock()
+            .unwrap()
+            .get(&prepared.storage_key)
+            .cloned()
+        {
+            return original;
+        }
+        let mut snapshot = self
+            .store
+            .snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(
+                self.store
+                    .originals
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|stored| &*stored.snapshot),
+            )
+            .find(|snapshot| WindowRef::from_snapshot(snapshot).unwrap() == prepared.window)
+            .cloned()
+            .unwrap_or_else(|| {
+                assert!(
+                    prepared.window.shares.is_none(),
+                    "fixture did not retain original snapshot"
+                );
+                Snapshot {
+                    anchor_ms: prepared.snapshot.anchor_ms,
+                    share_seq: prepared.snapshot.share_seq,
+                    payout_revision: prepared.snapshot.payout_revision,
+                    shares: vec![],
+                    prior_balances: (*prepared.reservation.balances).clone(),
+                }
+            });
+        snapshot.prior_balances = (*prepared.reservation.balances).clone();
+        let bundle = prepared.bundle.as_ref().map(|_| {
+            let body = bundle_build::build_body(
+                &self.coordinator.config,
+                &snapshot,
+                &prepared.template,
+                None,
+                prepared.reservation.record.coinbase_suffix_hex.clone(),
+                prepared.inputs.clone(),
+            )
+            .unwrap()
+            .0;
+            Arc::new(body.into_bundle(snapshot.shares.clone()))
+        });
+        let original = Arc::new(StoredPrepared {
+            template: prepared.template.clone(),
+            snapshot: Arc::new(snapshot),
+            bundle,
+            inputs: Some(prepared.inputs.clone()),
+            fee: prepared.fee,
+            fingerprint: prepared.fingerprint.clone(),
+            generation: prepared.generation,
+            parent_of_tip: prepared.parent_of_tip.clone(),
+            coinbase_suffix: prepared.reservation.record.coinbase_suffix_hex.clone(),
+        });
+        self.store
+            .originals
+            .lock()
+            .unwrap()
+            .insert(prepared.storage_key.clone(), original.clone());
+        original
     }
 
     pub fn proof(&self, job: &MiningJob<JobContext>, nonce: u32) -> codec::Submission {

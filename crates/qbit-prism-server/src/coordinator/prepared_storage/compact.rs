@@ -27,7 +27,7 @@ impl From<&CompactPrepared> for BundleInputs {
 
 impl CompactPrepared {
     #[cfg(test)]
-    fn from_original_build(
+    pub(in crate::coordinator) fn from_original_build(
         stored: &StoredPrepared,
         window: WindowRef,
         inputs: &BundleInputs,
@@ -300,7 +300,7 @@ pub(in crate::coordinator) struct CompactInputs {
     /// Coherent with the window read, but not a publication authorization.
     pub observed_payout_revision: i64,
     #[cfg(test)]
-    pub drop_probe: Option<CompactDropProbe>,
+    pub _drop_probe: Option<CompactDropProbe>,
     // Last field: cleanup drops the large inputs before releasing admission.
     pub build_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -826,7 +826,7 @@ impl Coordinator {
                     issued_expires_at_ms,
                     observed_payout_revision: window.payout_revision,
                     #[cfg(test)]
-                    drop_probe,
+                    _drop_probe: drop_probe,
                     build_permit,
                 })
             })

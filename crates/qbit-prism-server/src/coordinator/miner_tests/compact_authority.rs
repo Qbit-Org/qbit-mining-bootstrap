@@ -154,10 +154,19 @@ async fn cold_original_reservation_and_atomic_publication_preserve_identity() {
                 .hash,
             hash(1)
         );
-        assert!(
-            f.store.jobs.lock().unwrap().is_empty(),
-            "no inline persistence"
+        let rows = f.store.jobs.lock().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "idempotent reservation persists one dependency"
         );
+        let payload = &rows[&published.storage_key].payload;
+        assert_eq!(
+            payload["format_version"],
+            crate::ledger::CompactPrepared::FORMAT_VERSION
+        );
+        assert!(payload.get("snapshot").is_none());
+        assert!(payload.get("bundle").is_none());
     }
 }
 
@@ -491,6 +500,7 @@ async fn compact_build_proof_distinguishes_cached_refresh_from_superseding_publi
         let current = f.coordinator.prepared.read().await.clone().unwrap();
         assert_eq!(Arc::ptr_eq(&original, &current), !superseding);
         f.store.compact.saves.lock().unwrap().push_back(Ok(true));
+        f.store.compact.save_calls.lock().unwrap().clear();
         let reserved = f.coordinator.reserve_fresh_compact(&captured).await;
         assert_eq!(reserved.is_ok(), !superseding, "superseding={superseding}");
         assert_eq!(
