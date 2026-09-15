@@ -6,8 +6,10 @@
 //! INDEX CONCURRENTLY`, so these tests cover what that changes: the index
 //! set a fresh and a 2.x.x source end up with, that appends keep landing
 //! while a build waits, that an interrupted, pre-built or foreign index
-//! under a reserved name is rebuilt, kept or refused, and that an index
-//! swapped under a drop target while the builds run is refused too.
+//! under a reserved name is rebuilt, kept or refused, that an index
+//! swapped under a drop target while the builds run is refused too, and
+//! that a kept index swapped while the other replacement builds is refused
+//! before the version is recorded.
 use super::*;
 use anyhow::ensure;
 use qbit_prism_server::ledger::REQUIRED_SCHEMA_VERSIONS;
@@ -482,12 +484,14 @@ async fn migration_012_resumes_an_interrupted_build_keeps_its_own_index_and_refu
 /// waits, rename the index under `name` to `operator_kept` and create the
 /// operator's own index under `name` on operator_shares. The rename locks
 /// the index alone, not the table the build holds, so it lands at once.
-/// Returns the run's refusal and the operator's index as created.
+/// Returns the run's refusal, which must open with `refusal`, and the
+/// operator's index as created.
 async fn swap_during_build(
     db: &Database,
     pool: &PgPool,
     name: &str,
     share_id: u64,
+    refusal: &str,
 ) -> Result<(String, (String, bool, String))> {
     let index_state = "SELECT pg_get_indexdef(indexrelid),indisvalid,indexrelid::text FROM pg_index WHERE indexrelid=to_regclass($1)";
     let mut writer = pool.begin().await?;
@@ -534,17 +538,16 @@ async fn swap_during_build(
     let foreign = foreign?;
     let error = online
         .err()
-        .context("the online migration dropped an index swapped in while it built")?
+        .with_context(|| {
+            format!("the online migration finished although {name} was swapped while it built")
+        })?
         .to_string();
     let after: (String, bool, String) = sqlx::query_as(index_state)
         .bind(name)
         .fetch_one(pool)
         .await?;
     assert_eq!(after, foreign, "the operator's index was changed");
-    assert!(
-        error.contains("refusing to continue migration 11"),
-        "{error}"
-    );
+    assert!(error.contains(refusal), "{error}");
     assert!(
         error.contains(&format!(
             "index {name} on operator_shares now reads as CREATE INDEX {name} ON operator_shares USING btree (miner_id) (valid: true)"
@@ -589,7 +592,14 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
     // A release index the migration drops, swapped while the first build
     // waits. Both builds and the drop before it in plan order have run by
     // the time the swapped name is reached; the refusal says so.
-    let (error, _) = swap_during_build(&db, &pool, SEQ_WINDOW, 2).await?;
+    let (error, _) = swap_during_build(
+        &db,
+        &pool,
+        SEQ_WINDOW,
+        2,
+        "refusing to continue migration 11",
+    )
+    .await?;
     assert!(
         error.contains(&format!(
             "the name held the release's CREATE INDEX {SEQ_WINDOW} ON qbit_share_ledger "
@@ -672,7 +682,8 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
         .find(|(name, ..)| name == SEQ_WALK)
         .context("the failed build left no index")?;
     assert!(!leftover.2, "the failed build's index must be invalid");
-    let (error, _) = swap_during_build(&db, &pool, SEQ_WALK, 4).await?;
+    let (error, _) =
+        swap_during_build(&db, &pool, SEQ_WALK, 4, "refusing to continue migration 11").await?;
     assert!(
         error.contains(&format!(
             "the name held the invalid {SEQ_WALK_DEFINITION} on qbit_share_ledger an interrupted build left"
@@ -726,4 +737,97 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
     // committed.
     assert_eq!(share_count(&pool).await?, 3);
     db.close(vec![first, resumed, rebuilt]).await
+}
+
+/// A replacement already built and valid at preflight is kept without a
+/// build of its own, so the run's step for it is over before the other
+/// replacement's build starts, and that build takes hours on a large
+/// ledger, in which the kept index can be moved aside like a drop target.
+/// The whole declared set is looked up once more inside the transaction
+/// that records the version: the moved index is refused there, 11 is not
+/// recorded, and once the operator puts the name back the next start
+/// records it keeping both indexes.
+#[tokio::test]
+async fn migration_012_refuses_to_record_when_a_kept_index_moved_while_it_built() -> Result<()> {
+    const SEQ_WINDOW: &str = "qbit_share_ledger_accepted_seq_window_idx";
+    const MINER_RECENT: &str = "qbit_share_ledger_accepted_miner_recent_idx";
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let oid = |indexes: &[(String, String, bool, String)], name: &str| {
+        indexes
+            .iter()
+            .find(|(found, ..)| found == name)
+            .map(|(_, _, _, oid)| oid.clone())
+    };
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    undo_012(&pool).await?;
+    // An earlier build of the migration's own under one reserved name, so
+    // the run plans Keep for it and builds only the other replacement.
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE operator_shares (miner_id text); {SEQ_WALK_DEFINITION}"
+    ))
+    .execute(&pool)
+    .await?;
+    let prebuilt = ledger_indexes(&pool).await?;
+    // The kept index is swapped while that build waits. The build, its
+    // check and every drop then run as planned, and the record refuses.
+    let (error, _) =
+        swap_during_build(&db, &pool, SEQ_WALK, 2, "refusing to record migration 11").await?;
+    assert!(
+        error.contains(&format!(
+            "but the migration declares a valid {SEQ_WALK_DEFINITION} on qbit_share_ledger under that name"
+        )),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "It had already built {MINER_HISTORY} and dropped {MINER_RECENT}, {SEQ_WINDOW}, qbit_share_ledger_accepted_window_idx, qbit_share_ledger_template_height_idx; both stay as they are"
+        )),
+        "{error}"
+    );
+    assert!(error.contains("migrate again"), "{error}");
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    let after_refusal = ledger_indexes(&pool).await?;
+    let mut expected: Vec<&str> = KEPT.to_vec();
+    expected.extend([MINER_HISTORY, "operator_kept"]);
+    expected.sort_unstable();
+    let names: Vec<&str> = after_refusal
+        .iter()
+        .map(|(name, ..)| name.as_str())
+        .collect();
+    assert_eq!(names, expected);
+    let moved = after_refusal
+        .iter()
+        .find(|(name, ..)| name == "operator_kept")
+        .context("the kept index is missing")?;
+    assert!(moved.2, "the moved kept index was made invalid");
+    assert_eq!(
+        Some(moved.3.clone()),
+        oid(&prebuilt, SEQ_WALK),
+        "the kept index was not merely renamed"
+    );
+    assert_eq!(share_count(&pool).await?, 2);
+    // The operator puts the name back; the next start keeps both indexes,
+    // skips the drops, and records 11.
+    sqlx::raw_sql(&format!(
+        "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
+    ))
+    .execute(&pool)
+    .await?;
+    let resumed = db.ledger("resumed").await?;
+    let trimmed = assert_trimmed(&pool).await?;
+    assert_eq!(
+        oid(&trimmed, SEQ_WALK),
+        oid(&prebuilt, SEQ_WALK),
+        "the kept index was rebuilt"
+    );
+    assert_eq!(
+        oid(&trimmed, MINER_HISTORY),
+        oid(&after_refusal, MINER_HISTORY),
+        "the built index was rebuilt"
+    );
+    db.close(vec![first, resumed]).await
 }

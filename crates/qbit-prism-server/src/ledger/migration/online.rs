@@ -35,7 +35,13 @@
 //! and every index the migration drops are looked up again as their step
 //! is reached, and a name that holds something else by then stops the run
 //! before the drop, saying what the run had already built and dropped.
-//! The next start plans afresh from what it finds and keeps that.
+//! A kept index, and one built before a later build, are exposed the same
+//! way, so the whole declared set (every created index valid with its
+//! definition, every dropped name absent) is verified once more inside
+//! the transaction that records the version, after its lock; a kept or
+//! already-built index that moved while a later build ran is caught there
+//! before the version is recorded. The next start plans afresh from what
+//! it finds and keeps that.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -249,6 +255,7 @@ async fn apply(
     }
     let mut tx = connection.begin().await?;
     lock(&mut tx, MIGRATION_LOCK, metrics).await?;
+    verify_declared(&mut tx, migration, &progress).await?;
     sqlx::query(
         "INSERT INTO qbit_prism_schema_migrations(version) VALUES($1) ON CONFLICT (version) DO NOTHING",
     )
@@ -262,7 +269,9 @@ async fn apply(
 
 /// One index change of the plan, decided before any DDL. The two that drop
 /// something look their target up again when they are reached
-/// (`drop_planned`).
+/// (`drop_planned`), and every name the plan covers is looked up once more
+/// before the version is recorded (`verify_declared`): a step that runs or
+/// finishes early is otherwise exposed for the hours a later build takes.
 enum Step<'a> {
     Keep(&'a str),
     Build(&'a str, &'a IndexDefinition),
@@ -282,6 +291,21 @@ enum LiveRelation {
         table: String,
     },
     Other(String),
+}
+
+impl LiveRelation {
+    /// What `name` holds now, for a refusal after the plan was made.
+    fn describe(&self, name: &str) -> String {
+        match self {
+            LiveRelation::Index {
+                valid,
+                definition,
+                table,
+            } => format!("index {name} on {table} now reads as {definition} (valid: {valid})"),
+            LiveRelation::Other(kind) => format!("a {kind} named {name} now holds the name"),
+            LiveRelation::Absent => format!("index {name} no longer exists"),
+        }
+    }
 }
 
 async fn live_relation(connection: &mut PgConnection, name: &str) -> Result<LiveRelation> {
@@ -446,13 +470,7 @@ async fn drop_planned(
         {
             return drop_concurrently(connection, name).await;
         }
-        LiveRelation::Index {
-            valid,
-            definition,
-            table,
-        } => format!("index {name} on {table} now reads as {definition} (valid: {valid})"),
-        LiveRelation::Other(kind) => format!("a {kind} named {name} now holds the name"),
-        LiveRelation::Absent => format!("index {name} no longer exists"),
+        other => other.describe(name),
     };
     let planned = match planned {
         Planned::Release => format!(
@@ -468,6 +486,62 @@ async fn drop_planned(
         "refusing to continue migration {version}: {found}, but when this run planned its changes the name held {planned}. The plan is stale past that change, so this run will not drop anything by that name. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
         progress.describe()
     )
+}
+
+/// Look every name the migration declares up once more, inside the
+/// transaction that records the version and after its lock, and refuse to
+/// record unless each created index is valid on its table with exactly
+/// the declared definition and each dropped name is absent. The preflight
+/// saw a kept index once, and a build checks its own index as it finishes,
+/// but the builds after either take hours, in which the DDL that moves a
+/// drop target moves these just as well; recorded over that, the version
+/// would let every later start trust an index set the database no longer
+/// holds. The look-up and the INSERT share a transaction, so the record
+/// commits with what the check saw as far as PostgreSQL allows: a rename
+/// that commits between the two statements is not seen, since nothing
+/// here can lock an index against DDL by another session, but what stays
+/// open is that round trip, not the hours of a build.
+async fn verify_declared(
+    connection: &mut PgConnection,
+    migration: &OnlineMigration,
+    progress: &Progress<'_>,
+) -> Result<()> {
+    let version = migration.version;
+    let refuse = |found: String, declared: String| -> Result<()> {
+        bail!(
+            "refusing to record migration {version}: {found}, but the migration declares {declared}. The name changed after this run's step for it, and every start would trust the record over what the database holds. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
+            progress.describe()
+        )
+    };
+    for (name, expected) in &migration.creates {
+        match live_relation(connection, name).await? {
+            LiveRelation::Index {
+                valid: true,
+                definition,
+                table,
+            } if table == expected.table && definition == expected.definition => {}
+            other => refuse(
+                other.describe(name),
+                format!(
+                    "a valid {} on {} under that name",
+                    expected.definition, expected.table
+                ),
+            )?,
+        }
+    }
+    for (name, expected) in &migration.drops {
+        match live_relation(connection, name).await? {
+            LiveRelation::Absent => {}
+            other => refuse(
+                other.describe(name),
+                format!(
+                    "nothing under that name, the release's {} on {} having been dropped",
+                    expected.definition, expected.table
+                ),
+            )?,
+        }
+    }
+    Ok(())
 }
 
 async fn drop_concurrently(connection: &mut PgConnection, name: &str) -> Result<()> {
