@@ -1358,9 +1358,6 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let _ = tokio::time::timeout(Duration::from_secs(10), collector).await;
     let collected = std::mem::take(&mut *collected.lock().expect("collector lock"));
 
-    for child in &frontends {
-        blocked.extend(scan_logs(&child.read_stderr()));
-    }
     // The startup check ran before any phase. A refusal logged after it -- a
     // scheduled-block rebuild hitting the JSONB ceiling, say -- is the same
     // hard block seen late, and ordinary shares can keep flowing past a
@@ -1368,6 +1365,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // It is re-checked here: the artifact is withheld and the run exits
     // blocked, as it would have at startup, with the whole side report
     // (EP-OBSERVABILITY).
+    //
+    // The frontends are stopped before the check, not after the outputs are
+    // written. Nothing past this point needs a live frontend -- the sessions
+    // have stopped, the samplers have stopped, the metrics were scraped at
+    // each phase's end, and the evidence, profile and report are built from
+    // the frontends' specs, environments and log paths -- while a rebuild
+    // still running would keep writing to a log the check had already read
+    // (`stop_and_scan_logs`).
+    blocked.extend(stop_and_scan_logs(&mut frontends));
     let late_hard_block = hard_block_line(&blocked);
     // The premise checks again, over the whole run: a set_difficulty that
     // arrived after the startup check is the same contradiction seen late,
@@ -1876,9 +1882,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
 
     // --- exit code --------------------------------------------------------
     println!("{}", summary_text(&side_report, &evidence, &unrecognised));
-    for mut child in frontends {
-        child.kill();
-    }
+    // The frontends were stopped before the final hard-block check above.
     side.close().await;
     let outcome = RunOutcome {
         withhold: withhold.as_ref(),
@@ -2440,6 +2444,31 @@ pub fn check_delay_observed(delay_ms: u64, observed_median_ms: f64) -> Result<()
          must pay; the frontends' connections are not going through the delay proxy"
     );
     Ok(())
+}
+
+/// Stop every frontend, then read what each one logged.
+///
+/// The final hard-block check used to read the frontends' stderr while
+/// every one of them was still running, and they were not stopped until
+/// after the artifact, the profile and the side report had been written. A
+/// scheduled block's rebuild can still be running after the sessions have
+/// drained, and one that logged the JSONB-ceiling refusal after the check
+/// -- during the replication, window, reconciliation and profile queries
+/// that followed it -- was missed: the check found nothing and the harness
+/// wrote a self-validating qualification artifact for a window size that
+/// had in fact been refused. Stopping first closes that gap: `Frontend::kill`
+/// sends the process group SIGKILL and reaps it, stderr is a file the
+/// process wrote to directly, and a reaped process has nothing left to
+/// write, so what this returns is the whole log of the run and nothing can
+/// be added to it afterwards (EP-OBSERVABILITY).
+pub fn stop_and_scan_logs(frontends: &mut [Frontend]) -> Vec<BlockedLog> {
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    frontends
+        .iter()
+        .flat_map(|child| scan_logs(&child.read_stderr()))
+        .collect()
 }
 
 fn scan_logs(text: &str) -> Vec<BlockedLog> {

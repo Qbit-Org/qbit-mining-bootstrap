@@ -768,6 +768,21 @@ fn stand_in_server(dir: &std::path::Path, stderr_line: &str) -> std::path::PathB
     path
 }
 
+/// A stand-in that never stops logging: it writes `stderr_line` again every
+/// few milliseconds until it is killed, the way a rebuild still running
+/// after the sessions have drained keeps writing to a frontend's log.
+fn chattering_stand_in_server(dir: &std::path::Path, stderr_line: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("chattering-stand-in-server");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nwhile :; do echo '{stderr_line}' >&2; sleep 0.02; done\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 fn wait_for_log(path: &std::path::Path, needle: &str, count: usize) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -823,6 +838,86 @@ async fn a_stale_frontend_log_is_truncated_on_launch_and_kept_across_a_restart()
         "a restart appends to this invocation's log only"
     );
     child.kill();
+    Ok(())
+}
+
+/// The final hard-block check reads the frontends' logs after the load, and
+/// it used to read them while every frontend was still running: the
+/// frontends were stopped only after the artifact, the profile and the side
+/// report had been written. A scheduled block's rebuild that logged the
+/// JSONB-ceiling refusal after the check -- during the queries between the
+/// check and the outputs -- was missed, and the harness wrote a
+/// self-validating artifact for a size that had been refused. The check now
+/// stops every frontend first, so the log it reads is the whole log: a
+/// frontend that logs the refusal continuously is stopped and reaped before
+/// its log is read, and nothing is added to that log afterwards.
+#[tokio::test]
+async fn the_final_hard_block_check_stops_the_frontends_before_reading_their_logs() -> Result<()> {
+    let dir = ScratchDir::new("late-block");
+    let ceiling = "WARN template refresh deferred error=total size of jsonb array elements \
+                   exceeds the maximum of 268435455 bytes";
+    let server = chattering_stand_in_server(dir.path(), ceiling);
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let mut frontends: Vec<frontend::Frontend> = (0..2)
+        .map(|index| {
+            frontend::Frontend::launch(
+                server.clone(),
+                FrontendSpec {
+                    index,
+                    instance_id: format!("load-fe-{index}"),
+                    stratum_port: 1,
+                    audit_port: 1,
+                    database_url: "postgresql://u@127.0.0.1:1/x".into(),
+                },
+                BTreeMap::new(),
+                &log_dir,
+            )
+        })
+        .collect::<Result<_>>()?;
+    // Both are up and logging the refusal, and keep doing so.
+    for child in &frontends {
+        wait_for_log(&child.stderr_path, "exceeds the maximum of", 3);
+    }
+    let refusals = |frontends: &[frontend::Frontend]| -> usize {
+        frontends
+            .iter()
+            .map(|child| {
+                child
+                    .read_stderr()
+                    .lines()
+                    .filter_map(classify::classify_log_line)
+                    .count()
+            })
+            .sum()
+    };
+
+    let blocked = run::stop_and_scan_logs(&mut frontends);
+
+    for child in &frontends {
+        assert_eq!(
+            child.pid(),
+            None,
+            "{} was stopped and reaped before its log was read",
+            child.spec.instance_id
+        );
+    }
+    let line = run::hard_block_line(&blocked).expect("the refusal is the hard block it is");
+    assert!(line.contains("exceeds the maximum of"), "{line}");
+    assert!(
+        blocked.len() >= 6,
+        "the check read everything both frontends had logged: {} lines",
+        blocked.len()
+    );
+    // Nothing can be logged after the check: a reaped process has nothing
+    // left to write, so the logs hold exactly what the check read, however
+    // long the queries and the output writing after it take.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        refusals(&frontends),
+        blocked.len(),
+        "the logs did not grow after the check read them"
+    );
     Ok(())
 }
 
