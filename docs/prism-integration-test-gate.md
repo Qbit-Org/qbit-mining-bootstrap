@@ -41,16 +41,16 @@ if the job's own environment were edited. Keying on `CI` would be wrong:
 GitHub sets `CI=true` in every job, including `rust-tests`, which runs the
 whole workspace with no database.
 
-Explicit `#[ignore]` runs are always required. Four gated tests are selected
-explicitly, with `#[ignore]` and `--ignored`, because they are long or
-destructive: the 10,000-connection admission test in
-`stratum_admission_postgres`, the collector test in `observability_database`,
-and the full-size ratchet and baseline sweep in `jsonb_ceiling_gate`. They use
-the gate's `required_*` entry points, which never skip: a missing input fails
-them whatever the switch says, since a vacuous pass is exactly what selecting
-them explicitly tried to avoid. The first two are in the expected list because
-the native job selects them; the two JSONB measurement runs are not, because
-CI never selects them.
+Explicit `#[ignore]` runs are always required. The native job selects ten
+`#[ignore]` gated tests in three targets with `--ignored`: the 10,000-connection
+admission test in `stratum_admission_postgres` (by `--exact` name), both tests
+in `observability_database`, and all seven issued/prepared job dependency
+contracts in `issued_job_dependency` (with `--test-threads=2`). They use the
+gate's `required_*` entry points, which never skip: a missing input fails them
+whatever the switch says, since a vacuous pass is exactly what selecting them
+explicitly tried to avoid. All ten are in the expected list. Measurement runs,
+such as the full-size ratchet and baseline sweep in `jsonb_ceiling_gate`, stay
+`#[ignore]` and opt-in; CI never selects them, so they are not listed.
 
 The table is a pure function, `qbit_prism_test_gate::decide`, over injected
 values, with unit tests for every row in the crate itself.
@@ -118,7 +118,7 @@ The job has four shards, each with its own PostgreSQL service and qbitd.
 all workspace targets from Cargo metadata, sorts by package, kind, and name,
 and assigns them round-robin. Each test binary stays intact, preserving its
 fixtures and process-wide locks. New workspace targets join automatically.
-The two explicit `--ignored` contracts run on the shards owning their targets.
+The three explicit `--ignored` targets run only on the shards owning them.
 Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
 
 Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
@@ -154,7 +154,7 @@ run is as non-vacuous as CI:
 
 | invocation | what runs | required mode |
 | --- | --- | --- |
-| `make test-prism-postgres` (`test/prism-native-tests.sh`) | the whole workspace, the two explicit `--ignored` runs, then the manifest check | when `qbitd` and the PostgreSQL server tools are found; otherwise the manifest is printed and the run says which input is missing |
+| `make test-prism-postgres` (`test/prism-native-tests.sh`) | the whole workspace, the three explicit `--ignored` targets, then the manifest check | when `qbitd` and the PostgreSQL server tools are found; otherwise the manifest is printed and the run says which input is missing |
 | `make test-prism-regtest` (`... live`) | `live_regtest` | always (the mode refuses to start without `qbitd`) |
 | `make test-prism-public-read-replica` (`... replica`) | `postgres_failover` | always |
 | `test/prism-native-tests.sh cargo-args <args>` | the `cargo test` you name | always |

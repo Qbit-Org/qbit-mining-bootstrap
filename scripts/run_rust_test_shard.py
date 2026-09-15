@@ -15,14 +15,16 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# These ignored contracts were explicitly run by the unsharded job. Run each
-# only on the shard that owns its ordinary test target.
+# These ignored database contracts must be selected explicitly. Run each only
+# on the shard that owns its ordinary test target; test/prism-native-tests.sh
+# runs the same selections locally. Measurement runs stay opt-in.
 IGNORED = {
     ("qbit-prism-server", "test", "stratum_admission_postgres"): [
         "--exact",
         "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence",
     ],
     ("qbit-prism-server", "test", "observability_database"): [],
+    ("qbit-prism-server", "test", "issued_job_dependency"): ["--test-threads=2"],
 }
 
 
