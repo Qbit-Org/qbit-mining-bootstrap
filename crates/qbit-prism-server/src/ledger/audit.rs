@@ -227,7 +227,7 @@ impl Ledger {
         // Load only the representation that will be served.
         let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,CASE WHEN share_snapshot_sha256 IS NULL THEN canonical_audit_bytes END AS canonical_audit_bytes,CASE WHEN share_snapshot_sha256 IS NOT NULL OR canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
             .bind(block_hash)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *self.acquire().await?)
             .await?;
         let Some(row) = row else {
             return Ok(None);
@@ -344,9 +344,12 @@ fn oldest_boundary(weight: u128, shares: &[AcceptedShare]) -> Result<OldestBound
 /// change, so nothing this proves can change before the transaction; the
 /// in-transaction count guard in [`persist_audit_snapshot`] covers cardinality
 /// again under the lock. It does not establish the boundaries by itself.
+// Keep the pool + metrics seam that composes #379's independent boundary proof;
+// revisit it with the remaining #352 callers, retaining the shared observer.
 pub(super) async fn verify_durable_range(
     pool: &PgPool,
     snapshot: &AuditSnapshotWrite,
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     ensure!(
         snapshot.share_count > 0,
@@ -374,8 +377,10 @@ pub(super) async fn verify_durable_range(
     let mut cursor = snapshot.first_share_seq - 1;
     let mut matched = 0usize;
     while cursor < last {
+        // Release this page's checkout before its blocking comparison and the
+        // next page, observing each acquisition rather than the whole proof.
         let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
-            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(pool).await?;
+            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         if rows.is_empty() {
             break;
         }

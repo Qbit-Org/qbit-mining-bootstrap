@@ -46,6 +46,9 @@ use uuid::Uuid;
 mod window_fixture;
 use window_fixture::WindowPlan;
 
+#[path = "support/audit_acquire_metrics.rs"]
+mod acquire_metrics;
+
 // ---------------------------------------------------------------------------
 // Per-test schema and the small fixture from `tests/ledger_postgres.rs`
 // ---------------------------------------------------------------------------

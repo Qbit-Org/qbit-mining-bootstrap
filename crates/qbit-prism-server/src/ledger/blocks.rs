@@ -108,10 +108,10 @@ impl Ledger {
             "SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
         )
         .bind(&claim.candidate.block_hash)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *self.acquire().await?)
         .await?;
         if !landed {
-            verify_durable_range(&self.pool, &landing.snapshot).await?;
+            verify_durable_range(&self.pool, &landing.snapshot, self.metrics.as_deref()).await?;
         }
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
@@ -251,7 +251,7 @@ impl Ledger {
 
     pub async fn pool_blocks_for_reconcile(&self) -> Result<Vec<PoolBlock>> {
         sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state FROM qbit_pool_blocks WHERE (maturity_state='immature' AND chain_state IN ('prepared','confirmed','inactive')) OR block_hash=(SELECT block_hash FROM qbit_pool_blocks WHERE chain_state='confirmed' AND maturity_state='mature' ORDER BY block_height DESC,block_hash DESC LIMIT 1) ORDER BY block_height,block_hash")
-            .fetch_all(&self.pool).await?.into_iter().map(|row| Ok(PoolBlock {
+            .fetch_all(&mut *self.acquire().await?).await?.into_iter().map(|row| Ok(PoolBlock {
                 block_hash:row.try_get("block_hash")?,height:u64::try_from(row.try_get::<i64,_>("block_height")?)?,
                 chain_state:row.try_get("chain_state")?,maturity_state:row.try_get("maturity_state")?,
             })).collect()
