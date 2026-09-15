@@ -123,8 +123,23 @@ PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader:<encoded-reader-password>@st
 ```
 
 Alternatively, omit the password from the DSN and set
-`PRISM_PUBLIC_POSTGRES_PASSWORD` to the reader's raw password. Compose maps these
-two settings to `PRISM_DATABASE_URL` and `PGPASSWORD` inside `prism-public-api`.
+`PRISM_PUBLIC_POSTGRES_PASSWORD` to the reader's raw password. In `.env` files,
+single-quote that value so Compose preserves dollar signs and comment characters
+literally; do not percent-encode this separate carrier. For example, these
+synthetic values preserve the password `reader$literal #:@/383`:
+
+```dotenv
+PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader@standby.internal:5432/qbit?sslmode=verify-full
+PRISM_PUBLIC_POSTGRES_PASSWORD='reader$literal #:@/383'
+```
+
+If the password contains a single quote, use the percent-encoded DSN form above
+so the `.env` file also remains valid for the shell-based preflight scripts.
+Set the passwordless reader DSN as well: the carrier alone does not select a
+reader role, and a default DSN with an embedded bootstrap password still takes
+precedence.
+Compose maps these two settings to `PRISM_DATABASE_URL` and `PGPASSWORD` inside
+`prism-public-api`.
 The native SQLx driver loads PostgreSQL environment defaults before applying
 the DSN; a DSN password takes precedence over `PGPASSWORD`. The public process
 receives no extra bootstrap password, even when production, external-database

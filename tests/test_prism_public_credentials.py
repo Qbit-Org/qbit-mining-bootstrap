@@ -18,6 +18,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,9 @@ READER_PASSWORD = "fixture-reader-only-383"
 WRITER_URL = f"postgresql://prism_bootstrap:{BOOTSTRAP_PASSWORD}@prism-postgres:5432/prism_fixture"
 READER_URL = f"postgresql://prism_reader:{READER_PASSWORD}@prism-postgres-replica:5432/prism_fixture"
 PASSWORDLESS_URL = "postgresql://prism_reader@prism-postgres-replica:5432/prism_fixture"
+LITERAL_PASSWORD = "reader$MISSING #:@/383\\tail"
+LITERAL_PASSWORDLESS_URL = PASSWORDLESS_URL.replace("prism_reader@", "prism_literal_reader@")
+LITERAL_URL = LITERAL_PASSWORDLESS_URL.replace("prism_literal_reader@", f"prism_literal_reader:{quote(LITERAL_PASSWORD, safe='')}@")
 STACKS = tuple(
     tuple(name for enabled, name in zip(flags, (
         "compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml",
@@ -54,8 +58,10 @@ def fixture_env(*, production: bool = False, **overrides: str) -> dict[str, str]
 
 
 def compose_args(stack: tuple[str, ...], extra_file: str | None = None,
-                 project: str = "prism-reader-credentials") -> list[str]:
+                 project: str = "prism-reader-credentials", env_file: Path | None = None) -> list[str]:
     args = ["docker", "compose", "--env-file", str(ROOT / "config/upstream.env.example")]
+    if env_file:
+        args.extend(("--env-file", str(env_file)))
     for name in ("compose.yaml", *stack):
         args.extend(("-f", str(ROOT / name)))
     if extra_file:
@@ -63,12 +69,14 @@ def compose_args(stack: tuple[str, ...], extra_file: str | None = None,
     return [*args, "--project-name", project, "--profile", "prism"]
 
 
-def render_public(stack: tuple[str, ...], **overrides: str) -> dict:
+def render_public(stack: tuple[str, ...], *, env_file: Path | None = None, **overrides: str) -> dict:
     result = subprocess.run(
-        [*compose_args(stack), "config", "--format", "json"],
+        [*compose_args(stack, env_file=env_file), "config", "--format", "json"],
         cwd=ROOT, env=fixture_env(production="compose.production.yaml" in stack, **overrides),
-        text=True, capture_output=True, check=True,
+        text=True, capture_output=True, check=False,
     )
+    if result.returncode:
+        raise AssertionError(f"synthetic Compose render failed: {result.stderr}")
     # Never print the complete rendered stack: assertions concern this service.
     return json.loads(result.stdout)["services"]["prism-public-api"]
 
@@ -78,12 +86,18 @@ class PublicCredentialComposeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if shutil.which("docker") is None:
             raise unittest.SkipTest("docker CLI is not installed")
-        subprocess.run(["docker", "compose", "version"], check=True, capture_output=True)
+        result = subprocess.run(["docker", "compose", "version"], text=True, capture_output=True)
+        if result.returncode and "not a docker command" in result.stderr:
+            raise unittest.SkipTest("docker compose is unavailable")
+        if result.returncode:
+            raise AssertionError(f"docker compose version failed: {result.stderr}")
 
     def assert_reader_boundary(self, public: dict, url: str, password: str = "") -> None:
         environment = public["environment"]
         self.assertEqual(environment["PRISM_DATABASE_URL"], url)
-        self.assertEqual(environment.get("PGPASSWORD", ""), password)
+        # Compose escapes dollars when serializing its reusable config; actual
+        # container values are checked verbatim by the runtime test below.
+        self.assertEqual(environment["PGPASSWORD"], password.replace("$", "$$"))
         self.assertNotIn("PRISM_POSTGRES_PASSWORD", environment)
         self.assertNotIn("PRISM_PUBLIC_POSTGRES_PASSWORD", environment)
         self.assertNotIn(BOOTSTRAP_PASSWORD, json.dumps(public))
@@ -110,15 +124,35 @@ class PublicCredentialComposeTests(unittest.TestCase):
                 self.assert_reader_boundary(render_public(stack, **overrides), PASSWORDLESS_URL, password or "")
 
     def test_missing_and_empty_public_dsn_preserve_supported_defaults(self) -> None:
-        for stack, url in itertools.product(STACKS, (None, "")):
-            with self.subTest(stack=stack, url=url):
+        for stack, url, password in itertools.product(STACKS, (None, ""), ("", READER_PASSWORD)):
+            with self.subTest(stack=stack, url=url, carrier_set=bool(password)):
                 overrides = {} if url is None else {"PRISM_PUBLIC_DATABASE_URL": url}
+                overrides["PRISM_PUBLIC_POSTGRES_PASSWORD"] = password
                 public = render_public(stack, **overrides)
                 external = "compose.prism-external-db.yaml" in stack
                 expected = WRITER_URL if external else WRITER_URL.replace("@prism-postgres:", "@prism-postgres-replica:")
                 self.assertEqual(public["environment"]["PRISM_DATABASE_URL"], expected)
-                self.assertEqual(public["environment"].get("PGPASSWORD", ""), "")
+                self.assertEqual(public["environment"]["PGPASSWORD"], password)
                 self.assertEqual(public["environment"]["PRISM_PUBLIC_REPLICA_MODE"], "off" if external else "require")
+
+    def test_literal_env_file_password_and_encoded_dsn_in_every_stack(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prism-reader-env-") as directory:
+            env_file = Path(directory) / "reader.env"
+            # Match the documented form for both Compose and the shell-based
+            # preflight loader. The caller's environment has no carrier.
+            env_file.write_text(f"PRISM_PUBLIC_DATABASE_URL={LITERAL_PASSWORDLESS_URL}\n"
+                                f"PRISM_PUBLIC_POSTGRES_PASSWORD='{LITERAL_PASSWORD}'\n", encoding="utf-8")
+            sourced = subprocess.run(
+                ["bash", "-c", 'source "$1"; printf "%s" "$PRISM_PUBLIC_POSTGRES_PASSWORD"', "fixture", str(env_file)],
+                env=fixture_env(), text=True, capture_output=True, check=True,
+            )
+            self.assertEqual(sourced.stdout, LITERAL_PASSWORD)
+            for stack in STACKS:
+                with self.subTest(stack=stack):
+                    self.assert_reader_boundary(render_public(stack, env_file=env_file),
+                                                LITERAL_PASSWORDLESS_URL, LITERAL_PASSWORD)
+                    self.assert_reader_boundary(render_public(stack, PRISM_PUBLIC_DATABASE_URL=LITERAL_URL),
+                                                LITERAL_URL)
 
 
 @unittest.skipUnless(os.environ.get("PRISM_CREDENTIAL_TEST_IMAGE"), "set PRISM_CREDENTIAL_TEST_IMAGE for disposable image integration")
@@ -170,6 +204,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             GRANT USAGE ON SCHEMA public TO prism_reader;
             GRANT SELECT ON ALL TABLES IN SCHEMA public TO prism_reader;
             GRANT pg_read_all_stats TO prism_reader;
+            CREATE ROLE prism_literal_reader LOGIN PASSWORD '{LITERAL_PASSWORD.replace("'", "''")}'
+                NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+            GRANT prism_reader TO prism_literal_reader;
         """)
         # Use the shipped standby entrypoint against a disposable primary only.
         cls.command("docker", "exec", cls.primary, "sh", "-c",
@@ -191,7 +228,8 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         else:
             raise AssertionError("disposable standby did not become ready")
 
-    def start_public(self, stack: tuple[str, ...], *, lab_default: bool = False, **overrides: str) -> None:
+    def start_public(self, stack: tuple[str, ...], *, lab_default: bool = False,
+                     env_file: Path | None = None, **overrides: str) -> dict:
         self.command("docker", "rm", "--force", self.public, check=False)
         # Only adapt placement: retain the merged environment, command,
         # healthcheck and the image's real entrypoint. No production services,
@@ -207,7 +245,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
                 f"    name: {self.network}\n", encoding="utf-8",
             )
             subprocess.run(
-                [*compose_args(stack, str(overlay), self.project), "up", "--detach", "--no-deps", "--no-build",
+                [*compose_args(stack, str(overlay), self.project, env_file), "up", "--detach", "--no-deps", "--no-build",
                  "--pull", "never", "prism-public-api"],
                 cwd=ROOT, env=fixture_env(production="compose.production.yaml" in stack,
                                          PRISM_COORDINATOR_IMAGE=self.image, **overrides),
@@ -219,6 +257,8 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         self.assertNotIn("fixture-ambient-password-383", config)
         if lab_default:
             self.assertIn("PGPASSWORD=", json.loads(config)["Env"])
+        self.assertTrue(any(item.startswith("PGPASSWORD=") for item in json.loads(config)["Env"]))
+        return json.loads(config)
 
     def response(self, path: str) -> tuple[int, dict]:
         result = self.command("docker", "exec", self.public, "curl", "--silent", "--show-error",
@@ -237,7 +277,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             except subprocess.CalledProcessError:
                 pass
             if time.monotonic() >= deadline:
-                self.fail("public HTTP listener did not report readiness within 30 seconds")
+                logs = self.command("docker", "logs", "--tail", "40", self.public, check=False)
+                self.fail(f"synthetic public listener did not report readiness within 30 seconds:\n"
+                          f"{logs.stdout}{logs.stderr}")
             time.sleep(0.25)
         self.assertEqual(status, 200 if healthy else 503, body)
         self.assertIs(body["ok"], healthy, body)
@@ -246,6 +288,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             self.assertIn("password authentication failed", body.get("error", ""), body)
         self.assertNotIn(BOOTSTRAP_PASSWORD, json.dumps(body))
         self.assertNotIn(READER_PASSWORD, json.dumps(body))
+        self.assertNotIn(LITERAL_PASSWORD, json.dumps(body))
         probe = self.command("docker", "exec", self.public, "qbit-prism-server", "healthcheck", "--public-api", check=False)
         self.assertEqual(probe.returncode == 0, healthy, probe.stderr)
         # Blocks exercises application-table reads without requiring a node RPC.
@@ -263,6 +306,19 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             with self.subTest(stack=stack):
                 self.start_public(stack, lab_default=True)
                 self.assert_health(True)
+
+    def test_literal_env_file_password_and_encoded_dsn_authenticate(self) -> None:
+        stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
+        with tempfile.TemporaryDirectory(prefix="prism-reader-env-") as directory:
+            env_file = Path(directory) / "reader.env"
+            env_file.write_text(f"PRISM_PUBLIC_DATABASE_URL={LITERAL_PASSWORDLESS_URL}\n"
+                                f"PRISM_PUBLIC_POSTGRES_PASSWORD='{LITERAL_PASSWORD}'\n", encoding="utf-8")
+            config = self.start_public(stack, env_file=env_file)
+            self.assertIn(f"PGPASSWORD={LITERAL_PASSWORD}", config["Env"])
+            self.assert_health(True)
+        config = self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=LITERAL_URL)
+        self.assertIn("PGPASSWORD=", config["Env"])
+        self.assert_health(True)
 
     def test_passwordless_dsn_authentication_and_dsn_precedence(self) -> None:
         stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
