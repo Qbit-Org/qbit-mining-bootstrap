@@ -262,6 +262,9 @@ qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::landed_a
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::leased_candidate_submits_first_then_lands_as_issued_before_any_terminal_outcome
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::the_rebuild_and_landing_never_wait_for_the_order_lock
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::window_read_failures_retry_with_an_alert_and_never_abandon
+qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_compact_read_releases_checkout_before_blocking_decode
+qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_checkouts_start_on_first_poll_and_recover
+qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_sql_wait_errors_and_cancellation_do_not_change_checkout_samples
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace
