@@ -678,6 +678,96 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    on production-sized history and retains the exact data-loss boundary when
    completing the 3.0.0 release notes before approving rollout.
 
+## Share ledger indexes
+
+`qbit_share_ledger` is append-only and every insert maintains every index,
+so an index nobody scans, or INCLUDE payload nobody reads, is write
+amplification without a reader. Migration 013 (#153) trimmed the secondary
+indexes to the native query set below. The table is what to check against
+before adding an index or a query that reads the ledger.
+
+| Index | Definition | Native readers | Plan |
+| --- | --- | --- | --- |
+| `qbit_share_ledger_pkey` | `(share_seq)` | every `share_seq` walk that projects share rows: the payout page walk of `snapshot`, the audit range reads, `qbit_prism_window`'s ranking pass, the rollup batch in `rollups.sql`, the latest-share probe | index scan, then the heap for the projected columns |
+| `qbit_share_ledger_share_id_key` | `(share_id)`, unique | the duplicate-share probes on submit, `share_accepted_at_ms` | index scan |
+| `qbit_share_ledger_accepted_seq_walk_idx` (013) | `(share_seq DESC) INCLUDE (job_issued_at, accepted_at, share_difficulty) WHERE accepted` | `qbit_prism_window`'s newest-first page walk (pool snapshot, reward leaderboard), the landing durable-range count under the settlement lock, `max(share_seq)`, the rollup boundary and tail passes | index-only |
+| `qbit_share_ledger_accepted_recent_idx` | `(accepted_at DESC) INCLUDE (share_difficulty, miner_id, share_seq) WHERE accepted` | pool hashrate series, leaderboard window, pool snapshot rollups, the miner summary's pool figure, evidence counts | index-only |
+| `qbit_share_ledger_accepted_miner_history_idx` (013) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
+| `qbit_share_ledger_accepted_block_suffix_idx` | `((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC) INCLUDE (miner_id, share_difficulty, network_difficulty) WHERE accepted AND length(share_id) >= 65` | the block-solver lookup in blocks, leaderboard, reward leaderboard and pool snapshot | index scan, one row per block |
+
+Dropped by 013, with no native reader:
+
+- `qbit_share_ledger_accepted_seq_window_idx`, `share_seq DESC` with seven
+  INCLUDE columns. Every `share_seq` walk was planned on the primary key, so
+  the payload never earned an index-only read; the narrow replacement is the
+  one the planner takes.
+- `qbit_share_ledger_accepted_miner_recent_idx`: its `payout_order_key`
+  INCLUDE had no reader.
+- `qbit_share_ledger_accepted_window_idx`, `(job_issued_at, share_seq DESC)`:
+  `job_issued_at` is only ever a filter on a `share_seq` walk.
+- `qbit_share_ledger_template_height_idx`: no native query filters on
+  `template_height`. `qbit_shares_since_template_height`, the 001 operator
+  replay function, is its only caller and now reads the primary key with a
+  filter; if a native consumer appears, restoring it is one
+  `CREATE INDEX CONCURRENTLY ... ON qbit_share_ledger (template_height, share_seq) WHERE accepted`.
+
+`WHERE accepted` stays on every partial index. The native writers only
+insert accepted rows, but every reader excludes rejected rows by contract
+(the window and rollup tests write `accepted = false` rows to prove it), and
+the predicate is what lets the frozen `qbit_prism_window` walk stay
+index-only without carrying the column.
+
+Known full scan: the boundary and tail passes of
+`dashboard_hashrate_rollups.sql` bound `accepted_at` through CTE values the
+planner cannot estimate, so each is a full index-only scan (of
+`accepted_seq_walk_idx` after 013, of `accepted_recent_idx` before it). That
+predates 013 and is a query change, not an index change.
+
+### Measuring the trim on production
+
+Run these on the production database after 013 and before scheduling #144,
+in this order. The `ANALYZE` comes first: the statistics captured for #144
+were hundreds of times below the row count, and every plan is provisional
+until they are current.
+
+```sql
+ANALYZE qbit_share_ledger;
+
+-- Statistics after the ANALYZE, against the real row count.
+SELECT c.reltuples::bigint, s.n_live_tup, (SELECT count(*) FROM qbit_share_ledger) AS rows
+FROM pg_class c JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE c.relname = 'qbit_share_ledger';
+
+-- Whether vacuum has run, so the visibility map is set and index-only scans
+-- do not fall back to the heap; stats_reset bounds the scan counts below.
+SELECT s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze,
+       s.n_tup_ins, s.n_dead_tup, age(c.relfrozenxid) AS frozen_age,
+       pg_postmaster_start_time(), d.stats_reset
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+JOIN pg_stat_database d ON d.datname = current_database()
+WHERE s.relname = 'qbit_share_ledger';
+
+-- Every index with its size and scan count; a zero-scan index has had no
+-- reader since stats_reset.
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes WHERE relname = 'qbit_share_ledger'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- The gate: the payout page walk as the pool snapshot runs it, with the
+-- network difficulty of the moment. "Heap Fetches" near zero on
+-- qbit_share_ledger_accepted_seq_walk_idx means the covering index earns
+-- index-only reads; large Heap Fetches mean the visibility map is cold
+-- (VACUUM qbit_share_ledger, then run it again).
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*), sum(counted_difficulty)
+FROM qbit_prism_window(clock_timestamp(), (<network difficulty> * 8)::numeric);
+```
+
+Record the index sizes before and after 013, the scan counts, the
+`Heap Fetches` lines of the page walk, and the share acknowledgement latency
+histogram from `/metrics` before and after, in #153 and #144.
+
 ## Fatal-state recovery
 
 A disconnected mature pool block or deep confirmed CTV fanout records a shared

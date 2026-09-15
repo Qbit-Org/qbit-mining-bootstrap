@@ -13,7 +13,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     probe_share_rows, put_balance_snapshot, read_range_paged, BalanceSource, Candidate, Ledger,
-    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef,
+    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef, REQUIRED_SCHEMA_VERSIONS,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -28,16 +28,16 @@ const ANCHOR: i64 = 1_700_000_000_000;
 const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sql");
 /// Every version the membership runner installs except 007, so a database can
 /// be built in exactly the pre-007 state the runner then completes.
-/// Every native migration except 007 and 011, so a connect applies exactly
-/// those two and nothing else. #360's 010 and #321's 006 belong here for the
+/// Every native migration except 007, 011 and 012, so a connect applies
+/// those three and nothing else. #153's 013, #360's 010 and #321's 006 belong here for the
 /// same reason 008 and 009 do: leaving one out makes the connect apply a
-/// third migration, and the "only 007 ran" assertions then fail for a reason
+/// further migration, and the timestamp assertions then fail for a reason
 /// unrelated to 007. 006 matters most, because its own drain check refuses
 /// the very rows these tests hand to 007's, so without it the refusal under
 /// test never runs. #266's 011 cannot be pre-applied: its lifecycle CHECK
 /// names the columns 007 adds, so the runner always applies it after 007,
-/// and these tests accept the pair.
-const PRE_007: [(i32, &str); 8] = [
+/// followed by 012's startup fence, and these tests accept all three.
+const PRE_007: [(i32, &str); 9] = [
     (2, include_str!("../migrations/002_multi_instance.sql")),
     (3, include_str!("../migrations/003_2x_compatibility.sql")),
     (
@@ -55,8 +55,11 @@ const PRE_007: [(i32, &str); 8] = [
         10,
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
+    (
+        13,
+        include_str!("../migrations/013_share_ledger_index_trim.sql"),
+    ),
 ];
-const ALL_VERSIONS: [i32; 11] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 /// The columns 011 adds to the outbox, which the connect that applies 007
 /// adds as well.
 const OFFER_COLUMNS: [&str; 6] = [
@@ -362,7 +365,7 @@ async fn legacy_2x_schema_with_terminal_outbox_rows_gains_007_and_keeps_every_ro
 
             let _ledger = db.ledger("legacy-upgrade").await?;
             ensure!(
-                db.versions().await? == ALL_VERSIONS,
+                db.versions().await? == REQUIRED_SCHEMA_VERSIONS,
                 "007 did not join the applied set"
             );
             let after: Vec<Value> = sqlx::query_scalar(
@@ -499,7 +502,7 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
             sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp()")
                 .execute(&db.pool).await?;
             let _ledger = db.ledger("drained").await?;
-            ensure!(db.versions().await? == ALL_VERSIONS, "007 did not apply after the drain");
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS, "007 did not apply after the drain");
             Ok(())
         })).await?;
     }
@@ -527,7 +530,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
                     .iter()
                     .map(|(version, _)| *version)
                     .collect::<Vec<_>>()
-                    == ALL_VERSIONS
+                    == REQUIRED_SCHEMA_VERSIONS
             );
             // Every migration installed before this run keeps its original
             // timestamp; only missing migrations are applied.
@@ -548,7 +551,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
             }
             // A restart applies nothing further.
             let _restarted = db.ledger("membership-restart").await?;
-            ensure!(db.versions().await? == ALL_VERSIONS);
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS);
             Ok(())
         })
     })

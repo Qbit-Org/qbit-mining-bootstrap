@@ -50,7 +50,7 @@ const PRE_011: [(i32, &str); 9] = [
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
 ];
-const ALL_VERSIONS: [i32; 11] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const ALL_VERSIONS: [i32; 12] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
 /// The proof time the lifecycle test enqueues with, and the call time it
@@ -2048,7 +2048,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2085,11 +2085,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2126,7 +2126,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );

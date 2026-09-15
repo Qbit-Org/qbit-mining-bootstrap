@@ -95,7 +95,9 @@ Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
 hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
-transaction, including carry-forward summary repair. The migration is
+transaction, including carry-forward summary repair, except migration 013,
+the share ledger index trim, whose index builds run after the commit with
+`CREATE INDEX CONCURRENTLY` ([below](#migration-013-the-share-ledger-index-trim-applied-online)). The migration is
 idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
@@ -120,7 +122,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
-| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `009_wrap_safe_sessions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `013_share_ledger_index_trim.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 Migration requires visible `qbit_` relations and functions to resolve in
@@ -462,13 +464,15 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 11,
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 13,
 each checked on its own rather than as a high-water mark: a later migration
 being present never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
 quarantines previously attempted candidates for reconciliation without
 another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
-for the quiesce and recovery steps. A database missing any of them is refused
+for the quiesce and recovery steps. 013 is recorded only once its online
+index builds have completed, so a start after an interrupted build is
+refused until `migrate` finishes them. A database missing any of them is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
 capability or a runtime `candidate_storage_version` other than 1. A native
@@ -520,6 +524,69 @@ continuing; a matching hash without recoverable bytes is insufficient.
 `backfill-ctv` scans verified stored bundles and restores missing fanout records.
 Run import first. It is idempotent for matching existing records and replaces the
 old Python repair command's individual-path/block selection interface.
+
+### Migration 013: the share ledger index trim, applied online
+
+Migration 013 (#153) trims the secondary indexes of `qbit_share_ledger` to
+what the native readers use. It replaces
+`qbit_share_ledger_accepted_seq_window_idx`, a `share_seq DESC` index carrying
+seven INCLUDE columns that no native read ever fetched from it, with
+`qbit_share_ledger_accepted_seq_walk_idx`, whose INCLUDE is exactly what the
+newest-first page walk and the landing count read; replaces
+`qbit_share_ledger_accepted_miner_recent_idx` with
+`qbit_share_ledger_accepted_miner_history_idx`, without the unread
+`payout_order_key`; and drops `qbit_share_ledger_accepted_window_idx` and
+`qbit_share_ledger_template_height_idx`, which no native query uses. The
+[index inventory](prism-ledger-ops.md#share-ledger-indexes) maps every index
+to its readers and lists the measurements to take afterwards.
+
+On a fresh deployment or an empty 2.x.x source it is applied inside the
+migration transaction while the cutover locks exclude writers. Existing
+native ledgers always apply it outside that transaction, even when no
+shares are visible: the first share may still be uncommitted, and native
+writers do not take the migration lock. Populated 2.x.x sources also use
+this online path. `CREATE INDEX CONCURRENTLY` cannot run in a transaction
+block, and a plain `CREATE INDEX` holds a SHARE lock on the ledger for the
+whole build, so every append would queue behind it. Inside the migration
+transaction the file is then applied only to the scratch schema, so the
+migrator learns the index definitions as this PostgreSQL renders them. After
+the commit, on a dedicated connection with no statement or lock timeout and
+under a session-level advisory lock keyed by the ledger's schema, `migrate`
+(or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds each new index with
+`CREATE INDEX CONCURRENTLY`, drops each replaced one with `DROP INDEX
+CONCURRENTLY`, and records 13 last. Appends continue throughout. A
+concurrent build waits for the transactions that were already using the
+table, so a long payout-window read delays it without blocking anything
+else; two frontends starting together build once, the second waiting on the
+lock and finding the version recorded.
+
+Until 13 is recorded, every start refuses the database, naming it, like any
+other required migration. That is the resumable state: an interrupted build
+leaves an invalid index behind, still maintained by every insert, and the
+next `migrate` drops it and builds again; an index built before the
+interruption is kept when it is valid and matches the declared definition. A
+valid index under one of the two new names with any other definition, or a
+relation of another kind under one of the six names, is refused by name and
+left alone, as with every native collision:
+
+```
+refusing to apply migration 13: index qbit_share_ledger_accepted_seq_walk_idx on qbit_share_ledger
+already exists with a different definition (CREATE INDEX qbit_share_ledger_accepted_seq_walk_idx ON
+qbit_share_ledger USING btree (share_seq)); the migration declares CREATE INDEX
+qbit_share_ledger_accepted_seq_walk_idx ON qbit_share_ledger USING btree (share_seq DESC) INCLUDE
+(job_issued_at, accepted_at, share_difficulty) WHERE accepted. The migration is not recorded and
+nothing was changed by it. Check what that index serves, then rename or drop it and migrate again
+```
+
+Plan for the build on a large ledger. Both replacements are built before
+anything is dropped, so the transient footprint is the two new indexes on
+top of the existing ones; on the production ledger measured for #144 the two
+replaced indexes held 44 GB, and the replacements are a fraction of that, but
+keep that headroom free. A concurrent build reads the table twice. Run
+`migrate` from a shell where a multi-hour command is acceptable, rather than
+relying on a starting frontend, whose readiness stays down until the build
+completes. Then run `ANALYZE qbit_share_ledger` and take the measurements the
+inventory lists before scheduling #144.
 
 ## Bring up native instances
 

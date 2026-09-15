@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
     applied integer[];
     missing integer[];
     metadata text;
@@ -116,8 +116,9 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'native migration history must have the native logged-table, version primary-key and applied_at definitions, without extra columns, constraints, indexes, triggers, rules, inheritance or row security' USING HINT = hint;
     END IF;
-    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS. The
-    -- regression removes each version declared by the server in turn.
+    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS: a migration
+    -- unit test compares the two, and the recovery regression removes each
+    -- version declared by the server in turn.
     EXECUTE format('SELECT array_agg(version ORDER BY version) FROM %s', history) INTO applied;
     SELECT array_agg(version ORDER BY version) INTO missing
     FROM unnest(required_versions) AS required(version)
