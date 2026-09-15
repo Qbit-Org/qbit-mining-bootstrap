@@ -265,6 +265,7 @@ qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::window_r
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_compact_read_releases_checkout_before_blocking_decode
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_checkouts_start_on_first_poll_and_recover
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_sql_wait_errors_and_cancellation_do_not_change_checkout_samples
+qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace

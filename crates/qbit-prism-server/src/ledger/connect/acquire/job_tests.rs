@@ -1,4 +1,5 @@
 //! Checkout observations at ledger-owned job reads and expiry (#352).
+use super::test_support::{counts, family, sample, with_database};
 use super::*;
 use crate::metrics::Metrics;
 use anyhow::{Context, Result};
@@ -8,90 +9,46 @@ use tokio_util::task::AbortOnDropHandle;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-fn sample(metrics: &Metrics, outcome: &str, suffix: &str) -> f64 {
-    let prefix =
-        format!("qbit_prism_database_pool_acquire_seconds_{suffix}{{result=\"{outcome}\"}} ");
-    let body = metrics.render();
-    let values: Vec<_> = body
-        .lines()
-        .filter_map(|line| line.strip_prefix(&prefix))
-        .collect();
-    assert_eq!(values.len(), 1, "expected one rendered series for {prefix}");
-    values[0].parse().unwrap()
-}
-
-fn counts(metrics: &Metrics) -> (f64, f64) {
-    (
-        sample(metrics, "success", "count"),
-        sample(metrics, "failure", "count"),
-    )
-}
-
-fn family(metrics: &Metrics) -> Vec<String> {
-    metrics
-        .render()
-        .lines()
-        .filter(|line| line.contains("qbit_prism_database_pool_acquire_seconds"))
-        .map(str::to_owned)
-        .collect()
-}
-
 struct Database {
-    admin: PgPool,
     side: PgPool,
     ledger: Ledger,
     metrics: Arc<Metrics>,
-    schema: String,
 }
 
 impl Database {
-    async fn open() -> Result<Option<Self>> {
-        use qbit_prism_test_gate as gate;
-        let Some(raw) = gate::database_url(gate::site!())? else {
-            return Ok(None);
-        };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_job_acquire_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+    async fn open(url: &str, pools: &mut Vec<PgPool>) -> Result<Self> {
         let metrics = Arc::new(Metrics::default());
-        let mut ledger = Ledger::connect_with_metrics(
-            url.as_str(),
-            "job-acquire".into(),
-            2,
-            true,
-            Some(metrics.clone()),
-        )
-        .await?;
+        let mut ledger =
+            Ledger::connect_with_metrics(url, "job-acquire".into(), 2, true, Some(metrics.clone()))
+                .await?;
+        pools.push(ledger.pool.clone());
+        // Isolate checkout timing. Production after_connect deadlines are
+        // covered elsewhere; table-lock waits here are explicitly controlled.
         let single = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(WAIT)
-            .connect(url.as_str())
+            .connect(url)
             .await?;
+        pools.push(single.clone());
         let old = std::mem::replace(&mut ledger.pool, single);
         old.close().await;
-        let side = PgPool::connect(url.as_str()).await?;
-        Ok(Some(Self {
-            admin,
+        let side = PgPool::connect(url).await?;
+        pools.push(side.clone());
+        Ok(Self {
             side,
             ledger,
             metrics,
-            schema,
-        }))
+        })
     }
+}
 
-    async fn close(self) -> Result<()> {
-        self.ledger.pool.close().await;
-        self.side.close().await;
-        let result = sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await;
-        self.admin.close().await;
-        result.map(|_| ()).map_err(Into::into)
+// An assertion in the paused-clock block must resume time before the shared
+// fixture awaits database cleanup while propagating the panic.
+struct ResumeClock;
+
+impl Drop for ResumeClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
     }
 }
 
@@ -127,11 +84,10 @@ async fn wait_for_counts(metrics: &Metrics, expected: (f64, f64)) -> Result<()> 
 
 #[tokio::test]
 async fn postgres_job_checkouts_start_on_first_poll_and_recover() -> Result<()> {
-    let Some(db) = Database::open().await? else {
-        return Ok(());
-    };
-    let result = checkout_cases(&db).await;
-    result.and(db.close().await)
+    with_database(|url, pools| {
+        Box::pin(async move { checkout_cases(&Database::open(url, pools).await?).await })
+    })
+    .await
 }
 
 async fn checkout_cases(db: &Database) -> Result<()> {
@@ -141,8 +97,10 @@ async fn checkout_cases(db: &Database) -> Result<()> {
         let before = counts(metrics);
         let failure_sum = sample(metrics, "failure", "sum");
         // Exercise the real caller while controlling only its checkout clock.
-        // Unpolled lifetime must neither emit a sample nor inflate cancellation.
+        // Dropping the async caller unpolled checks its lazy outer boundary;
+        // the polled cancellation below checks the actual checkout clock.
         tokio::time::pause();
+        let resume_clock = ResumeClock;
         let unpolled = caller.run(ledger);
         tokio::time::advance(Duration::from_secs(60)).await;
         drop(unpolled);
@@ -153,7 +111,7 @@ async fn checkout_cases(db: &Database) -> Result<()> {
         assert_eq!(counts(metrics), before, "{caller:?}: pending");
         tokio::time::advance(Duration::from_millis(75)).await;
         drop(acquiring);
-        tokio::time::resume();
+        drop(resume_clock);
         assert_eq!(
             counts(metrics),
             (before.0, before.1 + 1.),
@@ -191,6 +149,8 @@ async fn checkout_cases(db: &Database) -> Result<()> {
         tx.rollback().await?;
         assert_eq!(counts(metrics), (before.0 + 2., before.1));
     }
+    // Intentional failure injection, not fixture cleanup. The shared owner
+    // later closes every registered pool (close is idempotent).
     ledger.pool.close().await;
     for caller in Caller::ALL {
         let before = counts(metrics);
@@ -214,11 +174,10 @@ async fn checkout_cases(db: &Database) -> Result<()> {
 #[tokio::test]
 async fn postgres_job_sql_wait_errors_and_cancellation_do_not_change_checkout_samples() -> Result<()>
 {
-    let Some(db) = Database::open().await? else {
-        return Ok(());
-    };
-    let result = sql_cases(&db).await;
-    result.and(db.close().await)
+    with_database(|url, pools| {
+        Box::pin(async move { sql_cases(&Database::open(url, pools).await?).await })
+    })
+    .await
 }
 
 async fn sql_cases(db: &Database) -> Result<()> {
@@ -290,13 +249,9 @@ fn postgres_compact_read_releases_checkout_before_blocking_decode() -> Result<()
         .max_blocking_threads(1)
         .enable_all()
         .build()?;
-    runtime.block_on(async {
-        let Some(db) = Database::open().await? else {
-            return Ok(());
-        };
-        let result = decode_case(&db).await;
-        result.and(db.close().await)
-    })
+    runtime.block_on(with_database(|url, pools| {
+        Box::pin(async move { decode_case(&Database::open(url, pools).await?).await })
+    }))
 }
 
 async fn decode_case(db: &Database) -> Result<()> {

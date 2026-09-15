@@ -17,3 +17,6 @@ mod tests;
 
 #[cfg(test)]
 mod job_tests;
+
+#[cfg(test)]
+mod test_support;
