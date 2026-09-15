@@ -11,8 +11,10 @@ use std::sync::{
 use submit_ledger::CommitGate;
 
 mod admission_races;
+mod authority_lease;
 mod blockwait;
 mod commit_reconcile;
+mod compact_authority;
 mod compact_prepared;
 mod config;
 mod credit;
@@ -79,7 +81,7 @@ impl Drop for CancelProbe<'_> {
 impl MemoryLedger {
     async fn append_gated(
         &self,
-        share: AcceptedShare,
+        mut share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
         commit: &CommitGate,
@@ -94,8 +96,23 @@ impl MemoryLedger {
             revision == self.revision.load(Ordering::SeqCst),
             "payout revision changed"
         );
+        let existing = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(old, _, _)| old.share_id == share.share_id)
+            .map(|(old, _, _)| old.clone());
+        if let Some(old) = &existing {
+            share.share_seq = old.share_seq;
+            share.accepted_at_ms = old.accepted_at_ms;
+            ensure!(share == *old, "duplicate share_id payload mismatch");
+        }
         // Model the production pre-commit hook: every statement has run.
         if !commit.begin_commit() {
+            if existing.is_some() && candidate.is_none() {
+                return Ok(false);
+            }
             return Err(crate::ledger::CommitGateClosed.into());
         }
         let gate = self.commit_gate.lock().unwrap().take();
@@ -301,17 +318,17 @@ impl Fixture {
             ledger,
             submit_ledger: store.clone(),
             work_ledger: store.clone(),
-            prepared: RwLock::new(None),
+            prepared: Arc::new(RwLock::new(None)),
             refresh,
             wake: Notify::new(),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
-            readiness: RwLock::new(ReadinessState {
+            readiness: Arc::new(RwLock::new(ReadinessState {
                 last_poll: Some(Instant::now()),
                 ..Default::default()
-            }),
-            observed_tip: RwLock::new(TipState::default()),
+            })),
+            observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
@@ -473,6 +490,7 @@ impl Fixture {
                 worker,
                 bundle,
                 bootstrap_share: None,
+                issuance_authority: None,
             }),
         }
     }

@@ -234,19 +234,31 @@ impl Coordinator {
         let tip_observation::SubmitAdmission {
             current,
             tip: selected,
+            lease,
         } = self.submit_admission().await?;
-        if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
+        if lease.is_none()
+            && last_poll.elapsed() >= self.config.health_timeout
+            && !selected.share_lease
+        {
             return Err(protocol_error(
                 "backend-rpc-unavailable",
                 "current chain state is unavailable",
             ));
         }
-        let revision = self.submit_ledger.payout_revision().await.map_err(|_| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current payout state is unavailable",
-            )
-        })?;
+        let revision = if let Some(lease) = &lease {
+            // Re-reading only a revision here would pair a newer transaction
+            // fence with the older balance digest checked by lease admission.
+            lease
+                .revision_for(&context.prepared)
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?
+        } else {
+            self.submit_ledger.payout_revision().await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current payout state is unavailable",
+                )
+            })?
+        };
         let parent_stale = selected.hash != job.wire.previousblockhash;
         let grace =
             parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
@@ -317,6 +329,16 @@ impl Coordinator {
                 ));
             }
         }
+        if let Some(lease) = &lease {
+            if !self.revalidate_published_lease(lease).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })? {
+                return Err(protocol_error("stale-job", "stale job"));
+            }
+        }
         // Both acknowledgement bounds are measured from here.
         let start = tokio::time::Instant::now();
         let share_id = share.share_id.clone();
@@ -372,7 +394,13 @@ impl Coordinator {
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
-                self.persist_share_pass(share, candidate, revision, start)
+                // Ordinary current-tip/candidate admission keeps its existing
+                // credit contract, including a proof that returned from lease
+                // selection to ordinary authority before admission finished.
+                let fence = lease
+                    .filter(|_| selected.share_lease)
+                    .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
+                self.persist_share_pass(share, candidate, revision, start, fence)
                     .await
             }
             Ok(candidate) => {
@@ -394,9 +422,18 @@ impl Coordinator {
             SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.downcast_ref::<CommitGateClosed>().is_none()
-                    && (error.to_string().contains("duplicate-share")
-                        || error.to_string().contains("duplicate share_id"))
+                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                    // A refused local gate proves COMMIT was never sent. It
+                    // can mean revoked authority or lock contention, so do not
+                    // label it a stale job or a database failure.
+                    tracing::info!(%error, "share commit gate refused before COMMIT");
+                    return Err(protocol_error(
+                        "ledger-confirmation-failed",
+                        "share was not committed because its commit gate closed",
+                    ));
+                }
+                if error.to_string().contains("duplicate-share")
+                    || error.to_string().contains("duplicate share_id")
                 {
                     return Err(protocol_error("duplicate-share", "duplicate share"));
                 }
@@ -437,9 +474,10 @@ impl Coordinator {
         candidate: Option<Candidate>,
         revision: i64,
         start: tokio::time::Instant,
+        lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
-        let gate = Arc::new(CommitGate::default());
+        let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
         let refusable = candidate.is_none();
