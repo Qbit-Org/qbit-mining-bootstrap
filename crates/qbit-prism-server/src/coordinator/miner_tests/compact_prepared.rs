@@ -8,10 +8,17 @@ use work_ledger::WorkLedger;
 
 // Reuse the fixture's original build parts under an unreserved key. This is
 // test setup, not a production conversion from a legacy/resumed Prepared.
-fn original_build(original: &Prepared) -> CompactOwner<OriginalPreparedBuild> {
+fn original_build(f: &Fixture, original: &Prepared) -> CompactOwner<OriginalPreparedBuild> {
+    let key = format!("prepared:fresh:{}", uuid::Uuid::new_v4().simple());
+    let stored = f.original(original);
+    f.store
+        .originals
+        .lock()
+        .unwrap()
+        .insert(key.clone(), stored.clone());
     OriginalPreparedBuild::from_original_build(
-        format!("prepared:fresh:{}", uuid::Uuid::new_v4().simple()),
-        original.stored.clone(),
+        key,
+        stored,
         original.window,
         original.inputs.clone(),
     )
@@ -20,7 +27,7 @@ fn original_build(original: &Prepared) -> CompactOwner<OriginalPreparedBuild> {
 async fn captured(f: &Fixture) -> CompactOwner<CapturedCompactPrepared> {
     let original = f.coordinator.prepared.read().await.clone().unwrap();
     f.coordinator
-        .capture_compact_prepared(original_build(&original), 130_000)
+        .capture_compact_prepared(original_build(f, &original), 130_000)
         .await
         .unwrap()
 }
@@ -28,8 +35,8 @@ async fn captured(f: &Fixture) -> CompactOwner<CapturedCompactPrepared> {
 fn observation(captured: &CapturedCompactPrepared) -> StoredCompactPrepared {
     StoredCompactPrepared {
         record: captured.record.clone(),
-        template: captured.original.stored.template.clone(),
-        prior_balances: captured.original.snapshot.prior_balances.clone(),
+        template: captured.original.template.clone(),
+        prior_balances: (*captured.original.reservation.balances).clone(),
         original_expires_at_ms: captured.original_expires_at_ms,
         expires_at_ms: 190_000,
     }
@@ -55,8 +62,8 @@ fn script_window(f: &Fixture, captured: &CapturedCompactPrepared) {
         .lock()
         .unwrap()
         .push_back(Ok(Window {
-            shares: captured.original.snapshot.shares.clone(),
-            prior_balances: captured.original.snapshot.prior_balances.clone(),
+            shares: f.original(&captured.original).snapshot.shares.clone(),
+            prior_balances: (*captured.original.reservation.balances).clone(),
             payout_revision: 37,
         }));
 }
@@ -124,7 +131,7 @@ async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_
         .await;
         let original = f.coordinator.prepared.read().await.clone().unwrap();
         let inputs = BundleInputs::capture(&f.coordinator.config, None).unwrap();
-        let mut raw = (*original.snapshot).clone();
+        let mut raw = (*f.original(&original).snapshot).clone();
         // SQL under a natural-language collation can yield a before B, while
         // the immutable balance blob's bytewise comparator yields B before a.
         raw.prior_balances = vec![
@@ -142,7 +149,7 @@ async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_
             },
         ];
         let found = original.bundle.as_ref().unwrap().found_block.clone();
-        let suffix = original.stored.coinbase_suffix.clone();
+        let suffix = original.reservation.record.coinbase_suffix_hex.clone();
         let permit = f
             .coordinator
             .build_slots
@@ -213,12 +220,14 @@ async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_
             parent_of_tip: original.parent_of_tip.clone(),
             coinbase_suffix: suffix.clone(),
         });
-        let source = OriginalPreparedBuild::from_original_build(
-            format!("prepared:canonical:{}", uuid::Uuid::new_v4().simple()),
-            stored,
-            window,
-            inputs.clone(),
-        );
+        let key = format!("prepared:canonical:{}", uuid::Uuid::new_v4().simple());
+        f.store
+            .originals
+            .lock()
+            .unwrap()
+            .insert(key.clone(), stored.clone());
+        let source =
+            OriginalPreparedBuild::from_original_build(key, stored, window, inputs.clone());
         let captured = f
             .coordinator
             .capture_compact_prepared(source, 130_000)
@@ -282,7 +291,7 @@ async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_
                 fingerprint: original.fingerprint.clone(),
                 generation: original.generation,
                 parent_of_tip: original.parent_of_tip.clone(),
-                coinbase_suffix: original.stored.coinbase_suffix.clone(),
+                coinbase_suffix: original.reservation.record.coinbase_suffix_hex.clone(),
             });
             let source = OriginalPreparedBuild::from_original_build(
                 format!("prepared:incompatible:{}", uuid::Uuid::new_v4().simple()),
@@ -353,7 +362,7 @@ async fn capture_rejects_mismatched_original_window_without_changing_identity() 
         "count",
     ] {
         let mut window = original.window;
-        let mut snapshot = (*original.snapshot).clone();
+        let mut snapshot = (*f.original(&original).snapshot).clone();
         match mismatch {
             "anchor" => window.anchor_ms += 1,
             "missing range" => window.shares = None,
@@ -367,13 +376,13 @@ async fn capture_rejects_mismatched_original_window_without_changing_identity() 
             Arc::new(StoredPrepared {
                 snapshot: Arc::new(snapshot),
                 template: original.template.clone(),
-                bundle: original.bundle.clone(),
+                bundle: f.original(&original).bundle.clone(),
                 inputs: Some(original.inputs.clone()),
                 fee: original.fee,
                 fingerprint: original.fingerprint.clone(),
                 generation: original.generation,
                 parent_of_tip: original.parent_of_tip.clone(),
-                coinbase_suffix: original.stored.coinbase_suffix.clone(),
+                coinbase_suffix: original.reservation.record.coinbase_suffix_hex.clone(),
             }),
             window,
             original.inputs.clone(),
@@ -427,7 +436,7 @@ async fn established_readiness_allows_unpublished_capture_and_preserves_inline_c
         // outputs without database I/O. This is not the cold-start contract.
         // Remove its access view: fresh capture must not read a publication.
         let original = f.coordinator.prepared.write().await.take().unwrap();
-        let mut snapshot = (*original.snapshot).clone();
+        let mut snapshot = (*f.original(&original).snapshot).clone();
         if empty {
             snapshot.shares.clear();
         }
@@ -435,13 +444,13 @@ async fn established_readiness_allows_unpublished_capture_and_preserves_inline_c
         let stored = Arc::new(StoredPrepared {
             snapshot: Arc::new(snapshot),
             template: original.template.clone(),
-            bundle: (!empty).then(|| original.stored.bundle.clone().unwrap()),
+            bundle: (!empty).then(|| f.original(&original).bundle.clone().unwrap()),
             inputs: Some(original.inputs.clone()),
             fee: original.fee,
             fingerprint: original.fingerprint.clone(),
             generation: original.generation,
             parent_of_tip: original.parent_of_tip.clone(),
-            coinbase_suffix: original.stored.coinbase_suffix.clone(),
+            coinbase_suffix: original.reservation.record.coinbase_suffix_hex.clone(),
         });
         let key = format!("prepared:fresh:{}", uuid::Uuid::new_v4().simple());
         let source = OriginalPreparedBuild::from_original_build(
@@ -538,7 +547,7 @@ async fn compact_save_refuses_cold_start_and_readiness_invalidation() {
         // A successful current observation is insufficient by itself: it
         // must not manufacture last_poll or undo an earlier invalidation.
         f.detect(1).await;
-        let mut source = original_build(&original);
+        let mut source = original_build(&f, &original);
         let probe = ReleaseProbe(Arc::new(prepared_storage::RepairProbe::default()));
         if phase == "during capture" {
             source = OriginalPreparedBuild::with_capture_probe(source, probe.0.clone());
@@ -595,7 +604,11 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     .await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
-    let source = original_build(&original);
+    f.store.compact.save_calls.lock().unwrap().clear();
+    let full = f.original(&original);
+    let snapshot_owners = Arc::strong_count(&full.snapshot);
+    let bundle_owners = Arc::strong_count(full.bundle.as_ref().unwrap());
+    let source = original_build(&f, &original);
     let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
     config.ctv_enabled = false;
     config.ctv_direct_floor += 1;
@@ -608,7 +621,18 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
         .capture_compact_prepared(source, 130_000)
         .await
         .unwrap();
-    assert!(Arc::ptr_eq(&captured.original.stored, &original.stored));
+    assert_eq!(
+        Arc::strong_count(&full.snapshot),
+        snapshot_owners,
+        "captured runtime work must not retain the full snapshot"
+    );
+    assert_eq!(
+        Arc::strong_count(full.bundle.as_ref().unwrap()),
+        bundle_owners,
+        "captured runtime work must not retain the full audit bundle"
+    );
+    assert_eq!(captured.original.window, original.window);
+    assert_eq!(captured.original.inputs, original.inputs);
     assert_ne!(captured.original.storage_key, original.storage_key);
     assert_eq!(captured.record.window, original.window);
     assert_eq!(captured.record.share_seq, original.snapshot.share_seq);
@@ -627,7 +651,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     );
     assert_eq!(
         captured.record.coinbase_suffix_hex,
-        original.stored.coinbase_suffix
+        original.reservation.record.coinbase_suffix_hex
     );
     assert_eq!(captured.record.fingerprint, original.fingerprint);
     assert_eq!(captured.record.generation, original.generation);
@@ -637,7 +661,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
     );
     assert_eq!(captured.record.parent_of_tip, original.parent_of_tip);
     let report = qbit_prism::verify_audit_bundle(
-        original.bundle.as_ref().unwrap(),
+        f.original(&original).bundle.as_ref().unwrap(),
         &original.inputs.signer_keys.ledger_key_hex,
     )
     .unwrap();
@@ -674,7 +698,7 @@ async fn capture_preserves_original_identity_and_exact_save_arguments() {
         assert_eq!(saved.key, captured.original.storage_key);
         assert_eq!(saved.record, captured.record);
         assert_eq!(saved.template_sha256, captured.template.sha256());
-        assert_eq!(saved.balances, original.snapshot.prior_balances);
+        assert_eq!(saved.balances, *original.reservation.balances);
         assert_eq!(saved.current_revision, 0);
         assert_eq!(saved.record.payout_revision, 0);
         assert_eq!(saved.original_expires_at_ms, 130_000);
@@ -693,7 +717,7 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
         .shares
         .clear();
     f.coordinator.refresh_once().await.unwrap();
-    let source = original_build(f.coordinator.prepared.read().await.as_ref().unwrap());
+    let source = original_build(&f, f.coordinator.prepared.read().await.as_ref().unwrap());
     let worker = f.job(1, 0, "original.worker").context.worker.clone();
     let issued = f
         .coordinator
@@ -711,8 +735,9 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
         .unwrap()
         .unwrap();
     let original = resumed.context.prepared.clone();
-    assert!(original.bundle.is_some());
-    assert!(original.stored.bundle.is_none());
+    assert!(original.bundle.is_none());
+    assert!(resumed.context.bootstrap_share.is_some());
+    assert!(f.original(&original).bundle.is_none());
     let captured = f
         .coordinator
         .capture_compact_prepared(source, 130_000)
@@ -724,16 +749,16 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
     assert!(captured.record.audit_hashes.is_none());
     assert_eq!(
         captured.record.coinbase_suffix_hex,
-        original.stored.coinbase_suffix
+        original.reservation.record.coinbase_suffix_hex
     );
 }
 
 #[tokio::test]
-async fn original_build_capture_retains_inputs_when_legacy_resume_rejects_changed_config() {
+async fn original_build_capture_and_runtime_resume_preserve_original_config() {
     let mut f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
-    let source = original_build(&original);
+    let source = original_build(&f, &original);
     let worker = f.job(1, 0, "original.worker").context.worker.clone();
     let job = f
         .coordinator
@@ -751,7 +776,7 @@ async fn original_build_capture_retains_inputs_when_legacy_resume_rejects_change
         .resume_job(&worker, &job.wire.job_id)
         .await
         .unwrap()
-        .is_none());
+        .is_some());
     let current_inputs = BundleInputs::capture(&f.coordinator.config, original.fee).unwrap();
     assert_ne!(current_inputs.payout_policy, original.inputs.payout_policy);
     let captured = f
@@ -759,10 +784,11 @@ async fn original_build_capture_retains_inputs_when_legacy_resume_rejects_change
         .capture_compact_prepared(source, 130_000)
         .await
         .unwrap();
-    assert!(Arc::ptr_eq(&captured.original.stored, &original.stored));
+    assert_eq!(captured.original.window, original.window);
+    assert_eq!(captured.original.inputs, original.inputs);
     assert_eq!(captured.record.payout_policy, original.inputs.payout_policy);
     let report = qbit_prism::verify_audit_bundle(
-        original.stored.bundle.as_ref().unwrap(),
+        f.original(&original).bundle.as_ref().unwrap(),
         &original.inputs.signer_keys.ledger_key_hex,
     )
     .unwrap();
@@ -787,10 +813,11 @@ impl Drop for ReleaseProbe {
 async fn with_probe() -> (Fixture, CompactOwner<OriginalPreparedBuild>, ReleaseProbe) {
     let f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
+    f.store.compact.save_calls.lock().unwrap().clear();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
     let probe = Arc::new(prepared_storage::RepairProbe::default());
     let source =
-        OriginalPreparedBuild::with_capture_probe(original_build(&original), probe.clone());
+        OriginalPreparedBuild::with_capture_probe(original_build(&f, &original), probe.clone());
     (f, source, ReleaseProbe(probe))
 }
 
@@ -920,10 +947,10 @@ async fn hydration_preserves_original_inputs_and_three_distinct_deadlines() {
             .unwrap()
             .unwrap();
         assert_eq!(hydrated.record, captured.record);
-        assert_eq!(hydrated.template, captured.original.stored.template);
+        assert_eq!(hydrated.template, captured.original.template);
         assert_eq!(
             serde_json::to_value(&hydrated.snapshot).unwrap(),
-            serde_json::to_value(&captured.original.snapshot).unwrap()
+            serde_json::to_value(&f.original(&captured.original).snapshot).unwrap()
         );
         assert_eq!(hydrated.inputs.payout_policy, captured.record.payout_policy);
         assert_ne!(

@@ -1,10 +1,10 @@
-//! Additive storage for the coordinated compact-prepared cutover (#273).
+//! Storage for the coordinated compact-prepared runtime cutover (#273).
 //!
-//! No runtime caller uses these APIs yet. Before enabling them, drain candidates
+//! Before enabling this runtime, drain candidates
 //! with compatible pre-007 frontends, stop ALL frontends, and verify zero pending
 //! candidates. Apply the coordinated migrations, then start compatible binaries.
-//! This is not a rolling old/new-writer contract. The generic job APIs keep
-//! their existing inline representation until the caller integration lands.
+//! This is not a rolling old/new-writer contract. Coordinator uses these typed
+//! APIs; generic job APIs remain available for their existing non-runtime callers.
 //!
 //! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
 //! ORDER_LOCK before inspecting references and deleting blobs. Prepared writers
@@ -87,6 +87,13 @@ impl PreparedTemplate {
 
     pub fn sha256(&self) -> &str {
         &self.digest
+    }
+
+    /// The in-memory decision fixture observes the typed encoder's exact
+    /// input without exposing blob bytes or adding a production decode API.
+    #[cfg(test)]
+    pub(crate) fn value_for_test(&self) -> Result<Value> {
+        Ok(serde_json::from_slice(&self.bytes)?)
     }
 }
 
@@ -260,14 +267,38 @@ impl Ledger {
     /// link before this lookup, not route a client-supplied issued-job ID here.
     /// An issued payload at this key is an error, not a legacy prepared miss.
     pub async fn compact_prepared(&self, key: &str) -> Result<Option<StoredCompactPrepared>> {
+        Ok(self
+            .compact_prepared_with_admission(key, ReadAdmission::default())
+            .await?
+            .map(BlockingDrop::into_inner))
+    }
+
+    /// Runtime admission follows the SQL row, decoder, returned metadata and
+    /// cancellation cleanup. The caller supplies capacity; no nested permit.
+    pub(crate) async fn compact_prepared_with_admission(
+        &self,
+        key: &str,
+        completion: ReadAdmission,
+    ) -> Result<Option<BlockingDrop<StoredCompactPrepared>>> {
         let row = sqlx::query("SELECT j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.job_id=$1 AND j.expires_at>clock_timestamp()")
             .bind(key).fetch_optional(&mut *self.acquire().await?).await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        // Includes large-template and balance decoding/hashing. Cancellation
-        // leaves that owned work on its blocking thread; no new deadline.
-        tokio::task::spawn_blocking(move || decode_row(row)).await?
+        #[cfg(test)]
+        let decode_hook = self.compact_decode_hook.lock().unwrap().clone();
+        let decoded = completion
+            .own(row)
+            .map_anyhow(move |row| {
+                #[cfg(test)]
+                if let Some(hook) = decode_hook {
+                    hook();
+                }
+                decode_row(row)
+            })
+            .await?;
+        // Synchronous handoff retains the same admission; no unowned await.
+        Ok(decoded.into_inner().map(|stored| completion.own(stored)))
     }
 }
 

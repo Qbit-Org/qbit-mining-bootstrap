@@ -10,9 +10,11 @@ fn candidate_construction_yields_before_copying_issued_balances() {
         .block_on(async {
             let fixture = Fixture::new(Duration::from_secs(10)).await;
             let mut job = fixture.job(1, 0, "original.worker");
+            let share = fixture.original(&job.context.prepared).snapshot.shares[0].clone();
             let prepared =
                 Arc::get_mut(&mut Arc::get_mut(&mut job.context).unwrap().prepared).unwrap();
-            Arc::make_mut(&mut prepared.snapshot).prior_balances = (0..300_000)
+            *Arc::make_mut(&mut Arc::get_mut(&mut prepared.reservation).unwrap().balances) = (0
+                ..300_000)
                 .map(|n| qbit_prism::CarryForwardBalance {
                     order_key: format!("recipient-{n:06}"),
                     recipient_id: format!("miner-{n:06}"),
@@ -20,7 +22,6 @@ fn candidate_construction_yields_before_copying_issued_balances() {
                     balance_sats: n + 1,
                 })
                 .collect();
-            let share = job.context.prepared.snapshot.shares[0].clone();
             for share_pass in [true, false] {
                 let mut proof = fixture.proof(&job, 0);
                 proof.share_pass = share_pass;
@@ -51,7 +52,7 @@ fn candidate_construction_yields_before_copying_issued_balances() {
                 let candidate = candidate.await.unwrap();
                 assert_eq!(
                     candidate.as_issued_balances,
-                    job.context.prepared.snapshot.prior_balances
+                    *job.context.prepared.reservation.balances
                 );
                 assert_eq!(candidate.block_bytes, block_bytes);
                 assert_eq!(

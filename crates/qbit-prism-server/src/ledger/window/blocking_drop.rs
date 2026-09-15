@@ -6,18 +6,53 @@ use tokio::sync::OwnedSemaphorePermit;
 /// One admission shared by the read, its blocking work and its cleanup.
 /// The final owner releases it; blocking-pool queue order is irrelevant.
 #[derive(Clone, Default)]
-pub(super) struct ReadAdmission {
-    _permit: Option<Arc<OwnedSemaphorePermit>>,
+pub(crate) struct ReadAdmission {
+    _owner: Option<Arc<AdmissionOwner>>,
+}
+
+struct AdmissionOwner {
+    permit: Option<Arc<OwnedSemaphorePermit>>,
+    changed: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl Drop for AdmissionOwner {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        if let Some(changed) = &self.changed {
+            changed.notify_waiters();
+        }
+    }
 }
 
 impl ReadAdmission {
-    pub(super) fn new(permit: OwnedSemaphorePermit) -> Self {
+    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self::shared(Arc::new(permit))
+    }
+
+    pub(crate) fn shared(permit: Arc<OwnedSemaphorePermit>) -> Self {
         Self {
-            _permit: Some(Arc::new(permit)),
+            _owner: Some(Arc::new(AdmissionOwner {
+                permit: Some(permit),
+                changed: None,
+            })),
         }
     }
 
-    pub(super) fn own<T: Send + 'static>(&self, value: T) -> BlockingDrop<T> {
+    /// Coalescer waiters wake when actual work/cleanup releases the last owner,
+    /// including when the async flight disappeared before its blocking task.
+    pub(crate) fn notifying(
+        permit: OwnedSemaphorePermit,
+        changed: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            _owner: Some(Arc::new(AdmissionOwner {
+                permit: Some(Arc::new(permit)),
+                changed: Some(changed),
+            })),
+        }
+    }
+
+    pub(crate) fn own<T: Send + 'static>(&self, value: T) -> BlockingDrop<T> {
         BlockingDrop {
             value: Some(value),
             completion: self.clone(),
@@ -26,28 +61,28 @@ impl ReadAdmission {
     }
 }
 
-pub(super) struct BlockingDrop<T: Send + 'static> {
+pub(crate) struct BlockingDrop<T: Send + 'static> {
     value: Option<T>,
     completion: ReadAdmission,
     runtime: tokio::runtime::Handle,
 }
 
 impl<T: Send + 'static> BlockingDrop<T> {
-    pub(super) fn new(value: T) -> Self {
+    pub(crate) fn new(value: T) -> Self {
         ReadAdmission::default().own(value)
     }
 
-    pub(super) fn get(&self) -> &T {
+    pub(crate) fn get(&self) -> &T {
         self.value.as_ref().expect("owned until taken")
     }
 
-    pub(super) fn into_inner(mut self) -> T {
+    pub(crate) fn into_inner(mut self) -> T {
         self.value.take().expect("owned until taken")
     }
 
     /// Retain admission while mapping, including an error or panic, and
     /// transfer it into the output before the blocking task can complete.
-    pub(super) async fn map<U: Send + 'static>(
+    pub(crate) async fn map<U: Send + 'static>(
         self,
         map: impl FnOnce(T) -> Result<U, WindowError> + Send + 'static,
     ) -> Result<BlockingDrop<U>, WindowError> {
@@ -60,6 +95,28 @@ impl<T: Send + 'static> BlockingDrop<T> {
             })
             .await
             .map_err(WindowError::TaskFailed)?
+    }
+
+    /// The generic ledger readers retain their existing anyhow/source contract.
+    pub(crate) async fn map_anyhow<U: Send + 'static>(
+        self,
+        map: impl FnOnce(T) -> anyhow::Result<U> + Send + 'static,
+    ) -> anyhow::Result<BlockingDrop<U>> {
+        self.map(move |value| map(value).map_err(WindowError::Decode))
+            .await
+            .map_err(|error| match error {
+                WindowError::Decode(error) => error,
+                WindowError::TaskFailed(error) => error.into(),
+                error => error.into(),
+            })
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for BlockingDrop<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.get()
     }
 }
 

@@ -224,9 +224,10 @@ impl Fixture {
             .clone()
             .context("the refresh published no work")?;
         ensure!(
-            prepared.snapshot.shares.len() as u64 == n && prepared.bundle.is_some(),
+            prepared.window.shares.map_or(0, |range| range.share_count) == n
+                && prepared.bundle.is_some(),
             "the refresh published a {}-share window, expected {n}",
-            prepared.snapshot.shares.len()
+            prepared.window.shares.map_or(0, |range| range.share_count)
         );
         println!(
             "[n={n}] loaded in {:.2} s, refreshed in {:.2} s",
@@ -518,11 +519,8 @@ async fn canonical_identity(raw: &str, n: u64) -> Result<()> {
 async fn canonical_identity_body(fixture: &Fixture, n: u64) -> Result<()> {
     let solved = fixture.solve(n).await?;
     let coordinator = &fixture.coordinator;
-    let bundle = solved
-        .prepared
-        .bundle
-        .clone()
-        .context("the refresh built no bundle")?;
+    let bundle =
+        Arc::new(d2_test_support::original_audit(coordinator, &solved.prepared, None).await?);
     ensure!(
         bundle.coinbase_script_sig_suffix_hex.as_deref() == Some(solved.coinbase_suffix_hex.as_str()),
         "the zero-extranonce candidate's coinbase suffix {} is not the refresh bundle's {:?}; the bundles would differ by design",
@@ -571,7 +569,8 @@ async fn canonical_identity_body(fixture: &Fixture, n: u64) -> Result<()> {
 
     // The landed digest is the refresh bundle's.
     let report = {
-        let bundle = solved.prepared.bundle.clone().context("bundle")?;
+        let bundle =
+            Arc::new(d2_test_support::original_audit(coordinator, &solved.prepared, None).await?);
         let key = coordinator.config.ledger_public_key.clone();
         tokio::task::spawn_blocking(move || {
             qbit_prism::verify_audit_bundle_with_ledger_public_key(&bundle, &key)

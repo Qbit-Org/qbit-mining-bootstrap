@@ -2,10 +2,8 @@
 use super::publication_authority::AbsoluteDeadline;
 use super::tip_observation::PreparedIdentity;
 use super::*;
-use crate::ledger::{IssuedJobSave, PreparedDependency};
+use crate::ledger::{CompactRepair, IssuedJobSave};
 
-// Preparatory only: no refresh, resume or issued-publication caller yet.
-#[allow(dead_code)]
 pub(super) mod compact;
 
 /// One issue operation retains its original identity, epoch, bytes and expiry
@@ -81,23 +79,34 @@ impl Coordinator {
             return Ok(());
         }
         let permit = self.build_slots.clone().acquire_owned().await?;
-        let original = prepared.stored.clone();
+        let original = prepared.reservation.clone();
         #[cfg(test)]
         let probe = prepared.repair_probe.lock().unwrap().clone();
-        let (serialized, _repair) = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            #[cfg(test)]
-            if let Some(probe) = probe {
-                probe.block();
-            }
-            (serde_json::to_value(original), repair)
-        })
-        .await?;
-        let serialized = serialized?;
+        let admitted = compact::CompactOwner::new((original, repair, permit));
+        let encoded = admitted
+            .spawn_blocking(move |(source, repair, permit)| {
+                let admission = permit;
+                let repair_guard = repair;
+                let original = source;
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe.block();
+                }
+                let encoded = original.encode_repair()?;
+                Ok::<_, anyhow::Error>(compact::CompactOwner::new((
+                    encoded,
+                    repair_guard,
+                    admission,
+                )))
+            })
+            .await??;
+        let (encoded, repair_guard, admission) = encoded.into_inner();
+        let serialized = compact::CompactOwner::new((encoded, repair_guard));
+        drop(admission);
         // Both admission and the transaction's current revision are checked
         // again after waiting. The original child deadline/payload stay fixed.
         ensure!(
-            self.save_with_dependency(&mut issued, Some(&serialized))
+            self.save_with_dependency(&mut issued, Some(&serialized.0))
                 .await?
                 == IssuedJobSave::Saved,
             "prepared dependency repair did not save issued work"
@@ -108,25 +117,19 @@ impl Coordinator {
     async fn save_with_dependency(
         &self,
         issued: &mut IssuedPersistence<'_>,
-        repair: Option<&Value>,
+        repair: Option<&CompactRepair>,
     ) -> Result<IssuedJobSave> {
         let revision = self.revalidate_issued(issued).await?;
         let prepared = &issued.job.context.prepared;
         let saved = self
             .work_ledger
-            .save_issued_job(
+            .save_issued_job_compact(
                 &issued.job.wire.job_id,
                 &issued.payload,
                 revision,
                 &issued.job.wire.previousblockhash,
                 issued.expires_at_ms,
-                PreparedDependency {
-                    key: &prepared.storage_key,
-                    original_revision: prepared.stored.snapshot.payout_revision,
-                    parent: prepared.stored.template["previousblockhash"]
-                        .as_str()
-                        .context("prepared parent missing")?,
-                },
+                prepared.reservation.dependency(&prepared.storage_key),
                 repair,
             )
             .await?;
@@ -161,7 +164,7 @@ pub(super) struct RepairProbe {
 
 #[cfg(test)]
 impl RepairProbe {
-    fn block(&self) {
+    pub(super) fn block(&self) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let mut released = self.released.lock().unwrap();
