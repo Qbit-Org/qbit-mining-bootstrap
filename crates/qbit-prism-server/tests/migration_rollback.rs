@@ -1331,12 +1331,12 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=2".into(),
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=1".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_storage_version'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_storage_version'".into(),
             "declares candidate_storage_version = 2",
         ),
         (
@@ -1353,6 +1353,16 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_offer_lifecycle'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_offer_lifecycle'".into(),
             "declares candidate_offer_lifecycle = 2",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='instance_offer_startup'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('instance_offer_startup',1)".into(),
+            "instance_offer_startup",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='instance_offer_startup'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='instance_offer_startup'".into(),
+            "instance_offer_startup",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),

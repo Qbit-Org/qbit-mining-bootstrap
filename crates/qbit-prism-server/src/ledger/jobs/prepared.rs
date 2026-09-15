@@ -268,7 +268,7 @@ impl Ledger {
     /// An issued payload at this key is an error, not a legacy prepared miss.
     pub async fn compact_prepared(&self, key: &str) -> Result<Option<StoredCompactPrepared>> {
         let row = sqlx::query("SELECT j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.job_id=$1 AND j.expires_at>clock_timestamp()")
-            .bind(key).fetch_optional(&self.pool).await?;
+            .bind(key).fetch_optional(&mut *self.acquire().await?).await?;
         let Some(row) = row else {
             return Ok(None);
         };

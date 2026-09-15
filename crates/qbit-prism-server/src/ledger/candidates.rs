@@ -649,33 +649,130 @@ impl Ledger {
         let mut claimed = None;
         if let Some(row) = row {
             let block_hash: String = row.try_get("block_hash")?;
+            let state: String = row.try_get("state")?;
             let storage_version: i32 = row.try_get("storage_version")?;
             let candidate: Option<Value> = row.try_get("candidate")?;
             match (storage_version, candidate) {
                 // Kept whole rather than reduced to its document: the decode
                 // below also authenticates the block bytes against
                 // `block_sha256`, and that digest scales with the block.
-                (1, Some(_)) => claimed = Some(row),
+                (1, Some(_)) => claimed = Some((row, block_hash, state)),
                 (version, candidate) => {
                     let reason = if version == 1 {
                         "unfinished storage_version 1 candidate has no JSONB body".to_owned()
                     } else {
                         format!("candidate storage_version {version} is not supported by this server; only version 1 JSONB candidates are (a #258 chunked body must be drained by the 2.x.x release)")
                     };
-                    park_candidate(&mut tx, &block_hash, &token, &reason).await?;
+                    park_candidate(&mut tx, &block_hash, &token, &state, &reason).await?;
                     tracing::warn!(block=%block_hash, storage_version=version, has_body=candidate.is_some(), "parked a candidate this server cannot decode; operator action required");
                 }
             }
         }
         tx.commit().await?;
-        let Some(row) = claimed else {
+        let Some((row, block_hash, state)) = claimed else {
             return Ok(None);
         };
         // The document is O(1), but the block digest scales with the block,
-        // so the decode stays off the runtime thread that renews leases.
-        tokio::task::spawn_blocking(move || decode_claimed_row(&row, token))
-            .await?
-            .map(Some)
+        // so the decode stays off the runtime thread that renews leases. The
+        // row's database hash, the token and the state the claim selected
+        // stay here: a validation failure parks exactly the claim this
+        // attempt took, never whatever the decoded document names.
+        let decode_token = token.clone();
+        #[cfg(test)]
+        let decode_fault = faults::take(&block_hash, |fault| {
+            matches!(
+                fault,
+                Fault::PanicInDecode
+                    | Fault::TransientDecodeDatabaseError
+                    | Fault::UnclassifiedDecodeError
+            )
+        });
+        let decoded = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            faults::before_decode(decode_fault)?;
+            decode_claimed_row(&row, decode_token)
+        })
+        .await?;
+        let error = match decoded {
+            Ok(claim) => return Ok(Some(claim)),
+            Err(error) => error,
+        };
+        #[cfg(test)]
+        faults::after_decode(&self.pool, &block_hash).await?;
+        // Only a positively identified malformed row is parked. Any other
+        // decode failure, a column extraction or serialization error among
+        // them, proves nothing about the stored data: its claim is left to
+        // expire and be retried like any failed attempt.
+        let Some(&InvalidCandidate(kind)) = error.downcast_ref::<InvalidCandidate>() else {
+            return Err(error);
+        };
+        Err(self
+            .park_invalid_candidate(&block_hash, &token, &state, kind, error)
+            .await)
+    }
+
+    /// Park a claimed row whose persisted input failed validation, in a
+    /// writable transaction of its own after the claim committed and the
+    /// decode returned. [`park_candidate`] fences it on the claim's database
+    /// block hash, token and selected state, so a replacement owner's claim
+    /// and a row that has since moved on are never touched.
+    ///
+    /// Returns the original validation error, its chain intact, with the
+    /// parking outcome as context: parked only once exactly one row was
+    /// updated and the commit succeeded; not parked when anything before the
+    /// commit failed; unknown when the commit itself returned an error, whose
+    /// reply may have been lost after the row was durably parked.
+    async fn park_invalid_candidate(
+        &self,
+        block_hash: &str,
+        token: &str,
+        state: &str,
+        kind: ValidationKind,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let reason = parking_reason(block_hash, kind, &error);
+        let staged = async {
+            let mut tx = self.begin().await?;
+            writable(&mut tx).await?;
+            park_candidate(&mut tx, block_hash, token, state, &reason).await?;
+            #[cfg(test)]
+            ensure!(
+                faults::take(block_hash, |fault| *fault == Fault::FailBeforeParkCommit).is_none(),
+                "injected failure before the parking commit"
+            );
+            Ok::<_, anyhow::Error>(tx)
+        }
+        .await;
+        let committed = match staged {
+            Ok(tx) => {
+                let committed = tx.commit().await;
+                #[cfg(test)]
+                let committed = committed.and_then(|()| faults::commit_reply(block_hash));
+                committed.map_err(ParkOutcome::Unknown)
+            }
+            Err(refused) => Err(ParkOutcome::NotParked(refused)),
+        };
+        let chain = format!("{error:#}");
+        match committed {
+            Ok(()) => {
+                tracing::warn!(block=%block_hash, validation=kind.as_str(), error=%chain, "parked a candidate that failed validation; operator action required");
+                error.context(format!(
+                    "candidate {block_hash} failed validation and was parked; operator action required"
+                ))
+            }
+            Err(ParkOutcome::NotParked(failure)) => {
+                tracing::error!(block=%block_hash, validation=kind.as_str(), error=%chain, parking_error=%format!("{failure:#}"), "a candidate failed validation and was not parked");
+                error.context(format!(
+                    "candidate {block_hash} failed validation and was not parked: {failure:#}"
+                ))
+            }
+            Err(ParkOutcome::Unknown(failure)) => {
+                tracing::error!(block=%block_hash, validation=kind.as_str(), error=%chain, commit_error=%failure, "a candidate failed validation and whether it was parked is unknown; inspect the row");
+                error.context(format!(
+                    "candidate {block_hash} failed validation and whether it was parked is unknown: the parking commit failed: {failure}"
+                ))
+            }
+        }
     }
 
     /// The landed audit row for a block, if an earlier claim already landed
@@ -988,20 +1085,146 @@ pub fn coinbase_witness_reserved_value(tx: &[u8]) -> Result<[u8; 32]> {
     Ok(reserved)
 }
 
+/// The closed set of deterministic reasons a claimed row's persisted input is
+/// not a candidate this server may offer. Only [`decode_claimed_row`] names
+/// one, at the checks that positively identify malformed persisted data; a
+/// database, executor, column extraction or serialization error never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ValidationKind {
+    /// A persisted lifecycle state or offer outcome no variant names.
+    Lifecycle,
+    /// No window reference: a row a pre-007 frontend wrote.
+    WindowReference,
+    /// An inline pre-007 document, or JSON that is not a supported `Candidate`.
+    Document,
+    /// `candidate_sha256` is not the document's canonical digest.
+    DocumentDigest,
+    /// The document names a block other than the row's `block_hash`.
+    DocumentIdentity,
+    /// The window columns disagree with the document, or cannot hold its range.
+    WindowColumns,
+    /// Block bytes missing, truncated, or not hashing to the document's digests.
+    Block,
+    /// An empty or non-hex coinbase suffix.
+    CoinbaseSuffix,
+    /// The stored inputs contradict the window reference.
+    ReferenceInvariants,
+}
+
+impl ValidationKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Lifecycle => "lifecycle",
+            Self::WindowReference => "window_reference",
+            Self::Document => "document",
+            Self::DocumentDigest => "document_digest",
+            Self::DocumentIdentity => "document_identity",
+            Self::WindowColumns => "window_columns",
+            Self::Block => "block",
+            Self::CoinbaseSuffix => "coinbase_suffix",
+            Self::ReferenceInvariants => "reference_invariants",
+        }
+    }
+}
+
+/// The typed context that marks a decode error as a validation failure. It is
+/// attached directly over the original diagnosis, which stays in the chain,
+/// and a claim finds it with `downcast_ref`, never by matching error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InvalidCandidate(pub(super) ValidationKind);
+
+impl std::fmt::Display for InvalidCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "validation {}", self.0.as_str())
+    }
+}
+
+/// How the follow-up parking transaction ended when it did not commit.
+enum ParkOutcome {
+    /// Nothing was committed: the transaction could not begin, the writer
+    /// fence refused, the claim was no longer held, or it failed before its
+    /// commit and rolled back.
+    NotParked(anyhow::Error),
+    /// The commit returned an error; the row may or may not be parked.
+    Unknown(sqlx::Error),
+}
+
+/// The bound on the reason a parked row records in `last_error`, in bytes.
+pub(super) const PARKING_REASON_MAX_BYTES: usize = 1024;
+
+/// `candidate <database block hash>: validation <kind>: <diagnosis>`, at most
+/// [`PARKING_REASON_MAX_BYTES`] bytes of UTF-8. The identity and the kind come
+/// first, so only the diagnosis is truncated, on a character boundary and
+/// marked with an ellipsis. `error` is the decode's error, whose outermost
+/// context is the [`InvalidCandidate`] marker the kind already spells out.
+pub(super) fn parking_reason(
+    block_hash: &str,
+    kind: ValidationKind,
+    error: &anyhow::Error,
+) -> String {
+    let mut reason = format!("candidate {block_hash}: validation {}: ", kind.as_str());
+    for (index, cause) in error.chain().skip(1).enumerate() {
+        if index > 0 {
+            reason.push_str(": ");
+        }
+        reason.push_str(&cause.to_string());
+    }
+    if reason.len() > PARKING_REASON_MAX_BYTES {
+        let mut end = PARKING_REASON_MAX_BYTES - '…'.len_utf8();
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason.push('…');
+    }
+    reason
+}
+
+/// The four range columns of an outbox row, as the claim reads them.
+type RangeColumns = (Option<i64>, Option<i64>, Option<i64>, Option<String>);
+
+/// The range columns a document's range must be stored as.
+fn range_columns(range: ShareRange) -> Result<RangeColumns> {
+    Ok((
+        Some(i64::try_from(range.first_share_seq)?),
+        Some(i64::try_from(range.last_share_seq)?),
+        Some(i64::try_from(range.share_count)?),
+        Some(hex::encode(range.snapshot_sha256)),
+    ))
+}
+
+/// Mark an error as the validation failure `kind`, keeping it as the source.
+fn invalid(kind: ValidationKind) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
+    move |error| error.context(InvalidCandidate(kind))
+}
+
+/// `ensure!` for a persisted-input check: the failure carries its kind.
+macro_rules! ensure_valid {
+    ($kind:expr, $condition:expr, $($message:tt)+) => {
+        if !$condition {
+            return Err(anyhow::anyhow!($($message)+).context(InvalidCandidate($kind)));
+        }
+    };
+}
+
 /// Decode a claimed row into the candidate the row authenticates.
 ///
 /// After 007 there is no compatibility decode: a pending row with a NULL
 /// `window_anchor_ms` is a pre-007 row, and the error tells the operator to
 /// stop that frontend. Every disagreement between the document and its
-/// columns, digest or block is surfaced as corruption.
+/// columns, digest or block is surfaced as corruption, marked with its
+/// [`ValidationKind`]; a failure to read a column or to serialize the parsed
+/// document is left unmarked, because it is not evidence about the row.
 fn decode_claimed_row(row: &PgRow, token: String) -> Result<CandidateClaim> {
     let block_hash: String = row.try_get("block_hash")?;
-    let state = CandidateState::parse(row.try_get::<String, _>("state")?.as_str())?;
+    let state = CandidateState::parse(row.try_get::<String, _>("state")?.as_str())
+        .map_err(invalid(ValidationKind::Lifecycle))?;
     let outcome = row
         .try_get::<Option<String>, _>("offer_outcome")?
         .as_deref()
         .map(OfferOutcome::parse)
-        .transpose()?;
+        .transpose()
+        .map_err(invalid(ValidationKind::Lifecycle))?;
     let lifecycle = ClaimLifecycle {
         state,
         proof_observed_at_ms: row.try_get("proof_observed_at_ms")?,
@@ -1014,80 +1237,105 @@ fn decode_claimed_row(row: &PgRow, token: String) -> Result<CandidateClaim> {
     };
     let anchor: Option<i64> = row.try_get("window_anchor_ms")?;
     let Some(anchor) = anchor else {
-        bail!(
+        return Err(anyhow::anyhow!(
             "pending candidate {block_hash} carries no window reference: it was written by a pre-007 frontend. \
              Stop every pre-007 frontend and drain the outbox with it before running the post-007 binary"
-        );
+        )
+        .context(InvalidCandidate(ValidationKind::WindowReference)));
     };
     let document: Value = row.try_get("candidate")?;
-    ensure!(
+    ensure_valid!(
+        ValidationKind::Document,
         document.get("bundle").is_none() && document.get("block_hex").is_none(),
         "pending candidate {block_hash} is an inline pre-007 document on a post-007 schema"
     );
-    let mut candidate: Candidate =
-        serde_json::from_value(document).context("invalid persisted candidate")?;
+    let mut candidate: Candidate = serde_json::from_value(document)
+        .context("invalid persisted candidate")
+        .map_err(invalid(ValidationKind::Document))?;
     let digest: String = row.try_get("candidate_sha256")?;
-    ensure!(
-        hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?)) == digest,
+    // Serializing the parsed document is not a check of the row: its failure
+    // stays unmarked.
+    let canonical = serde_json::to_vec(&candidate)?;
+    ensure_valid!(
+        ValidationKind::DocumentDigest,
+        hex::encode(Sha256::digest(canonical)) == digest,
         "persisted candidate digest mismatch"
     );
-    ensure!(
+    ensure_valid!(
+        ValidationKind::DocumentIdentity,
         candidate.block_hash == block_hash,
         "persisted candidate names block {} in row {block_hash}",
         candidate.block_hash
     );
     // The typed columns are the document's duplicate; any disagreement,
     // including a range in the document with NULL range columns, is corruption.
-    ensure!(
+    ensure_valid!(
+        ValidationKind::WindowColumns,
         anchor == candidate.window.anchor_ms,
         "candidate window anchor column disagrees with the document"
     );
     let prior: String = row.try_get("window_prior_balances_sha256")?;
-    ensure!(
+    ensure_valid!(
+        ValidationKind::WindowColumns,
         prior == hex::encode(candidate.window.prior_balances_digest),
         "candidate window balances digest column disagrees with the document"
     );
-    let columns: (Option<i64>, Option<i64>, Option<i64>, Option<String>) = (
+    let columns: RangeColumns = (
         row.try_get("window_first_share_seq")?,
         row.try_get("window_last_share_seq")?,
         row.try_get("window_share_count")?,
         row.try_get("window_snapshot_sha256")?,
     );
     match candidate.window.shares {
-        Some(range) => ensure!(
-            columns
-                == (
-                    Some(i64::try_from(range.first_share_seq)?),
-                    Some(i64::try_from(range.last_share_seq)?),
-                    Some(i64::try_from(range.share_count)?),
-                    Some(hex::encode(range.snapshot_sha256)),
-                ),
-            "candidate window range columns disagree with the document"
-        ),
-        None => ensure!(
+        Some(range) => {
+            let expected = range_columns(range)
+                .context("candidate window range is not representable in the range columns")
+                .map_err(invalid(ValidationKind::WindowColumns))?;
+            ensure_valid!(
+                ValidationKind::WindowColumns,
+                columns == expected,
+                "candidate window range columns disagree with the document"
+            );
+        }
+        None => ensure_valid!(
+            ValidationKind::WindowColumns,
             columns == (None, None, None, None),
             "candidate window range columns are set for an empty-window document"
         ),
     }
     let block: Option<Vec<u8>> = row.try_get("block_bytes")?;
-    let block = block.context("pending candidate row carries no block bytes")?;
-    ensure!(
+    let Some(block) = block else {
+        return Err(
+            anyhow::anyhow!("pending candidate row carries no block bytes")
+                .context(InvalidCandidate(ValidationKind::Block)),
+        );
+    };
+    ensure_valid!(
+        ValidationKind::Block,
         Candidate::block_digest_hex(&block) == candidate.block_sha256,
         "candidate block bytes do not hash to the document's block_sha256"
     );
-    ensure!(block.len() > 80, "candidate block is truncated");
+    ensure_valid!(
+        ValidationKind::Block,
+        block.len() > 80,
+        "candidate block is truncated"
+    );
     let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
     hash.reverse();
-    ensure!(
+    ensure_valid!(
+        ValidationKind::Block,
         hex::encode(hash) == candidate.block_hash,
         "candidate block header does not hash to block_hash"
     );
-    ensure!(
+    ensure_valid!(
+        ValidationKind::CoinbaseSuffix,
         !candidate.coinbase_suffix_hex.is_empty()
             && hex::decode(&candidate.coinbase_suffix_hex).is_ok(),
         "candidate coinbase suffix must be non-empty hex"
     );
-    check_reference_invariants(&candidate)?;
+    // Shared with the enqueue, whose errors stay unmarked: only this
+    // persisted-decode boundary classifies them.
+    check_reference_invariants(&candidate).map_err(invalid(ValidationKind::ReferenceInvariants))?;
     candidate.block_bytes = block;
     Ok(CandidateClaim {
         candidate,
@@ -1159,19 +1407,106 @@ async fn claim_candidate_lane(
         .await?)
 }
 
-/// Park a claimed row this server cannot decode: release the claim, record
-/// why in `last_error`, and move `next_attempt_at` past every lease expiry.
-/// The row keeps its state with its body untouched, so a release that reads
-/// it can pick it up by resetting `next_attempt_at`; until then it is
-/// operator work, not a retry loop.
+/// Park a claimed row this server cannot decode or that failed validation:
+/// release the claim, record why in `last_error`, and move `next_attempt_at`
+/// past every lease expiry. The row keeps its state, its body, its block bytes,
+/// its window columns and its offer record untouched, so a release that reads
+/// it can pick it up by resetting `next_attempt_at`; until then it is operator
+/// work, not a retry loop.
+///
+/// The fence is the claim's database block hash, its token and the state the
+/// claim selected, compared in the one `UPDATE`: a delayed caller never parks
+/// a replacement owner's claim, nor a row its own token has since advanced to
+/// another unfinished state.
 async fn park_candidate(
     tx: &mut Transaction<'_, Postgres>,
     block_hash: &str,
     token: &str,
+    state: &str,
     reason: &str,
 ) -> Result<()> {
-    let parked = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
-        .bind(block_hash).bind(token).bind(reason).execute(&mut **tx).await?.rows_affected();
+    let parked = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state=$4 AND state IN {}", CandidateState::UNFINISHED_SQL))
+        .bind(block_hash).bind(token).bind(reason).bind(state).execute(&mut **tx).await?.rows_affected();
     ensure!(parked == 1, "candidate to park was not held by this claim");
     Ok(())
 }
+
+/// Faults a test injects into one claim, keyed by the row's block hash so
+/// that tests claiming other rows in the same binary never meet them. Each
+/// injected fault fires once.
+#[cfg(test)]
+pub(super) mod faults {
+    use anyhow::Result;
+    use sqlx::PgPool;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        /// The blocking decode panics, so the executor reports a join error.
+        PanicInDecode,
+        /// The blocking decode fails with a transient database error.
+        TransientDecodeDatabaseError,
+        /// The blocking decode fails with an unclassified column error.
+        UnclassifiedDecodeError,
+        /// SQL run after a failed decode and before any parking: another
+        /// owner or a state change arriving while the row was being decoded.
+        AfterDecodeSql(String),
+        /// The parking transaction fails after its `UPDATE`, before commit.
+        FailBeforeParkCommit,
+        /// The parking commit succeeds but its reply is reported lost.
+        LoseParkCommitReply,
+    }
+
+    static FAULTS: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
+
+    pub fn inject(block_hash: &str, fault: Fault) {
+        FAULTS.lock().unwrap().push((block_hash.to_owned(), fault));
+    }
+
+    pub(in crate::ledger) fn take(
+        block_hash: &str,
+        wanted: impl Fn(&Fault) -> bool,
+    ) -> Option<Fault> {
+        let mut faults = FAULTS.lock().unwrap();
+        let at = faults
+            .iter()
+            .position(|(hash, fault)| hash == block_hash && wanted(fault))?;
+        Some(faults.remove(at).1)
+    }
+
+    pub(in crate::ledger) fn before_decode(fault: Option<Fault>) -> Result<()> {
+        match fault {
+            Some(Fault::PanicInDecode) => panic!("injected decode panic"),
+            Some(Fault::TransientDecodeDatabaseError) => Err(sqlx::Error::PoolTimedOut.into()),
+            Some(Fault::UnclassifiedDecodeError) => {
+                Err(sqlx::Error::ColumnNotFound("injected unclassified decode error".into()).into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(in crate::ledger) async fn after_decode(pool: &PgPool, block_hash: &str) -> Result<()> {
+        if let Some(Fault::AfterDecodeSql(sql)) = take(block_hash, |fault| {
+            matches!(fault, Fault::AfterDecodeSql(_))
+        }) {
+            sqlx::raw_sql(&sql).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::ledger) fn commit_reply(block_hash: &str) -> Result<(), sqlx::Error> {
+        match take(block_hash, |fault| *fault == Fault::LoseParkCommitReply) {
+            Some(_) => Err(sqlx::Error::Protocol(
+                "injected lost parking commit reply".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+use faults::Fault;
+
+#[cfg(test)]
+#[path = "candidates/park_tests.rs"]
+mod park_tests;
