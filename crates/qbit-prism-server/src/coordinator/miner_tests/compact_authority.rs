@@ -57,6 +57,7 @@ async fn build_original(
         template,
         snapshot,
         bundle,
+        inputs: Some(inputs.clone()),
         fee: None,
         fingerprint: "original-template".into(),
         generation: 2,
