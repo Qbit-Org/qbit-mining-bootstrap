@@ -251,6 +251,254 @@ async fn pending_lease_cannot_borrow_renewed_tip_bound_but_new_admission_can() {
 }
 
 #[tokio::test]
+async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
+    for changed in [
+        "unchanged",
+        "lease-renewal",
+        "epoch",
+        "same-arc-publication",
+    ] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        f.coordinator.refresh_once().await.unwrap();
+        let first_departure = if changed == "lease-renewal" {
+            f.detect(2).await;
+            let mut tip = f.coordinator.observed_tip.write().await;
+            tip.expire_lease_for_test(Duration::from_secs(119));
+            tip.divergence_for_test()
+        } else {
+            None
+        };
+        // Capture through the real runtime builder, before persistence starts.
+        let job = tokio::time::timeout(Duration::from_secs(5), issued(&f))
+            .await
+            .unwrap();
+        let original = job.context.prepared.clone();
+        let epoch = f.coordinator.readiness.read().await.generation;
+        let publication = f.coordinator.observed_tip.read().await.publication_stamp();
+        let revision = f.store.revision.load(Ordering::SeqCst);
+        match changed {
+            "lease-renewal" => {
+                // This wait is after build_job returned, outside the save API.
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(first_departure.unwrap().elapsed() >= Duration::from_secs(120));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    f.detect(1).await;
+                    f.detect(2).await;
+                })
+                .await
+                .unwrap();
+                f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
+            }
+            "epoch" => {
+                f.coordinator.invalidate_readiness().await;
+                f.detect(1).await;
+                f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
+            }
+            "same-arc-publication" => {
+                tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            _ => {}
+        }
+        assert!(Arc::ptr_eq(
+            f.coordinator.prepared.read().await.as_ref().unwrap(),
+            &original
+        ));
+        assert_eq!(f.store.revision.load(Ordering::SeqCst), revision);
+        assert_eq!(
+            f.coordinator.readiness.read().await.generation != epoch,
+            changed == "epoch"
+        );
+        assert_eq!(
+            f.coordinator.observed_tip.read().await.publication_stamp() != publication,
+            changed == "same-arc-publication"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), persist(&f, &job))
+            .await
+            .unwrap();
+        assert_eq!(result.is_ok(), changed == "unchanged", "{changed}");
+        assert_eq!(
+            f.store.jobs.lock().unwrap().contains_key(&job.wire.job_id),
+            changed == "unchanged",
+            "{changed}: stale issuance must be refused before its first save"
+        );
+
+        let fresh = tokio::time::timeout(Duration::from_secs(5), issued(&f))
+            .await
+            .unwrap();
+        assert_ne!(fresh.wire.job_id, job.wire.job_id);
+        assert!(Arc::ptr_eq(&fresh.context.prepared, &original));
+        tokio::time::timeout(Duration::from_secs(5), persist(&f, &fresh))
+            .await
+            .unwrap()
+            .expect("a new build captures the currently valid issuance authority");
+        let rows = f.store.jobs.lock().unwrap();
+        assert_eq!(rows[&fresh.wire.job_id].revision, revision);
+        assert_eq!(rows[&fresh.wire.job_id].expires_at_ms, 130_000);
+    }
+}
+
+#[tokio::test]
+async fn actual_resume_keeps_first_lease_proof_across_reconstruction_clock_wait() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f).await;
+    persist(&f, &job).await.unwrap();
+    let original_payload = f.store.jobs.lock().unwrap()[&job.wire.job_id]
+        .payload
+        .clone();
+    let original_expiry = f.store.jobs.lock().unwrap()[&job.wire.job_id].expires_at_ms;
+    f.detect(2).await;
+    let (publication, first_departure) = {
+        let mut tip = f.coordinator.observed_tip.write().await;
+        tip.expire_lease_for_test(Duration::from_secs(119));
+        (tip.publication_stamp(), tip.divergence_for_test().unwrap())
+    };
+    let epoch = f.coordinator.readiness.read().await.generation;
+    let state = Arc::new(Gate::default());
+    *f.store.compact.state_gate.lock().unwrap() = Some(state.clone());
+    let coordinator = f.coordinator.clone();
+    let pending_job = job.clone();
+    let pending = tokio::spawn(async move {
+        coordinator
+            .resume_job(&pending_job.context.worker, &pending_job.wire.job_id)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), state.entered.notified())
+        .await
+        .unwrap();
+    // The initial expiry lookup has already finished. Installing this gate
+    // during the first lease-state read targets the later reconstruction clock.
+    let clock = Arc::new(Gate::default());
+    *f.store.compact.clock_gate.lock().unwrap() = Some(clock.clone());
+    state.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), clock.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(first_departure.elapsed() >= Duration::from_secs(120));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        f.detect(1).await;
+        f.detect(2).await;
+    })
+    .await
+    .unwrap();
+    f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
+    assert_eq!(f.coordinator.readiness.read().await.generation, epoch);
+    assert_eq!(
+        f.coordinator.observed_tip.read().await.publication_stamp(),
+        publication
+    );
+    assert_eq!(
+        f.store.revision.load(Ordering::SeqCst),
+        job.wire.payout_revision
+    );
+    // The stored job remains unexpired; only its first lease proof elapsed.
+    f.store.clock_offset_ms.store(5_000, Ordering::SeqCst);
+    assert!(f.store.database_now() < original_expiry);
+    clock.release.notify_one();
+    let resumed = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        resumed.is_none(),
+        "resume must not replace its first lease proof with the renewed one"
+    );
+
+    let fresh = tokio::time::timeout(
+        Duration::from_secs(5),
+        f.coordinator
+            .resume_job(&job.context.worker, &job.wire.job_id),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("a fresh resume can use the new lease without renewing stored expiry");
+    assert_eq!(fresh.wire.job_id, job.wire.job_id);
+    assert_eq!(
+        fresh.context.prepared.storage_key,
+        job.context.prepared.storage_key
+    );
+    assert_eq!(fresh.context.prepared.window, job.context.prepared.window);
+    let remaining = fresh
+        .wire
+        .resume_expires_at
+        .unwrap()
+        .saturating_duration_since(Instant::now());
+    assert!(!remaining.is_zero() && remaining <= Duration::from_secs(25));
+    let rows = f.store.jobs.lock().unwrap();
+    assert_eq!(rows[&job.wire.job_id].payload, original_payload);
+    assert_eq!(rows[&job.wire.job_id].expires_at_ms, original_expiry);
+}
+
+#[tokio::test]
+async fn duplicate_retry_keeps_known_outcome_after_late_lease_invalidation() {
+    for changed in ["lease-expiry", "publication"] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        f.coordinator.refresh_once().await.unwrap();
+        let job = issued(&f).await;
+        let revision = prepare_replacement_lease(&f).await;
+        let proof = f.proof(&job, 0);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            f.coordinator
+                .submit(&job.context.worker, &job, proof.clone(), false.into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let original_share = {
+            let records = f.store.records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(records[0].1.is_none(), "exercise a share-only duplicate");
+            assert_eq!(records[0].2, revision);
+            serde_json::to_value(&records[0].0).unwrap()
+        };
+        assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 1);
+        let gate = Arc::new(Gate::default());
+        *f.store.append_gate.lock().unwrap() = Some(gate.clone());
+        let coordinator = f.coordinator.clone();
+        let pending = tokio::spawn(async move {
+            coordinator
+                .submit(&job.context.worker, &job, proof, false.into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        if changed == "publication" {
+            tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            f.coordinator
+                .observed_tip
+                .write()
+                .await
+                .expire_lease_for_test(Duration::from_secs(121));
+        }
+        assert_eq!(f.store.revision.load(Ordering::SeqCst), revision);
+        gate.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_error(result.unwrap_err(), "duplicate-share", "duplicate share");
+        let records = f.store.records.lock().unwrap();
+        assert_eq!(records.len(), 1, "{changed}");
+        assert_eq!(serde_json::to_value(&records[0].0).unwrap(), original_share);
+        assert!(records[0].1.is_none());
+        assert_eq!(records[0].2, revision);
+        assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn issued_save_wait_preserves_original_deadline_and_lease_before_delivery() {
     for changed in ["unchanged", "absolute-expiry", "lease-expiry"] {
         let f = Fixture::new(Duration::from_secs(10)).await;

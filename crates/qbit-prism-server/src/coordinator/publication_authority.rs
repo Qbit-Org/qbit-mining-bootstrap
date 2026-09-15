@@ -6,7 +6,7 @@ use tokio::time::Instant as MonotonicInstant;
 
 /// Translate once, counting the clock request's own wait conservatively.
 /// Callers choose whether elapsed authority is a miss or an error.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct AbsoluteDeadline(MonotonicInstant);
 
 impl AbsoluteDeadline {

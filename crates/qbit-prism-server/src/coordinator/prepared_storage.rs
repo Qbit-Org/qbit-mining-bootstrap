@@ -1,6 +1,6 @@
 //! Retain the exact prepared dependency when publishing compact issued work.
 use super::publication_authority::AbsoluteDeadline;
-use super::tip_observation::{PreparedIdentity, PublishedLease};
+use super::tip_observation::PreparedIdentity;
 use super::*;
 use crate::ledger::{IssuedJobSave, PreparedDependency};
 
@@ -16,9 +16,7 @@ struct IssuedPersistence<'a> {
     payload: Value,
     expires_at_ms: i64,
     deadline: AbsoluteDeadline,
-    identity: PreparedIdentity,
-    readiness_epoch: u64,
-    lease: Option<PublishedLease>,
+    authority: IssuanceAuthority,
 }
 
 impl Coordinator {
@@ -41,6 +39,20 @@ impl Coordinator {
         let expires_at_ms = now_ms
             .checked_add(seconds.checked_mul(1000).context("job TTL overflow")?)
             .context("job expiry overflow")?;
+        let authority = if let Some(original) = &job.context.issuance_authority {
+            (**original).clone()
+        } else {
+            self.begin_issuance_authority(
+                PreparedIdentity::of(&job.context.prepared),
+                readiness_epoch,
+                None,
+            )
+            .await?
+            .context("payout snapshot stale")?
+        };
+        let expires_at_ms = authority
+            .absolute_expiry()
+            .map_or(expires_at_ms, |original| original.min(expires_at_ms));
         let record = StoredJob {
             prepared_key: job.context.prepared.storage_key.clone(),
             worker: worker.clone(),
@@ -56,9 +68,7 @@ impl Coordinator {
             payload: serde_json::to_value(record)?,
             expires_at_ms,
             deadline: AbsoluteDeadline::from_database(now_ms, requested_at, expires_at_ms)?,
-            identity: PreparedIdentity::of(&job.context.prepared),
-            readiness_epoch,
-            lease: None,
+            authority,
         };
         if self.save_with_dependency(&mut issued, None).await? == IssuedJobSave::Saved {
             return Ok(());
@@ -129,25 +139,13 @@ impl Coordinator {
     }
 
     async fn revalidate_issued(&self, issued: &mut IssuedPersistence<'_>) -> Result<i64> {
-        let authority = self
-            .work_authority_in_epoch(
-                &issued.identity,
-                Some(issued.expires_at_ms),
-                issued.readiness_epoch,
-            )
+        let revision = self
+            .revalidate_issuance_authority(&mut issued.authority, Some(issued.expires_at_ms))
             .await?
             .context("payout snapshot stale")?;
-        if let Some(lease) = &issued.lease {
-            ensure!(
-                self.revalidate_published_lease(lease).await?,
-                "issued publication superseded"
-            );
-        } else {
-            issued.lease = authority.lease;
-        }
         // No later database clock read or repair retry renews this deadline.
         ensure!(issued.deadline.live(), "issued job deadline elapsed");
-        Ok(authority.revision)
+        Ok(revision)
     }
 }
 

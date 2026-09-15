@@ -33,7 +33,7 @@ mod publication_authority;
 mod submit_ledger;
 mod tip_observation;
 mod work_ledger;
-pub use tip_observation::TipState;
+pub use tip_observation::{IssuanceAuthority, TipState};
 
 pub struct JobContext {
     pub prepared: Arc<Prepared>,
@@ -45,6 +45,9 @@ pub struct JobContext {
     /// worker and the template the issuing frontend saw, which a claiming
     /// frontend cannot re-derive.
     pub bootstrap_share: Option<AcceptedShare>,
+    /// Original admission for Coordinator-built/recovered work. Internal
+    /// contexts not built by Coordinator start their proof at persistence.
+    pub issuance_authority: Option<Arc<IssuanceAuthority>>,
 }
 
 /// The builder inputs a job was built with, other than the window, captured
@@ -1892,13 +1895,19 @@ impl MiningBackend for Coordinator {
         minimum_difficulty: f64,
     ) -> Result<MiningJob<JobContext>, StratumError> {
         let build = async {
+            let readiness_epoch = self.readiness.read().await.generation;
             let prepared = self
                 .prepared
                 .read()
                 .await
                 .clone()
                 .context("no current template")?;
-            self.issued_work_revision(&prepared)
+            let mut issuance_authority = self
+                .begin_issuance_authority(
+                    tip_observation::PreparedIdentity::of(&prepared),
+                    readiness_epoch,
+                    None,
+                )
                 .await?
                 .context("payout snapshot stale")?;
             self.ensure_job_fee_current(prepared.fee).await?;
@@ -1949,6 +1958,9 @@ impl MiningBackend for Coordinator {
             };
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
+            self.revalidate_issuance_authority(&mut issuance_authority, None)
+                .await?
+                .context("payout snapshot stale")?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -1956,6 +1968,7 @@ impl MiningBackend for Coordinator {
                     worker: worker.clone(),
                     bundle,
                     bootstrap_share,
+                    issuance_authority: Some(Arc::new(issuance_authority)),
                 }),
             })
         };
@@ -2023,17 +2036,12 @@ impl MiningBackend for Coordinator {
                 &prepared,
                 window,
             );
-            if self
-                .work_authority_revision_in_epoch(
-                    &identity,
-                    Some(stored.expires_at_ms),
-                    readiness_epoch,
-                )
+            let Some(mut issuance_authority) = self
+                .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
                 .await?
-                .is_none()
-            {
+            else {
                 return Ok(None);
-            }
+            };
             if current.template["previousblockhash"] != prepared.template["previousblockhash"]
                 || prepared.snapshot.payout_revision != current.snapshot.payout_revision
             {
@@ -2129,11 +2137,7 @@ impl MiningBackend for Coordinator {
             // cannot borrow a superseding publication's replacement lease,
             // or recover authority revoked during those waits.
             if self
-                .work_authority_revision_in_epoch(
-                    &identity,
-                    Some(stored.expires_at_ms),
-                    readiness_epoch,
-                )
+                .revalidate_issuance_authority(&mut issuance_authority, Some(stored.expires_at_ms))
                 .await?
                 .is_none()
             {
@@ -2142,7 +2146,13 @@ impl MiningBackend for Coordinator {
             if !deadline.live() {
                 return Ok(None);
             }
-            wire.resume_expires_at = Some(deadline.instant());
+            wire.resume_expires_at = Some(
+                issuance_authority
+                    .deadline()
+                    .map_or(deadline.instant(), |original| {
+                        original.min(deadline.instant())
+                    }),
+            );
             // The absolute DB expiry is translated once to monotonic time;
             // moving the session between hosts never extends its work lease.
             let prepared = Arc::new(Prepared {
@@ -2170,6 +2180,7 @@ impl MiningBackend for Coordinator {
                     worker: stored.worker,
                     bundle,
                     bootstrap_share,
+                    issuance_authority: Some(Arc::new(issuance_authority)),
                 }),
             }))
         };

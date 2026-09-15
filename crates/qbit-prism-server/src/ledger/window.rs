@@ -430,6 +430,12 @@ impl Ledger {
             if let Err(error) = tx.rollback().await {
                 tracing::debug!(%error, "rollback after a closed commit gate failed");
             }
+            // append_in returns inserted=false only after matching the entire
+            // immutable, already-durable row, before any share/clock/hash write.
+            // With no candidate write, rollback cannot undo that prior credit.
+            if !result.inserted && prepared.is_none() {
+                return Ok(result);
+            }
             return Err(CommitGateClosed.into());
         }
         tx.commit().await?;

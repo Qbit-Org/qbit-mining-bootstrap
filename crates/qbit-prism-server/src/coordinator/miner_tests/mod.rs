@@ -80,7 +80,7 @@ impl Drop for CancelProbe<'_> {
 impl MemoryLedger {
     async fn append_gated(
         &self,
-        share: AcceptedShare,
+        mut share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
         commit: &CommitGate,
@@ -95,8 +95,23 @@ impl MemoryLedger {
             revision == self.revision.load(Ordering::SeqCst),
             "payout revision changed"
         );
+        let existing = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(old, _, _)| old.share_id == share.share_id)
+            .map(|(old, _, _)| old.clone());
+        if let Some(old) = &existing {
+            share.share_seq = old.share_seq;
+            share.accepted_at_ms = old.accepted_at_ms;
+            ensure!(share == *old, "duplicate share_id payload mismatch");
+        }
         // Model the production pre-commit hook: every statement has run.
         if !commit.begin_commit() {
+            if existing.is_some() && candidate.is_none() {
+                return Ok(false);
+            }
             return Err(crate::ledger::CommitGateClosed.into());
         }
         let gate = self.commit_gate.lock().unwrap().take();
@@ -472,6 +487,7 @@ impl Fixture {
                 worker,
                 bundle,
                 bootstrap_share: None,
+                issuance_authority: None,
             }),
         }
     }

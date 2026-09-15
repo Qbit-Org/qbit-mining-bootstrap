@@ -28,6 +28,29 @@ pub(super) struct PublishedLease {
 pub(super) struct WorkAuthority {
     pub revision: i64,
     pub lease: Option<PublishedLease>,
+    deadline: Option<AbsoluteDeadline>,
+}
+
+/// Original creation/recovery admission carried through later issue delivery.
+/// Fields stay opaque: callers can retain the proof, never manufacture one.
+#[derive(Clone)]
+pub struct IssuanceAuthority {
+    identity: Arc<PreparedIdentity>,
+    readiness_epoch: u64,
+    published_tip: Option<(String, u64)>,
+    lease: Option<Arc<PublishedLease>>,
+    deadline: Option<AbsoluteDeadline>,
+    expires_at_ms: Option<i64>,
+}
+
+impl IssuanceAuthority {
+    pub(super) fn absolute_expiry(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadline.map(|deadline| deadline.instant())
+    }
 }
 
 impl PublishedLease {
@@ -318,6 +341,79 @@ impl TipState {
 }
 
 impl Coordinator {
+    pub(super) async fn begin_issuance_authority(
+        &self,
+        identity: PreparedIdentity,
+        readiness_epoch: u64,
+        expires_at_ms: Option<i64>,
+    ) -> Result<Option<IssuanceAuthority>> {
+        let view = self.authority_view().await;
+        ensure!(
+            view.readiness.generation == readiness_epoch,
+            "node readiness changed during work admission"
+        );
+        let published_tip = view.tip.publication_stamp();
+        drop(view);
+        let mut proof = IssuanceAuthority {
+            identity: Arc::new(identity),
+            readiness_epoch,
+            published_tip,
+            lease: None,
+            deadline: None,
+            expires_at_ms,
+        };
+        Ok(self
+            .revalidate_issuance_authority(&mut proof, expires_at_ms)
+            .await?
+            .map(|_| proof))
+    }
+
+    /// Preserve the first selected lease and deadline across every build,
+    /// reconstruction, persistence and repair wait; never recapture its epoch.
+    pub(super) async fn revalidate_issuance_authority(
+        &self,
+        proof: &mut IssuanceAuthority,
+        expires_at_ms: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let expires_at_ms = match (proof.expires_at_ms, expires_at_ms) {
+            (Some(original), Some(next)) => Some(original.min(next)),
+            (original, next) => original.or(next),
+        };
+        let Some(current) = self
+            .work_authority_in_epoch(&proof.identity, expires_at_ms, proof.readiness_epoch)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let view = self.authority_view().await;
+        ensure!(
+            view.readiness.generation == proof.readiness_epoch,
+            "node readiness changed during work admission"
+        );
+        if view.tip.publication_stamp() != proof.published_tip {
+            return Ok(None);
+        }
+        if let Some(lease) = &proof.lease {
+            if lease.select(&view, &self.config)?.is_none() {
+                return Ok(None);
+            }
+        } else if let Some(lease) = current.lease {
+            if lease.select(&view, &self.config)?.is_none() {
+                return Ok(None);
+            }
+            proof.lease = Some(Arc::new(lease));
+        }
+        proof.deadline = match (proof.deadline, current.deadline) {
+            (Some(original), Some(next)) => Some(original.min(next)),
+            (original, next) => original.or(next),
+        };
+        proof.expires_at_ms = expires_at_ms;
+        if proof.deadline.is_some_and(|deadline| !deadline.live()) {
+            return Ok(None);
+        }
+        Ok(Some(current.revision))
+    }
+
     /// Current publication may issue/recover miner work during its bounded
     /// replacement lease. Persistence still locks the *current* DB revision;
     /// as-issued payloads retain their original economic snapshot.
@@ -437,11 +533,13 @@ impl Coordinator {
                 .map(|(_, _, lease)| WorkAuthority {
                     revision: lease.current_revision,
                     lease: Some(lease),
+                    deadline: clock,
                 })
         } else {
             (identity.revision == revision).then_some(WorkAuthority {
                 revision,
                 lease: None,
+                deadline: clock,
             })
         };
         if clock.is_some_and(|clock| !clock.live()) {
