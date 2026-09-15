@@ -1,7 +1,10 @@
 use crate::{
     config::{self, Config},
     coordinator::Coordinator,
-    ledger::{live_instances, unavailable_live_instances, LiveInstancesReport},
+    ledger::{
+        audit_completeness, live_instances, unavailable_live_instances, AuditCompleteness,
+        LiveInstancesReport,
+    },
 };
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
@@ -161,9 +164,19 @@ pub async fn run() -> Result<()> {
             .await?;
             let count = ledger
                 .import_legacy_audits(root.as_deref(), &ledger_public_key)
-                .await?;
+                .await;
+            // Preserve the remaining-work counts even when import stopped on
+            // an unverifiable or missing historical artifact.
+            let completeness = audit_completeness(&ledger.pool).await;
+            ledger.pool.close().await;
+            let completeness = completeness?;
+            println!(
+                "Audit completeness: {}",
+                serde_json::to_string(&completeness)?
+            );
+            let count = count?;
             println!("Imported {count} audit bodies");
-            Ok(())
+            completeness.require_complete()
         }
         Command::BackfillCtv => {
             let config = config::DatabaseConfig::from_env()?;
@@ -331,6 +344,7 @@ struct SelfCheckReport {
     health: Option<Value>,
     carry_forward_integrity: Option<Value>,
     durability: Option<Vec<(String, String)>>,
+    audit_completeness: Option<AuditCompleteness>,
     live_instances: LiveInstancesReport,
 }
 
@@ -342,6 +356,7 @@ async fn self_check() -> Result<()> {
         health: None,
         carry_forward_integrity: None,
         durability: None,
+        audit_completeness: None,
         live_instances: unavailable_live_instances(
             "unknown",
             "Heartbeat not sampled because configuration is unavailable; HA is unknown",
@@ -355,9 +370,22 @@ async fn self_check() -> Result<()> {
         report.instance_id = Some(config.instance_id.clone());
         // Snapshot before Coordinator::new: Ledger::connect writes a "starting"
         // heartbeat, which must not manufacture an additional live frontend.
-        report.live_instances = live_instances(&config.database_url, freshness).await;
+        // Audit availability is an independent read too: node startup or
+        // refresh failure must not hide an unfinished historical import.
+        let (instances, completeness) = tokio::join!(
+            live_instances(&config.database_url, freshness),
+            sample_audit_completeness(&config.database_url),
+        );
+        report.live_instances = instances;
+        report.audit_completeness = completeness.as_ref().ok().copied();
+        if let Some(completeness) = &report.audit_completeness {
+            if config::production_mode()? {
+                completeness.require_complete()?;
+            }
+        }
         // A failed heartbeat sample must not suppress the remaining local checks.
         self_check_local(config, &mut report).await?;
+        completeness?;
         ensure!(
             report.live_instances.status != "failed",
             "could not read cluster heartbeats"
@@ -368,6 +396,25 @@ async fn self_check() -> Result<()> {
     report.ok = result.is_ok();
     println!("{}", serde_json::to_string_pretty(&report)?);
     result
+}
+
+async fn sample_audit_completeness(database_url: &str) -> Result<AuditCompleteness> {
+    use sqlx::Connection;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut connection = sqlx::PgConnection::connect(database_url).await?;
+        sqlx::query("SET default_transaction_read_only = on")
+            .execute(&mut connection)
+            .await?;
+        audit_completeness(&mut connection).await
+    })
+    .await;
+    // Connection failures can include a credentialed DSN. Keep those out of
+    // operator output, and never turn an unavailable count into zero.
+    match result {
+        Ok(Ok(report)) => Ok(report),
+        _ => anyhow::bail!("audit completeness read failed or exceeded 5 seconds"),
+    }
 }
 
 async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Result<()> {

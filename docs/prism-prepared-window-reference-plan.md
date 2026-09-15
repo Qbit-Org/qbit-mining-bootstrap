@@ -228,37 +228,44 @@ The child's absolute expiry is computed once and never renewed by repair,
 lock waits, cancellation, or reconnect. Preserve PR313's dependency headroom,
 post-wait authority checks, and immutable conflicts.
 
-GC acquires `SETTLEMENT_LOCK` **then `ORDER_LOCK`**, before deleting any rows,
-and runs three separate statements in that same transaction:
+GC runs two independent phases at the existing two-second cadence, without
+overlapping batches:
 
-1. Delete at most 4096 jobs beyond the selected post-expiry retention grace,
-   keeping the outer expiry/grace recheck, and
-   return their template digests.
-2. Delete templates among those digests only when no surviving job references
-   them.
-3. Sweep balance snapshots with no surviving job reference **and no nonterminal
-   leased-candidate reference**. This sweep runs even when no jobs were deleted
-   and is not restricted to the expired batch's balance digests.
+1. `prune_expired_jobs` deletes at most 4096 expired jobs in its original
+   lock-free statement, under the configured database timeout. The indexed
+   key selection preserves the outer `clock_timestamp()` expiry recheck after
+   a concurrent renewal's row-lock wait. No additional retention grace is added.
+   This statement commits and releases all row locks before blob GC starts.
+2. `prune_unreferenced_blobs` starts a fresh five-second deadline and acquires
+   `SETTLEMENT_LOCK` **then `ORDER_LOCK`**, checks the shared writable fence,
+   and pages at most 256 keys from each blob table before filtering references.
+   Separate DELETE statements remove selected templates without any surviving
+   job reference, and selected balances without any surviving job **or candidate**
+   reference. Claim expiry does not affect retention, and unexpected terminal
+   references also retain their blobs until explicitly detached.
 
-The later sweep is required when a candidate outlives its job, then becomes
-terminal: no remaining job can nominate that balance digest for cleanup.
-The expired-job batch is bounded; the balance sweep ranges over retained
-snapshot metadata, not shares. Measure its cardinality/time rather than claim
-that all cleanup is bounded by 4096 rows. Do not add an arbitrary sweep cap
-without a progress rule that eventually revisits every orphan.
+Each blob table has an in-memory key cursor that advances past retained keys
+only after commit and wraps after an empty page. Both pages run with zero
+expired jobs, so terminal candidates' detached balances and other orphans are
+eventually revisited even behind a live prefix. The sweep reads metadata, not
+blob payloads or shares. Blob failure/cancellation rolls back both blob deletes
+and leaves cursors unchanged; already committed job expiry stays committed.
+A halted cluster permits the original expiry statement but stops protected blob
+GC at the writable fence.
 
-The settlement lock serializes save/repair with GC; the order lock serializes
-leased-candidate enqueue with GC. No path may reverse this order or acquire
-settlement after order. If repair goes first, GC observes its references; if GC
-goes first, repair atomically restores the original blobs/prepared/child. A
-modifying CTE with an outer `NOT EXISTS` sees the wrong statement snapshot, so
-it cannot replace the separate delete statements. Claim expiry/retry must not
-remove a nonterminal candidate's protection. No share-ledger pruning is added.
+The settlement lock serializes save/repair with blob GC; the order lock
+serializes leased-candidate enqueue with blob GC. No path may reverse this order
+or acquire advisory locks while retaining expiry's row locks. If repair goes
+first, blob GC observes its references; if GC goes first, repair atomically
+restores the original blobs/prepared/child. The lock-free expiry statement's
+post-wait recheck protects renewals independently. A modifying CTE with an outer
+`NOT EXISTS` sees the wrong statement snapshot, so it cannot replace the
+separate delete statements. Claim expiry/retry must not remove a nonterminal
+candidate's protection. No share-ledger pruning is added.
 
-Production GC remains gated on A265's typed outbox digest column/index and
-agreed authenticated `leased`/nonterminal predicate. The current inline outbox
-has no such columns; do not infer a reference from its old bundled payload or
-silently collect when a required schema/API is absent. Per landed `406b273`,
+Blob GC uses A265's landed typed outbox digest column and index; it checks all
+surviving references instead of inferring references from bundled payloads or
+filtering on claim state. Per landed `406b273`,
 A's enqueue re-inserts the digest-checked as-issued balances under `ORDER_LOCK`
 before committing its reference, including when GC went first. A probes the
 share prefix but still enqueues with an alert if it is missing. The exact Rust

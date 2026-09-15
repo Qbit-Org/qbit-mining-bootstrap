@@ -124,7 +124,9 @@ impl Connection {
         Self::with_max_age(retention, max_jobs, Duration::from_secs(600)).await
     }
     async fn with_max_age(retention: f64, max_jobs: usize, max_age: Duration) -> Self {
-        let fixture = Fixture::new(max_age).await;
+        Self::with_fixture(Fixture::new(max_age).await, retention, max_jobs).await
+    }
+    async fn with_fixture(fixture: Fixture, retention: f64, max_jobs: usize) -> Self {
         fixture.coordinator.refresh_once().await.unwrap();
         let worker = fixture.job(1, 0, "original.worker").context.worker.clone();
         let first = fixture
@@ -198,7 +200,8 @@ impl Connection {
             &self.config,
             input,
             tokio::time::Instant::now(),
-            &crate::metrics::Metrics::default(),
+            // One registry for Stratum and coordinator decisions, as in production.
+            &self.backend.fixture.coordinator.metrics,
         )
         .await
         .unwrap();
@@ -383,6 +386,140 @@ async fn slow_resume_crossing_absolute_expiry_is_rejected_before_coordinator_sub
         .lock()
         .unwrap()
         .is_empty());
+}
+
+/// Scrape `/metrics` from the real API router over a real HTTP connection.
+async fn http_metrics(metrics: Arc<crate::metrics::Metrics>) -> String {
+    use tokio::io::AsyncReadExt;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    let state = crate::api::ApiState::new(pool, crate::api::ApiConfig::default(), metrics.clone());
+    state.publish_metrics(metrics.render()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, crate::api::router(state))
+            .await
+            .unwrap()
+    });
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: prism\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    server.abort();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    body.to_owned()
+}
+
+#[tokio::test]
+async fn resume_expiry_is_attributed_before_a_failing_fee_floor_and_counted_once() {
+    use crate::coordinator::miner_tests::stale_causes::stale_causes;
+    let fixture = Fixture::build(
+        Duration::from_secs(600),
+        |config| {
+            config.ctv_enabled = true;
+            config.ctv_fee = Some(qbit_prism::FanoutFeeRatePolicy::new(1000, 12000));
+        },
+        None,
+    )
+    .await;
+    let mut client = Connection::with_fixture(fixture, 30.0, 1).await;
+    let metrics = client.backend.fixture.coordinator.metrics.clone();
+    let stale_rejections = |metrics: &crate::metrics::Metrics| {
+        let key = "qbit_prism_rejections_total{reason_id=\"stale-job\"} ";
+        let body = metrics.render();
+        let values: Vec<f64> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(key))
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(values.len(), 1);
+        values[0]
+    };
+    let old = client.deliver().await;
+    let current = client.deliver().await;
+    client.pause_time();
+    client.session.retained = retained_jobs::RetainedJobs::default();
+    let coordinator = client.backend.fixture.coordinator.clone();
+    let gate = Arc::new(Gate::default());
+    *client.backend.slow_resume.lock().unwrap() = Some((
+        tokio::time::Instant::now().into_std() + Duration::from_secs(1),
+        gate.clone(),
+    ));
+    let response = {
+        let submit = client.submit(&old, 0);
+        tokio::pin!(submit);
+        tokio::select! {
+            // A resume that answers before its pause fails here instead of
+            // leaving the gate waiter pending forever.
+            response = &mut submit => panic!("resume returned before reaching its gate: {response}"),
+            () = gate.entered.notified() => {
+                // Resume has passed its own fee admission. While it waits, the
+                // floor rises and the lease expires, so both predicates fail at
+                // Stratum's expiry check and at the coordinator's fee check behind it.
+                crate::coordinator::miner_tests::raise_ctv_fee_floor(&coordinator).await;
+                tokio::time::advance(Duration::from_secs(2)).await;
+                gate.release.notify_one();
+                submit.await
+            }
+        }
+    };
+    assert_eq!(
+        response,
+        json!({"id":41,"result":null,"error":[21,"stale job",{"reason_id":"stale-job"}]})
+    );
+    assert_eq!(stale_causes(&metrics), [1., 0., 0., 0.]);
+    assert_eq!(
+        stale_rejections(&metrics),
+        1.,
+        "coarse reason still counted once"
+    );
+
+    // Unexpired current work reaches the coordinator, whose fee floor refuses it.
+    let response = client.submit(&current, 100).await;
+    assert_eq!(
+        response,
+        json!({"id":41,"result":null,"error":[21,"job CTV fee is below the current relay floor",{"reason_id":"stale-job"}]})
+    );
+    assert_eq!(stale_causes(&metrics), [1., 1., 0., 0.]);
+    assert_eq!(stale_rejections(&metrics), 2.);
+    assert!(client
+        .backend
+        .fixture
+        .store
+        .records
+        .lock()
+        .unwrap()
+        .is_empty());
+
+    tokio::time::resume();
+    let body = http_metrics(metrics).await;
+    for expected in [
+        "# TYPE qbit_prism_stale_job_rejections_total counter",
+        "qbit_prism_stale_job_rejections_total{cause=\"resume_expired\"} 1",
+        "qbit_prism_stale_job_rejections_total{cause=\"fee_floor\"} 1",
+        "qbit_prism_stale_job_rejections_total{cause=\"parent_grace\"} 0",
+        "qbit_prism_stale_job_rejections_total{cause=\"payout_revision\"} 0",
+        "qbit_prism_rejections_total{reason_id=\"stale-job\"} 2",
+    ] {
+        assert!(
+            body.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    let excerpt: Vec<_> = body
+        .lines()
+        .filter(|line| line.contains("qbit_prism_stale_job_rejections_total"))
+        .collect();
+    println!(
+        "HTTP /metrics excerpt after real stale-job decisions:\n{}",
+        excerpt.join("\n")
+    );
 }
 
 #[path = "retained_tests.rs"]

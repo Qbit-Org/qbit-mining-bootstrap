@@ -437,6 +437,12 @@ impl Ledger {
             if let Err(error) = tx.rollback().await {
                 tracing::debug!(%error, "rollback after a closed commit gate failed");
             }
+            // append_in returns inserted=false only after matching the entire
+            // immutable, already-durable row, before any share/clock/hash write.
+            // With no candidate write, rollback cannot undo that prior credit.
+            if !result.inserted && prepared.is_none() {
+                return Ok(result);
+            }
             return Err(CommitGateClosed.into());
         }
         tx.commit().await?;
@@ -515,7 +521,7 @@ impl Ledger {
     /// the existing public audit format without relying on host clock sync.
     pub async fn snapshot(&self, network_difficulty: u128) -> Result<Snapshot> {
         let weight = network_difficulty
-            .checked_mul(8)
+            .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
             .context("window difficulty overflow")?;
         ensure!(weight > 0, "network difficulty must be positive");
         let mut tx = self.begin().await?;
@@ -540,8 +546,14 @@ impl Ledger {
         let mut remaining = weight;
         let mut cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
         while remaining > 0 {
-            let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq<$1 AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY share_seq DESC LIMIT 4096"))
-                .bind(cursor).bind(anchor_ms).fetch_all(&mut *tx).await?;
+            let rows = sqlx::query(&format!(
+                "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 4096",
+                super::audit::anchored_eligibility_sql(2)
+            ))
+            .bind(cursor)
+            .bind(anchor_ms)
+            .fetch_all(&mut *tx)
+            .await?;
             if rows.is_empty() {
                 break;
             }
