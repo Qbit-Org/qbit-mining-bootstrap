@@ -19,6 +19,9 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
 const TEST_GATE: i64 = 0x27300002;
 
+#[path = "support/blob_cleanup.rs"]
+mod blob_cleanup;
+
 struct Database {
     admin: PgPool,
     ledger: Ledger,

@@ -64,6 +64,7 @@ fn unavailable_report(instance_id: Option<&str>, status: &str, warning: &str) ->
         "health": null,
         "carry_forward_integrity": null,
         "durability": null,
+        "audit_completeness": null,
         "live_instances": {
             "status": status,
             "observed_at": null,
@@ -303,6 +304,10 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         "expected a fresh heartbeat sampled with the database clock: {live}"
     );
     let mut expected = unavailable_report(Some("self-check-cli"), "observed", "");
+    expected["audit_completeness"] = json!({
+        "missing_stored_bodies": 0,
+        "missing_canonical_bytes": 0,
+    });
     expected["live_instances"] = json!({
         "status": "observed",
         "observed_at": live["observed_at"],

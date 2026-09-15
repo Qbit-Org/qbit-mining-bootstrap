@@ -1,5 +1,47 @@
-//! Small synchronous hooks; producer code owns the event boundaries.
+//! Event recording hooks and the shared pool checkout timing boundary.
 use super::*;
+use std::future::Future;
+
+/// Records exactly once, including when the acquisition future is cancelled.
+/// Its lifetime ends before SQL or BEGIN, so only checkout is measured.
+struct PoolAcquireObservation<'a> {
+    metrics: &'a Metrics,
+    started: tokio::time::Instant,
+    outcome: Outcome,
+}
+
+impl Drop for PoolAcquireObservation<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .observe_pool_acquire(self.outcome, self.started.elapsed());
+    }
+}
+
+/// The shared ledger/collector checkout boundary. Tokio's monotonic clock
+/// measures real elapsed time normally and controlled time in a paused runtime.
+/// Neither the guard nor its clock is read before first poll or without metrics.
+pub(crate) async fn time_pool_acquire<T>(
+    metrics: Option<&Metrics>,
+    acquire: impl Future<Output = sqlx::Result<T>>,
+) -> sqlx::Result<T> {
+    let mut observation = metrics.map(|metrics| PoolAcquireObservation {
+        metrics,
+        started: tokio::time::Instant::now(),
+        outcome: Outcome::Failure,
+    });
+    let result = acquire.await;
+    if let Some(observation) = &mut observation {
+        observation.outcome = if result.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests;
 
 impl Metrics {
     pub fn observe_share_ack(&self, result: AckResult, elapsed: Duration) {

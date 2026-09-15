@@ -6,6 +6,7 @@ mod registry;
 pub mod runtime;
 mod snapshots;
 
+pub(crate) use events::time_pool_acquire;
 pub use labels::*;
 pub use registry::{descriptors, Descriptor, Kind, BUCKETS};
 use registry::{Family, Registry};
