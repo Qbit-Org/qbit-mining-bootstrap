@@ -250,8 +250,20 @@ it:
   deadline after taking the shared settlement lock and before locking its
   dependency row, and again just before commit, so a deadline that elapsed
   while waiting on row locks is a reported error that retrying cannot reset,
-  and the job is not saved. `prune_expired_jobs` removes expired
-  rows in bounded batches.
+  and the job is not saved. The runtime pruner runs every two seconds with
+  no overlapping batches. First, `prune_expired_jobs` removes at most 4096
+  expired rows as a separate statement, without advisory locks and with the
+  configured database timeout. Its outer expiry recheck preserves concurrent
+  renewals. Then `prune_unreferenced_blobs` starts a fresh five-second deadline,
+  takes `SETTLEMENT_LOCK` then `ORDER_LOCK`, checks the shared writable fence,
+  and inspects up to 256 template keys and 256 balance keys. References from
+  every surviving job and every candidate retain their blobs, regardless of
+  job or claim expiry. Per-table cursors advance only after commit, skip live
+  prefixes and wrap to find later orphans even when no jobs expire. A halted
+  cluster still permits the original expiry statement but refuses blob GC.
+  Blob failure or cancellation rolls back both blob deletes and leaves the
+  cursors unchanged; it does not undo previously committed expiry. Successful
+  nonzero counts are logged per phase, and failures warn on each pruning tick.
 - Per-item import failure and restart. `import-audits` processes one legacy
   audit at a time, each verified off the runtime threads and stored in its
   own transaction. A failing item stops the command with an error; earlier
