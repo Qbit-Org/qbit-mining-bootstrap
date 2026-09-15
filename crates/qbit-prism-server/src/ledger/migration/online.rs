@@ -118,7 +118,9 @@ pub(crate) async fn apply_online_migration(
     let version = migration.version;
     // A connection of its own, never returned to the pool: the session
     // settings and the session-level lock below end with it.
-    let mut connection = pool.acquire().await?.detach();
+    let mut connection = crate::metrics::time_pool_acquire(metrics, pool.acquire())
+        .await?
+        .detach();
     let outcome = apply(&mut connection, migration, metrics).await;
     let closed = connection.close().await;
     outcome?;
