@@ -606,7 +606,7 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
         &pool,
         SEQ_WINDOW,
         2,
-        "refusing to continue migration 11",
+        "refusing to continue migration 12",
     )
     .await?;
     assert!(
@@ -695,7 +695,7 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
         .context("the failed build left no index")?;
     assert!(!leftover.2, "the failed build's index must be invalid");
     let (error, _) =
-        swap_during_build(&db, &pool, SEQ_WALK, 4, "refusing to continue migration 11").await?;
+        swap_during_build(&db, &pool, SEQ_WALK, 4, "refusing to continue migration 12").await?;
     assert!(
         error.contains(&format!(
             "the name held the invalid {SEQ_WALK_DEFINITION} on qbit_share_ledger an interrupted build left"
@@ -759,7 +759,7 @@ async fn migration_012_refuses_a_drop_target_swapped_while_it_built() -> Result<
 /// replacement's build starts, and that build takes hours on a large
 /// ledger, in which the kept index can be moved aside like a drop target.
 /// The whole declared set is looked up once more inside the transaction
-/// that records the version: the moved index is refused there, 11 is not
+/// that records the version: the moved index is refused there, 12 is not
 /// recorded, and once the operator puts the name back the next start
 /// records it keeping both indexes.
 #[tokio::test]
@@ -790,7 +790,7 @@ async fn migration_012_refuses_to_record_when_a_kept_index_moved_while_it_built(
     // The kept index is swapped while that build waits. The build, its
     // check and every drop then run as planned, and the record refuses.
     let (error, _) =
-        swap_during_build(&db, &pool, SEQ_WALK, 2, "refusing to record migration 11").await?;
+        swap_during_build(&db, &pool, SEQ_WALK, 2, "refusing to record migration 12").await?;
     assert!(
         error.contains(&format!(
             "but the migration declares a valid {SEQ_WALK_DEFINITION} on qbit_share_ledger under that name"
@@ -829,7 +829,7 @@ async fn migration_012_refuses_to_record_when_a_kept_index_moved_while_it_built(
     );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both indexes,
-    // skips the drops, and records 11.
+    // skips the drops, and records 12.
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
     ))

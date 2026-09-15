@@ -554,13 +554,13 @@ the commit, on a dedicated connection with no statement or lock timeout and
 under a session-level advisory lock keyed by the ledger's schema, `migrate`
 (or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds each new index with
 `CREATE INDEX CONCURRENTLY`, drops each replaced one with `DROP INDEX
-CONCURRENTLY`, and records 11 last. Appends continue throughout. A
+CONCURRENTLY`, and records 12 last. Appends continue throughout. A
 concurrent build waits for the transactions that were already using the
 table, so a long payout-window read delays it without blocking anything
 else; two frontends starting together build once, the second waiting on the
 lock and finding the version recorded.
 
-Until 11 is recorded, every start refuses the database, naming it, like any
+Until 12 is recorded, every start refuses the database, naming it, like any
 other required migration. That is the resumable state: an interrupted build
 leaves an invalid index behind, still maintained by every insert, and the
 next `migrate` drops it and builds again; an index built before the
@@ -570,7 +570,7 @@ relation of another kind under one of the six names, is refused by name and
 left alone, as with every native collision:
 
 ```
-refusing to apply migration 11: index qbit_share_ledger_accepted_seq_walk_idx on qbit_share_ledger
+refusing to apply migration 12: index qbit_share_ledger_accepted_seq_walk_idx on qbit_share_ledger
 already exists with a different definition (CREATE INDEX qbit_share_ledger_accepted_seq_walk_idx ON
 qbit_share_ledger USING btree (share_seq)); the migration declares CREATE INDEX
 qbit_share_ledger_accepted_seq_walk_idx ON qbit_share_ledger USING btree (share_seq DESC) INCLUDE
