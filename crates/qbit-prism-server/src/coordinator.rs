@@ -27,18 +27,22 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+mod bundle_build;
+mod compact_resume;
+mod compact_runtime;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
 mod submit_ledger;
 mod tip_observation;
 mod work_ledger;
+pub use compact_runtime::{PreparedBundle, PreparedSnapshot};
 pub use tip_observation::{IssuanceAuthority, TipState};
 
 pub struct JobContext {
     pub prepared: Arc<Prepared>,
     pub worker: Worker,
-    pub bundle: Arc<AuditBundle>,
+    pub bundle: Arc<PreparedBundle>,
     /// The synthetic share a per-worker bootstrap build fabricated for an
     /// empty window, verbatim. It exists only here and in the bundle, and a
     /// candidate found on this job stores it inline: its fields come from the
@@ -109,15 +113,12 @@ fn local_signer_keys(config: &Config) -> Result<SignerKeys> {
 }
 
 pub struct Prepared {
-    // Original durable representation, including bootstrap bundle=None and
-    // coinbase suffix. Heavy snapshot/bundle data is shared by the stored
-    // record; Prepared also keeps access-oriented views below.
-    stored: Arc<StoredPrepared>,
+    reservation: Arc<compact_runtime::PreparedReservation>,
     repair: Arc<Mutex<()>>,
     #[cfg(test)]
     repair_probe: std::sync::Mutex<Option<Arc<prepared_storage::RepairProbe>>>,
     pub template: Value,
-    pub snapshot: Arc<Snapshot>,
+    pub snapshot: Arc<PreparedSnapshot>,
     /// The reference for `snapshot`'s window, computed once per non-cached
     /// refresh and carried with the work instead of being re-derived. Submit
     /// clones it into the candidate, so a found block never re-digests the
@@ -128,7 +129,7 @@ pub struct Prepared {
     /// This nonoptional view copies the original build's or validated stored
     /// inputs; callers never need to handle the legacy storage-only absence.
     pub inputs: BundleInputs,
-    pub bundle: Option<Arc<AuditBundle>>,
+    pub bundle: Option<Arc<PreparedBundle>>,
     pub base_wire: Option<codec::Job>,
     pub storage_key: String,
     pub fee: Option<FanoutFeeRatePolicy>,
@@ -220,6 +221,7 @@ pub struct Coordinator {
     /// the 15 s acquire timeout behind a multi-page read.
     window_reads: Arc<Semaphore>,
     refresh_lock: Mutex<()>,
+    resume_flights: compact_resume::ResumeFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
     /// The ledger sessions' effective `statement_timeout`, `None` when
@@ -573,6 +575,7 @@ impl Coordinator {
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
+            resume_flights: compact_resume::ResumeFlights::new(config.build_workers),
             window_reads: Arc::new(Semaphore::new(window_read_permits(
                 config.database_connections,
                 config.build_workers,
@@ -765,7 +768,8 @@ impl Coordinator {
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
-        let readiness_generation = self.readiness.read().await.generation;
+        let proof = self.begin_compact_build().await;
+        let readiness_generation = proof.readiness_epoch();
         let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
@@ -851,110 +855,8 @@ impl Coordinator {
                 return Ok(());
             }
         }
-        let snapshot = Arc::new(self.work_ledger.snapshot(network).await?);
-        // Captured once per refresh, where the builder would otherwise read
-        // configuration: every job of this generation, the shared bundle and
-        // each per-worker bootstrap build, uses these, and submit copies them
-        // into the candidate.
+        // Keep the original publication proof captured before node observation.
         let inputs = BundleInputs::capture(&self.config, fee)?;
-        // The reference is computed once per non-cached refresh and travels
-        // with the work; submit clones it rather than re-digesting the window
-        // on the share path.
-        let (bundle, window) = if snapshot.shares.is_empty() {
-            // An empty window reaches only the O(recipients) balances digest,
-            // microseconds, so it stays on this thread.
-            (None, WindowRef::from_snapshot(&snapshot)?)
-        } else {
-            // Serializing and hashing the window is 0.7 to 1.4 s of blocking
-            // work at 400,000 shares. Run it beside the bundle build rather
-            // than after it, so it adds no wait of its own; `refresh_lock`
-            // already makes refresh single-flight, and this takes no
-            // `build_slots` permit.
-            let reference = {
-                let snapshot = snapshot.clone();
-                tokio::task::spawn_blocking(move || WindowRef::from_snapshot(&snapshot))
-            };
-            let build = self.build_bundle(
-                snapshot.clone(),
-                template.clone(),
-                None,
-                format!(
-                    "{}{}",
-                    hex::encode(&self.config.coinbase_tag),
-                    "00".repeat(4 + self.config.extranonce2_size)
-                ),
-                inputs.clone(),
-            );
-            let (built, reference) = tokio::join!(build, reference);
-            (Some(Arc::new(built?.0)), reference??)
-        };
-        let base_wire = if let Some(bundle) = &bundle {
-            let template = template.clone();
-            let bundle = bundle.clone();
-            let extranonce2_size = self.config.extranonce2_size;
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    codec::Job::from_manifest(
-                        "shared".into(),
-                        &template,
-                        &bundle.signed_coinbase_manifest.manifest,
-                        "00000000",
-                        extranonce2_size,
-                        1.0,
-                        0.0,
-                        true,
-                    )
-                })
-                .await??,
-            )
-        } else {
-            None
-        };
-        ensure!(
-            self.work_ledger
-                .observe_chain_view(parent, height - 1, chainwork)
-                .await?
-                == snapshot.payout_revision,
-            "payout revision changed during job build"
-        );
-        ensure!(
-            self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(parent),
-            "tip changed during job build"
-        );
-        // Timer reanchors may refresh ntime without changing payable work.
-        // Keep semantic coverage stable for that case; new accepted shares,
-        // payout state, fee policy or template content require fresh delivery.
-        let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
-            current.fingerprint == fingerprint
-                && current.snapshot.share_seq == snapshot.share_seq
-                && current.snapshot.payout_revision == snapshot.payout_revision
-                && current.fee == fee
-        });
-        let generation = *self.refresh.borrow() + u64::from(!equivalent);
-        let parent_of_tip = self.cache_tip_parent(parent).await?;
-        let storage_key = format!(
-            "prepared:{}:{}",
-            self.config.instance_id,
-            uuid::Uuid::new_v4().simple()
-        );
-        let stored = Arc::new(StoredPrepared {
-            template: template.clone(),
-            snapshot: snapshot.clone(),
-            bundle: bundle.clone(),
-            inputs: Some(inputs.clone()),
-            fee,
-            fingerprint: fingerprint.clone(),
-            generation,
-            parent_of_tip: parent_of_tip.clone(),
-            coinbase_suffix: format!(
-                "{}{}",
-                hex::encode(&self.config.coinbase_tag),
-                "00".repeat(4 + self.config.extranonce2_size)
-            ),
-        });
-        let serializable = stored.clone();
-        let payload =
-            tokio::task::spawn_blocking(move || serde_json::to_value(serializable)).await??;
         let retention =
             crate::config::number("PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS", 30.0f64)?.max(
                 crate::config::number("PRISM_STRATUM_STALE_GRACE_SECONDS", 3.0f64)?,
@@ -967,61 +869,66 @@ impl Coordinator {
             + self.config.snapshot_interval.as_secs_f64()
             + self.config.health_timeout.as_secs_f64()
             + 60.0)
-            .ceil() as i64;
-        self.work_ledger
-            .save_job(
-                &storage_key,
-                &payload,
-                snapshot.payout_revision,
-                parent,
-                shared_ttl,
+            .ceil();
+        ensure!(
+            shared_ttl < i64::MAX as f64 / 1000.0,
+            "prepared TTL overflow"
+        );
+        let original_expires_at_ms = self
+            .work_ledger
+            .now_ms()
+            .await?
+            .checked_add(
+                (shared_ttl as i64)
+                    .checked_mul(1000)
+                    .context("prepared TTL overflow")?,
             )
-            .await?;
-        // Persisting a large bundle can outlive the original node observation.
-        // Recheck immediately before making this prepared work available.
-        let published_info = self.ready_tip(parent).await?;
-        self.ensure_template_fresh(&template).await?;
-        ensure!(
-            self.work_ledger
-                .observe_chain_view(
-                    parent,
-                    height - 1,
-                    published_info["chainwork"]
-                        .as_str()
-                        .context("node chainwork missing")?,
-                )
-                .await?
-                == snapshot.payout_revision,
-            "payout revision changed before job publication"
+            .context("prepared expiry overflow")?;
+        let permit = self.build_slots.clone().acquire_owned().await?;
+        let snapshot = self.work_ledger.snapshot(network).await?;
+        let admitted = prepared_storage::compact::CompactOwner::new((snapshot, permit));
+        let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
+            current.fingerprint == fingerprint
+                && current.snapshot.share_seq == admitted.0.share_seq
+                && current.snapshot.payout_revision == admitted.0.payout_revision
+                && current.fee == fee
+        });
+        let generation = self
+            .refresh
+            .borrow()
+            .checked_add(u64::from(!equivalent))
+            .context("prepared generation overflow")?;
+        let parent_of_tip = self.cache_tip_parent(parent).await?;
+        let storage_key = format!(
+            "prepared:{}:{}",
+            self.config.instance_id,
+            uuid::Uuid::new_v4().simple()
         );
-        let mut prepared = self.prepared.write().await;
-        let mut readiness = self.readiness.write().await;
-        ensure!(
-            readiness.generation == readiness_generation,
-            "node readiness changed before job publication"
-        );
-        let mut tip_state = self.observed_tip.write().await;
-        tip_state.publish(parent)?;
-        *prepared = Some(Arc::new(Prepared {
-            stored,
-            repair: Arc::new(Mutex::new(())),
-            #[cfg(test)]
-            repair_probe: Default::default(),
+        let (snapshot, permit) = admitted.into_inner();
+        let source = prepared_storage::compact::RefreshBuild {
+            proof,
+            key: storage_key,
             template,
             snapshot,
-            window,
             inputs,
-            bundle,
-            base_wire,
-            storage_key,
             fee,
             fingerprint,
             generation,
-            created: Instant::now(),
             parent_of_tip,
-        }));
-        readiness.last_poll = Some(Instant::now());
-        self.refresh.send_replace(generation);
+            suffix: format!(
+                "{}{}",
+                hex::encode(&self.config.coinbase_tag),
+                "00".repeat(4 + self.config.extranonce2_size)
+            ),
+            original_expires_at_ms,
+        };
+        let captured = self
+            .capture_refresh(prepared_storage::compact::CompactOwner::new((
+                source, permit,
+            )))
+            .await?;
+        let reserved = self.reserve_fresh_compact(&captured).await?;
+        self.lock_compact_publication(reserved).await?.publish()?;
         Ok(())
     }
 
@@ -1079,80 +986,14 @@ impl Coordinator {
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let network = codec::scaled_target_difficulty(&codec::target_from_compact(
-                codec::parse_u32_hex(template["bits"].as_str().context("missing bits")?)?,
-            )?)?;
-            let found = FoundBlock {
-                block_height: template["height"].as_u64().context("missing height")?,
-                coinbase_value_sats: template["coinbasevalue"]
-                    .as_u64()
-                    .context("missing coinbase value")?,
-                network_difficulty: network,
-                anchor_job_issued_at_ms: snapshot.anchor_ms,
-            };
-            let bootstrap_share = if let Some(worker) = bootstrap {
-                Some(AcceptedShare {
-                    share_seq: 1,
-                    share_id: "bootstrap-share".into(),
-                    miner_id: worker.payout_address.clone(),
-                    order_key: worker.payout_address,
-                    p2mr_program_hex: worker.p2mr_program_hex,
-                    share_difficulty: network,
-                    network_difficulty: network,
-                    template_height: template_parent_height(found.block_height)?,
-                    job_id: "bootstrap-job".into(),
-                    job_issued_at_ms: snapshot.anchor_ms,
-                    accepted_at_ms: snapshot.anchor_ms,
-                    ntime: template["curtime"]
-                        .as_u64()
-                        .context("missing time")?
-                        .try_into()?,
-                    credit_policy: None,
-                })
-            } else {
-                None
-            };
-            let shares = match &bootstrap_share {
-                Some(share) => vec![share.clone()],
-                None => snapshot.shares.clone(),
-            };
-            let witnesses =
-                codec::witness_merkle_leaves_hex(&codec::transactions_from_template(&template)?);
-            let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
-            let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
-            ensure!(
-                inputs.signer_keys == SignerKeys::of(&manifest_key, &ledger_key),
-                "job inputs name signing keys other than this frontend's"
-            );
-            // Prior-only recipients remain in the payout universe, including
-            // during bootstrap after an empty reward window.
-            let bundle = if let Some(ctv) = inputs.ctv {
-                qbit_prism::build_audit_bundle_with_ctv_settlement_options(
-                    shares,
-                    found,
-                    snapshot.prior_balances.clone(),
-                    inputs.payout_policy,
-                    ctv.direct_floor_sats,
-                    ctv.settlement_config,
-                    ctv.fanout_fee_policy,
-                    Some(suffix),
-                    witnesses,
-                    &manifest_key,
-                    &ledger_key,
-                )?
-            } else {
-                qbit_prism::build_audit_bundle_with_coinbase_options(
-                    shares,
-                    found,
-                    snapshot.prior_balances.clone(),
-                    inputs.payout_policy,
-                    Some(suffix),
-                    witnesses,
-                    &manifest_key,
-                    &ledger_key,
-                )?
-            };
-            Ok((bundle, bootstrap_share))
+            let (body, bootstrap_share) =
+                bundle_build::build_body(&config, &snapshot, &template, bootstrap, suffix, inputs)?;
+            // This owning compatibility adapter is used by legacy fixtures.
+            // Compact runtime callers keep the borrowed parts through hashing.
+            let shares = bootstrap_share
+                .as_ref()
+                .map_or_else(|| snapshot.shares.clone(), |share| vec![share.clone()]);
+            Ok((body.into_bundle(shares), bootstrap_share))
         })
         .await?
     }
@@ -1941,51 +1782,19 @@ impl MiningBackend for Coordinator {
                 .await?
                 .context("payout snapshot stale")?;
             self.ensure_job_fee_current(prepared.fee).await?;
-            let (bundle, bootstrap_share) = if let Some(bundle) = &prepared.bundle {
-                (bundle.clone(), None)
-            } else {
-                let (bundle, bootstrap_share) = self
-                    .build_bundle(
-                        prepared.snapshot.clone(),
-                        prepared.template.clone(),
-                        Some(worker.clone()),
-                        format!(
-                            "{}{}",
-                            hex::encode(&self.config.coinbase_tag),
-                            "00".repeat(4 + self.config.extranonce2_size)
-                        ),
-                        prepared.inputs.clone(),
-                    )
-                    .await?;
-                (Arc::new(bundle), bootstrap_share)
-            };
+            let (base, bundle, bootstrap_share) = self
+                .materialize_wire(
+                    prepared.clone(),
+                    worker.clone(),
+                    self.config.extranonce2_size,
+                )
+                .await?;
             let id = format!(
                 "{}-{}",
                 self.config.instance_id,
                 uuid::Uuid::new_v4().simple()
             );
-            let mut wire = if let Some(base) = &prepared.base_wire {
-                base.reassign(id, extranonce1, difficulty, minimum_difficulty)?
-            } else {
-                let template = prepared.template.clone();
-                let bundle = bundle.clone();
-                let extra = extranonce1.to_string();
-                let extranonce2_size = self.config.extranonce2_size;
-                tokio::task::spawn_blocking(move || {
-                    let base = codec::Job::from_manifest(
-                        "collection".into(),
-                        &template,
-                        &bundle.signed_coinbase_manifest.manifest,
-                        "00000000",
-                        extranonce2_size,
-                        difficulty,
-                        minimum_difficulty,
-                        true,
-                    )?;
-                    base.reassign(id, &extra, difficulty, minimum_difficulty)
-                })
-                .await??
-            };
+            let mut wire = base.reassign(id, extranonce1, difficulty, minimum_difficulty)?;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
             self.revalidate_issuance_authority(&mut issuance_authority, None)
@@ -2036,35 +1845,36 @@ impl MiningBackend for Coordinator {
                 return Ok(None);
             };
             let stored: StoredJob = serde_json::from_value(payload)?;
+            ensure!(
+                stored.extranonce2_size > 0 && stored.extranonce2_size <= 32,
+                "invalid stored extranonce2 size"
+            );
             if stored.worker.username != worker.username
                 || stored.worker.payout_address != worker.payout_address
                 || stored.worker.p2mr_program_hex != worker.p2mr_program_hex
             {
                 return Ok(None);
             }
-            let Some(payload) = self.work_ledger.job(&stored.prepared_key).await? else {
+            prepared_storage::compact::prepared_dependency_key(&stored.prepared_key)?;
+            let clock_started = tokio::time::Instant::now();
+            let deadline = publication_authority::AbsoluteDeadline::from_database(
+                self.work_ledger.now_ms().await?,
+                clock_started,
+                stored.expires_at_ms,
+            )?;
+            if !deadline.live() {
+                return Ok(None);
+            }
+            let flight = self
+                .resume_flights
+                .join(self, &stored.prepared_key, stored.extranonce2_size)
+                .await;
+            let Some(metadata) = flight.metadata.clone().await? else {
                 return Ok(None);
             };
-            // The decode already runs off the runtime, and the reference is
-            // whole-window work over the snapshot it produces, so both happen
-            // in the one blocking task. #273 replaces this with the reference
-            // the stored payload will carry.
-            let (prepared, window) = tokio::task::spawn_blocking(move || {
-                let prepared: Arc<StoredPrepared> = serde_json::from_value(payload)?;
-                let window = WindowRef::from_snapshot(&prepared.snapshot)?;
-                Ok::<_, anyhow::Error>((prepared, window))
-            })
-            .await??;
-            let current = self
-                .prepared
-                .read()
-                .await
-                .clone()
-                .context("no current template")?;
-            let identity = tip_observation::PreparedIdentity::from_stored(
+            let identity = tip_observation::PreparedIdentity::from_compact(
                 &stored.prepared_key,
-                &prepared,
-                window,
+                &metadata.record,
             );
             let Some(mut issuance_authority) = self
                 .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
@@ -2072,39 +1882,29 @@ impl MiningBackend for Coordinator {
             else {
                 return Ok(None);
             };
-            if current.template["previousblockhash"] != prepared.template["previousblockhash"]
-                || prepared.snapshot.payout_revision != current.snapshot.payout_revision
+            if !deadline.live() {
+                return Ok(None);
+            }
+            self.ensure_job_fee_current(metadata.record.fee).await?;
+            let prepared = flight
+                .reconstruction(
+                    self,
+                    stored.prepared_key.clone(),
+                    metadata,
+                    stored.extranonce2_size,
+                )
+                .await?;
+            if !deadline.live()
+                || self
+                    .revalidate_issuance_authority(
+                        &mut issuance_authority,
+                        Some(stored.expires_at_ms),
+                    )
+                    .await?
+                    .is_none()
             {
                 return Ok(None);
             }
-            let Some(inputs) = prepared.issued_inputs(&self.config)? else {
-                return Ok(None);
-            };
-            // Incompatible work is a miss, never a rebuild of a nonempty
-            // window or a new deadline. Compatible work retains its live fee
-            // admission check and carries the exact persisted inputs onward.
-            self.ensure_job_fee_current(prepared.fee).await?;
-            let inputs = inputs.clone();
-            let (bundle, bootstrap_share) = match prepared.bundle.as_ref() {
-                Some(bundle) => (bundle.clone(), None),
-                None => {
-                    let (bundle, bootstrap_share) = self
-                        .build_bundle(
-                            prepared.snapshot.clone(),
-                            prepared.template.clone(),
-                            Some(stored.worker.clone()),
-                            prepared.coinbase_suffix.clone(),
-                            inputs.clone(),
-                        )
-                        .await?;
-                    (Arc::new(bundle), bootstrap_share)
-                }
-            };
-            let template = prepared.template.clone();
-            let wire_bundle = bundle.clone();
-            let id = job_id.to_string();
-            let extra = stored.extranonce1.clone();
-            let n2 = stored.extranonce2_size;
             let target = num_bigint::BigUint::parse_bytes(stored.share_target_hex.as_bytes(), 16)
                 .context("invalid stored share target")?;
             ensure!(
@@ -2115,47 +1915,37 @@ impl MiningBackend for Coordinator {
                 stored.share_difficulty.is_finite() && stored.share_difficulty > 0.0,
                 "invalid stored difficulty"
             );
-            let mut wire = tokio::task::spawn_blocking(move || {
-                let mut wire = codec::Job::from_manifest(
-                    id,
-                    &template,
-                    &wire_bundle.signed_coinbase_manifest.manifest,
-                    "00000000",
-                    n2,
-                    1.0,
-                    0.0,
-                    false,
-                )?;
-                ensure!(
-                    extra.len() == 8 && hex::decode(&extra)?.len() == 4,
-                    "invalid stored extranonce1"
-                );
-                wire.extranonce1 = extra;
-                Ok::<_, anyhow::Error>(wire)
-            })
-            .await??;
+            ensure!(
+                stored.extranonce1.len() == 8 && hex::decode(&stored.extranonce1)?.len() == 4,
+                "invalid stored extranonce1"
+            );
+            let (base, bundle, bootstrap_share) = self
+                .materialize_wire(
+                    prepared.clone(),
+                    stored.worker.clone(),
+                    stored.extranonce2_size,
+                )
+                .await?;
+            let mut wire = base.reassign(
+                job_id.into(),
+                &stored.extranonce1,
+                stored.share_difficulty,
+                0.0,
+            )?;
+            wire.clean_jobs = false;
             wire.share_target = target;
             wire.share_difficulty = stored.share_difficulty;
             wire.version_mask = stored.version_mask;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
-            let clock_started = tokio::time::Instant::now();
-            let now_ms = self.work_ledger.now_ms().await?;
-            let deadline = publication_authority::AbsoluteDeadline::from_database(
-                now_ms,
-                clock_started,
-                stored.expires_at_ms,
-            )?;
-            if !deadline.live() {
-                return Ok(None);
-            }
-            // Decode, fee checks and reconstruction may wait. A stored job
-            // cannot borrow a superseding publication's replacement lease,
-            // or recover authority revoked during those waits.
-            if self
-                .revalidate_issuance_authority(&mut issuance_authority, Some(stored.expires_at_ms))
-                .await?
-                .is_none()
+            if !deadline.live()
+                || self
+                    .revalidate_issuance_authority(
+                        &mut issuance_authority,
+                        Some(stored.expires_at_ms),
+                    )
+                    .await?
+                    .is_none()
             {
                 return Ok(None);
             }
@@ -2169,26 +1959,6 @@ impl MiningBackend for Coordinator {
                         original.min(deadline.instant())
                     }),
             );
-            // The absolute DB expiry is translated once to monotonic time;
-            // moving the session between hosts never extends its work lease.
-            let prepared = Arc::new(Prepared {
-                stored: prepared.clone(),
-                repair: Arc::new(Mutex::new(())),
-                #[cfg(test)]
-                repair_probe: Default::default(),
-                template: prepared.template.clone(),
-                snapshot: prepared.snapshot.clone(),
-                window,
-                inputs,
-                bundle: Some(bundle.clone()),
-                base_wire: None,
-                storage_key: stored.prepared_key,
-                fee: prepared.fee,
-                fingerprint: prepared.fingerprint.clone(),
-                generation: prepared.generation,
-                parent_of_tip: prepared.parent_of_tip.clone(),
-                created: Instant::now(),
-            });
             Ok(Some(MiningJob {
                 wire,
                 context: Arc::new(JobContext {

@@ -1,8 +1,8 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
-    StoredCompactPrepared,
+    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
+    PreparedDependency, PreparedTemplate, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -69,6 +69,17 @@ pub(super) trait WorkLedger: Send + Sync {
         expires_at_ms: i64,
         dependency: PreparedDependency<'a>,
         repair_payload: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>>;
+    #[allow(clippy::too_many_arguments)]
+    fn save_issued_job_compact<'a>(
+        &'a self,
+        id: &'a str,
+        payload: &'a Value,
+        revision: i64,
+        parent: &'a str,
+        expires_at_ms: i64,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
     ) -> BoxFuture<'a, Result<IssuedJobSave>>;
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>>;
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>>;
@@ -172,6 +183,27 @@ impl WorkLedger for Ledger {
             expires_at_ms,
             dependency,
             repair_payload,
+        ))
+    }
+    fn save_issued_job_compact<'a>(
+        &'a self,
+        id: &'a str,
+        payload: &'a Value,
+        revision: i64,
+        parent: &'a str,
+        expires_at_ms: i64,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>> {
+        Box::pin(Ledger::save_issued_job_compact(
+            self,
+            id,
+            payload,
+            revision,
+            parent,
+            expires_at_ms,
+            dependency,
+            repair,
         ))
     }
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {

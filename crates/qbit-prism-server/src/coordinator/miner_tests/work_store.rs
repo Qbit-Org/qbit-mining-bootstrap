@@ -1,7 +1,7 @@
 use super::*;
 use crate::ledger::{
-    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
-    StoredCompactPrepared,
+    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
+    PreparedDependency, PreparedTemplate, StoredCompactPrepared,
 };
 use std::collections::VecDeque;
 
@@ -13,6 +13,8 @@ pub(crate) struct CompactStore {
     pub read_keys: StdMutex<Vec<String>>,
     pub saves: StdMutex<VecDeque<Result<bool>>>,
     pub save_calls: StdMutex<Vec<CompactSave>>,
+    pub issued_saves: StdMutex<VecDeque<Result<IssuedJobSave>>>,
+    pub issued_calls: StdMutex<Vec<CompactIssuedSave>>,
     pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
     pub state_gate: StdMutex<Option<Arc<Gate>>>,
     pub state_calls: AtomicUsize,
@@ -34,6 +36,21 @@ pub(crate) struct CompactSave {
     pub balances: Vec<qbit_prism::CarryForwardBalance>,
     pub current_revision: i64,
     pub original_expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactIssuedSave {
+    pub id: String,
+    pub payload: Value,
+    pub current_revision: i64,
+    pub parent: String,
+    pub expires_at_ms: i64,
+    pub key: String,
+    pub original_revision: i64,
+    pub original_expires_at_ms: i64,
+    pub template_sha256: String,
+    pub prior_balances_digest: [u8; 32],
+    pub repair: bool,
 }
 
 pub(crate) struct MemoryJob {
@@ -312,6 +329,47 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 parent: parent.into(),
             });
             Ok(IssuedJobSave::Saved)
+        })
+    }
+    fn save_issued_job_compact<'a>(
+        &'a self,
+        id: &'a str,
+        payload: &'a Value,
+        revision: i64,
+        parent: &'a str,
+        expires_at_ms: i64,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>> {
+        Box::pin(async move {
+            self.compact
+                .issued_calls
+                .lock()
+                .unwrap()
+                .push(CompactIssuedSave {
+                    id: id.into(),
+                    payload: payload.clone(),
+                    current_revision: revision,
+                    parent: parent.into(),
+                    expires_at_ms,
+                    key: dependency.key.into(),
+                    original_revision: dependency.original_revision,
+                    original_expires_at_ms: dependency.original_expires_at_ms,
+                    template_sha256: dependency.template_sha256.into(),
+                    prior_balances_digest: dependency.prior_balances_digest,
+                    repair: repair.is_some(),
+                });
+            let gate = self.save_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            self.compact
+                .issued_saves
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script compact issued save")
         })
     }
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
