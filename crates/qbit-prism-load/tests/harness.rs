@@ -5313,6 +5313,162 @@ async fn a_paused_session_is_not_offered_work_until_it_is_retargeted() -> Result
     Ok(())
 }
 
+/// The reconnect phase's drained restart begins a third of the way in and
+/// may still be draining, relaunching or waiting for `/healthz` when the
+/// phase's deadline arrives. The loop then sees it through with nothing
+/// scheduled, and the phase's end used to be stamped by the caller only
+/// once that wait was over: the idle tail landed inside `duration_millis`,
+/// the lock and process windows and the achieved-rate denominator, so a
+/// configured 60 s phase came out longer and its throughput understated.
+/// The phase now records the instant it stopped scheduling as its end, and
+/// the restart is completed after that as boundary time, the way the settle
+/// before the next phase's delay already is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_outruns_the_phase_deadline_is_completed_outside_the_measured_window(
+) -> Result<()> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{Args, PhasePlan};
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    let dir = ScratchDir::new("outrun");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    // Two frontends, so the phase restarts one of them; a short commit
+    // timeout, so the drain limit (that plus the margin) is well clear of
+    // the deadline; no memory floor, so the host's state cannot abort it.
+    let args = Args::parse_from([
+        "qbit-prism-load",
+        "--frontends",
+        "2",
+        "--reconnect-target",
+        "1",
+        "--share-commit-timeout-seconds",
+        "1",
+        "--work-timeout",
+        "20",
+        "--max-outstanding-per-session",
+        "1000",
+        "--min-mem-available-mib",
+        "0",
+    ]);
+    let plan = PhasePlan {
+        name: "reconnect".into(),
+        seconds: 2,
+        rate: 20.0,
+        in_artifact: true,
+        reconnects: true,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+    };
+    // The healthy frontend's session takes every offer it is given; the
+    // restarted frontend's session holds one submit that settles 800 ms
+    // after the phase's deadline, so the restart is still draining when
+    // the deadline arrives and the relaunch happens after it.
+    let (healthy, _healthy_control, _healthy_work) = queued_session(0, 0, 0, 4096);
+    let (draining, mut draining_control) = detached_session(1, 1, 1);
+    let sessions = vec![healthy, draining];
+    let settle = sessions[1].outstanding.clone();
+    let deadline = Duration::from_secs(plan.seconds);
+    tokio::spawn(async move {
+        tokio::time::sleep(deadline + Duration::from_millis(800)).await;
+        settle.store(0, Ordering::SeqCst);
+    });
+    let node_state = NodeState::new(window::TEMPLATE_BITS, "pload1");
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let mut external_tips = Vec::new();
+    let (mut remaining_blocks, mut remaining_tips) = (0usize, 0usize);
+
+    let started = Instant::now();
+    let outcome = run::drive_phase(
+        &args,
+        &plan,
+        &sessions,
+        &mut frontends,
+        &[],
+        &node_state,
+        &mut external_tips,
+        &mut remaining_blocks,
+        &mut remaining_tips,
+        &collected,
+    )
+    .await?;
+    let returned = started.elapsed();
+    let measured = outcome.ended.saturating_duration_since(started);
+    assert_eq!(outcome.aborted, None);
+    assert_eq!(
+        outcome.restart_records.len(),
+        1,
+        "the restart was seen through before the phase returned"
+    );
+    assert_eq!(frontends[1].restarts, 1);
+    assert!(
+        returned >= deadline + Duration::from_millis(800),
+        "the drain could not finish before the submit settled: {returned:?}"
+    );
+    // The phase's recorded end is its deadline, not the restart's end.
+    assert!(
+        measured >= deadline && measured < deadline + Duration::from_millis(250),
+        "the measured window is the scheduling window: {measured:?} against a {deadline:?} \
+         phase that returned after {returned:?}"
+    );
+    assert!(
+        outcome.ended_wall.signed_duration_since(chrono::Utc::now())
+            < chrono::Duration::milliseconds(-700),
+        "the wall-clock end is stamped at the same instant"
+    );
+    // Nothing was scheduled after the recorded end: the tokens minted are
+    // the schedule's for the measured window, not for the time returned.
+    let minted_for_measured = (plan.rate * measured.as_secs_f64()).floor() as u64;
+    assert!(
+        outcome.tokens <= minted_for_measured + 1,
+        "{} tokens were minted for a {measured:?} window at {} shares/s",
+        outcome.tokens,
+        plan.rate
+    );
+    assert!(
+        outcome.tokens >= minted_for_measured.saturating_sub(1),
+        "the schedule ran to the deadline: {} tokens",
+        outcome.tokens
+    );
+    // The session was paused for the drain and retargeted at the end, in
+    // that order, before the phase returned. The phase's own reconnect
+    // schedule sends it client-initiated reconnects as well; those are the
+    // phase's business, not the restart's.
+    let mut sent = Vec::new();
+    while let Ok(control) = draining_control.try_recv() {
+        sent.push(match control {
+            client::Control::Pause => "pause",
+            client::Control::Retarget {
+                frontend: 1,
+                reconnect: false,
+                ..
+            } => "retarget",
+            client::Control::Reconnect { .. } => "reconnect",
+            other => panic!("unexpected control to the restarted session: {other:?}"),
+        });
+    }
+    let restart_controls: Vec<&str> = sent
+        .iter()
+        .copied()
+        .filter(|control| *control != "reconnect")
+        .collect();
+    assert_eq!(
+        restart_controls,
+        vec!["pause", "retarget"],
+        "the restarted session was paused, then retargeted once the relaunch answered: {sent:?}"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
 /// The drain waits at least the configured commit timeout.
 /// The proxy reads its delay per chunk, so a submit still in flight when a
 /// phase boundary changes the delay finishes under the next phase's delay

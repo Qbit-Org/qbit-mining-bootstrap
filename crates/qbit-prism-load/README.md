@@ -149,7 +149,14 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
    reconnect that lands on a paused session does not lift the pause. If the
    submits never settle the frontend is not killed and the run aborts
    (exit 6) rather than turning the harness's own in-flight submits into
-   lost acknowledgements. A client-initiated reconnect quiesces the same
+   lost acknowledgements. A restart still in flight when the phase's
+   deadline arrives is completed after it, with nothing scheduled
+   meanwhile: the phase's `duration_seconds`, its `ended_at`, its lock and
+   process windows and the denominator of its achieved and offered rates
+   cover exactly the scheduling window, and the wait for the relaunch is
+   boundary time, like the settle before the next phase's delay is applied.
+   The restart itself is still this phase's, under `drained_restarts` and
+   `frontend_restarts`. A client-initiated reconnect quiesces the same
    way before it closes its socket: the session waits for its outstanding
    submits to settle for up to the share-commit timeout plus that same 10 s
    margin, so a planned close never turns a submit the server is still

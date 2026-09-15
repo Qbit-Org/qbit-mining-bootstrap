@@ -1209,15 +1209,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &sessions,
             &mut frontends,
             &process_samplers,
-            &ctx,
+            &ctx.node_state,
             &mut external_tips,
             &mut remaining_blocks,
             &mut remaining_tips,
             &collected,
         )
         .await?;
-        let ended = Instant::now();
-        let ended_wall = chrono::Utc::now();
+        // The phase's bounds are when it started and stopped scheduling; a
+        // restart the phase's deadline cut across was completed inside
+        // `drive_phase` after that, as boundary time.
+        let ended = outcome.ended;
+        let ended_wall = outcome.ended_wall;
         shared_session
             .record_notifies
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1897,34 +1900,49 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
 
 // --- phase driving -------------------------------------------------------
 
-struct PhaseOutcome {
-    tokens: u64,
-    dispatched: u64,
-    shortfall: u64,
-    min_mem_available_kib: Option<u64>,
-    aborted: Option<String>,
-    scheduled_blocks: usize,
-    frontend_restarts: usize,
+/// What driving one phase produced.
+pub struct PhaseOutcome {
+    pub tokens: u64,
+    pub dispatched: u64,
+    pub shortfall: u64,
+    pub min_mem_available_kib: Option<u64>,
+    pub aborted: Option<String>,
+    pub scheduled_blocks: usize,
+    pub frontend_restarts: usize,
     /// Completed drained restarts, with the scrapes bracketing each reset.
-    restart_records: Vec<RestartRecord>,
-    indeterminate: Vec<SubmitRecord>,
+    pub restart_records: Vec<RestartRecord>,
+    pub indeterminate: Vec<SubmitRecord>,
     /// Submits outstanding on the killed frontend at the instant of the kill.
-    outstanding_at_kill: Option<usize>,
+    pub outstanding_at_kill: Option<usize>,
     /// The dense-cadence schedule this phase drove, and what it drove.
-    dense_offsets: Vec<f64>,
-    dense_landings: Vec<Landing>,
+    pub dense_offsets: Vec<f64>,
+    pub dense_landings: Vec<Landing>,
     /// Schedule slots the landing budget could not pay for.
-    slots_over_budget: usize,
+    pub slots_over_budget: usize,
+    /// When the phase stopped scheduling: its deadline, or the abort. This
+    /// is the end of the measured window -- `duration_millis`, the lock and
+    /// process windows and the rates' denominator -- and it is stamped
+    /// before a restart or kill still in flight is seen through, so that
+    /// wait is boundary time, not the phase's.
+    pub ended: Instant,
+    pub ended_wall: chrono::DateTime<chrono::Utc>,
 }
 
+/// Drive one phase: the open-loop schedule from `plan`, with the phase's
+/// events (reconnects, the drained restart, the mid-flight kill, scheduled
+/// blocks, tips and dense landings) placed on their offsets, until the
+/// plan's deadline or an abort. The outcome's `ended` is that instant. A
+/// restart or kill still in flight then is completed before this returns,
+/// with nothing scheduled meanwhile, so the next phase never offers to a
+/// session that is still paused or pointed at a dead process.
 #[allow(clippy::too_many_arguments)]
-async fn drive_phase(
+pub async fn drive_phase(
     args: &Args,
     plan: &PhasePlan,
     sessions: &[SessionHandle],
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
-    ctx: &RunContext,
+    node_state: &crate::node::NodeState,
     external_tips: &mut Vec<crate::node::TipChange>,
     remaining_blocks: &mut usize,
     remaining_tips: &mut usize,
@@ -1950,6 +1968,8 @@ async fn drive_phase(
         dense_offsets: Vec::new(),
         dense_landings: Vec::new(),
         slots_over_budget: 0,
+        ended: started,
+        ended_wall: chrono::Utc::now(),
     };
     // Event schedule inside the phase.
     let reconnect_interval = if plan.reconnects {
@@ -2103,7 +2123,7 @@ async fn drive_phase(
         if tip_cursor < tip_times.len() && seconds >= tip_times[tip_cursor] {
             tip_cursor += 1;
             *remaining_tips = remaining_tips.saturating_sub(1);
-            external_tips.push(ctx.node_state.mint_external_block());
+            external_tips.push(node_state.mint_external_block());
         }
         if !kill_done && seconds >= duration.as_secs_f64() / 3.0 {
             kill_done = true;
@@ -2160,11 +2180,23 @@ async fn drive_phase(
             }
         }
     }
+    // The measured window closes here, with the schedule: every number that
+    // is per unit of phase time divides by this span. It used to be stamped
+    // by the caller after the wait below, so a restart that outran the
+    // deadline -- a drain that took until the deadline, then a relaunch and
+    // its readiness wait -- was inside `duration_millis`, the lock and
+    // process windows and the achieved-rate denominator while nothing was
+    // being offered, and a 60 s phase came out longer and slower than it
+    // was (EP-OBSERVABILITY).
+    outcome.ended = Instant::now();
+    outcome.ended_wall = chrono::Utc::now();
     // A restart or a kill still in flight at the phase boundary is seen
     // through, so its sessions are retargeted -- and, for the kill, its
     // re-offers sent -- before the next phase offers to them. Their own
     // deadlines bound the wait, and a failure aborts as it would inside the
-    // phase. Nothing is offered meanwhile.
+    // phase. Nothing is offered meanwhile, and the wait is boundary time,
+    // outside the window recorded above, like the settle before the next
+    // phase's delay is applied.
     while outcome.aborted.is_none() && (restart.is_some() || kill.is_some()) {
         if let Some(driver) = restart.as_mut() {
             match driver.poll(sessions, frontends, samplers) {
