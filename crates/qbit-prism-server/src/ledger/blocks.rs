@@ -574,6 +574,7 @@ fn landing_from_parts(
             first_share_seq: first,
             last_share_seq: last,
             anchor_ms: window.anchor_ms,
+            network_difficulty: body.found_block.network_difficulty,
             share_count: i64::try_from(shares.len())?,
             inline,
             shares: Arc::clone(shares),

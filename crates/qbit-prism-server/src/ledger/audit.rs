@@ -212,6 +212,9 @@ pub(super) struct AuditSnapshotWrite {
     pub first_share_seq: i64,
     pub last_share_seq: i64,
     pub anchor_ms: i64,
+    /// Issued difficulty from the verified found block, not share-row metadata
+    /// or a weight inferred from the selected range.
+    pub network_difficulty: u128,
     pub share_count: i64,
     /// The bootstrap window's one synthetic share, which is not in the ledger
     /// and so is stored inline rather than referenced. This is `Some` exactly
@@ -229,7 +232,22 @@ pub(super) struct AuditSnapshotWrite {
 const VERIFY_PAGE_ROWS: i64 = 4096;
 
 /// Prove the candidate's window is exactly what the immutable ledger holds for
-/// its anchored range, before the settlement lock is taken.
+/// its issued anchor and difficulty, before the settlement lock is taken.
+///
+/// Boundary decision (#356): re-derive the extent (issue option 3). A
+/// `WindowRef` is made from `Snapshot.shares`, so agreement with its copied
+/// endpoints/count/digest cannot catch a selection bug. The independent inputs
+/// are the anchor issued by `Ledger::snapshot`'s database timestamp barrier and
+/// the template difficulty carried by the verified found block. This still
+/// trusts issuance of those inputs; it does not certify the node template.
+///
+/// After full equality, an anchored probe rejects any newer eligible row.
+/// Folding the verified difficulties except the oldest must leave positive
+/// weight: that oldest row is the first one to reach/cross the target, or the
+/// ledger must have no older eligible row. This also accepts a partial window
+/// when history runs out. An inline bootstrap requires an empty anchored
+/// ledger, independently of its empty reference. No endpoint comes from a
+/// second copy of the claim's own selection.
 ///
 /// The predicate, the `share_seq` ordering and the full equality over every
 /// field are unchanged from the read that used to sit inside the settlement
@@ -241,8 +259,8 @@ const VERIFY_PAGE_ROWS: i64 = 4096;
 ///
 /// The anchored set is frozen once the anchor is issued and ledger rows never
 /// change, so nothing this proves can change before the transaction; the
-/// in-transaction count guard in [`persist_audit_snapshot`] covers the range
-/// again under the lock.
+/// in-transaction count guard in [`persist_audit_snapshot`] covers cardinality
+/// again under the lock. It does not establish the boundaries by itself.
 pub(super) async fn verify_durable_range(
     pool: &PgPool,
     snapshot: &AuditSnapshotWrite,
@@ -252,8 +270,19 @@ pub(super) async fn verify_durable_range(
         "audit share snapshot cannot be empty"
     );
     if snapshot.inline.is_some() {
+        let any: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE accepted AND accepted_at<=to_timestamp($1::double precision/1000) AND job_issued_at<=to_timestamp($1::double precision/1000))")
+            .bind(snapshot.anchor_ms).fetch_one(pool).await?;
+        ensure!(!any, "bootstrap audit window omits canonical shares");
         return Ok(());
     }
+    let mut remaining_without_oldest = snapshot
+        .network_difficulty
+        .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
+        .context("window difficulty overflow")?;
+    ensure!(
+        remaining_without_oldest > 0,
+        "network difficulty must be positive"
+    );
     let shares = &snapshot.shares;
     let last = snapshot.last_share_seq;
     let anchor = snapshot.anchor_ms;
@@ -270,30 +299,70 @@ pub(super) async fn verify_durable_range(
         let expected: Vec<AcceptedShare> =
             shares[matched.min(shares.len())..(matched + rows.len()).min(shares.len())].to_vec();
         let page_len = rows.len();
-        cursor = tokio::task::spawn_blocking(move || -> Result<i64> {
-            let durable = rows
-                .iter()
-                .map(share_from_row)
-                .collect::<Result<Vec<_>>>()?;
-            ensure!(
-                durable == expected,
-                "audit share snapshot differs from canonical database history"
-            );
-            Ok(i64::try_from(durable[durable.len() - 1].share_seq)?)
-        })
-        .await??;
+        let (next_cursor, remaining) =
+            tokio::task::spawn_blocking(move || -> Result<(i64, u128)> {
+                let durable = rows
+                    .iter()
+                    .map(share_from_row)
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    durable == expected,
+                    "audit share snapshot differs from canonical database history"
+                );
+                // Subtraction saturates just as Ledger::snapshot's reverse walk
+                // does, so even a crossing share near u128::MAX cannot overflow.
+                // Exclude only the first row of the first page, not each page.
+                let remaining = durable
+                    .iter()
+                    .skip(usize::from(matched == 0))
+                    .fold(remaining_without_oldest, |left, share| {
+                        left.saturating_sub(share.share_difficulty)
+                    });
+                Ok((
+                    i64::try_from(durable[durable.len() - 1].share_seq)?,
+                    remaining,
+                ))
+            })
+            .await??;
+        cursor = next_cursor;
+        remaining_without_oldest = remaining;
         matched += page_len;
     }
     ensure!(
         matched == shares.len(),
         "audit share snapshot differs from canonical database history"
     );
+    // Keep the ordered LIMIT as a scalar row query: EXISTS can discard its
+    // ordering and choose a full-ledger sequential scan for an older anchor.
+    let newer: Option<i64> = sqlx::query_scalar("SELECT share_seq FROM qbit_share_ledger WHERE accepted AND share_seq>$1 AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY share_seq LIMIT 1")
+        .bind(last).bind(anchor).fetch_optional(pool).await?;
+    ensure!(
+        newer.is_none(),
+        "audit share snapshot omits newest canonical share"
+    );
+    ensure!(
+        remaining_without_oldest > 0,
+        "audit share snapshot extends past canonical oldest share"
+    );
+    let oldest = shares
+        .first()
+        .context("audit share snapshot cannot be empty")?;
+    if remaining_without_oldest > oldest.share_difficulty {
+        let older: Option<i64> = sqlx::query_scalar("SELECT share_seq FROM qbit_share_ledger WHERE accepted AND share_seq<$1 AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY share_seq DESC LIMIT 1")
+            .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(pool).await?;
+        ensure!(
+            older.is_none(),
+            "audit share snapshot omits oldest canonical shares"
+        );
+    }
     Ok(())
 }
 
 /// Persist the share snapshot inside the landing transaction.
 ///
-/// The full-equality proof ran before the lock, in [`verify_durable_range`].
+/// The full-equality and independent boundary proof ran before the lock, in
+/// [`verify_durable_range`]. This count alone only authenticates cardinality
+/// within the supplied range; it cannot detect an omitted endpoint.
 /// Under the lock only the row count of the same anchored predicate is
 /// re-read: no share payload crosses this transaction, so the settlement lock
 /// is never held for a window-sized read.

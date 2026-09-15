@@ -632,8 +632,8 @@ async fn wrote_block_or_audit_row(pool: &PgPool, hash: &str) -> Result<bool> {
 
 /// The durable-range proof (`verify_durable_range` in `ledger/audit.rs`)
 /// runs before the settlement lock and compares the ledger's anchored range
-/// with the candidate window one page at a time. Its only input from the
-/// candidate is the window, and the share ledger is immutable by trigger, so
+/// with the candidate window one page at a time. The share ledger is
+/// immutable by trigger, so
 /// every disagreement here is built on the claim side: each window is signed
 /// over as it is, the audit signature check that precedes the proof accepts
 /// it, and the proof is what refuses it, by name. The window is three pages:
@@ -749,6 +749,210 @@ async fn durable_range_proof_refuses_a_window_that_differs_from_ledger_history_o
         "served canonical bytes differ from the landed candidate's"
     );
     db.close(vec![ledger]).await
+}
+
+/// Rebuild both the signed bundle and its reference from the truncated
+/// selection. Agreement with that reference must not certify its boundaries.
+async fn refuses_truncated_window(newest: bool) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("truncated-window").await?;
+    let result = async {
+        let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
+        plan.load(&ledger.pool, "truncated-window").await?;
+        let snapshot = ledger.snapshot(plan.window_network_difficulty()).await?;
+        ensure!(snapshot.shares.len() == PROOF_WINDOW_SHARES as usize);
+        // Later appends must not change the independently checked boundary.
+        ledger
+            .append(plan.share(PROOF_WINDOW_SHARES + 1), None)
+            .await?;
+        let mut truncated = snapshot.shares.clone();
+        let expected = if newest {
+            truncated.pop();
+            "audit share snapshot omits newest canonical share"
+        } else {
+            truncated.remove(0);
+            "audit share snapshot omits oldest canonical shares"
+        };
+        ensure!(truncated.len() > 2 * PROOF_PAGE_ROWS);
+        let candidate = signed_candidate(truncated, &snapshot, &plan, 3560)?;
+        let claim = claim_enqueued(&ledger, candidate).await?;
+        let error = ledger
+            .land_candidate(&claim, &ledger_public_key())
+            .await
+            .err()
+            .context("landing accepted a self-consistent truncated window")?;
+        ensure!(
+            format!("{error:#}").contains(expected),
+            "wrong refusal: {error:#}"
+        );
+        ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
+        let snapshots: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_audit_snapshots")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(snapshots == 0, "refused landing persisted a snapshot");
+        ledger
+            .finish_candidate(&claim, false, Some(expected))
+            .await?;
+
+        let candidate = signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3561)?;
+        let canonical = canonical_audit_bundle_bytes(&candidate.bundle)?;
+        let claim = claim_enqueued(&ledger, candidate).await?;
+        let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
+        ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
+        let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
+        ensure!(served.as_deref() == Some(canonical.as_slice()));
+        Ok(())
+    }
+    .await;
+    let cleanup = db.close(vec![ledger]).await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+async fn durable_range_proof_refuses_newest_truncation_of_a_multi_page_window() -> Result<()> {
+    refuses_truncated_window(true).await
+}
+
+#[tokio::test]
+async fn durable_range_proof_refuses_oldest_truncation_of_a_multi_page_window() -> Result<()> {
+    refuses_truncated_window(false).await
+}
+
+async fn lands_identically(ledger: &Ledger, candidate: TestCandidate) -> Result<()> {
+    let canonical = canonical_audit_bundle_bytes(&candidate.bundle)?;
+    let claim = claim_enqueued(ledger, candidate).await?;
+    let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
+    ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
+    let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
+    ensure!(served.as_deref() == Some(canonical.as_slice()));
+    ledger.finish_candidate(&claim, true, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_range_proof_retains_the_crossing_share_and_refuses_an_extra_prefix() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("crossing-window").await?;
+    let result = async {
+        let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
+        plan.load(&ledger.pool, "crossing-window").await?;
+        let mut newest = plan.share(PROOF_WINDOW_SHARES + 1);
+        newest.share_difficulty = 1_201;
+        ledger.append(newest, None).await?;
+        let snapshot = ledger.snapshot(plan.window_network_difficulty()).await?;
+        ensure!(snapshot.shares.len() == PROOF_WINDOW_SHARES as usize);
+        ensure!(snapshot.shares[0].share_seq == 2);
+        let weight: u128 = snapshot.shares.iter().map(|s| s.share_difficulty).sum();
+        ensure!(weight == window_fixture::WINDOW_WEIGHT + 401);
+        let mut extra = vec![plan.share(1)];
+        extra.extend(snapshot.shares.clone());
+        let candidate = signed_candidate(extra, &snapshot, &plan, 3562)?;
+        let claim = claim_enqueued(&ledger, candidate).await?;
+        let error = ledger
+            .land_candidate(&claim, &ledger_public_key())
+            .await
+            .err()
+            .context("landing accepted an extra oldest share")?;
+        ensure!(
+            format!("{error:#}")
+                .contains("audit share snapshot extends past canonical oldest share"),
+            "wrong refusal: {error:#}"
+        );
+        ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
+        ledger
+            .finish_candidate(&claim, false, Some("extra oldest share"))
+            .await?;
+        lands_identically(
+            &ledger,
+            signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3563)?,
+        )
+        .await
+    }
+    .await;
+    let cleanup = db.close(vec![ledger]).await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+async fn durable_range_proof_accepts_partial_history_and_ignores_ineligible_endpoints() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("partial-window").await?;
+    let result = async {
+        // Rejected rows precede and follow the real range; the gap also
+        // proves boundaries are about eligibility, not sequence adjacency.
+        sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch)
+            SELECT i,'rejected-'||i,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(1),1,to_timestamp(1),false,'stale-job','partial-window',0 FROM unnest(ARRAY[1,3,5,9]) AS g(i)")
+            .execute(&ledger.pool).await?;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),5)")
+            .execute(&ledger.pool).await?;
+        let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
+        ledger.append(plan.share(6), None).await?;
+        let snapshot = ledger.snapshot(plan.window_network_difficulty()).await?;
+        ensure!(snapshot.shares.len() == 1);
+        // A future job on an otherwise eligible accepted row is excluded by
+        // the same predicate on both sides of the range.
+        sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch)
+            SELECT i,'future-job-'||i,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(($1+1)::double precision/1000),1,to_timestamp(1),true,'partial-window',0 FROM unnest(ARRAY[2,7]) AS g(i)")
+            .bind(snapshot.anchor_ms).execute(&ledger.pool).await?;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),7)")
+            .execute(&ledger.pool).await?;
+        ledger.append(plan.share(8), None).await?;
+        lands_identically(&ledger, signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3564)?).await
+    }.await;
+    let cleanup = db.close(vec![ledger]).await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("bootstrap-window").await?;
+    let result = async {
+        let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
+        let empty = ledger.snapshot(plan.window_network_difficulty()).await?;
+        ledger.append(plan.share(1), None).await?;
+        let bootstrap = |snapshot: &Snapshot, nonce| -> Result<TestCandidate> {
+            let mut synthetic = plan.share(1);
+            synthetic.share_id = "bootstrap-share".into();
+            synthetic.job_id = "bootstrap-job".into();
+            synthetic.share_difficulty = plan.window_network_difficulty();
+            synthetic.network_difficulty = plan.window_network_difficulty();
+            synthetic.job_issued_at_ms = snapshot.anchor_ms;
+            synthetic.accepted_at_ms = snapshot.anchor_ms;
+            let mut candidate = signed_candidate(vec![synthetic.clone()], snapshot, &plan, nonce)?;
+            candidate.candidate.window.shares = None;
+            candidate.candidate.bootstrap_share = Some(synthetic);
+            Ok(candidate)
+        };
+        // The first share arrived after issuance of this empty window.
+        lands_identically(&ledger, bootstrap(&empty, 3565)?).await?;
+        let nonempty = ledger.snapshot(plan.window_network_difficulty()).await?;
+        let claim = claim_enqueued(&ledger, bootstrap(&nonempty, 3566)?).await?;
+        let error = ledger
+            .land_candidate(&claim, &ledger_public_key())
+            .await
+            .err()
+            .context("landing accepted bootstrap over nonempty history")?;
+        ensure!(
+            format!("{error:#}").contains("bootstrap audit window omits canonical shares"),
+            "wrong refusal: {error:#}"
+        );
+        ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
+        Ok(())
+    }
+    .await;
+    let cleanup = db.close(vec![ledger]).await;
+    result.and(cleanup)
 }
 
 // ---------------------------------------------------------------------------
