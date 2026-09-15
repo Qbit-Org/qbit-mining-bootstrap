@@ -3,15 +3,7 @@ use super::{Labels, LockKind, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-/// Default ladder for first-offer, pool-acquisition and advisory-lock timings.
 pub const BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 30.];
-// Resolve the default share commit deadline and its reconciliation grace end.
-// ACK time includes work outside that deadline; these are elapsed-time buckets.
-const SHARE_ACK_BUCKETS: &[f64] = &[
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 15., 20., 30.,
-];
-// Fixed storage keeps event recording allocation-free. Shorter ladders use only
-// their prefix; observation and rendering both select the family's ladder.
 const BUCKET_COUNT: usize = SHARE_ACK_BUCKETS.len();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +84,20 @@ families! {
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
 }
+
+// Keep bucket metadata below the descriptor block to preserve producer links.
+// Default BUCKETS cover first-offer, pool-acquisition and advisory-lock timings.
+// ACK time includes work outside the default commit deadline/grace interval;
+// these additional bounds describe elapsed ACK time, not ledger outcomes.
+const SHARE_ACK_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 15., 20., 30.,
+];
+// Fixed storage keeps event recording allocation-free. Guard every ladder so
+// future changes cannot silently truncate observation or rendering via zip.
+const _: () = {
+    assert!(BUCKETS.len() <= BUCKET_COUNT);
+    assert!(SHARE_ACK_BUCKETS.len() <= BUCKET_COUNT);
+};
 
 impl Family {
     fn buckets(self) -> &'static [f64] {
