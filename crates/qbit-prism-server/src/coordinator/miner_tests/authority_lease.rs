@@ -774,9 +774,9 @@ async fn lease_or_resumed_wire_expiry_before_commit_refuses_without_records() {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_ne!(
+        assert_eq!(
             error.response(json!(41))["error"][2]["reason_id"],
-            "ledger-outcome-unknown",
+            "ledger-confirmation-failed",
             "{expired}: an append refused before COMMIT has a definite outcome"
         );
         assert!(f.store.records.lock().unwrap().is_empty(), "{expired}");

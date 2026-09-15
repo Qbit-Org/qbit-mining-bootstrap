@@ -422,9 +422,18 @@ impl Coordinator {
             SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.downcast_ref::<CommitGateClosed>().is_none()
-                    && (error.to_string().contains("duplicate-share")
-                        || error.to_string().contains("duplicate share_id"))
+                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                    // A refused local gate proves COMMIT was never sent. It
+                    // can mean revoked authority or lock contention, so do not
+                    // label it a stale job or a database failure.
+                    tracing::info!(%error, "share commit gate refused before COMMIT");
+                    return Err(protocol_error(
+                        "ledger-confirmation-failed",
+                        "share was not committed because its commit gate closed",
+                    ));
+                }
+                if error.to_string().contains("duplicate-share")
+                    || error.to_string().contains("duplicate share_id")
                 {
                     return Err(protocol_error("duplicate-share", "duplicate share"));
                 }
