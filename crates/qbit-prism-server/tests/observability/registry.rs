@@ -4,7 +4,7 @@ use axum::{
 };
 use qbit_prism_server::{
     api::{router, ApiConfig, ApiState},
-    metrics::{self, AckResult, Metrics, RejectReason},
+    metrics::{self, AckResult, ConnectionRefusalReason, Metrics, RejectReason, StaleJobCause},
 };
 use sqlx::postgres::PgPoolOptions;
 use std::{
@@ -227,6 +227,79 @@ fn histogram_buckets_are_cumulative_and_rejects_are_closed() {
         reasons,
         RejectReason::ALL.iter().map(|r| r.as_str()).collect()
     );
+}
+
+/// Label pairs of every sample in `family`, which must be a closed label set.
+fn label_pairs(body: &str, family: &str) -> BTreeSet<String> {
+    body.lines()
+        .filter(|line| line.starts_with(&format!("{family}{{")))
+        .map(|line| {
+            line.split_once('{')
+                .unwrap()
+                .1
+                .split_once('}')
+                .unwrap()
+                .0
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn refusal_and_cause_labels_are_closed_and_do_not_touch_share_rejections() {
+    let metrics = Metrics::default();
+    let body = metrics.render();
+    let refusals = "qbit_prism_stratum_connection_refusals_total";
+    let causes = "qbit_prism_stale_job_rejections_total";
+    let reasons: BTreeSet<_> = ConnectionRefusalReason::ALL
+        .iter()
+        .map(|reason| format!("reason=\"{}\"", reason.as_str()))
+        .collect();
+    let stale: BTreeSet<_> = StaleJobCause::ALL
+        .iter()
+        .map(|cause| format!("cause=\"{}\"", cause.as_str()))
+        .collect();
+    assert_eq!(label_pairs(&body, refusals), reasons);
+    assert_eq!(label_pairs(&body, causes), stale);
+    for pair in reasons.iter().map(|pair| format!("{refusals}{{{pair}}}")) {
+        assert_eq!(sample(&body, &pair), 0.);
+    }
+    for pair in stale.iter().map(|pair| format!("{causes}{{{pair}}}")) {
+        assert_eq!(sample(&body, &pair), 0.);
+    }
+    assert_eq!(sample(&body, "qbit_prism_stratum_connection_limit"), -1.);
+
+    metrics.set_stratum_connection_limit(3);
+    for reason in ConnectionRefusalReason::ALL {
+        metrics.record_connection_refusal(*reason);
+    }
+    for cause in StaleJobCause::ALL {
+        metrics.record_stale_job_rejection(*cause);
+    }
+    let body = metrics.render();
+    assert_eq!(
+        label_pairs(&body, refusals),
+        reasons,
+        "identity-free labels"
+    );
+    assert_eq!(label_pairs(&body, causes), stale, "identity-free labels");
+    for pair in reasons.iter().map(|pair| format!("{refusals}{{{pair}}}")) {
+        assert_eq!(sample(&body, &pair), 1.);
+    }
+    for pair in stale.iter().map(|pair| format!("{causes}{{{pair}}}")) {
+        assert_eq!(sample(&body, &pair), 1.);
+    }
+    assert_eq!(sample(&body, "qbit_prism_stratum_connection_limit"), 3.);
+    // Neither refusals nor causes are share rejections of their own.
+    for reason in RejectReason::ALL {
+        let key = format!(
+            "qbit_prism_rejections_total{{reason_id=\"{}\"}}",
+            reason.as_str()
+        );
+        assert_eq!(sample(&body, &key), 0.);
+    }
+    assert_eq!(sample(&body, "qbit_prism_stale_shares_total"), 0.);
+    assert_eq!(sample(&body, "qbit_prism_rejected_shares_total"), 0.);
 }
 
 #[tokio::test]

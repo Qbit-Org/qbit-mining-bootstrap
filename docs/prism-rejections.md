@@ -95,27 +95,38 @@ stalls beyond that budget, submits fall back to the live RPC read instead of
 accepting shares against a frozen snapshot.
 
 Rejections are counted, never logged per share or written to the ledger.
-Diagnose reject spikes from `qbit_prism_rejections_total`, the
-`qbit_prism_job_build_seconds` histogram, and the
-`qbit_prism_tip_refresh_seconds` histograms. The native runtime has no
+Diagnose reject spikes from `qbit_prism_rejections_total{reason_id}` and
+`qbit_prism_share_ack_seconds{result="rejected"}`, then use the stale-job
+causes below. The native runtime has no
 per-share or per-job stdout logging; it does not read the retired Python
 `PRISM_HOT_PATH_LOG` <!-- retired-setting: PRISM_HOT_PATH_LOG --> debugging switch. Prepared fanout passes validate tip and chain-view trust once per
 pass (minting a validation token; per-client deliveries consult only
 in-memory token state) plus a post-fanout re-validation, so per-client RPC
 round trips never return to the delivery path.
 
-Additional private metrics relevant to attribution and grace behavior:
+## Stale-job causes
 
-- `qbit_prism_grace_credited_shares_total`
-- `qbit_prism_vardiff_idle_retargets_total`
-- `qbit_prism_worker_submitted_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_accepted_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_grace_credited_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_rejections_total{worker="<bounded-label>",reason_id="<id>"}`
-- `qbit_prism_evicted_job_contexts{class="same_tip|stale_grace"}`
-- `qbit_prism_evicted_job_submits_total{outcome="accepted_same_tip|credited_stale_grace"}`
-- `qbit_prism_evicted_job_expirations_total{class="same_tip|stale_grace"}`
-- `qbit_prism_evicted_job_capacity_evictions_total{scope="connection"}`
+Every `stale-job` rejection keeps its wire reason, numeric code 21 and message.
+`qbit_prism_stale_job_rejections_total{cause}` also records which existing
+decision refused the share, once, at that decision. The share observation still
+counts the same rejection once as `reason_id="stale-job"`, so over one process
+lifetime the four cause series sum to that reason, apart from submissions still
+in flight. `unknown-job` has no cause series. Stale-grace credit is an accepted
+share, counted by `qbit_prism_grace_credited_shares_total`, not a cause.
+
+The decisions run in this order, and a share that would fail several is
+counted only under the first one it reaches. No later check runs just to choose
+a cause, and backend-unavailable answers are never stale-job causes.
+
+| Cause | Decision | What to check |
+| --- | --- | --- |
+| `resume_expired` | Stratum found the job's absolute resume lease expired after restoring it for a reconnected miner, before submitting to the coordinator. Message `stale job`. | Reconnect churn and how long miners take to resubmit old work: `qbit_prism_connections`, `qbit_prism_stratum_connection_refusals_total` and the retention settings `PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS` and `PRISM_STRATUM_STALE_GRACE_SECONDS`, whichever is longer. |
+| `fee_floor` | The coordinator found the job's CTV fanout fee below the live relay floor, or the floor unavailable. Message `job CTV fee is below the current relay floor`. | Node relay policy and mempool minimum fee, then whether replacement work reached miners: `qbit_prism_authorized_missing_current_work` and `qbit_prism_stratum_current_tip_coverage_gap_seconds`. |
+| `parent_grace` | The job's parent is not the published tip, and stale grace was unavailable, expired, or the job's parent is not the new tip's immediate parent. Message `stale job`. | Tip freshness and delivery: `qbit_prism_stratum_semantic_current_work_ratio`, `qbit_prism_authorized_missing_current_work`, `qbit_prism_stratum_current_tip_coverage_gap_seconds`, `qbit_prism_job_delivery_failures_total` and `qbit_prism_grace_credited_shares_total`. |
+| `payout_revision` | The parent is current, but either the job's payout snapshot or the current published payout snapshot disagrees with the durable payout revision, and no share-lease exception applies. Message `stale job`. | Payout revision changes and replacement delivery: `qbit_prism_pending_job_builds`, `qbit_prism_job_delivery_successes_total`, `qbit_prism_job_delivery_failures_total` and the coverage series above. |
+
+The native registry has no per-worker, evicted-job, job-build or tip-refresh
+histograms; `docs/prism-native-metrics.md` is the complete inventory.
 
 The native runtime does not read the retired Python worker-label cap
 `PRISM_WORKER_METRICS_LIMIT` <!-- retired-setting: PRISM_WORKER_METRICS_LIMIT -->.

@@ -82,6 +82,13 @@ labels!(RejectReason {
     LedgerConfirmationFailed => "ledger-confirmation-failed",
     LedgerOutcomeUnknown => "ledger-outcome-unknown"
 });
+// Existing admission limits only; never a peer address or username.
+labels!(ConnectionRefusalReason { GlobalLimit => "global_limit", UsernameLimit => "username_limit" });
+// The stale-job decision that refused a share. The wire reason stays `stale-job`.
+labels!(StaleJobCause {
+    ResumeExpired => "resume_expired", FeeFloor => "fee_floor",
+    ParentGrace => "parent_grace", PayoutRevision => "payout_revision"
+});
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.

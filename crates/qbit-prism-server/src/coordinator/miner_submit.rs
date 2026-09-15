@@ -10,6 +10,7 @@
 use super::submit_ledger::{CommitGate, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
+use crate::metrics::StaleJobCause;
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -208,6 +209,13 @@ impl Drop for AppendTask {
 }
 
 impl Coordinator {
+    /// Record the internal cause at its refusal branch. The response stays the
+    /// generic `stale-job` answer that miners and the share observation see.
+    fn stale_job(&self, cause: StaleJobCause) -> StratumError {
+        self.metrics.record_stale_job_rejection(cause);
+        protocol_error("stale-job", "stale job")
+    }
+
     pub(super) async fn submit_share(
         &self,
         _worker: &Worker,
@@ -229,24 +237,38 @@ impl Coordinator {
         self.ensure_job_fee_current(context.prepared.fee)
             .await
             .map_err(|_| {
+                self.metrics
+                    .record_stale_job_rejection(StaleJobCause::FeeFloor);
                 protocol_error("stale-job", "job CTV fee is below the current relay floor")
             })?;
         let tip_observation::SubmitAdmission {
             current,
             tip: selected,
+            lease,
         } = self.submit_admission().await?;
-        if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
+        if lease.is_none()
+            && last_poll.elapsed() >= self.config.health_timeout
+            && !selected.share_lease
+        {
             return Err(protocol_error(
                 "backend-rpc-unavailable",
                 "current chain state is unavailable",
             ));
         }
-        let revision = self.submit_ledger.payout_revision().await.map_err(|_| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current payout state is unavailable",
-            )
-        })?;
+        let revision = if let Some(lease) = &lease {
+            // Re-reading only a revision here would pair a newer transaction
+            // fence with the older balance digest checked by lease admission.
+            lease
+                .revision_for(&context.prepared)
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?
+        } else {
+            self.submit_ledger.payout_revision().await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current payout state is unavailable",
+                )
+            })?
+        };
         let parent_stale = selected.hash != job.wire.previousblockhash;
         let grace =
             parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
@@ -258,18 +280,19 @@ impl Coordinator {
                 )
             })?;
             if parent != job.wire.previousblockhash {
-                return Err(protocol_error("stale-job", "stale job"));
+                return Err(self.stale_job(StaleJobCause::ParentGrace));
             }
-        } else if parent_stale
-            || (context.prepared.snapshot.payout_revision != revision
-                && !(selected.share_lease
-                    && context.prepared.snapshot.payout_revision
-                        == current.snapshot.payout_revision
-                    && current.template["previousblockhash"].as_str()
-                        == Some(job.wire.previousblockhash.as_str())))
+        } else if parent_stale {
+            // A stale parent is attributed before any coincident revision change.
+            return Err(self.stale_job(StaleJobCause::ParentGrace));
+        } else if (context.prepared.snapshot.payout_revision != revision
+            && !(selected.share_lease
+                && context.prepared.snapshot.payout_revision == current.snapshot.payout_revision
+                && current.template["previousblockhash"].as_str()
+                    == Some(job.wire.previousblockhash.as_str())))
             || (current.snapshot.payout_revision != revision && !selected.share_lease)
         {
-            return Err(protocol_error("stale-job", "stale job"));
+            return Err(self.stale_job(StaleJobCause::PayoutRevision));
         }
         // Prior-parent share credit deliberately uses the current durable
         // revision. That exception never admits an obsolete block candidate.
@@ -315,6 +338,16 @@ impl Coordinator {
                     "backend-rpc-unavailable",
                     "current chain state is unavailable",
                 ));
+            }
+        }
+        if let Some(lease) = &lease {
+            if !self.revalidate_published_lease(lease).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })? {
+                return Err(protocol_error("stale-job", "stale job"));
             }
         }
         // Both acknowledgement bounds are measured from here.
@@ -372,7 +405,13 @@ impl Coordinator {
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
-                self.persist_share_pass(share, candidate, revision, start)
+                // Ordinary current-tip/candidate admission keeps its existing
+                // credit contract, including a proof that returned from lease
+                // selection to ordinary authority before admission finished.
+                let fence = lease
+                    .filter(|_| selected.share_lease)
+                    .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
+                self.persist_share_pass(share, candidate, revision, start, fence)
                     .await
             }
             Ok(candidate) => {
@@ -394,9 +433,18 @@ impl Coordinator {
             SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.downcast_ref::<CommitGateClosed>().is_none()
-                    && (error.to_string().contains("duplicate-share")
-                        || error.to_string().contains("duplicate share_id"))
+                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                    // A refused local gate proves COMMIT was never sent. It
+                    // can mean revoked authority or lock contention, so do not
+                    // label it a stale job or a database failure.
+                    tracing::info!(%error, "share commit gate refused before COMMIT");
+                    return Err(protocol_error(
+                        "ledger-confirmation-failed",
+                        "share was not committed because its commit gate closed",
+                    ));
+                }
+                if error.to_string().contains("duplicate-share")
+                    || error.to_string().contains("duplicate share_id")
                 {
                     return Err(protocol_error("duplicate-share", "duplicate share"));
                 }
@@ -437,9 +485,10 @@ impl Coordinator {
         candidate: Option<Candidate>,
         revision: i64,
         start: tokio::time::Instant,
+        lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
-        let gate = Arc::new(CommitGate::default());
+        let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
         let refusable = candidate.is_none();
