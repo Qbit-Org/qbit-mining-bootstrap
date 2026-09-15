@@ -279,7 +279,14 @@ async fn canceled_serializer_keeps_capacity_and_repair_guard_until_actual_comple
         2,
         "canceled leader never committed; follower repairs once after it finishes"
     );
+    // Persistence completion queues CompactOwner cleanup off runtime. The
+    // returned follower task does not join that cleanup, which still owns its
+    // repair guard. Synchronize on that actual owner instead of racing Drop.
+    let cleaned_up = tokio::time::timeout(Duration::from_secs(5), prepared.repair.lock())
+        .await
+        .expect("completed repair must release its cleanup owner");
     assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+    drop(cleaned_up);
     assert!(prepared.repair.try_lock().is_ok());
     assert!(!f.store.jobs.lock().unwrap().contains_key(&first_id));
 }
