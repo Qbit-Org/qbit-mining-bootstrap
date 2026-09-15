@@ -234,9 +234,28 @@ async fn bootstrap_resume_keeps_each_workers_original_payout() -> Result<()> {
                 "bootstrap synthetic share missing"
             );
             ensure!(
-                serde_json::to_vec(&*first.context.bundle)?
-                    != serde_json::to_vec(&*second.context.bundle)?,
+                first.wire.coinb1 != second.wire.coinb1 || first.wire.coinb2 != second.wire.coinb2,
                 "bootstrap accidentally shared a worker payout"
+            );
+            ensure!(
+                first
+                    .context
+                    .bootstrap_share
+                    .as_ref()
+                    .context("alice bootstrap share")?
+                    .miner_id
+                    == alice.payout_address,
+                "alice bootstrap share lost her payout identity"
+            );
+            ensure!(
+                second
+                    .context
+                    .bootstrap_share
+                    .as_ref()
+                    .context("bob bootstrap share")?
+                    .miner_id
+                    == bob.payout_address,
+                "bob bootstrap share lost his payout identity"
             );
             for (worker, original) in [(&alice, &first), (&bob, &second)] {
                 let resumed =
@@ -245,7 +264,8 @@ async fn bootstrap_resume_keeps_each_workers_original_payout() -> Result<()> {
                         .context("bootstrap resume missed")?;
                 same_job(original, &resumed)?;
             }
-            compact_storage(f, &first).await
+            compact_storage(f, &first).await?;
+            compact_storage(f, &second).await
         })
     })
     .await
@@ -256,8 +276,8 @@ async fn real_socket_reconnect_resumes_original_entropy_mask_and_submits_once() 
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {
             f.refresh(true).await?;
-            let mut a = Listener::start(&f.a).await?;
-            let mut b = Listener::start(&f.b).await?;
+            let mut a = Listener::start(&f.a, support::DIFFICULTY).await?;
+            let mut b = Listener::start(&f.b, 1e-9).await?;
             let mut original_socket = Client::connect(a.address).await?;
             original_socket.configure().await?;
             original_socket.login("alice.rig").await?;
@@ -285,6 +305,10 @@ async fn real_socket_reconnect_resumes_original_entropy_mask_and_submits_once() 
             ensure!(
                 reconnected.extranonce1 != old_extra,
                 "reconnect did not allocate fresh session entropy"
+            );
+            ensure!(
+                reconnected.difficulty > original.wire.share_difficulty,
+                "reconnect did not advertise a different assigned target"
             );
             // B negotiates no rolling mask. The submitted job retains A's mask.
             reconnected.send(submit.clone()).await?;

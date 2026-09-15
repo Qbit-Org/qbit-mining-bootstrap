@@ -20,15 +20,15 @@ pub struct Listener {
     task: JoinHandle<Result<()>>,
 }
 impl Listener {
-    pub async fn start(coordinator: &Arc<Coordinator>) -> Result<Self> {
+    pub async fn start(coordinator: &Arc<Coordinator>, difficulty: f64) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (shutdown, receiver) = watch::channel(false);
         let config = StratumConfig {
-            startup_difficulty: DIFFICULTY,
+            startup_difficulty: difficulty,
             vardiff: qbit_prism_server::vardiff::VardiffConfig {
                 enabled: false,
-                minimum: DIFFICULTY,
+                minimum: difficulty,
                 ..Default::default()
             },
             job_retention_seconds: 15.0,
