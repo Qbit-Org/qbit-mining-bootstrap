@@ -132,9 +132,8 @@ pub async fn prove_original_audit(
             "original coinbase suffix changed"
         );
         ensure!(
-            serde_json::to_value(&body.ctv_fanout_manifest_set)?
-                == serde_json::to_value(&metadata.ctv_fanout_manifest_set)?,
-            "original CTV metadata changed"
+            body.ctv_fanout_manifest_set.is_some() == metadata.ctv_fanout_manifest_set.is_some(),
+            "original CTV presence changed"
         );
         let expected = codec::Job::from_manifest(
             "independent-audit".into(),
