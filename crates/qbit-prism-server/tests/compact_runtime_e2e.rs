@@ -362,7 +362,8 @@ async fn resume_expiry_does_not_slide_and_expired_work_is_a_miss() -> Result<()>
             ))
             .await;
             ensure!(
-                first_deadline <= Instant::now() && second_deadline <= Instant::now(),
+                first_deadline <= std::time::Instant::now()
+                    && second_deadline <= std::time::Instant::now(),
                 "resumed wire deadline outlived the original database expiry"
             );
             ensure!(
