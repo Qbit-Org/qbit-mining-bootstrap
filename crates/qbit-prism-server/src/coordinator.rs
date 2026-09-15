@@ -493,12 +493,12 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 }
 
 #[derive(Debug)]
-struct ValidatedFeePolicy {
+pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
 }
 
-async fn validated_ctv_fee_policy(
+pub(crate) async fn validated_ctv_fee_policy(
     rpc: &Rpc,
     configured: Option<FanoutFeeRatePolicy>,
     premium_bps: u64,
@@ -611,12 +611,22 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
-        ledger
+        if let Err(error) = ledger
             .configure(
                 &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,
                 &local_signer_keys(&config)?,
             )
-            .await?;
+            .await
+        {
+            // No workers or sessions exist yet. A rejected old-policy start
+            // must not leave a permanent `starting` blocker for the next
+            // offline transition.
+            ledger
+                .heartbeat(crate::ledger::HeartbeatStatus::Stopped)
+                .await
+                .context("configuration rejected and stopped marker could not be recorded")?;
+            return Err(error);
+        }
         // Read through the ledger pool, so this is the value its sessions run
         // with. PostgreSQL reports it in milliseconds; zero disables it.
         let statement_timeout: i64 = sqlx::query_scalar(

@@ -25,7 +25,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// ledgers apply 013 online (`ONLINE_MIGRATIONS`) and record it after its
 /// last index change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -2073,6 +2073,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         13,
         include_str!("../../migrations/013_share_ledger_index_trim.sql"),
     ),
+    (
+        14,
+        include_str!("../../migrations/014_policy_transition.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -2969,6 +2973,14 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(12)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&14) {
+        sqlx::raw_sql(native_migration(14))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(14)")
             .execute(&mut **tx)
             .await?;
     }

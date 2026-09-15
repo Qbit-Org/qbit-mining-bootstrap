@@ -768,6 +768,84 @@ Record the index sizes before and after 013, the scan counts, the
 `Heap Fetches` lines of the page walk, and the share acknowledgement latency
 histogram from `/metrics` before and after, in #153 and #144.
 
+## Offline pool-fee and CTV fee-rate changes
+
+`qbit-prism-server policy-transition --to /protected/next.env` changes the
+cluster's pinned fee policy after **every frontend has stopped**. It supports
+pool-fee enablement, recipient and basis-point changes, and explicit/automatic
+CTV fee rates and premiums. Signing keys, genesis, username fallback, output
+ordering, payout thresholds, CTV enablement and settlement layout must stay
+unchanged. Signing-key rotation and multi-epoch verification are deferred.
+
+1. Preserve the current configuration, signing material and database backup.
+   Prepare a protected env file containing the target overrides. For example,
+   for an already-enabled pool fee and CTV settlement:
+
+   ```dotenv
+   PRISM_POOL_FEE_BPS=200
+   PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT=2000
+   PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
+   ```
+
+   These are examples, not market-rate recommendations. The command validates
+   the target CTV fee against the node's current relay and mempool floors; it
+   can replace an old rate that is already below those floors. Mainnet still
+   requires an explicit rate. Rates can change again before restart.
+
+2. Disable automatic restarts and stop every frontend and standalone candidate
+   or CTV worker. Graceful SIGTERM closes miner admission and drains workers;
+   in the bundled stack use
+   `docker compose stop --timeout 45 prism-coordinator prism-coordinator-2`.
+   Confirm every `qbit_prism_instances.status.state` is `stopped`. A stale,
+   `starting`, `draining`, `drained`, unknown or live heartbeat is refused by
+   instance name. There is no force flag. If a crashed instance cannot record
+   its own stopped marker, escalate for reviewed recovery; do not manufacture
+   markers with SQL. Keep the qbit node and database available.
+
+3. With the **current** configuration in the command's environment, run:
+
+   ```sh
+   qbit-prism-server migrate
+   qbit-prism-server policy-transition --to /protected/next.env
+   ```
+
+   Migration `014` adds the immutable transition journal (`013` is used for
+   the share ledger index trim). The command creates no frontend heartbeat.
+   The target file overlays current `PRISM_*` and `QBIT_*` variables; omitted
+   values retain their current values, and an empty value clears an optional
+   setting. It supports dotenv quoting and `export`, never shell execution.
+   Other stack variables are ignored. The target database URL must be unchanged.
+   Both effective policies are checked with the normal configuration parser
+   and pool-fee address resolution. The current fingerprint must match the
+   database, and the target must actually change the policy.
+
+4. Save the returned JSON. Under the settlement and ordering locks, with
+   concurrent frontend registrations excluded, one transaction updates the
+   fingerprint, increments `payout_revision` once, and journals the old/new
+   public policies, revisions, database login, instance snapshot and candidate
+   counts. It abandons unoffered pending candidates with `epoch-superseded` and
+   releases their retained window/block payloads. A pending candidate with an
+   already-landed block is refused until reconciled. Offered, offer-reserved
+   and reconciliation candidates retain their original bytes, policy and keys;
+   their old claims are fenced and they can resume immediately on restart
+   without another offer. Parked rows stay parked for operator recovery.
+   Existing audit and CTV manifest bytes are unchanged. Recovery evidence
+   exports include the transition journal and its allocation sequence.
+
+   A failure before commit leaves the policy and candidate dispositions intact.
+   A timeout or lost commit response can mean success: inspect
+   `qbit_prism_policy_transitions` and the cluster fingerprint/revision before
+   retrying. Repeating a committed transition with the old environment fails
+   the current-fingerprint check and does not increment the revision again.
+   The journal contains public keys, never signing seeds or credentials.
+
+5. Apply the effective target configuration to **all** frontends, run the normal
+   `check-config`, then restart and verify health before restoring miner traffic.
+   Restarting with the old policy is rejected and names the active payout
+   revision. Miners disconnect during the stop and receive fresh work after
+   reconnecting; revision-bound jobs prepared before the transition cannot be
+   issued. Historical verification continues to use the unchanged public keys.
+
 ## Fatal-state recovery
 
 A disconnected mature pool block or deep confirmed CTV fanout records a shared

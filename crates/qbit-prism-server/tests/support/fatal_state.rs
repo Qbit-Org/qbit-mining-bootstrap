@@ -7,9 +7,7 @@ use serde_json::Value;
 use std::{process::Output, time::Duration};
 use tokio::process::Command;
 
-#[allow(dead_code)]
-#[path = "fake_qbitd.rs"]
-mod fake;
+use super::fake_qbitd as fake;
 
 async fn setup(db: &Database) -> Result<(Ledger, fake::FakeNode, Config)> {
     let ledger = db.ledger("frontend-a").await?;

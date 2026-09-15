@@ -97,10 +97,11 @@ async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
     Ok(indexes)
 }
 
-/// Put a migrated database back to 12: the release indexes as 001 creates
-/// them, without the replacements and without the record.
+/// Undo 013: restore the release indexes as 001 creates them and remove
+/// its record, preserving the other migrations present in the fixture.
 pub(super) async fn undo_013(pool: &PgPool) -> Result<()> {
-    assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let versions = schema_versions(pool).await?;
+    assert!(versions.contains(&13));
     let mut sql = format!(
         "DELETE FROM qbit_prism_schema_migrations WHERE version=13; DROP INDEX {SEQ_WALK}; DROP INDEX {MINER_HISTORY};"
     );
@@ -111,7 +112,10 @@ pub(super) async fn undo_013(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql(&sql).execute(pool).await?;
     assert_eq!(
         schema_versions(pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        versions
+            .into_iter()
+            .filter(|version| *version != 13)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -344,7 +348,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     let error = Ledger::connect(&db.url, "cold".into(), 8, false)
         .await
         .err()
-        .context("a non-initializing start accepted a database at 12")?
+        .context("a non-initializing start accepted a database missing 013")?
         .to_string();
     assert!(error.contains("missing migration(s) 13"), "{error}");
     // Invalid indexes with another definition or on another table belong
@@ -388,7 +392,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         assert_eq!(ledger_indexes(&pool).await?, before);
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
         );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
             .execute(&pool)
@@ -466,7 +470,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     assert_eq!(ledger_indexes(&pool).await?, before);
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
     );
     // The declared definition under the reserved name is an earlier build
     // of the migration's own: kept as it is, not rebuilt.
@@ -650,7 +654,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     }
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
     );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both builds
@@ -729,7 +733,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     );
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
     );
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
@@ -806,7 +810,7 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
     assert!(error.contains("migrate again"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
     );
     let after_refusal = ledger_indexes(&pool).await?;
     let mut expected: Vec<&str> = KEPT.to_vec();
