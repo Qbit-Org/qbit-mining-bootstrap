@@ -1,5 +1,5 @@
 use super::*;
-use crate::metrics::{LockKind, Metrics, Outcome};
+use crate::metrics::{time_pool_acquire, LockKind, Metrics, Outcome};
 
 mod acquire;
 
@@ -474,7 +474,7 @@ async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-    Transaction::begin(acquire::acquire(pool, metrics).await?, None).await
+    Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
