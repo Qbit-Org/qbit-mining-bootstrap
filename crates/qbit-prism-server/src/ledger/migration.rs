@@ -2878,6 +2878,8 @@ where
     read_migration_source_connection(&mut connection).await
 }
 
+// The concrete reader keeps migration_source's future Send for spawned callers;
+// passing its borrowed checkout through generic Acquire fails that bound.
 async fn read_migration_source_connection(
     connection: &mut sqlx::PgConnection,
 ) -> Result<Option<MigrationSource>> {

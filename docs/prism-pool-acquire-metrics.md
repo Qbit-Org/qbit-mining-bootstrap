@@ -49,6 +49,8 @@ Other direct job, coordinator, candidate, startup and session-reservation
 cleanup queries still acquire without this helper. Audit reconstruction
 (`audit_canonical_bytes`, the snapshot lookup in `materialize_audit_row`, and
 its range read) remains untimed, including when `audit_bundle` invokes it.
+The independent bootstrap/newest/older boundary probes added by #379 also
+remain untimed; only the durable-range page checkouts are observed here.
 The separate rollup transaction also remains untimed. Public API read pools and the public role's export
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
