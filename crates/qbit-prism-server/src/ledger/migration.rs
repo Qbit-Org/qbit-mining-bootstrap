@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -43,6 +43,8 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // entry refuses the migrated database at connect, which is what keeps a
     // pre-011 frontend off rows the reservation lifecycle owns.
     ("candidate_offer_lifecycle", 1),
+    // 012: startup proves support again in its initial heartbeat.
+    ("instance_offer_startup", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -564,7 +566,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             String::new()
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}, then start or migrate again");
+        let startup_remedy = if versions.contains(&12) {
+            " and restore the instance_offer_startup = 1 declaration from migrations/012_offer_startup_fence.sql after verifying its qbit_prism_instances_offer_startup constraint is present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -578,6 +585,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
                 "database is at schema migration 11 but qbit_prism_schema_capabilities declares {lifecycle} = {value}: 011 declares {declared} and this server understands {declared} only, so either the row was edited or a newer PRISM release wrote this database. Restore the full backup, or upgrade the server if a newer release wrote it; nothing native writes another value"
             ),
         }
+    }
+    if versions.contains(&12) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "instance_offer_startup" && *value == 1),
+            "database is at schema migration 12 but does not declare instance_offer_startup = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 012's startup constraint and capability; nothing was changed"
+        );
     }
     Ok(())
 }
@@ -594,7 +607,7 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
     // restored selectively; it is not read as a pre-006 database, which
     // would let 006 declare a storage version above an outbox 011 already
     // owns without the lifecycle declaration being checked first.
-    if !versions.contains(&6) && !versions.contains(&11) {
+    if !versions.contains(&6) && !versions.contains(&11) && !versions.contains(&12) {
         return Ok(());
     }
     if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref(), versions)
@@ -2044,6 +2057,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         11,
         include_str!("../../migrations/011_offer_before_landing.sql"),
     ),
+    (
+        12,
+        include_str!("../../migrations/012_offer_startup_fence.sql"),
+    ),
 ];
 
 /// The SQL of one native migration, by the version it records.
@@ -2854,20 +2871,28 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
+    if !versions.contains(&12) {
+        if versions.contains(&11) {
+            // A database migrated by an earlier 011 build needs the same
+            // shutdown proof before installing the missing startup fence.
+            refuse_unquiesced_instances(tx, 12).await?;
+        }
+        sqlx::raw_sql(native_migration(12))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(12)")
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
-/// 011's own quiesce check, before any of its DDL runs. Every registered
-/// instance must explicitly report shutdown, even if it holds no claim.
-/// A pending row whose
-/// claim is still live belongs to a pre-011 frontend that may be mid-offer:
-/// the reservation lifecycle cannot take over a row an old frontend may
-/// still send. And 011 quarantines every attempted pending row as an
-/// unknown-delivery reconciliation row, which must carry the evidence the
-/// lifecycle payload rule requires (the document, the block bytes and the
-/// window reference); a parked chunked row or a pre-007 row cannot be
-/// quarantined and is refused by name, exactly as 007 refused it.
-async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+/// Refuse any instance that has not explicitly shut down, including one
+/// whose heartbeat is stale or whose candidate lease has expired.
+async fn refuse_unquiesced_instances(
+    tx: &mut Transaction<'_, Postgres>,
+    version: i32,
+) -> Result<()> {
     // Claim expiry proves nothing about an idle or paused frontend. Use the
     // same explicit shutdown markers as fatal-state recovery, without a
     // heartbeat-age cutoff. Serialize the scan with heartbeat registration
@@ -2882,11 +2907,26 @@ async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<
     .await?;
     ensure!(
         instances.is_empty(),
-        "migration 011 requires every pre-011 instance to report drained or stopped; offending instances: {}. \
-         Stop every pre-011 frontend gracefully and disable automatic restarts before migrating. \
+        "migration {version:03} requires every earlier instance to report drained or stopped; offending instances: {}. \
+         Stop every earlier frontend gracefully and disable automatic restarts before migrating. \
          An empty outbox or an expired heartbeat does not prove shutdown; nothing was changed",
         named_objects(&instances)
     );
+    Ok(())
+}
+
+/// 011's own quiesce check, before any of its DDL runs. Every registered
+/// instance must explicitly report shutdown, even if it holds no claim.
+/// A pending row whose
+/// claim is still live belongs to a pre-011 frontend that may be mid-offer:
+/// the reservation lifecycle cannot take over a row an old frontend may
+/// still send. And 011 quarantines every attempted pending row as an
+/// unknown-delivery reconciliation row, which must carry the evidence the
+/// lifecycle payload rule requires (the document, the block bytes and the
+/// window reference); a parked chunked row or a pre-007 row cannot be
+/// quarantined and is refused by name, exactly as 007 refused it.
+async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    refuse_unquiesced_instances(tx, 11).await?;
     let outbox: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_block_candidate_outbox') IS NOT NULL")
             .fetch_one(&mut **tx)
@@ -4831,7 +4871,7 @@ mod tests {
 
     #[test]
     fn a_database_at_11_must_declare_the_offer_lifecycle_as_011_declared_it() {
-        let at_11 = REQUIRED_SCHEMA_VERSIONS;
+        let at_11: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let storage = ("candidate_storage_version", 1);
         let lifecycle = ("candidate_offer_lifecycle", 1);
         declared_at(&[storage, lifecycle], at_11).unwrap();
@@ -4925,12 +4965,12 @@ mod tests {
         // version alone is.
         refuse_undeclared_native_database(&[2, 3, 4, 5], &inventory(None)).unwrap();
         refuse_undeclared_native_database(&[2, 3, 4, 5, 6, 7, 8, 9, 10], &storage_only).unwrap();
-        refuse_undeclared_native_database(REQUIRED_SCHEMA_VERSIONS, &both).unwrap();
+        refuse_undeclared_native_database(&[2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &both).unwrap();
         let error = refuse_undeclared_native_database(REQUIRED_SCHEMA_VERSIONS, &storage_only)
             .unwrap_err()
             .to_string();
         assert!(
-            error.starts_with("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 before any DDL: database is at schema migration 11 but"),
+            error.starts_with("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 before any DDL: database is at schema migration 11 but"),
             "{error}"
         );
         // 11 without 6 was restored selectively: checked all the same, the

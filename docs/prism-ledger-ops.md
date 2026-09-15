@@ -271,6 +271,20 @@ fails that write's transaction as any CHECK would. Signer rotation is
 refused while any unfinished row stores other keys, in every unfinished
 state.
 
+**Startup fence (012).** The instance-table lock alone cannot reject an old
+startup queued behind migration. Migration 012 adds a database CHECK that
+requires `candidate_offer_lifecycle: 1` in every `starting` heartbeat. This
+binary writes that marker; a pre-011 binary cannot finish registering even
+if it checked capabilities before the cutover. The constraint is checked
+after the lock wait, including an upsert that would reuse a stopped instance
+ID. Shutdown and historical health evidence are retained. Migration 012 and
+011 commit together on a pre-011 database. A database already at 011 must
+also stop all frontends gracefully before applying 012; it uses the same
+explicit shutdown check. Restart with this binary after cutover. The new
+`instance_offer_startup = 1` capability rejects earlier binaries at their
+ordinary startup gate, and this binary refuses a missing or changed
+012 declaration. Recovery exports require the same schema and declaration.
+
 PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
 socket write or a missing RPC reply: an offered block is confirmed only by a

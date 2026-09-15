@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
     applied integer[];
     missing integer[];
     metadata text;
@@ -52,6 +52,7 @@ DECLARE
     capability record;
     declared boolean := false;
     offer_declared boolean := false;
+    startup_declared boolean := false;
     source record;
     source_rows bigint;
 BEGIN
@@ -147,25 +148,29 @@ BEGIN
         END IF;
     END LOOP;
     -- Startup decodes capability as text and capability_value as int4, and
-    -- understands storage version 1 and offer lifecycle 1. Both declarations
-    -- are required on this native schema; a missing row is never repaired.
+    -- understands storage version 1, offer lifecycle 1 and startup fence 1.
+    -- All three declarations are required on this native schema; a missing row is never repaired.
     FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s ORDER BY capability DESC', capability_table) LOOP
         IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
            OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
             RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
-        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle') THEN
+        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup') THEN
             RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
         ELSIF capability.capability_value <> 1 THEN
             RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to 1 only', capability.capability, capability.capability_value, capability.capability USING HINT = hint;
         END IF;
         declared := declared OR capability.capability = 'candidate_storage_version';
         offer_declared := offer_declared OR capability.capability = 'candidate_offer_lifecycle';
+        startup_declared := startup_declared OR capability.capability = 'instance_offer_startup';
     END LOOP;
     IF NOT declared THEN
         RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row' USING HINT = hint;
     END IF;
     IF NOT offer_declared THEN
         RAISE EXCEPTION 'database is at schema migration 11 but qbit_prism_schema_capabilities has no candidate_offer_lifecycle row' USING HINT = hint;
+    END IF;
+    IF NOT startup_declared THEN
+        RAISE EXCEPTION 'database is at schema migration 12 but has no instance_offer_startup declaration' USING HINT = hint;
     END IF;
     -- The singleton row startup decodes into MigrationSource.
     EXECUTE format('SELECT concat_ws('','', pg_typeof(source_state), pg_typeof(source_release), pg_typeof(source_commit), pg_typeof(candidate_storage_version), pg_typeof(prior_schema_version), pg_typeof(migrated_by), pg_typeof(migrated_at)) AS types, source_state IS NULL OR prior_schema_version IS NULL OR migrated_by IS NULL OR migrated_at IS NULL AS incomplete FROM %s WHERE singleton LIMIT 1', source_table) INTO source;

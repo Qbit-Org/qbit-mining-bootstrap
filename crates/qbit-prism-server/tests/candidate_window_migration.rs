@@ -56,7 +56,7 @@ const PRE_007: [(i32, &str); 8] = [
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
 ];
-const ALL_VERSIONS: [i32; 10] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const ALL_VERSIONS: [i32; 11] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 /// The columns 011 adds to the outbox, which the connect that applies 007
 /// adds as well.
 const OFFER_COLUMNS: [&str; 6] = [
@@ -529,12 +529,12 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
                     .collect::<Vec<_>>()
                     == ALL_VERSIONS
             );
-            // Only 007 and 011 ran: every other version keeps the row it
-            // already had.
+            // Every migration installed before this run keeps its original
+            // timestamp; only missing migrations are applied.
             ensure!(
                 after
                     .iter()
-                    .filter(|(version, _)| *version != 7 && *version != 11)
+                    .filter(|(version, _)| before.iter().any(|(installed, _)| installed == version))
                     .copied()
                     .collect::<Vec<_>>()
                     == before,
