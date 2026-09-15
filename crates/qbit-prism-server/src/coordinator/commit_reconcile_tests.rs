@@ -669,6 +669,45 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
             fixture.rows(&share.share_id).await? == 1,
             "expected one ledger row"
         );
+        let clock_before: i64 =
+            sqlx::query_scalar("SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton")
+                .fetch_one(&fixture.side)
+                .await?;
+        // The hook may close after the transaction has already verified an
+        // identical durable share. Its read-only rollback must retain that
+        // known duplicate outcome, without another credit or clock update.
+        let duplicate = ledger
+            .append_at_revision_gated(share.clone(), None, revision, &refuse)
+            .await?;
+        ensure!(
+            !duplicate.inserted && duplicate.share == appended.share,
+            "closed gate discarded the known identical duplicate"
+        );
+        ensure!(
+            calls.load(Ordering::SeqCst) == 3,
+            "duplicate did not reach the gate"
+        );
+        let clock_after: i64 =
+            sqlx::query_scalar("SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton")
+                .fetch_one(&fixture.side)
+                .await?;
+        ensure!(
+            clock_after == clock_before && fixture.rows(&share.share_id).await? == 1,
+            "read-only duplicate changed durable credit or its clock"
+        );
+        let mut mismatched = share.clone();
+        mismatched.job_id = "different-immutable-input".into();
+        let mismatch = ledger
+            .append_at_revision_gated(mismatched, None, revision, &refuse)
+            .await
+            .expect_err("different payload cannot borrow prior credit");
+        ensure!(
+            mismatch
+                .to_string()
+                .contains("duplicate share_id payload mismatch")
+                && calls.load(Ordering::SeqCst) == 3,
+            "payload mismatch was reclassified as a known identical duplicate"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;

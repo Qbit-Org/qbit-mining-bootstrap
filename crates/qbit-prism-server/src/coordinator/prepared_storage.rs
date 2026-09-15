@@ -1,10 +1,23 @@
 //! Retain the exact prepared dependency when publishing compact issued work.
+use super::publication_authority::AbsoluteDeadline;
+use super::tip_observation::PreparedIdentity;
 use super::*;
 use crate::ledger::{IssuedJobSave, PreparedDependency};
 
 // Preparatory only: no refresh, resume or issued-publication caller yet.
 #[allow(dead_code)]
 pub(super) mod compact;
+
+/// One issue operation retains its original identity, epoch, bytes and expiry
+/// across dependency repair and every storage wait. A lease selected by any
+/// attempt stays bound to that exact publication through final delivery.
+struct IssuedPersistence<'a> {
+    job: &'a MiningJob<JobContext>,
+    payload: Value,
+    expires_at_ms: i64,
+    deadline: AbsoluteDeadline,
+    authority: IssuanceAuthority,
+}
 
 impl Coordinator {
     pub(super) async fn save_issued_record(
@@ -14,6 +27,8 @@ impl Coordinator {
         version_mask: u32,
         ttl: Duration,
     ) -> Result<()> {
+        let readiness_epoch = self.readiness.read().await.generation;
+        let requested_at = tokio::time::Instant::now();
         let now_ms = self.work_ledger.now_ms().await?;
         let seconds = ttl
             .as_secs()
@@ -24,6 +39,20 @@ impl Coordinator {
         let expires_at_ms = now_ms
             .checked_add(seconds.checked_mul(1000).context("job TTL overflow")?)
             .context("job expiry overflow")?;
+        let authority = if let Some(original) = &job.context.issuance_authority {
+            (**original).clone()
+        } else {
+            self.begin_issuance_authority(
+                PreparedIdentity::of(&job.context.prepared),
+                readiness_epoch,
+                None,
+            )
+            .await?
+            .context("payout snapshot stale")?
+        };
+        let expires_at_ms = authority
+            .absolute_expiry()
+            .map_or(expires_at_ms, |original| original.min(expires_at_ms));
         let record = StoredJob {
             prepared_key: job.context.prepared.storage_key.clone(),
             worker: worker.clone(),
@@ -34,23 +63,21 @@ impl Coordinator {
             version_mask,
             expires_at_ms,
         };
-        let payload = serde_json::to_value(record)?;
-        if self
-            .save_with_dependency(job, &payload, expires_at_ms, None)
-            .await?
-            == IssuedJobSave::Saved
-        {
+        let mut issued = IssuedPersistence {
+            job,
+            payload: serde_json::to_value(record)?,
+            expires_at_ms,
+            deadline: AbsoluteDeadline::from_database(now_ms, requested_at, expires_at_ms)?,
+            authority,
+        };
+        if self.save_with_dependency(&mut issued, None).await? == IssuedJobSave::Saved {
             return Ok(());
         }
         let prepared = &job.context.prepared;
         // Followers retry compact persistence after the first repair completes.
         // The guard also lives through actual blocking work if its waiter dies.
         let repair = prepared.repair.clone().lock_owned().await;
-        if self
-            .save_with_dependency(job, &payload, expires_at_ms, None)
-            .await?
-            == IssuedJobSave::Saved
-        {
+        if self.save_with_dependency(&mut issued, None).await? == IssuedJobSave::Saved {
             return Ok(());
         }
         let permit = self.build_slots.clone().acquire_owned().await?;
@@ -70,7 +97,7 @@ impl Coordinator {
         // Both admission and the transaction's current revision are checked
         // again after waiting. The original child deadline/payload stay fixed.
         ensure!(
-            self.save_with_dependency(job, &payload, expires_at_ms, Some(&serialized))
+            self.save_with_dependency(&mut issued, Some(&serialized))
                 .await?
                 == IssuedJobSave::Saved,
             "prepared dependency repair did not save issued work"
@@ -80,23 +107,19 @@ impl Coordinator {
 
     async fn save_with_dependency(
         &self,
-        job: &MiningJob<JobContext>,
-        payload: &Value,
-        expires_at_ms: i64,
+        issued: &mut IssuedPersistence<'_>,
         repair: Option<&Value>,
     ) -> Result<IssuedJobSave> {
-        let prepared = &job.context.prepared;
-        let revision = self
-            .issued_work_revision(prepared)
-            .await?
-            .context("payout snapshot stale")?;
-        self.work_ledger
+        let revision = self.revalidate_issued(issued).await?;
+        let prepared = &issued.job.context.prepared;
+        let saved = self
+            .work_ledger
             .save_issued_job(
-                &job.wire.job_id,
-                payload,
+                &issued.job.wire.job_id,
+                &issued.payload,
                 revision,
-                &job.wire.previousblockhash,
-                expires_at_ms,
+                &issued.job.wire.previousblockhash,
+                issued.expires_at_ms,
                 PreparedDependency {
                     key: &prepared.storage_key,
                     original_revision: prepared.stored.snapshot.payout_revision,
@@ -106,7 +129,23 @@ impl Coordinator {
                 },
                 repair,
             )
-            .await
+            .await?;
+        if saved == IssuedJobSave::Saved {
+            // A transaction may leave an immutable row after revocation, but
+            // that row must never be delivered with the old admission proof.
+            self.revalidate_issued(issued).await?;
+        }
+        Ok(saved)
+    }
+
+    async fn revalidate_issued(&self, issued: &mut IssuedPersistence<'_>) -> Result<i64> {
+        let revision = self
+            .revalidate_issuance_authority(&mut issued.authority, Some(issued.expires_at_ms))
+            .await?
+            .context("payout snapshot stale")?;
+        // No later database clock read or repair retry renews this deadline.
+        ensure!(issued.deadline.live(), "issued job deadline elapsed");
+        Ok(revision)
     }
 }
 
