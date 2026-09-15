@@ -1,7 +1,7 @@
 use super::*;
 use qbit_prism_server::{
     config::Config,
-    ledger::{HeartbeatStatus, OfferOutcome},
+    ledger::{HeartbeatHealth, HeartbeatStatus, OfferOutcome},
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -174,7 +174,7 @@ async fn two_frontends_must_stop_and_old_work_and_startup_are_rejected() -> Resu
         )
         .fetch_one(&a.pool)
         .await?,
-        "stopped"
+        "starting"
     );
     let restart = db.ledger("frontend-b").await?;
     let error = restart
@@ -205,6 +205,69 @@ async fn two_frontends_must_stop_and_old_work_and_startup_are_rejected() -> Resu
             .inserted
     );
     db.close(vec![a, b, restart]).await
+}
+
+#[tokio::test]
+async fn rejected_same_id_startup_cannot_authorize_a_policy_transition() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (a, b, _node, config) = setup(&db).await?;
+    let next = changed_fee(&config);
+    let held = a.new_session_id().await?;
+    a.heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+        true,
+        Default::default(),
+    )))
+    .await?;
+    b.heartbeat(HeartbeatStatus::Stopped).await?;
+    a.append(share(1), None).await?;
+    let pending = candidate(&a.snapshot(100).await?, 2895)?;
+    a.enqueue_candidate(pending.candidate).await?;
+    let before = state(&a).await?;
+
+    // The rejected process shares a's ID but owns none of its live sessions.
+    let mut rejected_config = next.clone();
+    rejected_config.instance_id = "frontend-a".into();
+    let rejected = qbit_prism_server::coordinator::Coordinator::new(
+        rejected_config,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await
+    .err()
+    .context("mismatched-policy coordinator started")?;
+    assert!(rejected.to_string().contains("fingerprint mismatch"));
+
+    // Try before a's next heartbeat: the shared row must not prove quiescence.
+    let error = a
+        .transition_policy(&config, &next)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("frontend-a") && error.contains("stopped"),
+        "{error}"
+    );
+    assert_eq!(state(&a).await?, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status->>'state' FROM qbit_prism_instances WHERE instance_id='frontend-a'"
+        )
+        .fetch_one(&a.pool)
+        .await?,
+        "starting"
+    );
+    a.new_session_id().await?.release().await?;
+    assert!(a.heartbeat(HeartbeatStatus::Stopped).await.is_err());
+    held.release().await?;
+    a.heartbeat(HeartbeatStatus::Stopped).await?;
+    let event = a.transition_policy(&config, &next).await?;
+    assert_eq!(
+        event["payout_revision"],
+        before["cluster"]["payout_revision"].as_i64().unwrap() + 1
+    );
+    assert_eq!(event["abandoned_candidates"], 1);
+    db.close(vec![a, b]).await
 }
 
 #[tokio::test]

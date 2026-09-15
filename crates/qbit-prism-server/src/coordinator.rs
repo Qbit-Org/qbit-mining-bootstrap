@@ -611,22 +611,15 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
-        if let Err(error) = ledger
+        // Keep the initial heartbeat non-quiescent if configuration fails.
+        // Another live incarnation may share this instance ID, so this
+        // rejected startup cannot safely publish `stopped` for the shared row.
+        ledger
             .configure(
                 &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,
                 &local_signer_keys(&config)?,
             )
-            .await
-        {
-            // No workers or sessions exist yet. A rejected old-policy start
-            // must not leave a permanent `starting` blocker for the next
-            // offline transition.
-            ledger
-                .heartbeat(crate::ledger::HeartbeatStatus::Stopped)
-                .await
-                .context("configuration rejected and stopped marker could not be recorded")?;
-            return Err(error);
-        }
+            .await?;
         // Read through the ledger pool, so this is the value its sessions run
         // with. PostgreSQL reports it in milliseconds; zero disables it.
         let statement_timeout: i64 = sqlx::query_scalar(

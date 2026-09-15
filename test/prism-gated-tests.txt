@@ -138,6 +138,7 @@ qbit-prism-server::ledger_postgres::policy_transition::offered_candidates_keep_o
 qbit-prism-server::ledger_postgres::policy_transition::only_fee_fields_can_change_and_retry_does_not_bump_again
 qbit-prism-server::ledger_postgres::policy_transition::policy_transition_cannot_clear_a_fatal_state
 qbit-prism-server::ledger_postgres::policy_transition::registration_racing_the_stopped_scan_is_not_missed
+qbit-prism-server::ledger_postgres::policy_transition::rejected_same_id_startup_cannot_authorize_a_policy_transition
 qbit-prism-server::ledger_postgres::policy_transition::transition_waits_for_both_accounting_locks
 qbit-prism-server::ledger_postgres::policy_transition::two_frontends_must_stop_and_old_work_and_startup_are_rejected
 qbit-prism-server::ledger_postgres::reconciliation_watches_only_recent_blocks_and_one_mature_checkpoint
