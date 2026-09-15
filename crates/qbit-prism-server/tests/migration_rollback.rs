@@ -646,6 +646,62 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
                 recovery::evidence(db, pg_bin).await? == baseline,
                 "{schema} block lifecycle restore diverged from baseline"
             );
+            // Candidate retry state is carried verbatim from 2.x, so both
+            // exports must see a rewound count or a lost error. The native-only
+            // schedule is clock-derived and is evidence only when parked;
+            // ownership and updated_at never are.
+            let has_next_attempt_at: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=$1 AND table_name='qbit_block_candidate_outbox' AND column_name='next_attempt_at')",
+            )
+            .bind(&db.schema)
+            .fetch_one(&db.pool)
+            .await?;
+            ensure!(has_next_attempt_at == (schema == "native"));
+            let update_candidate = |set: &str| format!(
+                "UPDATE {}.qbit_block_candidate_outbox SET {set} WHERE block_hash=repeat('77',32)",
+                db.schema
+            );
+            for (mutation, visible) in [
+                ("attempt_count=2", true),
+                ("last_error='node rejected the block'", true),
+                ("next_attempt_at='infinity'", true),
+                ("next_attempt_at=clock_timestamp()+interval '1 hour'", false),
+                ("claim_token='recovery-claim',claim_instance_id='recovery-owner',claim_expires_at=clock_timestamp()+interval '1 minute'", false),
+                ("updated_at=clock_timestamp()", false),
+            ]
+            .into_iter()
+            .filter(|(mutation, _)| {
+                has_next_attempt_at
+                    || !(mutation.starts_with("next_attempt_at") || mutation.starts_with("claim_"))
+            }) {
+                sqlx::query(&update_candidate(mutation)).execute(&db.pool).await?;
+                let current = recovery::evidence(db, pg_bin).await?;
+                if visible {
+                    ensure!(current["records"]["candidates"]["count"] == baseline["records"]["candidates"]["count"]);
+                    ensure!(
+                        current["records"]["candidates"]["sha256"] != baseline["records"]["candidates"]["sha256"],
+                        "{schema} candidate retry state change was invisible to recovery evidence: {mutation}"
+                    );
+                    let mut unchanged = current;
+                    unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
+                    ensure!(unchanged == baseline, "unrelated accounting changed with {mutation}");
+                } else {
+                    ensure!(
+                        current == baseline,
+                        "{schema} transient candidate state changed recovery evidence: {mutation}"
+                    );
+                }
+                let reset = if has_next_attempt_at {
+                    "attempt_count=0,last_error=NULL,next_attempt_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL"
+                } else {
+                    "attempt_count=0,last_error=NULL"
+                };
+                sqlx::query(&update_candidate(reset)).execute(&db.pool).await?;
+                ensure!(
+                    recovery::evidence(db, pg_bin).await? == baseline,
+                    "{schema} candidate retry state restore diverged from baseline"
+                );
+            }
         }
         ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
@@ -1357,10 +1413,24 @@ async fn assert_candidate_payload_fingerprints(
             let claim = ledger.claim_candidate(60).await?.expect("pending candidate");
             ensure!(claim.candidate.block_bytes == block);
             ensure!(serde_json::to_value(claim.candidate)? == body);
-            ensure!(recovery::evidence(&source, pg_bin).await? == baseline,
-                "candidate claim ownership changed recovery evidence");
+            // The claim's attempt outlives its lease: it keeps the row out of
+            // the fresh lane and lengthens the next backoff, so it is evidence
+            // while the lease itself is not.
+            let attempted = recovery::evidence(&source, pg_bin).await?;
+            ensure!(attempted["records"]["candidates"]["sha256"]
+                != baseline["records"]["candidates"]["sha256"],
+                "candidate attempt count change was invisible to recovery evidence");
+            let mut unchanged = attempted.clone();
+            unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
+            ensure!(unchanged == baseline, "unrelated evidence changed with a candidate claim");
             sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1")
                 .bind(&candidate.block_hash).execute(&source.pool).await?;
+            ensure!(recovery::evidence(&source, pg_bin).await? == attempted,
+                "candidate claim ownership changed recovery evidence");
+            // A restore that rewinds the count is the never-attempted baseline.
+            sqlx::query("UPDATE qbit_block_candidate_outbox SET attempt_count=0 WHERE block_hash=$1")
+                .bind(&candidate.block_hash).execute(&source.pool).await?;
+            ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
 
             // Keep the declared digest, identity and pending state fixed.
             // JSON null is permitted by the schema but cannot deserialize.
@@ -1397,6 +1467,38 @@ async fn assert_candidate_payload_fingerprints(
                     ({WINDOW_COLUMNS})=(SELECT {WINDOW_COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$4)) WHERE block_hash=$1"))
                     .bind(&candidate.block_hash).bind(&body).bind(&candidate.block_bytes).bind(&window_columns)
                     .execute(&source.pool).await?;
+                ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
+            }
+            // Retry state is evidence where it is clock-independent. Migration
+            // 002 backfills next_attempt_at from clock_timestamp(), so a finite
+            // schedule cannot be compared across a migration and stays
+            // invisible; the count, the last error and the parked sentinel
+            // that keeps a row off the due lane are durable.
+            for (mutation, visible) in [
+                ("attempt_count=1", true),
+                ("attempt_count=7", true),
+                ("last_error='node rejected the block'", true),
+                ("next_attempt_at='infinity'", true),
+                ("next_attempt_at=clock_timestamp()+interval '1 hour'", false),
+                ("next_attempt_at=clock_timestamp()-interval '1 hour'", false),
+                ("claim_token='recovery-claim',claim_instance_id='recovery-owner',claim_expires_at=clock_timestamp()+interval '1 minute'", false),
+                ("updated_at=clock_timestamp()", false),
+            ] {
+                sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET {mutation} WHERE block_hash=$1"))
+                    .bind(&candidate.block_hash).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                if visible {
+                    ensure!(current["records"]["candidates"]["count"] == baseline["records"]["candidates"]["count"]);
+                    ensure!(current["records"]["candidates"]["sha256"] != baseline["records"]["candidates"]["sha256"],
+                        "candidate retry state change was invisible: {mutation}");
+                    let mut unchanged = current;
+                    unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
+                    ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
+                } else {
+                    ensure!(current == baseline, "transient candidate state changed recovery evidence: {mutation}");
+                }
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET attempt_count=0,last_error=NULL,next_attempt_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1")
+                    .bind(&candidate.block_hash).execute(&source.pool).await?;
                 ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
             }
             assert_candidate_balance_fingerprints(&source, &ledger, pg_bin, &candidate).await?;
