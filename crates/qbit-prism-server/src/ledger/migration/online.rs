@@ -27,6 +27,15 @@
 //! anything else: an operator's index under that name is theirs to judge,
 //! as with every other native collision. Until the version is recorded,
 //! every start refuses the database, as for every other required migration.
+//!
+//! The plan those inspections produce is decided before any DDL and is
+//! not trusted past the builds: each takes hours on a large ledger, the
+//! advisory lock orders only runners, and an operator can rename an index
+//! while a build holds its table. So the invalid index a rebuild replaces
+//! and every index the migration drops are looked up again as their step
+//! is reached, and a name that holds something else by then stops the run
+//! before the drop, saying what the run had already built and dropped.
+//! The next start plans afresh from what it finds and keeps that.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -178,7 +187,7 @@ async fn apply(
             LiveRelation::Index {
                 table, definition, ..
             } if table == expected.table && definition == expected.definition => {
-                plan.push(Step::Drop(name, &expected.table));
+                plan.push(Step::Drop(name, expected));
             }
             LiveRelation::Index {
                 table, definition, ..
@@ -192,6 +201,7 @@ async fn apply(
             ),
         }
     }
+    let mut progress = Progress::default();
     for step in plan {
         match step {
             Step::Keep(name) => tracing::info!(
@@ -199,19 +209,40 @@ async fn apply(
                 index = %name,
                 "index already built with the declared definition; keeping it"
             ),
-            Step::Build(name, expected) => build(connection, version, name, expected).await?,
+            Step::Build(name, expected) => {
+                build(connection, version, name, expected).await?;
+                progress.built.push(name);
+            }
             Step::Rebuild(name, expected) => {
+                drop_planned(
+                    connection,
+                    version,
+                    name,
+                    expected,
+                    Planned::InvalidBuild,
+                    &progress,
+                )
+                .await?;
                 tracing::warn!(
                     version,
                     index = %name,
-                    "dropping the invalid index an interrupted build left, then building again"
+                    "dropped the invalid index an interrupted build left; building again"
                 );
-                drop_concurrently(connection, name).await?;
                 build(connection, version, name, expected).await?;
+                progress.built.push(name);
             }
-            Step::Drop(name, table) => {
-                drop_concurrently(connection, name).await?;
-                tracing::info!(version, index = %name, table = %table, "dropped replaced index");
+            Step::Drop(name, expected) => {
+                drop_planned(
+                    connection,
+                    version,
+                    name,
+                    expected,
+                    Planned::Release,
+                    &progress,
+                )
+                .await?;
+                progress.dropped.push(name);
+                tracing::info!(version, index = %name, table = %expected.table, "dropped replaced index");
             }
             Step::Dropped(name) => tracing::info!(version, index = %name, "index already dropped"),
         }
@@ -229,12 +260,14 @@ async fn apply(
     Ok(())
 }
 
-/// One index change of the plan, decided before any DDL.
+/// One index change of the plan, decided before any DDL. The two that drop
+/// something look their target up again when they are reached
+/// (`drop_planned`).
 enum Step<'a> {
     Keep(&'a str),
     Build(&'a str, &'a IndexDefinition),
     Rebuild(&'a str, &'a IndexDefinition),
-    Drop(&'a str, &'a str),
+    Drop(&'a str, &'a IndexDefinition),
     Dropped(&'a str),
 }
 
@@ -342,6 +375,101 @@ fn concurrent_create(definition: &str) -> Result<String> {
     bail!("index definition does not start with CREATE INDEX: {definition}")
 }
 
+/// What the plan saw under a name it is about to drop.
+#[derive(Clone, Copy)]
+enum Planned {
+    /// The release's index the migration replaces, whatever its validity.
+    Release,
+    /// The migration's own definition, left invalid by an interrupted
+    /// build and dropped to build again.
+    InvalidBuild,
+}
+
+/// What this run has changed so far. A refusal after the plan was made
+/// says so: unlike the preflight refusals, "nothing was changed" is only
+/// true until the first build or drop.
+#[derive(Default)]
+struct Progress<'a> {
+    built: Vec<&'a str>,
+    dropped: Vec<&'a str>,
+}
+
+impl Progress<'_> {
+    /// The sentence for a refusal, which must stay true of the next run: a
+    /// built index is valid with the declared definition, so it is kept,
+    /// and a dropped one is absent, so it is skipped.
+    fn describe(&self) -> String {
+        let built = self.built.join(", ");
+        let dropped = self.dropped.join(", ");
+        match (self.built.is_empty(), self.dropped.is_empty()) {
+            (true, true) => "Nothing was changed by it.".to_owned(),
+            (false, true) => {
+                format!("It had already built {built}; what it built stays, and the next run keeps it.")
+            }
+            (true, false) => format!(
+                "It had already dropped {dropped}; what it dropped stays dropped, and the next run skips it."
+            ),
+            (false, false) => format!(
+                "It had already built {built} and dropped {dropped}; both stay as they are, and the next run keeps what was built and skips what was dropped."
+            ),
+        }
+    }
+}
+
+/// Drop the index the plan found under `name`, after looking the name up
+/// again. The plan was decided before any DDL, and the builds between it
+/// and this step take hours on a large ledger, in which nothing stops an
+/// operator's DDL on the name: the advisory lock orders only runners, an
+/// index is renamed under a lock on itself alone while a build holds its
+/// table, and `DROP INDEX CONCURRENTLY` resolves the name when it runs.
+/// The look-up and the drop are still two statements, since CONCURRENTLY
+/// refuses a transaction block, so a change that lands between them is
+/// not caught; PostgreSQL offers nothing here to close that, and what the
+/// check leaves open is the round trip between two statements, not the
+/// hours of a build.
+async fn drop_planned(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    expected: &IndexDefinition,
+    planned: Planned,
+    progress: &Progress<'_>,
+) -> Result<()> {
+    let found = match live_relation(connection, name).await? {
+        LiveRelation::Index {
+            valid,
+            definition,
+            table,
+        } if table == expected.table
+            && definition == expected.definition
+            && (!valid || matches!(planned, Planned::Release)) =>
+        {
+            return drop_concurrently(connection, name).await;
+        }
+        LiveRelation::Index {
+            valid,
+            definition,
+            table,
+        } => format!("index {name} on {table} now reads as {definition} (valid: {valid})"),
+        LiveRelation::Other(kind) => format!("a {kind} named {name} now holds the name"),
+        LiveRelation::Absent => format!("index {name} no longer exists"),
+    };
+    let planned = match planned {
+        Planned::Release => format!(
+            "the release's {} on {}",
+            expected.definition, expected.table
+        ),
+        Planned::InvalidBuild => format!(
+            "the invalid {} on {} an interrupted build left",
+            expected.definition, expected.table
+        ),
+    };
+    bail!(
+        "refusing to continue migration {version}: {found}, but when this run planned its changes the name held {planned}. The plan is stale past that change, so this run will not drop anything by that name. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
+        progress.describe()
+    )
+}
+
 async fn drop_concurrently(connection: &mut PgConnection, name: &str) -> Result<()> {
     sqlx::raw_sql(&format!(
         "DROP INDEX CONCURRENTLY {}",
@@ -395,6 +523,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not start with CREATE INDEX"));
+    }
+
+    #[test]
+    fn a_refusal_after_the_plan_says_what_the_run_changed() {
+        let mut progress = Progress::default();
+        assert_eq!(progress.describe(), "Nothing was changed by it.");
+        progress.built.push("a");
+        progress.built.push("b");
+        assert_eq!(
+            progress.describe(),
+            "It had already built a, b; what it built stays, and the next run keeps it."
+        );
+        progress.dropped.push("c");
+        assert_eq!(
+            progress.describe(),
+            "It had already built a, b and dropped c; both stay as they are, and the next run keeps what was built and skips what was dropped."
+        );
+        progress.built.clear();
+        assert_eq!(
+            progress.describe(),
+            "It had already dropped c; what it dropped stays dropped, and the next run skips it."
+        );
     }
 
     #[test]
