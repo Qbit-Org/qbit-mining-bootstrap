@@ -11,36 +11,53 @@ This document does not change `docs/prism-capacity-readiness.md`, which #303
 owns. The raw side reports, artifacts, frontend logs and host samples are kept
 outside the repository, and this document cites them by run id.
 
-## Results in brief
+## What the matrix established
 
-- **Throughput is bounded by the share append, not by the frontends.** At the
-  20k window, every configuration's median `steady_state` rate fell between
-  238 and 304 shares/s against a 500 shares/s target, and the 2,000 shares/s
-  burst achieved no more. Adding frontends did not add throughput. Summed
-  over all frontends, CPU stayed at or below 0.65 cores in every phase. `ORDER_LOCK` held a waiter queue as
-  long as the database pool minus the holder (15, 31 and 63 waiters at 1, 2
-  and 4 frontends), with a mean of 85–94 % of that in `steady_state`. The
-  append takes that one advisory lock, so concurrent appends serialise on it.
-- **Sync replication costs 13–18 %.** The median `steady_state` rate was 290,
-  304 and 288 shares/s async against 238, 251 and 254 shares/s sync, at 1, 2
-  and 4 frontends.
-- **The ceiling holds at five times the window.** At 100k and 1 frontend the
-  rate matched 20k: 285 shares/s async and 238 shares/s sync. Frontend peak RSS
-  rose from about 0.7 GiB to about 2.8 GiB.
-- **100k at 4 frontends did not fit on this host.** The run stopped itself at
-  the memory floor 64 s into `steady_state`.
-- **200k, 400k and 500k are blocked** at startup by PostgreSQL's JSONB
-  container ceiling (#273). At 400k the JSONB refusal comes first. No work is
-  served and no candidate is produced, so the found-block refusal (#265) cannot
-  be observed.
-- **Every run's capacity evidence is refused**, as expected. None
-  acknowledged every offered valid share.
-- **No ACK/commit divergence (#324), unknown-outcome commit or durability
-  finding** occurred in any completed run on this base. The replication premise
-  agreed at entry and after the load in every run.
-- **The dense-cadence block could not be measured on this base.** The harness
-  aborts the D1 dense run before the dense phase (exit 6). See
-  [Dense cadence](#dense-cadence).
+- **No configuration reaches 500 shares/s.**
+  - At the 20k window, every configuration's median `steady_state` rate fell
+    between 238 and 304 shares/s against the 500 shares/s target. Individual
+    runs ranged from 235 to 320 shares/s across three repeats.
+  - The 2,000 shares/s burst achieved no more.
+  - **Adding frontends does not add throughput.** Summed over all frontends,
+    CPU stayed at or below 0.65 cores in every phase.
+  - **`ORDER_LOCK` waiters saturate every pool.** The waiter queue peaked at
+    the frontends' total database connections minus the holder: 15, 31 and 63
+    at 1, 2 and 4 frontends. It averaged 85–94 % of that in `steady_state`.
+    The share append takes that one advisory lock, so appends serialise on it.
+- **Synchronous replication costs 12–18 % against asynchronous, consistently.**
+  - Median `steady_state` was 290, 304 and 288 shares/s async against 238, 251
+    and 254 shares/s sync, at 1, 2 and 4 frontends. That is 18 %, 17 % and
+    12 %.
+  - Every sync run was slower than every async run at the same frontend count.
+- **200k, 400k and 500k are all refused by the JSONB ceiling (#273)** at
+  startup, with the verbatim refusal in [Blocked sizes](#blocked-sizes).
+  - **At 400k**, #265 (found-block candidates) would refuse next, but it cannot
+    be reached. See [The 400k result](#the-400k-result), which is what #271
+    stays open for.
+- **100k at 4 frontends does not fit on this host.**
+  - The async attempt stopped itself at the harness memory floor, at
+    `MemAvailable` 6,092 MiB against the 6,144 MiB floor, 64 s into
+    `steady_state`.
+  - The sync attempt was terminated from outside about 3 minutes in, with
+    `MemAvailable` falling past 7,303 MiB.
+  - At 1 frontend, 100k fits and the ceiling holds at five times the window:
+    285 shares/s async and 238 shares/s sync.
+- **ACK latency now counts acknowledgements only.**
+  - The median `slow_database` ACK p50 is 12.2–15.3 s on this base. On
+    `2e94136c` the same column read 0.4 ms, because refusal response times were
+    blended into acknowledgement latency.
+  - Those earlier figures are kept under `base-2e94136` for comparison. The
+    harness fix is why they moved; see
+    [Comparison with the earlier harness bases](#comparison-with-the-earlier-harness-bases).
+- **Repeats.** The 20k tables have three repeats per configuration. The 100k
+  tables have two, which cannot identify an outlier.
+- **Other results.**
+  - Every run's capacity evidence is refused, as expected.
+  - No completed run on this base recorded an ACK/commit divergence (#324), an
+    unknown-outcome commit or a durability finding.
+  - The replication premise agreed at entry and after the load in every run.
+- **The dense-cadence block was dropped.** At D1 the harness correctly refuses
+  to start the dense phase; see [Dense cadence](#dense-cadence).
 
 ## Host
 
@@ -92,8 +109,9 @@ run includes the run's own PostgreSQL, frontends and client.
   maximum in parentheses.
 - **Two repeats cannot identify an outlier.** A two-run cell's "median" is the
   mean of the two runs, and its range is just those two runs. It carries less
-  confidence than a three-run cell. At 20k the spread between repeats of one
-  configuration reached 14.5 % on two configurations.
+  confidence than a three-run cell. At 20k, the `steady_state` rate's spread
+  across three repeats reached 14.4–14.5 % of the median at 1 and 4
+  frontends, async.
 - **Units.**
   - Rates are shares per second.
   - ACK latency is measured on the client, from writing the submit to reading
@@ -351,27 +369,47 @@ fell to 6092 MiB, below the 6144 MiB floor`, and withheld the artifact.
   6,462 ms. The partial `steady_state` achieved 266 shares/s at ACK p99
   9,385 ms.
 
-The remaining async and sync repeats at 4 frontends were not attempted. See
-[Open items](#open-items).
+`w11-100k-fe4-sync-r1` exited 6 after 177 s, with no side report.
+
+- **How it ended.** The harness logged `qbit-prism-load: terminated; tearing
+  down`, meaning it received SIGTERM from outside. The driver's own ceiling
+  was 2,400 s, so the driver did not send it. The coordinator's external
+  memory guard sends exactly this signal below 25 % free memory, but the side
+  report was not written, so this document cannot confirm the sender.
+- **Memory.** Before the run, `MemAvailable` was 19,871 MiB and the 1-minute
+  load average 0.51. In the last minute, 10 s samples went from 11,658 MiB
+  through 9,652, 8,819, 7,911 and 7,925 to 7,303 MiB; the signal arrived
+  before the next sample.
+
+No further 4-frontend repeat was attempted. A configuration that does not fit
+needs no second demonstration.
 
 ## Dense cadence
 
-**No dense-cadence number is available on this base.**
+**The dense-cadence block was dropped.** It is the input to #291's soak, not
+a #271 gate, and it was not worth more host time. It was not retried at D1 or
+at the calibrated sustained rate. The one attempt produced a finding: **at D1
+on this host, the `dense_cadence` phase cannot start.** The harness refuses to
+publish numbers under a delay the phase does not declare, and that refusal is
+correct behaviour.
 
 `w11-dense20k-fe1-async-r1` (D1 with `--cadence dense --scheduled-blocks 15`,
-1 frontend, async, 20k window) exited 6. It completed every D1 phase, but the
-harness aborted before the dense phase with this message:
+1 frontend, async, 20k window) exited 6. It completed every D1 phase, then the
+harness aborted before the dense phase with this reason:
 
 ```text
 1201 submit(s) offered before the dense_cadence phase were still outstanding 25.0 s later, so its 0 ms delay could not be applied without them finishing under it
 ```
 
-The harness changes the proxy delay only once the previous phase's submits
-have settled, and aborts the run if they have not settled within the 25 s
-drain limit. The dense phase follows `slow_database`, whose accepted-share
-ACK p99 on this host was 28–34 s in 17 of the 18 runs at 20k (19 s in the
-other). So at 2,000 sessions the settle limit expires
-with submits still in flight.
+The dense phase runs at 0 ms database delay and follows `slow_database`,
+which runs at 10 ms. The harness changes the proxy delay only once every submit
+offered under the previous delay has settled. Otherwise those submits would
+finish under the new delay while keeping the old phase's stamp. If they have
+not settled within the 25 s phase-boundary limit, the harness aborts the run.
+
+`slow_database` left about 1,200 submits outstanding, and they did not drain
+inside that limit. Its accepted-share ACK p99 on this host was 28–34 s in 17
+of the 18 runs at 20k, and 19 s in the other.
 
 The same condition appears at the end of the ordinary runs. In 15 of the 20
 runs at 20k (including the calibration probes), submits were still
@@ -385,8 +423,8 @@ Everything else in the aborted run was clean:
 - there was no divergence, no durability finding and no teardown tail;
 - the D1 phases matched the 20k matrix (steady 319 shares/s at p99 8,256 ms).
 
-The remaining dense runs, 1, 2 and 4 frontends at two repeats plus the short
-run at the calibrated 200 shares/s, are held pending a coordinator decision.
+The dense runs at 2 and 4 frontends, the repeats, and the short-plan run at
+the calibrated 200 shares/s were not run.
 
 ## Blocked sizes
 
@@ -399,17 +437,48 @@ artifact.
 | Size | Run id | Exit | Refusal text (frontend log, verbatim) | Matches | Lowest MemAvailable MiB | Unblocked by |
 |---|---|---|---|---|---|---|
 | 200k | w11-200k-fe1-async-r1 | 3 | `template refresh deferred error=error returned from database: total size of jsonb object elements exceeds the maximum of 268435455 bytes` | 8 | 13,124 | #273 |
-| 400k | w11-400k-fe1-async-r1 | 3 | `template refresh deferred error=error returned from database: total size of jsonb object elements exceeds the maximum of 268435455 bytes` | 3 | 9,517 | #273, then #265 |
-| 500k | w11-500k-fe1-async-r1 | 3 | `template refresh deferred error=error returned from database: total size of jsonb array elements exceeds the maximum of 268435455 bytes` | 1 | 6,575 | #273, then #265 |
+| 400k | w11-400k-fe1-async-r1 | 3 | `template refresh deferred error=error returned from database: total size of jsonb object elements exceeds the maximum of 268435455 bytes` | 3 | 9,517 | #273; then #265 for found-block candidates |
+| 500k | w11-500k-fe1-async-r1 | 3 | `template refresh deferred error=error returned from database: total size of jsonb array elements exceeds the maximum of 268435455 bytes` | 1 | 6,575 | #273; #265 refuses candidates from 400k |
 
-**The found-block refusal (#265) is not observable at 400k while #273 stands.**
-The JSONB ceiling refuses the template refresh first. No frontend serves work,
-so no found-block candidate is ever produced, and nothing reaches the landing
-path where #265 refuses. The 400k result is therefore "blocked by #273". It is
-not yet evidence about #265.
+At 500k the refusal names `jsonb array elements`; at 200k and 400k it names
+`jsonb object elements`. At 500k, seeding took the host to 6,575 MiB
+`MemAvailable`, which is 431 MiB above the harness floor and about 700 MiB
+above the external memory guard.
 
-At 500k, seeding took the host to 6,575 MiB `MemAvailable`. That is 431 MiB
-above the harness floor and about 700 MiB above the external memory guard.
+## The 400k result
+
+**#271 stays open for this result.**
+
+- **Run.** `w11-400k-fe1-async-r1`: 1 frontend, async, D1, 2,000 sessions,
+  `--window-shares 400000`. It exited 3 (blocked) after 156 s.
+- **Startup.** The frontend never became ready: `load-fe-0 did not become
+  ready within 120s (listening=true)`.
+- **Refusal.** The frontend log shows the refusal three times, verbatim:
+
+  ```text
+  template refresh deferred error=error returned from database: total size of jsonb object elements exceeds the maximum of 268435455 bytes
+  ```
+
+- **Harness classification.** It recorded `blocked.blocked: true`, found only
+  the `jsonb_ceiling` refusal kind, and wrote a startup-only side report and
+  no artifact.
+- **Memory.** The lowest `MemAvailable` sampled was 9,517 MiB. The load
+  average was 0.98 before the run.
+
+Two issues stand between this size and a measurement:
+
+1. **#273, the JSONB ceiling.** Persisting the prepared job exceeds
+   PostgreSQL's 268,435,455-byte JSONB container limit. The template refresh
+   is deferred, so no frontend ever serves work.
+2. **#265, found-block candidates at 400k.** The audit bundle written at
+   landing is refused at this window. **That refusal was not observed here,
+   and cannot be while #273 stands.** No work is served, so no share or
+   candidate is produced and nothing reaches the landing path. This run is
+   therefore evidence of the #273 block only; it is not yet evidence about
+   #265.
+
+Once #273 lands, the same command should be re-run. It is expected to get
+past startup and reach the #265 refusal. If it does not, the plan changes.
 
 ## Capacity-evidence verdicts
 
@@ -452,6 +521,7 @@ server also changed between those bases:
 |---|---|---|---|
 | Harness ACK latency | accepted and refused shares blended | accepted only (H3) | accepted only |
 | Proxy delay changed only after the previous phase settled (H2) | no | yes | yes |
+| slow_database ACK p50 ms, median per configuration | 0.4 in every configuration | 11,219–20,980 | 12,204–15,346 |
 | burst ACK p50 ms, median per configuration | 0.5–5,118 | 5,695–6,946 | 6,422–7,910 |
 | reconnect ACK p99 ms, median per configuration | 18,553–29,753 | 6,083–13,930 | 7,230–9,306 |
 | slow_database achieved /s, median per configuration | 2.9–31.9 | 3.0–5.1 | 2.8–5.9 |
@@ -460,10 +530,17 @@ server also changed between those bases:
 
 What the table shows:
 
-- **Burst ACK p50.** On `2e94136c`, sub-millisecond refusals dragged the
-  burst ACK p50 down to about 1 ms in five of six configurations. Once only
-  accepted shares are counted (H3), it is 6–8 s, which is what the accepted
-  shares actually waited.
+- **ACK p50 under refusals.** On `2e94136c` the harness counted refusal
+  response times as acknowledgement latency.
+  - Refusals return in about 0.5 ms and outnumber acknowledgements in
+    `slow_database`, so that phase's ACK p50 read 0.4 ms in every
+    configuration.
+  - The burst ACK p50 read about 1 ms in five of six configurations.
+  - Once the p50 counts acknowledgements only (H3), `slow_database` is 12–15 s
+    and burst is 6–8 s, which is what the accepted shares actually waited.
+
+  The change is the harness fix, not a change in the server's behaviour. The
+  blended figures stay under `base-2e94136` for this comparison.
 - **Reconnect and slow_database.** The high reconnect ACK p99 and the higher
   `slow_database` rates on `2e94136c` are consistent with submits from the
   previous phase finishing under the next phase's stamp. That is what H2
@@ -555,8 +632,8 @@ target/release/qbit-prism-load \
 | `w11-premise-fe2-{async,sync}-short50` | `--frontends 2 --sessions 200 --window-shares 20000 --replication {async,sync} --plan short --rate 50 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
 | `w11-20k-fe{1,2,4}-{async,sync}-r{1,2,3}` | `--frontends {1,2,4} --sessions 2000 --window-shares 20000 --replication {async,sync} --plan d1 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
 | `w11-cal-fe2-async-short-r{200,100}` | `--frontends 2 --sessions 2000 --window-shares 20000 --replication async --plan short --rate {200,100} --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
-| `w11-100k-fe{1,4}-{async,sync}-r{1,2}` | `--frontends {1,4} --sessions 2000 --window-shares 100000 --replication {async,sync} --plan d1 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
-| `w11-dense20k-fe{1,2,4}-async-r{1,2}` | `--frontends {1,2,4} --sessions 2000 --window-shares 20000 --replication async --plan d1 --cadence dense --scheduled-blocks 15 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
+| `w11-100k-fe1-{async,sync}-r{1,2}`, `w11-100k-fe4-{async,sync}-r1` | `--frontends {1,4} --sessions 2000 --window-shares 100000 --replication {async,sync} --plan d1 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
+| `w11-dense20k-fe1-async-r1` | `--frontends 1 --sessions 2000 --window-shares 20000 --replication async --plan d1 --cadence dense --scheduled-blocks 15 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
 | `w11-{200,400,500}k-fe1-async-r1` | `--frontends 1 --sessions 2000 --window-shares {200000,400000,500000} --replication async --plan d1 --forecast-peak-shares-per-second 2000 --ack-p99-limit-ms 1000 --min-mem-available-mib 6144` |
 
 Runs were driven one at a time, detached from any interactive session, with a
@@ -573,11 +650,11 @@ sizes). The harness exit code is the run's result:
 | 7 | harness-bug rejections |
 | 8 | contradicted premise |
 
-## Open items
+## What was not measured
 
-- **Dense cadence.** The D1 dense runs abort with exit 6 on this base, as
-  described under [Dense cadence](#dense-cadence). A decision is needed
-  between two paths: change the harness, or measure dense cadence without a
-  `slow_database` phase in front of it.
-- **100k at 4 frontends.** One attempt did not fit. The remaining three
-  attempts were not run.
+- **Dense cadence.** The block was dropped after its first run showed the
+  dense phase cannot start at D1 on this host.
+- **100k at 4 frontends.** The configuration does not fit on this host, so
+  no repeat was attempted.
+- **100k at 2 frontends, and a third 100k repeat.** Both were cut from the
+  plan; the 20k block settles the frontend dimension.
