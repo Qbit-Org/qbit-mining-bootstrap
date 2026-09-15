@@ -23,6 +23,19 @@ mod highdiff_tests;
 #[path = "support/live_ctv_cpfp.rs"]
 mod cpfp_tests;
 
+/// Each fixture starts a regtest `qbitd` and two servers, and a server binds
+/// its listeners only after coordinator startup: the schema migrations, which
+/// the second server of a fixture waits for under the migrations table lock,
+/// and the node handshake. libtest ran two fixtures at once on the two-vCPU CI
+/// runner, and the readiness wait below, a 30-second setup budget rather than
+/// behaviour under test, timed out four times on one branch while the sibling
+/// fixture mined and restarted its node; the failover test's 20-second
+/// reconnection wait timed out twice more under the same load, and every rerun
+/// passed. The tests of this binary therefore run one at a time, as the ledger
+/// suites do: the guard lives in the fixture, so the next one opens only after
+/// cleanup has stopped every process.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Process {
     child: Child,
     log: PathBuf,
@@ -65,6 +78,8 @@ struct Fixture {
     client: reqwest::Client,
     address: String,
     ctv: bool,
+    /// Declared last, so it is released after the processes and pools above.
+    _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
 fn free_port() -> Result<u16> {
@@ -98,6 +113,7 @@ impl Fixture {
         let Some((binary, database)) = gate::qbitd_and_database_url(gate::site!())? else {
             return Ok(None);
         };
+        let serial = SERIAL.lock().await;
         let directory = tempfile::tempdir()?;
         let admin = PgPool::connect(&database).await?;
         let schema = format!("prism_live_{}", Uuid::new_v4().simple());
@@ -146,6 +162,7 @@ impl Fixture {
                 .build()?,
             address: String::new(),
             ctv,
+            _serial: serial,
         };
         until("qbit RPC", 30, || async {
             Ok(fixture
@@ -170,16 +187,26 @@ impl Fixture {
             fixture.servers.push(process);
         }
         for index in 0..2 {
-            until("PRISM HTTP readiness", 30, || async {
-                Ok(fixture
-                    .client
-                    .get(format!("http://127.0.0.1:{}/healthz", fixture.api[index]))
-                    .send()
-                    .await?
-                    .status()
-                    .is_success())
-            })
-            .await?;
+            let ready = until(
+                &format!("PRISM HTTP readiness of server {index}"),
+                30,
+                || async {
+                    Ok(fixture
+                        .client
+                        .get(format!("http://127.0.0.1:{}/healthz", fixture.api[index]))
+                        .send()
+                        .await?
+                        .status()
+                        .is_success())
+                },
+            )
+            .await;
+            if let Err(error) = ready {
+                // The server logs say whether it was still starting or had
+                // already exited, which the timeout alone cannot.
+                eprintln!("{}", fixture.diagnostics());
+                return Err(error);
+            }
         }
         Ok(Some(fixture))
     }
