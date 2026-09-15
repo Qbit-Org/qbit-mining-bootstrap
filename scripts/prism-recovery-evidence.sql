@@ -272,10 +272,14 @@ SELECT jsonb_build_object('kind', 'payouts', 'row', to_jsonb(p))
 FROM qbit_pool_payout_entries p ORDER BY payout_entry_seq;
 -- The claim lane serves attempt_count = 0 first and backs a retry off by the
 -- count, so a rewound count reorders and hastens pending work; the count and
--- last_error are legacy columns carried verbatim. Claim ownership is not
--- evidence, and neither is the clock-derived schedule: migration 002
--- backfills next_attempt_at from clock_timestamp(), so only the parked
--- sentinel (infinity) is durable and clock-independent.
+-- last_error are legacy columns carried verbatim. So is created_at: the fresh
+-- lane serves the newest pending candidate first and the retry lane breaks
+-- ties on it, so a restore that rewinds or swaps creation order submits a
+-- different competing block first. It is set once at enqueue and never
+-- rewritten; render it in UTC so the digest ignores the session TimeZone.
+-- Claim ownership is not evidence, and neither is the clock-derived schedule:
+-- migration 002 backfills next_attempt_at from clock_timestamp(), so only the
+-- parked sentinel (infinity) is durable and clock-independent.
 SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'block_hash', block_hash, 'share_id', share_id,
     'candidate_sha256', candidate_sha256, 'state', state,
@@ -289,6 +293,7 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'window_snapshot_sha256', to_jsonb(o)->'window_snapshot_sha256',
     'storage_version', COALESCE(to_jsonb(o)->'storage_version', '1'::jsonb),
     'attempt_count', attempt_count, 'last_error', last_error,
+    'created_at', to_jsonb(created_at AT TIME ZONE 'UTC'),
     'parked', CASE WHEN to_jsonb(o)->'next_attempt_at' = '"infinity"'::jsonb THEN true END))
 FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
 -- Pending candidates retain the as-issued balances needed for replay.
