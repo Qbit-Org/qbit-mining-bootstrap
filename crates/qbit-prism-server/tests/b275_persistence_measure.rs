@@ -12,8 +12,8 @@ async fn small_public_delivery_measurement() -> Result<()> {
         return Ok(());
     };
     for frontends in [1, 2] {
-        support::run(&raw, frontends, |fixture| {
-            support::delivery(fixture, 8).boxed_local()
+        support::run(&raw, frontends, |fixture, deadline| {
+            support::delivery(fixture, 8, deadline).boxed_local()
         })
         .await?;
     }
@@ -25,7 +25,7 @@ async fn three_second_landing_lock_baseline() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    support::run(&raw, 1, |fixture| {
+    support::run(&raw, 1, |fixture, _| {
         support::landing_lock(fixture).boxed_local()
     })
     .await
@@ -36,8 +36,19 @@ async fn original_revision_fence_survives_lock_wait() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    support::run(&raw, 1, |fixture| {
+    support::run(&raw, 1, |fixture, _| {
         support::revision_fence(fixture).boxed_local()
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retried_delivery_is_not_reported_as_failure_free() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    support::run(&raw, 1, |fixture, deadline| {
+        support::retry_attribution(fixture, deadline).boxed_local()
     })
     .await
 }
@@ -48,8 +59,8 @@ async fn measure_2000_sessions_one_and_two_frontends() -> Result<()> {
     let raw = gate::required_database_url(gate::site!())?;
     // Separate schemas and fully closed listeners/pools between topologies.
     for frontends in [1, 2] {
-        support::run(&raw, frontends, |fixture| {
-            support::delivery(fixture, 2_000).boxed_local()
+        support::run(&raw, frontends, |fixture, deadline| {
+            support::delivery(fixture, 2_000, deadline).boxed_local()
         })
         .await?;
     }

@@ -1,20 +1,22 @@
 use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     coordinator::Coordinator,
-    stratum::{run_listener, ConnectionLimit, StratumConfig},
+    stratum::{run_listener, ConnectionLimit, StratumConfig, StratumStats},
 };
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream},
-    sync::watch,
+    sync::{watch, Semaphore},
     task::JoinHandle,
     time::{timeout, timeout_at, Instant},
 };
 
 pub struct Listener {
     pub address: SocketAddr,
+    pub stats: Arc<StratumStats>,
+    pub settings: Value,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
 }
@@ -26,6 +28,9 @@ impl Listener {
         let (shutdown, receiver) = watch::channel(false);
         let config = StratumConfig {
             connection_limit: ConnectionLimit::new(2_000),
+            initial_job_limit: Arc::new(Semaphore::new(128)),
+            initial_job_timeout_seconds: 30.0,
+            write_timeout_seconds: 20.0,
             job_retention_seconds: 300.0,
             vardiff: qbit_prism_server::vardiff::VardiffConfig {
                 enabled: false,
@@ -33,6 +38,15 @@ impl Listener {
             },
             ..Default::default()
         };
+        let stats = config.stats.clone();
+        let settings = json!({
+            "connection_limit":config.connection_limit.capacity(),
+            "job_build_admission_permits":config.initial_job_limit.available_permits(),
+            "initial_job_timeout_seconds_per_phase":config.initial_job_timeout_seconds,
+            "write_timeout_seconds":config.write_timeout_seconds,
+            "job_retention_seconds":config.job_retention_seconds,
+            "vardiff_enabled":config.vardiff.enabled
+        });
         let task = tokio::spawn(run_listener(
             listener,
             config,
@@ -43,6 +57,8 @@ impl Listener {
         ));
         Ok(Self {
             address,
+            stats,
+            settings,
             shutdown,
             task,
         })
