@@ -43,7 +43,7 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +55,25 @@ use tokio::task::{JoinHandle, JoinSet};
 /// Start of the NOTICE message a fixture trigger raises:
 /// `prism-execution-marker <table> <INSERT|UPDATE|DELETE>`.
 pub const MARKER_PREFIX: &str = "prism-execution-marker";
+/// AFTER ROW notices installed by the compact-runtime measurement fixture.
+pub const JSONB_WRITE_PREFIX: &str = "prism-jsonb-write ";
+
+/// Observed row mutations, including unchanged JSONB values carried by UPDATE.
+/// These are server executions, not proof of a subsequent transaction commit.
+#[derive(Clone, Debug, Default)]
+pub struct JsonbWrites {
+    pub rows: u64,
+    pub values: u64,
+    pub max_uncompressed_bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonbWriteNotice {
+    table: String,
+    operation: String,
+    values: BTreeMap<String, u64>,
+}
 
 const SSL_REQUEST: u32 = 80_877_103;
 const GSSENC_REQUEST: u32 = 80_877_104;
@@ -99,6 +118,11 @@ pub struct Execution {
     pub sql: String,
     pub markers: Vec<Marker>,
     pub outcome: Outcome,
+    /// Actual DataRow frames, counted without retaining their payloads.
+    pub rows_received: u64,
+    pub jsonb_writes: BTreeMap<(String, String), JsonbWrites>,
+    select_rows: Option<u64>,
+    ready: bool,
 }
 
 impl Execution {
@@ -136,6 +160,26 @@ impl Execution {
 
     pub fn is_commit(&self) -> bool {
         self.completion() == Some("COMMIT")
+    }
+
+    /// Simple-query batches can produce several completions; only their final
+    /// ReadyForQuery proves the remainder of the batch is no longer pending.
+    pub fn complete_response(&self) -> bool {
+        self.delivered() && (self.protocol == Protocol::Extended || self.ready)
+    }
+
+    /// A successfully completed SELECT's actual rows, including measured zero.
+    /// Partial, failed, lost-response and mixed-result observations are errors.
+    pub fn returned_rows(&self) -> Result<u64> {
+        ensure!(self.complete_response(), "SELECT response is incomplete");
+        let reported = self
+            .select_rows
+            .context("execution has no SELECT completion")?;
+        ensure!(
+            reported == self.rows_received,
+            "SELECT completion differs from observed DataRow count"
+        );
+        Ok(self.rows_received)
     }
 }
 
@@ -226,6 +270,7 @@ pub struct ExecutionProxy {
     /// Taken by [`Self::finish`], so a shared proxy is finished once.
     accept: Mutex<Option<JoinHandle<Result<()>>>>,
     tasks: Arc<Mutex<JoinSet<Result<()>>>>,
+    failure: Mutex<Option<String>>,
 }
 
 impl ExecutionProxy {
@@ -260,6 +305,7 @@ impl ExecutionProxy {
             shared,
             accept: Mutex::new(Some(accept)),
             tasks,
+            failure: Mutex::default(),
         })
     }
 
@@ -333,9 +379,16 @@ impl ExecutionProxy {
 
     /// Surface any connection task that ended with an error or a panic.
     pub fn check(&self) -> Result<()> {
+        let mut failure = self.failure.lock().expect("proxy failure");
+        if let Some(error) = failure.as_ref() {
+            bail!("proxy observation previously failed: {error}");
+        }
         let mut tasks = self.tasks.lock().expect("proxy task registry");
         while let Some(joined) = tasks.try_join_next() {
-            settle(joined)?;
+            if let Err(error) = settle(joined) {
+                *failure = Some(format!("{error:#}"));
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -549,6 +602,10 @@ fn record(
             sql,
             markers: Vec::new(),
             outcome: Outcome::Pending,
+            rows_received: 0,
+            jsonb_writes: BTreeMap::new(),
+            select_rows: None,
+            ready: false,
         });
         state.executions.len() - 1
     };
@@ -641,9 +698,16 @@ async fn pump_server(
             b'C' => {
                 let mut at = 0;
                 let tag = text(cstring(&body, &mut at)?);
-                complete(&shared, &connection, id, tag)
+                complete(&shared, &connection, id, tag)?
             }
-            b'I' => complete(&shared, &connection, id, String::new()),
+            b'I' => complete(&shared, &connection, id, String::new())?,
+            b'D' => {
+                let index = front(&connection).context("DataRow without an observed execution")?;
+                let mut state = shared.state.lock().expect("proxy state");
+                let count = &mut state.executions[index].rows_received;
+                *count = count.checked_add(1).context("DataRow counter overflow")?;
+                Action::Forward
+            }
             b'1' => {
                 connection
                     .lock()
@@ -659,7 +723,7 @@ async fn pump_server(
             }
             b'N' => {
                 let (_, message) = fields(&body)?;
-                notice(&shared, &connection, &message);
+                notice(&shared, &connection, &message)?;
                 Action::Forward
             }
             b'Z' => {
@@ -711,9 +775,14 @@ fn pop(connection: &Mutex<Connection>) {
         .pop_front();
 }
 
-fn complete(shared: &Shared, connection: &Mutex<Connection>, id: u64, tag: String) -> Action {
+fn complete(
+    shared: &Shared,
+    connection: &Mutex<Connection>,
+    id: u64,
+    tag: String,
+) -> Result<Action> {
     let Some(index) = front(connection) else {
-        return Action::Forward;
+        return Ok(Action::Forward);
     };
     let mut state = shared.state.lock().expect("proxy state");
     let State {
@@ -724,6 +793,16 @@ fn complete(shared: &Shared, connection: &Mutex<Connection>, id: u64, tag: Strin
         fired,
     } = &mut *state;
     let execution = &mut executions[index];
+    if let Some(count) = tag.strip_prefix("SELECT ") {
+        let count: u64 = count.parse().context("invalid SELECT completion count")?;
+        execution.select_rows = Some(
+            execution
+                .select_rows
+                .unwrap_or(0)
+                .checked_add(count)
+                .context("SELECT completion counter overflow")?,
+        );
+    }
     let protocol = execution.protocol;
     let mut sever = false;
     if let Some(fault) = plan.as_ref() {
@@ -749,9 +828,9 @@ fn complete(shared: &Shared, connection: &Mutex<Connection>, id: u64, tag: Strin
         pop(connection);
     }
     if sever {
-        Action::Sever
+        Ok(Action::Sever)
     } else {
-        Action::Forward
+        Ok(Action::Forward)
     }
 }
 
@@ -790,16 +869,44 @@ fn fail(shared: &Shared, connection: &Mutex<Connection>, id: u64, code: String, 
     });
 }
 
-fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) {
+fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) -> Result<()> {
+    if let Some(encoded) = message.strip_prefix(JSONB_WRITE_PREFIX) {
+        let notice: JsonbWriteNotice =
+            serde_json::from_str(encoded).context("invalid JSONB write observation")?;
+        ensure!(
+            !notice.table.is_empty()
+                && matches!(notice.operation.as_str(), "INSERT" | "UPDATE")
+                && notice.values.values().all(|bytes| *bytes > 0),
+            "invalid JSONB write measurement"
+        );
+        let index = front(connection).context("JSONB write without an observed execution")?;
+        let mut state = shared.state.lock().expect("proxy state");
+        let summary = state.executions[index]
+            .jsonb_writes
+            .entry((notice.table, notice.operation))
+            .or_default();
+        summary.rows = summary
+            .rows
+            .checked_add(1)
+            .context("JSONB row counter overflow")?;
+        summary.values = summary
+            .values
+            .checked_add(notice.values.len().try_into()?)
+            .context("JSONB value counter overflow")?;
+        summary.max_uncompressed_bytes = summary
+            .max_uncompressed_bytes
+            .max(notice.values.values().copied().max().unwrap_or(0));
+        return Ok(());
+    }
     let Some(rest) = message.strip_prefix(MARKER_PREFIX) else {
-        return;
+        return Ok(());
     };
     let mut words = rest.split_whitespace();
     let (Some(table), Some(op)) = (words.next(), words.next()) else {
-        return;
+        return Ok(());
     };
     let Some(index) = front(connection) else {
-        return;
+        return Ok(());
     };
     shared.state.lock().expect("proxy state").executions[index]
         .markers
@@ -807,6 +914,7 @@ fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) {
             table: table.to_owned(),
             op: op.to_owned(),
         });
+    Ok(())
 }
 
 fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Option<u8>) {
@@ -815,6 +923,10 @@ fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Optio
         // skipped by the server after an earlier error in the same batch; a
         // skipped execution stays `Pending` and nothing later settles it.
         let mut state = connection.lock().expect("proxy connection");
+        let mut observations = shared.state.lock().expect("proxy state");
+        for index in &state.inflight {
+            observations.executions[*index].ready = true;
+        }
         state.parses.clear();
         state.inflight.clear();
     }
