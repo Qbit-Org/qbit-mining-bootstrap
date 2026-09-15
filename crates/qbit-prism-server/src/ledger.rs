@@ -37,8 +37,8 @@ pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInsta
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
 pub use jobs::{
-    BlobPruneCursor, CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave,
-    JobPruneResult, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
+    BlobPruneCursor, BlobPruneResult, CompactDependency, CompactPrepared, CompactRepair,
+    IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
     StoredCompactPrepared,
 };
 mod migration;

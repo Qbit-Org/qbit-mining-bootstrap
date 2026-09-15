@@ -1,6 +1,6 @@
 //! Share the compact repair fixture, including its disposable schema and locks.
 use super::*;
-use qbit_prism_server::ledger::{BlobPruneCursor, Candidate, JobPruneResult};
+use qbit_prism_server::ledger::{BlobPruneCursor, Candidate};
 use tokio::time::Instant;
 
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -10,10 +10,33 @@ fn deadline_error(error: &anyhow::Error) -> bool {
     text.contains("cleanup deadline elapsed") || text.contains("statement timeout")
 }
 
+// Match the runtime's two independent phases; the blob deadline starts only
+// after expiry commits under its original database statement budget.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct JobPruneResult {
+    jobs: u64,
+    templates: u64,
+    balances: u64,
+}
+
+async fn sweep_ledger(
+    ledger: &Ledger,
+    cursor: &mut BlobPruneCursor,
+    blob_budget: Duration,
+) -> Result<JobPruneResult> {
+    let jobs = ledger.prune_expired_jobs().await?;
+    let blobs = ledger
+        .prune_unreferenced_blobs(cursor, Instant::now() + blob_budget)
+        .await?;
+    Ok(JobPruneResult {
+        jobs,
+        templates: blobs.templates,
+        balances: blobs.balances,
+    })
+}
+
 async fn sweep(db: &Database, cursor: &mut BlobPruneCursor) -> Result<JobPruneResult> {
-    db.ledger
-        .prune_expired_jobs_and_blobs(cursor, Instant::now() + Duration::from_secs(5))
-        .await
+    sweep_ledger(&db.ledger, cursor, Duration::from_secs(5)).await
 }
 
 async fn expire(db: &Database) -> Result<()> {
@@ -196,7 +219,7 @@ async fn collector_waits_for_repair_and_candidate_writers_in_lock_order() -> Res
         let writer_pid = blocked_query(db, pid, "INSERT INTO qbit_prism_jobs").await?;
         let ledger = db.ledger.clone();
         let mut gc = Running(tokio::spawn(async move {
-            ledger.prune_expired_jobs_and_blobs(&mut BlobPruneCursor::default(), Instant::now()+Duration::from_secs(5)).await
+            sweep_ledger(&ledger, &mut BlobPruneCursor::default(), Duration::from_secs(5)).await
         }));
         blocked_query(db, writer_pid, "SELECT pg_advisory_xact_lock").await?;
         gate.rollback().await?;
@@ -211,7 +234,7 @@ async fn collector_waits_for_repair_and_candidate_writers_in_lock_order() -> Res
         expire(db).await?;
         let ledger = db.ledger.clone();
         let mut gc = Running(tokio::spawn(async move {
-            ledger.prune_expired_jobs_and_blobs(&mut BlobPruneCursor::default(), Instant::now()+Duration::from_secs(5)).await
+            sweep_ledger(&ledger, &mut BlobPruneCursor::default(), Duration::from_secs(5)).await
         }));
         blocked_query(db, pid, "SELECT pg_advisory_xact_lock").await?;
         let holds_settlement: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1)").bind(SETTLEMENT_LOCK).fetch_one(&mut *tx).await?;
@@ -225,13 +248,15 @@ async fn collector_waits_for_repair_and_candidate_writers_in_lock_order() -> Res
 }
 
 #[tokio::test]
-async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor() -> Result<()> {
+async fn blob_failure_preserves_committed_expiry_and_rolls_back_blobs_without_cursor_progress(
+) -> Result<()> {
     run(|db| Box::pin(async move {
         seed(db, true).await?;
         expire(db).await?;
-        let before = snapshot(db).await?;
-        // The last deletion fails after expired jobs and templates were
-        // removed inside the transaction. All three must roll back together.
+        let mut after_expiry = snapshot(db).await?;
+        after_expiry[0] = json!([]);
+        // Expiry commits independently. Failure in the last blob DELETE must
+        // roll back both blob deletes without resurrecting expired jobs.
         sqlx::raw_sql("CREATE FUNCTION reject_balance_gc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected unknown failure'; END $$;
             CREATE TRIGGER reject_balance_gc BEFORE DELETE ON qbit_prism_balance_snapshots FOR EACH ROW EXECUTE FUNCTION reject_balance_gc();")
             .execute(&db.ledger.pool).await?;
@@ -239,7 +264,7 @@ async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor(
         let error = sweep(db, &mut cursor).await.unwrap_err();
         ensure!(format!("{error:#}").contains("injected unknown failure"));
         rollback_fence(db).await?;
-        ensure!(snapshot(db).await? == before && cursor == BlobPruneCursor::default());
+        ensure!(snapshot(db).await? == after_expiry && cursor == BlobPruneCursor::default());
         sqlx::raw_sql(&format!("CREATE OR REPLACE FUNCTION reject_balance_gc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({TEST_GATE}); RETURN OLD; END $$;"))
             .execute(&db.ledger.pool).await?;
         let mut gate = db.ledger.pool.begin().await?;
@@ -248,7 +273,7 @@ async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor(
         let ledger = db.ledger.clone();
         let mut gc = Running(tokio::spawn(async move {
             let mut cursor = BlobPruneCursor::default();
-            let result = ledger.prune_expired_jobs_and_blobs(&mut cursor, Instant::now()+Duration::from_millis(700)).await;
+            let result = sweep_ledger(&ledger, &mut cursor, Duration::from_millis(700)).await;
             (result,cursor)
         }));
         blocked_query(db, pid, "DELETE FROM qbit_prism_balance_snapshots").await?;
@@ -259,9 +284,9 @@ async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor(
         // collector's locks without help from the blocked query.
         timeout(Duration::from_secs(1), rollback_fence(db)).await??;
         gate.rollback().await?;
-        ensure!(snapshot(db).await? == before);
+        ensure!(snapshot(db).await? == after_expiry);
         sqlx::query("DROP TRIGGER reject_balance_gc ON qbit_prism_balance_snapshots").execute(&db.ledger.pool).await?;
-        ensure!(sweep(db, &mut BlobPruneCursor::default()).await? == JobPruneResult { jobs: 1, templates: 1, balances: 1 });
+        ensure!(sweep(db, &mut BlobPruneCursor::default()).await? == JobPruneResult { jobs: 0, templates: 1, balances: 1 });
         Ok(())
     })).await
 }
@@ -277,7 +302,7 @@ async fn expiry_selection_rechecks_renewal_after_its_row_lock_wait() -> Result<(
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *renewal).await?;
         let ledger = db.ledger.clone();
         let mut gc = Running(tokio::spawn(async move {
-            ledger.prune_expired_jobs_and_blobs(&mut BlobPruneCursor::default(), Instant::now()+Duration::from_secs(5)).await
+            sweep_ledger(&ledger, &mut BlobPruneCursor::default(), Duration::from_secs(5)).await
         }));
         // The key was selected from the expired committed version. Once this
         // update commits, the DELETE must recheck the newly live row.
@@ -291,27 +316,93 @@ async fn expiry_selection_rechecks_renewal_after_its_row_lock_wait() -> Result<(
 }
 
 #[tokio::test]
-async fn halted_cluster_refuses_cleanup_without_mutation_or_cursor_progress() -> Result<()> {
+async fn slow_expiry_keeps_advisory_locks_free_for_share_ack_and_candidate_enqueue() -> Result<()> {
+    run(|db| Box::pin(async move {
+        let original = seed(db, false).await?;
+        expire(db).await?;
+        // A row-lock wait deterministically models a slow expiry batch without
+        // a large TOAST fixture or assumptions about the machine's I/O speed.
+        let mut row = db.ledger.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM qbit_prism_jobs WHERE job_id='prepared' FOR UPDATE")
+            .execute(&mut *row).await?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *row).await?;
+        let ledger = db.ledger.clone();
+        let mut gc = Running(tokio::spawn(async move {
+            sweep_ledger(&ledger, &mut BlobPruneCursor::default(), Duration::from_millis(700)).await
+        }));
+        blocked_query(db, pid, "DELETE FROM qbit_prism_jobs").await?;
+        // The future blob budget must not cancel expiry or be consumed by it.
+        sleep(Duration::from_millis(800)).await;
+        ensure!(!gc.0.is_finished(), "expiry inherited the blob deadline");
+        let share = qbit_prism::AcceptedShare {
+            share_seq: 0,
+            share_id: "append-during-expiry".into(),
+            miner_id: "miner".into(),
+            order_key: "miner".into(),
+            p2mr_program_hex: "11".repeat(32),
+            share_difficulty: 1,
+            network_difficulty: 100,
+            template_height: 100,
+            job_id: "child".into(),
+            job_issued_at_ms: 1,
+            accepted_at_ms: 0,
+            ntime: 1_800_000_000,
+            credit_policy: None,
+        };
+        let mut pending = candidate(&original);
+        pending.bootstrap_share = Some(qbit_prism::AcceptedShare {
+            share_id: "bootstrap-share".into(),
+            job_id: "bootstrap-job".into(),
+            ..share.clone()
+        });
+        let appended = timeout(Duration::from_secs(1), db.ledger.append(share, Some(pending)))
+            .await.context("slow expiry blocked the share ACK and candidate enqueue")??;
+        ensure!(appended.share.share_id == "append-during-expiry");
+        // Neither advisory lock may be held while expiry holds/waits for row
+        // locks. In particular it cannot acquire SETTLEMENT after a row lock.
+        let mut probe = db.ledger.pool.begin().await?;
+        for lock in [SETTLEMENT_LOCK, ORDER_LOCK] {
+            let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(lock).fetch_one(&mut *probe).await?;
+            ensure!(free, "expiry held advisory lock {lock}");
+        }
+        probe.rollback().await?;
+        // Keep the expiry row blocked through both checks, then let the
+        // independently committed candidate retain its balance blob in GC.
+        ensure!(!gc.0.is_finished());
+        row.rollback().await?;
+        ensure!((&mut gc.0).await?? == JobPruneResult { jobs: 1, templates: 1, balances: 0 });
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM qbit_share_ledger),(SELECT count(*) FROM qbit_block_candidate_outbox WHERE window_prior_balances_sha256 IS NOT NULL)")
+            .fetch_one(&db.ledger.pool).await?;
+        ensure!(counts == (1, 1));
+        Ok(())
+    })).await
+}
+
+#[tokio::test]
+async fn halted_cluster_stops_blob_cleanup_but_expiry_still_commits() -> Result<()> {
     run(|db| {
         Box::pin(async move {
             seed(db, true).await?;
             expire(db).await?;
-            let before = snapshot(db).await?;
+            let mut after_expiry = snapshot(db).await?;
+            after_expiry[0] = json!([]);
             sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='injected halted cluster'")
                 .execute(&db.ledger.pool)
                 .await?;
             let mut cursor = BlobPruneCursor::default();
             let error = sweep(db, &mut cursor).await.unwrap_err();
             ensure!(format!("{error:#}").contains("cluster halted: injected halted cluster"));
-            ensure!(cursor == BlobPruneCursor::default() && snapshot(db).await? == before);
-            // Test-only recovery lets the same cursor retry the unmodified page.
+            ensure!(cursor == BlobPruneCursor::default() && snapshot(db).await? == after_expiry);
+            // Test-only recovery lets the same cursor retry the unchanged blob page.
             sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL")
                 .execute(&db.ledger.pool)
                 .await?;
             ensure!(
                 sweep(db, &mut cursor).await?
                     == JobPruneResult {
-                        jobs: 1,
+                        jobs: 0,
                         templates: 1,
                         balances: 1
                     }
@@ -327,7 +418,8 @@ async fn stricter_database_timeout_survives_failure_and_success() -> Result<()> 
     run(|db| Box::pin(async move {
         seed(db, false).await?;
         expire(db).await?;
-        let before = snapshot(db).await?;
+        let mut after_expiry = snapshot(db).await?;
+        after_expiry[0] = json!([]);
         sqlx::raw_sql("CREATE FUNCTION slow_blob_gc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN OLD; END $$;
             CREATE TRIGGER slow_blob_gc BEFORE DELETE ON qbit_prism_templates FOR EACH ROW EXECUTE FUNCTION slow_blob_gc();")
             .execute(&db.ledger.pool).await?;
@@ -339,11 +431,11 @@ async fn stricter_database_timeout_survives_failure_and_success() -> Result<()> 
         let mut cursor = BlobPruneCursor::default();
         let error = sweep(db, &mut cursor).await.unwrap_err();
         ensure!(format!("{error:#}").contains("statement timeout"));
-        ensure!(cursor == BlobPruneCursor::default() && snapshot(db).await? == before);
+        ensure!(cursor == BlobPruneCursor::default() && snapshot(db).await? == after_expiry);
         let setting: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.ledger.pool).await?;
         ensure!(setting == "50ms", "cleanup changed the configured timeout: {setting}");
         sqlx::query("DROP TRIGGER slow_blob_gc ON qbit_prism_templates").execute(&db.ledger.pool).await?;
-        ensure!(sweep(db, &mut cursor).await? == JobPruneResult { jobs: 1, templates: 1, balances: 1 });
+        ensure!(sweep(db, &mut cursor).await? == JobPruneResult { jobs: 0, templates: 1, balances: 1 });
         let setting: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.ledger.pool).await?;
         ensure!(setting == "50ms");
         drop(held);
@@ -365,10 +457,7 @@ async fn one_deadline_covers_pool_and_both_advisory_waits() -> Result<()> {
             let mut cursor = BlobPruneCursor::default();
             let error = db
                 .ledger
-                .prune_expired_jobs_and_blobs(
-                    &mut cursor,
-                    Instant::now() + Duration::from_millis(100),
-                )
+                .prune_unreferenced_blobs(&mut cursor, Instant::now() + Duration::from_millis(100))
                 .await
                 .unwrap_err();
             ensure!(format!("{error:#}").contains("cleanup deadline elapsed"));
@@ -393,7 +482,7 @@ async fn one_deadline_covers_pool_and_both_advisory_waits() -> Result<()> {
             let ledger = db.ledger.clone();
             let mut gc = Running(tokio::spawn(async move {
                 ledger
-                    .prune_expired_jobs_and_blobs(&mut BlobPruneCursor::default(), deadline)
+                    .prune_unreferenced_blobs(&mut BlobPruneCursor::default(), deadline)
                     .await
             }));
             blocked_query(db, settlement_pid, "SELECT pg_advisory_xact_lock").await?;

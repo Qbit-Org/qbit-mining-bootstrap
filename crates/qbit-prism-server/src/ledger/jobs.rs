@@ -1,7 +1,7 @@
 use super::*;
 
 mod cleanup;
-pub use cleanup::{BlobPruneCursor, JobPruneResult};
+pub use cleanup::{BlobPruneCursor, BlobPruneResult};
 mod compact_issued;
 pub use compact_issued::{CompactDependency, CompactRepair};
 mod prepared;

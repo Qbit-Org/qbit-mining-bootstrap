@@ -13,15 +13,15 @@ pub struct BlobPruneCursor {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct JobPruneResult {
-    pub jobs: u64,
+pub struct BlobPruneResult {
     pub templates: u64,
     pub balances: u64,
 }
 
 impl Ledger {
-    /// Prune at most 4096 expired jobs and inspect at most 256 keys in EACH
-    /// blob table, including when no job expired. Never reads blob payloads.
+    /// Inspect at most 256 keys in EACH blob table, including when no job
+    /// expired. Never reads blob payloads. Run job expiry separately before
+    /// starting this deadline: its larger DELETE must not hold advisory locks.
     ///
     /// Settlement serializes prepared save/renewal/repair; ordering serializes
     /// candidate insertion and its balance blob. Acquire them in that order
@@ -33,71 +33,94 @@ impl Ledger {
     /// One caller-supplied deadline covers acquisition, locks, scans and commit.
     /// Each statement also gets the remaining budget: dropping an SQLx future
     /// queues rollback but does not cancel the in-flight PostgreSQL statement.
-    /// Cancellation rolls back an open transaction. A failed/unknown commit
-    /// leaves cursor progress unchanged; replaying the same page is safe.
-    pub async fn prune_expired_jobs_and_blobs(
+    /// Cancellation rolls back blob deletes, not already committed job expiry.
+    /// A failed/unknown commit leaves cursor progress unchanged; replaying the
+    /// same page is safe.
+    pub async fn prune_unreferenced_blobs(
         &self,
         cursor: &mut BlobPruneCursor,
         deadline: Instant,
-    ) -> Result<JobPruneResult> {
-        let (result, next) = timeout_at(deadline, async {
-            let mut tx = self.begin().await?;
-            statement_deadline(&mut tx, deadline).await?;
-            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-            statement_deadline(&mut tx, deadline).await?;
-            self.lock(&mut tx, ORDER_LOCK).await?;
-            statement_deadline(&mut tx, deadline).await?;
-            writable(&mut tx).await?;
-            statement_deadline(&mut tx, deadline).await?;
-            let jobs = sqlx::query(EXPIRED_JOBS)
-                .execute(&mut *tx).await?.rows_affected();
-
-            // Bound the inspected keys BEFORE reference filtering. OFFSET 0
-            // keeps each existence probe correlated and indexable instead of
-            // allowing an anti-join that scans the complete reference tables.
-            statement_deadline(&mut tx, deadline).await?;
-            let templates: Vec<String> = sqlx::query_scalar(
-                "SELECT template_sha256 FROM qbit_prism_templates WHERE template_sha256 > $1 ORDER BY template_sha256 LIMIT $2",
-            ).bind(&cursor.template).bind(BLOB_PAGE).fetch_all(&mut *tx).await?;
-            statement_deadline(&mut tx, deadline).await?;
-            let balances: Vec<String> = sqlx::query_scalar(
-                "SELECT prior_balances_digest FROM qbit_prism_balance_snapshots WHERE prior_balances_digest > $1 ORDER BY prior_balances_digest LIMIT $2",
-            ).bind(&cursor.balance).bind(BLOB_PAGE).fetch_all(&mut *tx).await?;
-
-            statement_deadline(&mut tx, deadline).await?;
-            let removed_templates = sqlx::query(
-                "DELETE FROM qbit_prism_templates t WHERE t.template_sha256 = ANY($1) AND NOT EXISTS (SELECT 1 FROM qbit_prism_jobs j WHERE j.template_sha256=t.template_sha256 OFFSET 0)",
-            ).bind(&templates).execute(&mut *tx).await?.rows_affected();
-            statement_deadline(&mut tx, deadline).await?;
-            let removed_balances = sqlx::query(
-                "DELETE FROM qbit_prism_balance_snapshots b WHERE b.prior_balances_digest = ANY($1) AND NOT EXISTS (SELECT 1 FROM qbit_prism_jobs j WHERE j.window_prior_balances_sha256=b.prior_balances_digest OFFSET 0) AND NOT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox c WHERE c.window_prior_balances_sha256=b.prior_balances_digest OFFSET 0)",
-            ).bind(&balances).execute(&mut *tx).await?.rows_affected();
-            let next = BlobPruneCursor {
-                template: templates.last().cloned().unwrap_or_default(),
-                balance: balances.last().cloned().unwrap_or_default(),
-            };
-            statement_deadline(&mut tx, deadline).await?;
-            tx.commit().await?;
-            Ok::<_, anyhow::Error>((JobPruneResult {
-                jobs, templates: removed_templates, balances: removed_balances,
-            }, next))
-        }).await.context("job/blob cleanup deadline elapsed")??;
+    ) -> Result<BlobPruneResult> {
+        let (result, next) = timeout_at(deadline, self.sweep_blobs(cursor, deadline))
+            .await
+            .context("blob cleanup deadline elapsed")??;
         *cursor = next;
         Ok(result)
     }
+
+    async fn sweep_blobs(
+        &self,
+        cursor: &BlobPruneCursor,
+        deadline: Instant,
+    ) -> Result<(BlobPruneResult, BlobPruneCursor)> {
+        let mut tx = BlobTransaction {
+            tx: self.begin().await?,
+            deadline,
+        };
+        self.lock(tx.statement().await?, SETTLEMENT_LOCK).await?;
+        self.lock(tx.statement().await?, ORDER_LOCK).await?;
+        writable(tx.statement().await?).await?;
+
+        // Bound the inspected keys BEFORE reference filtering. OFFSET 0
+        // is a planner fence that preserves correlated indexed probes;
+        // PostgreSQL may choose the same bounded plan without this insurance.
+        let templates: Vec<String> = sqlx::query_scalar(
+                "SELECT template_sha256 FROM qbit_prism_templates WHERE template_sha256 > $1 ORDER BY template_sha256 LIMIT $2",
+            ).bind(&cursor.template).bind(BLOB_PAGE).fetch_all(&mut **tx.statement().await?).await?;
+        let balances: Vec<String> = sqlx::query_scalar(
+                "SELECT prior_balances_digest FROM qbit_prism_balance_snapshots WHERE prior_balances_digest > $1 ORDER BY prior_balances_digest LIMIT $2",
+            ).bind(&cursor.balance).bind(BLOB_PAGE).fetch_all(&mut **tx.statement().await?).await?;
+
+        let removed_templates = sqlx::query(
+                "DELETE FROM qbit_prism_templates t WHERE t.template_sha256 = ANY($1) AND NOT EXISTS (SELECT 1 FROM qbit_prism_jobs j WHERE j.template_sha256=t.template_sha256 OFFSET 0)",
+            ).bind(&templates).execute(&mut **tx.statement().await?).await?.rows_affected();
+        let removed_balances = sqlx::query(
+                "DELETE FROM qbit_prism_balance_snapshots b WHERE b.prior_balances_digest = ANY($1) AND NOT EXISTS (SELECT 1 FROM qbit_prism_jobs j WHERE j.window_prior_balances_sha256=b.prior_balances_digest OFFSET 0) AND NOT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox c WHERE c.window_prior_balances_sha256=b.prior_balances_digest OFFSET 0)",
+            ).bind(&balances).execute(&mut **tx.statement().await?).await?.rows_affected();
+        let next = BlobPruneCursor {
+            template: templates.last().cloned().unwrap_or_default(),
+            balance: balances.last().cloned().unwrap_or_default(),
+        };
+        tx.commit().await?;
+        Ok((
+            BlobPruneResult {
+                templates: removed_templates,
+                balances: removed_balances,
+            },
+            next,
+        ))
+    }
 }
 
-async fn statement_deadline(tx: &mut Transaction<'_, Postgres>, deadline: Instant) -> Result<()> {
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis();
-    ensure!(remaining > 0, "job/blob cleanup deadline elapsed");
-    let millis = remaining.min(i32::MAX as u128) as i64;
-    // SET LOCAL is reverted with this transaction; preserve a stricter
-    // configured statement timeout and the existing lock_timeout unchanged.
-    sqlx::query("SELECT set_config('statement_timeout', LEAST(COALESCE(NULLIF(EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval)*1000,0),$1::bigint),$1::bigint)::bigint::text,true)")
-        .bind(millis).execute(&mut **tx).await?;
-    Ok(())
+/// Apply the remaining deadline whenever a statement obtains the transaction,
+/// including advisory locks, the write fence and commit. Keep Ledger::lock so
+/// lock-wait observations continue through the shared timing API.
+struct BlobTransaction<'a> {
+    tx: Transaction<'a, Postgres>,
+    deadline: Instant,
+}
+
+impl<'a> BlobTransaction<'a> {
+    async fn statement(&mut self) -> Result<&mut Transaction<'a, Postgres>> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
+        ensure!(remaining > 0, "blob cleanup deadline elapsed");
+        let millis = remaining.min(i32::MAX as u128) as i64;
+        // SET LOCAL is reverted with this transaction; preserve a stricter
+        // configured statement timeout and the existing lock_timeout unchanged.
+        // PostgreSQL LEAST ignores NULL: timeout 0 (disabled) uses our budget.
+        sqlx::query("SELECT set_config('statement_timeout', LEAST(NULLIF(EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval)*1000,0),$1::bigint)::bigint::text,true)")
+        .bind(millis).execute(&mut *self.tx).await?;
+        Ok(&mut self.tx)
+    }
+
+    async fn commit(mut self) -> Result<()> {
+        self.statement().await?;
+        self.tx.commit().await?;
+        Ok(())
+    }
 }
 
 // The stable cutoff permits an expiry-index range scan even with zero expired
