@@ -367,7 +367,8 @@ impl Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, None, None).await
+        self.append_checked(share, candidate, None, None, None)
+            .await
     }
 
     pub async fn append_at_revision(
@@ -376,7 +377,7 @@ impl Ledger {
         candidate: Option<Candidate>,
         expected_revision: i64,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, Some(expected_revision), None)
+        self.append_checked(share, candidate, None, Some(expected_revision), None)
             .await
     }
 
@@ -395,28 +396,63 @@ impl Ledger {
         expected_revision: i64,
         pre_commit: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, Some(expected_revision), Some(pre_commit))
-            .await
+        self.append_checked(
+            share,
+            candidate,
+            None,
+            Some(expected_revision),
+            Some(pre_commit),
+        )
+        .await
+    }
+
+    /// [`Ledger::append_at_revision_gated`], recording when the candidate's
+    /// locally validated proof was observed (a wall clock, UNIX ms); see
+    /// `ClaimLifecycle::proof_observed_at_ms`.
+    pub async fn append_at_revision_gated_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
+        expected_revision: i64,
+        pre_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<AppendResult> {
+        self.append_checked(
+            share,
+            candidate,
+            proof_observed_at_ms,
+            Some(expected_revision),
+            Some(pre_commit),
+        )
+        .await
     }
 
     async fn append_checked(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
         // The ACK path is the incident path. A block-solving share's candidate
         // is serialized, digested and checked here, before the transaction
-        // opens, so `ORDER_LOCK` is held only for the share append and the
-        // insert of the prepared bytes, whatever the window size.
+        // opens and off the runtime, so `ORDER_LOCK` is held only for the
+        // share append and the insert of the prepared bytes, whatever the
+        // window size, and the runtime thread never prepares the as-issued
+        // balances, whatever the recipient count.
         if let Some(candidate) = &candidate {
             ensure!(
                 candidate.deferred_share.is_none(),
                 "credited candidates cannot also contain a deferred share"
             );
         }
-        let prepared = candidate.as_ref().map(prepare_candidate).transpose()?;
+        let prepared = match candidate {
+            Some(candidate) => {
+                Some(prepare_candidate_observed(candidate, proof_observed_at_ms).await?)
+            }
+            None => None,
+        };
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
@@ -778,9 +814,10 @@ where
 
 /// Write the canonical encoding of an as-issued balance set, on the caller's
 /// transaction, and return the [`qbit_prism::prior_balances_digest`] that keys
-/// it. Shared by every writer of the row: the candidate enqueue, which
-/// re-establishes what a `leased` candidate references under `ORDER_LOCK`, and
-/// `save_job` and its repair, under `SETTLEMENT_LOCK`.
+/// it. The writer for `save_job` and its repair, under `SETTLEMENT_LOCK`; the
+/// candidate enqueue, which re-establishes what a candidate references under
+/// `ORDER_LOCK`, prepares the same encoding before its transaction opens and
+/// writes it through [`put_canonical_balance_snapshot`].
 ///
 /// **Stored order.** The row holds compact
 /// `serde_json::to_vec(&CarryForwardBalance)` bytes over the set sorted
@@ -812,10 +849,26 @@ pub async fn put_balance_snapshot(
         .map(canonical_balance_snapshot)
         .await?
         .into_inner();
+    put_canonical_balance_snapshot(tx, digest, &bytes).await?;
+    Ok(digest)
+}
+
+/// Write a set's canonical encoding under its digest, on the caller's
+/// transaction, or verify that the row already there holds exactly these
+/// bytes: the statements of [`put_balance_snapshot`], for a caller that
+/// prepared the encoding earlier and elsewhere, as the candidate enqueue
+/// does before its transaction opens. `bytes` must be the canonical
+/// encoding of the set `digest` names; the runtime thread only issues the
+/// statements and compares the stored bytes.
+pub(super) async fn put_canonical_balance_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    digest: [u8; 32],
+    bytes: &[u8],
+) -> Result<(), WindowError> {
     let key = hex::encode(digest);
     let written = sqlx::query(
         "INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2) ON CONFLICT DO NOTHING",
-    ).bind(&key).bind(&bytes).execute(&mut **tx).await?.rows_affected();
+    ).bind(&key).bind(bytes).execute(&mut **tx).await?.rows_affected();
     if written == 0 {
         let stored: Vec<u8> = sqlx::query_scalar(
             "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
@@ -832,7 +885,7 @@ pub async fn put_balance_snapshot(
             )));
         }
     }
-    Ok(digest)
+    Ok(())
 }
 
 /// The canonical stored form of an as-issued balance set: its digest and the
@@ -844,6 +897,24 @@ fn canonical_balance_snapshot(
     let digest = qbit_prism::prior_balances_digest(&balances);
     let bytes = serde_json::to_vec(&balances).map_err(|error| WindowError::Decode(error.into()))?;
     Ok((digest, bytes))
+}
+
+/// The canonical stored encoding of a candidate's as-issued set, if it is
+/// the set `expected` names: the set is sorted in place into its stored
+/// order and digested once, and only a set whose digest is `expected` is
+/// encoded, once. Whole-set work for the preparing thread; the set is
+/// dropped here either way.
+pub(super) fn canonical_as_issued_snapshot(
+    mut balances: Vec<CarryForwardBalance>,
+    expected: [u8; 32],
+) -> Result<Option<Vec<u8>>, WindowError> {
+    sort_balances(&mut balances);
+    if qbit_prism::prior_balances_digest(&balances) != expected {
+        return Ok(None);
+    }
+    serde_json::to_vec(&balances)
+        .map(Some)
+        .map_err(|error| WindowError::Decode(error.into()))
 }
 
 struct DigestWriter<'a>(&'a mut Sha256);

@@ -1009,6 +1009,7 @@ async fn pipeline_body(
             body: std::sync::Arc::new(body),
             shares: std::sync::Arc::new(shares),
         }),
+        lifecycle: claimed.lifecycle.clone(),
     };
     drop(claimed.candidate);
     writes.append(

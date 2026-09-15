@@ -95,10 +95,12 @@ pub struct Candidate {
     /// `block_bytes` column, and a claim fills it from there.
     #[serde(skip)]
     pub block_bytes: Vec<u8>,
-    /// The as-issued prior balances a `leased` enqueue writes back to
-    /// `qbit_prism_balance_snapshots`, digest-checked against
-    /// `window.prior_balances_digest`. Never part of the document, unused
-    /// when `leased` is false, and empty on a claimed candidate.
+    /// The as-issued prior balances an enqueue writes back to
+    /// `qbit_prism_balance_snapshots` when they hash to
+    /// `window.prior_balances_digest`, which a `leased` candidate's must.
+    /// Never part of the document, consumed by the enqueue's preparation
+    /// (sorted, digested and encoded once, off the runtime), and empty on a
+    /// claimed candidate.
     #[serde(skip)]
     pub as_issued_balances: Vec<CarryForwardBalance>,
 }
@@ -119,6 +121,115 @@ pub struct ClaimParts {
     pub shares: Arc<Vec<AcceptedShare>>,
 }
 
+/// Where an outbox row is in the offer-before-landing lifecycle (migration
+/// 011). Every variant is unfinished: the row keeps its document, its block
+/// bytes and its window reference, and a claim can hold it. The terminal
+/// states, `submitted` and `abandoned`, are never claimed and have no
+/// variant here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CandidateState {
+    /// Never offered. The only state a claim may offer from, and the only
+    /// state that may still be abandoned, on a proven pre-offer supersession.
+    #[default]
+    Pending,
+    /// The durable reservation taken before the one `submitblock` call. A
+    /// claim that finds a row here did not take the reservation: the call
+    /// may or may not have happened, so it never offers.
+    OfferReserved,
+    /// The node's answer is recorded; the audit is still to be landed.
+    Offered,
+    /// Offered, and automation could not finish it: an ambiguous answer, a
+    /// lost call, a node rejection, or a landing failure after acceptance.
+    /// Retried with read-only chain observations only: never another
+    /// `submitblock`, never abandoned.
+    Reconciliation,
+}
+
+impl CandidateState {
+    /// The SQL list of every unfinished state, for `state IN` predicates.
+    pub const UNFINISHED_SQL: &'static str =
+        "('pending','offer_reserved','offered','reconciliation')";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::OfferReserved => "offer_reserved",
+            Self::Offered => "offered",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+
+    pub(super) fn parse(state: &str) -> Result<Self> {
+        Ok(match state {
+            "pending" => Self::Pending,
+            "offer_reserved" => Self::OfferReserved,
+            "offered" => Self::Offered,
+            "reconciliation" => Self::Reconciliation,
+            other => {
+                bail!("claimed candidate row is in state {other:?}, which no claim lane selects")
+            }
+        })
+    }
+}
+
+/// How the one `submitblock` call ended, as the outbox records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferOutcome {
+    /// The node answered `null`: it accepted the block, on some chain.
+    Accepted,
+    /// The node answered a reason string, kept as the offer reply.
+    Rejected,
+    /// The call's result is not known: a transport failure or timeout after
+    /// the request may have been sent, or an outcome lost with the frontend
+    /// that took the reservation.
+    Unknown,
+}
+
+impl OfferOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(outcome: &str) -> Result<Self> {
+        Ok(match outcome {
+            "accepted" => Self::Accepted,
+            "rejected" => Self::Rejected,
+            "unknown" => Self::Unknown,
+            other => bail!("claimed candidate row records offer outcome {other:?}"),
+        })
+    }
+}
+
+/// What the outbox remembers about a row's one offer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OfferRecord {
+    /// The instance that took the reservation.
+    pub reserved_by: Option<String>,
+    /// The actual `submitblock` call time on the offering frontend's wall
+    /// clock, UNIX milliseconds. `None` when the outcome commit was lost:
+    /// the reservation time is never substituted for it.
+    pub offered_at_ms: Option<i64>,
+    pub outcome: Option<OfferOutcome>,
+    /// The node's rejection reason, when it gave one.
+    pub reply: Option<String>,
+}
+
+/// The lifecycle columns of a claimed row, beside the candidate itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaimLifecycle {
+    pub state: CandidateState,
+    /// The enqueuing frontend's wall clock (UNIX ms) when the locally
+    /// validated proof reached the coordinator; `None` for rows written
+    /// before 011. Provenance for the proof-to-first-offer histogram, whose
+    /// other boundary is the offering frontend's own wall clock.
+    pub proof_observed_at_ms: Option<i64>,
+    pub offer: OfferRecord,
+}
+
 #[derive(Clone, Debug)]
 pub struct CandidateClaim {
     pub candidate: Candidate,
@@ -126,6 +237,8 @@ pub struct CandidateClaim {
     /// `None` until the claim's rebuild fills it. Landing reads the parts
     /// here; a claim without them cannot land.
     pub parts: Option<ClaimParts>,
+    /// The row's lifecycle state and offer record as the claim found them.
+    pub lifecycle: ClaimLifecycle,
 }
 
 impl CandidateClaim {
@@ -231,17 +344,57 @@ pub fn build_claim_parts(
 
 /// A candidate serialized, digested and checked **before** any transaction
 /// opens, so the append and enqueue transactions insert prepared bytes only.
-pub(super) struct PreparedCandidate<'a> {
-    candidate: &'a Candidate,
+/// Owns the candidate: the preparation is whole-set work that runs off the
+/// runtime, and what it produced is all the transaction writes.
+pub(super) struct PreparedCandidate {
+    candidate: Candidate,
     document: Value,
     sha256: String,
     deferred: Option<(Value, String)>,
+    /// The canonical stored encoding of the candidate's as-issued balances,
+    /// when that set is the one its window reference names: written back to
+    /// `qbit_prism_balance_snapshots` under the reference's digest at
+    /// enqueue. `None` when the set does not hash to the reference (a caller
+    /// that built the candidate by hand), which a leased candidate is
+    /// refused for. The set itself was consumed by the preparation: the
+    /// transaction sees these bytes and nothing that scales with recipients.
+    snapshot: Option<Vec<u8>>,
+    /// The proof-observation wall clock the row records, see
+    /// [`ClaimLifecycle::proof_observed_at_ms`].
+    proof_observed_at_ms: Option<i64>,
 }
 
-/// Serialize, digest and validate a candidate. Runs on the caller's thread
-/// before it opens its transaction: the document is O(1) and the only
-/// scaling input is the block, whose digest consensus bounds.
-pub(super) fn prepare_candidate(candidate: &Candidate) -> Result<PreparedCandidate<'_>> {
+impl PreparedCandidate {
+    pub(super) fn block_hash(&self) -> &str {
+        &self.candidate.block_hash
+    }
+}
+
+/// Serialize, digest and validate a candidate on the blocking pool,
+/// recording when its proof was observed. The document is O(1); the block
+/// digest scales with the block, which consensus bounds; and the as-issued
+/// balance set scales with the window's recipients and is sorted, digested
+/// and encoded exactly once, by [`prepare_candidate_blocking`]. None of it
+/// runs on a runtime thread, and the caller holds no transaction or lock
+/// while it waits: it opens its transaction only with the prepared bytes in
+/// hand. A caller cancelled while waiting leaves nothing behind: no
+/// transaction has opened, and the task drops the candidate on its own
+/// thread.
+pub(super) async fn prepare_candidate_observed(
+    candidate: Candidate,
+    proof_observed_at_ms: Option<i64>,
+) -> Result<PreparedCandidate> {
+    tokio::task::spawn_blocking(move || prepare_candidate_blocking(candidate, proof_observed_at_ms))
+        .await
+        .context("candidate preparation task failed")?
+}
+
+/// [`prepare_candidate_observed`]'s work: synchronous, whole-set, and never
+/// on a runtime thread.
+fn prepare_candidate_blocking(
+    mut candidate: Candidate,
+    proof_observed_at_ms: Option<i64>,
+) -> Result<PreparedCandidate> {
     let block = &candidate.block_bytes;
     ensure!(block.len() > 80, "candidate block is truncated");
     let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
@@ -259,22 +412,30 @@ pub(super) fn prepare_candidate(candidate: &Candidate) -> Result<PreparedCandida
             && hex::decode(&candidate.coinbase_suffix_hex).is_ok(),
         "candidate coinbase suffix must be non-empty hex"
     );
-    check_reference_invariants(candidate)?;
-    if candidate.leased {
-        let mut balances = candidate.as_issued_balances.clone();
-        balances.sort_by(|a, b| {
-            a.order_key
-                .cmp(&b.order_key)
-                .then_with(|| a.recipient_id.cmp(&b.recipient_id))
-                .then_with(|| a.p2mr_program_hex.cmp(&b.p2mr_program_hex))
-        });
-        ensure!(
-            qbit_prism::prior_balances_digest(&balances) == candidate.window.prior_balances_digest,
-            "leased candidate's as-issued balances do not hash to its window reference"
-        );
-    }
-    let document = serde_json::to_value(candidate)?;
-    let sha256 = hex::encode(Sha256::digest(serde_json::to_vec(candidate)?));
+    check_reference_invariants(&candidate)?;
+    // The as-issued set is what the block's coinbase commits to, and after
+    // 011 every landing rebuilds from it, so every enqueue whose candidate
+    // carries the set the reference names writes it back. The set is taken
+    // from the candidate here, sorted into its stored order, digested once
+    // and, when the digest is the reference's, encoded once: the digest
+    // decides whether this is the referenced set (the vector's order is
+    // immaterial), and the encoding is what the transaction inserts. A
+    // leased candidate must carry it; any other candidate that does not (a
+    // caller that built the candidate by hand) is enqueued without a
+    // snapshot and can only land while the current balances still hash to
+    // its reference. The vector is dropped here, on this thread, whatever
+    // its size.
+    let balances = std::mem::take(&mut candidate.as_issued_balances);
+    let snapshot = super::window::canonical_as_issued_snapshot(
+        balances,
+        candidate.window.prior_balances_digest,
+    )?;
+    ensure!(
+        snapshot.is_some() || !candidate.leased,
+        "leased candidate's as-issued balances do not hash to its window reference"
+    );
+    let document = serde_json::to_value(&candidate)?;
+    let sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?));
     let deferred = candidate
         .deferred_share
         .as_ref()
@@ -290,6 +451,8 @@ pub(super) fn prepare_candidate(candidate: &Candidate) -> Result<PreparedCandida
         document,
         sha256,
         deferred,
+        snapshot,
+        proof_observed_at_ms,
     })
 }
 
@@ -319,18 +482,29 @@ impl Ledger {
     }
 
     /// Enqueue a block-only candidate. The row is serialized and digested
-    /// before the transaction opens; under `ORDER_LOCK` the transaction only
-    /// runs the writer fence, re-establishes what the candidate references
-    /// and inserts the prepared bytes.
+    /// before the transaction opens, off the runtime; under `ORDER_LOCK` the
+    /// transaction only runs the writer fence, re-establishes what the
+    /// candidate references and inserts the prepared bytes.
     pub async fn enqueue_candidate_once(&self, candidate: Candidate) -> Result<bool> {
-        let prepared = prepare_candidate(&candidate)?;
+        self.enqueue_candidate_observed(candidate, None).await
+    }
+
+    /// [`Ledger::enqueue_candidate_once`], recording the wall-clock time the
+    /// locally validated proof was observed (see
+    /// [`ClaimLifecycle::proof_observed_at_ms`]).
+    pub async fn enqueue_candidate_observed(
+        &self,
+        candidate: Candidate,
+        proof_observed_at_ms: Option<i64>,
+    ) -> Result<bool> {
+        let prepared = prepare_candidate_observed(candidate, proof_observed_at_ms).await?;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",
         )
-        .bind(&candidate.block_hash)
+        .bind(prepared.block_hash())
         .fetch_one(&mut *tx)
         .await?;
         if exists {
@@ -345,16 +519,17 @@ impl Ledger {
     }
 
     /// Insert a prepared candidate inside the caller's `ORDER_LOCK`
-    /// transaction. In order: the writer fence, the `leased` balance
+    /// transaction. In order: the writer fence, the as-issued balance
     /// snapshot, the window prefix probe, then the insert of the prepared
-    /// bytes. Nothing here serializes or digests the candidate.
+    /// bytes. Nothing here serializes, sorts, digests or encodes anything of
+    /// the candidate.
     pub(super) async fn persist_prepared_candidate(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-        prepared: &PreparedCandidate<'_>,
+        prepared: &PreparedCandidate,
         share_id: Option<&str>,
     ) -> Result<bool> {
-        let candidate = prepared.candidate;
+        let candidate = &prepared.candidate;
         // The writer fence. `FOR SHARE` conflicts with `configure`'s `FOR
         // UPDATE`, so a fingerprint reset and this write cannot interleave:
         // either the write commits first and the reset's refusal sees it, or
@@ -381,16 +556,22 @@ impl Ledger {
                 );
             }
         }
-        if candidate.leased {
-            // A prune may have removed the job row and its balance snapshot
-            // between the submission's expiry check and this lock; the
-            // as-issued set the job carried is written back, or found already
-            // present, so the leased claim can read `AsIssued`.
-            let digest = put_balance_snapshot(tx, &candidate.as_issued_balances).await?;
-            ensure!(
-                digest == candidate.window.prior_balances_digest,
-                "leased candidate's as-issued balances do not hash to its window reference"
-            );
+        if let Some(snapshot) = &prepared.snapshot {
+            // The as-issued set is written back, or found already present
+            // and byte-identical, so the post-offer landing can read
+            // `AsIssued` whatever the current balances have become by then.
+            // A prune may have removed the job row and its snapshot between
+            // the submission's expiry check and this lock, which is why every
+            // enqueue re-establishes it rather than only a leased one. The
+            // bytes are the canonical encoding the preparation produced off
+            // the runtime, of the set it proved hashes to the reference, so
+            // the reference's digest keys them.
+            super::window::put_canonical_balance_snapshot(
+                tx,
+                candidate.window.prior_balances_digest,
+                snapshot,
+            )
+            .await?;
         }
         if let Some(range) = candidate.window.shares {
             let first = i64::try_from(range.first_share_seq)?;
@@ -416,9 +597,10 @@ impl Ledger {
             ),
             None => (None, None, None, None),
         };
-        let inserted = sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,share_id,candidate,candidate_sha256,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(block_hash) DO NOTHING")
+        let inserted = sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,share_id,candidate,candidate_sha256,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,proof_observed_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(block_hash) DO NOTHING")
             .bind(&candidate.block_hash).bind(share_id).bind(&prepared.document).bind(&prepared.sha256).bind(&candidate.block_bytes)
             .bind(candidate.window.anchor_ms).bind(hex::encode(candidate.window.prior_balances_digest)).bind(first).bind(last).bind(count).bind(snapshot)
+            .bind(prepared.proof_observed_at_ms)
             .execute(&mut **tx).await?.rows_affected();
         if inserted == 0 {
             let same: bool = sqlx::query_scalar("SELECT candidate_sha256=$2 AND share_id IS NOT DISTINCT FROM $3 FROM qbit_block_candidate_outbox WHERE block_hash=$1").bind(&candidate.block_hash).bind(&prepared.sha256).bind(share_id).fetch_one(&mut **tx).await?;
@@ -445,8 +627,9 @@ impl Ledger {
         // Empty polling does not use a scheduling slot. A racing SKIP LOCKED
         // selection can still leave a gap; this weighting is deliberately an
         // approximate service ratio rather than a global serialization point.
-        let slot: Option<i64> = sqlx::query_scalar("SELECT nextval('qbit_prism_candidate_dispatch_sequence') WHERE EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))")
-            .fetch_optional(&mut *tx).await?;
+        let slot: Option<i64> = sqlx::query_scalar(&Self::due_work_probe_sql())
+            .fetch_optional(&mut *tx)
+            .await?;
         let mut row = None;
         if let Some(slot) = slot {
             if slot % 8 != 0 {
@@ -475,7 +658,7 @@ impl Ledger {
                 (1, Some(_)) => claimed = Some(row),
                 (version, candidate) => {
                     let reason = if version == 1 {
-                        "pending storage_version 1 candidate has no JSONB body".to_owned()
+                        "unfinished storage_version 1 candidate has no JSONB body".to_owned()
                     } else {
                         format!("candidate storage_version {version} is not supported by this server; only version 1 JSONB candidates are (a #258 chunked body must be drained by the 2.x.x release)")
                     };
@@ -544,22 +727,127 @@ impl Ledger {
         // SHARE lock, so audit persistence cannot block its own heartbeat.
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let updated = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+$3*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+        let updated = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+$3*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::UNFINISHED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(lease_seconds).execute(&mut *tx).await?.rows_affected();
         ensure!(updated == 1, "candidate claim was lost or expired");
         tx.commit().await?;
         Ok(())
     }
 
+    /// Release the claim and reschedule the row in whatever unfinished state
+    /// it is in. A pending or offered row backs off `min(60, attempt_count)`
+    /// seconds; a reconciliation row, which is retried without another
+    /// `submitblock` until its block is proven active or an operator
+    /// resolves it, backs off `min(3600, 10 * attempt_count)`.
     pub async fn retry_candidate(&self, claim: &CandidateClaim, error: &str) -> Result<()> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let result = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+        let result = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+(CASE WHEN state='reconciliation' THEN LEAST(3600,10*attempt_count) ELSE LEAST(60,attempt_count) END)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::UNFINISHED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(error).execute(&mut *tx).await?;
         ensure!(
             result.rows_affected() == 1,
             "candidate claim was lost or expired"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The durable reservation before the one `submitblock` call: the
+    /// pending row this live claim holds becomes `offer_reserved`, recording
+    /// which instance took it and when (database clock). The row is the
+    /// unique reservation per block hash; once it commits, no claim on any
+    /// frontend, this one included after a crash, will offer the block
+    /// again.
+    pub async fn reserve_offer(&self, claim: &CandidateClaim) -> Result<()> {
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
+            .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
+        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            reserved == 1,
+            "candidate claim was lost or expired before the offer reservation"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record how the reserved row's one `submitblock` call ended, moving it
+    /// to `offered`. `offered_at_ms` is the offering frontend's wall clock
+    /// immediately before the call, never the reservation time.
+    pub async fn record_offer(
+        &self,
+        claim: &CandidateClaim,
+        offered_at_ms: i64,
+        outcome: OfferOutcome,
+        reply: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
+            .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
+        let recorded = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offered',offered_at_ms=$3,offer_outcome=$4,offer_reply=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(offered_at_ms).bind(outcome.as_str()).bind(reply).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            recorded == 1,
+            "candidate claim was lost or expired while recording the offer outcome"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Adopt a pending row whose block the node already proves active into
+    /// the no-resubmission lifecycle, before anything lands: it becomes a
+    /// reconciliation row with the node's evidence as its reply, an unknown
+    /// outcome (the call that put the block on the chain, if there was one,
+    /// is not this attempt's, and its time is unknown, never fabricated),
+    /// the reason recorded, and the claim kept so this attempt lands and
+    /// confirms it. From here no claim on any frontend offers the block, and
+    /// no supersession can abandon it.
+    pub async fn adopt_active_candidate(
+        &self,
+        claim: &CandidateClaim,
+        evidence: &str,
+        reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            !reason.trim().is_empty() && !evidence.trim().is_empty(),
+            "an adoption needs its reason and the node's evidence"
+        );
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
+            .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
+        let adopted = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,offer_outcome='unknown',offer_reply=$4,last_error=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).bind(evidence).bind(reason).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            adopted == 1,
+            "candidate claim was lost or expired before the active block was adopted"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Move an offered row this claim holds into `reconciliation`, with the
+    /// reason, and release the claim with the reconciliation backoff. A
+    /// recovered `offer_reserved` row, whose call may or may not have
+    /// happened, records the `unknown` outcome here; an `offered` row keeps
+    /// the outcome it recorded. Never abandons and never clears evidence.
+    pub async fn reconcile_candidate(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
+        ensure!(
+            !reason.trim().is_empty(),
+            "a reconciliation row needs a reason"
+        );
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        lock_candidate_row(&mut tx, claim).await?;
+        let moved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN ('offer_reserved','offered','reconciliation') AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            moved == 1,
+            "candidate claim was lost or expired, or the row was never offered"
         );
         tx.commit().await?;
         Ok(())
@@ -708,6 +996,22 @@ pub fn coinbase_witness_reserved_value(tx: &[u8]) -> Result<[u8; 32]> {
 /// columns, digest or block is surfaced as corruption.
 fn decode_claimed_row(row: &PgRow, token: String) -> Result<CandidateClaim> {
     let block_hash: String = row.try_get("block_hash")?;
+    let state = CandidateState::parse(row.try_get::<String, _>("state")?.as_str())?;
+    let outcome = row
+        .try_get::<Option<String>, _>("offer_outcome")?
+        .as_deref()
+        .map(OfferOutcome::parse)
+        .transpose()?;
+    let lifecycle = ClaimLifecycle {
+        state,
+        proof_observed_at_ms: row.try_get("proof_observed_at_ms")?,
+        offer: OfferRecord {
+            reserved_by: row.try_get("offer_reserved_by")?,
+            offered_at_ms: row.try_get("offered_at_ms")?,
+            outcome,
+            reply: row.try_get("offer_reply")?,
+        },
+    };
     let anchor: Option<i64> = row.try_get("window_anchor_ms")?;
     let Some(anchor) = anchor else {
         bail!(
@@ -789,6 +1093,7 @@ fn decode_claimed_row(row: &PgRow, token: String) -> Result<CandidateClaim> {
         candidate,
         claim_token: token,
         parts: None,
+        lifecycle,
     })
 }
 
@@ -805,6 +1110,39 @@ async fn lock_candidate_row(
     Ok(())
 }
 
+impl Ledger {
+    /// The due-work probe [`Ledger::claim_candidate`] issues first: a
+    /// dispatch slot is consumed only while some unfinished row is due and
+    /// unclaimed, so empty polling never advances the sequence. Public so a
+    /// test can EXPLAIN the statement the server runs rather than a copy.
+    pub fn due_work_probe_sql() -> String {
+        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') WHERE EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))", CandidateState::UNFINISHED_SQL)
+    }
+
+    /// The row selection of one claim lane, exactly as
+    /// [`Ledger::claim_candidate`] issues it inside its claiming statement.
+    /// The fresh lane (`fresh`) offers new blocks first: a never-attempted
+    /// pending row, newest first. The oldest-due lane serves everything
+    /// unfinished, the offered rows waiting for their landing or
+    /// reconciliation included, by due time, so no unfinished row is ever
+    /// stranded by continuous new work. Public so a test can EXPLAIN the
+    /// statement the server runs rather than a copy.
+    pub fn claim_lane_sql(fresh: bool) -> String {
+        let (states, ordering) = if fresh {
+            (
+                "('pending')",
+                "AND attempt_count=0 ORDER BY created_at DESC,block_hash",
+            )
+        } else {
+            (
+                CandidateState::UNFINISHED_SQL,
+                "ORDER BY next_attempt_at,created_at,block_hash",
+            )
+        };
+        format!("SELECT block_hash FROM qbit_block_candidate_outbox WHERE state IN {states} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1")
+    }
+}
+
 async fn claim_candidate_lane(
     tx: &mut Transaction<'_, Postgres>,
     fresh: bool,
@@ -812,14 +1150,7 @@ async fn claim_candidate_lane(
     instance_id: &str,
     lease_seconds: i64,
 ) -> Result<Option<PgRow>> {
-    let ordering = if fresh {
-        "AND attempt_count=0 ORDER BY created_at DESC,block_hash"
-    } else {
-        // Includes never-attempted rows: continuous new work must not strand
-        // an older candidate that has not yet received its first attempt.
-        "ORDER BY next_attempt_at,created_at,block_hash"
-    };
-    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256");
+    let query = format!("WITH next AS ({}) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256,o.state,o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply", Ledger::claim_lane_sql(fresh));
     Ok(sqlx::query(&query)
         .bind(token)
         .bind(instance_id)
@@ -830,7 +1161,7 @@ async fn claim_candidate_lane(
 
 /// Park a claimed row this server cannot decode: release the claim, record
 /// why in `last_error`, and move `next_attempt_at` past every lease expiry.
-/// The row stays `pending` with its body untouched, so a release that reads
+/// The row keeps its state with its body untouched, so a release that reads
 /// it can pick it up by resetting `next_attempt_at`; until then it is
 /// operator work, not a retry loop.
 async fn park_candidate(
@@ -839,7 +1170,7 @@ async fn park_candidate(
     token: &str,
     reason: &str,
 ) -> Result<()> {
-    let parked = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
+    let parked = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
         .bind(block_hash).bind(token).bind(reason).execute(&mut **tx).await?.rows_affected();
     ensure!(parked == 1, "candidate to park was not held by this claim");
     Ok(())

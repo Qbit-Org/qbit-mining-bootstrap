@@ -13,6 +13,7 @@ use submit_ledger::CommitGate;
 mod admission_races;
 mod authority_lease;
 mod blockwait;
+mod candidate_preparation;
 mod commit_reconcile;
 mod compact_authority;
 mod compact_prepared;
@@ -342,6 +343,7 @@ impl Fixture {
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
+            offer_probe: Default::default(),
         });
         let fixture = Self {
             coordinator,
