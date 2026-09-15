@@ -231,6 +231,40 @@ pub(super) struct AuditSnapshotWrite {
 /// page of decoded rows, never a second copy of the window.
 const VERIFY_PAGE_ROWS: i64 = 4096;
 
+/// The same anchored eligibility at selection, proof, persistence and readback.
+/// `anchor_parameter` is a SQL bind position supplied only by these call sites.
+pub(super) fn anchored_eligibility_sql(anchor_parameter: usize) -> String {
+    format!("accepted AND accepted_at<=to_timestamp(${anchor_parameter}::double precision/1000) AND job_issued_at<=to_timestamp(${anchor_parameter}::double precision/1000)")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OldestBoundary {
+    Crossing,
+    /// Valid only if no older eligible history exists.
+    Partial,
+}
+
+/// Classify a fully verified, oldest-first window at a positive target weight.
+/// Saturating subtraction matches the snapshot's reverse walk without summing
+/// difficulties that can exceed u128::MAX. Equality retains the crossing row.
+fn oldest_boundary(weight: u128, shares: &[AcceptedShare]) -> Result<OldestBoundary> {
+    let remaining_without_oldest = shares.iter().skip(1).fold(weight, |left, share| {
+        left.saturating_sub(share.share_difficulty)
+    });
+    ensure!(
+        remaining_without_oldest > 0,
+        "audit share snapshot extends past canonical oldest share"
+    );
+    let oldest = shares
+        .first()
+        .context("audit share snapshot cannot be empty")?;
+    Ok(if remaining_without_oldest > oldest.share_difficulty {
+        OldestBoundary::Partial
+    } else {
+        OldestBoundary::Crossing
+    })
+}
+
 /// Prove the candidate's window is exactly what the immutable ledger holds for
 /// its issued anchor and difficulty, before the settlement lock is taken.
 ///
@@ -270,26 +304,28 @@ pub(super) async fn verify_durable_range(
         "audit share snapshot cannot be empty"
     );
     if snapshot.inline.is_some() {
-        let any: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE accepted AND accepted_at<=to_timestamp($1::double precision/1000) AND job_issued_at<=to_timestamp($1::double precision/1000))")
-            .bind(snapshot.anchor_ms).fetch_one(pool).await?;
+        let any: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE {})",
+            anchored_eligibility_sql(1)
+        ))
+        .bind(snapshot.anchor_ms)
+        .fetch_one(pool)
+        .await?;
         ensure!(!any, "bootstrap audit window omits canonical shares");
         return Ok(());
     }
-    let mut remaining_without_oldest = snapshot
+    let weight = snapshot
         .network_difficulty
         .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
         .context("window difficulty overflow")?;
-    ensure!(
-        remaining_without_oldest > 0,
-        "network difficulty must be positive"
-    );
+    ensure!(weight > 0, "network difficulty must be positive");
     let shares = &snapshot.shares;
     let last = snapshot.last_share_seq;
     let anchor = snapshot.anchor_ms;
     let mut cursor = snapshot.first_share_seq - 1;
     let mut matched = 0usize;
     while cursor < last {
-        let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT $4"))
+        let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
             .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(pool).await?;
         if rows.is_empty() {
             break;
@@ -299,33 +335,18 @@ pub(super) async fn verify_durable_range(
         let expected: Vec<AcceptedShare> =
             shares[matched.min(shares.len())..(matched + rows.len()).min(shares.len())].to_vec();
         let page_len = rows.len();
-        let (next_cursor, remaining) =
-            tokio::task::spawn_blocking(move || -> Result<(i64, u128)> {
-                let durable = rows
-                    .iter()
-                    .map(share_from_row)
-                    .collect::<Result<Vec<_>>>()?;
-                ensure!(
-                    durable == expected,
-                    "audit share snapshot differs from canonical database history"
-                );
-                // Subtraction saturates just as Ledger::snapshot's reverse walk
-                // does, so even a crossing share near u128::MAX cannot overflow.
-                // Exclude only the first row of the first page, not each page.
-                let remaining = durable
-                    .iter()
-                    .skip(usize::from(matched == 0))
-                    .fold(remaining_without_oldest, |left, share| {
-                        left.saturating_sub(share.share_difficulty)
-                    });
-                Ok((
-                    i64::try_from(durable[durable.len() - 1].share_seq)?,
-                    remaining,
-                ))
-            })
-            .await??;
-        cursor = next_cursor;
-        remaining_without_oldest = remaining;
+        cursor = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let durable = rows
+                .iter()
+                .map(share_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                durable == expected,
+                "audit share snapshot differs from canonical database history"
+            );
+            Ok(i64::try_from(durable[durable.len() - 1].share_seq)?)
+        })
+        .await??;
         matched += page_len;
     }
     ensure!(
@@ -334,21 +355,31 @@ pub(super) async fn verify_durable_range(
     );
     // Keep the ordered LIMIT as a scalar row query: EXISTS can discard its
     // ordering and choose a full-ledger sequential scan for an older anchor.
-    let newer: Option<i64> = sqlx::query_scalar("SELECT share_seq FROM qbit_share_ledger WHERE accepted AND share_seq>$1 AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY share_seq LIMIT 1")
+    // This probe can scan all post-anchor history: delayed landings grow its
+    // cost with share volume. The connection's statement_timeout (15 s by
+    // default) is the ceiling per query, not a total proof budget; expiry fails
+    // landing closed before persistence. Revisit if delayed candidates exhaust
+    // that budget or the reference gains the anchor-time sequence cutoff.
+    // Checking only the next accepted row would assume monotone accepted_at
+    // and job_issued_at <= accepted_at, guaranteed by native append under the
+    // ordering lock but not by legacy/raw rows. Those rows may hide a later
+    // eligible share behind an ineligible one, so keep both timestamp filters.
+    let newer: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 ORDER BY share_seq LIMIT 1", anchored_eligibility_sql(2)))
         .bind(last).bind(anchor).fetch_optional(pool).await?;
     ensure!(
         newer.is_none(),
         "audit share snapshot omits newest canonical share"
     );
-    ensure!(
-        remaining_without_oldest > 0,
-        "audit share snapshot extends past canonical oldest share"
-    );
-    let oldest = shares
-        .first()
-        .context("audit share snapshot cannot be empty")?;
-    if remaining_without_oldest > oldest.share_difficulty {
-        let older: Option<i64> = sqlx::query_scalar("SELECT share_seq FROM qbit_share_ledger WHERE accepted AND share_seq<$1 AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY share_seq DESC LIMIT 1")
+    // Equality above authenticates every share used by the pure rule. Keep
+    // this window-sized fold off the runtime and after the newest refusal so
+    // a window failing both boundaries retains its existing error precedence.
+    let boundary = tokio::task::spawn_blocking({
+        let shares = std::sync::Arc::clone(shares);
+        move || oldest_boundary(weight, &shares)
+    })
+    .await??;
+    if boundary == OldestBoundary::Partial {
+        let older: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 1", anchored_eligibility_sql(2)))
             .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(pool).await?;
         ensure!(
             older.is_none(),
@@ -375,8 +406,15 @@ pub(super) async fn persist_audit_snapshot(
         "audit share snapshot cannot be empty"
     );
     if snapshot.inline.is_none() {
-        let durable: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_seq BETWEEN $1 AND $2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000)")
-            .bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).fetch_one(&mut **tx).await?;
+        let durable: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM qbit_share_ledger WHERE {} AND share_seq BETWEEN $1 AND $2",
+            anchored_eligibility_sql(3)
+        ))
+        .bind(snapshot.first_share_seq)
+        .bind(snapshot.last_share_seq)
+        .bind(snapshot.anchor_ms)
+        .fetch_one(&mut **tx)
+        .await?;
         ensure!(
             durable == snapshot.share_count,
             "audit share snapshot count differs from canonical database history"
@@ -395,6 +433,19 @@ async fn read_range<'e>(
     last: i64,
     anchor: i64,
 ) -> Result<Vec<AcceptedShare>> {
-    sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq BETWEEN $1 AND $2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq"))
-        .bind(first).bind(last).bind(anchor).fetch_all(executor).await?.iter().map(share_from_row).collect()
+    sqlx::query(&format!(
+        "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
+        anchored_eligibility_sql(3)
+    ))
+    .bind(first)
+    .bind(last)
+    .bind(anchor)
+    .fetch_all(executor)
+    .await?
+    .iter()
+    .map(share_from_row)
+    .collect()
 }
+
+#[cfg(test)]
+mod tests;
