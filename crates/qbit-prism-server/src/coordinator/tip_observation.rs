@@ -282,11 +282,12 @@ impl Coordinator {
             "node readiness changed during work admission"
         );
         let parent = identity.parent.as_deref().context("job parent missing")?;
-        let leased = selected
-            .authority(
-                self.config.submit_tip_max_age,
-                self.config.template_refresh_failure_exit,
-            )
+        let authority = selected.authority(
+            self.config.submit_tip_max_age,
+            self.config.template_refresh_failure_exit,
+        );
+        let leased = authority
+            .as_ref()
             .is_some_and(|tip| tip.hash == parent && tip.share_lease);
         let last_poll = readiness.last_poll.context("tip polling unavailable")?;
         if leased
@@ -297,8 +298,24 @@ impl Coordinator {
             return Ok(None);
         }
         if selected.as_deref() != Some(parent) && !leased {
-            // A known retired parent is a miss. It must not turn Stratum's
-            // retained-job fallback into an apparent backend outage.
+            // Preserve the unavailable-current-publication contract. A miss
+            // describes retired requested work only when the current work
+            // still has ordinary tip authority or a replacement lease.
+            let current_parent = published_work
+                .as_ref()
+                .and_then(|p| p.template["previousblockhash"].as_str());
+            let current_leased = authority
+                .as_ref()
+                .is_some_and(|tip| tip.share_lease && Some(tip.hash.as_str()) == current_parent);
+            ensure!(
+                current_parent.is_some()
+                    && (current_parent == selected.as_deref() || current_leased),
+                "new tip work is pending"
+            );
+            ensure!(
+                last_poll.elapsed() < self.config.health_timeout || current_leased,
+                "tip polling stale"
+            );
             return Ok(None);
         }
         ensure!(

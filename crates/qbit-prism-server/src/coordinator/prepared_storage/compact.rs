@@ -466,9 +466,30 @@ impl Coordinator {
     ) -> Result<CompactPublicationGuard<'a>> {
         let captured = reserved.captured;
         let clock = self.prove_fresh_compact(captured).await?;
-        let prepared = self.prepared.write().await;
-        let readiness = self.readiness.write().await;
-        let tip = self.observed_tip.write().await;
+        let (prepared, readiness, tip) = loop {
+            // No asynchronous gap between the last external proof and these
+            // coupled locks. If acquisition would wait, release partial locks,
+            // wait for the boundary, then refresh the external proof.
+            let available = (|| {
+                Some((
+                    self.prepared.try_write().ok()?,
+                    self.readiness.try_write().ok()?,
+                    self.observed_tip.try_write().ok()?,
+                ))
+            })();
+            if let Some(guards) = available {
+                break guards;
+            }
+            {
+                let _prepared = self.prepared.write().await;
+                let _readiness = self.readiness.write().await;
+                let _tip = self.observed_tip.write().await;
+            }
+            // Keep the first clock: retries cannot renew this operation's
+            // fixed expiry, including when a clock reply was delayed.
+            clock.ensure_live(captured.original_expires_at_ms)?;
+            self.prove_fresh_compact(captured).await?;
+        };
         Self::check_compact_build_stamp(
             captured
                 .build_proof

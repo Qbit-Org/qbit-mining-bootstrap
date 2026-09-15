@@ -380,6 +380,71 @@ async fn cold_reservation_expiring_while_final_publication_lock_waits_stays_unpu
 }
 
 #[tokio::test]
+async fn economics_changed_while_final_publication_lock_waits_rejects_guard() {
+    let mut unexpected_guards = Vec::new();
+    for changed in ["revision", "balances"] {
+        let f = cold_fixture().await;
+        let captured = captured(&f).await;
+        f.store.compact.saves.lock().unwrap().push_back(Ok(true));
+        let reserved = f
+            .coordinator
+            .reserve_fresh_compact(&captured)
+            .await
+            .unwrap();
+        let epoch = f.coordinator.readiness.read().await.generation;
+        let held = f.coordinator.prepared.read().await;
+        let (result, ()) = tokio::join!(f.coordinator.lock_compact_publication(reserved), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // The read guard permits the proof's reads but blocks its
+                // final writer. Refusing a new reader proves that writer queued.
+                while f.coordinator.prepared.try_read().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if changed == "revision" {
+                f.store.revision.store(1, Ordering::SeqCst);
+            } else {
+                f.store
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .prior_balances
+                    .push(qbit_prism::CarryForwardBalance {
+                        recipient_id: "changed-recipient".into(),
+                        order_key: "changed-recipient".into(),
+                        p2mr_program_hex: hash(0xac),
+                        balance_sats: 1,
+                    });
+            }
+            // Model a different frontend's economic change, without any local
+            // invalidation or publication that could trip the captured stamp.
+            drop(held);
+        });
+        // Consume any unexpected guard before checking locks it would hold;
+        // the test must reject the guard itself, never call publish on it.
+        let error = result.err();
+        if let Some(error) = error {
+            assert!(
+                error.to_string().contains("payout snapshot stale"),
+                "{changed}: {error}"
+            );
+        } else {
+            unexpected_guards.push(changed);
+        }
+        assert_eq!(f.coordinator.readiness.read().await.generation, epoch);
+        assert_unpublished(&f).await;
+    }
+    assert!(
+        unexpected_guards.is_empty(),
+        "economic changes during publication lock wait returned guards: {unexpected_guards:?}"
+    );
+}
+
+#[tokio::test]
 async fn cold_publication_guard_rechecks_expiry_at_installation() {
     let f = cold_fixture().await;
     let captured = captured(&f).await;

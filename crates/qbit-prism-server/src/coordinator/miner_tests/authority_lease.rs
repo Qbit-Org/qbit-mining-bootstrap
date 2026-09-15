@@ -37,6 +37,44 @@ fn change_balances(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn unready_current_publication_is_an_error_but_retired_work_is_a_miss() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f).await;
+    persist(&f, &job).await.unwrap();
+    // Match the live node regression: a fresh baseline does not grant the
+    // existing prepared object a published replacement lease.
+    *f.coordinator.observed_tip.write().await = TipState::baseline(hash(2));
+    assert!(f
+        .coordinator
+        .resume_job(&job.context.worker, &job.wire.job_id)
+        .await
+        .is_err());
+    assert!(f
+        .coordinator
+        .build_job(&job.context.worker, "00000002", 1e-12, 0.0)
+        .await
+        .is_err());
+    f.node.lock().unwrap().tip = hash(2);
+    f.coordinator.refresh_once().await.unwrap();
+    assert!(f
+        .coordinator
+        .resume_job(&job.context.worker, &job.wire.job_id)
+        .await
+        .unwrap()
+        .is_none());
+    // A later valid replacement lease also must not make a retired parent
+    // look like a backend outage to retained-job fallback.
+    f.detect(3).await;
+    assert!(f
+        .coordinator
+        .resume_job(&job.context.worker, &job.wire.job_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn unchanged_balances_keep_original_identity_and_current_transaction_revision() {
     let f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
