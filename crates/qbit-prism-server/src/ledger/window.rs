@@ -3,7 +3,7 @@ use super::*;
 mod payout_state;
 pub use payout_state::PayoutState;
 mod blocking_drop;
-use blocking_drop::{BlockingDrop, ReadCompletion};
+use blocking_drop::{BlockingDrop, ReadAdmission};
 
 #[derive(Clone, Debug)]
 pub struct AppendResult {
@@ -200,7 +200,7 @@ impl Ledger {
         window: &WindowRef,
         balances: BalanceSource,
     ) -> Result<Window, WindowError> {
-        self.read_window_owned(window, balances, ReadCompletion::default())
+        self.read_window_owned(window, balances, ReadAdmission::default())
             .await
     }
 
@@ -208,7 +208,7 @@ impl Ledger {
         &self,
         window: &WindowRef,
         balances: BalanceSource,
-        completion: ReadCompletion,
+        completion: ReadAdmission,
     ) -> Result<Window, WindowError> {
         let bounds = window.shares.map(ShareRange::bounds).transpose()?;
         let mut tx = self.begin().await?;
@@ -255,16 +255,15 @@ impl Ledger {
             }
             let state = read_range_owned(
                 &mut tx,
+                first,
                 last,
                 window.anchor_ms,
-                completion.own((
-                    WindowRead::new(),
-                    move |state: &mut WindowRead, shares| state.page(shares, range.share_count),
-                    first.saturating_sub(1),
-                )),
+                &completion,
+                WindowRead::new(),
+                move |state: &mut WindowRead, shares| state.page(shares, range.share_count),
             )
             .await?;
-            state.map(move |(state, _, _)| state.finish(range)).await?
+            state.map(move |state| state.finish(range)).await?
         } else {
             completion.own(Vec::new())
         };
@@ -304,7 +303,7 @@ impl Ledger {
         balances: BalanceSource,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Window, WindowError> {
-        self.read_window_owned(window, balances, ReadCompletion::new(permit))
+        self.read_window_owned(window, balances, ReadAdmission::new(permit))
             .await
     }
 
@@ -695,25 +694,35 @@ where
     S: Send + 'static,
     F: FnMut(&mut S, Vec<AcceptedShare>) -> Result<(), WindowError> + Send + 'static,
 {
-    let carried = BlockingDrop::new((state, consume, first.saturating_sub(1)));
-    Ok(read_range_owned(connection, last, anchor_ms, carried)
-        .await?
-        .into_inner()
-        .0)
+    read_range_owned(
+        connection,
+        first,
+        last,
+        anchor_ms,
+        &ReadAdmission::default(),
+        state,
+        consume,
+    )
+    .await
+    .map(BlockingDrop::into_inner)
 }
 
 /// Keep the completion owner attached to the accumulated state until its
 /// caller finishes validation and commits, or hands that state to cleanup.
 async fn read_range_owned<S, F>(
     connection: &mut sqlx::PgConnection,
+    first: i64,
     last: i64,
     anchor_ms: i64,
-    mut carried: BlockingDrop<(S, F, i64)>,
-) -> Result<BlockingDrop<(S, F, i64)>, WindowError>
+    completion: &ReadAdmission,
+    state: S,
+    consume: F,
+) -> Result<BlockingDrop<S>, WindowError>
 where
     S: Send + 'static,
     F: FnMut(&mut S, Vec<AcceptedShare>) -> Result<(), WindowError> + Send + 'static,
 {
+    let mut carried = completion.own((state, consume, first.saturating_sub(1)));
     // `read_range`'s predicate (`ledger/audit.rs`), paged forwards: both
     // bounds are known here, so rows arrive in canonical order and a digest
     // over them can stream. `$1` is the exclusive cursor, which starts one
@@ -747,7 +756,12 @@ where
             })
             .await?;
     }
-    Ok(carried)
+    let (state, consume, _) = carried.into_inner();
+    // No await separates the guards. Re-own state before dropping the
+    // consumer so even a panicking consumer destructor schedules cleanup.
+    let state = completion.own(state);
+    drop(consume);
+    Ok(state)
 }
 
 /// Write the canonical encoding of an as-issued balance set, on the caller's
@@ -782,10 +796,10 @@ pub async fn put_balance_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     balances: &[CarryForwardBalance],
 ) -> Result<[u8; 32], WindowError> {
-    let owned = balances.to_vec();
-    let (digest, bytes) = tokio::task::spawn_blocking(move || canonical_balance_snapshot(owned))
-        .await
-        .map_err(WindowError::TaskFailed)??;
+    let (digest, bytes) = BlockingDrop::new(balances.to_vec())
+        .map(canonical_balance_snapshot)
+        .await?
+        .into_inner();
     let key = hex::encode(digest);
     let written = sqlx::query(
         "INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2) ON CONFLICT DO NOTHING",

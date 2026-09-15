@@ -6,7 +6,7 @@ Refs #273, reader cancellation and error-classification gates from
 ## Completion boundary
 
 `read_window_with_permit` puts the caller's permit in one shared
-`ReadCompletion`. The read future, each blocking mapping, and every guarded
+`ReadAdmission`. The read future, each blocking mapping, and every guarded
 payload retain that same admission. A blocking mapping transfers ownership
 to its output before returning; a cleanup owns the payload before the
 completion reference in field drop order. The final reference releases the
@@ -23,6 +23,17 @@ On success, the authenticated vectors transfer to the caller and the read
 permit is released before the caller's rebuild. The caller then owns those
 vectors and their cleanup obligation. There is no additional semaphore
 acquisition, retry, background paging loop, or timeout in the reader.
+
+The private paging helper owns its cursor and consumer alongside the state,
+then returns only guarded state. The final transfer has no await and restores
+the state guard before dropping the consumer. The window reader's consumer
+captures only the share count; the public paging helper continues to drop its
+consumer on the runtime after successful paging.
+
+Cleanup captures one struct so its field order also applies when runtime
+shutdown discards a queued blocking task without executing the closure.
+Separate moved closure captures have an unspecified destruction order, even
+if explicit `drop` calls would order them when the closure runs.
 
 ## Caller and compatibility audit
 
@@ -56,8 +67,13 @@ The focused `ledger::window` unit suite covers:
 - exactly-once payload destruction and permit recovery;
 - runtime timer progress and spare blocking-worker progress while cleanup or
   mapping is held;
-- payout decoder panic as `TaskFailed`, corruption as `Decode`, and valid
-  empty balances as a successful digest.
+- mapping panic as `TaskFailed` and mapping decode errors as `Decode`;
+- admission held during cleanup after the captured runtime has shut down,
+  including a payload destructor that panics.
+
+The PostgreSQL `window_reference::payout_state` tests exercise the production
+balance decoder with a stored numeric overflow (`Decode`) and valid empty
+balances (the canonical empty digest).
 
 The existing database cancellation regression in `candidate_window_migration`
 also exercises the real reader after one accumulated page while the next
@@ -89,6 +105,14 @@ The first parallel run hit a PostgreSQL lock timeout in
 `window_reference` suite then passed serially (19 tests, 2 ignores). The
 serial invocation above avoids concurrent fixture migration lock contention;
 no production timeout or connection configuration was changed.
+
+Follow-up qualification on 2026-09-15 after the paging and blocking-handoff
+review fixes passed all 15 focused tests, 267 library tests and 62 integration
+tests on a fresh disposable PostgreSQL, with the same 6 explicit ignores.
+The serial run completed without failures; the real payout corruption and
+reader cancellation tests executed. Clippy with warnings denied, formatting,
+and whitespace checks passed. Independent verification of the resulting PR
+head remains a separate review step.
 
 These changes satisfy the reader ownership and error-classification gates.
 They do not activate compact runtime work or establish the separate

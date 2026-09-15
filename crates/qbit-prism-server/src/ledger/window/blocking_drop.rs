@@ -6,11 +6,11 @@ use tokio::sync::OwnedSemaphorePermit;
 /// One admission shared by the read, its blocking work and its cleanup.
 /// The final owner releases it; blocking-pool queue order is irrelevant.
 #[derive(Clone, Default)]
-pub(super) struct ReadCompletion {
+pub(super) struct ReadAdmission {
     _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
-impl ReadCompletion {
+impl ReadAdmission {
     pub(super) fn new(permit: OwnedSemaphorePermit) -> Self {
         Self {
             _permit: Some(Arc::new(permit)),
@@ -28,13 +28,13 @@ impl ReadCompletion {
 
 pub(super) struct BlockingDrop<T: Send + 'static> {
     value: Option<T>,
-    completion: ReadCompletion,
+    completion: ReadAdmission,
     runtime: tokio::runtime::Handle,
 }
 
 impl<T: Send + 'static> BlockingDrop<T> {
     pub(super) fn new(value: T) -> Self {
-        ReadCompletion::default().own(value)
+        ReadAdmission::default().own(value)
     }
 
     pub(super) fn get(&self) -> &T {
@@ -69,11 +69,12 @@ impl<T: Send + 'static> Drop for BlockingDrop<T> {
             // Use the captured handle: cancellation can drop a future outside
             // the context in which it was polled. A running blocking closure
             // owns its input until actual exit, even if its waiter disappears.
-            // Field order also retains admission if a payload destructor
-            // unwinds. The closure must capture the whole cleanup owner.
+            // Field order retains admission if the payload destructor unwinds
+            // or shutdown drops the closure without running it. Capture the
+            // whole owner: separate closure captures have no defined drop order.
             struct Cleanup<T> {
                 _value: T,
-                _completion: ReadCompletion,
+                _completion: ReadAdmission,
             }
             let cleanup = Cleanup {
                 _value: value,
@@ -85,54 +86,4 @@ impl<T: Send + 'static> Drop for BlockingDrop<T> {
 }
 
 #[cfg(test)]
-#[path = "lifetime_tests.rs"]
-mod lifetime_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::oneshot;
-
-    struct Probe(Option<oneshot::Sender<std::thread::ThreadId>>);
-
-    impl Drop for Probe {
-        fn drop(&mut self) {
-            let _ = self.0.take().unwrap().send(std::thread::current().id());
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_future_drops_its_payload_on_a_blocking_thread() {
-        let runtime_thread = std::thread::current().id();
-        let (dropped, receive) = oneshot::channel();
-        let (entered, ready) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _owned = BlockingDrop::new(Probe(Some(dropped)));
-            entered.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        ready.await.unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        let thread = tokio::time::timeout(std::time::Duration::from_secs(2), receive)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(thread, runtime_thread);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn successful_handoff_keeps_the_payload_for_its_caller() {
-        let (dropped, mut receive) = oneshot::channel();
-        let owned = BlockingDrop::new(Probe(Some(dropped))).into_inner();
-        assert!(matches!(
-            receive.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        let runtime_thread = std::thread::current().id();
-        tokio::task::spawn_blocking(move || drop(owned))
-            .await
-            .unwrap();
-        assert_ne!(receive.await.unwrap(), runtime_thread);
-    }
-}
+mod tests;
