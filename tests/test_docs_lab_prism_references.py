@@ -716,6 +716,7 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
     command_string = False
     noexec = False
     dump = False
+    restored = False  # the last `n` or `o noexec` setting was a `+`
     argument_flags = "oO" if shell in {"bash", "sh"} else "o"
     # Bash's dump modes read the command string and run nothing: `-D`,
     # `--dump-strings` and `--dump-po-strings` print its `$"…"` strings and
@@ -730,9 +731,23 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
     # abbreviated `--dump-str` and `--dump-strings=x` as invalid options,
     # running nothing either. dash 0.5.12 answers `-D` with "Illegal option"
     # and runs nothing, so an `sh` that is either shell reads the same. ksh
-    # and zsh were not installed on the inspected host and keep their own
-    # meanings for the letter, so like `argument_flags` the dump modes are
-    # read for bash and sh only.
+    # has the mode bash took the letter from, with one difference: a `+n` or
+    # `+o noexec` that stands as the last such setting restores execution,
+    # before or after the `-D`. ksh93u+m 1.0.8 printed only the strings for
+    # `ksh -D -c 'echo hi'`, `ksh -Dc 'echo hi'`, `ksh -cD 'echo hi'`, `ksh
+    # -eD -c 'echo hi'`, `ksh -Do vi -c 'echo hi'`, `ksh --dump-strings -c
+    # 'echo hi'`, `ksh -D +n -n -c 'echo hi'` and `ksh -D +o noexec -n -c
+    # 'echo hi'`, printed nothing for `ksh +D -c 'echo hi'` and `ksh -n +D
+    # -c 'echo hi'`, and ran `echo hi` for `ksh -D +n -c 'echo hi'`, `ksh +n
+    # -D -c 'echo hi'`, `ksh -D +o noexec -c 'echo hi'`, `ksh -nD +n -c
+    # 'echo hi'`, `ksh +D +n -c 'echo hi'` and `ksh --dump-strings +n -c
+    # 'echo hi'`; it rejected `--dump-po-strings` as an unknown option and
+    # ran nothing, which like every unknown option is outside this check.
+    # mksh R59 rejects `-D` as an unknown option in every spelling and runs
+    # nothing, so a `ksh` of either kind runs nothing for `ksh -D -c`. zsh
+    # 5.9 keeps its own meaning for the letter (`PUSHD_IGNORE_DUPS`) and ran
+    # `echo hi` for `zsh -D -c 'echo hi'` and `zsh +D -c 'echo hi'`, so its
+    # strings are read as before.
     while index < len(words):
         option = unquote(words[index])
         if option in {"--help", "--version"}:
@@ -743,7 +758,9 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
         if shell in {"bash", "sh"} and option in {"--rcfile", "--init-file"}:
             index += 2
             continue
-        if shell in {"bash", "sh"} and option in {"--dump-strings", "--dump-po-strings"}:
+        if shell in {"bash", "sh"} and option in {"--dump-strings", "--dump-po-strings"} or (
+            shell == "ksh" and option == "--dump-strings"
+        ):
             dump = True
             index += 1
             continue
@@ -757,16 +774,20 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
         # including options between -c and its command-string argument.
         for flag in option[1:]:
             command_string |= flag == "c"
-            dump |= flag == "D" and shell in {"bash", "sh"}
+            dump |= flag == "D" and shell in {"bash", "sh", "ksh"}
             if flag == "n":
                 noexec = option[0] == "-"
+                restored = not noexec
             if flag in argument_flags:
                 if index >= len(words):
                     return None
                 if flag == "o" and unquote(words[index]) == "noexec":
                     noexec = option[0] == "-"
+                    restored = not noexec
                 index += 1
-    return index if command_string and not noexec and not dump and index < len(words) else None
+    if dump and (shell != "ksh" or not restored):
+        return None
+    return index if command_string and not noexec and index < len(words) else None
 
 
 def python_commands(line: str):
@@ -3406,13 +3427,37 @@ class ScannerTests(unittest.TestCase):
         text = "```sh\nbash -D \\\n  -c 'python3 -m lab.prism.deleted'\npython3 lab/prism/storm.py\n```"
         self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
         self.assertEqual(self.commands("sudo bash -Dc 'python3 lab/prism/deleted.py'"), [])
-        # dash rejects the letter and ksh and zsh were not inspected, so the
-        # string is still read there; after the string, `-D` is the `$0`.
-        for shell in ("dash", "ksh", "zsh"):
+        # ksh93u+m 1.0.8 printed only the strings for `ksh -D -c 'echo hi'`,
+        # `ksh -Dc 'echo hi'`, `ksh +D -c 'echo hi'`, `ksh --dump-strings -c
+        # 'echo hi'` and `ksh -D +n -n -c 'echo hi'`, and mksh R59 rejects
+        # the letter and runs nothing, but a `+n` or `+o noexec` standing as
+        # the last such setting restores execution in ksh93: it ran `echo
+        # hi` for `ksh -D +n -c 'echo hi'`, `ksh +n -D -c 'echo hi'`, `ksh
+        # -D +o noexec -c 'echo hi'` and `ksh --dump-strings +n -c 'echo hi'`.
+        for options in (
+            "-D -c", "-Dc", "-cD", "-c -D", "+D -c", "'-D' -c", "-eD -c", "-D +n -n -c", "-n +D -c",
+            "-D +o noexec -n -c", "-D -o pipefail -c", "-Do pipefail -c", "--dump-strings -c", "-D +D -c",
+        ):
+            with self.subTest(options=options):
+                text = f"ksh {options} 'python3 -m lab.prism.deleted'"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.deleted"])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for options in (
+            "-D +n -c", "+n -D -c", "-D +o noexec -c", "-nD +n -c", "+D +n -c", "--dump-strings +n -c",
+            "-D -n +n -c", "+o noexec -D -c", "-c",
+        ):
+            with self.subTest(options=options):
+                text = f"ksh {options} 'python3 lab/prism/storm.py'"
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+        # dash rejects the letter and zsh 5.9 ran `zsh -D -c 'echo hi'`, so
+        # the string is still read there; after the string, `-D` is the `$0`.
+        for shell in ("dash", "zsh"):
             for options in ("-D -c", "-Dc", "--dump-strings -c"):
                 with self.subTest(shell=shell, options=options):
                     text = f"{shell} {options} 'python3 lab/prism/storm.py'"
                     self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("ksh -c 'python3 lab/prism/storm.py' -D"), ["lab/prism/storm.py"])
         for shell in ("bash", "sh"):
             for options in ("-c", "-n +n -c", "-o pipefail -c", "-O extglob -c"):
                 with self.subTest(shell=shell, options=options):
