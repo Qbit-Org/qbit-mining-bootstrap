@@ -570,6 +570,20 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 continue
             if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
                 return None
+            if program == "env" and (option == "--null" or re.match(r"-[iv]*0", option)):
+                # `-0`/`--null` prints the environment NUL-terminated and takes
+                # no command, so like `--help` it ends the command: GNU
+                # coreutils 9.4 answered `env -0 echo hi`, `env --null echo
+                # hi`, `env -i0 echo hi`, `env -0i echo hi`, `env -v0 echo
+                # hi`, `env -0u FOO echo hi`, `env -0S 'echo hi'`, `env -0 -S
+                # 'echo hi'` and `env -S '-0 echo hi'` alike with "cannot
+                # specify --null (-0) with command" and exit 125, and printed
+                # `FOO=x` NUL-terminated for `env -i -0 FOO=x`. Only
+                # argument-free flags may precede the `0` in a cluster, as
+                # with the sudo modes below: `env -u0 echo hi` unsets the
+                # variable `0` and ran. An abbreviated `--nul` is outside this
+                # check, as it is for `--help`.
+                return None
             if program == "sudo" and (
                 option in {"--edit", "--remove-timestamp", "--validate"}
                 or re.match(r"-[ABbEHkNnPSis]*[eKv]", option)
@@ -2542,6 +2556,45 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
         text = "```sh\nenv -S 'sh -c'\n```"
         self.assertEqual(self.commands(text), [])
+
+    def test_env_null_mode_does_not_run_commands(self) -> None:
+        # GNU coreutils 9.4 refuses a command after `-0`/`--null` ("cannot
+        # specify --null (-0) with command", exit 125), whether the `0` stands
+        # alone, follows other argument-free flags in a cluster, or arrives
+        # through `-S`, so nothing after it runs.
+        for options in (
+            "-0", "--null", "'-0'", "-i0", "-0i", "-v0", "-iv0", "-0u FOO", "-0 -u FOO",
+            "-i -0", "-0 -i", "-0S", "-0 -S", "-0 --null",
+        ):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py",
+                "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                for delimiter in ("", "-- "):
+                    with self.subTest(options=options, argument=argument, delimiter=delimiter):
+                        text = f"env {options} {delimiter}{argument}"
+                        self.assertEqual(self.commands(text), [])
+                        self.assertEqual(len(self.references(text)), 1)
+                        self.assertEqual(
+                            self.commands(text + "; python3 lab/prism/storm.py"),
+                            ["lab/prism/storm.py"],
+                        )
+        for text in (
+            "env -S '-0 python3 -m lab.prism.deleted'",
+            "env -iS '-0 python3 -m lab.prism.deleted'",
+            "env -0S 'python3 -m lab.prism.deleted'",
+            "sudo env -0 python3 -m lab.prism.deleted",
+            "nohup env --null python3 lab/prism/deleted.py",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        text = "```sh\nenv -0 \\\n  python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+        # `-u0` and `-u 0` unset the variable `0` and run the command.
+        for options in ("-u0", "-u 0", "-iu0", "-i -u 0", "--unset=0", "--unset 0", "-S '-u 0'"):
+            with self.subTest(options=options):
+                self.assertEqual(self.commands(f"env {options} python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
 
     def test_sudo_chdir_arguments_before_commands_are_consumed(self) -> None:
         for options in (
