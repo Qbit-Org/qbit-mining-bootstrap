@@ -92,6 +92,7 @@ fi
 
 scratch="$(mktemp -d)"
 publishing=""
+download_pid=""
 cleanup() {
   rm -rf "${scratch}"
   if [[ -n "${publishing}" ]]; then
@@ -101,6 +102,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+cancel_download() {
+  # timeout forwards TERM to its curl process and reaps it before exiting.
+  # Ignore further cancellation while waiting for that cleanup to finish.
+  trap '' INT TERM
+  kill -TERM "${download_pid}" 2>/dev/null || true
+  wait "${download_pid}" 2>/dev/null || true
+  exit "$1"
+}
 
 verify() {
   printf '%s  %s\n' "${sha256}" "$1" | sha256sum --check --quiet
@@ -123,11 +133,27 @@ if [[ -n "${cached_asset}" && ( -e "${cached_asset}" || -L "${cached_asset}" ) ]
   printf 'install-pinned-tool: using cached %s\n' "${cached_asset}"
 else
   status=0
+  # Record signals during launch so cancellation cannot orphan the child
+  # between starting it and recording its PID.
+  cancelled=0
+  trap 'cancelled=130' INT
+  trap 'cancelled=143' TERM
   timeout --signal=KILL 210 \
     curl --fail --location --silent --show-error \
       --retry 12 --retry-delay 15 --retry-max-time 180 \
       --connect-timeout 10 --max-time 30 \
-      --output "${scratch}/download" "${url}" || status=$?
+      --output "${scratch}/download" "${url}" &
+  download_pid=$!
+  trap 'cancel_download 130' INT
+  trap 'cancel_download 143' TERM
+  if (( cancelled != 0 )); then
+    cancel_download "${cancelled}"
+  fi
+  # Unlike a foreground external command, Bash's wait services traps promptly.
+  wait "${download_pid}" || status=$?
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  download_pid=""
   if (( status == 137 )); then
     echo "install-pinned-tool: download of ${url} did not finish within 210 seconds" >&2
     exit 1
