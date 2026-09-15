@@ -236,7 +236,10 @@ impl Coordinator {
             tip: selected,
             lease,
         } = self.submit_admission().await?;
-        if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
+        if lease.is_none()
+            && last_poll.elapsed() >= self.config.health_timeout
+            && !selected.share_lease
+        {
             return Err(protocol_error(
                 "backend-rpc-unavailable",
                 "current chain state is unavailable",
@@ -246,7 +249,7 @@ impl Coordinator {
             // Re-reading only a revision here would pair a newer transaction
             // fence with the older balance digest checked by lease admission.
             lease
-                .revision_for(&tip_observation::PreparedIdentity::of(&context.prepared))
+                .revision_for(&context.prepared)
                 .ok_or_else(|| protocol_error("stale-job", "stale job"))?
         } else {
             self.submit_ledger.payout_revision().await.map_err(|_| {
@@ -391,7 +394,13 @@ impl Coordinator {
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
-                self.persist_share_pass(share, candidate, revision, start)
+                // Ordinary current-tip/candidate admission keeps its existing
+                // credit contract, including a proof that returned from lease
+                // selection to ordinary authority before admission finished.
+                let fence = lease
+                    .filter(|_| selected.share_lease)
+                    .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
+                self.persist_share_pass(share, candidate, revision, start, fence)
                     .await
             }
             Ok(candidate) => {
@@ -456,9 +465,10 @@ impl Coordinator {
         candidate: Option<Candidate>,
         revision: i64,
         start: tokio::time::Instant,
+        lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
-        let gate = Arc::new(CommitGate::default());
+        let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
         let refusable = candidate.is_none();

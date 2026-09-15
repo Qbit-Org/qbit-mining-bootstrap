@@ -29,6 +29,7 @@ use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod miner_submit;
 mod prepared_storage;
+mod publication_authority;
 mod submit_ledger;
 mod tip_observation;
 mod work_ledger;
@@ -171,14 +172,14 @@ pub struct Coordinator {
     pub ledger: Arc<Ledger>,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub rpc: Rpc,
-    pub prepared: RwLock<Option<Arc<Prepared>>>,
+    pub prepared: Arc<RwLock<Option<Arc<Prepared>>>>,
     pub refresh: watch::Sender<u64>,
     pub wake: Notify,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
-    readiness: RwLock<ReadinessState>,
-    pub observed_tip: RwLock<TipState>,
+    readiness: Arc<RwLock<ReadinessState>>,
+    pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     pub last_error: RwLock<Option<String>>,
@@ -553,13 +554,13 @@ impl Coordinator {
             ledger,
             rpc,
             refresh,
-            prepared: RwLock::new(None),
+            prepared: Arc::new(RwLock::new(None)),
             wake: Notify::new(),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
-            readiness: RwLock::new(ReadinessState::default()),
-            observed_tip: RwLock::new(TipState::default()),
+            readiness: Arc::new(RwLock::new(ReadinessState::default())),
+            observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
@@ -2114,13 +2115,16 @@ impl MiningBackend for Coordinator {
             wire.version_mask = stored.version_mask;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
-            let clock_started = Instant::now();
+            let clock_started = tokio::time::Instant::now();
             let now_ms = self.work_ledger.now_ms().await?;
-            if now_ms >= stored.expires_at_ms {
+            let deadline = publication_authority::AbsoluteDeadline::from_database(
+                now_ms,
+                clock_started,
+                stored.expires_at_ms,
+            )?;
+            if !deadline.live() {
                 return Ok(None);
             }
-            let resume_expires_at =
-                clock_started + Duration::from_millis((stored.expires_at_ms - now_ms) as u64);
             // Decode, fee checks and reconstruction may wait. A stored job
             // cannot borrow a superseding publication's replacement lease,
             // or recover authority revoked during those waits.
@@ -2135,10 +2139,10 @@ impl MiningBackend for Coordinator {
             {
                 return Ok(None);
             }
-            if Instant::now() >= resume_expires_at {
+            if !deadline.live() {
                 return Ok(None);
             }
-            wire.resume_expires_at = Some(resume_expires_at);
+            wire.resume_expires_at = Some(deadline.instant());
             // The absolute DB expiry is translated once to monotonic time;
             // moving the session between hosts never extends its work lease.
             let prepared = Arc::new(Prepared {

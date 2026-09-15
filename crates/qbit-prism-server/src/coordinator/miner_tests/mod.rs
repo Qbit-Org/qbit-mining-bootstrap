@@ -302,17 +302,17 @@ impl Fixture {
             ledger,
             submit_ledger: store.clone(),
             work_ledger: store.clone(),
-            prepared: RwLock::new(None),
+            prepared: Arc::new(RwLock::new(None)),
             refresh,
             wake: Notify::new(),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
-            readiness: RwLock::new(ReadinessState {
+            readiness: Arc::new(RwLock::new(ReadinessState {
                 last_poll: Some(Instant::now()),
                 ..Default::default()
-            }),
-            observed_tip: RwLock::new(TipState::default()),
+            })),
+            observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),

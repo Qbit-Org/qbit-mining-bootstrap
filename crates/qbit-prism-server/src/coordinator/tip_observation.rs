@@ -1,4 +1,5 @@
 //! Detected tips fence candidates immediately; published tips own miner credit.
+use super::publication_authority::{AbsoluteDeadline, AuthorityView};
 use super::*;
 use tokio::time::Instant as MonotonicInstant;
 
@@ -21,11 +22,59 @@ pub(super) struct PublishedLease {
     published_tip: Option<(String, u64)>,
     readiness_epoch: u64,
     current_revision: i64,
+    deadline: MonotonicInstant,
+}
+
+pub(super) struct WorkAuthority {
+    pub revision: i64,
+    pub lease: Option<PublishedLease>,
 }
 
 impl PublishedLease {
-    pub(super) fn revision_for(&self, identity: &PreparedIdentity) -> Option<i64> {
-        (self.identity == *identity).then_some(self.current_revision)
+    pub(super) fn revision_for(&self, prepared: &Prepared) -> Option<i64> {
+        self.identity
+            .matches(prepared)
+            .then_some(self.current_revision)
+    }
+
+    pub(super) fn select(
+        &self,
+        view: &AuthorityView<'_>,
+        config: &Config,
+    ) -> Result<Option<(Arc<Prepared>, TipView)>> {
+        ensure!(
+            view.readiness.generation == self.readiness_epoch && view.readiness.last_poll.is_some(),
+            "node readiness changed during replacement lease admission"
+        );
+        let Some(current) = view.prepared.as_ref().filter(|p| self.identity.matches(p)) else {
+            return Ok(None);
+        };
+        if view.tip.publication_stamp() != self.published_tip {
+            return Ok(None);
+        }
+        let tip = view
+            .tip
+            .authority(
+                config.submit_tip_max_age,
+                config.template_refresh_failure_exit,
+            )
+            .filter(|tip| {
+                Some(tip.hash.as_str()) == self.identity.parent.as_deref()
+                    && ((tip.share_lease && MonotonicInstant::now() <= self.deadline)
+                        || (view.tip.as_deref() == self.identity.parent.as_deref()
+                            && self.current_revision == self.identity.revision))
+            });
+        if tip.as_ref().is_some_and(|tip| !tip.share_lease) {
+            // Returning to the published parent grants only ordinary authority:
+            // the original current revision and a fresh poll are still required.
+            ensure!(
+                view.readiness
+                    .last_poll
+                    .is_some_and(|poll| poll.elapsed() < config.health_timeout),
+                "tip polling stale"
+            );
+        }
+        Ok(tip.map(|tip| (current.clone(), tip)))
     }
 }
 
@@ -42,6 +91,14 @@ pub(super) struct PreparedIdentity {
 }
 
 impl PreparedIdentity {
+    pub(super) fn matches(&self, prepared: &Prepared) -> bool {
+        self.key == prepared.storage_key
+            && self.generation == prepared.generation
+            && self.fingerprint == prepared.fingerprint
+            && self.window == prepared.window
+            && self.revision == prepared.snapshot.payout_revision
+            && self.parent.as_deref() == prepared.template["previousblockhash"].as_str()
+    }
     pub(super) fn from_stored(key: &str, prepared: &StoredPrepared, window: WindowRef) -> Self {
         Self {
             key: key.into(),
@@ -107,6 +164,32 @@ impl TipState {
         self.published
             .as_ref()
             .map(|tip| (tip.hash.clone(), tip.sequence))
+    }
+
+    /// Freeze the selected lease interval before waiting on its economic
+    /// proof. A later return/redeparture may grant a new admission a new
+    /// interval, but cannot renew an operation already waiting to persist.
+    fn lease_deadline(
+        &self,
+        max_age: Duration,
+        build_budget: Duration,
+    ) -> Result<MonotonicInstant> {
+        let ordinary = self
+            .published
+            .as_ref()
+            .context("published tip missing")?
+            .observed_at
+            .checked_add(max_age)
+            .context("tip authority deadline overflow")?;
+        let replacement = self
+            .divergence_started
+            .filter(|_| !build_budget.is_zero())
+            .map(|at| {
+                at.checked_add(build_budget)
+                    .context("replacement lease deadline overflow")
+            })
+            .transpose()?;
+        Ok(replacement.map_or(ordinary, |at| ordinary.max(at)))
     }
 
     /// A startup baseline fences work but cannot open stale grace.
@@ -261,22 +344,38 @@ impl Coordinator {
         expires_at_ms: Option<i64>,
         readiness_epoch: u64,
     ) -> Result<Option<i64>> {
+        Ok(self
+            .work_authority_in_epoch(identity, expires_at_ms, readiness_epoch)
+            .await?
+            .map(|authority| authority.revision))
+    }
+
+    pub(super) async fn work_authority_in_epoch(
+        &self,
+        identity: &PreparedIdentity,
+        expires_at_ms: Option<i64>,
+        readiness_epoch: u64,
+    ) -> Result<Option<WorkAuthority>> {
         let clock = if let Some(expires) = expires_at_ms {
             let requested_at = MonotonicInstant::now();
             let now = self.work_ledger.now_ms().await?;
-            if now >= expires {
+            let clock = AbsoluteDeadline::from_database(now, requested_at, expires)?;
+            if !clock.live() {
                 return Ok(None);
             }
-            Some((now, requested_at, expires))
+            Some(clock)
         } else {
             None
         };
+        // Preserve the existing database-first failure priority, even when a
+        // later coherent lease proof will supply the transaction revision.
         let revision = self.work_ledger.payout_revision().await?;
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
-        let published_work = self.prepared.read().await;
-        let readiness = self.readiness.read().await;
-        let selected = self.observed_tip.read().await;
+        let view = self.authority_view().await;
+        let published_work = &view.prepared;
+        let readiness = &view.readiness;
+        let selected = &view.tip;
         ensure!(
             readiness.generation == readiness_epoch,
             "node readiness changed during work admission"
@@ -293,7 +392,7 @@ impl Coordinator {
         if leased
             && !published_work
                 .as_deref()
-                .is_some_and(|p| PreparedIdentity::of(p) == *identity)
+                .is_some_and(|p| identity.matches(p))
         {
             return Ok(None);
         }
@@ -323,26 +422,34 @@ impl Coordinator {
             "tip polling stale"
         );
         let published_tip = selected.publication_stamp();
-        drop(selected);
-        drop(readiness);
-        drop(published_work);
-        let admitted_revision = if leased {
-            self.prove_published_lease(identity.clone(), published_tip, readiness_epoch)
+        let deadline = leased
+            .then(|| {
+                selected.lease_deadline(
+                    self.config.submit_tip_max_age,
+                    self.config.template_refresh_failure_exit,
+                )
+            })
+            .transpose()?;
+        drop(view);
+        let admitted = if let Some(deadline) = deadline {
+            self.prove_published_lease(identity.clone(), published_tip, readiness_epoch, deadline)
                 .await?
-                .map(|(_, _, lease)| lease.current_revision)
+                .map(|(_, _, lease)| WorkAuthority {
+                    revision: lease.current_revision,
+                    lease: Some(lease),
+                })
         } else {
-            (identity.revision == revision).then_some(revision)
+            (identity.revision == revision).then_some(WorkAuthority {
+                revision,
+                lease: None,
+            })
         };
-        if let Some((now, requested_at, expires)) = clock {
-            let elapsed_ms = i64::try_from(requested_at.elapsed().as_millis())
-                .context("issued expiry clock overflow")?;
-            if now.checked_add(elapsed_ms).is_none_or(|now| now >= expires) {
-                return Ok(None);
-            }
+        if clock.is_some_and(|clock| !clock.live()) {
+            return Ok(None);
         }
         // A known superseded payout is an unknown/retired resumable job,
         // not a failed database lookup. Keep that outcome distinct.
-        Ok(admitted_revision)
+        Ok(admitted)
     }
 
     async fn prove_published_lease(
@@ -350,13 +457,19 @@ impl Coordinator {
         identity: PreparedIdentity,
         published_tip: Option<(String, u64)>,
         readiness_epoch: u64,
+        deadline: MonotonicInstant,
     ) -> Result<Option<(Arc<Prepared>, TipView, PublishedLease)>> {
+        // This coherent proof reads/hashes the current balance set per lease
+        // admission. Caching just the publication key would miss mid-lease
+        // balance changes; revisit only with a transactionally versioned digest
+        // producer if recipient-count cost makes this bounded path too costly.
         let state = self.work_ledger.payout_state().await?;
         let lease = PublishedLease {
             identity,
             published_tip,
             readiness_epoch,
             current_revision: state.payout_revision,
+            deadline,
         };
         let selected = self.select_validated_lease(&lease).await?;
         if selected.as_ref().is_some_and(|(_, tip)| tip.share_lease)
@@ -371,45 +484,7 @@ impl Coordinator {
         &self,
         lease: &PublishedLease,
     ) -> Result<Option<(Arc<Prepared>, TipView)>> {
-        let prepared = self.prepared.read().await;
-        let readiness = self.readiness.read().await;
-        let selected = self.observed_tip.read().await;
-        ensure!(
-            readiness.generation == lease.readiness_epoch && readiness.last_poll.is_some(),
-            "node readiness changed during replacement lease admission"
-        );
-        let Some(current) = prepared
-            .as_ref()
-            .filter(|p| PreparedIdentity::of(p) == lease.identity)
-        else {
-            return Ok(None);
-        };
-        if selected.publication_stamp() != lease.published_tip {
-            return Ok(None);
-        }
-        let tip = selected
-            .authority(
-                self.config.submit_tip_max_age,
-                self.config.template_refresh_failure_exit,
-            )
-            .filter(|tip| {
-                Some(tip.hash.as_str()) == lease.identity.parent.as_deref()
-                    && (tip.share_lease
-                        || (selected.as_deref() == lease.identity.parent.as_deref()
-                            && lease.current_revision == lease.identity.revision))
-            });
-        if tip.as_ref().is_some_and(|tip| !tip.share_lease) {
-            // The node may return to the published parent during the state
-            // wait. Its ordinary authority needs the original revision and
-            // fresh polling; a previously selected lease grants no override.
-            ensure!(
-                readiness
-                    .last_poll
-                    .is_some_and(|poll| poll.elapsed() < self.config.health_timeout),
-                "tip polling stale"
-            );
-        }
-        Ok(tip.map(|tip| (current.clone(), tip)))
+        lease.select(&self.authority_view().await, &self.config)
     }
 
     pub(super) async fn revalidate_published_lease(&self, lease: &PublishedLease) -> Result<bool> {
@@ -419,13 +494,13 @@ impl Coordinator {
     pub(super) async fn submit_admission(&self) -> Result<SubmitAdmission, StratumError> {
         // Match publication order. A tip's lease belongs to the payout selected
         // with it, never a prepared snapshot captured before an awaited lookup.
-        // Readiness is checked separately; never take it after observed_tip.
         let lease_candidate = {
-            let prepared = self.prepared.read().await;
-            let current = prepared
+            let view = self.tip_publication_view().await;
+            let current = view
+                .prepared
                 .clone()
                 .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
-            let state = self.observed_tip.read().await;
+            let state = &view.tip;
             if let Some(tip) = state.authority(
                 self.config.submit_tip_max_age,
                 self.config.template_refresh_failure_exit,
@@ -437,15 +512,30 @@ impl Coordinator {
                         lease: None,
                     });
                 }
-                Some((PreparedIdentity::of(&current), state.publication_stamp()))
+                let deadline = state
+                    .lease_deadline(
+                        self.config.submit_tip_max_age,
+                        self.config.template_refresh_failure_exit,
+                    )
+                    .map_err(|_| {
+                        protocol_error(
+                            "backend-rpc-unavailable",
+                            "current chain state is unavailable",
+                        )
+                    })?;
+                Some((
+                    PreparedIdentity::of(&current),
+                    state.publication_stamp(),
+                    deadline,
+                ))
             } else {
                 None
             }
         };
-        if let Some((identity, published_tip)) = lease_candidate {
+        if let Some((identity, published_tip, deadline)) = lease_candidate {
             let readiness_epoch = self.readiness.read().await.generation;
             let (current, tip, lease) = self
-                .prove_published_lease(identity, published_tip, readiness_epoch)
+                .prove_published_lease(identity, published_tip, readiness_epoch, deadline)
                 .await
                 .map_err(|_| {
                     protocol_error(
@@ -479,11 +569,12 @@ impl Coordinator {
         // Work may have published during the RPC. Select that complete pair
         // now, but only a publication matching the answer supplies provenance.
         // RPC itself cannot publish a transition or restore a disabled lease.
-        let prepared = self.prepared.read().await;
-        let current = prepared
+        let view = self.tip_publication_view().await;
+        let current = view
+            .prepared
             .clone()
             .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
-        let state = self.observed_tip.read().await;
+        let state = &view.tip;
         let mut tip = state
             .published
             .clone()

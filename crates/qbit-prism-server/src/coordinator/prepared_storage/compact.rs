@@ -8,6 +8,7 @@
 //! original bundle build. Existing SQL-order legacy builds remain unchanged;
 //! completed noncanonical bundles cannot be converted by rewriting their hash.
 use super::*;
+use crate::coordinator::publication_authority::{AbsoluteDeadline, AuthorityViewMut};
 use crate::coordinator::tip_observation::PreparedIdentity;
 use crate::ledger::{CompactPrepared, PreparedAuditHashes, PreparedTemplate};
 
@@ -78,38 +79,17 @@ pub(in crate::coordinator) struct CompactBuildProof {
 pub(in crate::coordinator) struct ReservedCompact<'a> {
     captured: &'a CapturedCompactPrepared,
     pub inserted: bool,
-}
-
-struct ReservationClock {
-    now_ms: i64,
-    requested_at: tokio::time::Instant,
-}
-
-impl ReservationClock {
-    fn ensure_live(&self, expires_at_ms: i64) -> Result<()> {
-        // Count time spent waiting for the clock reply too, conservatively.
-        let elapsed_ms = i64::try_from(self.requested_at.elapsed().as_millis())
-            .context("reservation clock overflow")?;
-        ensure!(
-            self.now_ms
-                .checked_add(elapsed_ms)
-                .is_some_and(|now| now < expires_at_ms),
-            "prepared reservation deadline elapsed"
-        );
-        Ok(())
-    }
+    deadline: AbsoluteDeadline,
 }
 
 /// A short, synchronous installation boundary. All I/O finished before these
 /// ordered locks were acquired. Dropping it publishes nothing.
 #[must_use]
 pub(in crate::coordinator) struct CompactPublicationGuard<'a> {
-    prepared: tokio::sync::RwLockWriteGuard<'a, Option<Arc<Prepared>>>,
-    readiness: tokio::sync::RwLockWriteGuard<'a, ReadinessState>,
-    tip: tokio::sync::RwLockWriteGuard<'a, TipState>,
+    view: AuthorityViewMut<'a>,
     refresh: &'a watch::Sender<u64>,
     captured: &'a CapturedCompactPrepared,
-    clock: ReservationClock,
+    clock: AbsoluteDeadline,
     template_max_age: Duration,
 }
 
@@ -117,15 +97,14 @@ impl CompactPublicationGuard<'_> {
     /// No runtime caller is wired in this prerequisite slice. Future callers
     /// install immediately, under their original outer operation deadline.
     pub fn publish(mut self) -> Result<()> {
-        self.clock
-            .ensure_live(self.captured.original_expires_at_ms)?;
+        ensure!(self.clock.live(), "prepared reservation deadline elapsed");
         crate::readiness::validate_template_age(
             &self.captured.original.template,
             self.template_max_age,
         )?;
-        self.tip.publish(&self.captured.record.parent_hash)?;
-        *self.prepared = Some(self.captured.original.clone());
-        self.readiness.last_poll = Some(Instant::now());
+        self.view.tip.publish(&self.captured.record.parent_hash)?;
+        *self.view.prepared = Some(self.captured.original.clone());
+        self.view.readiness.last_poll = Some(Instant::now());
         self.refresh.send_replace(self.captured.original.generation);
         Ok(())
     }
@@ -332,13 +311,11 @@ impl Coordinator {
     /// This captures revocation/publication identity without creating readiness.
     /// The caller's one outer deadline covers this, build, reserve and install.
     pub(in crate::coordinator) async fn begin_compact_build(&self) -> CompactBuildProof {
-        let prepared = self.prepared.read().await;
-        let readiness = self.readiness.read().await;
-        let tip = self.observed_tip.read().await;
+        let view = self.authority_view().await;
         CompactBuildProof {
-            readiness_epoch: readiness.generation,
-            publication: prepared.as_deref().map(PreparedIdentity::of),
-            published_tip: tip.publication_stamp(),
+            readiness_epoch: view.readiness.generation,
+            publication: view.prepared.as_deref().map(PreparedIdentity::of),
+            published_tip: view.tip.publication_stamp(),
         }
     }
 
@@ -353,24 +330,25 @@ impl Coordinator {
             "node readiness changed during compact build"
         );
         ensure!(
-            prepared.map(PreparedIdentity::of) == proof.publication
-                && tip.publication_stamp() == proof.published_tip,
+            match (&proof.publication, prepared) {
+                (Some(identity), Some(prepared)) => identity.matches(prepared),
+                (None, None) => true,
+                _ => false,
+            } && tip.publication_stamp() == proof.published_tip,
             "work publication changed during compact build"
         );
         Ok(())
     }
 
     async fn check_compact_build_current(&self, proof: &CompactBuildProof) -> Result<()> {
-        let prepared = self.prepared.read().await;
-        let readiness = self.readiness.read().await;
-        let tip = self.observed_tip.read().await;
-        Self::check_compact_build_stamp(proof, prepared.as_deref(), &readiness, &tip)
+        let view = self.authority_view().await;
+        Self::check_compact_build_stamp(proof, view.prepared.as_deref(), &view.readiness, &view.tip)
     }
 
     async fn prove_fresh_compact(
         &self,
         captured: &CapturedCompactPrepared,
-    ) -> Result<ReservationClock> {
+    ) -> Result<AbsoluteDeadline> {
         let proof = captured
             .build_proof
             .as_ref()
@@ -403,10 +381,11 @@ impl Coordinator {
             "payout snapshot stale"
         );
         let requested_at = tokio::time::Instant::now();
-        let clock = ReservationClock {
-            now_ms: self.work_ledger.now_ms().await?,
+        let clock = AbsoluteDeadline::from_database(
+            self.work_ledger.now_ms().await?,
             requested_at,
-        };
+            captured.original_expires_at_ms,
+        )?;
         // A slow database lookup cannot leave the earlier node proof in force.
         // These calls may revoke readiness; never hold its lock across them.
         let info = self.ready_tip(parent).await?;
@@ -423,15 +402,18 @@ impl Coordinator {
             "payout snapshot stale"
         );
         self.ensure_template_fresh(&original.template).await?;
-        let prepared = self.prepared.read().await;
-        let readiness = self.readiness.read().await;
-        let tip = self.observed_tip.read().await;
-        Self::check_compact_build_stamp(proof, prepared.as_deref(), &readiness, &tip)?;
+        let view = self.authority_view().await;
+        Self::check_compact_build_stamp(
+            proof,
+            view.prepared.as_deref(),
+            &view.readiness,
+            &view.tip,
+        )?;
         ensure!(
-            tip.as_deref() == Some(parent),
+            view.tip.as_deref() == Some(parent),
             "compact tip observation superseded"
         );
-        clock.ensure_live(captured.original_expires_at_ms)?;
+        ensure!(clock.live(), "prepared reservation deadline elapsed");
         Ok(clock)
     }
 
@@ -442,7 +424,7 @@ impl Coordinator {
         &self,
         captured: &'a CapturedCompactPrepared,
     ) -> Result<ReservedCompact<'a>> {
-        self.prove_fresh_compact(captured).await?;
+        let deadline = self.prove_fresh_compact(captured).await?;
         let inserted = self
             .work_ledger
             .save_compact_prepared(
@@ -455,7 +437,12 @@ impl Coordinator {
             )
             .await?;
         self.prove_fresh_compact(captured).await?;
-        Ok(ReservedCompact { captured, inserted })
+        ensure!(deadline.live(), "prepared reservation deadline elapsed");
+        Ok(ReservedCompact {
+            captured,
+            inserted,
+            deadline,
+        })
     }
 
     /// Revalidate after every reservation/caller wait, then take the existing
@@ -465,29 +452,22 @@ impl Coordinator {
         reserved: ReservedCompact<'a>,
     ) -> Result<CompactPublicationGuard<'a>> {
         let captured = reserved.captured;
-        let clock = self.prove_fresh_compact(captured).await?;
-        let (prepared, readiness, tip) = loop {
+        let clock = reserved.deadline;
+        self.prove_fresh_compact(captured).await?;
+        let view = loop {
             // No asynchronous gap between the last external proof and these
             // coupled locks. If acquisition would wait, release partial locks,
             // wait for the boundary, then refresh the external proof.
-            let available = (|| {
-                Some((
-                    self.prepared.try_write().ok()?,
-                    self.readiness.try_write().ok()?,
-                    self.observed_tip.try_write().ok()?,
-                ))
-            })();
+            let available = self.try_authority_view_mut();
             if let Some(guards) = available {
                 break guards;
             }
             {
-                let _prepared = self.prepared.write().await;
-                let _readiness = self.readiness.write().await;
-                let _tip = self.observed_tip.write().await;
+                let _view = self.authority_view_mut().await;
             }
             // Keep the first clock: retries cannot renew this operation's
             // fixed expiry, including when a clock reply was delayed.
-            clock.ensure_live(captured.original_expires_at_ms)?;
+            ensure!(clock.live(), "prepared reservation deadline elapsed");
             self.prove_fresh_compact(captured).await?;
         };
         Self::check_compact_build_stamp(
@@ -495,23 +475,21 @@ impl Coordinator {
                 .build_proof
                 .as_ref()
                 .context("pre-build authority proof missing")?,
-            prepared.as_deref(),
-            &readiness,
-            &tip,
+            view.prepared.as_deref(),
+            &view.readiness,
+            &view.tip,
         )?;
         ensure!(
-            tip.as_deref() == Some(captured.record.parent_hash.as_str()),
+            view.tip.as_deref() == Some(captured.record.parent_hash.as_str()),
             "compact tip observation superseded"
         );
-        clock.ensure_live(captured.original_expires_at_ms)?;
+        ensure!(clock.live(), "prepared reservation deadline elapsed");
         crate::readiness::validate_template_age(
             &captured.original.template,
             self.config.template_max_age,
         )?;
         Ok(CompactPublicationGuard {
-            prepared,
-            readiness,
-            tip,
+            view,
             refresh: &self.refresh,
             captured,
             clock,
