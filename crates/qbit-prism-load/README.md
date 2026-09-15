@@ -376,7 +376,7 @@ target/release/qbit-prism-load \
 | 2 | The harness failed with an error: before it could measure anything, or, rarely, while reconciling or writing its outputs after the load. The error is printed on stderr, redacted. Once the invocation has taken `--out`, the side report is written with `failed.error` naming the failure and nothing that could be read as a measurement; a failure after the phases does not recover their numbers. No artifact is written |
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, a committed share was never acknowledged and nothing explains it, or PostgreSQL holds a run-prefixed row that no phase offered |
-| 5 | An ACK/commit divergence: PostgreSQL holds a share whose acknowledgement never reached the client. The server refused it with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324), or the submit got no response because the socket closed before its answer was read (`no_response_commits`). Nothing was lost in any of the three |
+| 5 | An ACK/commit divergence: PostgreSQL holds a share whose acknowledgement never reached the client, for a reason inside the run. The server refused it with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324), or the socket closed mid-run before its answer was read. Nothing was lost in any of the three. A submit still outstanding when the drain expires does **not** exit 5: see below |
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus the 10 s drain margin, the `mid_flight_kill` phase's relaunched frontend exited or did not answer `/healthz` within `--work-timeout`, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 | 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
@@ -543,6 +543,17 @@ The side report repeats all of this under `honest_value_notes`.
   really used and annotated them as unread (#288); the server has since answered
   that question, so leaving them out is now the honest answer rather than the
   lossy one.
+- **A tail the measurement window cut off is reported, not counted as a
+  divergence.** A submit still outstanding when the teardown drain expires had
+  its window end underneath it: the server is still allowed to answer, and in
+  production the connection would still be there to carry the answer. Such a
+  share, if PostgreSQL then holds it, is in `no_response_commits` with
+  `window_ended: true`, and the run says so on stderr, but it does not by itself
+  make the run exit 5. Only a no-response caused *inside* the run does.
+  Measured reason: under 2000 sessions against a delayed database the
+  `slow_database` ACK p99 was 25.3 s against a 25 s drain limit, so a tail is
+  near-certain. Exiting 5 for it would have fired on nearly every run and left
+  the code unable to distinguish a real divergence from where the run stopped.
 - **An ACK/commit divergence is counted, never smoothed over.** A share
   PostgreSQL holds after the server refused it is in `ack_commit_divergence`,
   in `unexpected_committed_share_ids` and in `rejected_valid_shares`, and it

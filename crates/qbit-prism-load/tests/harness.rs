@@ -1634,6 +1634,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: 0,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     assert_ne!(run::EXIT_PREMISE_CONTRADICTED, run::EXIT_OK);
@@ -1818,6 +1819,7 @@ async fn a_replication_mode_other_than_the_declared_one_refuses_qualification() 
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: 0,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     Ok(())
@@ -2284,6 +2286,7 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: 0,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(clean.exit_code(), run::EXIT_OK);
     assert_eq!(clean.explanation(std::path::Path::new("r.json")), None);
@@ -2294,6 +2297,7 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
         divergences: 1,
         unknown_outcome_commits: 1,
         no_response_commits: 1,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(late.exit_code(), run::EXIT_BLOCKED);
     let explanation = late
@@ -3158,6 +3162,14 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
         json!("socket closed: end of stream")
     );
     assert_eq!(detail["classification"], json!("transport-indeterminate"));
+    // A peer close mid-run, not the measurement window ending underneath the
+    // submit, so it counts toward the exit code.
+    assert_eq!(detail["window_ended"], json!(false));
+    let mid_run = gaps
+        .no_response_commits
+        .iter()
+        .filter(|share| share["window_ended"] != json!(true))
+        .count();
     let outcome = RunOutcome {
         withhold: None,
         durability_findings: 0,
@@ -3165,6 +3177,7 @@ fn a_committed_share_whose_answer_was_lost_is_not_a_durability_loss() {
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: gaps.no_response_commits.len(),
+        no_response_commits_mid_run: mid_run,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_ACK_COMMIT_DIVERGENCE);
     assert_ne!(
@@ -3257,6 +3270,7 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: 0,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_DURABILITY);
 
@@ -3419,6 +3433,7 @@ fn an_unrecognised_rejection_reason_is_named_in_the_summary_and_the_refusal() {
         divergences: 0,
         unknown_outcome_commits: 0,
         no_response_commits: 0,
+        no_response_commits_mid_run: 0,
     };
     assert_eq!(outcome.exit_code(), run::EXIT_OK);
 }
@@ -6858,4 +6873,43 @@ fn a_phase_that_acknowledged_nothing_has_no_ack_latency_to_state() {
         !run::has_no_ack_latency(&measured),
         "a phase with acknowledgements states its latency"
     );
+}
+
+#[test]
+fn a_tail_the_measurement_window_cut_off_is_not_a_divergence() {
+    use qbit_prism_load::run::RunOutcome;
+    // A submit still outstanding when the drain expires had its window end
+    // underneath it: the server is allowed to answer a moment later, and in
+    // production the connection would still be there to carry the answer. A
+    // socket the peer closed mid-run is the failure this harness exists to
+    // catch. Conflating them would make exit 5 fire on nearly every run under
+    // load -- measured: a slow_database ACK p99 of 25.3 s against a 25 s drain
+    // -- and stop distinguishing a real divergence from where the run stopped.
+    let window_ended = RunOutcome {
+        withhold: None,
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: 8,
+        no_response_commits_mid_run: 0,
+    };
+    assert_eq!(window_ended.exit_code(), run::EXIT_OK);
+    assert!(
+        window_ended
+            .explanation(std::path::Path::new("report.json"))
+            .is_some_and(|line| line.contains("measurement window closed")),
+        "a cut-off tail is still reported, it just is not a divergence"
+    );
+
+    let mid_run = RunOutcome {
+        withhold: None,
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: 8,
+        no_response_commits_mid_run: 3,
+    };
+    assert_eq!(mid_run.exit_code(), run::EXIT_ACK_COMMIT_DIVERGENCE);
 }

@@ -359,6 +359,12 @@ pub struct RunOutcome<'a> {
     /// Committed shares whose submit got no response: the share is there,
     /// only its acknowledgement is missing.
     pub no_response_commits: usize,
+    /// Of those, the ones whose answer was lost mid-run rather than because the
+    /// measurement window closed underneath the submit. Only these mean the
+    /// miner and the database disagree for a reason the run should answer for;
+    /// a tail left outstanding when the drain expires is an artefact of where
+    /// the window ended, and the server is still allowed to answer it.
+    pub no_response_commits_mid_run: usize,
 }
 
 impl RunOutcome<'_> {
@@ -379,7 +385,9 @@ impl RunOutcome<'_> {
         if self.harness_bug_rejections > 0 {
             return EXIT_HARNESS_BUG_REJECTIONS;
         }
-        if self.divergences > 0 || self.unknown_outcome_commits > 0 || self.no_response_commits > 0
+        if self.divergences > 0
+            || self.unknown_outcome_commits > 0
+            || self.no_response_commits_mid_run > 0
         {
             return EXIT_ACK_COMMIT_DIVERGENCE;
         }
@@ -413,9 +421,17 @@ impl RunOutcome<'_> {
                  {report}",
                 self.unknown_outcome_commits
             ),
+            None if self.no_response_commits_mid_run > 0 => format!(
+                "{} shares committed whose submit got no response mid-run: present in \
+                 PostgreSQL, acknowledgement lost in transit, nothing lost; see {report}",
+                self.no_response_commits_mid_run
+            ),
+            // Said even though the run exits 0, because it is the difference
+            // between a clean run and a clean run with a tail the window cut off.
             None if self.no_response_commits > 0 => format!(
-                "{} shares committed whose submit got no response: present in PostgreSQL, \
-                 acknowledgement lost in transit, nothing lost; see {report}",
+                "{} shares committed after the measurement window closed on their submit: \
+                 present in PostgreSQL, nothing lost, and the server was still allowed to \
+                 answer; see {report}",
                 self.no_response_commits
             ),
             None => return None,
@@ -1861,6 +1877,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         divergences: divergences.len(),
         unknown_outcome_commits: unknown_outcome_commits.len(),
         no_response_commits: no_response_commits.len(),
+        no_response_commits_mid_run: no_response_commits
+            .iter()
+            .filter(|share| share["window_ended"] != serde_json::Value::Bool(true))
+            .count(),
     };
     if let Some(line) = outcome.explanation(&report_path) {
         eprintln!("{line}");
@@ -3248,8 +3268,9 @@ pub fn classify_gaps(
                         "frontend": record.map(|record| record.frontend),
                         "session": record.map(|record| record.session),
                         "job_id": record.map(|record| record.job_id.clone()),
-                        "no_response_reason": reason,
+                        "no_response_reason": reason.clone(),
                         "classification": "transport-indeterminate",
+                        "window_ended": reason.as_deref() == Some(client::RUN_ENDED),
                     }));
                 }
                 GapKind::DurabilityLoss => unexplained.push(share.clone()),

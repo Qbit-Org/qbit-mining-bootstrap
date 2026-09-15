@@ -143,6 +143,16 @@ pub struct JobState {
 }
 
 /// What the server answered, or did not.
+/// The `NoResponse` reason recorded when the run itself stopped waiting,
+/// rather than the peer closing the socket mid-run.
+///
+/// The distinction decides an exit code. A submit still outstanding when the
+/// drain expires is one whose measurement window ended underneath it: the
+/// server is allowed to answer a moment later, and in production the
+/// connection would still be there to carry the answer. A socket the peer
+/// closed mid-run is the failure this harness exists to catch.
+pub const RUN_ENDED: &str = "run ended";
+
 #[derive(Clone, Debug)]
 pub enum Outcome {
     Accepted,
@@ -815,7 +825,7 @@ async fn run_session(
         }
     }
     if let Some(mut active) = connection {
-        fail_pending(&mut active, "run ended", &shared, &config, &outstanding);
+        fail_pending(&mut active, RUN_ENDED, &shared, &config, &outstanding);
         active.drop_reader();
     }
 }
