@@ -180,11 +180,13 @@ fn histogram_buckets_are_cumulative_and_rejects_are_closed() {
         metrics.observe_share_ack(AckResult::Accepted, Duration::from_millis(millis));
     }
     for reason in RejectReason::ALL {
-        metrics.record_rejection(*reason);
+        let normalized = RejectReason::from_reason_id(Some(reason.as_str()));
+        assert_eq!(normalized, *reason);
+        metrics.record_rejection(normalized);
     }
     assert_eq!(
         RejectReason::from_reason_id(Some("attacker-controlled")),
-        RejectReason::InternalError
+        RejectReason::Unrecognised
     );
     let body = metrics.render();
     assert_eq!(sample(&body, "qbit_prism_stale_shares_total"), 2.);
@@ -227,6 +229,81 @@ fn histogram_buckets_are_cumulative_and_rejects_are_closed() {
         reasons,
         RejectReason::ALL.iter().map(|r| r.as_str()).collect()
     );
+}
+
+#[tokio::test]
+async fn ack_deadline_buckets_resolve_both_edges_without_changing_other_histograms() {
+    use metrics::{LockKind, Outcome};
+
+    let metrics = Arc::new(Metrics::default());
+    // On either side of each edge, at each edge, and beyond the finite ladder.
+    let millis = [14_999, 15_000, 15_001, 19_999, 20_000, 20_001, 35_000];
+    for millis in millis {
+        let elapsed = Duration::from_millis(millis);
+        for result in AckResult::ALL {
+            metrics.observe_share_ack(*result, elapsed);
+        }
+        metrics.observe_first_offer(elapsed);
+        for result in Outcome::ALL {
+            metrics.observe_pool_acquire(*result, elapsed);
+            for lock in LockKind::ALL {
+                metrics.observe_advisory_lock(*lock, *result, elapsed);
+            }
+        }
+    }
+    let state = state(metrics.clone());
+    state.publish_metrics(metrics.render()).unwrap();
+    let body = scrape(&state).await;
+    assert_complete_registry(&body);
+    let mut histograms = 0;
+    for line in body.lines().filter(|line| {
+        line.contains("_count{") || line.starts_with("qbit_prism_block_submit_seconds_count ")
+    }) {
+        let (key, _) = line.rsplit_once(' ').unwrap();
+        let (prefix, labels) = key.split_once("_count").unwrap();
+        let is_ack = prefix == "qbit_prism_share_ack_seconds";
+        let labels = labels.trim_matches(['{', '}']);
+        let labels = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{labels},")
+        };
+        let mut expected = vec![
+            ("0.01", 0.),
+            ("0.025", 0.),
+            ("0.05", 0.),
+            ("0.1", 0.),
+            ("0.25", 0.),
+            ("0.5", 0.),
+            ("1", 0.),
+            ("2.5", 0.),
+            ("5", 0.),
+            ("10", 0.),
+            ("30", 6.),
+            ("+Inf", 7.),
+        ];
+        if is_ack {
+            expected.extend([("15", 2.), ("20", 5.)]);
+        }
+        let bucket_prefix = format!("{prefix}_bucket{{{labels}le=");
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(&bucket_prefix))
+                .count(),
+            expected.len()
+        );
+        for (bound, count) in expected {
+            assert_eq!(
+                sample(&body, &format!("{bucket_prefix}\"{bound}\"}}")),
+                count
+            );
+        }
+        assert_eq!(sample(&body, key), 7.);
+        assert!((sample(&body, &key.replace("_count", "_sum")) - 140.).abs() < 1e-9);
+        histograms += 1;
+    }
+    // Two ACK outcomes, first offer, two pool outcomes, six lock/outcome pairs.
+    assert_eq!(histograms, 11);
 }
 
 /// Label pairs of every sample in `family`, which must be a closed label set.

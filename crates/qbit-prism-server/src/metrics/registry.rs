@@ -3,8 +3,16 @@ use super::{Labels, LockKind, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
+/// Default ladder for first-offer, pool-acquisition and advisory-lock timings.
 pub const BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 30.];
-const BUCKET_COUNT: usize = BUCKETS.len();
+// Resolve the default share commit deadline and its reconciliation grace end.
+// ACK time includes work outside that deadline; these are elapsed-time buckets.
+const SHARE_ACK_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 15., 20., 30.,
+];
+// Fixed storage keeps event recording allocation-free. Shorter ladders use only
+// their prefix; observation and rendering both select the family's ladder.
+const BUCKET_COUNT: usize = SHARE_ACK_BUCKETS.len();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -86,6 +94,13 @@ families! {
 }
 
 impl Family {
+    fn buckets(self) -> &'static [f64] {
+        match self {
+            Self::ShareAck => SHARE_ACK_BUCKETS,
+            _ => BUCKETS,
+        }
+    }
+
     pub(super) fn is_live(self) -> bool {
         self.is_collection() || self == Self::PoolAcquire
     }
@@ -220,7 +235,7 @@ impl Registry {
             sum,
         } = self.sample(family, labels.into(), 0.)
         {
-            for (limit, value) in BUCKETS.iter().zip(buckets) {
+            for (limit, value) in family.buckets().iter().zip(buckets) {
                 if seconds <= *limit {
                     *value += 1;
                 }
@@ -257,7 +272,7 @@ impl Registry {
                         count,
                         sum,
                     } => {
-                        for (limit, value) in BUCKETS.iter().zip(buckets) {
+                        for (limit, value) in family.buckets().iter().zip(buckets) {
                             let limit = limit.to_string();
                             line(
                                 &mut body,

@@ -80,7 +80,7 @@ labels!(RejectReason {
     BackendRpcUnavailable => "backend-rpc-unavailable",
     InternalError => "internal-error", PoolClosed => "pool-closed",
     LedgerConfirmationFailed => "ledger-confirmation-failed",
-    LedgerOutcomeUnknown => "ledger-outcome-unknown"
+    LedgerOutcomeUnknown => "ledger-outcome-unknown", Unrecognised => "unrecognised"
 });
 // Existing admission limits only; never a peer address or username.
 labels!(ConnectionRefusalReason { GlobalLimit => "global_limit", UsernameLimit => "username_limit" });
@@ -92,11 +92,16 @@ labels!(StaleJobCause {
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.
+    /// Missing reasons retain the legacy internal-error classification; present
+    /// but unrecognised IDs (including empty strings) signal label drift.
     pub fn from_reason_id(reason: Option<&str>) -> Self {
+        let Some(reason) = reason else {
+            return Self::InternalError;
+        };
         Self::ALL
             .iter()
             .copied()
-            .find(|value| Some(value.as_str()) == reason)
-            .unwrap_or(Self::InternalError)
+            .find(|value| value.as_str() == reason)
+            .unwrap_or(Self::Unrecognised)
     }
 }
