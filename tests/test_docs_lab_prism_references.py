@@ -90,27 +90,32 @@ PROSE_TRAILING_PUNCTUATION = ".,;:!?*()[]{}|"
 URL_REFERENCE_PREFIX = re.compile(r"https?://\S+/$")
 # A `lab/prism` path names the repository's own tree only where a path token
 # starts: at the start of a line or after whitespace, behind any Markdown
-# openers `( [ { < * |` that begin that token, or after a Markdown link's `](`;
-# then behind any opening quotes or backticks and at most one `./`. It also
-# starts directly after the ref of a GitHub blob, tree or raw URL. `\b` alone
-# matched inside `my-lab/prism`, `my*lab/prism`, `my(lab/prism`,
-# `my=lab/prism`, `vendor/lab/prism`, `/tmp/lab/prism` and
-# `https://example.com/lab/prism`, which are other paths. `../lab/prism` and
+# openers `( [ { < * | >` that begin that token, or after a Markdown link's
+# `](`; then behind any opening quotes or backticks and at most one `./`. The
+# `>` is the blockquote marker, which needs no space after it: `>lab/prism/x`
+# and the nested `>>lab/prism/x` quote the root path as `> lab/prism/x` does.
+# It also starts directly after the ref of a GitHub blob, tree or raw URL.
+# `\b` alone matched inside `my-lab/prism`, `my*lab/prism`, `my(lab/prism`,
+# `my=lab/prism`, `my>lab/prism`, `vendor/lab/prism`, `/tmp/lab/prism` and
+# `https://example.com/lab/prism`, which are other paths: an opener starts a
+# token only at the start of the line or after whitespace. `../lab/prism` and
 # `/lab/prism` are not the root either: a scan of doc text does not know which
 # directory the doc sits in, so neither spelling can be resolved. Whitespace
 # still starts a token inside a code span, so `echo lab/prism/x` is read.
 PATH_ROOT_PREFIX = re.compile(
-    r"(?:(?:^|\s)[(\[{<*|]*[`'\"]*(?:\./)?"
+    r"(?:(?:^|\s)[(\[{<*|>]*[`'\"]*(?:\./)?"
     r"|\]\([<`'\"]*(?:\./)?"
     r"|https?://github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[^/\s]+/)$"
 )
 # A dotted `lab.prism` module is the repository's own only where a token
-# starts, as `PATH_ROOT_PREFIX` reads it but with no `./` or URL form: a module
-# name is never a path. A shell `$'` or `$"` may open the token, so the prose
-# net still reads `-m $'lab.prism.x"`. `\b` alone matched inside
-# `vendor.lab.prism`, `my-lab.prism`, `../lab.prism`, `/tmp/lab.prism` and
-# `https://example.com/lab.prism`, which name other modules or paths.
-MODULE_ROOT_PREFIX = re.compile(r"(?:(?:^|\s)[(\[{<*|]*(?:\$['\"])?[`'\"]*|\]\([<`'\"]*)$")
+# starts, as `PATH_ROOT_PREFIX` reads it (the blockquote `>lab.prism.x` and
+# `>>lab.prism.x` included) but with no `./` or URL form: a module name is
+# never a path. A shell `$'` or `$"` may open the token, so the prose net
+# still reads `-m $'lab.prism.x"`. `\b` alone matched inside
+# `vendor.lab.prism`, `my-lab.prism`, `my>lab.prism`, `../lab.prism`,
+# `/tmp/lab.prism` and `https://example.com/lab.prism`, which name other
+# modules or paths.
+MODULE_ROOT_PREFIX = re.compile(r"(?:(?:^|\s)[(\[{<*|>]*(?:\$['\"])?[`'\"]*|\]\([<`'\"]*)$")
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
 # option form `python3 --help` lists may sit between the interpreter and its
 # target: clustered flag letters, `-W`/`-X` with an attached or following
@@ -1103,7 +1108,7 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.references(text), [root])
                 self.assertEqual(dangling_references(text, self.TRACKED | {"lab/prism/deleted.py"}), [])
         for prefix in (
-            "vendor.", "a.", "_", "my-", "my*", "my(", "my=", "my[", "my|", "my<", "--module=", "vendor/",
+            "vendor.", "a.", "_", "my-", "my*", "my(", "my=", "my[", "my|", "my<", "my>", "--module=", "vendor/",
             "/tmp/", "./", "../", "/", "~/", "$HOME/", "@", "+", "C:\\", "https://example.com/",
             "https://example.com/?m=", "https://github.com/o/r/blob/main/",
         ):
@@ -1136,7 +1141,7 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.references(text), [root])
                 self.assertEqual(dangling_references(text, self.TRACKED | {root}), [])
         for prefix in (
-            "my-", "my*", "my(", "my=", "my[", "my|", "my<", "--out=", "vendor/", "/tmp/", "../", "/", "~/",
+            "my-", "my*", "my(", "my=", "my[", "my|", "my<", "my>", "--out=", "vendor/", "/tmp/", "../", "/", "~/",
             "a.", "$HOME/", "@", "+", "C:\\", "my-\"", "https://example.com/",
             "https://github.com/o/r/blob/main/vendor/",
         ):
@@ -1148,6 +1153,28 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.references(text), [])
         self.assertEqual(self.references(f"See `vendor/{root}` and `{root}`."), [root])
         self.assertEqual(self.references(f"The students' `my*{root}` and `{root}` differ."), [root])
+
+    def test_blockquote_markers_start_reference_tokens(self) -> None:
+        # A Markdown blockquote marker needs no space after it, so `>lab/prism/x`
+        # and the nested `>>lab/prism/x` name the root path as `> lab/prism/x`
+        # does. A `>` inside a token (`my>lab/prism`) opens nothing, as `my<`
+        # does not: an opener counts only at the start of the line or after
+        # whitespace.
+        for root in ("lab/prism/deleted.py", "lab.prism.deleted"):
+            for surrounding in (
+                ">{}", ">>{}", "> >{}", "  >{}", ">`{}`", ">'{}'", '>"{}"', ">**{}**",
+                ">(`{}`)", ">{} is gone.", ">>`{}`.",
+            ):
+                text = surrounding.format(root)
+                with self.subTest(text=text):
+                    self.assertEqual(self.references(text), [root])
+                    self.assertEqual(dangling_references(text, self.TRACKED | {"lab/prism/deleted.py"}), [])
+            for surrounding in ("my>{}", "my>>{}", "x>>{}", "`my>{}`", "<b>{}", "->{}", "=>{}"):
+                text = surrounding.format(root)
+                with self.subTest(text=text):
+                    self.assertEqual(self.references(text), [])
+        self.assertEqual(self.references(">./lab/prism/deleted.py"), ["lab/prism/deleted.py"])
+        self.assertEqual(self.references("> ./lab/prism/deleted.py"), ["lab/prism/deleted.py"])
 
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
