@@ -128,6 +128,13 @@ delivery after the reply is released, and both frontends reject the retired
 job while accepting fresh work. The committed old row stays unchanged: database
 commit alone does not authorize miner delivery after revocation.
 
+The final delta was then replayed onto the newer integration head
+`a9158b1cd68cd83ddd5c9c4449d03f327af21e95`, including the owner's later compact
+ledger guards and runtime admission tests. The same complete E2E command again
+passed **18/18** with no skips (9.65 seconds), and target Clippy again passed
+with warnings denied. This is functional evidence for these 15 runtime cases;
+the separate scale qualification and coordinated full review remain required.
+
 ## Gate IDs for activation-owner registration
 
 ```text
