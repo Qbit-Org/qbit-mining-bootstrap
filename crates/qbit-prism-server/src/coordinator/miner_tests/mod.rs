@@ -24,6 +24,7 @@ mod prepared_expiry;
 mod published_lease;
 mod refresh;
 mod resume_inputs;
+mod runtime_recovery;
 pub(crate) mod stale_causes;
 mod work_store;
 
