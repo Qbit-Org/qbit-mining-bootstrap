@@ -31,13 +31,14 @@ impl Ledger {
             "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'",
         ).fetch_one(&mut *tx).await?;
         let rows = prior_balance_rows(&mut tx).await?;
-        let prior_balances_digest = tokio::task::spawn_blocking(move || {
-            let balances = decode_prior_balances(rows).map_err(WindowError::Decode)?;
-            // The shared digest sorts by its bytewise semantic comparator.
-            Ok::<_, WindowError>(qbit_prism::prior_balances_digest(&balances))
-        })
-        .await
-        .map_err(|error| WindowError::Decode(error.into()))??;
+        let prior_balances_digest = BlockingDrop::new(rows)
+            .map(|rows| {
+                let balances = decode_prior_balances(rows).map_err(WindowError::Decode)?;
+                // The shared digest sorts by its bytewise semantic comparator.
+                Ok(qbit_prism::prior_balances_digest(&balances))
+            })
+            .await?
+            .into_inner();
         tx.commit().await?;
         Ok(PayoutState {
             payout_revision,

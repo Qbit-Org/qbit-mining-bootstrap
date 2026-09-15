@@ -148,6 +148,36 @@ fn record(
     }
 }
 
+#[test]
+fn compact_and_inline_inputs_require_explicit_ctv_and_preserve_encoding() -> Result<()> {
+    use qbit_prism_server::coordinator::BundleInputs;
+
+    let template = PreparedTemplate::encode(&template())?;
+    for ctv in [
+        None,
+        Some(CandidateCtv {
+            direct_floor_sats: 777,
+            settlement_config: SettlementModeConfig::default(),
+            fanout_fee_policy: None,
+        }),
+    ] {
+        let mut original = record(&template, &[], false);
+        original.ctv = ctv;
+        let bytes = serde_json::to_vec(&original)?;
+        let decoded: CompactPrepared = serde_json::from_slice(&bytes)?;
+        ensure!(serde_json::to_vec(&decoded)? == bytes);
+        let inputs = BundleInputs::from(&decoded);
+        let mut inline = serde_json::to_value(inputs)?;
+        let mut compact = serde_json::to_value(&original)?;
+        ensure!(inline["ctv"] == compact["ctv"]);
+        inline.as_object_mut().unwrap().remove("ctv");
+        compact.as_object_mut().unwrap().remove("ctv");
+        ensure!(serde_json::from_value::<BundleInputs>(inline).is_err());
+        ensure!(serde_json::from_value::<CompactPrepared>(compact).is_err());
+    }
+    Ok(())
+}
+
 async fn seed_share(db: &Database, sequence: i64) -> Result<()> {
     sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) VALUES($1,$2,'a','a',decode(repeat('11',32),'hex'),1,100,100,'test-job',to_timestamp(1),1,to_timestamp(1),true,'storage-test',0)")
         .bind(sequence).bind(format!("test-share-{sequence}")).execute(&db.ledger.pool).await?;
@@ -448,6 +478,11 @@ async fn compact_reader_and_retry_reject_payload_column_disagreement() -> Result
             ensure!(db.ledger.save_compact_prepared("columns", &record, &template, &[], 0, expires).await.is_err(), "retry accepted {assignment}");
             sqlx::query("DELETE FROM qbit_prism_jobs").execute(&db.ledger.pool).await?;
         }
+        db.ledger.save_compact_prepared("ctv-key", &record, &template, &[], 0, expires).await?;
+        ensure!(db.ledger.compact_prepared("ctv-key").await?.unwrap().record.ctv.is_none());
+        sqlx::query("UPDATE qbit_prism_jobs SET payload=payload-'ctv' WHERE job_id='ctv-key'").execute(&db.ledger.pool).await?;
+        ensure!(db.ledger.compact_prepared("ctv-key").await.is_err(), "omitted CTV must remain corruption");
+        ensure!(db.ledger.save_compact_prepared("ctv-key", &record, &template, &[], 0, expires).await.is_err(), "retry accepted omitted CTV");
         Ok(())
     })).await
 }
