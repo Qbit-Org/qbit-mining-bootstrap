@@ -41,7 +41,16 @@ async fn preinstall_migration(db: &Database, version: i32, migration: &str) -> R
     Ok(())
 }
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Database {
+    fixture: FixtureDatabase,
+    /// A default-size pool on the fixture database, separate from `pool`:
+    /// tests hold locks and advisory gates on its connections and poll
+    /// `pg_stat_activity` and `pg_locks` through it while `pool` is busy.
     admin: PgPool,
     pool: PgPool,
     url: String,
@@ -50,44 +59,59 @@ struct Database {
 }
 
 impl Database {
+    /// A pre-008 schema in its own database.
     async fn open() -> Result<Option<Self>> {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_window_ref_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let pool = PgPoolOptions::new()
+        let fixture = FixtureDatabase::open(&raw, "prism_window_ref_").await?;
+        let admin = match PgPool::connect(&fixture.url).await {
+            Ok(admin) => admin,
+            Err(error) => return Err(fixture.abandon(error.into()).await),
+        };
+        let pool = match PgPoolOptions::new()
             .max_connections(1)
-            .connect(url.as_str())
-            .await?;
-        // Build the actual pre-008 schema, without temporarily installing 008
-        // and then trying to reverse-engineer its predecessor by dropping fields.
-        sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
-            .execute(&pool)
-            .await?;
-        let mut tx = pool.begin().await?;
-        for migration in [
-            include_str!("../migrations/002_multi_instance.sql"),
-            include_str!("../migrations/003_2x_compatibility.sql"),
-            include_str!("../migrations/004_cpfp_retired_funding.sql"),
-            include_str!("../migrations/005_candidate_dispatch.sql"),
-        ] {
-            sqlx::raw_sql(migration).execute(&mut *tx).await?;
+            .connect(&fixture.url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                admin.close().await;
+                return Err(fixture.abandon(error.into()).await);
+            }
+        };
+        let installed = async {
+            // Build the actual pre-008 schema, without temporarily installing 008
+            // and then trying to reverse-engineer its predecessor by dropping fields.
+            sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
+                .execute(&pool)
+                .await?;
+            let mut tx = pool.begin().await?;
+            for migration in [
+                include_str!("../migrations/002_multi_instance.sql"),
+                include_str!("../migrations/003_2x_compatibility.sql"),
+                include_str!("../migrations/004_cpfp_retired_funding.sql"),
+                include_str!("../migrations/005_candidate_dispatch.sql"),
+            ] {
+                sqlx::raw_sql(migration).execute(&mut *tx).await?;
+            }
+            sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+            anyhow::Ok(())
         }
-        sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
-            .execute(&mut *tx).await?;
-        tx.commit().await?;
+        .await;
+        if let Err(error) = installed {
+            pool.close().await;
+            admin.close().await;
+            return Err(fixture.abandon(error).await);
+        }
         Ok(Some(Self {
             admin,
             pool,
-            url: url.to_string(),
-            schema,
+            url: fixture.url.clone(),
+            schema: fixture.schema.clone(),
+            fixture,
             ledgers: Mutex::new(Vec::new()),
         }))
     }
@@ -98,17 +122,16 @@ impl Database {
         Ok(ledger)
     }
 
-    async fn close(self) -> Result<()> {
+    /// Closes every pool this fixture owns, then drops its database. A test
+    /// error wins; a cleanup error is attached to it as context.
+    async fn close(self, result: Result<()>) -> Result<()> {
         let ledgers = self.ledgers.into_inner().unwrap();
         for pool in ledgers {
             pool.close().await;
         }
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
         self.admin.close().await;
-        Ok(())
+        self.fixture.close(result).await
     }
 }
 
@@ -119,14 +142,7 @@ async fn run(
         return Ok(());
     };
     let result = body(&db).await;
-    let cleanup = db.close().await;
-    match (result, cleanup) {
-        (Ok(()), cleanup) => cleanup,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-        }
-    }
+    db.close(result).await
 }
 
 fn share(seq: u64, filtered: bool) -> AcceptedShare {

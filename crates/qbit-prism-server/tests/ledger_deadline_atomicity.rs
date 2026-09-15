@@ -33,9 +33,13 @@ const PUBLICATION_TABLES: [&str; 6] = [
     "qbit_ctv_fanout_artifacts",
 ];
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Database {
-    admin: PgPool,
-    schema: String,
+    fixture: FixtureDatabase,
     ledger: Ledger,
 }
 
@@ -45,43 +49,17 @@ impl Database {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_atomicity_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        match Ledger::connect(url.as_str(), "ledger-atomicity".into(), 8, true).await {
-            Ok(ledger) => Ok(Some(Self {
-                admin,
-                schema,
-                ledger,
-            })),
-            Err(error) => {
-                let _ = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-                    .execute(&admin)
-                    .await;
-                admin.close().await;
-                Err(error)
-            }
+        let fixture = FixtureDatabase::open(&raw, "prism_atomicity_").await?;
+        match Ledger::connect(&fixture.url, "ledger-atomicity".into(), 8, true).await {
+            Ok(ledger) => Ok(Some(Self { fixture, ledger })),
+            Err(error) => Err(fixture.abandon(error).await),
         }
     }
 
+    /// A test error wins; a cleanup error is attached to it as context.
     async fn close(self, result: Result<()>) -> Result<()> {
         self.ledger.pool.close().await;
-        let cleanup = sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await;
-        self.admin.close().await;
-        match (result, cleanup) {
-            (Ok(()), cleanup) => cleanup.map(|_| ()).map_err(Into::into),
-            (Err(error), Ok(_)) => Err(error),
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-            }
-        }
+        self.fixture.close(result).await
     }
 }
 

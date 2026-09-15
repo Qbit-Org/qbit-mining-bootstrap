@@ -63,7 +63,16 @@ const WINDOW_COLUMNS: [&str; 7] = [
     "block_bytes",
 ];
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Database {
+    fixture: FixtureDatabase,
+    /// A default-size pool on the fixture database, separate from `pool`: the
+    /// permit test holds an advisory gate on one of its connections and polls
+    /// `pg_locks` through another.
     admin: PgPool,
     pool: PgPool,
     url: String,
@@ -72,32 +81,38 @@ struct Database {
 }
 
 impl Database {
-    /// An empty schema. Each test installs exactly the starting state it needs,
-    /// because the whole point here is which migrations have already run.
+    /// An empty schema in its own database. Each test installs exactly the
+    /// starting state it needs, because the whole point here is which
+    /// migrations have already run.
     async fn open() -> Result<Option<Self>> {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_candidate_window_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        let fixture = FixtureDatabase::open(&raw, "prism_candidate_window_").await?;
+        let admin = match PgPool::connect(&fixture.url).await {
+            Ok(admin) => admin,
+            Err(error) => return Err(fixture.abandon(error.into()).await),
+        };
         // One connection, and none of `Ledger::connect`'s statement/lock
         // timeouts, so a test can park a reader on a gate for as long as it
         // needs to.
-        let pool = PgPoolOptions::new()
+        let pool = match PgPoolOptions::new()
             .max_connections(1)
-            .connect(url.as_str())
-            .await?;
+            .connect(&fixture.url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                admin.close().await;
+                return Err(fixture.abandon(error.into()).await);
+            }
+        };
         Ok(Some(Self {
             admin,
             pool,
-            url: url.to_string(),
-            schema,
+            url: fixture.url.clone(),
+            schema: fixture.schema.clone(),
+            fixture,
             ledgers: Mutex::new(Vec::new()),
         }))
     }
@@ -145,16 +160,15 @@ impl Database {
             .bind(table).bind(column).fetch_one(&self.pool).await?)
     }
 
-    async fn close(self) -> Result<()> {
+    /// Closes every pool this fixture owns, then drops its database. A test
+    /// error wins; a cleanup error is attached to it as context.
+    async fn close(self, result: Result<()>) -> Result<()> {
         for pool in self.ledgers.into_inner().unwrap() {
             pool.close().await;
         }
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
         self.admin.close().await;
-        Ok(())
+        self.fixture.close(result).await
     }
 }
 
@@ -165,14 +179,7 @@ async fn run(
         return Ok(());
     };
     let result = body(&db).await;
-    let cleanup = db.close().await;
-    match (result, cleanup) {
-        (Ok(()), cleanup) => cleanup,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-        }
-    }
+    db.close(result).await
 }
 
 async fn outbox_columns(pool: &PgPool) -> Result<Vec<String>> {
@@ -938,14 +945,7 @@ fn read_window_permit_outlives_a_cancelled_page_and_is_released_off_the_runtime(
             return Ok(());
         };
         let result = permit_release_body(&db).await;
-        let cleanup = db.close().await;
-        match (result, cleanup) {
-            (Ok(()), cleanup) => cleanup,
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-            }
-        }
+        db.close(result).await
     })
 }
 
