@@ -463,7 +463,6 @@ WRAPPER_ARGUMENTS = {
     "exec": {"-a"},
     "docker": {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys"},
 }
-ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\+?=")
 
 
@@ -531,9 +530,6 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
         index += 1
     while index < len(words):
         word = unquote(words[index])
-        if ASSIGNMENT.match(words[index]):
-            index += 1
-            continue
         program = word.rsplit("/", 1)[-1]
         if program not in LAUNCHERS:
             return index
@@ -543,6 +539,7 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 return None
             program = "docker"
             index += 1
+        terminated = False
         while index < len(words):
             option = unquote(words[index])
             # S takes the rest of a short cluster, or the next word, as its
@@ -597,16 +594,35 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 return None  # executable lookup prints information; it runs nothing
             if option == "--":
                 index += 1
+                terminated = True
                 break
             if not option.startswith("-"):
                 break
             index += 2 if option in WRAPPER_ARGUMENTS.get(program, ()) else 1
         if program == "docker":
             index += 1  # container name
-        elif program == "env":
-            # env accepts FOO+=value too, setting the literal name FOO+.
+        elif program == "env" or (program == "sudo" and not terminated):
+            # Only env and sudo take VAR=value words between their options and
+            # the command: `env [OPTION]... [-] [NAME=VALUE]... [COMMAND
+            # [ARG]...]` and `sudo [options] [VAR=value] [-i | -s] [command
+            # [arg ...]]` in their usage lines. Both accept FOO+=value too,
+            # setting the literal name FOO+ (sudo 1.9.15p5 exported `FOO+=x`
+            # for `sudo FOO+=x env`, as GNU coreutils 9.4 env does), and both
+            # receive a quoted `'FOO=x'` as the same word once the shell
+            # strips the quotes. After `--` they part: env still exported FOO
+            # for `env -- FOO=x sh -c 'echo $FOO'`, while sudo answered `sudo
+            # -- FOO=x sh -c '…'` with "FOO=x: command not found". No other
+            # launcher takes one: nohup 9.4 answered `nohup FOO=x echo hi`
+            # with "failed to run command 'FOO=x'", bash 5.2.21 `command
+            # FOO=x echo hi` with "FOO=x: command not found" and `exec FOO=x
+            # echo hi` with "exec: FOO=x: not found", each exit 127 and each
+            # running nothing, and `docker exec [OPTIONS] CONTAINER COMMAND
+            # [ARG...]` runs the word after the container as the program. A
+            # `FOO=x` after those is therefore the executable word. sudo's
+            # own test is wider (it also took `9FOO=x`); such spellings are
+            # outside this check.
             while index < len(words) and SHELL_ASSIGNMENT.match(unquote(words[index])):
-                index += 1  # env receives quoted assignments as ordinary arguments
+                index += 1
     return None
 
 
@@ -2556,6 +2572,44 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
         text = "```sh\nenv -S 'sh -c'\n```"
         self.assertEqual(self.commands(text), [])
+
+    def test_only_env_and_sudo_take_assignment_arguments(self) -> None:
+        # nohup 9.4 answers `nohup FOO=x echo hi` with "failed to run command
+        # 'FOO=x'", bash 5.2.21 `command FOO=x echo hi` with "FOO=x: command
+        # not found" and `exec FOO=x echo hi` with "exec: FOO=x: not found",
+        # each exit 127, and docker exec runs the word after the container:
+        # the assignment is the program, and nothing after it runs. sudo
+        # 1.9.15p5 exported `FOO=x` and `FOO+=x` before a command, but ran
+        # `FOO=x` as the command after `--`.
+        command = "python3 -m lab.prism.deleted"
+        for launcher in (
+            "nohup", "command", "command -p", "exec", "exec -a name", "docker exec c",
+            "podman exec -it c", "env nohup", "sudo nohup", "sudo -u prism command",
+            "nohup sudo --", "sudo --", "sudo -n --", "env sudo --",
+        ):
+            for assignments in ("FOO=x", "FOO=x BAR=y", "FOO+=x", "'FOO=x'", 'FOO="x y"'):
+                with self.subTest(launcher=launcher, assignments=assignments):
+                    text = f"{launcher} {assignments} {command}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(self.references(text), ["lab.prism.deleted"])
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for launcher in (
+            "env", "env -i", "env --", "env -", "sudo", "sudo -u prism", "sudo -n", "nohup env",
+            "sudo env", "env sudo", "nohup sudo -u prism", "command env", "exec env",
+            "docker exec c env", "sudo FOO=x env", "env FOO=x sudo",
+        ):
+            for assignments in ("FOO=x", "FOO=x BAR=y", "FOO+=x", "'FOO=x'", '"FOO=x"', 'FOO="x y"'):
+                with self.subTest(launcher=launcher, assignments=assignments):
+                    text = f"{launcher} {assignments} python3 lab/prism/storm.py"
+                    self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+        # A leading assignment is shell syntax and precedes any launcher.
+        for text in (
+            "FOO=x nohup python3 lab/prism/storm.py", "FOO=x BAR+=y command python3 lab/prism/storm.py",
+            "FOO=x exec python3 lab/prism/storm.py", "FOO=x docker exec c python3 lab/prism/storm.py",
+            "FOO=x sudo BAR=y python3 lab/prism/storm.py",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
 
     def test_env_null_mode_does_not_run_commands(self) -> None:
         # GNU coreutils 9.4 refuses a command after `-0`/`--null` ("cannot
