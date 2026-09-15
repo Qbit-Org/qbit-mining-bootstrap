@@ -9,7 +9,7 @@ use futures_util::future::LocalBoxFuture;
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, AuditBundle,
-    FoundBlock, PayoutPolicy,
+    CarryForwardBalance, FoundBlock, PayoutPolicy,
 };
 use qbit_prism_server::ledger::{
     authenticate_landed_audit, BalanceSource, Candidate, CandidateClaim, Ledger, ShareRange,
@@ -21,8 +21,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{
     io::Write,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 /// The ledger's advisory locks are cluster-wide constants, not schema-scoped,
@@ -1183,6 +1186,324 @@ async fn the_durable_range_proof_runs_before_the_settlement_lock() -> Result<()>
                     "the landing read share payloads under the settlement lock: it saw an \
                      alteration made after its proof had already run",
                 )?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// As-issued snapshot preparation
+// ---------------------------------------------------------------------------
+
+/// The stored order of a balance set, the digest's own comparator.
+fn canonical_sort(set: &mut [CarryForwardBalance]) {
+    set.sort_by(|a, b| {
+        a.order_key
+            .cmp(&b.order_key)
+            .then_with(|| a.recipient_id.cmp(&b.recipient_id))
+            .then_with(|| a.p2mr_program_hex.cmp(&b.p2mr_program_hex))
+    });
+}
+
+/// `n` recipients with distinct keys in a scrambled order, so a canonical
+/// sort does real work. Deterministic in `salt`, so a set can be rebuilt
+/// for comparison instead of being kept.
+fn scrambled_as_issued_set(n: usize, salt: u64) -> Vec<CarryForwardBalance> {
+    let mut set: Vec<CarryForwardBalance> = (0..n)
+        .map(|i| CarryForwardBalance {
+            recipient_id: format!("miner-{i:07}"),
+            order_key: format!("order-{:07}", (i * 7919) % n),
+            p2mr_program_hex: format!("{:064x}", i as u128 + u128::from(salt)),
+            balance_sats: i as i128 * 1000 + i128::from(salt),
+        })
+        .collect();
+    // Fisher-Yates over a fixed linear congruential sequence.
+    let mut state = salt | 1;
+    for i in (1..set.len()).rev() {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let j = (state >> 33) as usize % (i + 1);
+        set.swap(i, j);
+    }
+    set
+}
+
+/// The longest gap between consecutive 1 ms timer ticks, observed by a task
+/// that shares the runtime's thread with the code under test.
+struct Ticker {
+    max_gap_ns: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Ticker {
+    async fn start() -> Result<Self> {
+        let max_gap_ns = Arc::new(AtomicU64::new(0));
+        let gaps = max_gap_ns.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut previous = Instant::now();
+            ready.send(()).ok();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = Instant::now();
+                gaps.fetch_max(
+                    now.duration_since(previous).as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                previous = now;
+            }
+        });
+        started.await?;
+        Ok(Self { max_gap_ns, task })
+    }
+
+    /// The longest gap since the previous reading.
+    fn take_max_gap(&self) -> Duration {
+        Duration::from_nanos(self.max_gap_ns.swap(0, Ordering::Relaxed))
+    }
+
+    async fn stop(self) -> Result<()> {
+        self.task.abort();
+        ensure!(
+            self.task.await.unwrap_err().is_cancelled(),
+            "ticker did not stop"
+        );
+        Ok(())
+    }
+}
+
+/// The as-issued balance set a candidate carries is whole-set work at
+/// enqueue: a canonical sort, a digest and an encoding over every recipient
+/// before the snapshot can be written back. On both paths that write a
+/// candidate, the direct enqueue and the block-solving share's append, that
+/// work runs off the runtime and before the transaction opens: on a
+/// single-threaded runtime, where the code under test and a 1 ms ticker
+/// share the one thread, the ticker keeps ticking while a 300 000-recipient
+/// set is prepared, and the set reaches the database once, as its canonical
+/// encoding, readable as issued and no longer carried by the claim.
+#[tokio::test]
+async fn as_issued_snapshot_preparation_runs_off_the_runtime_on_both_write_paths() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            const RECIPIENTS: usize = 300_000;
+            let ledger = db.ledger("prepare-off-runtime").await?;
+            ledger.append(appended_share(1), None).await?;
+            let snapshot = ledger.snapshot(100).await?;
+            let sets = [
+                scrambled_as_issued_set(RECIPIENTS, 1),
+                scrambled_as_issued_set(RECIPIENTS, 2),
+            ];
+            let digests = [
+                qbit_prism::prior_balances_digest(&sets[0]),
+                qbit_prism::prior_balances_digest(&sets[1]),
+            ];
+            // What the preparation costs here: the same sort, digest and
+            // encoding over the same set, measured off the runtime.
+            let sample = sets[0].clone();
+            let work = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let mut sorted = sample;
+                canonical_sort(&mut sorted);
+                let digest = qbit_prism::prior_balances_digest(&sorted);
+                let bytes = serde_json::to_vec(&sorted).expect("a balance set encodes");
+                std::hint::black_box((digest, bytes));
+                started.elapsed()
+            })
+            .await?;
+            ensure!(
+                work >= Duration::from_millis(50),
+                "{RECIPIENTS} recipients prepare in {work:?}: too little work to observe a stall"
+            );
+            let [enqueued_set, appended_set] = sets;
+            let mut enqueued = found(&snapshot, 21)?.candidate;
+            enqueued.leased = true;
+            enqueued.window.prior_balances_digest = digests[0];
+            enqueued.as_issued_balances = enqueued_set;
+            let mut appended = found(&snapshot, 22)?.candidate;
+            appended.leased = true;
+            appended.window.prior_balances_digest = digests[1];
+            appended.as_issued_balances = appended_set;
+            let references = [
+                (enqueued.block_hash.clone(), enqueued.window),
+                (appended.block_hash.clone(), appended.window),
+            ];
+
+            let ticker = Ticker::start().await?;
+            ledger.enqueue_candidate(enqueued).await?;
+            let enqueue_gap = ticker.take_max_gap();
+            ledger.append(appended_share(2), Some(appended)).await?;
+            let append_gap = ticker.take_max_gap();
+            ticker.stop().await?;
+            println!(
+                "as_issued_preparation recipients={RECIPIENTS} work_ms={} enqueue_max_tick_gap_ms={} append_max_tick_gap_ms={}",
+                work.as_millis(),
+                enqueue_gap.as_millis(),
+                append_gap.as_millis()
+            );
+            ensure!(
+                enqueue_gap < work / 2,
+                "the direct enqueue stalled the runtime for {enqueue_gap:?} while {work:?} of balances were prepared"
+            );
+            ensure!(
+                append_gap < work / 2,
+                "the share append stalled the runtime for {append_gap:?} while {work:?} of balances were prepared"
+            );
+
+            // Each set reached the database once, as its canonical encoding,
+            // and is read back as issued.
+            for (salt, (block_hash, window)) in references.iter().enumerate() {
+                let mut canonical = scrambled_as_issued_set(RECIPIENTS, salt as u64 + 1);
+                canonical_sort(&mut canonical);
+                let stored: Vec<u8> = sqlx::query_scalar(
+                    "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+                )
+                .bind(hex::encode(window.prior_balances_digest))
+                .fetch_one(&db.pool)
+                .await?;
+                ensure!(
+                    stored == serde_json::to_vec(&canonical)?,
+                    "the stored set of {block_hash} is not the canonical encoding"
+                );
+                let read = ledger.read_window(window, BalanceSource::AsIssued).await?;
+                ensure!(
+                    read.prior_balances == canonical,
+                    "AsIssued did not return the stored set of {block_hash}"
+                );
+                let row = outbox_row(&db.pool, block_hash).await?;
+                ensure!(
+                    row["candidate"]["leased"] == true && row["state"] == "pending",
+                    "{row}"
+                );
+            }
+            let snapshots: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM qbit_prism_balance_snapshots")
+                    .fetch_one(&db.pool)
+                    .await?;
+            ensure!(snapshots == 2, "{snapshots} snapshot rows for two sets");
+            // The claim carries the reference, never the set.
+            let claim = ledger
+                .claim_candidate(60)
+                .await?
+                .context("no candidate claimable")?;
+            ensure!(claim.candidate.as_issued_balances.is_empty() && claim.candidate.leased);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// A balance snapshot row is immutable evidence keyed by its digest. When
+/// the row a candidate's as-issued set would write is already there under
+/// another encoding, the write is refused as corruption and the candidate
+/// with it: the direct enqueue writes no outbox row, and the share append
+/// writes neither the share nor the row. A candidate that carries no
+/// as-issued set never touches the row: it is enqueued and reads the current
+/// balances for as long as they still hash to its reference. Once the
+/// foreign row is gone, the leased enqueue writes the canonical encoding.
+#[tokio::test]
+async fn a_stored_snapshot_that_is_not_the_canonical_encoding_refuses_both_write_paths_atomically(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("snapshot-authenticity").await?;
+            seed_carry(&db.pool).await?;
+            ledger.append(appended_share(1), None).await?;
+            let snapshot = ledger.snapshot(100).await?;
+            ensure!(snapshot.prior_balances.len() == 2, "fixture carries no balances");
+            let digest = hex::encode(snapshot_digest(&snapshot));
+            let mut canonical = snapshot.prior_balances.clone();
+            canonical_sort(&mut canonical);
+            let canonical_bytes = serde_json::to_vec(&canonical)?;
+            // The same set under another encoding: it decodes to the same
+            // balances and still is not the stored form.
+            let foreign = serde_json::to_vec_pretty(&canonical)?;
+            ensure!(foreign != canonical_bytes);
+            sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2)")
+                .bind(&digest).bind(&foreign).execute(&db.pool).await?;
+            let counts = |pool: &PgPool| {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_as::<_, (i64, i64)>("SELECT (SELECT count(*) FROM qbit_block_candidate_outbox),(SELECT count(*) FROM qbit_share_ledger)")
+                        .fetch_one(&pool)
+                        .await
+                }
+            };
+            let stored = |pool: &PgPool| {
+                let pool = pool.clone();
+                let digest = digest.clone();
+                async move {
+                    sqlx::query_scalar::<_, Vec<u8>>(
+                        "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+                    )
+                    .bind(digest)
+                    .fetch_one(&pool)
+                    .await
+                }
+            };
+            for (nonce, leased) in [(30, true), (31, false)] {
+                let mut candidate = found(&snapshot, nonce)?.candidate;
+                candidate.leased = leased;
+                candidate.as_issued_balances = snapshot.prior_balances.clone();
+                let error = ledger
+                    .enqueue_candidate(candidate)
+                    .await
+                    .err()
+                    .with_context(|| {
+                        format!("leased={leased}: a foreign encoding under the set's digest was accepted")
+                    })?;
+                ensure!(
+                    format!("{error:#}").contains("immutable balance snapshot"),
+                    "{error:#}"
+                );
+                ensure!(counts(&db.pool).await? == (0, 1), "a refused enqueue wrote rows");
+                ensure!(
+                    stored(&db.pool).await? == foreign,
+                    "a refused enqueue rewrote the snapshot row"
+                );
+            }
+            let mut candidate = found(&snapshot, 32)?.candidate;
+            candidate.leased = true;
+            candidate.as_issued_balances = snapshot.prior_balances.clone();
+            let error = ledger
+                .append(appended_share(2), Some(candidate))
+                .await
+                .err()
+                .context("the share append accepted a foreign encoding")?;
+            ensure!(
+                format!("{error:#}").contains("immutable balance snapshot"),
+                "{error:#}"
+            );
+            ensure!(
+                counts(&db.pool).await? == (0, 1),
+                "a refused append wrote the share or the row"
+            );
+            ensure!(stored(&db.pool).await? == foreign);
+            // The missing-snapshot fallback: a candidate without the set is
+            // enqueued and reads the current balances.
+            let plain = found(&snapshot, 33)?.candidate;
+            ensure!(plain.as_issued_balances.is_empty() && !plain.leased);
+            ledger.enqueue_candidate(plain.clone()).await?;
+            ensure!(counts(&db.pool).await? == (1, 1));
+            let window = ledger
+                .read_window(&plain.window, BalanceSource::Current)
+                .await?;
+            ensure!(window.prior_balances.len() == 2);
+            // The foreign row gone, the leased enqueue writes the canonical
+            // encoding.
+            sqlx::query("DELETE FROM qbit_prism_balance_snapshots")
+                .execute(&db.pool)
+                .await?;
+            let mut leased = found(&snapshot, 34)?.candidate;
+            leased.leased = true;
+            leased.as_issued_balances = snapshot.prior_balances.clone();
+            ledger.enqueue_candidate(leased).await?;
+            ensure!(
+                stored(&db.pool).await? == canonical_bytes,
+                "the leased enqueue did not store the canonical encoding"
+            );
+            ensure!(counts(&db.pool).await? == (2, 1));
             Ok(())
         })
     })

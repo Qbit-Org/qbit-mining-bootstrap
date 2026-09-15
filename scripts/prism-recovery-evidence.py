@@ -28,6 +28,7 @@ def summarize(lines):
     last_share_seq = 0
     accepted = 0
     pending = 0
+    unfinished = 0
     integrity = None
     complete = False
     for line in lines:
@@ -58,6 +59,8 @@ def summarize(lines):
                 accepted += int(row["accepted"])
             elif kind == "candidates":
                 pending += int(row["state"] == "pending")
+                # Unknown states must not make a drained-work check pass.
+                unfinished += int(row["state"] not in ("submitted", "abandoned"))
         else:
             raise ValueError(f"unknown evidence kind: {kind}")
     if not complete:
@@ -74,6 +77,7 @@ def summarize(lines):
         "accepted_shares": accepted,
         "last_share_seq": last_share_seq,
         "pending_candidates": pending,
+        "unfinished_candidates": unfinished,
         "audit_chain_version": "qbit.prism.carry-forward-active-delta-chain.v1",
         "audit_head_sha256": head.hex(),
         "carry_forward_integrity": integrity,
