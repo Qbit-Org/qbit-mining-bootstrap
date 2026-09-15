@@ -38,8 +38,11 @@ outside the repository, and this document cites them by run id.
   - The async attempt stopped itself at the harness memory floor, at
     `MemAvailable` 6,092 MiB against the 6,144 MiB floor, 64 s into
     `steady_state`.
-  - The sync attempt was terminated from outside about 3 minutes in, with
-    `MemAvailable` falling past 7,303 MiB.
+    That run is the load-bearing evidence for this conclusion.
+  - The sync attempt was stopped from outside by the coordinator's memory guard
+    about 3 minutes in, so it shows only that free memory fell past an external
+    threshold, not that the harness declined to continue. It is reported for
+    completeness rather than relied on.
   - At 1 frontend, 100k fits and the ceiling holds at five times the window:
     285 shares/s async and 238 shares/s sync.
 - **ACK latency now counts acknowledgements only.**
@@ -371,11 +374,32 @@ fell to 6092 MiB, below the 6144 MiB floor`, and withheld the artifact.
 
 `w11-100k-fe4-sync-r1` exited 6 after 177 s, with no side report.
 
-- **How it ended.** The harness logged `qbit-prism-load: terminated; tearing
-  down`, meaning it received SIGTERM from outside. The driver's own ceiling
-  was 2,400 s, so the driver did not send it. The coordinator's external
-  memory guard sends exactly this signal below 25 % free memory, but the side
-  report was not written, so this document cannot confirm the sender.
+- **How it ended.** The coordinator's external memory guard sent it SIGTERM.
+  That guard's log, kept on the coordinator's machine rather than this host,
+  records the decision and the reading it acted on:
+
+  ```text
+  2026-09-15T18:22:05Z avail=6360MB total=23463MB pct=27 min_pct=26 running=4
+  2026-09-15T18:22:07Z avail=5686MB total=23463MB pct=24 min_pct=24 running=4
+  2026-09-15T18:22:07Z BELOW FLOOR: SIGTERM qbit-prism-load on alexdevbox2
+  ```
+
+  The harness logged `qbit-prism-load: terminated; tearing down` at 18:22:08.
+
+- **This is weaker evidence than its async sibling, and the difference
+  matters.** The async attempt stopped *itself* at the harness's own floor, so
+  it demonstrates the harness declining to measure what it cannot measure. This
+  run was stopped from outside, so it demonstrates only that free memory fell
+  past an external threshold. The conclusion -- 100k at 4 frontends does not fit
+  on this host -- rests on the async run.
+
+- **Why the external guard won.** The harness floor is 6,144 MiB and the guard's
+  is 25 % of 23,463 MiB, about 5,866 MiB: a gap of roughly 280 MiB. Memory fell
+  from 11,658 MiB to 5,686 MiB in under a minute, and at that gradient 280 MiB
+  is a few seconds. The two thresholds are too close together for this
+  workload, and the harness should have been given more room to stop itself
+  first. That is a fact about how these measurements were set up, not about
+  PRISM.
 - **Memory.** Before the run, `MemAvailable` was 19,871 MiB and the 1-minute
   load average 0.51. In the last minute, 10 s samples went from 11,658 MiB
   through 9,652, 8,819, 7,911 and 7,925 to 7,303 MiB; the signal arrived
