@@ -2,7 +2,9 @@
 use super::*;
 use qbit_prism_server::metrics::Metrics;
 use sqlx::postgres::PgPoolOptions;
+use std::future::{poll_fn, Future};
 use std::sync::Arc;
+use std::task::Poll;
 use tokio_util::task::AbortOnDropHandle;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -178,17 +180,27 @@ async fn direct_cases(db: &Database, ledger: &Ledger, metrics: &Metrics) -> Resu
         let held = ledger.pool.acquire().await?;
         let before = counts(metrics);
         let failure_sum = sample(metrics, "failure", "sum");
+        // Reach the held pool slot before starting the cancellation deadline.
+        // Caller setup (including import key derivation) is outside checkout
+        // timing and may consume an arbitrary part of an earlier deadline.
+        let mut acquiring = Box::pin(caller.run(ledger));
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), caller.run(ledger))
+            poll_fn(|cx| Poll::Ready(acquiring.as_mut().poll(cx)))
                 .await
-                .is_err()
+                .is_pending(),
+            "{caller:?}: expected checkout wait"
         );
+        assert_eq!(counts(metrics), before, "{caller:?}: pending checkout");
+        assert!(tokio::time::timeout(Duration::from_millis(50), acquiring)
+            .await
+            .is_err());
         assert_eq!(
             counts(metrics),
             (before.0, before.1 + 1.),
             "{caller:?}: checkout cancellation"
         );
-        assert!(sample(metrics, "failure", "sum") - failure_sum >= 0.04);
+        let observed = sample(metrics, "failure", "sum") - failure_sum;
+        assert!(observed >= 0.04, "{caller:?}: observed {observed} seconds");
         drop(held);
         tokio::time::timeout(WAIT, caller.run(ledger)).await??;
         assert_eq!(
