@@ -591,7 +591,7 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 words[index:argument + 1] = quoted
                 offsets[index:argument + 1] = [origin + offset for _, offset in split]
                 continue
-            if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
+            if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list"}):
                 return None
             if program == "env" and (option == "--null" or re.match(r"-[iv]*0", option)):
                 # `-0`/`--null` prints the environment NUL-terminated and takes
@@ -609,12 +609,16 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 return None
             if program == "sudo" and (
                 option in {"--edit", "--remove-timestamp", "--validate"}
-                or re.match(r"-[ABbEHkNnPSis]*[eKv]", option)
+                or re.match(r"-[ABbEHkNnPSis]*[eKvV]", option)
             ):
-                # Edit and credential-only modes run no command. Only flags
-                # without arguments may precede the mode letter in a cluster:
-                # -nv validates, while -pv gives p the prompt "v". Lowercase
-                # -k resets credentials but still permits a command to run.
+                # Edit, credential-only and version modes run no command.
+                # Only flags without arguments may precede the mode letter in
+                # a cluster: -nv validates, while -pv gives p the prompt "v".
+                # Lowercase -k resets credentials but still permits a command
+                # to run. sudo 1.9.15p5 printed its usage and ran nothing for
+                # `sudo -nV id`, `sudo -Vn id`, `sudo -HV id` and `sudo -Vu
+                # nobody id`, as for `sudo -V id`, while `sudo -uV nobody id`
+                # read the user `V`.
                 return None
             if program == "sudo" and (
                 re.fullmatch(r"-[ABbEHkNnPSis]+h", option)
@@ -3000,6 +3004,31 @@ class ScannerTests(unittest.TestCase):
                         )
         self.assertEqual(self.commands("env sudo -nv -- python3 lab/prism/deleted.py"), [])
         text = "```sh\nsudo --validate \\\n  -- python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_sudo_version_mode_in_a_cluster_does_not_run_commands(self) -> None:
+        # sudo 1.9.15p5 printed its usage and ran nothing for `sudo -nV id`,
+        # `sudo -Vn id`, `sudo -HV id`, `sudo -Vu nobody id` and `sudo -nVu
+        # nobody id`, as for `sudo -V id`; `sudo -uV nobody id` read the
+        # user `V` and `sudo -pV nobody id` the prompt "V", so the word after
+        # those is the program.
+        for options in ("-V", "'-V'", "-nV", "-Vn", "-HV", "-HnV", "-Vu nobody", "-nVu nobody", "-V --", "-n -V"):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py", "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                with self.subTest(options=options, argument=argument):
+                    text = f"sudo {options} {argument}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(len(self.references(text)), 1)
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for text in ("sudo -uV nobody", "sudo -pV nobody"):
+            for argument in ("python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py"):
+                with self.subTest(text=text, argument=argument):
+                    line = f"{text} {argument}"
+                    self.assertEqual(self.commands(line), [])
+                    self.assertEqual(self.commands(line + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("env sudo -nV python3 lab/prism/deleted.py"), [])
+        text = "```sh\nsudo -nV \\\n  python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
         self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
 
     def test_sudo_timestamp_reset_and_mode_option_arguments_preserve_commands(self) -> None:
