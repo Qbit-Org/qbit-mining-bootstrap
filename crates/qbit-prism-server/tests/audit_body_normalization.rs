@@ -39,7 +39,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 #[allow(dead_code)]
 #[path = "support/window_fixture.rs"]
@@ -50,29 +49,35 @@ use window_fixture::WindowPlan;
 mod acquire_metrics;
 
 // ---------------------------------------------------------------------------
-// Per-test schema and the small fixture from `tests/ledger_postgres.rs`
+// Per-test database and the small fixture from `tests/ledger_postgres.rs`
 // ---------------------------------------------------------------------------
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
+/// A fixture database with one schema on `search_path`. `url` copies the
+/// fixture's, for the included modules that read it. `admin` is a
+/// default-size pool on that same database, separate from the ledgers' pools;
+/// the measurement watches `pg_locks` through it.
 struct Database {
+    fixture: FixtureDatabase,
     admin: PgPool,
-    schema: String,
     url: String,
 }
 
 impl Database {
     async fn open_raw(raw: &str) -> Result<Self> {
-        let admin = PgPool::connect(raw).await?;
-        let schema = format!("prism_audit_body_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        let fixture = FixtureDatabase::open(raw, "prism_audit_body_").await?;
+        let admin = match PgPool::connect(&fixture.url).await {
+            Ok(admin) => admin,
+            Err(error) => return Err(fixture.abandon(error.into()).await),
+        };
         Ok(Self {
             admin,
-            schema,
-            url: url.to_string(),
+            url: fixture.url.clone(),
+            fixture,
         })
     }
 
@@ -94,16 +99,14 @@ impl Database {
         Ledger::connect(&self.url, id.to_owned(), 8, true).await
     }
 
-    /// EP-ERRORS: the schema goes away on success and on failure alike.
+    /// EP-ERRORS: the database goes away on success and on failure alike; a
+    /// fixture that never reaches `close` is dropped by the helper's fallback.
     async fn close(self, ledgers: Vec<Ledger>) -> Result<()> {
         for ledger in ledgers {
             ledger.pool.close().await;
         }
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
         self.admin.close().await;
-        Ok(())
+        self.fixture.close(Ok(())).await
     }
 }
 
