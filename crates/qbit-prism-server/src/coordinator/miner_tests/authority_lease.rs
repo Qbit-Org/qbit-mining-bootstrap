@@ -37,6 +37,54 @@ fn change_balances(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn tip_return_during_lease_state_wait_uses_ordinary_current_work_checks() {
+    for operation in ["issue", "resume", "submit"] {
+        for changed_revision in [false, true] {
+            let f = Fixture::new(Duration::from_secs(10)).await;
+            f.coordinator.refresh_once().await.unwrap();
+            let job = issued(&f).await;
+            persist(&f, &job).await.unwrap();
+            f.detect(2).await;
+            if changed_revision {
+                f.store.revision.store(1, Ordering::SeqCst);
+            }
+            let gate = Arc::new(Gate::default());
+            *f.store.compact.state_gate.lock().unwrap() = Some(gate.clone());
+            let proof = f.proof(&job, 0);
+            let c = f.coordinator.clone();
+            let pending = tokio::spawn(async move {
+                match operation {
+                    "issue" => c
+                        .build_job(&job.context.worker, "00000002", 1e-12, 0.0)
+                        .await
+                        .map(|_| true),
+                    "resume" => c
+                        .resume_job(&job.context.worker, &job.wire.job_id)
+                        .await
+                        .map(|job| job.is_some()),
+                    "submit" => c
+                        .submit(&job.context.worker, &job, proof, false.into())
+                        .await
+                        .map(|_| true),
+                    _ => unreachable!(),
+                }
+            });
+            gate.entered.notified().await;
+            f.detect(1).await;
+            gate.release.notify_one();
+            assert_eq!(
+                matches!(pending.await.unwrap(), Ok(true)),
+                !changed_revision,
+                "{operation}/{changed_revision}"
+            );
+            if operation == "submit" && !changed_revision {
+                assert_eq!(f.store.records.lock().unwrap()[0].0.credit_policy, None);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn unready_current_publication_is_an_error_but_retired_work_is_a_miss() {
     let f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();

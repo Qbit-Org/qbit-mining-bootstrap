@@ -359,7 +359,9 @@ impl Coordinator {
             current_revision: state.payout_revision,
         };
         let selected = self.select_validated_lease(&lease).await?;
-        if state.prior_balances_digest != lease.identity.window.prior_balances_digest {
+        if selected.as_ref().is_some_and(|(_, tip)| tip.share_lease)
+            && state.prior_balances_digest != lease.identity.window.prior_balances_digest
+        {
             return Ok(None);
         }
         Ok(selected.map(|(current, tip)| (current, tip, lease)))
@@ -391,8 +393,22 @@ impl Coordinator {
                 self.config.template_refresh_failure_exit,
             )
             .filter(|tip| {
-                tip.share_lease && Some(tip.hash.as_str()) == lease.identity.parent.as_deref()
+                Some(tip.hash.as_str()) == lease.identity.parent.as_deref()
+                    && (tip.share_lease
+                        || (selected.as_deref() == lease.identity.parent.as_deref()
+                            && lease.current_revision == lease.identity.revision))
             });
+        if tip.as_ref().is_some_and(|tip| !tip.share_lease) {
+            // The node may return to the published parent during the state
+            // wait. Its ordinary authority needs the original revision and
+            // fresh polling; a previously selected lease grants no override.
+            ensure!(
+                readiness
+                    .last_poll
+                    .is_some_and(|poll| poll.elapsed() < self.config.health_timeout),
+                "tip polling stale"
+            );
+        }
         Ok(tip.map(|tip| (current.clone(), tip)))
     }
 
