@@ -1,5 +1,7 @@
 use super::*;
 
+mod cleanup;
+pub use cleanup::{BlobPruneCursor, JobPruneResult};
 mod compact_issued;
 pub use compact_issued::{CompactDependency, CompactRepair};
 mod prepared;
@@ -168,7 +170,10 @@ impl Ledger {
     pub async fn prune_expired_jobs(&self) -> Result<u64> {
         // A candidate ID may have been selected before renewal committed. The
         // outer predicate is rechecked after DELETE waits for its row lock.
-        Ok(sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id IN (SELECT job_id FROM qbit_prism_jobs WHERE expires_at < clock_timestamp() ORDER BY expires_at LIMIT 4096) AND expires_at < clock_timestamp()").execute(&self.pool).await?.rows_affected())
+        Ok(sqlx::query(cleanup::EXPIRED_JOBS)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 }
 

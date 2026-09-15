@@ -162,7 +162,21 @@ pub async fn run(config: Config) -> Result<()> {
     tasks.spawn({
         let ledger = coordinator.ledger.clone();
         let shutdown = shutdown_rx.clone();
-        async move { prune_jobs(|| ledger.prune_expired_jobs(), shutdown).await }
+        async move {
+            let cursor = tokio::sync::Mutex::new(crate::ledger::BlobPruneCursor::default());
+            prune_jobs(
+                || async {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let mut cursor = cursor.lock().await;
+                    Ok(ledger
+                        .prune_expired_jobs_and_blobs(&mut cursor, deadline)
+                        .await?
+                        .jobs)
+                },
+                shutdown,
+            )
+            .await
+        }
     });
     let failure = tokio::select! {
         result=signal()=>{result?;None},
