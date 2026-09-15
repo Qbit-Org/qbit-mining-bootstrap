@@ -655,7 +655,24 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
     index = 0
     command_string = False
     noexec = False
+    dump = False
     argument_flags = "oO" if shell in {"bash", "sh"} else "o"
+    # Bash's dump modes read the command string and run nothing: `-D`,
+    # `--dump-strings` and `--dump-po-strings` print its `$"…"` strings and
+    # exit, and bash documents `-D` as implying `-n`. Unlike `-n`, no later
+    # `+n` or `+o noexec` restores execution, and the `+` sign is ignored as
+    # it is for `+c`: bash 5.2.21 printed nothing for `bash -D -c 'echo hi'`,
+    # `bash -Dc 'echo hi'`, `bash -cD 'echo hi'`, `bash +D -c 'echo hi'`,
+    # `bash -D +n -c 'echo hi'`, `bash +n -D -c 'echo hi'`, `bash -D +o
+    # noexec -c 'echo hi'`, `bash --dump-strings -c 'echo hi'`, `bash
+    # --dump-po-strings -c 'echo hi'` and `bash --dump-strings +n -c 'echo
+    # hi'`, while `bash -n +n -c 'echo hi'` ran, and it rejected the
+    # abbreviated `--dump-str` and `--dump-strings=x` as invalid options,
+    # running nothing either. dash 0.5.12 answers `-D` with "Illegal option"
+    # and runs nothing, so an `sh` that is either shell reads the same. ksh
+    # and zsh were not installed on the inspected host and keep their own
+    # meanings for the letter, so like `argument_flags` the dump modes are
+    # read for bash and sh only.
     while index < len(words):
         option = unquote(words[index])
         if option in {"--help", "--version"}:
@@ -665,6 +682,10 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
             break
         if shell in {"bash", "sh"} and option in {"--rcfile", "--init-file"}:
             index += 2
+            continue
+        if shell in {"bash", "sh"} and option in {"--dump-strings", "--dump-po-strings"}:
+            dump = True
+            index += 1
             continue
         if option.startswith("--"):
             index += 1
@@ -676,6 +697,7 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
         # including options between -c and its command-string argument.
         for flag in option[1:]:
             command_string |= flag == "c"
+            dump |= flag == "D" and shell in {"bash", "sh"}
             if flag == "n":
                 noexec = option[0] == "-"
             if flag in argument_flags:
@@ -684,7 +706,7 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
                 if flag == "o" and unquote(words[index]) == "noexec":
                     noexec = option[0] == "-"
                 index += 1
-    return index if command_string and not noexec and index < len(words) else None
+    return index if command_string and not noexec and not dump and index < len(words) else None
 
 
 def python_commands(line: str):
@@ -3073,6 +3095,42 @@ class ScannerTests(unittest.TestCase):
         for options in ("-on errexit -c", "-oon errexit noexec -c"):
             with self.subTest(options=options):
                 self.assertEqual(self.commands(f"bash {options} 'python3 lab/prism/storm.py'"), [])
+
+    def test_bash_dump_modes_do_not_run_shell_command_strings(self) -> None:
+        # bash 5.2.21 printed nothing for `bash -D -c 'echo hi'`, `bash -Dc
+        # 'echo hi'`, `bash -cD 'echo hi'`, `bash +D -c 'echo hi'`, `bash -D
+        # +n -c 'echo hi'`, `bash --dump-strings -c 'echo hi'`, `bash
+        # --dump-po-strings -c 'echo hi'` and `bash --dump-po-strings +o
+        # noexec -c 'echo hi'`: the dump modes imply -n and no later +n
+        # restores execution. dash 0.5.12 rejects -D and runs nothing
+        # either, so `sh` reads the same.
+        for shell in ("bash", "sh"):
+            for options in (
+                "-D -c", "-Dc", "-cD", "-c -D", "+D -c", "'-D' -c", "-eD -c", "-D +n -c", "+n -D -c",
+                "-D +o noexec -c", "-nD +n -c", "-D -o pipefail -c", "-Do pipefail -c",
+                "--dump-strings -c", "--dump-po-strings -c", "--dump-strings +n -c",
+                "--dump-po-strings +o noexec -c",
+            ):
+                with self.subTest(shell=shell, options=options):
+                    text = f"{shell} {options} 'python3 -m lab.prism.deleted'"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(self.references(text), ["lab.prism.deleted"])
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        text = "```sh\nbash -D \\\n  -c 'python3 -m lab.prism.deleted'\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+        self.assertEqual(self.commands("sudo bash -Dc 'python3 lab/prism/deleted.py'"), [])
+        # dash rejects the letter and ksh and zsh were not inspected, so the
+        # string is still read there; after the string, `-D` is the `$0`.
+        for shell in ("dash", "ksh", "zsh"):
+            for options in ("-D -c", "-Dc", "--dump-strings -c"):
+                with self.subTest(shell=shell, options=options):
+                    text = f"{shell} {options} 'python3 lab/prism/storm.py'"
+                    self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+        for shell in ("bash", "sh"):
+            for options in ("-c", "-n +n -c", "-o pipefail -c", "-O extglob -c"):
+                with self.subTest(shell=shell, options=options):
+                    text = f"{shell} {options} 'python3 lab/prism/storm.py' -D"
+                    self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
 
     def test_shell_option_arguments_are_not_command_strings(self) -> None:
         command = "python3 -m lab.example.deleted"
