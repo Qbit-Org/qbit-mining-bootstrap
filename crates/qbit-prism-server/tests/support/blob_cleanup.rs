@@ -267,6 +267,30 @@ async fn deadline_and_unknown_errors_roll_back_deletes_without_advancing_cursor(
 }
 
 #[tokio::test]
+async fn expiry_selection_rechecks_renewal_after_its_row_lock_wait() -> Result<()> {
+    run(|db| Box::pin(async move {
+        let original = seed(db, true).await?;
+        expire(db).await?;
+        let mut renewal = db.ledger.pool.begin().await?;
+        sqlx::query("UPDATE qbit_prism_jobs SET expires_at=to_timestamp($1::double precision/1000) WHERE job_id='prepared'")
+            .bind(original.expires).execute(&mut *renewal).await?;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *renewal).await?;
+        let ledger = db.ledger.clone();
+        let mut gc = Running(tokio::spawn(async move {
+            ledger.prune_expired_jobs_and_blobs(&mut BlobPruneCursor::default(), Instant::now()+Duration::from_secs(5)).await
+        }));
+        // The key was selected from the expired committed version. Once this
+        // update commits, the DELETE must recheck the newly live row.
+        blocked_query(db, pid, "DELETE FROM qbit_prism_jobs").await?;
+        renewal.commit().await?;
+        ensure!((&mut gc.0).await?? == JobPruneResult::default());
+        let retained = db.ledger.compact_prepared("prepared").await?.unwrap();
+        ensure!(retained.record == original.record && retained.expires_at_ms == original.expires);
+        Ok(())
+    })).await
+}
+
+#[tokio::test]
 async fn halted_cluster_refuses_cleanup_without_mutation_or_cursor_progress() -> Result<()> {
     run(|db| {
         Box::pin(async move {

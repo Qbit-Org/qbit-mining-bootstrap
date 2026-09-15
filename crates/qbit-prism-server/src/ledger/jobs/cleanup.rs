@@ -100,5 +100,8 @@ async fn statement_deadline(tx: &mut Transaction<'_, Postgres>, deadline: Instan
     Ok(())
 }
 
-// Retain the original expiry recheck after a concurrent row-lock wait.
-pub(super) const EXPIRED_JOBS: &str = "DELETE FROM qbit_prism_jobs WHERE job_id IN (SELECT job_id FROM qbit_prism_jobs WHERE expires_at < clock_timestamp() ORDER BY expires_at LIMIT 4096) AND expires_at < clock_timestamp()";
+// The stable cutoff permits an expiry-index range scan even with zero expired
+// jobs. A bounded array initplan keeps DELETE on selected primary keys instead
+// of a hash semi-join scanning every live job. Preserve the outer expiry recheck
+// after a concurrent renewal's row-lock wait; selection grants no delete right.
+pub(super) const EXPIRED_JOBS: &str = "DELETE FROM qbit_prism_jobs WHERE job_id = ANY(ARRAY(SELECT job_id FROM qbit_prism_jobs WHERE expires_at < statement_timestamp() ORDER BY expires_at LIMIT 4096)) AND expires_at < clock_timestamp()";
