@@ -1,12 +1,12 @@
 //! Original compact inputs, not authority to publish miner work.
 //!
-//! This additive seam does not switch the inline runtime. Activation still
-//! needs atomic typed issued-save/repair and wiring of these authority checks
-//! under the existing outer operation deadline. The storage migration requires all
+//! Runtime refresh captures canonical balances before the original borrowed
+//! build, reserves the typed record, and publishes under the reviewed authority
+//! boundary. Issued save/repair and reconstruction preserve that identity under
+//! the original operation deadline. The storage migration requires all
 //! frontends stopped and old candidates drained; this is not a rolling writer.
-//! A future refresh caller must prepare CanonicalCompactBalances before its
-//! original bundle build. Existing SQL-order legacy builds remain unchanged;
-//! completed noncanonical bundles cannot be converted by rewriting their hash.
+//! Legacy fixture adapters cannot convert completed noncanonical bundles by
+//! rewriting their hash.
 use super::*;
 use crate::coordinator::publication_authority::{AbsoluteDeadline, AuthorityViewMut};
 use crate::coordinator::tip_observation::PreparedIdentity;

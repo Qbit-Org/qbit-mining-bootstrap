@@ -268,3 +268,50 @@ async fn original_resume_expiry_includes_coalescer_build_and_reader_admission() 
         );
     }
 }
+
+#[tokio::test]
+async fn retained_ctv_context_contains_presence_without_fanout_outputs() {
+    let f = Fixture::build(
+        Duration::from_secs(10),
+        |config| {
+            config.ctv_enabled = true;
+            config.ctv_direct_floor = u64::MAX;
+            config.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 12000));
+        },
+        None,
+    )
+    .await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f, Duration::from_secs(30)).await;
+    let original = f.original(&job.context.prepared);
+    let native = original.bundle.as_ref().unwrap();
+    assert!(native.ctv_fanout_manifest_set.is_some());
+    assert!(job.context.bundle.ctv_fanout_manifest_set.is_some());
+    let retained = serde_json::to_value(&job.context.bundle).unwrap();
+    assert_eq!(retained["ctv_fanout_manifest_set"], json!({}));
+    assert!(serde_json::to_vec(&retained).unwrap().len() < 1024);
+    let resumed = f
+        .coordinator
+        .resume_job(&job.context.worker, &job.wire.job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.wire.coinb1, job.wire.coinb1);
+    assert_eq!(resumed.wire.coinb2, job.wire.coinb2);
+    assert_eq!(
+        serde_json::to_value(&resumed.context.bundle).unwrap(),
+        retained
+    );
+    let hashes = job
+        .context
+        .prepared
+        .reservation
+        .record
+        .audit_hashes
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        prepared_storage::compact::canonical_json_sha256(native).unwrap(),
+        hashes.audit_bundle_sha256
+    );
+}

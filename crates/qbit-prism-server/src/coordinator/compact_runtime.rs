@@ -26,15 +26,23 @@ impl From<&Snapshot> for PreparedSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct PreparedBundle {
     pub found_block: FoundBlock,
-    pub ctv_fanout_manifest_set: Option<qbit_prism::CtvFanoutManifestSet>,
+    pub ctv_fanout_manifest_set: Option<PreparedCtv>,
     pub coinbase_script_sig_suffix_hex: Option<String>,
 }
+
+/// Presence of the original CTV fanout set, without retaining its outputs.
+/// Candidate reconstruction uses the original captured CTV inputs separately.
+#[derive(Clone, Debug, Serialize)]
+pub struct PreparedCtv {}
 
 impl From<&qbit_prism::AuditBundleBody> for PreparedBundle {
     fn from(body: &qbit_prism::AuditBundleBody) -> Self {
         Self {
             found_block: body.found_block.clone(),
-            ctv_fanout_manifest_set: body.ctv_fanout_manifest_set.clone(),
+            ctv_fanout_manifest_set: body
+                .ctv_fanout_manifest_set
+                .as_ref()
+                .map(|_| PreparedCtv {}),
             coinbase_script_sig_suffix_hex: body.coinbase_script_sig_suffix_hex.clone(),
         }
     }
@@ -44,7 +52,10 @@ impl From<&AuditBundle> for PreparedBundle {
     fn from(bundle: &AuditBundle) -> Self {
         Self {
             found_block: bundle.found_block.clone(),
-            ctv_fanout_manifest_set: bundle.ctv_fanout_manifest_set.clone(),
+            ctv_fanout_manifest_set: bundle
+                .ctv_fanout_manifest_set
+                .as_ref()
+                .map(|_| PreparedCtv {}),
             coinbase_script_sig_suffix_hex: bundle.coinbase_script_sig_suffix_hex.clone(),
         }
     }
