@@ -1,5 +1,7 @@
 //! These use the existing protocol fixture and real TCP response writes.
 use super::*;
+use qbit_prism_server::metrics::{ConnectionRefusalReason, Metrics, RejectReason, StaleJobCause};
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub(super) struct Gate {
@@ -283,6 +285,349 @@ async fn failed_rejection_response_counts_the_decision_without_an_ack() {
             "qbit_prism_share_ack_seconds_count{result=\"accepted\"}"
         ),
         1.
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// `[global_limit, username_limit]`.
+fn refusals(metrics: &Metrics) -> [f64; 2] {
+    ConnectionRefusalReason::ALL
+        .iter()
+        .map(|reason| {
+            sample(
+                metrics,
+                &format!(
+                    "qbit_prism_stratum_connection_refusals_total{{reason=\"{}\"}}",
+                    reason.as_str()
+                ),
+            )
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+/// Attribution samples carry exactly their closed label, once per value, and
+/// never an identity observed during the test.
+fn assert_closed_attribution_labels(body: &str, identities: &[&str]) {
+    for (family, key, allowed) in [
+        (
+            "qbit_prism_stratum_connection_refusals_total",
+            "reason",
+            ConnectionRefusalReason::ALL
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<BTreeSet<_>>(),
+        ),
+        (
+            "qbit_prism_stale_job_rejections_total",
+            "cause",
+            StaleJobCause::ALL
+                .iter()
+                .map(|value| value.as_str())
+                .collect(),
+        ),
+    ] {
+        let mut seen = BTreeSet::new();
+        for line in body
+            .lines()
+            .filter(|line| line.starts_with(&format!("{family}{{")))
+        {
+            let labels = line.split_once('{').unwrap().1.rsplit_once('}').unwrap().0;
+            let value = labels
+                .strip_prefix(&format!("{key}=\""))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("unexpected labels: {line}"));
+            assert!(allowed.contains(value), "unexpected label value: {line}");
+            assert!(seen.insert(value), "duplicate series: {line}");
+        }
+        assert_eq!(seen, allowed, "{family}");
+    }
+    assert!(body
+        .lines()
+        .any(|line| line.starts_with("qbit_prism_stratum_connection_limit ")));
+    for identity in identities {
+        assert!(
+            !body.contains(identity),
+            "identity in exposition: {identity}"
+        );
+    }
+}
+
+/// The existing global-limit behavior: the socket is closed without a response.
+async fn assert_refused_without_response(address: std::net::SocketAddr) {
+    use tokio::io::AsyncReadExt;
+    let mut refused = TcpStream::connect(address).await.unwrap();
+    let mut bytes = Vec::new();
+    match timeout(Duration::from_secs(5), refused.read_to_end(&mut bytes))
+        .await
+        .expect("the refused socket stayed open")
+    {
+        Ok(_) => assert!(bytes.is_empty(), "refused socket received {bytes:?}"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+}
+
+#[tokio::test]
+async fn global_limit_of_one_refuses_a_second_socket_exactly_once_and_keeps_the_configured_gauge() {
+    let config = StratumConfig {
+        connection_limit: ConnectionLimit::new(1),
+        ..Default::default()
+    };
+    let stats = config.stats.clone();
+    let metrics = Arc::new(Metrics::default());
+    assert_eq!(sample(&metrics, "qbit_prism_stratum_connection_limit"), -1.);
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut held = Client::connect(address).await;
+    held.login("miner.held").await;
+    assert_eq!(sample(&metrics, "qbit_prism_stratum_connection_limit"), 1.);
+    assert_eq!(refusals(&metrics), [0., 0.]);
+    assert_refused_without_response(address).await;
+    assert_eq!(refusals(&metrics), [1., 0.]);
+    // The only permit is still held: the gauge is capacity, not free permits.
+    assert_eq!(sample(&metrics, "qbit_prism_stratum_connection_limit"), 1.);
+    assert_eq!(stats.snapshot(0).connections, 1);
+    // The admitted session keeps working, and success is not a refusal.
+    held.send(held.solved_submit(10, "miner.held", 0)).await;
+    assert_eq!(held.response(10).await["result"], true);
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.held"]
+    );
+    assert_eq!(refusals(&metrics), [1., 0.]);
+    assert_closed_attribution_labels(
+        &metrics.render(),
+        &["miner.held", "127.0.0.1", &address.to_string()],
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn default_listener_reports_configured_capacity_while_connections_hold_permits() {
+    let config = StratumConfig::default();
+    assert_eq!(config.connection_limit.capacity(), 384);
+    let metrics = Arc::new(Metrics::default());
+    let (address, _backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut clients = Vec::new();
+    for index in 0..3 {
+        let mut client = Client::connect(address).await;
+        client.login(&format!("miner.{index}")).await;
+        clients.push(client);
+        assert_eq!(
+            sample(&metrics, "qbit_prism_stratum_connection_limit"),
+            384.
+        );
+    }
+    assert_eq!(refusals(&metrics), [0., 0.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn username_limit_refusal_counts_once_while_reauthorization_and_success_do_not() {
+    let metrics = Arc::new(Metrics::default());
+    let (address, backend, _refresh, shutdown, task) = start_with_metrics(
+        StratumConfig {
+            max_connections_per_username: 1,
+            ..Default::default()
+        },
+        metrics.clone(),
+    )
+    .await;
+    let mut first = Client::connect(address).await;
+    first.login("miner.one").await;
+    first.send(first.solved_submit(10, "miner.one", 0)).await;
+    assert_eq!(first.response(10).await["result"], true);
+    // Same-username reauthorization keeps the session's own permit.
+    first
+        .send(json!({"id":11,"method":"mining.authorize","params":["miner.one","x"]}))
+        .await;
+    assert_eq!(
+        first.response(11).await,
+        json!({"id":11,"result":true,"error":null})
+    );
+    assert_eq!(refusals(&metrics), [0., 0.]);
+    let mut second = Client::connect(address).await;
+    second.login("miner.two").await;
+    second
+        .send(json!({"id":9,"method":"mining.authorize","params":["miner.one","x"]}))
+        .await;
+    assert_eq!(
+        second.response(9).await,
+        json!({"id":9,"result":null,"error":[20,"too many connections for username",null]})
+    );
+    assert_eq!(refusals(&metrics), [0., 1.]);
+    second.send(second.solved_submit(12, "miner.two", 0)).await;
+    assert_eq!(second.response(12).await["result"], true);
+    assert_eq!(refusals(&metrics), [0., 1.]);
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.one", "miner.two"]
+    );
+    // An authorization refusal is not a share rejection.
+    for reason in RejectReason::ALL {
+        let key = format!(
+            "qbit_prism_rejections_total{{reason_id=\"{}\"}}",
+            reason.as_str()
+        );
+        assert_eq!(sample(&metrics, &key), 0.);
+    }
+    assert_eq!(
+        sample(
+            &metrics,
+            "qbit_prism_share_ack_seconds_count{result=\"rejected\"}"
+        ),
+        0.
+    );
+    assert_closed_attribution_labels(
+        &metrics.render(),
+        &["miner.one", "miner.two", "127.0.0.1", &address.to_string()],
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// Manual inspection only, never run by CI: `cargo test -p qbit-prism-server
+/// --test stratum_protocol -- --ignored --exact
+/// observability::serve_admission_metrics_for_manual_inspection --nocapture`.
+/// It produces one refusal of each reason on a real listener, then serves the
+/// real API router, republishing every second, at
+/// `PRISM_MANUAL_METRICS_BIND` (default `127.0.0.1:0`) for
+/// `PRISM_MANUAL_METRICS_HOLD_SECONDS` (default 60).
+#[tokio::test]
+#[ignore = "serves /metrics for manual inspection"]
+async fn serve_admission_metrics_for_manual_inspection() {
+    use qbit_prism_server::api::{router, ApiConfig, ApiState};
+    let bind = std::env::var("PRISM_MANUAL_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:0".into());
+    let hold: u64 = std::env::var("PRISM_MANUAL_METRICS_HOLD_SECONDS")
+        .map_or(60, |value| value.parse().expect("hold seconds"));
+    let metrics = Arc::new(Metrics::default());
+    let (address, _backend, _refresh, shutdown, task) = start_with_metrics(
+        StratumConfig {
+            connection_limit: ConnectionLimit::new(2),
+            max_connections_per_username: 1,
+            ..Default::default()
+        },
+        metrics.clone(),
+    )
+    .await;
+    let mut first = Client::connect(address).await;
+    first.login("miner.one").await;
+    let mut second = Client::connect(address).await;
+    second.login("miner.two").await;
+    second
+        .send(json!({"id":9,"method":"mining.authorize","params":["miner.one","x"]}))
+        .await;
+    assert_eq!(
+        second.response(9).await["error"][1],
+        "too many connections for username"
+    );
+    assert_refused_without_response(address).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    let state = ApiState::new(pool, ApiConfig::default(), metrics.clone());
+    state.publish_metrics(metrics.render()).unwrap();
+    let listener = TcpListener::bind(&bind).await.unwrap();
+    println!(
+        "serving http://{}/metrics for {hold} seconds",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn({
+        let state = state.clone();
+        async move { axum::serve(listener, router(state)).await.unwrap() }
+    });
+    for _ in 0..hold {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        state.publish_metrics(metrics.render()).unwrap();
+    }
+    server.abort();
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// Serve the coordinator API router on a real listener and scrape it by HTTP.
+async fn http_metrics(metrics: Arc<Metrics>) -> String {
+    use qbit_prism_server::api::{router, ApiConfig, ApiState};
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    let state = ApiState::new(pool, ApiConfig::default(), metrics.clone());
+    state.publish_metrics(metrics.render()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let response = reqwest::get(format!("http://{address}/metrics"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    server.abort();
+    body
+}
+
+#[tokio::test]
+async fn real_http_scrape_captures_admission_refusals_and_configured_limit() {
+    let metrics = Arc::new(Metrics::default());
+    let config = StratumConfig {
+        connection_limit: ConnectionLimit::new(2),
+        max_connections_per_username: 1,
+        ..Default::default()
+    };
+    let (address, _backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut first = Client::connect(address).await;
+    first.login("miner.one").await;
+    let mut second = Client::connect(address).await;
+    second.login("miner.two").await;
+    second
+        .send(json!({"id":9,"method":"mining.authorize","params":["miner.one","x"]}))
+        .await;
+    assert_eq!(
+        second.response(9).await["error"][1],
+        "too many connections for username"
+    );
+    assert_refused_without_response(address).await;
+    let body = http_metrics(metrics).await;
+    let families = [
+        "qbit_prism_stratum_connection_refusals_total",
+        "qbit_prism_stratum_connection_limit",
+        "qbit_prism_stale_job_rejections_total",
+    ];
+    for descriptor in qbit_prism_server::metrics::descriptors()
+        .filter(|descriptor| families.contains(&descriptor.name))
+    {
+        assert!(body.contains(&format!("# HELP {} {}\n", descriptor.name, descriptor.help)));
+    }
+    for expected in [
+        "# TYPE qbit_prism_stratum_connection_refusals_total counter",
+        "qbit_prism_stratum_connection_refusals_total{reason=\"global_limit\"} 1",
+        "qbit_prism_stratum_connection_refusals_total{reason=\"username_limit\"} 1",
+        "# TYPE qbit_prism_stratum_connection_limit gauge",
+        "qbit_prism_stratum_connection_limit 2",
+        "# TYPE qbit_prism_stale_job_rejections_total counter",
+        "qbit_prism_connections 0",
+    ] {
+        assert!(
+            body.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    assert_closed_attribution_labels(
+        &body,
+        &["miner.one", "miner.two", "127.0.0.1", &address.to_string()],
+    );
+    let excerpt: Vec<_> = body
+        .lines()
+        .filter(|line| families.iter().any(|family| line.contains(family)))
+        .collect();
+    println!(
+        "HTTP /metrics excerpt from a real Stratum listener:\n{}",
+        excerpt.join("\n")
     );
     shutdown.send(true).unwrap();
     task.await.unwrap();

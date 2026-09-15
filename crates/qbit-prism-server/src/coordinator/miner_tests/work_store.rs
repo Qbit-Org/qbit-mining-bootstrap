@@ -14,6 +14,9 @@ pub(crate) struct CompactStore {
     pub saves: StdMutex<VecDeque<Result<bool>>>,
     pub save_calls: StdMutex<Vec<CompactSave>>,
     pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
+    pub state_gate: StdMutex<Option<Arc<Gate>>>,
+    pub state_calls: AtomicUsize,
+    pub save_gate: StdMutex<Option<Arc<Gate>>>,
     pub windows: StdMutex<VecDeque<Result<Window, WindowError>>>,
     pub window_calls: StdMutex<Vec<(WindowRef, BalanceSource)>>,
     pub window_gate: StdMutex<Option<Arc<Gate>>>,
@@ -55,12 +58,26 @@ impl work_ledger::WorkLedger for MemoryLedger {
     }
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>> {
         Box::pin(async {
-            self.compact
-                .states
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("script payout state")
+            self.compact.state_calls.fetch_add(1, Ordering::SeqCst);
+            let scripted = self.compact.states.lock().unwrap().pop_front();
+            let result = scripted.unwrap_or_else(|| {
+                if self.fail_revision.load(Ordering::SeqCst) {
+                    return Err(WindowError::Database(sqlx::Error::PoolClosed));
+                }
+                let snapshot = self.snapshot.lock().unwrap();
+                Ok(PayoutState {
+                    payout_revision: self.revision.load(Ordering::SeqCst),
+                    prior_balances_digest: qbit_prism::prior_balances_digest(
+                        &snapshot.as_ref().expect("fixture snapshot").prior_balances,
+                    ),
+                })
+            });
+            let gate = self.compact.state_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            result
         })
     }
     fn read_window_with_permit<'a>(
@@ -107,6 +124,11 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 current_revision: expected_current_revision,
                 original_expires_at_ms: expires_at_ms,
             });
+            let gate = self.compact.save_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             // Inline and compact payloads cannot reserve the same immutable
             // key. Do not let a scripted success hide this producer conflict.
             ensure!(
