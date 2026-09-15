@@ -454,6 +454,12 @@ ORDER BY singleton;
 SELECT jsonb_build_object('kind', 'cluster_config', 'row', jsonb_build_object(
     'config_fingerprint', config_fingerprint))
 FROM qbit_prism_cluster c WHERE config_fingerprint IS NOT NULL ORDER BY singleton;
+-- Candidate admission, landing and reconciliation require exact equality with
+-- this fence, so a rewound revision can revive fenced-out payout work. The
+-- migration default of zero is omitted; every later revision is evidence.
+SELECT jsonb_build_object('kind', 'payout_revision', 'row', jsonb_build_object(
+    'payout_revision', payout_revision))
+FROM qbit_prism_cluster c WHERE payout_revision <> 0 ORDER BY singleton;
 \endif
 \if :has_fatal_state_events
 SELECT jsonb_build_object('kind', 'fatal_state_events', 'row', to_jsonb(e))

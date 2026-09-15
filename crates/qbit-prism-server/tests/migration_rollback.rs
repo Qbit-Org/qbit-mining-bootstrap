@@ -146,7 +146,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         for kind in [
             "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
-            "fatal_state", "fatal_state_events", "cluster_config",
+            "fatal_state", "fatal_state_events", "cluster_config", "payout_revision",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
         }
@@ -342,11 +342,39 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             .execute(&source.pool).await?;
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
 
-        // A halt can be the only durable change. Routine cluster activity must
-        // not count, but every halt and its immutable recovery decision must.
-        sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp()")
+        // A halt can be the only durable change, and so can a payout revision:
+        // candidate admission, landing and reconciliation compare stored
+        // issuance revisions with the cluster fence exactly, so a rewind that
+        // keeps every fenced row must still be visible. Routine cluster
+        // activity such as updated_at must not count.
+        sqlx::query("UPDATE qbit_prism_cluster SET updated_at=clock_timestamp()")
             .execute(&source.pool).await?;
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
+        ensure!(prior["records"]["payout_revision"]["count"] == 0);
+        let before_revision = prior.clone();
+        for (mutation, count) in [
+            ("payout_revision=payout_revision+1,updated_at=clock_timestamp()", 1),
+            ("payout_revision=payout_revision+1", 1),
+            ("payout_revision=0", 0),
+        ] {
+            sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation}"))
+                .execute(&source.pool).await?;
+            let current = recovery::evidence(&source, pg_bin).await?;
+            ensure!(current["records"]["payout_revision"]["count"] == count);
+            ensure!(current["records"]["payout_revision"]["sha256"]
+                != prior["records"]["payout_revision"]["sha256"],
+                "payout revision change was invisible to recovery evidence: {mutation}");
+            let mut unchanged = current.clone();
+            unchanged["records"]["payout_revision"] = prior["records"]["payout_revision"].clone();
+            ensure!(unchanged == prior, "unrelated accounting changed with payout revision");
+            prior = current;
+        }
+        ensure!(prior == before_revision);
+        // Leave an advanced revision for the native backup roundtrip below.
+        sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp()")
+            .execute(&source.pool).await?;
+        prior = recovery::evidence(&source, pg_bin).await?;
+        ensure!(prior["records"]["payout_revision"]["count"] == 1);
         // The chain-view checkpoint gates future tip acceptance, so each
         // column must be fingerprinted once it leaves the migration default.
         ensure!(prior["records"]["chain_checkpoint"]["count"] == 0);
