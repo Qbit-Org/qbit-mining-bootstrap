@@ -49,11 +49,6 @@ or a WAL measurement. Missing measurements fail rather than becoming zero.
 
 ## Remaining qualification
 
-- Add the cached unchanged-refresh/blocked-persistence race when the shared
-  proxy can pause delivery of a completed COMMIT acknowledgement. Holding an
-  advisory or prepared-row lock cannot reproduce that boundary: persistence
-  holds SETTLEMENT while waiting, so refresh must also wait. This gap remains
-  explicit; the existing cancellation test does not claim that coverage.
 - Core qualification owns internal admission/read/rebuild/cleanup deadline
   proofs and the 400k/500k memory/WAL runs. This 16-share fixture makes no scale
   claims and does not qualify replacement-lease authority by cross-frontend
@@ -85,13 +80,14 @@ failures remain at the compact-format prerequisite. Clippy passes with
 
 ## Integrated functional run, 2026-09-15
 
-Activation base: `a154eb5969e1fe64b180914c099dc257b701cf50`. Only the new E2E
+Activation base: `a154eb5969e1fe64b180914c099dc257b701cf50`, plus approved
+COMMIT-pause helper `487827d`. Only the new E2E
 files were replayed onto this exact committed head; production, shared support,
 and gate-manifest files remain the activation owner's versions. The original
 inline-red commits and evidence remain preserved on their separate branch.
 
-The adapted suite reports **16 passed, 0 failed, 0 ignored** in the same durable
-PostgreSQL 16.14 fixture: 13 runtime cases and 3 inherited WindowPlan unit tests.
+The completed suite reports **18 passed, 0 failed, 0 ignored** in the same durable
+PostgreSQL 16.14 fixture: 15 runtime cases and 3 inherited WindowPlan unit tests.
 Strict Clippy also passes. The previously blocked corruption, reference-row
 authentication, blob retention, and original-dependency repair cases now execute
 and pass. Observed prepared-row maxima are 1,518 uncompressed JSONB bytes for
@@ -122,6 +118,16 @@ held. Both cases subsequently issue/resume fresh work successfully, proving
 recovery after the queued SQL operations are released. These are public runtime
 tests, not claims about internal build-permit or blocking-owner cancellation.
 
+The final two tests use the owner's `ExecutionProxy::pause_after_commit` helper
+to hold an actual completed COMMIT reply while the database row is already
+visible and transaction locks are free. An unchanged cached refresh completes
+during that wait and preserves the original publication, payload, and expiry;
+the original job is then delivered and resumed successfully. A genuinely newer
+tip publication during the same wait causes the old persistence to refuse
+delivery after the reply is released, and both frontends reject the retired
+job while accepting fresh work. The committed old row stays unchanged: database
+commit alone does not authorize miner delivery after revocation.
+
 ## Gate IDs for activation-owner registration
 
 ```text
@@ -137,5 +143,7 @@ qbit-prism-server::compact_runtime_e2e::refresh_issue_resume_preserves_original_
 qbit-prism-server::compact_runtime_e2e::resume_expiry_does_not_slide_and_expired_work_is_a_miss
 qbit-prism-server::compact_runtime_e2e::resume_expiry_includes_blocked_share_read_and_releases_resources
 qbit-prism-server::compact_runtime_e2e::resumed_compact_work_authenticates_retained_share_rows
+qbit-prism-server::compact_runtime_e2e::superseding_publication_during_completed_commit_wait_refuses_old_delivery
+qbit-prism-server::compact_runtime_e2e::unchanged_refresh_during_completed_commit_wait_preserves_original_authority
 qbit-prism-server::compact_runtime_e2e::unknown_issued_commit_is_observed_and_reconciled_without_reissuing
 ```
