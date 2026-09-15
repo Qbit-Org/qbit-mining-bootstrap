@@ -103,7 +103,11 @@ pub async fn compact_storage(f: &Fixture, job: &MiningJob<JobContext>) -> Result
     let record = &stored.record;
     ensure!(
         record.window == prepared.window
-            && record.share_seq == prepared.snapshot.share_seq
+            && record.share_seq
+                == prepared
+                    .window
+                    .shares
+                    .map_or(0, |range| range.last_share_seq)
             && record.payout_revision == prepared.snapshot.payout_revision,
         "durable original window/watermark/revision changed"
     );
@@ -127,7 +131,8 @@ pub async fn compact_storage(f: &Fixture, job: &MiningJob<JobContext>) -> Result
             && record.audit_builder_version == prepared.inputs.audit_builder_version,
         "compact original inputs changed"
     );
-    if let Some(bundle) = &prepared.bundle {
+    if prepared.window.shares.is_some() {
+        let bundle = &job.context.bundle;
         let hashes = record
             .audit_hashes
             .as_ref()
@@ -161,6 +166,7 @@ pub async fn compact_storage(f: &Fixture, job: &MiningJob<JobContext>) -> Result
         maximum < 1_000_000,
         "prepared JSONB exceeded the compact bound: {maximum}"
     );
-    eprintln!("runtime prepared evidence: writes={writes}, max_uncompressed_jsonb_bytes={maximum}, shares={SHARES}; functional fixture only");
+    let shares = prepared.window.shares.map_or(0, |range| range.share_count);
+    eprintln!("runtime prepared evidence: writes={writes}, max_uncompressed_jsonb_bytes={maximum}, shares={shares}; functional fixture only");
     Ok(())
 }

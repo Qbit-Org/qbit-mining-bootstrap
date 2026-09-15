@@ -150,12 +150,9 @@ impl Fixture {
                 .clone()
                 .context("refresh published no work")?;
             ensure!(
-                prepared.snapshot.shares.len() as u64 == if nonempty { SHARES } else { 0 },
+                prepared.window.shares.map_or(0, |range| range.share_count)
+                    == if nonempty { SHARES } else { 0 },
                 "refresh selected the wrong window"
-            );
-            ensure!(
-                prepared.bundle.is_some() == nonempty,
-                "bootstrap must remain per-worker"
             );
         }
         Ok(())
@@ -219,6 +216,30 @@ impl Fixture {
                 .fetch_one(self.pool())
                 .await?,
         )
+    }
+
+    /// The shared proxy counts actual PostgreSQL DataRow frames. Endpoint
+    /// existence probes and metadata SELECTs do not count as window reads.
+    pub fn returned_share_rows(&self, mark: u64) -> Result<u64> {
+        ensure!(
+            self.proxy.rejections_since(mark)?.is_empty(),
+            "resume observation contains a rejected SQL operation"
+        );
+        let mut rows = 0u64;
+        for execution in self.proxy.executions_since(mark)? {
+            ensure!(
+                execution.complete_response(),
+                "resume SQL response is unknown"
+            );
+            if execution.sql.contains("FROM qbit_share_ledger")
+                && execution.sql.contains("payout_order_key")
+            {
+                rows = rows
+                    .checked_add(execution.returned_rows()?)
+                    .context("returned share count overflow")?;
+            }
+        }
+        Ok(rows)
     }
 
     pub async fn wait_for_settlement_waiter(&self) -> Result<()> {

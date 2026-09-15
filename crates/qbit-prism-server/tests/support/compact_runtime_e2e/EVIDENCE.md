@@ -51,9 +51,11 @@ or a WAL measurement. Missing measurements fail rather than becoming zero.
 
 - Run on the qualified integrated activation head, including compact corruption
   and retained-blob checks that are unreachable on the inline baseline.
-- Use the owner's approved shared-helper commit for deterministic node
-  supersession, unchanged refresh during blocked persistence, and actual
-  returned-share-row observations; do not duplicate those helpers.
+- Add the cached unchanged-refresh/blocked-persistence race when the shared
+  proxy can pause delivery of a completed COMMIT acknowledgement. Holding an
+  advisory or prepared-row lock cannot reproduce that boundary: persistence
+  holds SETTLEMENT while waiting, so refresh must also wait. This gap remains
+  explicit; the existing cancellation test does not claim that coverage.
 - Execute the cold dependency repair and retained range/balance integrity
   assertions that are blocked at the inline baseline's compact prerequisite.
 - Core qualification owns internal admission/read/rebuild/cleanup deadline
@@ -63,12 +65,34 @@ or a WAL measurement. Missing measurements fail rather than becoming zero.
 - Full deep-review lanes require the final qualified activation diff and are
   launched by the coordinator. No standalone red PR is ready for review or merge.
 
+## Approved-helper follow-up
+
+After preserving the independent baseline commit, the coordinator approved
+integrating support-only `c52a7572f31096f589848682ebe5aa306f354d52` for its
+FakeNode controls and PostgreSQL returned-row observer. No shared helper was
+edited by this test slice.
+
+`delayed_old_refresh_cannot_replace_new_tip_publication_or_resume_retired_work`
+passes: A's old template response is held at the approved HTTP barrier, B
+publishes an advanced node tip, A's delayed refresh fails, and both frontends
+refuse the old issued job after A publishes its own new-tip replacement.
+The A/B resume test now also requires exactly 16 actual returned share rows,
+using the shared proxy's DataRow/CommandComplete accounting and excluding
+endpoint probes and metadata. This assertion follows the compact-storage
+prerequisite and therefore remains unqualified on the inline base.
+
+The complete helper-backed inline run reports **8 passed, 6 expected failures,
+0 ignored**, including the three inherited WindowPlan unit tests. All six
+failures remain at the compact-format prerequisite. Clippy passes with
+`cargo clippy --locked -p qbit-prism-server --test compact_runtime_e2e -- -D warnings`.
+
 ## Gate IDs for activation-owner registration
 
 ```text
 qbit-prism-server::compact_runtime_e2e::bootstrap_resume_keeps_each_workers_original_payout
 qbit-prism-server::compact_runtime_e2e::cancelled_issued_save_releases_sql_resources_without_publishing
 qbit-prism-server::compact_runtime_e2e::compact_reference_corruption_is_an_error_and_blobs_survive_collection
+qbit-prism-server::compact_runtime_e2e::delayed_old_refresh_cannot_replace_new_tip_publication_or_resume_retired_work
 qbit-prism-server::compact_runtime_e2e::malformed_issued_inputs_are_errors_and_missing_work_is_a_miss
 qbit-prism-server::compact_runtime_e2e::missing_prepared_dependency_repairs_original_record_without_renewing_identity
 qbit-prism-server::compact_runtime_e2e::real_socket_reconnect_resumes_original_entropy_mask_and_submits_once
