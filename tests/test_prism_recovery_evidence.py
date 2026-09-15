@@ -119,6 +119,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
         checkpoint = {"best_chainwork": "2", "best_tip_hash": "aa" * 32, "best_tip_height": 7}
         config = {"config_fingerprint": "fingerprint-one"}
         revision = {"payout_revision": 1}
+        clock = {"ledger_clock_ms": 1758000000000}
         event = {
             "event_id": 1, "cleared_at": "2026-09-14T21:00:00+00:00",
             "operator_identity": "operator", "database_role": "prism",
@@ -127,7 +128,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
         }
         for kind, row in (("fatal_state", fatal), ("fatal_state_events", event),
                           ("chain_checkpoint", checkpoint), ("cluster_config", config),
-                          ("payout_revision", revision)):
+                          ("payout_revision", revision), ("ledger_clock", clock)):
             with self.subTest(kind=kind):
                 self.assertEqual(baseline["records"][kind]["count"], 0)
                 added = module.summarize(iter([record(kind, row)] + closing()))

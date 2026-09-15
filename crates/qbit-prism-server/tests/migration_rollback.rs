@@ -147,6 +147,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
             "fatal_state", "fatal_state_events", "cluster_config", "payout_revision",
+            "ledger_clock",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
         }
@@ -196,6 +197,10 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         );
         let after = recovery::evidence(&source, pg_bin).await?;
         ensure!(after["accepted_shares"] == 4);
+        ensure!(
+            after["records"]["ledger_clock"]["count"] == 1,
+            "the acknowledged append left the ledger clock at its migration default"
+        );
         ensure!(
             after["records"]["shares"]["sha256"] != source_evidence["records"]["shares"]["sha256"]
         );
@@ -420,6 +425,32 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             .execute(&source.pool).await?;
         prior = recovery::evidence(&source, pg_bin).await?;
         ensure!(prior["records"]["cluster_config"]["count"] == 1);
+        // append and snapshot advance the ledger clock as the monotonic barrier
+        // behind share timestamps and window anchors, so a rewound clock must
+        // be visible even when every stamped share and anchor is unchanged.
+        let ledger_clock_ms: i64 =
+            sqlx::query_scalar("SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton")
+                .fetch_one(&source.pool)
+                .await?;
+        ensure!(ledger_clock_ms > 1);
+        ensure!(prior["records"]["ledger_clock"]["count"] == 1);
+        let before_clock = prior.clone();
+        for (value, count) in [(ledger_clock_ms - 1, 1), (0, 0), (1, 1), (ledger_clock_ms, 1)] {
+            sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=$1")
+                .bind(value)
+                .execute(&source.pool)
+                .await?;
+            let current = recovery::evidence(&source, pg_bin).await?;
+            ensure!(current["records"]["ledger_clock"]["count"] == count);
+            ensure!(current["records"]["ledger_clock"]["sha256"]
+                != prior["records"]["ledger_clock"]["sha256"],
+                "ledger clock change was invisible to recovery evidence: {value}");
+            let mut unchanged = current.clone();
+            unchanged["records"]["ledger_clock"] = prior["records"]["ledger_clock"].clone();
+            ensure!(unchanged == prior, "unrelated accounting changed with ledger clock");
+            prior = current;
+        }
+        ensure!(prior == before_clock, "ledger clock restore diverged from baseline");
         let before_halt = prior.clone();
         for mutation in [
             "fatal_error='deep confirmed CTV fanout disconnected: test; manual reconciliation required'",
