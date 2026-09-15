@@ -828,3 +828,162 @@ async fn unknown_issued_commit_is_observed_and_reconciled_without_reissuing() ->
     })
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_refresh_during_completed_commit_wait_preserves_original_authority() -> Result<()>
+{
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let mut job =
+                f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
+                    .await?;
+            job.wire.version_mask = MASK;
+            let prepared_before = f.payload(&job.context.prepared.storage_key).await?;
+            let pause = f.proxy.pause_after_commit("qbit_prism_jobs", "INSERT")?;
+            let mark = f.proxy.mark();
+            let a = f.a.clone();
+            let issued = job.clone();
+            let owner = worker.clone();
+            let mut pending = tokio::spawn(async move {
+                a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(30))
+                    .await
+            });
+            let commit = timeout(Duration::from_secs(5), pause.entered())
+                .await
+                .context("issued COMMIT did not reach the response barrier")?;
+            ensure!(
+                !pending.is_finished(),
+                "persistence did not wait for its COMMIT reply"
+            );
+            let observed = f.proxy.executions_since(mark)?;
+            ensure!(
+                observed.iter().any(|execution| execution.seq == commit
+                    && execution.is_commit()
+                    && !execution.delivered()),
+                "paused reply was not an actual undelivered completed COMMIT"
+            );
+            let issued_before = f.payload(&job.wire.job_id).await?;
+            // The transaction has committed and released its locks. Refresh
+            // must finish while the original caller still awaits that reply.
+            timeout(Duration::from_secs(5), f.a.refresh_once()).await??;
+            let publication =
+                f.a.prepared
+                    .read()
+                    .await
+                    .clone()
+                    .context("cached publication missing")?;
+            ensure!(
+                publication.storage_key == job.context.prepared.storage_key
+                    && publication.generation == job.wire.refresh_generation,
+                "fixture did not take the unchanged cached-refresh path"
+            );
+            ensure!(
+                f.payload(&publication.storage_key).await? == prepared_before,
+                "unchanged refresh rewrote original reservation identity"
+            );
+            ensure!(
+                !pending.is_finished(),
+                "COMMIT reply was released before cached refresh completed"
+            );
+            pause.release();
+            let result = timeout(Duration::from_secs(5), &mut pending).await;
+            if result.is_err() {
+                pending.abort();
+                let _ = pending.await;
+                anyhow::bail!("issued operation did not finish after COMMIT release");
+            }
+            result???;
+            ensure!(
+                f.payload(&job.wire.job_id).await? == issued_before,
+                "post-wait issuance changed original payload or expiry"
+            );
+            let resumed =
+                f.b.resume_job(&worker, &job.wire.job_id)
+                    .await?
+                    .context("unchanged refresh invalidated the original authority")?;
+            same_job(&job, &resumed)?;
+            compact_storage(f, &job).await
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseding_publication_during_completed_commit_wait_refuses_old_delivery() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let job =
+                f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
+                    .await?;
+            let pause = f.proxy.pause_after_commit("qbit_prism_jobs", "INSERT")?;
+            let a = f.a.clone();
+            let issued = job.clone();
+            let owner = worker.clone();
+            let mut pending = tokio::spawn(async move {
+                a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(30))
+                    .await
+            });
+            timeout(Duration::from_secs(5), pause.entered())
+                .await
+                .context("issued COMMIT did not reach the response barrier")?;
+            let issued_before = f.payload(&job.wire.job_id).await?;
+            f.node
+                .set_tip(&"ef".repeat(32), &"ab".repeat(32), 101, "02");
+            timeout(Duration::from_secs(5), f.a.refresh_once()).await??;
+            timeout(Duration::from_secs(5), f.b.refresh_once()).await??;
+            ensure!(
+                f.a.prepared
+                    .read()
+                    .await
+                    .as_ref()
+                    .context("replacement publication missing")?
+                    .storage_key
+                    != job.context.prepared.storage_key,
+                "fixture did not genuinely supersede the original publication"
+            );
+            ensure!(
+                !pending.is_finished(),
+                "old issuance returned before supersession"
+            );
+            pause.release();
+            let result = timeout(Duration::from_secs(5), &mut pending).await;
+            if result.is_err() {
+                pending.abort();
+                let _ = pending.await;
+                anyhow::bail!("superseded issuance did not finish after COMMIT release");
+            }
+            let error = result??
+                .err()
+                .context("old work borrowed the superseding publication authority")?;
+            ensure!(
+                error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
+                "revoked issuance lost its refusal error"
+            );
+            // A committed row may remain after revocation. Its identity and
+            // deadline stay original, and no frontend may deliver it as work.
+            ensure!(
+                f.payload(&job.wire.job_id).await? == issued_before,
+                "revocation rewrote the committed original job"
+            );
+            ensure!(
+                f.a.resume_job(&worker, &job.wire.job_id).await?.is_none(),
+                "A resumed revoked work"
+            );
+            ensure!(
+                f.b.resume_job(&worker, &job.wire.job_id).await?.is_none(),
+                "B resumed revoked work under its own publication"
+            );
+            let next = f.issue(&worker, Duration::from_secs(30)).await?;
+            ensure!(
+                f.b.resume_job(&worker, &next.wire.job_id).await?.is_some(),
+                "new current-tip work did not resume after the refusal"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
