@@ -40,7 +40,9 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+import string
 import subprocess
+import unicodedata
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -84,38 +86,62 @@ def prose_reference_pattern(root: str, separator: str) -> re.Pattern[str]:
     )
 
 
-PATH_REFERENCE = prose_reference_pattern(r"\blab/prism", "/")
-MODULE_REFERENCE = prose_reference_pattern(r"\blab\.prism", r"\.")
+# A root starts where no letter or digit precedes it. `\b` would refuse an
+# underscore there, since `_` is a word character, and the emphasized
+# `_lab/prism/x_` would never match; whether that underscore is emphasis or
+# the `my_lab` of another path is settled by the root prefixes below.
+ROOT_BOUNDARY = r"(?<![^\W_])"
+PATH_REFERENCE = prose_reference_pattern(rf"{ROOT_BOUNDARY}lab/prism", "/")
+MODULE_REFERENCE = prose_reference_pattern(rf"{ROOT_BOUNDARY}lab\.prism", r"\.")
+# A bare reference loses its trailing prose punctuation. `_` is not listed: a
+# file may be named `tool_`, and `lab/prism/tool_` names it. The run that
+# closes an emphasis the token's own underscores opened is removed instead, by
+# the delimiters the pair spends (``prose_reference``), so `_lab/prism/tool__`
+# still names `lab/prism/tool_`.
 PROSE_TRAILING_PUNCTUATION = ".,;:!?*()[]{}|"
 URL_REFERENCE_PREFIX = re.compile(r"https?://\S+/$")
 # A `lab/prism` path names the repository's own tree only where a path token
 # starts: at the start of a line or after whitespace, behind any Markdown
-# openers `( [ { < * | >` that begin that token, or after a Markdown link's
-# `](`; then behind any opening quotes or backticks and at most one `./`. The
-# `>` is the blockquote marker, which needs no space after it: `>lab/prism/x`
-# and the nested `>>lab/prism/x` quote the root path as `> lab/prism/x` does.
-# It also starts directly after the ref of a GitHub blob, tree or raw URL.
+# openers `( [ { < * | >` and underscore emphasis that begin that token, or
+# after a Markdown link's `](`; then behind any opening quotes or backticks
+# and at most one `./`. The `>` is the blockquote marker, which needs no
+# space after it: `>lab/prism/x` and the nested `>>lab/prism/x` quote the
+# root path as `> lab/prism/x` does. The underscores are emphasis only when
+# they close: Markdown renders `_lab/prism/x_`, `__lab/prism/x__` and
+# `` _`lab/prism/x`_ `` with the underscores gone and the path emphasized,
+# while `_lab/prism/x` with no closing run renders literally and names a
+# path in `_lab/`, so the run is captured as `emphasis` and the token is
+# read only when ``underscore_emphasis`` finds its closer. Inside a code
+# span nothing is emphasis: `` `_lab/prism/x` `` is that literal path, and
+# an underscore after the backtick starts no token, since the openers come
+# before the quotes here. It also starts directly after the ref of a GitHub
+# blob, tree or raw URL.
 # `\b` alone matched inside `my-lab/prism`, `my*lab/prism`, `my(lab/prism`,
 # `my=lab/prism`, `my>lab/prism`, `vendor/lab/prism`, `/tmp/lab/prism` and
-# `https://example.com/lab/prism`, which are other paths: an opener starts a
-# token only at the start of the line or after whitespace. `../lab/prism` and
-# `/lab/prism` are not the root either: a scan of doc text does not know which
-# directory the doc sits in, so neither spelling can be resolved. Whitespace
-# still starts a token inside a code span, so `echo lab/prism/x` is read.
+# `https://example.com/lab/prism`, which are other paths, and `my_lab/prism`
+# is one more: an opener starts a token only at the start of the line or
+# after whitespace. `../lab/prism` and `/lab/prism` are not the root either:
+# a scan of doc text does not know which directory the doc sits in, so
+# neither spelling can be resolved. Whitespace still starts a token inside a
+# code span, so `echo lab/prism/x` is read, and its underscores pair as they
+# do in prose, so `echo _lab/prism/x_` is read as `echo *lab/prism/x*` is.
 PATH_ROOT_PREFIX = re.compile(
-    r"(?:(?:^|\s)[(\[{<*|>]*[`'\"]*(?:\./)?"
+    r"(?:(?:^|\s)(?:[(\[{<*|>]|(?P<emphasis>_+))*[`'\"]*(?:\./)?"
     r"|\]\([<`'\"]*(?:\./)?"
     r"|https?://github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[^/\s]+/)$"
 )
 # A dotted `lab.prism` module is the repository's own only where a token
 # starts, as `PATH_ROOT_PREFIX` reads it (the blockquote `>lab.prism.x` and
-# `>>lab.prism.x` included) but with no `./` or URL form: a module name is
-# never a path. A shell `$'` or `$"` may open the token, so the prose net
-# still reads `-m $'lab.prism.x"`. `\b` alone matched inside
-# `vendor.lab.prism`, `my-lab.prism`, `my>lab.prism`, `../lab.prism`,
-# `/tmp/lab.prism` and `https://example.com/lab.prism`, which name other
-# modules or paths.
-MODULE_ROOT_PREFIX = re.compile(r"(?:(?:^|\s)[(\[{<*|>]*(?:\$['\"])?[`'\"]*|\]\([<`'\"]*)$")
+# `>>lab.prism.x` and the emphasized `_lab.prism.x_` included) but with no
+# `./` or URL form: a module name is never a path. A shell `$'` or `$"` may
+# open the token, so the prose net still reads `-m $'lab.prism.x"`. `\b`
+# alone matched inside `vendor.lab.prism`, `my-lab.prism`, `my>lab.prism`,
+# `../lab.prism`, `/tmp/lab.prism` and `https://example.com/lab.prism`,
+# which name other modules or paths, and `my_lab.prism.x` and the unclosed
+# `_lab.prism.x` name a module of the `my_lab` or `_lab` package.
+MODULE_ROOT_PREFIX = re.compile(
+    r"(?:(?:^|\s)(?:[(\[{<*|>]|(?P<emphasis>_+))*(?:\$['\"])?[`'\"]*|\]\([<`'\"]*)$"
+)
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
 # option form `python3 --help` lists may sit between the interpreter and its
 # target: clustered flag letters, `-W`/`-X` with an attached or following
@@ -961,16 +987,106 @@ def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, st
     return found
 
 
+UNDERSCORE_RUN = re.compile(r"_+")
+
+
+def markdown_punctuation(character: str) -> bool:
+    """Whether ``character`` is punctuation to CommonMark: ASCII punctuation, or Unicode P or S."""
+    return character in string.punctuation or unicodedata.category(character)[0] in "PS"
+
+
+def underscore_emphasis(line: str, root: re.Match[str]) -> tuple[re.Match[str], int] | None:
+    """The run closing the emphasis the underscores of ``root`` open, with the delimiters the pair spends.
+
+    The underscore runs after the opener are paired as CommonMark 0.31 pairs
+    them. A run can close when it is right-flanking (its previous character
+    is neither whitespace nor punctuation, or is punctuation followed by
+    whitespace or punctuation) and, for `_`, not also left-flanking unless
+    followed by punctuation; it can open under the mirror image. A run
+    between letters or digits is neither and is text, so
+    `_lab.prism.process_telemetry_` closes at its end. A closer pairs with
+    the nearest unpaired opener, spending two delimiters when both runs have
+    two or more and one otherwise, and spends what it has left on the next
+    opener down: `___lab/prism/x___` spends three on its opener,
+    `_lab/prism/x and _y_` spends its closer on `_y` and leaves the opener
+    literal, and `_lab/prism/x and _y_ z_` closes it at the end. Code spans
+    are read before emphasis, so a run an odd number of backticks after the
+    opener is text. ``None`` when no run pairs with the opener, as for
+    `_lab/prism/x` alone: Markdown renders that underscore literally.
+
+    One line is read, as far as the guard's line scan sees: an emphasis
+    closed on a later line is missed, the runs before the opener are not
+    read (a closer pairs with the nearest opener, so they take none from
+    it), and the rule of three for runs that both open and close, the `*`
+    delimiters and link and HTML boundaries are not followed.
+    """
+    openers = [len(root.group("emphasis"))]  # the token's opener first, nearer openers after it
+    start = root.end("emphasis")
+    for run in UNDERSCORE_RUN.finditer(line, start):
+        if line.count("`", start, run.start()) % 2:
+            continue
+        before = line[run.start() - 1] if run.start() else " "
+        after = line[run.end()] if run.end() < len(line) else " "
+        before_punctuation = markdown_punctuation(before)
+        after_punctuation = markdown_punctuation(after)
+        left = not after.isspace() and (not after_punctuation or before.isspace() or before_punctuation)
+        right = not before.isspace() and (not before_punctuation or after.isspace() or after_punctuation)
+        remaining = run.end() - run.start()
+        spent = 0
+        if right and (not left or after_punctuation):
+            while remaining and openers:
+                use = 2 if remaining >= 2 and openers[-1] >= 2 else 1
+                openers[-1] -= use
+                remaining -= use
+                if len(openers) == 1:
+                    spent += use
+                if not openers[-1]:
+                    openers.pop()
+        if spent:
+            return run, spent
+        if remaining and left and (not right or before_punctuation):
+            openers.append(remaining)
+    return None
+
+
+def prose_reference(line: str, match: re.Match[str], root: re.Match[str]) -> str | None:
+    """The path or module ``match`` names on ``line``, where the token root ``root`` precedes it.
+
+    A quoted literal is kept whole. A bare token loses its trailing prose
+    punctuation and, when ``root`` opened underscore emphasis, the run that
+    closes it (``underscore_emphasis``), by the delimiters the pair spends:
+    `_lab/prism/x_` names `lab/prism/x`, `_lab/prism/tool__` names
+    `lab/prism/tool_`, and `_lab/prism/x and more_` closes past the token,
+    which is then read whole. ``None`` when the underscores open no
+    emphasis: `_lab/prism/x` renders literally and names another path.
+    """
+    reference = match.group("literal") or match.group("bare")
+    if root.group("emphasis"):
+        if (closed := underscore_emphasis(line, root)) is None:
+            return None
+        closer, spent = closed
+        if match.group("bare") and closer.start() < match.end("bare"):
+            # The closer ends the token, behind at most trailing punctuation
+            # and the closers of emphasis opened further out, as in
+            # `(_lab/prism/x_)`, `**_lab/prism/x_**` and `_(_lab/prism/x_)_`.
+            if not line[closer.end() : match.end("bare")].strip(PROSE_TRAILING_PUNCTUATION + "_"):
+                reference = line[match.start("bare") : closer.start()] + closer.group()[spent:]
+    if match.group("bare"):
+        reference = reference.rstrip(PROSE_TRAILING_PUNCTUATION)
+    return reference
+
+
 def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, str]]:
     """``(line, reference)`` for each ``lab/prism`` mention that resolves to nothing."""
     found = []
     for number, line in enumerate(text.splitlines(), 1):
         for match in PATH_REFERENCE.finditer(line):
             prefix = line[: match.start()]
-            if PINNED_GITHUB_URL.search(prefix) or not PATH_ROOT_PREFIX.search(prefix):
+            if PINNED_GITHUB_URL.search(prefix) or (root := PATH_ROOT_PREFIX.search(prefix)) is None:
                 continue
-            reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
-            if match.group("bare") and URL_REFERENCE_PREFIX.search(line[: match.start()]):
+            if (reference := prose_reference(line, match, root)) is None:
+                continue
+            if match.group("bare") and URL_REFERENCE_PREFIX.search(prefix):
                 reference = re.split(r"[?#]", reference, maxsplit=1)[0]
             normalized = posixpath.normpath(reference)
             if normalized == "lab" or normalized.startswith("lab/"):
@@ -981,9 +1097,11 @@ def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, s
                     continue
             found.append((number, reference))
         for match in MODULE_REFERENCE.finditer(line):
-            if not MODULE_ROOT_PREFIX.search(line[: match.start("literal" if match.group("literal") else "bare")]):
+            prefix = line[: match.start("literal" if match.group("literal") else "bare")]
+            if (root := MODULE_ROOT_PREFIX.search(prefix)) is None:
                 continue
-            reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
+            if (reference := prose_reference(line, match, root)) is None:
+                continue
             if not any(c in tracked for c in module_candidates(reference)):
                 found.append((number, reference))
     return found
@@ -1251,6 +1369,47 @@ class ScannerTests(unittest.TestCase):
                     self.assertEqual(self.references(text), [])
         self.assertEqual(self.references(">./lab/prism/deleted.py"), ["lab/prism/deleted.py"])
         self.assertEqual(self.references("> ./lab/prism/deleted.py"), ["lab/prism/deleted.py"])
+
+    def test_closed_underscore_emphasis_starts_reference_tokens(self) -> None:
+        # Markdown renders `_lab/prism/x_`, `__lab/prism/x__` and
+        # `` _`lab/prism/x`_ `` with the underscores gone and the path
+        # emphasized, so the doc shows the root path, and the closing run is
+        # no part of it. An underscore no later run closes renders literally
+        # and names a path in `_lab/`, `my_lab` is another path, a run inside
+        # a word is text, and inside a code span nothing is emphasis
+        # (markdown-it-py 3.0.0 in CommonMark mode agrees on every spelling).
+        for root in ("lab/prism/deleted.py", "lab.prism.deleted"):
+            for surrounding in (
+                "_{}_", "__{}__", "___{}___", "_{}_.", "See _{}_.", "See _{}_, then", "The old _{}_ file",
+                "_`{}`_", "__`{}`__", "_'{}'_", '_"{}"_', "(_{}_)", "_({})_", "**_{}_**", "_**{}**_", "[_{}_](x)",
+                "> _{}_", ">_{}_", "> The old _{}_ file.", "_{} is gone_", "_{} and `more`_", "_{}_ and _more_",
+                "_a _{}_", "__{}_", "_{} _y_ z_", "_{}_'s",
+            ):
+                text = surrounding.format(root)
+                with self.subTest(text=text):
+                    self.assertEqual(self.references(text), [root])
+                    self.assertEqual(dangling_references(text, self.TRACKED | {"lab/prism/deleted.py"}), [])
+            for surrounding in (
+                "_{}", "_{}.", "See _{}.", "__{}", "`_{}`", "`_{}_`", "my_{}", "`my_{}`", "_{}_y", "_{} and _y_",
+                "_{} and `tool_`", "_{} then_more", "[x](_{}_)",
+            ):
+                text = surrounding.format(root)
+                with self.subTest(text=text):
+                    self.assertEqual(self.references(text), [])
+        self.assertEqual(self.references("_lab.prism.process_telemetry_"), ["lab.prism.process_telemetry"])
+        # A path may end in `_`, which no trailing-punctuation rule may trim:
+        # only the run that closes the emphasis the token opened goes, by the
+        # delimiters the pair spends, so `_lab/prism/tool__` renders and names
+        # `lab/prism/tool_` as `lab/prism/tool_` does.
+        tracked = self.TRACKED | {"lab/prism/tool_"}
+        for text in (
+            "See lab/prism/tool_.", "See `lab/prism/tool_`.", "lab/prism/tool_", "_lab/prism/tool__",
+            "__lab/prism/tool___", "_`lab/prism/tool_`_", "See lab.prism.tool_.", "_lab.prism.tool__",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(dangling_references(text, tracked), [])
+        self.assertEqual(dangling_references("See lab/prism/tool_.", self.TRACKED), [(1, "lab/prism/tool_")])
+        self.assertEqual(dangling_references("_lab/prism/tool__", self.TRACKED), [(1, "lab/prism/tool_")])
 
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
