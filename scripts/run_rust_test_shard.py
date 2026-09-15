@@ -15,6 +15,7 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+COMPACT_SCALE = ("qbit-prism-server", "test", "compact_runtime_scale")
 # These ignored contracts were explicitly run by the unsharded job. Run each
 # only on the shard that owns its ordinary test target.
 IGNORED = {
@@ -23,6 +24,9 @@ IGNORED = {
         "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence",
     ],
     ("qbit-prism-server", "test", "observability_database"): [],
+    # Both real scale cases share this shard's primary. Run serially so the
+    # insert-LSN bracket observes one refresh, under optimized runtime code.
+    COMPACT_SCALE: ["--test-threads=1"],
 }
 
 
@@ -54,7 +58,8 @@ def shard_commands(metadata: dict, index: int, count: int) -> list[list[str]]:
             command.append(name)
         commands.append(command + ["--", "--nocapture"])
         if (package, kind, name) in IGNORED:
-            commands.append(command + ["--", "--ignored", "--nocapture"] + IGNORED[package, kind, name])
+            profile = ["--release"] if (package, kind, name) == COMPACT_SCALE else []
+            commands.append(command + profile + ["--", "--ignored", "--nocapture"] + IGNORED[package, kind, name])
     return commands
 
 

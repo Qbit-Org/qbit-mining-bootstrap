@@ -136,6 +136,8 @@ case "${mode}" in
     run_tests cargo test --locked -p qbit-prism-server --test stratum_admission_postgres \
       -- --ignored --nocapture --exact ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
     run_tests cargo test --locked -p qbit-prism-server --test observability_database -- --ignored --nocapture
+    run_tests cargo test --release --locked -p qbit-prism-server --test compact_runtime_scale \
+      -- --ignored --nocapture --test-threads=1
     ;;
 esac
 
