@@ -111,7 +111,7 @@ impl Ledger {
         .fetch_one(&mut *self.acquire().await?)
         .await?;
         if !landed {
-            verify_durable_range(self, &landing.snapshot).await?;
+            verify_durable_range(&self.pool, &landing.snapshot, self.metrics.as_deref()).await?;
         }
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;

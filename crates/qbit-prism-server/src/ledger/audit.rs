@@ -244,8 +244,9 @@ const VERIFY_PAGE_ROWS: i64 = 4096;
 /// in-transaction count guard in [`persist_audit_snapshot`] covers the range
 /// again under the lock.
 pub(super) async fn verify_durable_range(
-    ledger: &Ledger,
+    pool: &PgPool,
     snapshot: &AuditSnapshotWrite,
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     ensure!(
         snapshot.share_count > 0,
@@ -263,7 +264,7 @@ pub(super) async fn verify_durable_range(
         // Release this page's checkout before its blocking comparison and the
         // next page, observing each acquisition rather than the whole proof.
         let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT $4"))
-            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *ledger.acquire().await?).await?;
+            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         if rows.is_empty() {
             break;
         }
