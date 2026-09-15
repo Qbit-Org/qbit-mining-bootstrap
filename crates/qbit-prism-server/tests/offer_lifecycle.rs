@@ -1732,3 +1732,359 @@ async fn signer_rotation_is_refused_at_every_unfinished_state_alone_and_accepted
     })
     .await
 }
+
+// ---------------------------------------------------------------------------
+// The declaration 011 makes, and the index it builds
+// ---------------------------------------------------------------------------
+
+/// Every relation, sequence, index and function of the schema, by name: the
+/// witness that a refused start or migrate changed nothing.
+async fn schema_objects(pool: &PgPool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT relkind::text||' '||relname::text FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relkind IN ('r','S','i') UNION ALL SELECT 'f '||oid::regprocedure::text FROM pg_proc WHERE pronamespace=current_schema()::regnamespace ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn offer_capability(pool: &PgPool) -> Result<Option<i32>> {
+    Ok(sqlx::query_scalar(
+        "SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'",
+    )
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// A database at 11 declares `candidate_offer_lifecycle = 1`: 011 declared
+/// it once every object of the lifecycle existed, and nothing native removes
+/// or edits it. Without the row, or with another value, the database can no
+/// longer say that every unfinished outbox row belongs to the offer
+/// lifecycle, so a start refuses it in both connect modes and a migrate
+/// refuses it before any DDL, with every row, every object and the
+/// declaration itself left exactly as found: the server never repairs a
+/// selectively restored declaration. A genuine pre-011 database has no such
+/// row to lose and is declared by 011; declared again as 011 declares it, a
+/// refused database starts and migrates.
+#[tokio::test]
+async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at_connect_and_at_migrate(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            // The genuine upgrade: a pre-011 database is not refused for the
+            // row it cannot have, and 011 declares it while it quarantines
+            // the attempted row and keeps the never-attempted one.
+            db.apply_pre_011().await?;
+            ensure!(offer_capability(&db.pool).await?.is_none());
+            seed_share(&db.pool, 1).await?;
+            let snapshot = seeded_snapshot();
+            let (attempted, _) = candidate_for(&snapshot, 41)?;
+            let (fresh, _) = candidate_for(&snapshot, 42)?;
+            insert_pre_011_pending(&db.pool, &attempted, 1, Some("node timed out"), false, true)
+                .await?;
+            insert_pre_011_pending(&db.pool, &fresh, 0, None, false, true).await?;
+            sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,state,attempt_count,completed_at) VALUES($1,NULL,$2,'submitted',1,clock_timestamp()-interval '1 hour')")
+                .bind("d4".repeat(32)).bind(format!("d4{}", "0".repeat(62)))
+                .execute(&db.pool).await?;
+            let upgraded = db.ledger("upgrade").await?;
+            ensure!(db.versions().await? == ALL_VERSIONS);
+            ensure!(
+                offer_capability(&db.pool).await? == Some(1),
+                "011 did not declare the lifecycle"
+            );
+            ensure!(db.row(&attempted.block_hash).await?["state"] == "reconciliation");
+            ensure!(db.row(&fresh.block_hash).await?["state"] == "pending");
+            upgraded.pool.close().await;
+            let rows = db.outbox_rows().await?;
+            let objects = schema_objects(&db.pool).await?;
+            // Healthy controls: both connect modes start the declared database.
+            for initialize in [false, true] {
+                Ledger::connect(&db.url, format!("healthy-{initialize}"), 4, initialize)
+                    .await
+                    .with_context(|| {
+                        format!("connect(initialize={initialize}) refused a declared database")
+                    })?
+                    .pool
+                    .close()
+                    .await;
+            }
+            for (case, statement, message, remedy) in [
+                (
+                    "deleted",
+                    "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'",
+                    "qbit_prism_schema_capabilities has no candidate_offer_lifecycle row",
+                    "VALUES('candidate_offer_lifecycle',1)",
+                ),
+                (
+                    "edited",
+                    "UPDATE qbit_prism_schema_capabilities SET capability_value=0 WHERE capability='candidate_offer_lifecycle'",
+                    "declares candidate_offer_lifecycle = 0",
+                    "nothing native writes another value",
+                ),
+                (
+                    "newer",
+                    "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_offer_lifecycle'",
+                    "declares candidate_offer_lifecycle = 2",
+                    "newer PRISM release",
+                ),
+            ] {
+                sqlx::raw_sql(statement).execute(&db.pool).await?;
+                let declared = offer_capability(&db.pool).await?;
+                for initialize in [false, true] {
+                    let error = Ledger::connect(&db.url, "cold".into(), 4, initialize)
+                        .await
+                        .err()
+                        .with_context(|| format!("{case}: connect(initialize={initialize}) accepted a database at 11 without its lifecycle declaration"))?;
+                    let text = format!("{error:#}");
+                    ensure!(
+                        text.contains("database is at schema migration 11 but")
+                            && text.contains(message)
+                            && text.contains(remedy),
+                        "{case}: {text}"
+                    );
+                    if initialize {
+                        ensure!(
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 before any DDL"),
+                            "{case}: {text}"
+                        );
+                    }
+                    ensure!(
+                        db.versions().await? == ALL_VERSIONS,
+                        "{case}: the migration record changed"
+                    );
+                    ensure!(
+                        db.outbox_rows().await? == rows,
+                        "{case}: a refused start rewrote outbox rows"
+                    );
+                    ensure!(
+                        schema_objects(&db.pool).await? == objects,
+                        "{case}: a refused start changed the schema"
+                    );
+                    ensure!(
+                        offer_capability(&db.pool).await? == declared,
+                        "{case}: the refusal repaired the declaration itself"
+                    );
+                }
+                sqlx::raw_sql("DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_offer_lifecycle',1)")
+                    .execute(&db.pool).await?;
+            }
+            // Before any DDL: with 009 undone as well, migrate refuses the
+            // missing declaration and applies nothing above it. Declared
+            // again, 009 is applied and the database starts in both modes.
+            sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=9; DROP TABLE qbit_prism_session_reservations; DROP INDEX qbit_prism_jobs_extranonce1_expiry_idx; ALTER SEQUENCE qbit_prism_session_sequence NO CYCLE; DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'")
+                .execute(&db.pool).await?;
+            let objects = schema_objects(&db.pool).await?;
+            let error = db
+                .ledger("this-build")
+                .await
+                .err()
+                .context("migrate applied 009 above a missing lifecycle declaration")?;
+            let text = format!("{error:#}");
+            ensure!(
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11 before any DDL")
+                    && text.contains("has no candidate_offer_lifecycle row"),
+                "{text}"
+            );
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11]);
+            ensure!(
+                schema_objects(&db.pool).await? == objects,
+                "a refused migrate changed the schema"
+            );
+            ensure!(
+                db.outbox_rows().await? == rows,
+                "a refused migrate rewrote outbox rows"
+            );
+            sqlx::raw_sql("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_offer_lifecycle',1)")
+                .execute(&db.pool).await?;
+            let migrated = db.ledger("this-build").await?;
+            ensure!(
+                db.versions().await? == ALL_VERSIONS,
+                "009 was not applied after the remedy"
+            );
+            migrated.pool.close().await;
+            Ledger::connect(&db.url, "follower".into(), 4, false)
+                .await?
+                .pool
+                .close()
+                .await;
+            ensure!(
+                db.outbox_rows().await? == rows,
+                "the remedy rewrote outbox rows"
+            );
+            // A record with 11 and not 6 was restored selectively: the fence
+            // still runs before any DDL, ahead of 006's own refusals, and the
+            // remedy is the same.
+            sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=6; DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'")
+                .execute(&db.pool).await?;
+            let objects = schema_objects(&db.pool).await?;
+            let error = db.ledger("this-build").await.err().context(
+                "migrate accepted a record with 11 and not 6 without the lifecycle declaration",
+            )?;
+            let text = format!("{error:#}");
+            ensure!(
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11 before any DDL")
+                    && text.contains("has no candidate_offer_lifecycle row"),
+                "{text}"
+            );
+            ensure!(
+                schema_objects(&db.pool).await? == objects && db.outbox_rows().await? == rows,
+                "a refused migrate changed the database"
+            );
+            sqlx::raw_sql("INSERT INTO qbit_prism_schema_migrations(version) VALUES(6); INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_offer_lifecycle',1)")
+                .execute(&db.pool).await?;
+            Ledger::connect(&db.url, "restored".into(), 4, true)
+                .await?
+                .pool
+                .close()
+                .await;
+            ensure!(db.versions().await? == ALL_VERSIONS && db.outbox_rows().await? == rows);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Retained terminal history beside one unfinished row in each state, all
+/// due, the pending rows attempted so that only the oldest-due lane can
+/// serve them. Every row satisfies 011's lifecycle, payload and offer rules.
+async fn seed_retained_history(pool: &PgPool, terminal_rows: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,state,attempt_count,created_at,next_attempt_at,completed_at) \
+         SELECT lpad(to_hex(i),64,'0'),NULL,lpad(to_hex(i),64,'0'),CASE WHEN i%7=0 THEN 'abandoned' ELSE 'submitted' END,1+(i%3), \
+                clock_timestamp()-(i||' seconds')::interval,clock_timestamp()-(i||' seconds')::interval,clock_timestamp()-(i||' seconds')::interval \
+         FROM generate_series(1,$1::bigint) AS g(i)",
+    )
+    .bind(terminal_rows)
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(
+        r#"INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,block_bytes,window_anchor_ms,window_prior_balances_sha256,state,attempt_count,created_at,next_attempt_at,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,last_error) VALUES
+           (repeat('a1',32),'{"k":1}',repeat('a1',32),decode('00','hex'),1,repeat('b1',32),'pending',2,clock_timestamp()-interval '10 minutes',clock_timestamp()-interval '10 minutes',NULL,NULL,NULL,NULL,'window read timed out'),
+           (repeat('a2',32),'{"k":2}',repeat('a2',32),decode('00','hex'),1,repeat('b2',32),'pending',3,clock_timestamp()-interval '3 hours',clock_timestamp()-interval '1 minute',NULL,NULL,NULL,NULL,'window read timed out'),
+           (repeat('a3',32),'{"k":3}',repeat('a3',32),decode('00','hex'),1,repeat('b3',32),'offer_reserved',1,clock_timestamp()-interval '5 minutes',clock_timestamp()-interval '4 minutes',clock_timestamp()-interval '5 minutes','fe-1',NULL,NULL,NULL),
+           (repeat('a4',32),'{"k":4}',repeat('a4',32),decode('00','hex'),1,repeat('b4',32),'offered',1,clock_timestamp()-interval '6 minutes',clock_timestamp()-interval '5 minutes',clock_timestamp()-interval '6 minutes','fe-1',1700000000456,'accepted',NULL),
+           (repeat('a5',32),'{"k":5}',repeat('a5',32),decode('00','hex'),1,repeat('b5',32),'reconciliation',4,clock_timestamp()-interval '2 hours',clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '2 hours','fe-2',NULL,'unknown','delivery unknown')"#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every node of an `EXPLAIN (FORMAT JSON)` plan tree, depth first.
+fn plan_nodes<'a>(plan: &'a Value, nodes: &mut Vec<&'a Value>) {
+    nodes.push(plan);
+    if let Some(children) = plan["Plans"].as_array() {
+        for child in children {
+            plan_nodes(child, nodes);
+        }
+    }
+}
+
+/// The oldest-due lane selects every unfinished state, the pending rows
+/// included, and takes the first due row in its own order; the dispatch
+/// probe asks whether any such row is due at all. Over an outbox that keeps
+/// its terminal history, both are served by 011's partial index, the lane in
+/// the index's order, under the planner's defaults: no claim scans or sorts
+/// the retained rows. The fresh lane keeps 005's index. The plans are those
+/// of the statements the server issues, and the lane's first row is the
+/// earliest due unfinished row whatever its state.
+#[tokio::test]
+async fn oldest_due_lane_and_dispatch_probe_use_the_unfinished_index_over_retained_history(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            db.apply_pre_011().await?;
+            let ledger = db.ledger("plan").await?;
+            let forced: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM pg_settings WHERE name IN ('enable_seqscan','enable_sort','enable_indexscan','enable_bitmapscan') AND setting<>'on'",
+            )
+            .fetch_all(&db.pool)
+            .await?;
+            ensure!(forced.is_empty(), "planner settings are forced: {forced:?}");
+            seed_retained_history(&db.pool, 50_000).await?;
+            sqlx::raw_sql("ANALYZE qbit_block_candidate_outbox")
+                .execute(&db.pool)
+                .await?;
+            for (name, statement, index, ordered) in [
+                (
+                    "oldest-due lane",
+                    Ledger::claim_lane_sql(false),
+                    "qbit_block_candidate_outbox_unfinished_idx",
+                    true,
+                ),
+                (
+                    "dispatch probe",
+                    Ledger::due_work_probe_sql(),
+                    "qbit_block_candidate_outbox_unfinished_idx",
+                    false,
+                ),
+                (
+                    "fresh lane",
+                    Ledger::claim_lane_sql(true),
+                    "qbit_prism_candidate_fresh_idx",
+                    true,
+                ),
+            ] {
+                let plan: Value =
+                    sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {statement}"))
+                        .fetch_one(&db.pool)
+                        .await?;
+                let plan = &plan[0]["Plan"];
+                let mut nodes = Vec::new();
+                plan_nodes(plan, &mut nodes);
+                let scans: Vec<(&str, &str)> = nodes
+                    .iter()
+                    .filter(|node| {
+                        node["Relation Name"] == "qbit_block_candidate_outbox"
+                            || node["Node Type"] == "Bitmap Index Scan"
+                    })
+                    .map(|node| {
+                        (
+                            node["Node Type"].as_str().unwrap_or(""),
+                            node["Index Name"].as_str().unwrap_or(""),
+                        )
+                    })
+                    .collect();
+                println!("{name} over 50000 retained rows: {scans:?}");
+                ensure!(
+                    scans.iter().any(|(kind, used)| *used == index
+                        && matches!(*kind, "Index Scan" | "Index Only Scan" | "Bitmap Index Scan")),
+                    "{name}: not served by {index}: {plan}"
+                );
+                ensure!(
+                    !scans.iter().any(|(kind, _)| *kind == "Seq Scan"),
+                    "{name}: scans the whole outbox: {plan}"
+                );
+                if ordered {
+                    ensure!(
+                        !nodes.iter().any(|node| node["Node Type"] == "Sort"),
+                        "{name}: sorts the outbox: {plan}"
+                    );
+                    ensure!(
+                        scans
+                            .iter()
+                            .any(|(kind, used)| *used == index && *kind == "Index Scan"),
+                        "{name}: not an ordered index scan: {plan}"
+                    );
+                }
+            }
+            // The lane over that history: the earliest due unfinished row, a
+            // pending one, comes first, and the probe sees the due work.
+            let mut tx = db.pool.begin().await?;
+            let first: String = sqlx::query_scalar(&Ledger::claim_lane_sql(false))
+                .fetch_one(&mut *tx)
+                .await?;
+            ensure!(
+                first == "a1".repeat(32),
+                "the oldest-due lane did not take the earliest due pending row: {first}"
+            );
+            let slot: Option<i64> = sqlx::query_scalar(&Ledger::due_work_probe_sql())
+                .fetch_optional(&mut *tx)
+                .await?;
+            ensure!(slot.is_some(), "the dispatch probe saw no due work");
+            tx.rollback().await?;
+            ledger.pool.close().await;
+            Ok(())
+        })
+    })
+    .await
+}

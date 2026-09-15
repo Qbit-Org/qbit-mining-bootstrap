@@ -2,7 +2,7 @@
 
 Reference: `2.x.x` commit `95ffe063846d51f83999a66cc654da5f7476fdef`,
 `tests/test_prism_retained_jobs.py`, `tests/test_prism_hot_path.py`,
-`lab/prism/tip_refresh.py` and `lab/prism/job_delivery.py`.
+[`tip_refresh.py`](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/95ffe063846d51f83999a66cc654da5f7476fdef/lab/prism/tip_refresh.py) and [`job_delivery.py`](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/95ffe063846d51f83999a66cc654da5f7476fdef/lab/prism/job_delivery.py).
 
 The native tests execute `Coordinator::submit`, `refresh_once`, job construction,
 persistence and resume. Narrow `SubmitLedger` and `WorkLedger` interfaces replace

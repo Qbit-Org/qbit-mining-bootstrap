@@ -3040,8 +3040,12 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
             assert_eq!(schema_objects(&pool).await?, before);
         }
     }
-    // Declared again as 006 declares it, the database starts.
+    // Restoring the dropped table must restore every declaration made by
+    // recorded migrations, including the lifecycle 011 already owns.
     sqlx::raw_sql(include_str!("../../migrations/006_source_schema.sql"))
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_offer_lifecycle',1)")
         .execute(&pool)
         .await?;
     assert_eq!(capability(&pool).await?, Some(1));

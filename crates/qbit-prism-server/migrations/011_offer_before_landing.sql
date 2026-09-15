@@ -276,13 +276,22 @@ BEGIN
     END IF;
 END $$;
 
--- The recovery lane: offered rows waiting for their landing or for chain
--- reconciliation, by due time. 005's fresh index and 001's pending index keep
--- serving the offer lane; 007's balance-reference index is state-independent
--- and unchanged.
+-- The oldest-due lane's index: every unfinished row, the pending rows
+-- included, in the lane's own order. The lane selects `state IN` all four
+-- unfinished states and takes the first due row ordered by next_attempt_at,
+-- created_at and block_hash, so the predicate here is exactly the lane's
+-- and the columns are exactly its order; the dispatch probe that asks
+-- whether any unfinished row is due uses the same predicate. A partial
+-- index over the three offer states alone could serve neither: the planner
+-- cannot prove the lane's four-state predicate from it, so every claim would
+-- scan and sort the whole outbox, the retained terminal history included.
+-- A row leaves this index when the terminal UPDATE leaves the predicate.
+-- 005's fresh index keeps serving the fresh lane (never-attempted pending
+-- rows, newest first); 001's pending index and 002's claim index are
+-- unchanged, and 007's balance-reference index is state-independent.
 CREATE INDEX IF NOT EXISTS qbit_block_candidate_outbox_unfinished_idx
     ON qbit_block_candidate_outbox (next_attempt_at, created_at, block_hash)
-    WHERE state IN ('offer_reserved', 'offered', 'reconciliation');
+    WHERE state IN ('pending', 'offer_reserved', 'offered', 'reconciliation');
 
 -- Quarantine, before any post-011 frontend can claim: a pending row an old
 -- frontend attempted at least once (every pre-011 claim counted an attempt)

@@ -15,8 +15,10 @@
 --
 -- DATA LOSS: dropping the column discards every assigned publication
 -- ordinal. This is a legacy Python-only tool: stop every writer and take a
--- backup first. Native deployments must restore their pre-migration backup;
--- see docs/prism-rust-migration.md. The guard below refuses native schemas.
+-- backup first. Native deployments use one-way migration and forward repair
+-- or isolated-restore reconciliation; see docs/prism-rust-migration.md#recovery-and-rollback.
+-- An older restore after a native ACK loses acknowledged history. The guard
+-- below refuses native schemas before any destructive statement.
 --
 -- The revert is one transaction serialized behind the same advisory lock as
 -- the forward migration. Any failing step aborts the whole file, so the
@@ -35,7 +37,7 @@ BEGIN
     IF to_regclass(format('%I.qbit_prism_schema_migrations', current_schema()))
        IS NOT NULL THEN
         RAISE EXCEPTION
-            'legacy ordinal revert cannot run against native Prism; restore the pre-migration backup';
+            'legacy ordinal revert cannot run against native Prism; one-way migration; use forward repair or isolated-restore reconciliation in docs/prism-rust-migration.md#recovery-and-rollback; never discard acknowledged shares without accounting reconciliation';
     END IF;
 END;
 $$;

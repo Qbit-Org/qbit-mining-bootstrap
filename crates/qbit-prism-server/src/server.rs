@@ -13,6 +13,8 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
+const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
+
 pub async fn run(config: Config) -> Result<()> {
     let rollup_settings = crate::rollups::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
@@ -162,7 +164,34 @@ pub async fn run(config: Config) -> Result<()> {
     tasks.spawn({
         let ledger = coordinator.ledger.clone();
         let shutdown = shutdown_rx.clone();
-        async move { prune_jobs(|| ledger.prune_expired_jobs(), shutdown).await }
+        async move {
+            let cursor = tokio::sync::Mutex::new(crate::ledger::BlobPruneCursor::default());
+            prune_jobs(
+                || async {
+                    // Expiry keeps its original statement budget and commits
+                    // without holding the locks needed by shares and writers.
+                    let jobs = ledger.prune_expired_jobs().await.context("job expiry")?;
+                    if jobs > 0 {
+                        tracing::info!(jobs, "expired PRISM jobs pruned");
+                    }
+                    let deadline = tokio::time::Instant::now() + BLOB_PRUNE_BUDGET;
+                    let mut cursor = cursor.lock().await;
+                    let blobs = ledger
+                        .prune_unreferenced_blobs(&mut cursor, deadline)
+                        .await?;
+                    if blobs.templates > 0 || blobs.balances > 0 {
+                        tracing::info!(
+                            templates = blobs.templates,
+                            balances = blobs.balances,
+                            "unreferenced PRISM blobs pruned"
+                        );
+                    }
+                    Ok(())
+                },
+                shutdown,
+            )
+            .await
+        }
     });
     let failure = tokio::select! {
         result=signal()=>{result?;None},
@@ -236,7 +265,7 @@ fn publication_ticks(state: &ApiState) -> tokio::time::Interval {
 
 /// Keep bounded job cleanup at the original two-second cadence, independent
 /// of health publication and heartbeat latency. Never overlap prune batches.
-async fn prune_jobs<F: std::future::Future<Output = Result<u64>>>(
+async fn prune_jobs<T, F: std::future::Future<Output = Result<T>>>(
     mut prune: impl FnMut() -> F,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -256,7 +285,7 @@ async fn prune_jobs<F: std::future::Future<Output = Result<u64>>>(
             _ = shutdown.changed() => break,
             result = prune() => {
                 if let Err(error) = result {
-                    tracing::warn!(%error, "job expiry failed");
+                    tracing::warn!(error=%format!("{error:#}"), "job/blob cleanup failed");
                 }
             }
         }
@@ -598,7 +627,7 @@ mod tests {
         let pruner = tokio::spawn(prune_jobs(
             move || {
                 entered.take().unwrap().send(()).unwrap();
-                std::future::pending()
+                std::future::pending::<Result<()>>()
             },
             shutdown,
         ));

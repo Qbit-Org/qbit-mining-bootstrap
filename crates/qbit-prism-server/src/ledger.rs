@@ -19,7 +19,10 @@ use uuid::Uuid;
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
-pub use audit::{audit_canonical_bytes, decode_canonical_audit_body, materialize_audit_row};
+pub use audit::{
+    audit_canonical_bytes, audit_completeness, decode_canonical_audit_body, materialize_audit_row,
+    AuditCompleteness,
+};
 mod candidates;
 use candidates::prepare_candidate_observed;
 pub use candidates::{
@@ -38,8 +41,9 @@ pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInsta
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
 pub use jobs::{
-    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes,
-    PreparedDependency, PreparedTemplate, StoredCompactPrepared,
+    BlobPruneCursor, BlobPruneResult, CompactDependency, CompactPrepared, CompactRepair,
+    IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
+    StoredCompactPrepared,
 };
 mod migration;
 pub use migration::{
