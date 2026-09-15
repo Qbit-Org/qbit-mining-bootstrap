@@ -1,40 +1,9 @@
 //! Background observations. HTTP rendering performs no external I/O.
-use super::{DatabaseMetrics, Metrics, Outcome, ProcessMetrics};
+use super::{time_pool_acquire, DatabaseMetrics, Metrics, ProcessMetrics};
 use anyhow::{Context, Result};
 use sqlx::{Connection, PgPool};
-use std::{future::Future, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
-
-/// Records exactly once, including when the acquisition future is cancelled.
-/// Its lifetime ends before transaction work, so only pool wait is measured.
-struct PoolAcquireObservation<'a> {
-    metrics: &'a Metrics,
-    started: tokio::time::Instant,
-    outcome: Outcome,
-}
-
-impl Drop for PoolAcquireObservation<'_> {
-    fn drop(&mut self) {
-        self.metrics
-            .observe_pool_acquire(self.outcome, self.started.elapsed());
-    }
-}
-
-async fn observe_pool_acquire<T>(
-    metrics: &Metrics,
-    acquire: impl Future<Output = sqlx::Result<T>>,
-) -> sqlx::Result<T> {
-    let mut observation = PoolAcquireObservation {
-        metrics,
-        started: tokio::time::Instant::now(),
-        outcome: Outcome::Failure,
-    };
-    let result = acquire.await;
-    if result.is_ok() {
-        observation.outcome = Outcome::Success;
-    }
-    result
-}
 
 /// Read from one procfs process directory; the explicit path also permits
 /// deterministic tests of the production parser and failure behavior.
@@ -64,7 +33,7 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 /// A/#266 must extend the pending predicate when new outbox states land.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let mut connection = observe_pool_acquire(metrics, pool.acquire()).await?;
+        let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
         let mut tx = connection.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx).await?;
@@ -79,8 +48,6 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
     }).await.context("metrics database collection deadline exceeded")?
 }
 
-#[cfg(test)]
-mod tests;
 fn seconds(value: f64) -> Result<Duration> {
     Duration::try_from_secs_f64(value).context("invalid measured database age")
 }

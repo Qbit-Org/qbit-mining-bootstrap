@@ -23,6 +23,7 @@ mod observations;
 mod prepared_expiry;
 mod published_lease;
 mod refresh;
+mod resume_inputs;
 mod work_store;
 
 pub(super) fn hash(byte: u8) -> String {
@@ -446,11 +447,21 @@ impl Fixture {
         // exactly 1,000,000 scaled units, independently asserted by the tests.
         wire.share_target = codec::target_from_compact(0x207fffff).unwrap();
         wire.payout_revision = revision;
+        let inputs = BundleInputs {
+            payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+            ctv: None,
+            signer_keys: SignerKeys::of(
+                &ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap(),
+                &ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap(),
+            ),
+            audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        };
         let prepared = Arc::new(Prepared {
             stored: Arc::new(StoredPrepared {
                 template: template.clone(),
                 snapshot: snapshot.clone(),
                 bundle: Some(bundle.clone()),
+                inputs: Some(inputs.clone()),
                 fee: None,
                 fingerprint: "fixture".into(),
                 generation: 1,
@@ -460,15 +471,7 @@ impl Fixture {
             repair: Arc::new(Mutex::new(())),
             repair_probe: Default::default(),
             window: WindowRef::from_snapshot(&snapshot).expect("fixture window reference"),
-            inputs: BundleInputs {
-                payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
-                ctv: None,
-                signer_keys: SignerKeys::of(
-                    &ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap(),
-                    &ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap(),
-                ),
-                audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
-            },
+            inputs,
             template,
             snapshot,
             bundle: Some(bundle.clone()),

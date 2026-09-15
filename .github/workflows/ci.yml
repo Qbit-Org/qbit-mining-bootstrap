@@ -200,10 +200,32 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-toolchain
 
+      - name: Compute the cargo-deny cache key
+        id: pinned-tool
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ runner.temp }}/pinned-tool-cache
+        run: bash .github/scripts/install-pinned-tool.sh --cache-metadata cargo-deny
+
+      - name: Restore the cargo-deny release cache
+        id: restore-pinned-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
       - name: Install pinned cargo-deny
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ steps.pinned-tool.outputs.cache-dir }}
         run: |
           bash .github/scripts/install-pinned-tool.sh cargo-deny "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Save the cargo-deny release cache
+        if: steps.restore-pinned-tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny --locked check
@@ -216,10 +238,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Compute the hadolint cache key
+        id: pinned-tool
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ runner.temp }}/pinned-tool-cache
+        run: bash .github/scripts/install-pinned-tool.sh --cache-metadata hadolint
+
+      - name: Restore the hadolint release cache
+        id: restore-pinned-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
       - name: Install pinned hadolint
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ steps.pinned-tool.outputs.cache-dir }}
         run: |
           bash .github/scripts/install-pinned-tool.sh hadolint "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Save the hadolint release cache
+        if: steps.restore-pinned-tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
 
       - name: Lint every Dockerfile
         run: git ls-files -z '*Dockerfile*' | xargs -0 hadolint

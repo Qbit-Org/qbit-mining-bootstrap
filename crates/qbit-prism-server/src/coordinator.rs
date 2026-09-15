@@ -54,11 +54,14 @@ pub struct JobContext {
 /// where `build_bundle` reads them and carried beside the bundle. A candidate
 /// stores exactly these, so a rebuild reads no local configuration for any
 /// field that reaches the signed bundle.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleInputs {
     pub payout_policy: PayoutPolicy,
     /// `Some` exactly when the CTV builder was used; its presence selects
     /// the builder at a rebuild in place of `config.ctv_enabled`.
+    /// The key is required: explicit null means no CTV; omission is corruption.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub ctv: Option<CandidateCtv>,
     /// The public keys of the seeds the bundle was signed with.
     pub signer_keys: SignerKeys,
@@ -79,22 +82,9 @@ impl BundleInputs {
         })
     }
 
-    /// Whether a bundle this frontend stored was built with these inputs.
-    ///
-    /// A resumed job reuses the bundle it was issued with but captures its
-    /// inputs from configuration now, so if configuration moved in between the
-    /// two disagree. That matters since the candidate stores the inputs rather
-    /// than the bundle: a claim would rebuild from the current ones and produce
-    /// a coinbase the block does not commit to, failing before `submitblock`
-    /// and retrying until the job expires. A disagreement is therefore a cache
-    /// miss, and the bundle is rebuilt rather than mislabelled.
-    ///
-    /// Compared here is everything the bundle itself records about how it was
-    /// built: the payout policy, and the public keys that actually signed its
-    /// coinbase manifest and its ledger attestation. The CTV settlement inputs
-    /// and `audit_builder_version` are not recorded in a bundle, so a change to
-    /// either between issue and resume is still undetectable here; closing that
-    /// needs the issued job to store its inputs, which is #273's format.
+    /// Check the policy and actual signer identities recorded in the bundle.
+    /// Resume also compares the persisted inputs, since a bundle alone cannot
+    /// prove its CTV configuration or builder version.
     fn describes(&self, bundle: &AuditBundle) -> bool {
         bundle.payout_policy == self.payout_policy
             && bundle
@@ -135,6 +125,8 @@ pub struct Prepared {
     pub window: WindowRef,
     /// What `bundle` was built with, other than the window. A per-worker
     /// bootstrap build uses the same inputs, and a candidate copies them.
+    /// This nonoptional view copies the original build's or validated stored
+    /// inputs; callers never need to handle the legacy storage-only absence.
     pub inputs: BundleInputs,
     pub bundle: Option<Arc<AuditBundle>>,
     pub base_wire: Option<codec::Job>,
@@ -151,11 +143,45 @@ struct StoredPrepared {
     template: Value,
     snapshot: Arc<Snapshot>,
     bundle: Option<Arc<AuditBundle>>,
+    /// Absent only in legacy inline rows, which cannot prove compatibility.
+    /// A present value must decode completely; null is not a legacy record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "StoredPrepared::deserialize_inputs"
+    )]
+    inputs: Option<BundleInputs>,
     fee: Option<FanoutFeeRatePolicy>,
     fingerprint: String,
     generation: u64,
     parent_of_tip: String,
     coinbase_suffix: String,
+}
+
+impl StoredPrepared {
+    /// Legacy rows cannot prove their CTV inputs or builder version. A resumed
+    /// candidate (including bootstrap work) must use the exact issued inputs,
+    /// and any stored bundle must agree with their policy and signer keys.
+    fn issued_inputs(&self, config: &Config) -> Result<Option<&BundleInputs>> {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return Ok(None);
+        };
+        if inputs != &BundleInputs::capture(config, self.fee)?
+            || self
+                .bundle
+                .as_ref()
+                .is_some_and(|bundle| !inputs.describes(bundle))
+        {
+            return Ok(None);
+        }
+        Ok(Some(inputs))
+    }
+
+    fn deserialize_inputs<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<BundleInputs>, D::Error> {
+        BundleInputs::deserialize(deserializer).map(Some)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -912,6 +938,7 @@ impl Coordinator {
             template: template.clone(),
             snapshot: snapshot.clone(),
             bundle: bundle.clone(),
+            inputs: Some(inputs.clone()),
             fee,
             fingerprint: fingerprint.clone(),
             generation,
@@ -2047,28 +2074,14 @@ impl MiningBackend for Coordinator {
             {
                 return Ok(None);
             }
-            self.ensure_job_fee_current(prepared.fee).await?;
-            // Until #273 stores them, a resume takes the inputs from this
-            // frontend's configuration, as it always has. The stored bundle is
-            // only reused when those inputs still describe it; otherwise this
-            // is a cache miss and the bundle is rebuilt, because the candidate
-            // stores the inputs and a claim rebuilds from them.
-            let inputs = BundleInputs::capture(&self.config, prepared.fee)?;
-            // A stored bundle the current inputs no longer describe cannot be
-            // resumed at all. Rebuilding it here is not the answer either:
-            // `build_bundle` reads a worker as a request for a one-share
-            // bootstrap window, so on a non-empty window it would pair a
-            // bootstrap bundle with the original reference and
-            // `prepare_candidate` would refuse the block. Drop the cached work
-            // and let a fresh prepare produce it; a miss costs a rebuild, and
-            // resuming on inputs that do not match can cost a found block.
-            if prepared
-                .bundle
-                .as_ref()
-                .is_some_and(|bundle| !inputs.describes(bundle))
-            {
+            let Some(inputs) = prepared.issued_inputs(&self.config)? else {
                 return Ok(None);
-            }
+            };
+            // Incompatible work is a miss, never a rebuild of a nonempty
+            // window or a new deadline. Compatible work retains its live fee
+            // admission check and carries the exact persisted inputs onward.
+            self.ensure_job_fee_current(prepared.fee).await?;
+            let inputs = inputs.clone();
             let (bundle, bootstrap_share) = match prepared.bundle.as_ref() {
                 Some(bundle) => (bundle.clone(), None),
                 None => {

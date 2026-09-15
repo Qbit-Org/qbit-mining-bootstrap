@@ -12,6 +12,51 @@ use crate::coordinator::publication_authority::{AbsoluteDeadline, AuthorityViewM
 use crate::coordinator::tip_observation::PreparedIdentity;
 use crate::ledger::{CompactPrepared, PreparedAuditHashes, PreparedTemplate};
 
+// Keep both directions of the inline/compact input mapping together without
+// changing the compact record's existing flat fields or serialization order.
+impl From<&CompactPrepared> for BundleInputs {
+    fn from(record: &CompactPrepared) -> Self {
+        Self {
+            payout_policy: record.payout_policy.clone(),
+            ctv: record.ctv.clone(),
+            signer_keys: record.signer_keys.clone(),
+            audit_builder_version: record.audit_builder_version,
+        }
+    }
+}
+
+impl CompactPrepared {
+    fn from_original_build(
+        stored: &StoredPrepared,
+        window: WindowRef,
+        inputs: &BundleInputs,
+        template: &PreparedTemplate,
+        audit_hashes: Option<PreparedAuditHashes>,
+    ) -> Result<Self> {
+        Ok(Self {
+            format_version: Self::FORMAT_VERSION,
+            window,
+            share_seq: stored.snapshot.share_seq,
+            payout_revision: stored.snapshot.payout_revision,
+            template_sha256: template.sha256().into(),
+            parent_hash: stored.template["previousblockhash"]
+                .as_str()
+                .context("prepared parent missing")?
+                .into(),
+            parent_of_tip: stored.parent_of_tip.clone(),
+            fingerprint: stored.fingerprint.clone(),
+            generation: stored.generation,
+            coinbase_suffix_hex: stored.coinbase_suffix.clone(),
+            payout_policy: inputs.payout_policy.clone(),
+            ctv: inputs.ctv.clone(),
+            fee: stored.fee,
+            audit_builder_version: inputs.audit_builder_version,
+            signer_keys: inputs.signer_keys.clone(),
+            audit_hashes,
+        })
+    }
+}
+
 /// Successful reads still own potentially large inputs. Keep abandonment off
 /// the runtime, including when a caller drops a result outside Tokio context.
 pub(in crate::coordinator) struct CompactOwner<T: Send + 'static> {
@@ -151,8 +196,10 @@ pub(in crate::coordinator) enum IncompatibleCompactBuild {
 }
 
 /// Explicit handoff from the original builder, before either persistence
-/// format reserves the key. Legacy/resumed Prepared cannot recover historical
-/// CTV/version inputs, so there is intentionally no conversion from Prepared.
+/// format reserves the key. Resumed work now carries historical inputs, but its
+/// key is already reserved and cannot authorize this unpublished-build handoff.
+/// Keep the builder's nonoptional inputs beside its durable representation,
+/// just as Prepared does; neither path substitutes current configuration.
 pub(in crate::coordinator) struct OriginalPreparedBuild {
     storage_key: String,
     stored: Arc<StoredPrepared>,
@@ -546,12 +593,7 @@ impl Coordinator {
         let drop_probe = self.work_ledger.compact_drop_probe();
         let hydrated = owned
             .spawn_blocking(move |(stored, window, build_permit)| {
-                let inputs = BundleInputs {
-                    payout_policy: stored.record.payout_policy.clone(),
-                    ctv: stored.record.ctv.clone(),
-                    signer_keys: stored.record.signer_keys.clone(),
-                    audit_builder_version: stored.record.audit_builder_version,
-                };
+                let inputs = BundleInputs::from(&stored.record);
                 let snapshot = Arc::new(Snapshot {
                     anchor_ms: stored.record.window.anchor_ms,
                     share_seq: stored.record.share_seq,
@@ -687,27 +729,13 @@ impl Coordinator {
                 } else {
                     None
                 };
-                let record = CompactPrepared {
-                    format_version: CompactPrepared::FORMAT_VERSION,
-                    window: original.window,
-                    share_seq: stored.snapshot.share_seq,
-                    payout_revision: stored.snapshot.payout_revision,
-                    template_sha256: template.sha256().into(),
-                    parent_hash: stored.template["previousblockhash"]
-                        .as_str()
-                        .context("prepared parent missing")?
-                        .into(),
-                    parent_of_tip: stored.parent_of_tip.clone(),
-                    fingerprint: stored.fingerprint.clone(),
-                    generation: stored.generation,
-                    coinbase_suffix_hex: stored.coinbase_suffix.clone(),
-                    payout_policy: original.inputs.payout_policy.clone(),
-                    ctv: original.inputs.ctv.clone(),
-                    fee: stored.fee,
-                    audit_builder_version: original.inputs.audit_builder_version,
-                    signer_keys: original.inputs.signer_keys.clone(),
+                let record = CompactPrepared::from_original_build(
+                    stored,
+                    original.window,
+                    &original.inputs,
+                    &template,
                     audit_hashes,
-                };
+                )?;
                 Ok::<_, anyhow::Error>(CompactOwner::new((
                     CapturedCompactPrepared {
                         original,
