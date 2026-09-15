@@ -638,8 +638,16 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 # -h -u nobody id`, `sudo -h -- id` and `sudo -h FOO=x id`.
                 # Its own assignment test is the wider one noted below.
                 return None
-            if program == "command" and option in {"-v", "-V"}:
-                return None  # executable lookup prints information; it runs nothing
+            if program == "command" and re.fullmatch(r"-[pvV]*[vV][pvV]*", option):
+                # The lookup flags print information and run nothing, alone
+                # or in a cluster with `-p` or each other: bash 5.2.21
+                # printed `echo` and ran nothing for `command -v echo hi`,
+                # `command -pv echo hi`, `command -vp echo hi`, `command -vv
+                # echo hi` and `command -pv -- echo hi`, described the
+                # builtin for `command -pV echo hi` and `command -Vp echo
+                # hi`, and ran `echo hi` for `command -p echo hi`, `command
+                # -pp echo hi` and `command -p -- echo hi`.
+                return None
             if option == "--":
                 index += 1
                 terminated = True
@@ -3114,6 +3122,29 @@ class ScannerTests(unittest.TestCase):
                     self.assertEqual(self.commands(line + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
         text = "```sh\nsudo -nh \\\n  host \\\n  python3 lab/example/deleted.py\npython3 lab/prism/storm.py\n```"
         self.assertEqual(self.located(text), [(5, "lab/prism/storm.py")])
+
+    def test_command_lookup_flags_in_a_cluster_do_not_run_commands(self) -> None:
+        # bash 5.2.21 printed `echo` and ran nothing for `command -pv echo
+        # hi`, `command -vp echo hi`, `command -vv echo hi` and `command -pv
+        # -- echo hi`, described the builtin for `command -pV echo hi` and
+        # `command -Vp echo hi`, and ran `echo hi` for `command -p echo hi`,
+        # `command -pp echo hi` and `command -p -- echo hi`.
+        for options in ("-v", "-V", "-pv", "-vp", "-pV", "-Vp", "-vv", "-pvp", "'-pv'", "-p -v", "-pv -p", "-pv --"):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py", "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                with self.subTest(options=options, argument=argument):
+                    text = f"command {options} {argument}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(len(self.references(text)), 1)
+                    self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for options in ("-p", "-pp", "-p --", "--", "-p -p"):
+            with self.subTest(options=options):
+                self.assertEqual(self.commands(f"command {options} python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("sudo command -pv python3 lab/prism/storm.py"), [])
+        self.assertEqual(self.commands("command -pv sudo python3 lab/prism/storm.py"), [])
+        text = "```sh\ncommand -pv \\\n  python3 lab/prism/deleted.py\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
         for quote in ("'", '"'):
