@@ -682,7 +682,7 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
 
 `qbit_share_ledger` is append-only and every insert maintains every index,
 so an index nobody scans, or INCLUDE payload nobody reads, is write
-amplification without a reader. Migration 012 (#153) trimmed the secondary
+amplification without a reader. Migration 013 (#153) trimmed the secondary
 indexes to the native query set below. The table is what to check against
 before adding an index or a query that reads the ledger.
 
@@ -690,12 +690,12 @@ before adding an index or a query that reads the ledger.
 | --- | --- | --- | --- |
 | `qbit_share_ledger_pkey` | `(share_seq)` | every `share_seq` walk that projects share rows: the payout page walk of `snapshot`, the audit range reads, `qbit_prism_window`'s ranking pass, the rollup batch in `rollups.sql`, the latest-share probe | index scan, then the heap for the projected columns |
 | `qbit_share_ledger_share_id_key` | `(share_id)`, unique | the duplicate-share probes on submit, `share_accepted_at_ms` | index scan |
-| `qbit_share_ledger_accepted_seq_walk_idx` (012) | `(share_seq DESC) INCLUDE (job_issued_at, accepted_at, share_difficulty) WHERE accepted` | `qbit_prism_window`'s newest-first page walk (pool snapshot, reward leaderboard), the landing durable-range count under the settlement lock, `max(share_seq)`, the rollup boundary and tail passes | index-only |
+| `qbit_share_ledger_accepted_seq_walk_idx` (013) | `(share_seq DESC) INCLUDE (job_issued_at, accepted_at, share_difficulty) WHERE accepted` | `qbit_prism_window`'s newest-first page walk (pool snapshot, reward leaderboard), the landing durable-range count under the settlement lock, `max(share_seq)`, the rollup boundary and tail passes | index-only |
 | `qbit_share_ledger_accepted_recent_idx` | `(accepted_at DESC) INCLUDE (share_difficulty, miner_id, share_seq) WHERE accepted` | pool hashrate series, leaderboard window, pool snapshot rollups, the miner summary's pool figure, evidence counts | index-only |
-| `qbit_share_ledger_accepted_miner_history_idx` (012) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
+| `qbit_share_ledger_accepted_miner_history_idx` (013) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
 | `qbit_share_ledger_accepted_block_suffix_idx` | `((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC) INCLUDE (miner_id, share_difficulty, network_difficulty) WHERE accepted AND length(share_id) >= 65` | the block-solver lookup in blocks, leaderboard, reward leaderboard and pool snapshot | index scan, one row per block |
 
-Dropped by 012, with no native reader:
+Dropped by 013, with no native reader:
 
 - `qbit_share_ledger_accepted_seq_window_idx`, `share_seq DESC` with seven
   INCLUDE columns. Every `share_seq` walk was planned on the primary key, so
@@ -720,12 +720,12 @@ index-only without carrying the column.
 Known full scan: the boundary and tail passes of
 `dashboard_hashrate_rollups.sql` bound `accepted_at` through CTE values the
 planner cannot estimate, so each is a full index-only scan (of
-`accepted_seq_walk_idx` after 012, of `accepted_recent_idx` before it). That
-predates 012 and is a query change, not an index change.
+`accepted_seq_walk_idx` after 013, of `accepted_recent_idx` before it). That
+predates 013 and is a query change, not an index change.
 
 ### Measuring the trim on production
 
-Run these on the production database after 012 and before scheduling #144,
+Run these on the production database after 013 and before scheduling #144,
 in this order. The `ANALYZE` comes first: the statistics captured for #144
 were hundreds of times below the row count, and every plan is provisional
 until they are current.
@@ -764,7 +764,7 @@ SELECT count(*), sum(counted_difficulty)
 FROM qbit_prism_window(clock_timestamp(), (<network difficulty> * 8)::numeric);
 ```
 
-Record the index sizes before and after 012, the scan counts, the
+Record the index sizes before and after 013, the scan counts, the
 `Heap Fetches` lines of the page walk, and the share acknowledgement latency
 histogram from `/metrics` before and after, in #153 and #144.
 

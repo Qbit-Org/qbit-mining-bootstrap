@@ -2071,7 +2071,7 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
     ),
     (
         13,
-        include_str!("../../migrations/012_share_ledger_index_trim.sql"),
+        include_str!("../../migrations/013_share_ledger_index_trim.sql"),
     ),
 ];
 

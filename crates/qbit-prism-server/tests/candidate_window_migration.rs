@@ -28,15 +28,15 @@ const ANCHOR: i64 = 1_700_000_000_000;
 const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sql");
 /// Every version the membership runner installs except 007, so a database can
 /// be built in exactly the pre-007 state the runner then completes.
-/// Every native migration except 007 and 011, so a connect applies exactly
-/// those two and nothing else. #153's 012, #360's 010 and #321's 006 belong here for the
+/// Every native migration except 007, 011 and 012, so a connect applies
+/// those three and nothing else. #153's 013, #360's 010 and #321's 006 belong here for the
 /// same reason 008 and 009 do: leaving one out makes the connect apply a
-/// third migration, and the "only 007 ran" assertions then fail for a reason
+/// further migration, and the timestamp assertions then fail for a reason
 /// unrelated to 007. 006 matters most, because its own drain check refuses
 /// the very rows these tests hand to 007's, so without it the refusal under
 /// test never runs. #266's 011 cannot be pre-applied: its lifecycle CHECK
 /// names the columns 007 adds, so the runner always applies it after 007,
-/// and these tests accept the pair.
+/// followed by 012's startup fence, and these tests accept all three.
 const PRE_007: [(i32, &str); 9] = [
     (2, include_str!("../migrations/002_multi_instance.sql")),
     (3, include_str!("../migrations/003_2x_compatibility.sql")),
@@ -56,8 +56,8 @@ const PRE_007: [(i32, &str); 9] = [
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
     (
-        12,
-        include_str!("../migrations/012_share_ledger_index_trim.sql"),
+        13,
+        include_str!("../migrations/013_share_ledger_index_trim.sql"),
     ),
 ];
 /// The columns 011 adds to the outbox, which the connect that applies 007

@@ -643,14 +643,14 @@ mod tests {
         after
             .indexes
             .insert("new".into(), index("t", "CREATE INDEX new ON t (b)"));
-        let migration = derive(12, &before, &after).unwrap();
-        assert_eq!(migration.version, 12);
+        let migration = derive(13, &before, &after).unwrap();
+        assert_eq!(migration.version, 13);
         assert_eq!(migration.creates.keys().collect::<Vec<_>>(), vec!["new"]);
         assert_eq!(
             migration.drops,
             BTreeMap::from([("old".to_owned(), index("t", "CREATE INDEX old ON t (a)"))])
         );
-        assert!(derive(12, &before, &before)
+        assert!(derive(13, &before, &before)
             .unwrap_err()
             .to_string()
             .contains("creates and drops no index"));
@@ -666,7 +666,7 @@ mod tests {
         after
             .indexes
             .insert("same".into(), index("t", "CREATE INDEX same ON t (b)"));
-        let error = derive(12, &before, &after).unwrap_err().to_string();
+        let error = derive(13, &before, &after).unwrap_err().to_string();
         assert!(
             error.contains("redefines index same under its old name"),
             "{error}"
@@ -693,7 +693,7 @@ mod tests {
                 cycle: false,
             },
         );
-        let error = derive(12, &before, &after).unwrap_err().to_string();
+        let error = derive(13, &before, &after).unwrap_err().to_string();
         assert!(
             error.contains("may only create and drop indexes"),
             "{error}"

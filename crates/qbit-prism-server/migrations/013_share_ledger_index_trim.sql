@@ -45,7 +45,7 @@
 -- under the cutover locks that exclude writers. Every native upgrade runs
 -- each change after the commit as CREATE INDEX CONCURRENTLY or DROP INDEX
 -- CONCURRENTLY, even without visible shares, so appends continue while the
--- replacements are built, and it records 12
+-- replacements are built, and it records 13
 -- after the last drop. A replacement takes a new name: CREATE INDEX IF NOT
 -- EXISTS under the old name would keep the old definition.
 CREATE INDEX qbit_share_ledger_accepted_seq_walk_idx
