@@ -267,6 +267,17 @@ impl Fixture {
         }).await.context("no runtime SQL lock waiter observed")?
     }
 
+    pub async fn wait_for_share_read_waiter(&self) -> Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='relation' AND relation=$1::regclass AND mode='AccessShareLock' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
+                    .bind(format!("{}.qbit_share_ledger", self.schema)).fetch_one(&self.admin).await?;
+                if waiting { return Ok::<_, anyhow::Error>(()); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.context("no runtime share-read lock waiter observed")?
+    }
+
     async fn close(self) -> Result<()> {
         timeout(Duration::from_secs(10), async {
             self.a.ledger.pool.close().await;

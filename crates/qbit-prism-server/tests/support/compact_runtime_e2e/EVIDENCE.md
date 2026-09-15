@@ -90,8 +90,8 @@ files were replayed onto this exact committed head; production, shared support,
 and gate-manifest files remain the activation owner's versions. The original
 inline-red commits and evidence remain preserved on their separate branch.
 
-The adapted suite reports **14 passed, 0 failed, 0 ignored** in the same durable
-PostgreSQL 16.14 fixture: 11 runtime cases and 3 inherited WindowPlan unit tests.
+The adapted suite reports **16 passed, 0 failed, 0 ignored** in the same durable
+PostgreSQL 16.14 fixture: 13 runtime cases and 3 inherited WindowPlan unit tests.
 Strict Clippy also passes. The previously blocked corruption, reference-row
 authentication, blob retention, and original-dependency repair cases now execute
 and pass. Observed prepared-row maxima are 1,518 uncompressed JSONB bytes for
@@ -110,8 +110,17 @@ Bootstrap workers prove distinct actual coinbases and synthetic payout shares,
 and each coinbase is independently reconstructed. The real-socket replacement
 listener advertises a harder target and negotiates no rolling mask; the old
 job still submits under its original target, entropy, and mask exactly once.
-That strengthened socket case passes separately after the full integrated run.
+That strengthened socket case is included in the final full integrated run.
 The 16-row fixture does not claim enabled-CTV or large-window qualification.
+
+Two additional cases exercise original expiry across real PostgreSQL waits.
+Issued persistence waits behind SETTLEMENT past its one-second expiry, then
+refuses publication after the lock is released without changing the prepared
+reservation. Resume reaches an observed AccessShareLock wait on the actual
+share table and returns an expired-job miss while the blocking lock is still
+held. Both cases subsequently issue/resume fresh work successfully, proving
+recovery after the queued SQL operations are released. These are public runtime
+tests, not claims about internal build-permit or blocking-owner cancellation.
 
 ## Gate IDs for activation-owner registration
 
@@ -120,11 +129,13 @@ qbit-prism-server::compact_runtime_e2e::bootstrap_resume_keeps_each_workers_orig
 qbit-prism-server::compact_runtime_e2e::cancelled_issued_save_releases_sql_resources_without_publishing
 qbit-prism-server::compact_runtime_e2e::compact_reference_corruption_is_an_error_and_blobs_survive_collection
 qbit-prism-server::compact_runtime_e2e::delayed_old_refresh_cannot_replace_new_tip_publication_or_resume_retired_work
+qbit-prism-server::compact_runtime_e2e::issued_expiry_during_sql_wait_does_not_publish_or_renew_original_identity
 qbit-prism-server::compact_runtime_e2e::malformed_issued_inputs_are_errors_and_missing_work_is_a_miss
 qbit-prism-server::compact_runtime_e2e::missing_prepared_dependency_repairs_original_record_without_renewing_identity
 qbit-prism-server::compact_runtime_e2e::real_socket_reconnect_resumes_original_entropy_mask_and_submits_once
 qbit-prism-server::compact_runtime_e2e::refresh_issue_resume_preserves_original_work_and_compact_storage
 qbit-prism-server::compact_runtime_e2e::resume_expiry_does_not_slide_and_expired_work_is_a_miss
+qbit-prism-server::compact_runtime_e2e::resume_expiry_includes_blocked_share_read_and_releases_resources
 qbit-prism-server::compact_runtime_e2e::resumed_compact_work_authenticates_retained_share_rows
 qbit-prism-server::compact_runtime_e2e::unknown_issued_commit_is_observed_and_reconciled_without_reissuing
 ```

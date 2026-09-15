@@ -655,6 +655,119 @@ async fn cancelled_issued_save_releases_sql_resources_without_publishing() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issued_expiry_during_sql_wait_does_not_publish_or_renew_original_identity() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let job =
+                f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
+                    .await?;
+            let before = f.payload(&job.context.prepared.storage_key).await?;
+            let mut lock = f.pool().begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(SETTLEMENT_LOCK)
+                .execute(&mut *lock)
+                .await?;
+            let a = f.a.clone();
+            let issued = job.clone();
+            let owner = worker.clone();
+            let mut pending = tokio::spawn(async move {
+                a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(1))
+                    .await
+            });
+            let observed = f.wait_for_settlement_waiter().await;
+            if observed.is_ok() {
+                sleep(Duration::from_millis(1100)).await;
+            }
+            lock.rollback().await?;
+            let completion = timeout(Duration::from_secs(5), &mut pending).await;
+            if completion.is_err() {
+                pending.abort();
+                let _ = pending.await;
+                anyhow::bail!("expired persistence did not finish after releasing its SQL wait");
+            }
+            observed?;
+            let error = completion??
+                .err()
+                .context("expired issued operation published work")?;
+            ensure!(
+                error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
+                "expired persistence lost its truthful error"
+            );
+            ensure!(
+                f.a.ledger.job(&job.wire.job_id).await?.is_none(),
+                "issued operation renewed its deadline after waiting"
+            );
+            ensure!(
+                f.payload(&job.context.prepared.storage_key).await? == before,
+                "expired wait changed original reservation identity"
+            );
+            let next = f.issue(&worker, Duration::from_secs(30)).await?;
+            ensure!(
+                f.b.resume_job(&worker, &next.wire.job_id).await?.is_some(),
+                "runtime did not recover after expired persistence"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_expiry_includes_blocked_share_read_and_releases_resources() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let job = f.issue(&worker, Duration::from_secs(1)).await?;
+            let original = f.payload(&job.wire.job_id).await?;
+            let mut lock = f.pool().begin().await?;
+            sqlx::raw_sql("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let b = f.b.clone();
+            let id = job.wire.job_id.clone();
+            let owner = worker.clone();
+            let mut pending = tokio::spawn(async move { b.resume_job(&owner, &id).await });
+            let observed = f.wait_for_share_read_waiter().await;
+            // A successful timeout includes the actual read wait. The lock is
+            // still held when the public API returns the expired-job miss.
+            let completion = timeout(Duration::from_secs(3), &mut pending).await;
+            if completion.is_err() {
+                pending.abort();
+                let _ = pending.await;
+            }
+            lock.rollback().await?;
+            observed?;
+            ensure!(
+                completion
+                    .context("resume did not honor original expiry during its read wait")???
+                    .is_none(),
+                "expired read returned miner work"
+            );
+            ensure!(
+                f.payload(&job.wire.job_id).await? == original,
+                "read timeout changed issued expiry"
+            );
+            let next = timeout(
+                Duration::from_secs(5),
+                f.issue(&worker, Duration::from_secs(30)),
+            )
+            .await??;
+            let resumed = timeout(
+                Duration::from_secs(5),
+                f.b.resume_job(&worker, &next.wire.job_id),
+            )
+            .await??
+            .context("runtime did not recover after read expiry")?;
+            same_job(&next, &resumed)
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_issued_commit_is_observed_and_reconciled_without_reissuing() -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {
