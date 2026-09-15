@@ -25,6 +25,8 @@ mod jsonb_inventory;
 mod observer;
 #[path = "support/ledger_execution_proxy.rs"]
 mod proxy;
+#[path = "support/wal_primary.rs"]
+mod wal_primary;
 #[path = "support/window_fixture.rs"]
 #[allow(dead_code)]
 mod window_fixture;
@@ -36,13 +38,16 @@ struct Database {
     proxy: proxy::ExecutionProxy,
     schema: String,
     url: String,
+    primary: wal_primary::Primary,
 }
 
 impl Database {
     async fn open() -> Result<Option<Self>> {
-        let Some(raw) = gate::database_url(gate::site!())? else {
+        let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
             return Ok(None);
         };
+        let primary = wal_primary::Primary::start(bin).await?;
+        let raw = primary.url.clone();
         let admin = PgPool::connect(&raw).await?;
         let (version, fsync): (String, String) =
             sqlx::query_as("SELECT current_setting('server_version_num'),current_setting('fsync')")
@@ -78,6 +83,7 @@ impl Database {
             proxy,
             schema,
             url,
+            primary,
         }))
     }
 
@@ -89,9 +95,10 @@ impl Database {
             .execute(&self.admin)
             .await;
         self.admin.close().await;
+        let primary = self.primary.close().await;
         proxy?;
         schema?;
-        Ok(())
+        primary
     }
 }
 
@@ -149,6 +156,7 @@ async fn qualify(n: u64) -> Result<()> {
             let wal = observer::wal_bytes(&db.direct, &before, &after).await?;
             let prepared = a.prepared.read().await.clone().context("A published no work")?;
             let count = prepared.window.shares.context("nonempty reference absent")?.share_count;
+            eprintln!("compact refresh observation: shares={n}, published_shares={count}, max_jsonb={}, insert_wal_bytes={wal}, refresh_seconds={:.3}", measured.max_uncompressed_bytes, elapsed.as_secs_f64());
             assertions::assert_refresh_measurements(n,count,Some(measured.max_uncompressed_bytes),Some(wal))?;
             let payload: Value = sqlx::query_scalar("SELECT payload FROM qbit_prism_jobs WHERE job_id=$1")
                 .bind(&prepared.storage_key).fetch_one(&db.direct).await?;

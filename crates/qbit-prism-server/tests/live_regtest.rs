@@ -117,17 +117,26 @@ impl Fixture {
     }
 
     async fn open_with_servers(ctv: bool, start_servers: bool) -> Result<Option<Self>> {
-        let Some((binary, database)) = gate::qbitd_and_database_url(gate::site!())? else {
+        Self::open_on_database(ctv, start_servers, None).await
+    }
+
+    async fn open_on_database(
+        ctv: bool,
+        start_servers: bool,
+        database: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let Some((binary, default_database)) = gate::qbitd_and_database_url(gate::site!())? else {
             return Ok(None);
         };
+        let database = database.unwrap_or(&default_database);
         let serial = SERIAL.lock().await;
         let directory = tempfile::tempdir()?;
-        let admin = PgPool::connect(&database).await?;
+        let admin = PgPool::connect(database).await?;
         let schema = format!("prism_live_{}", Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE SCHEMA {schema}"))
             .execute(&admin)
             .await?;
-        let mut url = url::Url::parse(&database)?;
+        let mut url = url::Url::parse(database)?;
         url.query_pairs_mut()
             .append_pair("options", &format!("-csearch_path={schema}"));
         let database_url = url.to_string();
