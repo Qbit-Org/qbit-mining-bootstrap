@@ -2,6 +2,7 @@
 //!
 //! Tests replace I/O here, not Coordinator's classification/accounting logic.
 //! Production appends retain the transaction-scoped payout revision check.
+use super::publication_authority::LeaseCommitFence;
 use super::*;
 use futures_util::future::BoxFuture;
 use std::sync::{atomic::AtomicU8, OnceLock};
@@ -25,12 +26,30 @@ pub(super) enum GateState {
 pub(super) struct CommitGate {
     state: AtomicU8,
     committing_since: OnceLock<Instant>,
+    lease: Option<LeaseCommitFence>,
 }
 
 impl CommitGate {
+    pub(super) fn with_lease(lease: Option<LeaseCommitFence>) -> Self {
+        Self {
+            lease,
+            ..Self::default()
+        }
+    }
     /// The append's pre-commit hook. `true` lets COMMIT be sent, and records
     /// when it started.
     pub(super) fn begin_commit(&self) -> bool {
+        if let Some(lease) = &self.lease {
+            let won = lease.with_authority(|| self.begin_authorized_commit());
+            if !won {
+                self.close();
+            }
+            return won;
+        }
+        self.begin_authorized_commit()
+    }
+
+    fn begin_authorized_commit(&self) -> bool {
         let now = Instant::now();
         let won = self
             .state

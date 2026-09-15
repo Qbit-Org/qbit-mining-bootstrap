@@ -13,8 +13,7 @@ pub(super) trait WorkLedger: Send + Sync {
         None
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
-    // Additive compact-prepared seam; runtime callers still use inline jobs.
-    #[allow(dead_code)]
+    // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
     #[allow(dead_code)]
     fn read_window_with_permit<'a>(

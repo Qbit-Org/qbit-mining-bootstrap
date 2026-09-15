@@ -10,6 +10,7 @@
 use super::submit_ledger::{CommitGate, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
+use crate::metrics::StaleJobCause;
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -207,7 +208,73 @@ impl Drop for AppendTask {
     }
 }
 
+/// Construct the durable candidate from the job's immutable issued inputs.
+pub(super) async fn submission_candidate(
+    job: &MiningJob<JobContext>,
+    submission: codec::Submission,
+    share: AcceptedShare,
+) -> Result<Candidate> {
+    let context = Arc::clone(&job.context);
+    let job_id = job.wire.job_id.clone();
+    let extranonce1 = job.wire.extranonce1.clone();
+    let extranonce2_size = job.wire.extranonce2_size;
+    // The job context is shared; the recipient-sized copy and block encoding
+    // belong on a blocking worker, before the ledger transaction begins.
+    tokio::task::spawn_blocking(move || {
+        let original = context
+            .bundle
+            .coinbase_script_sig_suffix_hex
+            .as_ref()
+            .context("job coinbase suffix missing")?;
+        let placeholder_length = (4 + extranonce2_size) * 2;
+        let prefix = original
+            .get(
+                ..original
+                    .len()
+                    .checked_sub(placeholder_length)
+                    .context("job coinbase suffix too short")?,
+            )
+            .context("invalid job suffix")?;
+        let suffix = format!("{prefix}{}{}", extranonce1, submission.extranonce2_hex);
+        // The slim candidate: the window reference `refresh_once`
+        // already computed, the stored inputs the job was built with,
+        // and the block as bytes. Nothing here walks the window, clones
+        // the bundle or reads configuration. The as-issued balances,
+        // O(recipients), travel beside the document so the enqueue can
+        // write the snapshot the post-offer landing rebuilds from.
+        let inputs = &context.prepared.inputs;
+        let block_bytes = hex::decode(&submission.block_hex)?;
+        anyhow::Ok(Candidate {
+            block_hash: submission.block_hash_hex,
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
+            job_id,
+            payout_revision: context.prepared.snapshot.payout_revision,
+            window: context.prepared.window,
+            bootstrap_share: context.bootstrap_share.clone(),
+            found_block: context.bundle.found_block.clone(),
+            payout_policy: inputs.payout_policy.clone(),
+            ctv: inputs.ctv.clone(),
+            audit_builder_version: inputs.audit_builder_version,
+            signer_keys: inputs.signer_keys.clone(),
+            leased: false,
+            coinbase_suffix_hex: suffix,
+            deferred_share: (!submission.share_pass).then_some(share),
+            block_bytes,
+            as_issued_balances: context.prepared.snapshot.prior_balances.clone(),
+        })
+    })
+    .await
+    .context("candidate construction worker failed")?
+}
+
 impl Coordinator {
+    /// Record the internal cause at its refusal branch. The response stays the
+    /// generic `stale-job` answer that miners and the share observation see.
+    fn stale_job(&self, cause: StaleJobCause) -> StratumError {
+        self.metrics.record_stale_job_rejection(cause);
+        protocol_error("stale-job", "stale job")
+    }
+
     pub(super) async fn submit_share(
         &self,
         _worker: &Worker,
@@ -234,24 +301,38 @@ impl Coordinator {
         self.ensure_job_fee_current(context.prepared.fee)
             .await
             .map_err(|_| {
+                self.metrics
+                    .record_stale_job_rejection(StaleJobCause::FeeFloor);
                 protocol_error("stale-job", "job CTV fee is below the current relay floor")
             })?;
         let tip_observation::SubmitAdmission {
             current,
             tip: selected,
+            lease,
         } = self.submit_admission().await?;
-        if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
+        if lease.is_none()
+            && last_poll.elapsed() >= self.config.health_timeout
+            && !selected.share_lease
+        {
             return Err(protocol_error(
                 "backend-rpc-unavailable",
                 "current chain state is unavailable",
             ));
         }
-        let revision = self.submit_ledger.payout_revision().await.map_err(|_| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current payout state is unavailable",
-            )
-        })?;
+        let revision = if let Some(lease) = &lease {
+            // Re-reading only a revision here would pair a newer transaction
+            // fence with the older balance digest checked by lease admission.
+            lease
+                .revision_for(&context.prepared)
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?
+        } else {
+            self.submit_ledger.payout_revision().await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current payout state is unavailable",
+                )
+            })?
+        };
         let parent_stale = selected.hash != job.wire.previousblockhash;
         let grace =
             parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
@@ -263,18 +344,19 @@ impl Coordinator {
                 )
             })?;
             if parent != job.wire.previousblockhash {
-                return Err(protocol_error("stale-job", "stale job"));
+                return Err(self.stale_job(StaleJobCause::ParentGrace));
             }
-        } else if parent_stale
-            || (context.prepared.snapshot.payout_revision != revision
-                && !(selected.share_lease
-                    && context.prepared.snapshot.payout_revision
-                        == current.snapshot.payout_revision
-                    && current.template["previousblockhash"].as_str()
-                        == Some(job.wire.previousblockhash.as_str())))
+        } else if parent_stale {
+            // A stale parent is attributed before any coincident revision change.
+            return Err(self.stale_job(StaleJobCause::ParentGrace));
+        } else if (context.prepared.snapshot.payout_revision != revision
+            && !(selected.share_lease
+                && context.prepared.snapshot.payout_revision == current.snapshot.payout_revision
+                && current.template["previousblockhash"].as_str()
+                    == Some(job.wire.previousblockhash.as_str())))
             || (current.snapshot.payout_revision != revision && !selected.share_lease)
         {
-            return Err(protocol_error("stale-job", "stale job"));
+            return Err(self.stale_job(StaleJobCause::PayoutRevision));
         }
         // Prior-parent share credit deliberately uses the current durable
         // revision. That exception never admits an obsolete block candidate.
@@ -322,65 +404,46 @@ impl Coordinator {
                 ));
             }
         }
+        if let Some(lease) = &lease {
+            if !self.revalidate_published_lease(lease).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })? {
+                return Err(protocol_error("stale-job", "stale job"));
+            }
+        }
         // Both acknowledgement bounds are measured from here.
         let start = tokio::time::Instant::now();
         let share_id = share.share_id.clone();
         let block_hash = submission.block_hash_hex.clone();
         let share_pass = submission.share_pass;
-        let candidate = (|| {
-            if !(submission.block_pass && candidate_current) {
-                return Ok(None);
-            }
-            let original = context
-                .bundle
-                .coinbase_script_sig_suffix_hex
-                .as_ref()
-                .context("job coinbase suffix missing")?;
-            let placeholder_length = (4 + job.wire.extranonce2_size) * 2;
-            let prefix = original
-                .get(
-                    ..original
-                        .len()
-                        .checked_sub(placeholder_length)
-                        .context("job coinbase suffix too short")?,
-                )
-                .context("invalid job suffix")?;
-            let suffix = format!(
-                "{prefix}{}{}",
-                job.wire.extranonce1, submission.extranonce2_hex
-            );
-            // The slim candidate: the window reference `refresh_once`
-            // already computed, the stored inputs the job was built with,
-            // and the block as bytes. Nothing here walks the window, clones
-            // the bundle or reads configuration. The as-issued balances,
-            // O(recipients), travel beside the document so the enqueue can
-            // write the snapshot the post-offer landing rebuilds from.
-            let inputs = &context.prepared.inputs;
-            let block_bytes = hex::decode(&submission.block_hex)?;
-            anyhow::Ok(Some(Candidate {
-                block_hash: submission.block_hash_hex,
-                block_sha256: Candidate::block_digest_hex(&block_bytes),
-                job_id: job.wire.job_id.clone(),
-                payout_revision: context.prepared.snapshot.payout_revision,
-                window: context.prepared.window,
-                bootstrap_share: context.bootstrap_share.clone(),
-                found_block: context.bundle.found_block.clone(),
-                payout_policy: inputs.payout_policy.clone(),
-                ctv: inputs.ctv.clone(),
-                audit_builder_version: inputs.audit_builder_version,
-                signer_keys: inputs.signer_keys.clone(),
-                leased: false,
-                coinbase_suffix_hex: suffix,
-                deferred_share: (!share_pass).then(|| share.clone()),
-                block_bytes,
-                as_issued_balances: context.prepared.snapshot.prior_balances.clone(),
-            }))
-        })();
+        let candidate = if submission.block_pass && candidate_current {
+            submission_candidate(job, submission, share.clone())
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        };
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
-                self.persist_share_pass(share, candidate, proof_observed_at_ms, revision, start)
-                    .await
+                // Ordinary current-tip/candidate admission keeps its existing
+                // credit contract, including a proof that returned from lease
+                // selection to ordinary authority before admission finished.
+                let fence = lease
+                    .filter(|_| selected.share_lease)
+                    .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
+                self.persist_share_pass(
+                    share,
+                    candidate,
+                    proof_observed_at_ms,
+                    revision,
+                    start,
+                    fence,
+                )
+                .await
             }
             Ok(candidate) => {
                 self.persist_block_only(&share, candidate, proof_observed_at_ms, &block_hash, start)
@@ -401,9 +464,18 @@ impl Coordinator {
             SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.downcast_ref::<CommitGateClosed>().is_none()
-                    && (error.to_string().contains("duplicate-share")
-                        || error.to_string().contains("duplicate share_id"))
+                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                    // A refused local gate proves COMMIT was never sent. It
+                    // can mean revoked authority or lock contention, so do not
+                    // label it a stale job or a database failure.
+                    tracing::info!(%error, "share commit gate refused before COMMIT");
+                    return Err(protocol_error(
+                        "ledger-confirmation-failed",
+                        "share was not committed because its commit gate closed",
+                    ));
+                }
+                if error.to_string().contains("duplicate-share")
+                    || error.to_string().contains("duplicate share_id")
                 {
                     return Err(protocol_error("duplicate-share", "duplicate share"));
                 }
@@ -445,9 +517,10 @@ impl Coordinator {
         proof_observed_at_ms: Option<i64>,
         revision: i64,
         start: tokio::time::Instant,
+        lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
-        let gate = Arc::new(CommitGate::default());
+        let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
         let refusable = candidate.is_none();

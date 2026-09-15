@@ -176,7 +176,7 @@ pub struct StratumConfig {
     pub stale_grace_seconds: f64,
     pub initial_job_timeout_seconds: f64,
     pub write_timeout_seconds: f64,
-    pub connection_limit: Arc<Semaphore>,
+    pub connection_limit: ConnectionLimit,
     pub initial_job_limit: Arc<Semaphore>,
     pub max_connections_per_username: usize,
     pub username_connections: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
@@ -203,12 +203,35 @@ impl Default for StratumConfig {
             stale_grace_seconds: 3.0,
             initial_job_timeout_seconds: 30.0,
             write_timeout_seconds: 20.0,
-            connection_limit: Arc::new(Semaphore::new(384)),
+            connection_limit: ConnectionLimit::new(384),
             initial_job_limit: Arc::new(Semaphore::new(128)),
             max_connections_per_username: 0,
             username_connections: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(StratumStats::default()),
         }
+    }
+}
+
+/// The global Stratum admission ceiling, kept with the capacity it was created
+/// with so observation never has to infer configuration from free permits.
+#[derive(Clone, Debug)]
+pub struct ConnectionLimit {
+    permits: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl ConnectionLimit {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
     }
 }
 
@@ -499,7 +522,7 @@ impl StratumConfig {
         let initial = value("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS", 128usize)?;
         ensure!(connections > 0 && connections <= Semaphore::MAX_PERMITS && initial > 0 && initial <= connections,
             "Stratum pending initial job limit must be positive and no greater than connection limit");
-        config.connection_limit = Arc::new(Semaphore::new(connections));
+        config.connection_limit = ConnectionLimit::new(connections);
         config.initial_job_limit = Arc::new(Semaphore::new(initial));
         config.max_connections_per_username =
             value("PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME", 0usize)?;
@@ -1075,6 +1098,9 @@ async fn request<B: MiningBackend>(
                             }
                         };
                         Some(Arc::new(semaphore.try_acquire_owned().map_err(|_| {
+                            metrics.record_connection_refusal(
+                                crate::metrics::ConnectionRefusalReason::UsernameLimit,
+                            );
                             StratumError {
                                 code: 20,
                                 message: "too many connections for username".into(),
@@ -1297,6 +1323,8 @@ async fn request<B: MiningBackend>(
                     .resume_expires_at
                     .is_some_and(|expires| tokio::time::Instant::now().into_std() >= expires)
                 {
+                    metrics
+                        .record_stale_job_rejection(crate::metrics::StaleJobCause::ResumeExpired);
                     return Err(StratumError::new(21, "stale job", "stale-job").into());
                 }
                 let grace = if issued.job.wire.resume_expires_at.is_none() {
@@ -1456,6 +1484,8 @@ pub async fn run_listener<B: MiningBackend>(
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     config.validate()?;
+    // Both listeners share this one limit, so either may report its capacity.
+    metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     let mut connections = JoinSet::new();
     loop {
         if *shutdown.borrow() {
@@ -1466,7 +1496,11 @@ pub async fn run_listener<B: MiningBackend>(
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream,_) = accepted?;
-                let Ok(permit) = config.connection_limit.clone().try_acquire_owned() else { drop(stream); continue; };
+                let Some(permit) = config.connection_limit.try_acquire() else {
+                    metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::GlobalLimit);
+                    drop(stream);
+                    continue;
+                };
                 let (backend,config,refresh,shutdown) = (backend.clone(),config.clone(),refresh.clone(),shutdown.clone());
                 let metrics = metrics.clone();
                 let runtime = metrics.runtime();

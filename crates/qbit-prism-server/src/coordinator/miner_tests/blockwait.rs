@@ -44,7 +44,12 @@ async fn changed_notification_after_a_newer_poll_verifies_while_real_refresh_is_
         .unwrap()
         .snapshot_interval = Duration::ZERO;
     fixture.coordinator.refresh_once().await.unwrap();
-    let old = fixture.job(1, 0, "original.worker");
+    let worker = fixture.job(1, 0, "original.worker").context.worker.clone();
+    let old = fixture
+        .coordinator
+        .build_job(&worker, "00000000", 1e-12, 0.0)
+        .await
+        .unwrap();
     fixture.node.lock().unwrap().tip = hash(2);
     let notification = gate(&fixture, "waitfornewblock");
     let running = Running::start(&fixture);
@@ -102,6 +107,12 @@ async fn changed_notification_after_a_newer_poll_verifies_while_real_refresh_is_
 async fn verification_started_after_notification_still_loses_to_a_later_chain_poll() {
     let fixture = Fixture::new(Duration::from_secs(10)).await;
     fixture.coordinator.refresh_once().await.unwrap();
+    let worker = fixture.job(1, 0, "original.worker").context.worker.clone();
+    let old = fixture
+        .coordinator
+        .build_job(&worker, "00000000", 1e-12, 0.0)
+        .await
+        .unwrap();
     fixture.node.lock().unwrap().tip = hash(2);
     let notification = gate(&fixture, "waitfornewblock");
     let running = Running::start(&fixture);
@@ -124,10 +135,7 @@ async fn verification_started_after_notification_still_loses_to_a_later_chain_po
     assert_eq!(state.as_deref(), Some(hash(3).as_str()));
     assert_eq!(state.divergence_for_test(), first_departure);
     drop(state);
-    fixture
-        .submit(&fixture.job(1, 0, "original.worker"), false)
-        .await
-        .unwrap();
+    fixture.submit(&old, false).await.unwrap();
     assert!(fixture.store.records.lock().unwrap()[0].1.is_none());
     running.stop().await;
     next_wait.release.notify_one();

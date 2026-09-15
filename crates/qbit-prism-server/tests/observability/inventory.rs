@@ -1,7 +1,7 @@
-use super::registry::{assert_complete_registry, running_scrape, state};
+use super::registry::{assert_complete_registry, running_scrape, sample, state};
 use qbit_prism_server::{
     api::{public_service, router},
-    metrics::{self, Metrics},
+    metrics::{self, ConnectionRefusalReason, Metrics, StaleJobCause},
 };
 use std::{collections::BTreeSet, path::Path, process::Command, sync::Arc};
 
@@ -116,6 +116,38 @@ fn inventory_is_generated_from_registry() {
             descriptor.name
         );
     }
+    // New closed label sets come from labels.rs, never from free-form values.
+    let joined = |values: Vec<&str>| values.join(",");
+    for (family, labels) in [
+        (
+            "qbit_prism_stratum_connection_refusals_total",
+            format!(
+                "`reason={}`",
+                joined(
+                    ConnectionRefusalReason::ALL
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect()
+                )
+            ),
+        ),
+        ("qbit_prism_stratum_connection_limit", "none".into()),
+        (
+            "qbit_prism_stale_job_rejections_total",
+            format!(
+                "`cause={}`",
+                joined(StaleJobCause::ALL.iter().map(|v| v.as_str()).collect())
+            ),
+        ),
+    ] {
+        let entries = rows();
+        let row = entries
+            .iter()
+            .find(|row| row[0].trim_matches('`') == family)
+            .unwrap();
+        assert_eq!(row[2], labels, "{family}");
+        assert_eq!(row[3], "run", "{family}");
+    }
 }
 
 #[tokio::test]
@@ -130,6 +162,23 @@ async fn inventory_scrapes_both_roles_in_both_directions() {
         let body = running_scrape(router(state.clone()), &[]).await;
         assert_complete_registry(&body);
         assert_inventory(&body, "run", false);
+        // Every finite series is present at zero, and the limit is unknown
+        // rather than zero before a listener reports its configuration.
+        for reason in ConnectionRefusalReason::ALL {
+            let key = format!(
+                "qbit_prism_stratum_connection_refusals_total{{reason=\"{}\"}}",
+                reason.as_str()
+            );
+            assert_eq!(sample(&body, &key), 0.);
+        }
+        for cause in StaleJobCause::ALL {
+            let key = format!(
+                "qbit_prism_stale_job_rejections_total{{cause=\"{}\"}}",
+                cause.as_str()
+            );
+            assert_eq!(sample(&body, &key), 0.);
+        }
+        assert_eq!(sample(&body, "qbit_prism_stratum_connection_limit"), -1.);
     }
     for replica_required in [false, true] {
         let (app, _) = public_service::router(
