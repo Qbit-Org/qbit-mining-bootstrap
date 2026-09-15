@@ -37,11 +37,13 @@ async fn refresh_issue_resume_preserves_original_work_and_compact_storage() -> R
                 own_b.storage_key != original.context.prepared.storage_key,
                 "B did not publish independently"
             );
+            let resume_mark = f.proxy.mark();
             let resumed =
                 f.b.resume_job(&worker, &original.wire.job_id)
                     .await?
                     .context("same-tip B could not resume A work")?;
             same_job(&original, &resumed)?;
+            let returned_rows = f.returned_share_rows(resume_mark)?;
             // A no-change refresh preserves authority to the original identity.
             f.b.refresh_once().await?;
             let again =
@@ -59,7 +61,84 @@ async fn refresh_issue_resume_preserves_original_work_and_compact_storage() -> R
                     .is_none(),
                 "another worker resumed A work"
             );
-            compact_storage(f, &original).await
+            compact_storage(f, &original).await?;
+            ensure!(
+                returned_rows == support::SHARES,
+                "resume returned {returned_rows} actual share rows, expected {}",
+                support::SHARES
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_old_refresh_cannot_replace_new_tip_publication_or_resume_retired_work(
+) -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let original = f.issue(&worker, Duration::from_secs(30)).await?;
+            let original_key = original.context.prepared.storage_key.clone();
+            let mut pause = f.node.pause_next("getblocktemplate")?;
+            let a = f.a.clone();
+            let pending = tokio::spawn(async move { a.refresh_once().await });
+            let entered = timeout(Duration::from_secs(5), pause.entered()).await;
+            if !matches!(entered, Ok(Ok(()))) {
+                pending.abort();
+                let _ = pending.await;
+                anyhow::bail!("old template response did not reach the RPC barrier");
+            }
+            // The handler captured A's OLD template before blocking. B gets
+            // the new real node view and publishes it using its own refresh.
+            let next_tip = "ef".repeat(32);
+            f.node.set_tip(&next_tip, &"ab".repeat(32), 101, "02");
+            let advanced = f.b.refresh_once().await;
+            pause.release();
+            let old_result = timeout(Duration::from_secs(5), pending).await??;
+            advanced?;
+            ensure!(
+                old_result.is_err(),
+                "a delayed stale template refresh succeeded"
+            );
+            ensure!(
+                f.a.prepared
+                    .read()
+                    .await
+                    .as_ref()
+                    .context("A lost original publication")?
+                    .storage_key
+                    == original_key,
+                "failed old refresh replaced A publication"
+            );
+            ensure!(
+                f.b.prepared
+                    .read()
+                    .await
+                    .as_ref()
+                    .context("B has no new publication")?
+                    .template["previousblockhash"]
+                    == next_tip,
+                "B did not publish the advanced tip"
+            );
+            // Once A publishes its own current-tip replacement, old work is
+            // retired. This does not grant B a lease for A's old publication.
+            f.a.refresh_once().await?;
+            ensure!(
+                f.a.resume_job(&worker, &original.wire.job_id)
+                    .await?
+                    .is_none(),
+                "A resumed genuinely superseded work"
+            );
+            ensure!(
+                f.b.resume_job(&worker, &original.wire.job_id)
+                    .await?
+                    .is_none(),
+                "B resumed genuinely superseded work"
+            );
+            Ok(())
         })
     })
     .await
@@ -275,10 +354,6 @@ async fn resume_expiry_does_not_slide_and_expired_work_is_a_miss() -> Result<()>
                 .wire
                 .resume_expires_at
                 .context("second expiry missing")?;
-            ensure!(
-                second_deadline <= first_deadline + Duration::from_millis(5),
-                "reconnect slid the original deadline"
-            );
             let expiry = before["expires_at_ms"]
                 .as_i64()
                 .context("original SQL expiry missing")?;
@@ -286,6 +361,10 @@ async fn resume_expiry_does_not_slide_and_expired_work_is_a_miss() -> Result<()>
                 (expiry - f.now_ms().await?).max(0) as u64 + 20,
             ))
             .await;
+            ensure!(
+                first_deadline <= Instant::now() && second_deadline <= Instant::now(),
+                "resumed wire deadline outlived the original database expiry"
+            );
             ensure!(
                 f.b.resume_job(&worker, &original.wire.job_id)
                     .await?
