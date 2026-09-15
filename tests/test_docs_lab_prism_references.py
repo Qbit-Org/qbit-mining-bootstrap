@@ -22,7 +22,9 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    ordinary arguments and heredoc bodies run no command of their own. Command
    positions include shell lists, brace groups and loop conditions/bodies,
    the env/sudo/nohup/command/exec/builtin and docker/podman exec wrappers,
-   and literal sh/bash/dash/ksh/zsh ``-c`` strings.
+   and literal sh/bash/dash/ksh/zsh ``-c`` strings up to a ``set -n`` or
+   ``set -o noexec`` of their own, after which the shell reads without
+   executing.
    Other launcher grammars, shell evaluation of stdin, and expansions inside
    quoted arguments or heredocs are outside this lexical check.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
@@ -596,7 +598,16 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
             # is outside this check.
             if index < len(words) and unquote(words[index]) == "--":
                 index += 1
-            if index == len(words) or unquote(words[index]) not in SHELL_BUILTIN_LAUNCHERS:
+            if index == len(words):
+                return None
+            argument = unquote(words[index])
+            if argument == "set":
+                # The one other builtin read here (``sets_noexec``): bash ran
+                # nothing after `builtin set -n; echo NO`, `builtin -- set -n;
+                # echo NO`, `command builtin set -n; echo NO` and `builtin
+                # builtin set -n; echo NO`.
+                return index
+            if argument not in SHELL_BUILTIN_LAUNCHERS:
                 return None
             continue
         terminated = False
@@ -744,6 +755,87 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
     return None
 
 
+# The letters bash 5.2's `set` accepts, from its usage line `set
+# [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]`.
+SET_FLAGS = frozenset("abefhkmnptuvxBCEHPTo")
+
+
+def sets_noexec(words: list[str], index: int) -> bool:
+    """Whether the command whose executable word is ``words[index]`` is the shell's ``set`` leaving noexec on.
+
+    A non-interactive shell that runs `set -n` or `set -o noexec` reads the
+    rest of its input without executing it, and no later command can turn
+    the mode off, `set +n` included, since none runs: bash 5.2.21 and dash
+    0.5.12 printed nothing for `set -n; echo NO`, `set -o noexec; echo NO`,
+    `set -n; set +n; echo NO`, `set -en; echo NO`, `set -no noexec; echo
+    NO`, `set -on noexec; echo NO`, `set -o errexit -n; echo NO`, `set -n
+    x; echo NO`, `set -n -- x; echo NO`, `set '-n'; echo NO`, `FOO=x set
+    -n; echo NO`, `command set -n; echo NO`, `{ set -n; }; echo NO`, `if
+    set -n; then :; fi; echo NO` and `set -n` on a line of its own before
+    `echo NO`, and bash also for `builtin set -n; echo NO`, `time set -n;
+    echo NO`, `! set -n; echo NO`, `set + -n; echo NO`, `set -o -n; echo
+    NO`, `set -no; echo NO` and `set -n 2>/dev/null; echo NO`. The options
+    of one `set` apply in order, so a `+n` or `+o noexec` later in the same
+    command leaves execution on: both shells ran `echo YES` for `set -n +n;
+    echo YES` and `set -o noexec +o noexec; echo YES`, as for `set +n; echo
+    YES`, `set -- -n; echo YES`, `set - -n; echo YES` and `set x -n; echo
+    YES`, where `--`, `-` or the first argument ends the options. `-o`
+    takes the next word as its option name unless that word is missing or
+    starts with `-` or `+`, when bash prints the settings and reads on: `set
+    -o -n; echo NO` printed them and ran nothing, `set -o +n; echo YES` ran.
+    A letter outside ``SET_FLAGS`` makes bash reject the whole command and
+    apply none of it: it ran `echo RAN` for `set -nz; echo RAN`, `set -n
+    -z; echo RAN`, `set -z -o noexec; echo RAN` and `set -+n; echo RAN`;
+    dash exits at such an option, and at `set -o -n`, running nothing
+    either way, and bash's reading is the one followed. An option name bash
+    rejects stops the command with the earlier options applied (`set -o
+    nosuch -n; echo RAN` ran, `set -n -o nosuch; echo RAN` did not); every
+    name is read here as one the shell accepts, so that stop is outside
+    this check, as it is for the invocation options.
+
+    Only the shell's own `set` counts. After env, sudo, nohup, exec or
+    docker exec the word names a program: GNU coreutils 9.4 answered `env
+    set -n; echo YES` and `nohup set -n; echo YES` with "No such file or
+    directory" and the shell ran on, and bash found no program for `exec
+    set -n` and exited 127, an exit that is not followed. `command` and
+    `builtin` reach the builtin, as above. A `set -n` in a subshell leaves
+    the parent shell running: both shells ran `echo YES` for `(set -n);
+    echo YES` and `x=$(set -n); echo YES`, and only B for `(set -n; echo
+    A); echo B`; ``python_commands`` follows that by parenthesis depth.
+    Read as run where it stands, and so not followed: a `set -n` in a
+    pipeline element or a background job (`set -n | cat; echo YES` and `set
+    -n & wait; echo YES` ran, each in a subshell), in a backtick
+    substitution, behind a condition (`false && set -n; echo YES` ran,
+    `true && set -n; echo NO` did not, and a `case` arm is the same), or in
+    a function body, which runs in the calling shell when the function is
+    called (`f() { set -n; }; f; echo NO` ran nothing in both shells, `f()
+    { set -n; }; echo YES` with no call ran); `\\set -n` is an escape,
+    outside this check as escapes are.
+    """
+    if unquote(words[index]) != "set" or any(
+        unquote(word).rsplit("/", 1)[-1] in LAUNCHERS - SHELL_BUILTIN_LAUNCHERS for word in words[:index]
+    ):
+        return False
+    noexec = False
+    arguments = [unquote(word) for word in words[index + 1:]]
+    position = 0
+    while position < len(arguments):
+        option = arguments[position]
+        position += 1
+        if option in {"-", "--"} or not option.startswith(("-", "+")):
+            break
+        if any(flag not in SET_FLAGS for flag in option[1:]):
+            return False  # bash rejects the whole command and applies none of it
+        for flag in option[1:]:
+            if flag == "n":
+                noexec = option[0] == "-"
+            elif flag == "o" and position < len(arguments) and not arguments[position].startswith(("-", "+")):
+                if arguments[position] == "noexec":
+                    noexec = option[0] == "-"
+                position += 1
+    return noexec
+
+
 def shell_command_argument(words: list[str], shell: str) -> int | None:
     """Locate a literal shell's command string after consuming its option arguments."""
     index = 0
@@ -824,12 +916,21 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
     return index if command_string and not noexec and index < len(words) else None
 
 
-def python_commands(line: str):
+def python_commands(line: str, noexec: list[bool] | None = None):
     """``(line offset, source, match)`` for Python in executable positions, including shell ``-c``.
 
     Whole words keep ordinary arguments opaque. Only a supported shell's
     literal command-string argument starts another shell context; Python's
     ``-c`` argument and strings passed to printf, echo, etc. remain data.
+
+    ``noexec`` is the `set -n` state of a literal shell string (see
+    ``sets_noexec``): one entry per open subshell, the innermost last, true
+    once the shell reads without executing. The caller keeps it across the
+    lines of one string, so a `set -n` ends what runs to the end of that
+    string, and each string starts its own, so the state reaches neither the
+    document nor another string. A document line is read with none: its
+    inline code spans and fenced lines are commands of their own, so a `set
+    -n` there hides nothing, as a `cd` line changes nothing.
     """
     words: list[tuple[int, int]] = []
     redirect = False
@@ -850,7 +951,13 @@ def python_commands(line: str):
         command_words = [line[a:b] for a, b in words]
         original_words = command_words.copy()
         offsets = [line[:a].count("\n") for a, _ in words]
-        index = executable_word(command_words, offsets)
+        if noexec is not None and noexec[-1]:
+            index = None  # read by the shell, not executed
+        else:
+            index = executable_word(command_words, offsets)
+            if noexec is not None and index is not None and sets_noexec(command_words, index):
+                noexec[-1] = True
+                index = None
         if index is not None:
             command_line, spans = line, words
             if command_words != original_words:
@@ -873,9 +980,14 @@ def python_commands(line: str):
                     argument += index + 1
                     source = literal_word(command_words[argument])
                     if source is not None:
+                        state = [False]
                         for number, nested in shell_lines(source, shell_source=True):
-                            for offset, source_line, match in python_commands(nested):
+                            for offset, source_line, match in python_commands(nested, state):
                                 yield offsets[argument] + number - 1 + offset, source_line, match
+        if noexec is not None and token == "(":
+            noexec.append(noexec[-1])
+        elif noexec is not None and token == ")" and len(noexec) > 1:
+            noexec.pop()
         words = []
         redirect = False
 
@@ -3549,6 +3661,97 @@ class ScannerTests(unittest.TestCase):
                 with self.subTest(shell=shell, options=options):
                     text = f"{shell} {options} 'python3 lab/prism/storm.py' -D"
                     self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+
+    def test_noexec_set_inside_a_shell_string_ends_what_runs(self) -> None:
+        # bash 5.2.21 and dash 0.5.12 printed nothing for `set -n; echo NO`,
+        # `set -o noexec; echo NO`, `set -n; set +n; echo NO` and the other
+        # spellings ``sets_noexec`` lists, and the outer shell ran `echo YES`
+        # for `sh -c 'set -n; echo NO'; echo YES`.
+        for setting in (
+            "set -n", "set -o noexec", "set -en", "set -ne", "set -nB", "set -no noexec", "set -on noexec",
+            "set -oo noexec errexit", "set -oe noexec", "set -o errexit -n", "set +e -n", "set +n -n",
+            "set +o noexec -o noexec", "set -n +", "set + -n", "set -o -n", "set -n -o", "set -no", "set -n x",
+            "set -n -- x", "set -n --", "set -n -", "set -o noexec x", "set -n 2>/dev/null", "set >/dev/null -n",
+            "FOO=x set -n", "command set -n", "command -p set -n", "command -- set -n", "builtin set -n",
+            "builtin -- set -n", "command builtin set -n", "builtin builtin set -n", "time set -n", "! set -n",
+            "{ set -n; }", "if set -n; then :; fi", "true && set -n", "set -n; set +n", "set -n; set +o noexec",
+            "set -o noexec; set +n", "set -n; (true)", "(true); set -n", "set -n -o nosuch",
+        ):
+            for shell in ("bash", "sh", "dash", "ksh", "zsh"):
+                for command in (
+                    "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py", 'bash -c "python3 -m lab.prism.deleted"',
+                    "env python3 lab/prism/deleted.py", "builtin command python3 lab/prism/deleted.py",
+                ):
+                    with self.subTest(setting=setting, shell=shell, command=command):
+                        text = f"{shell} -c '{setting}; {command}'"
+                        self.assertEqual(self.commands(text), [])
+                        self.assertEqual(len(self.references(text)), 1)
+                        self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        for text in (
+            "bash -c \"set '-n'; python3 lab/prism/deleted.py\"",
+            "bash -c \"set '-o' 'noexec'; python3 lab/prism/deleted.py\"",
+            "sh -c 'set -n\npython3 lab/prism/deleted.py'",
+            "sh -c 'true\nset -o noexec\ntrue\npython3 -m lab.prism.deleted'",
+            "sh -c 'set -n; python3 lab/prism/deleted.py\npython3 -m lab.prism.deleted'",
+            "docker exec \"$c\" bash -o pipefail -c 'set -n\npython3 lab/prism/deleted.py'",
+            "sudo sh -c 'set -n; sh -c \"python3 lab/prism/deleted.py\"'",
+            "bash -c 'set -n; bash -c \"set +n; python3 lab/prism/deleted.py\"'",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+        text = "sh -c 'python3 lab/prism/storm.py\nset -n\npython3 lab/prism/deleted.py'\npython3 lab/prism/wave.py"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py"), (4, "lab/prism/wave.py")])
+        text = "```sh\nbash -c 'set -n\n  python3 lab/prism/deleted.py'\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_noexec_set_the_shell_undoes_rejects_or_never_reaches_leaves_the_string_running(self) -> None:
+        # bash 5.2.21 and dash 0.5.12 ran `echo YES` for `set -n +n; echo YES`,
+        # `set -o noexec +o noexec; echo YES`, `set +n; echo YES`, `set -- -n;
+        # echo YES`, `set - -n; echo YES`, `set x -n; echo YES`, `(set -n);
+        # echo YES` and `x=$(set -n); echo YES`; bash for `set -o +n; echo
+        # YES`, `set -nz; echo RAN`, `set -n -z; echo RAN`, `set -z -o noexec;
+        # echo RAN` and `set -+n; echo RAN`; and the shell ran on after GNU
+        # coreutils 9.4 env and nohup found no `set` program. docker was not
+        # installed on the inspected host; `docker exec` runs its command as
+        # a program and is read as env is.
+        for setting in (
+            "set -n +n", "set +n", "set -o noexec +o noexec", "set -o noexec +n", "set -n +o noexec",
+            "set -o errexit -o noexec +o noexec", "set -oo noexec errexit +n", "set +o noexec", "set -o +n",
+            "set -- -n", "set - -n", "set x -n", "set -o -- -n", "set -o - -n", "set -o", "set",
+            "set -nz", "set -z -n", "set -n -z", "set -z -o noexec", "set -+n", "set --noexec", "set -o noexecx",
+            "set -o pipefail", "set -eu", "set -x", "env set -n", "env -i set -n", "nohup set -n",
+            "docker exec c set -n", "command -v set -n", "command -V set -n", "(set -n)", "(set -n; true)",
+            "( set -o noexec )", "(set -n; (true))", "((set -n))", "x=$(set -n)", "(x=$(set -n); true)",
+            "(set -n\ntrue)",
+        ):
+            for shell in ("bash", "sh", "dash", "ksh", "zsh"):
+                with self.subTest(setting=setting, shell=shell):
+                    text = f"{shell} -c '{setting}; python3 lab/prism/deleted.py'"
+                    self.assertEqual(self.commands(text), ["lab/prism/deleted.py"])
+        self.assertEqual(self.commands("bash -c \"set '' -n; python3 lab/prism/deleted.py\""), ["lab/prism/deleted.py"])
+        # The subshell's state ends at its parenthesis, and an enclosing
+        # `set -n` reaches into one.
+        self.assertEqual(self.commands("bash -c '(set -n; python3 lab/prism/deleted.py); python3 lab/prism/storm.py'"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("bash -c '(set -n; (python3 lab/prism/deleted.py)); python3 lab/prism/storm.py'"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("bash -c 'set -n; (python3 lab/prism/deleted.py); python3 lab/prism/storm.py'"), [])
+        self.assertEqual(self.commands("bash -c '(true); set -n; python3 lab/prism/deleted.py'"), [])
+        # A pipeline element and a background job run in subshells, which is
+        # not followed: the `set -n` is read as the shell's own.
+        self.assertEqual(self.commands("bash -c 'set -n | cat; python3 lab/prism/deleted.py; python3 lab/prism/storm.py'"), [])
+        # A string's state reaches neither the document nor another string,
+        # and a document line has none: its code spans are separate commands.
+        for text, expected in (
+            ("bash -c 'set -n'; python3 lab/prism/deleted.py", [(1, "lab/prism/deleted.py")]),
+            ("sh -c 'set -n' && python3 lab/prism/deleted.py", [(1, "lab/prism/deleted.py")]),
+            ("bash -c 'sh -c \"set -n\"; python3 lab/prism/deleted.py'", [(1, "lab/prism/deleted.py")]),
+            ("```sh\nbash -c 'set -n'\npython3 lab/prism/deleted.py\n```", [(3, "lab/prism/deleted.py")]),
+            ("```sh\nset -n\npython3 lab/prism/deleted.py\n```", [(3, "lab/prism/deleted.py")]),
+            ("set -n; python3 lab/prism/deleted.py", [(1, "lab/prism/deleted.py")]),
+            ("Run `set -n` first, then `python3 lab/prism/deleted.py`.", [(1, "lab/prism/deleted.py")]),
+            ("```sh\nsh -c 'set -n\npython3 lab/prism/deleted.py'\nsh -c 'python3 lab/prism/storm.py'\n```", [(4, "lab/prism/storm.py")]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.located(text), expected)
 
     def test_shell_option_arguments_are_not_command_strings(self) -> None:
         command = "python3 -m lab.example.deleted"
