@@ -10,6 +10,7 @@
 use super::submit_ledger::{CommitGate, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
+use crate::metrics::StaleJobCause;
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -208,6 +209,13 @@ impl Drop for AppendTask {
 }
 
 impl Coordinator {
+    /// Record the internal cause at its refusal branch. The response stays the
+    /// generic `stale-job` answer that miners and the share observation see.
+    fn stale_job(&self, cause: StaleJobCause) -> StratumError {
+        self.metrics.record_stale_job_rejection(cause);
+        protocol_error("stale-job", "stale job")
+    }
+
     pub(super) async fn submit_share(
         &self,
         _worker: &Worker,
@@ -229,6 +237,8 @@ impl Coordinator {
         self.ensure_job_fee_current(context.prepared.fee)
             .await
             .map_err(|_| {
+                self.metrics
+                    .record_stale_job_rejection(StaleJobCause::FeeFloor);
                 protocol_error("stale-job", "job CTV fee is below the current relay floor")
             })?;
         let tip_observation::SubmitAdmission {
@@ -270,18 +280,19 @@ impl Coordinator {
                 )
             })?;
             if parent != job.wire.previousblockhash {
-                return Err(protocol_error("stale-job", "stale job"));
+                return Err(self.stale_job(StaleJobCause::ParentGrace));
             }
-        } else if parent_stale
-            || (context.prepared.snapshot.payout_revision != revision
-                && !(selected.share_lease
-                    && context.prepared.snapshot.payout_revision
-                        == current.snapshot.payout_revision
-                    && current.template["previousblockhash"].as_str()
-                        == Some(job.wire.previousblockhash.as_str())))
+        } else if parent_stale {
+            // A stale parent is attributed before any coincident revision change.
+            return Err(self.stale_job(StaleJobCause::ParentGrace));
+        } else if (context.prepared.snapshot.payout_revision != revision
+            && !(selected.share_lease
+                && context.prepared.snapshot.payout_revision == current.snapshot.payout_revision
+                && current.template["previousblockhash"].as_str()
+                    == Some(job.wire.previousblockhash.as_str())))
             || (current.snapshot.payout_revision != revision && !selected.share_lease)
         {
-            return Err(protocol_error("stale-job", "stale job"));
+            return Err(self.stale_job(StaleJobCause::PayoutRevision));
         }
         // Prior-parent share credit deliberately uses the current durable
         // revision. That exception never admits an obsolete block candidate.

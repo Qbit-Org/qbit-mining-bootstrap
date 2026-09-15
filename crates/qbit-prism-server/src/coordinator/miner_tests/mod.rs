@@ -24,6 +24,7 @@ mod prepared_expiry;
 mod published_lease;
 mod refresh;
 mod resume_inputs;
+pub(crate) mod stale_causes;
 mod work_store;
 
 pub(super) fn hash(byte: u8) -> String {
@@ -525,6 +526,12 @@ impl Fixture {
             .submit(&job.context.worker, job, self.proof(job, 0), grace.into())
             .await
     }
+}
+
+/// Raise the live relay floor above the fixture's CTV fee policy, as a refresh
+/// observing a higher node floor would.
+pub(crate) async fn raise_ctv_fee_floor(coordinator: &Coordinator) {
+    coordinator.readiness.write().await.ctv_fee_floor = Some(2000);
 }
 
 pub(super) fn assert_error(error: StratumError, reason: &str, message: &str) {

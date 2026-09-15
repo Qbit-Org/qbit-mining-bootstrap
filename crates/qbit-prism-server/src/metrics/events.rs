@@ -82,6 +82,35 @@ impl Metrics {
             registry.increment(family, Labels::Empty);
         }
     }
+    /// Exactly once, at the branch that refused admission under an existing limit.
+    pub fn record_connection_refusal(&self, reason: ConnectionRefusalReason) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::ConnectionRefusals,
+                Labels::One(("reason", reason.as_str())),
+            );
+    }
+    /// The configured global ceiling, never the permits left after admissions.
+    pub fn set_stratum_connection_limit(&self, limit: usize) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
+            Family::ConnectionLimit,
+            Labels::Empty,
+            limit as f64,
+        );
+    }
+    /// Exactly once, at the stale-job branch that refused the share. The coarse
+    /// `stale-job` reason is still counted separately by the share observation.
+    pub fn record_stale_job_rejection(&self, cause: StaleJobCause) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::StaleJobRejections,
+                Labels::One(("cause", cause.as_str())),
+            );
+    }
     /// Exactly one observation at the actual first-offer boundary. A/#266
     /// owns timestamp transport and recovery semantics across processes.
     pub fn observe_first_offer(&self, elapsed: Duration) {
