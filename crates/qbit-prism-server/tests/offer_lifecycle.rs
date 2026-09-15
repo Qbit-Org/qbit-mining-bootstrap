@@ -430,7 +430,10 @@ impl Database {
             Source::Applied258 => {
                 sqlx::raw_sql(FROZEN_2X_001).execute(&self.pool).await?;
                 sqlx::raw_sql(FROZEN_2X_002).execute(&self.pool).await?;
-                let _earlier = self.ledger("earlier-build").await?;
+                let earlier = self.ledger("earlier-build").await?;
+                earlier
+                    .heartbeat(qbit_prism_server::ledger::HeartbeatStatus::Stopped)
+                    .await?;
                 ensure!(
                     self.versions().await? == ALL_VERSIONS,
                     "the runner did not migrate the #258 source"
@@ -652,6 +655,94 @@ async fn migration_011_quarantines_attempted_pending_rows_and_keeps_never_attemp
         })
     })
     .await
+}
+
+/// An empty outbox does not prove that an old frontend has stopped. Even
+/// an arbitrarily old heartbeat may belong to a paused process that resumes.
+#[tokio::test]
+async fn migration_011_refuses_idle_instances_until_explicitly_stopped() -> Result<()> {
+    for status in [
+        json!({}),
+        Value::Null,
+        json!({"state": "starting"}),
+        json!({"state": "unknown"}),
+        json!({"schema": "qbit.prism.audit-health.v1", "ready": true}),
+        json!({"schema": "qbit.prism.audit-health.v1", "ready": false}),
+    ] {
+        run(move |db| {
+            Box::pin(async move {
+                db.apply_pre_011().await?;
+                sqlx::query("INSERT INTO qbit_prism_instances(instance_id,heartbeat_at,status) VALUES('idle-pre-011',clock_timestamp()-interval '1 day',$1)")
+                    .bind(&status).execute(&db.pool).await?;
+                let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_block_candidate_outbox")
+                    .fetch_one(&db.pool).await?;
+                ensure!(count == 0, "the regression requires no candidate claim");
+                let error = db.ledger("refused-idle").await.err()
+                    .context("migration 011 accepted an idle pre-011 instance without a stopped marker")?;
+                let text = format!("{error:#}");
+                ensure!(text.contains("idle-pre-011") && text.contains("drained or stopped"), "{text}");
+                ensure!(!db.versions().await?.contains(&11));
+                ensure!(!db.has_column("qbit_block_candidate_outbox", "offer_outcome").await?);
+                ensure!(!db.has_column("qbit_pool_blocks", "as_issued_audit_sha256").await?);
+                let capability: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle')")
+                    .fetch_one(&db.pool).await?;
+                ensure!(!capability, "a refused migration published its capability");
+                let retained: Value = sqlx::query_scalar("SELECT status FROM qbit_prism_instances WHERE instance_id='idle-pre-011'")
+                    .fetch_one(&db.pool).await?;
+                ensure!(retained == status, "refusal changed the instance evidence");
+                // Simulate the old frontend's graceful-shutdown heartbeat.
+                sqlx::query(r#"UPDATE qbit_prism_instances SET status='{"state":"stopped"}'::jsonb WHERE instance_id='idle-pre-011'"#)
+                    .execute(&db.pool).await?;
+                sqlx::query(r#"INSERT INTO qbit_prism_instances(instance_id,status) VALUES('drained-pre-011','{"state":"drained"}'::jsonb)"#)
+                    .execute(&db.pool).await?;
+                let _ledger = db.ledger("post-011").await?;
+                ensure!(db.versions().await? == ALL_VERSIONS);
+                // Once 011 is applied, ordinary concurrent frontend starts remain allowed.
+                let _other = db.ledger("another-post-011").await?;
+                Ok(())
+            })
+        }).await?;
+    }
+    Ok(())
+}
+
+/// A heartbeat that has not committed yet must not be invisible to the
+/// migration's instance scan. The table lock waits for that writer first.
+#[tokio::test]
+async fn migration_011_waits_for_in_flight_instance_registration() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            db.apply_pre_011().await?;
+            let mut heartbeat = db.pool.begin().await?;
+            sqlx::query(r#"INSERT INTO qbit_prism_instances(instance_id,status) VALUES('registering-pre-011','{"state":"starting"}'::jsonb)"#)
+                .execute(&mut *heartbeat).await?;
+            let url = db.url.clone();
+            let registration = async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let waiting: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='qbit_prism_instances'::regclass AND mode='ShareRowExclusiveLock' AND NOT granted)",
+                        ).fetch_one(&db.pool).await?;
+                        if waiting { return Ok::<_, anyhow::Error>(()); }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.context("migration did not wait for in-flight instance registration")??;
+                heartbeat.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let (migration, registration) = tokio::join!(
+                Ledger::connect(&url, "migration-waiter".to_owned(), 4, true),
+                registration,
+            );
+            registration?;
+            let error = migration.err()
+                .context("migration missed the newly committed pre-011 instance")?;
+            ensure!(format!("{error:#}").contains("registering-pre-011"), "{error:#}");
+            ensure!(!db.versions().await?.contains(&11));
+            ensure!(!db.has_column("qbit_block_candidate_outbox", "offer_outcome").await?);
+            Ok(())
+        })
+    }).await
 }
 
 /// 011 refuses, before any DDL, a pending row whose claim is still live (an

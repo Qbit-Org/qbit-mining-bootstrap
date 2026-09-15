@@ -237,8 +237,16 @@ most once per block, not exactly once across crashes.
 through its whole attempt and offers it after landing, or before landing for
 a leased candidate; a post-011 frontend would reserve and offer such a row
 again. The two must never share an outbox. Stop every pre-011 frontend and
-let their claims expire (at most the 120 s lease) before migrating. 011
-refuses to run while any pending row holds a live claim, refuses an attempted
+let their claims expire (at most the 120 s lease) before migrating. Keep
+supervisors and automatic restarts disabled throughout the cutover. Every
+`qbit_prism_instances` row must explicitly report `stopped` or `drained`;
+011 names and refuses any other instance, even with an empty outbox or a
+stale heartbeat. Heartbeat age proves only that reporting stopped, not that
+an idle or paused frontend cannot resume. Resolve blockers through graceful
+shutdown; do not edit or delete instance evidence to bypass the check.
+The scan holds a table lock through migration commit to serialize heartbeat
+registration and updates. 011 also refuses any pending row with a live claim,
+refuses an attempted
 pending row that lacks its block bytes or window reference, quarantines every
 pending row a pre-011 frontend attempted as `reconciliation` with an unknown
 outcome (recovered without any offer, confirmed if the chain holds the block,

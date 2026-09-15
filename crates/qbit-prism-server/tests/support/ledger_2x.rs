@@ -3421,7 +3421,7 @@ async fn pre_006_native_schema_with_009_applies_006_on_the_next_migrate() -> Res
     let pool = PgPool::connect(&db.url).await?;
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Pre258).await?;
+    undo_006(&earlier, &pool, SourceState::Pre258).await?;
     let applied_009 = applied_at(&pool, 9).await?;
     let migrated = db.ledger("this-build").await?;
     assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
@@ -3458,7 +3458,7 @@ async fn startup_without_initialize_refuses_a_pre_006_native_schema_with_009() -
     let pool = PgPool::connect(&db.url).await?;
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Pre258).await?;
+    undo_006(&earlier, &pool, SourceState::Pre258).await?;
     let error = Ledger::connect(&db.url, "cold".into(), 8, false)
         .await
         .err()
@@ -3540,7 +3540,12 @@ async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
 /// On a pre-#258 source 006 created the column and the capability table
 /// itself, so both are dropped again: that build saw an outbox without
 /// `storage_version`.
-async fn undo_006(pool: &PgPool, state: SourceState) -> Result<()> {
+async fn undo_006(earlier: &Ledger, pool: &PgPool, state: SourceState) -> Result<()> {
+    // Replaying 011 requires the old frontend to have shut down. Preserve
+    // that lifecycle evidence when constructing a pre-006 database.
+    earlier
+        .heartbeat(qbit_prism_server::ledger::HeartbeatStatus::Stopped)
+        .await?;
     assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
     undo_011(pool, state).await?;
     sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=6; DROP TABLE qbit_prism_migration_source")
@@ -3632,7 +3637,7 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
     apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
     insert_v2_terminal(&pool, &legacy_hash(0x44), "abandoned").await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Applied258).await?;
+    undo_006(&earlier, &pool, SourceState::Applied258).await?;
     // The pending v2 row that build's v1-only predicate never counted.
     let pending = legacy_hash(0x22);
     let body = insert_v2_pending(&pool, &pending).await?;
@@ -3707,7 +3712,7 @@ async fn pre_006_native_outbox_row_security_is_refused_before_the_drain_check() 
         let limited_pool = PgPool::connect(limited.as_str()).await?;
         apply_frozen_2x_schema(&limited_pool, state).await?;
         let earlier = Ledger::connect(limited.as_str(), "earlier".into(), 8, true).await?;
-        undo_006(&limited_pool, state).await?;
+        undo_006(&earlier, &limited_pool, state).await?;
         let hash = legacy_hash(0x66);
         if state == SourceState::Applied258 {
             insert_v2_pending(&limited_pool, &hash).await?;
@@ -3794,7 +3799,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
     let pool = PgPool::connect(&db.url).await?;
     apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Applied258).await?;
+    undo_006(&earlier, &pool, SourceState::Applied258).await?;
     // The row 002 made, raised as a newer release would raise it.
     sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=3 WHERE capability='candidate_storage_version'")
         .execute(&pool).await?;
@@ -3893,7 +3898,7 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
     let pool = PgPool::connect(&db.url).await?;
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Pre258).await?;
+    undo_006(&earlier, &pool, SourceState::Pre258).await?;
     sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=2")
         .execute(&pool)
         .await?;
@@ -4058,7 +4063,7 @@ async fn pre_006_native_schema_refuses_preexisting_source_metadata() -> Result<(
             let earlier = db.ledger("earlier-build").await?;
             sqlx::raw_sql("CREATE TABLE operator_source_template (LIKE qbit_prism_migration_source INCLUDING ALL); INSERT INTO operator_source_template SELECT * FROM qbit_prism_migration_source")
                 .execute(&pool).await?;
-            undo_006(&pool, state).await?;
+            undo_006(&earlier, &pool, state).await?;
             sqlx::raw_sql("CREATE TABLE qbit_prism_migration_source (LIKE operator_source_template INCLUDING ALL)")
                 .execute(&pool).await?;
             sqlx::raw_sql(alteration).execute(&pool).await?;
@@ -4141,7 +4146,7 @@ async fn pre_006_native_schema_refuses_a_malformed_storage_version_column() -> R
             earlier.append(share(1), None).await?;
             let block = candidate(&earlier.snapshot(100).await?, 7001)?;
             earlier.enqueue_candidate(block.candidate.clone()).await?;
-            undo_006(&pool, state).await?;
+            undo_006(&earlier, &pool, state).await?;
             if state == SourceState::Pre258 {
                 sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD COLUMN storage_version integer NOT NULL DEFAULT 1").execute(&pool).await?;
             }
@@ -4244,7 +4249,7 @@ async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_
         earlier.append(share(1), None).await?;
         let block = candidate(&earlier.snapshot(100).await?, 5601)?;
         earlier.enqueue_candidate(block.candidate.clone()).await?;
-        undo_006(&pool, state).await?;
+        undo_006(&earlier, &pool, state).await?;
         assert_eq!(pending_rows(&pool).await?, 1);
         let migrated = db.ledger("this-build").await.with_context(|| {
             format!("006 refused a native pending candidate on a {state:?} source")
@@ -4289,7 +4294,7 @@ async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_w
     let pool = PgPool::connect(&db.url).await?;
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     let earlier = db.ledger("earlier-build").await?;
-    undo_006(&pool, SourceState::Pre258).await?;
+    undo_006(&earlier, &pool, SourceState::Pre258).await?;
     // A 2.x.x v1 row the native lane cannot replay, on an outbox without
     // storage_version or body_id: the predicate must take its v1-only form.
     let pending = legacy_hash(0x11);

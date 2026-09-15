@@ -2857,7 +2857,9 @@ pub(super) async fn migrate_schema(
     Ok(())
 }
 
-/// 011's own quiesce check, before any of its DDL runs. A pending row whose
+/// 011's own quiesce check, before any of its DDL runs. Every registered
+/// instance must explicitly report shutdown, even if it holds no claim.
+/// A pending row whose
 /// claim is still live belongs to a pre-011 frontend that may be mid-offer:
 /// the reservation lifecycle cannot take over a row an old frontend may
 /// still send. And 011 quarantines every attempted pending row as an
@@ -2866,6 +2868,25 @@ pub(super) async fn migrate_schema(
 /// window reference); a parked chunked row or a pre-007 row cannot be
 /// quarantined and is refused by name, exactly as 007 refused it.
 async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    // Claim expiry proves nothing about an idle or paused frontend. Use the
+    // same explicit shutdown markers as fatal-state recovery, without a
+    // heartbeat-age cutoff. Serialize the scan with heartbeat registration
+    // and retain the lock until the capability change commits.
+    sqlx::query("LOCK TABLE qbit_prism_instances IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await?;
+    let instances: Vec<String> = sqlx::query_scalar(
+        "SELECT instance_id FROM qbit_prism_instances WHERE COALESCE(status->>'state','') NOT IN ('drained','stopped') ORDER BY instance_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        instances.is_empty(),
+        "migration 011 requires every pre-011 instance to report drained or stopped; offending instances: {}. \
+         Stop every pre-011 frontend gracefully and disable automatic restarts before migrating. \
+         An empty outbox or an expired heartbeat does not prove shutdown; nothing was changed",
+        named_objects(&instances)
+    );
     let outbox: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_block_candidate_outbox') IS NOT NULL")
             .fetch_one(&mut **tx)
