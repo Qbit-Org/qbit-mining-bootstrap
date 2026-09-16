@@ -333,8 +333,8 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
 FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
 -- Every unfinished candidate retains the as-issued balances needed to land
 -- or reconcile its audit, including a row that must never be offered again.
--- A row settled `orphaned` (migration 015) is terminal but keeps its window
--- reference, so its snapshot is still referenced and belongs here too.
+-- Terminal rows, including `orphaned` (migration 015), release their window
+-- references; their offer metadata remains in the candidate record above.
 -- Ignore unreferenced snapshots, which ordinary garbage collection removes.
 SELECT (to_regclass('qbit_prism_balance_snapshots') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_candidate_balances
@@ -345,7 +345,7 @@ SELECT jsonb_build_object('kind', 'candidate_balances', 'row', jsonb_build_objec
     'balances_sha256', encode(pg_catalog.sha256(b.balances), 'hex')))
 FROM qbit_prism_balance_snapshots b
 WHERE EXISTS (SELECT 1 FROM qbit_block_candidate_outbox c
-              WHERE c.state IN ('pending','offer_reserved','offered','reconciliation','orphaned')
+              WHERE c.state IN ('pending','offer_reserved','offered','reconciliation')
                 AND c.window_prior_balances_sha256 = b.prior_balances_digest)
 ORDER BY b.prior_balances_digest COLLATE "C";
 \endif

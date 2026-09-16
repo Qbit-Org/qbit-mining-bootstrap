@@ -183,6 +183,19 @@ async fn answer(
         "getmempoolinfo" => json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
         "getbestblockhash" => json!(state.tip),
         "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
+        // Above the tip qbitd has no block, and neither does this fake
+        // node: the same error `support/scripted_node.rs` answers, never the
+        // tip. At or below the tip every height still answers the tip.
+        "getblockhash"
+            if request["params"][0]
+                .as_u64()
+                .is_none_or(|height| height > state.height) =>
+        {
+            return Json(json!({
+                "id":request["id"],"result":null,
+                "error":{"code":-8,"message":"Block height out of range"}
+            }))
+        }
         "getblockhash" => json!(state.tip),
         "getblockheader" => json!({"previousblockhash": state.tip_parent}),
         "validateaddress" => {

@@ -870,9 +870,14 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
-        self.work_ledger
+        // Reconciliation and settlement both count the block's durable first
+        // confirmation, regardless of the outbox state at that moment.
+        let first_confirmations = self
+            .work_ledger
             .reconcile(&observations, tip_height, revision)
             .await?;
+        self.blocks
+            .fetch_add(first_confirmations, Ordering::Relaxed);
         *cache = Some(ChainCache {
             tip: tip.into(),
             height: tip_height,
@@ -1356,8 +1361,12 @@ impl Coordinator {
                 // Finishing can commit its terminal state just before the
                 // processing future receives COMMIT's reply. The canceled
                 // work needs no retry when durable completion already won.
+                // Every state that is not unfinished is terminal. A proven
+                // orphan that committed here was not counted by
+                // `record_candidate_orphaned`: that counter reports completions
+                // this process observed, not every committed settlement.
                 let terminal = tokio::time::timeout(lease.timeout, sqlx::query_scalar::<_, bool>(
-                    &format!("SELECT state IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::TERMINAL_SQL)
+                    &format!("SELECT state NOT IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL)
                 ).bind(&claim.candidate.block_hash).fetch_optional(&self.ledger.pool)).await;
                 if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
             },
@@ -1756,10 +1765,12 @@ impl Coordinator {
         // now, at a revision proven now, advances the shared payout state.
         let observation = self.observe_candidate(claim).await?;
         if observation.active {
-            self.ledger
-                .finish_candidate_at_revision(claim, true, None, observation.revision)
+            let first_confirmation = self
+                .ledger
+                .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
                 .await?;
-            self.blocks.fetch_add(1, Ordering::Relaxed);
+            self.blocks
+                .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
             self.wake.notify_one();
             return Ok(());
         }
@@ -1771,12 +1782,14 @@ impl Coordinator {
         // bumped that revision, and the settlement then fails and falls to
         // the ordinary reconciliation retry below. An observation that
         // failed never reaches here, so a failed observation never settles.
+        // The log line and the counter follow the committed settlement only;
+        // a refused one reports nothing terminal.
         if let Some(reason) = self.orphan_evidence(claim, &observation) {
-            tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
             self.ledger
                 .orphan_candidate_at_revision(claim, &reason, observation.revision)
                 .await?;
             self.metrics.record_candidate_orphaned();
+            tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
             return Ok(());
         }
         let reason = format!(
@@ -1800,17 +1813,24 @@ impl Coordinator {
         observation: &CandidateObservation,
     ) -> Option<String> {
         let height = claim.candidate.found_block.block_height;
+        // The candidate's own hash at its height is exactly
+        // `observation.active`. The tip height is the node's report: the
+        // subtraction stays checked rather than trusting that `at_height` is
+        // only ever read at or below it, and the count saturates.
         let competitor = observation.at_height.as_deref()?;
-        if observation.active || competitor == claim.candidate.block_hash {
+        if competitor == claim.candidate.block_hash {
             return None;
         }
-        let confirmations = observation.tip_height.checked_sub(height)?.checked_add(1)?;
+        let confirmations = observation
+            .tip_height
+            .checked_sub(height)?
+            .saturating_add(1);
         let required = self.config.candidate_orphan_confirmations;
         if confirmations < required {
             return None;
         }
         Some(format!(
-            "proven orphan: block {competitor} is active at height {height} with {confirmations} confirmations (tip {} at height {}, {required} required) and block {} is not on the active chain; settled terminal with its evidence, never offered again",
+            "proven orphan: block {competitor} is active at height {height} with {confirmations} confirmations (tip {} at height {}, {required} required) and block {} is not on the active chain; settled terminal with its landed audit kept for a reorg back, never offered again",
             observation.tip, observation.tip_height, claim.candidate.block_hash
         ))
     }

@@ -83,8 +83,11 @@
       ],
       "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height."
     },
+    "blocks_total": {
+      "status": "Process-local count of first block confirmations observed after a successful settlement or reconciliation commit. Reconciliation includes a previously orphaned candidate that later becomes active; the durable audit publication marker prevents repeat counting on later disconnect/reconnect cycles. Cancellation or restart after commit can lose an increment."
+    },
     "block_candidates_orphaned_total": {
-      "status": "Increments once per offered candidate this instance settled terminal as a proven orphan (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. Attributed to the committed settlement, never to a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
+      "status": "Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
     },
     "process_resident_memory_bytes": {
       "replaces": [

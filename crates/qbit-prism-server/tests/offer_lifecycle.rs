@@ -24,6 +24,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Mutex;
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 const ANCHOR: i64 = 1_700_000_000_000;
 const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sql");
 /// Every native migration before 011, in the runner's order.
@@ -60,10 +65,9 @@ const PROOF_MS: i64 = 1_700_000_000_123;
 const OFFERED_MS: i64 = 1_700_000_000_456;
 
 struct Database {
-    admin: PgPool,
+    fixture: FixtureDatabase,
     pool: PgPool,
     url: String,
-    schema: String,
     ledgers: Mutex<Vec<PgPool>>,
 }
 
@@ -72,20 +76,17 @@ impl Database {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_offer_lifecycle_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let pool = PgPool::connect(url.as_str()).await?;
+        // Migration and settlement advisory locks are database-wide, so
+        // separate schemas would still make independent tests block each other.
+        let fixture = FixtureDatabase::open(&raw, "prism_offer_lifecycle_").await?;
+        let pool = match PgPool::connect(&fixture.url).await {
+            Ok(pool) => pool,
+            Err(error) => return Err(fixture.abandon(error.into()).await),
+        };
         Ok(Some(Self {
-            admin,
+            url: fixture.url.clone(),
+            fixture,
             pool,
-            url: url.to_string(),
-            schema,
             ledgers: Mutex::new(Vec::new()),
         }))
     }
@@ -164,11 +165,7 @@ impl Database {
             pool.close().await;
         }
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.fixture.close(Ok(())).await
     }
 }
 
@@ -1327,17 +1324,27 @@ async fn outbox_lifecycle_checks_accept_exactly_the_lifecycle_shapes() -> Result
                 ("submitted", false, true, false, true, false, false, None, None, None, false),
                 ("abandoned", false, false, false, true, false, false, None, None, Some("superseded"), true),
                 ("abandoned", false, false, false, true, true, false, None, None, None, false),
-                // 015: an orphaned row is terminal and keeps its evidence and its offer record.
-                ("orphaned", true, true, true, true, true, true, Some("accepted"), None, Some("proven orphan"), true),
-                ("orphaned", true, true, true, true, true, false, Some("unknown"), None, Some("proven orphan"), true),
-                ("orphaned", true, true, true, true, true, true, Some("rejected"), Some("duplicate"), Some("proven orphan"), true),
-                ("orphaned", false, true, true, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
-                ("orphaned", true, false, true, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
-                ("orphaned", true, true, false, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
-                ("orphaned", true, true, true, false, true, true, Some("accepted"), None, Some("proven orphan"), false),
-                ("orphaned", true, true, true, true, false, false, None, None, Some("proven orphan"), false),
-                ("orphaned", true, true, true, true, true, true, Some("accepted"), None, None, false),
-                ("orphaned", true, true, true, true, true, true, Some("accepted"), None, Some("   "), false),
+                // 015: an orphaned row is terminal, its payload cleared like
+                // every terminal row's, and keeps its offer record and reason.
+                ("orphaned", false, false, false, true, true, true, Some("accepted"), None, Some("proven orphan"), true),
+                ("orphaned", false, false, false, true, true, true, Some("rejected"), Some("duplicate"), Some("proven orphan"), true),
+                ("orphaned", false, false, false, true, true, true, Some("unknown"), None, Some("proven orphan"), true),
+                // A reservation whose call was lost stays unknown without a call time.
+                ("orphaned", false, false, false, true, true, false, Some("unknown"), None, Some("proven orphan"), true),
+                // No payload survives the disposition.
+                ("orphaned", true, false, false, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
+                ("orphaned", false, true, false, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
+                ("orphaned", false, false, true, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
+                ("orphaned", true, true, true, true, true, true, Some("accepted"), None, Some("proven orphan"), false),
+                ("orphaned", false, false, false, false, true, true, Some("accepted"), None, Some("proven orphan"), false),
+                // The offer record and the reason are required.
+                ("orphaned", false, false, false, true, false, false, None, None, Some("proven orphan"), false),
+                ("orphaned", false, false, false, true, true, false, None, None, Some("proven orphan"), false),
+                ("orphaned", false, false, false, true, true, true, Some("accepted"), None, None, false),
+                ("orphaned", false, false, false, true, true, true, Some("accepted"), None, Some("   "), false),
+                // A node answer without its call time would be an invented submission.
+                ("orphaned", false, false, false, true, true, false, Some("accepted"), None, Some("proven orphan"), false),
+                ("orphaned", false, false, false, true, true, false, Some("rejected"), Some("duplicate"), Some("proven orphan"), false),
                 ("rejected", false, false, false, true, false, false, None, None, None, false),
             ];
             for (index, (state, candidate, block, window, completed, reserved, offered_at, outcome, reply, last_error, accepted)) in cases.iter().enumerate() {
@@ -1469,14 +1476,35 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
     .await
 }
 
+/// Whether a `Database::row` has the payload every terminal row has: no
+/// document, no block, none of the six window columns, and no body where the
+/// outbox has a body column.
+fn terminal_payload_cleared(row: &Value) -> bool {
+    row["candidate"].is_null()
+        && row["has_block"] == false
+        && [
+            "window_anchor_ms",
+            "window_prior_balances_sha256",
+            "window_first_share_seq",
+            "window_last_share_seq",
+            "window_share_count",
+            "window_snapshot_sha256",
+            "body_id",
+        ]
+        .iter()
+        .all(|column| row.get(*column).is_none_or(Value::is_null))
+}
+
 /// The terminal orphan disposition (#415, migration 015) through the ledger:
 /// reachable from the offer states only and never from `pending`, written at
 /// the revision the observation was taken at and refused at any other, and
-/// refused without a reason. The settled row keeps its document, its block
-/// bytes, its window reference (so retention keeps it) and its offer record,
-/// leaves the pending gauge and the collector, is never claimable, can be
-/// moved by no later settlement, and, like every other terminal row, blocks
-/// no signer rotation.
+/// refused without a reason. `orphaned` is a processing disposition, so the
+/// settled row is cleared like every terminal row (no document, block bytes
+/// or window reference, so retention releases it) and keeps its offer record
+/// and reason; a reservation whose call was lost stays `unknown`, with no
+/// call time or reply invented for it. The row leaves the pending gauge and
+/// the collector, is never claimable, can be moved by no later settlement,
+/// and, like every other terminal row, blocks no signer rotation.
 #[tokio::test]
 async fn orphaned_rows_are_terminal_keep_their_evidence_and_leave_the_pending_gauge() -> Result<()>
 {
@@ -1495,7 +1523,7 @@ async fn orphaned_rows_are_terminal_keep_their_evidence_and_leave_the_pending_ga
                 let collected = collectors::database(&db.pool, &metrics).await?.candidates;
                 Ok::<_, anyhow::Error>((retained, gauge, collected))
             };
-            let (candidate, _) = candidate_for(&snapshot, 50)?;
+            let (candidate, bundle) = candidate_for(&snapshot, 50)?;
             let hash = candidate.block_hash.clone();
             ensure!(ledger.enqueue_candidate_observed(candidate, Some(PROOF_MS)).await?);
             let claim = ledger.claim_candidate(60).await?.context("pending not claimable")?;
@@ -1509,6 +1537,20 @@ async fn orphaned_rows_are_terminal_keep_their_evidence_and_leave_the_pending_ga
             // From an offered row: the fences first, then the settlement.
             ledger.reserve_offer(&claim).await?;
             ledger.record_offer(&claim, OFFERED_MS, OfferOutcome::Accepted, None).await?;
+            // The post-offer landing ran first: the audit and the prepared
+            // pool block are evidence the disposition must keep.
+            let claim = claim.with_bundle(bundle);
+            ledger.land_candidate_at_revision(&claim, &keys().1.public_key_hex(), revision).await?;
+            let revision = ledger.payout_revision().await?;
+            let audit_evidence = || async {
+                Ok::<_, anyhow::Error>(sqlx::query_as::<_, (i64, Option<String>)>(
+                    "SELECT (SELECT count(*) FROM qbit_pool_audit_bundles WHERE block_hash=$1),(SELECT chain_state FROM qbit_pool_blocks WHERE block_hash=$1)",
+                )
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await?)
+            };
+            ensure!(audit_evidence().await? == (1, Some("prepared".into())), "the landing left no audit: {:?}", audit_evidence().await?);
             ensure!(ledger.orphan_candidate_at_revision(&claim, "   ", revision).await.is_err(), "an orphan was settled without a reason");
             let error = ledger.orphan_candidate_at_revision(&claim, "proven orphan", revision + 1).await.err().context("an orphan was settled at a revision never observed")?;
             ensure!(format!("{error:#}").contains("payout revision changed"), "{error:#}");
@@ -1517,19 +1559,35 @@ async fn orphaned_rows_are_terminal_keep_their_evidence_and_leave_the_pending_ga
             ledger.orphan_candidate_at_revision(&claim, "proven orphan: another block is active at height 101 with 6 confirmations", revision).await?;
             let row = db.row(&hash).await?;
             ensure!(row["state"] == "orphaned" && !row["completed_at"].is_null() && row["claim_token"].is_null(), "{row}");
-            ensure!(!row["candidate"].is_null() && row["has_block"] == true && !row["window_anchor_ms"].is_null(), "the orphaned row lost its evidence: {row}");
-            ensure!(row["offered_at_ms"] == OFFERED_MS && row["offer_outcome"] == "accepted" && row["offer_reserved_by"] == "orphan" && row["proof_observed_at_ms"] == PROOF_MS, "the offer record was lost: {row}");
+            ensure!(terminal_payload_cleared(&row), "the orphaned row kept a payload: {row}");
+            ensure!(row["offered_at_ms"] == OFFERED_MS && row["offer_outcome"] == "accepted" && row["offer_reply"].is_null() && row["offer_reserved_by"] == "orphan" && !row["offer_reserved_at"].is_null() && row["proof_observed_at_ms"] == PROOF_MS, "the offer record was lost: {row}");
             ensure!(row["last_error"].as_str().is_some_and(|reason| reason.contains("proven orphan")), "{row}");
+            ensure!(audit_evidence().await? == (1, Some("inactive".into())), "the landed audit or pool block was lost: {:?}", audit_evidence().await?);
 
-            // Retained by its window reference, counted by neither the gauge
-            // predicate nor the collector, and never claimed or moved again.
-            ensure!(live_rows().await? == (1, 0, 0));
+            // Released by retention, counted by neither the gauge predicate
+            // nor the collector, and never claimed or moved again.
+            ensure!(live_rows().await? == (0, 0, 0));
             sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1").bind(&hash).execute(&db.pool).await?;
             ensure!(ledger.claim_candidate(60).await?.is_none(), "a terminal orphan was claimed");
             ensure!(ledger.reconcile_candidate(&claim, "again").await.is_err(), "a terminal orphan was reconciled");
             ensure!(ledger.finish_candidate(&claim, true, None).await.is_err(), "a terminal orphan was finished");
             ensure!(ledger.orphan_candidate_at_revision(&claim, "again", ledger.payout_revision().await?).await.is_err(), "a terminal orphan was orphaned twice");
             ensure!(db.row(&hash).await?["state"] == "orphaned");
+
+            // A reservation whose submitblock call was lost: the disposition
+            // records the outcome as unknown and invents no call time or
+            // reply, and the row is cleared the same way.
+            let (reserved, _) = candidate_for(&snapshot, 51)?;
+            let reserved_hash = reserved.block_hash.clone();
+            ensure!(ledger.enqueue_candidate_observed(reserved, Some(PROOF_MS)).await?);
+            let claim = ledger.claim_candidate(60).await?.context("second pending not claimable")?;
+            ensure!(claim.candidate.block_hash == reserved_hash);
+            ledger.reserve_offer(&claim).await?;
+            ledger.orphan_candidate_at_revision(&claim, "proven orphan: reservation lost, another block is active", ledger.payout_revision().await?).await?;
+            let row = db.row(&reserved_hash).await?;
+            ensure!(row["state"] == "orphaned" && terminal_payload_cleared(&row), "{row}");
+            ensure!(row["offer_outcome"] == "unknown" && row["offered_at_ms"].is_null() && row["offer_reply"].is_null() && row["offer_reserved_by"] == "orphan", "a submission was invented for a lost reservation: {row}");
+            ensure!(live_rows().await? == (0, 0, 0));
 
             // A terminal row blocks no signer rotation.
             ledger.configure("rotated", &other_signer_keys()).await.context("rotation refused by an orphaned row")?;

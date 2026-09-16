@@ -18,14 +18,22 @@
 //! block is offered twice, or if the orphan disposition stops being terminal
 //! and reversible for credit.
 //!
-//! The lost race is reproduced exactly: `submitblock` returns null and our
-//! hash is the node's best tip, within `RACE_WINDOW` the node reorgs to a
-//! same-height competitor, and the tip then advances two further heights.
+//! The lost race, as the scripted node (`support/scripted_node.rs`) plays it:
+//! `submitblock` accepts our block and makes it the node's best tip, and in
+//! the same handler, before the null reply is sent, a same-height competitor
+//! replaces it; the tip then advances further. The reorg is deterministic: no
+//! post-offer observation can see our block active first, however loaded the
+//! host. Two differences from the incident are deliberate and stated here:
+//! our block's activation is visible only in the node's tip history, never to
+//! the coordinator (which in the incident could have observed it for 61 ms),
+//! and every tip change on the scripted node adds chainwork, so the
+//! competitor has strictly MORE cumulative work than our block. The
+//! equal-work replacement of the best tip, which `Ledger::observe_chain_view`
+//! refuses (#423), is therefore not exercised.
 //!
 //! Run through test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test lost_race_pin -- --nocapture.
 use anyhow::{ensure, Context, Result};
-use axum::{extract::State, routing::post, Json, Router};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy};
 use qbit_prism_server::{
@@ -40,16 +48,23 @@ use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+#[path = "support/scripted_node.rs"]
+#[allow(dead_code)]
+mod scripted_node;
+use ledger_database::FixtureDatabase;
+use scripted_node::{ChainState, ScriptedNode};
 
 /// The incident's race: our block is the best tip, and the node reorgs to the
-/// competitor this soon after. #413 measured 61 ms; the test drives the reorg
-/// as soon as the offer is observed at the node and asserts it landed inside
-/// this window, so the reproduction stays the incident's and not a slow one.
+/// competitor this soon after. #413 measured 61 ms; the scripted node replaces
+/// it inside the `submitblock` handler, and the tests assert from the node's
+/// tip history that it did so inside this window.
 const RACE_WINDOW: Duration = Duration::from_millis(100);
 /// The pin's bound: after the race, each new tip's work must be issued within
 /// this much of the tip becoming visible, *while* a candidate claim on the
@@ -63,104 +78,21 @@ const HEIGHT: u64 = 101;
 const PARENT: &str = "aa";
 /// The competitor that wins the race: same height, same parent.
 const COMPETITOR: &str = "bb";
-
-struct NodeState {
-    tip: String,
-    height: u64,
-    chainwork: u64,
-    /// The active chain by height, for `getblockhash`.
-    blocks: HashMap<u64, String>,
-    parents: HashMap<String, String>,
-    /// Every `submitblock` arrival, by block hash.
-    submissions: HashMap<String, Vec<Instant>>,
-}
-
-impl NodeState {
-    /// Replace the active block at `height` and make the replacement the tip,
-    /// discarding everything above: the node's own reorg.
-    fn reorg_to(&mut self, height: u64, hash: &str) {
-        self.blocks.retain(|at, _| *at < height);
-        self.blocks.insert(height, hash.to_owned());
-        self.tip = hash.to_owned();
-        self.height = height;
-        self.chainwork += 1;
-    }
-
-    /// Extend the active chain by one block of no interest to the pool.
-    fn advance(&mut self) {
-        let height = self.height + 1;
-        let hash = format!("{height:02x}").repeat(32);
-        self.parents.insert(hash.clone(), self.tip.clone());
-        self.blocks.insert(height, hash.clone());
-        self.tip = hash;
-        self.height = height;
-        self.chainwork += 1;
-    }
-}
-
-async fn node_reply(
-    State(node): State<Arc<Mutex<NodeState>>>,
-    Json(request): Json<Value>,
-) -> Json<Value> {
-    let arrived = Instant::now();
-    let now = chrono::Utc::now().timestamp();
-    let mut node = node.lock().await;
-    let result = match request["method"].as_str().unwrap_or("") {
-        "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
-        "getblockhash" => {
-            let height = request["params"][0].as_u64().unwrap_or(0);
-            // A height above the tip has no block; the node would error, and
-            // the coordinator never asks (it compares the tip height first).
-            json!(node.blocks.get(&height).cloned())
-        }
-        "getblockheader" => {
-            json!({"previousblockhash": node.parents.get(request["params"][0].as_str().unwrap_or(""))})
-        }
-        "getblockchaininfo" => json!({"chain":"test","initialblockdownload":false,
-            "blocks":node.height,"headers":node.height,"bestblockhash":node.tip,
-            "chainwork":format!("{:x}",node.chainwork)}),
-        "getbestblockhash" => json!(node.tip),
-        "getnetworkinfo" => json!({"connections":2}),
-        "getblocktemplate" => json!({"height":node.height+1,"coinbasevalue":500_000_000u64,
-            "previousblockhash":node.tip,"version":0x20000000u32,"bits":"207fffff",
-            "curtime":now,"mintime":now-1,"transactions":[]}),
-        "estimatesmartfee" => json!({"feerate":"0.00001"}),
-        "getmempoolinfo" => json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
-        "validateaddress" => {
-            json!({"isvalid":true,"scriptPubKey":format!("5220{}","11".repeat(32))})
-        }
-        "submitblock" => {
-            let block = hex::decode(request["params"][0].as_str().unwrap_or("")).unwrap();
-            let hash = codec::hash_display(&codec::double_sha256(&block[..80]));
-            node.submissions
-                .entry(hash.clone())
-                .or_default()
-                .push(arrived);
-            // Accepted, exactly as qbitd accepted ours: null reply, and our
-            // block is the node's best block. The race is lost afterwards.
-            let height = node.height + 1;
-            let previous = node.tip.clone();
-            node.parents.insert(hash.clone(), previous);
-            node.tip = hash.clone();
-            node.height = height;
-            node.chainwork += 1;
-            node.blocks.insert(height, hash);
-            Value::Null
-        }
-        method => panic!("unexpected lost-race RPC {method}"),
-    };
-    Json(json!({"id":request["id"],"result":result,"error":null}))
-}
+/// A second competitor, for a reorg that disconnects our block again.
+const SECOND_COMPETITOR: &str = "cc";
+/// Bounds every wait on the coordinator's own processing.
+const PROCESS_BOUND: Duration = Duration::from_secs(60);
 
 struct Fixture {
-    admin: PgPool,
-    /// A plain connection pool on the fixture's schema, for the lock hold.
+    /// The fixture's own database: advisory locks are per database, so the
+    /// settlement lock this binary's coordinator takes never queues another
+    /// test binary's ledger.
+    database: FixtureDatabase,
+    /// A plain connection pool on the fixture's database, for the lock hold.
     pool: PgPool,
-    schema: String,
     coordinator: Arc<Coordinator>,
     metrics: Arc<Metrics>,
-    node: Arc<Mutex<NodeState>>,
-    server: tokio::task::JoinHandle<()>,
+    node: ScriptedNode,
 }
 
 impl Fixture {
@@ -168,31 +100,26 @@ impl Fixture {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_lost_race_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let pool = PgPool::connect(url.as_str()).await?;
-        let node = Arc::new(Mutex::new(NodeState {
-            tip: PARENT.repeat(32),
-            height: HEIGHT - 1,
-            chainwork: 1,
-            blocks: HashMap::from([(HEIGHT - 1, PARENT.repeat(32))]),
-            parents: HashMap::from([(PARENT.repeat(32), "00".repeat(32))]),
-            submissions: HashMap::new(),
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let rpc_url = format!("http://{}/", listener.local_addr()?);
-        let app = Router::new()
-            .route("/", post(node_reply))
-            .with_state(node.clone());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let database = FixtureDatabase::open(&raw, "prism_lost_race_").await?;
+        match Self::build(&database).await {
+            Ok((pool, coordinator, metrics, node)) => Ok(Some(Self {
+                database,
+                pool,
+                coordinator,
+                metrics,
+                node,
+            })),
+            Err(error) => Err(database.abandon(error).await),
+        }
+    }
+
+    async fn build(
+        database: &FixtureDatabase,
+    ) -> Result<(PgPool, Arc<Coordinator>, Arc<Metrics>, ScriptedNode)> {
+        let pool = PgPool::connect(&database.url).await?;
+        let node = ScriptedNode::open(ChainState::new(&PARENT.repeat(32), HEIGHT - 1)).await?;
         let config = Config {
-            database_url: url.to_string(),
+            database_url: database.url.clone(),
             instance_id: "lost-race".into(),
             database_connections: 8,
             initialize_schema: true,
@@ -202,7 +129,7 @@ impl Fixture {
             template_max_age: Duration::from_secs(120),
             submit_tip_max_age: Duration::from_secs(10),
             template_refresh_failure_exit: Duration::from_secs(120),
-            rpc_url,
+            rpc_url: node.url.clone(),
             rpc_user: "test".into(),
             rpc_password: "test".into(),
             rpc_timeout: Duration::from_secs(5),
@@ -246,19 +173,36 @@ impl Fixture {
         for index in 1..=3u64 {
             coordinator.ledger.append(seed_share(index), None).await?;
         }
-        Ok(Some(Self {
-            admin,
-            pool,
-            schema,
-            coordinator,
-            metrics,
-            node,
-            server,
-        }))
+        Ok((pool, coordinator, metrics, node))
     }
 
     fn ledger(&self) -> &Ledger {
         &self.coordinator.ledger
+    }
+
+    /// The scripted node's chain, locked.
+    async fn chain(&self) -> tokio::sync::MutexGuard<'_, ChainState> {
+        self.node.state.lock().await
+    }
+
+    /// Extend the node's chain until the tip is at `height`.
+    async fn advance_to(&self, height: u64) {
+        let mut chain = self.chain().await;
+        while chain.height < height {
+            chain.advance();
+        }
+    }
+
+    /// The node's own reorg at `HEIGHT`: `hash` replaces the active block
+    /// there, and its branch is extended one block past the old tip, so it is
+    /// the longer chain as well as the one with more work.
+    async fn reorg_at_height(&self, hash: &str) {
+        let mut chain = self.chain().await;
+        let beyond = chain.height + 1;
+        chain.reorg_to(HEIGHT, hash);
+        while chain.height < beyond {
+            chain.advance();
+        }
     }
 
     /// A block found on `snapshot` at `HEIGHT` on `parent`, with this
@@ -355,6 +299,18 @@ impl Fixture {
         )
     }
 
+    /// `(inactive_since IS NULL, audit_publication_sequence IS NULL)` of the
+    /// block's pool row: whether a disconnection was recorded, and whether
+    /// the block has never been confirmed.
+    async fn block_markers(&self, block_hash: &str) -> Result<(bool, bool)> {
+        Ok(sqlx::query_as(
+            "SELECT inactive_since IS NULL, audit_publication_sequence IS NULL FROM qbit_pool_blocks WHERE block_hash=$1",
+        )
+        .bind(block_hash)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn credited(&self, share_id: &str) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE share_id=$1")
@@ -394,15 +350,37 @@ impl Fixture {
         Ok(())
     }
 
+    /// Claim the due row for `block_hash` and run one attempt on it.
+    async fn retry(&self, block_hash: &str) -> Result<()> {
+        self.make_due(block_hash).await?;
+        let claim = self
+            .ledger()
+            .claim_candidate(120)
+            .await?
+            .context("the row was not claimable for its retry")?;
+        ensure!(
+            claim.candidate.block_hash == block_hash,
+            "another row was claimed for the retry"
+        );
+        tokio::time::timeout(PROCESS_BOUND, self.coordinator.process_candidate(&claim))
+            .await
+            .context("the retry did not complete")?
+    }
+
     /// Every `submitblock` arrival for the block.
     async fn arrivals(&self, block_hash: &str) -> Vec<Instant> {
-        self.node
-            .lock()
+        self.chain()
             .await
             .submissions
             .get(block_hash)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// `qbit_prism_blocks_total`'s source: the coordinator's confirmed-block
+    /// count, which the server publishes as the counter.
+    fn blocks_total(&self) -> u64 {
+        self.coordinator.blocks.load(Ordering::Relaxed)
     }
 
     /// The cluster-wide pending-candidate gauges, as the metrics collector
@@ -412,15 +390,13 @@ impl Fixture {
         Ok((observed.candidates, observed.candidate_oldest))
     }
 
-    async fn close(self) -> Result<()> {
-        self.server.abort();
+    /// Stops the node, closes the pools and drops the fixture database; a
+    /// test error wins over a cleanup error.
+    async fn close(self, result: Result<()>) -> Result<()> {
+        self.node.stop();
         self.coordinator.ledger.pool.close().await;
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.database.close(result).await
     }
 }
 
@@ -464,12 +440,11 @@ fn unix_ms_now() -> Result<i64> {
     Ok(i64::try_from(elapsed.as_millis())?)
 }
 
-/// Offer the candidate, lose the race inside `RACE_WINDOW`, and return the
-/// block hash and how long after the offer's arrival the reorg was installed.
-async fn lose_the_race(
+/// Enqueue our block at `HEIGHT` and claim it.
+async fn claim_found(
     fixture: &Fixture,
     deferred: Option<AcceptedShare>,
-) -> Result<(String, Duration)> {
+) -> Result<qbit_prism_server::ledger::CandidateClaim> {
     let ledger = fixture.ledger();
     let snapshot = ledger.snapshot(u128::from(HEIGHT - 1)).await?;
     let candidate = fixture.found(&snapshot, &PARENT.repeat(32), deferred)?;
@@ -489,45 +464,58 @@ async fn lose_the_race(
         claim.candidate.block_hash == hash,
         "another row was claimed"
     );
-    let process = {
-        let coordinator = fixture.coordinator.clone();
-        tokio::spawn(async move { coordinator.process_candidate(&claim).await })
-    };
+    Ok(claim)
+}
 
-    // The node accepted it and it is the best block. Lose the race now, the
-    // way qbitd did 61 ms later: a same-height competitor replaces it.
-    let arrival = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(first) = fixture.arrivals(&hash).await.first().copied() {
-                return first;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .context("the block never reached submitblock")?;
-    {
-        let mut node = fixture.node.lock().await;
-        ensure!(
-            node.tip == hash && node.height == HEIGHT,
-            "the fake node did not make our block the best block at {HEIGHT}"
-        );
-        node.parents
-            .insert(COMPETITOR.repeat(32), PARENT.repeat(32));
-        let competitor = COMPETITOR.repeat(32);
-        node.reorg_to(HEIGHT, &competitor);
-    }
-    let raced_after = arrival.elapsed();
-    tokio::time::timeout(Duration::from_secs(60), process)
+/// Offer the candidate and lose the race: the node accepts it as its best
+/// tip, and the competitor replaces it inside the same `submitblock` handler,
+/// before the reply. Returns the block hash and how long the node held our
+/// block as its best tip.
+async fn lose_the_race(
+    fixture: &Fixture,
+    deferred: Option<AcceptedShare>,
+) -> Result<(String, Duration)> {
+    let claim = claim_found(fixture, deferred).await?;
+    let hash = claim.candidate.block_hash.clone();
+    let competitor = COMPETITOR.repeat(32);
+    fixture.chain().await.lose_next_race_to(&competitor);
+    tokio::time::timeout(PROCESS_BOUND, fixture.coordinator.process_candidate(&claim))
         .await
-        .context("the post-offer settlement did not complete")???;
+        .context("the post-offer settlement did not complete")??;
+    let chain = fixture.chain().await;
     ensure!(
-        raced_after <= RACE_WINDOW,
-        "the competitor replaced our block {:.0} ms after it reached the node, outside the {} ms the incident measured",
-        raced_after.as_secs_f64() * 1e3,
+        chain.submissions.get(&hash).map(Vec::len) == Some(1),
+        "the block did not reach submitblock exactly once"
+    );
+    // The node's own history: our block was its best tip at HEIGHT, and the
+    // competitor replaced it there, briefly after.
+    let lifetime = chain
+        .tip_lifetime(&hash)
+        .context("our block was never the node's best tip, or was never replaced")?;
+    ensure!(
+        chain.block_at(HEIGHT) == Some(competitor.as_str()),
+        "the competitor is not the active block at {HEIGHT}"
+    );
+    ensure!(
+        lifetime <= RACE_WINDOW,
+        "the competitor replaced our block {:.0} ms after it became the tip, outside the {} ms the incident measured",
+        lifetime.as_secs_f64() * 1e3,
         RACE_WINDOW.as_millis()
     );
-    Ok((hash, raced_after))
+    Ok((hash, lifetime))
+}
+
+/// Settle our lost-race block as a proven orphan: the competitor reaches the
+/// configured depth, and one retry observes it.
+async fn prove_orphan(fixture: &Fixture, hash: &str) -> Result<()> {
+    fixture.advance_to(HEIGHT + ORPHAN_CONFIRMATIONS - 1).await;
+    fixture.retry(hash).await?;
+    let row = fixture.row(hash).await?;
+    ensure!(
+        row["state"] == "orphaned" && !row["completed_at"].is_null(),
+        "the proven orphan was not settled terminal: {row}"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -536,8 +524,7 @@ async fn lost_tip_race_reconciles_the_orphan_and_never_delays_the_next_tips_work
         return Ok(());
     };
     let result = lost_race_pin(&fixture).await;
-    fixture.close().await?;
-    result
+    fixture.close(result).await
 }
 
 async fn lost_race_pin(fixture: &Fixture) -> Result<()> {
@@ -627,9 +614,9 @@ async fn lost_race_pin(fixture: &Fixture) -> Result<()> {
     let mut issuance = Vec::new();
     for advance in 0..2 {
         let tip = {
-            let mut node = fixture.node.lock().await;
-            node.advance();
-            node.tip.clone()
+            let mut chain = fixture.chain().await;
+            chain.advance();
+            chain.tip.clone()
         };
         let visible = Instant::now();
         fixture.coordinator.refresh_once().await?;
@@ -662,7 +649,9 @@ async fn lost_race_pin(fixture: &Fixture) -> Result<()> {
     // The retry runs its course once the row is free: still reconciliation,
     // still one offer. The competitor has three confirmations here, below
     // ORPHAN_CONFIRMATIONS, so the row is not yet settled terminal.
-    fixture.coordinator.process_candidate(&stuck).await?;
+    tokio::time::timeout(PROCESS_BOUND, fixture.coordinator.process_candidate(&stuck))
+        .await
+        .context("the retry did not complete")??;
     let row = fixture.row(&hash).await?;
     ensure!(
         row["state"] == "reconciliation",
@@ -677,8 +666,8 @@ async fn lost_race_pin(fixture: &Fixture) -> Result<()> {
     let slowest = issuance.iter().copied().max().unwrap_or_default();
     eprintln!(
         "orphan-stall pin (#413): our block was the node's best block at {HEIGHT} and a same-height competitor \
-         replaced it {:.0} ms later; the row is in reconciliation with one submitblock. \
-         New work for the next two tips was issued {:.0} ms and {:.0} ms after each tip became \
+         with more chainwork replaced it {:.3} ms later, inside submitblock; the row is in reconciliation with \
+         one submitblock. New work for the next two tips was issued {:.0} ms and {:.0} ms after each tip became \
          visible, while that row was claimed by a live lease and its outbox row was held under \
          FOR UPDATE (the 2.x.x incident held all delivery for 307 s).",
         raced_after.as_secs_f64() * 1e3,
@@ -700,8 +689,7 @@ async fn a_proven_orphan_is_settled_terminal_and_a_reorg_back_still_credits_it()
         return Ok(());
     };
     let result = orphan_disposition(&fixture).await;
-    fixture.close().await?;
-    result
+    fixture.close(result).await
 }
 
 async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
@@ -719,14 +707,8 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
 
     // Below the depth, a retry keeps reconciling: unknown is not a verdict.
     for expected in [HEIGHT + 1, HEIGHT + 2] {
-        fixture.node.lock().await.advance();
-        ensure!(fixture.node.lock().await.height == expected);
-        fixture.make_due(&hash).await?;
-        let claim = ledger
-            .claim_candidate(120)
-            .await?
-            .context("no retry claim")?;
-        fixture.coordinator.process_candidate(&claim).await?;
+        fixture.advance_to(expected).await;
+        fixture.retry(&hash).await?;
         ensure!(
             fixture.row(&hash).await?["state"] == "reconciliation",
             "the row was settled terminal at {} confirmations, below {ORPHAN_CONFIRMATIONS}",
@@ -735,21 +717,8 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
     }
 
     // At the depth, the competitor is proven and the row is settled terminal.
-    while fixture.node.lock().await.height < HEIGHT + ORPHAN_CONFIRMATIONS - 1 {
-        fixture.node.lock().await.advance();
-    }
-    fixture.make_due(&hash).await?;
-    let claim = ledger
-        .claim_candidate(120)
-        .await?
-        .context("the reconciliation row was not claimable at the orphan depth")?;
-    fixture.coordinator.process_candidate(&claim).await?;
-
+    prove_orphan(fixture, &hash).await?;
     let row = fixture.row(&hash).await?;
-    ensure!(
-        row["state"] == "orphaned" && !row["completed_at"].is_null(),
-        "the proven orphan was not settled terminal: {row}"
-    );
     let reason = row["last_error"].as_str().unwrap_or_default().to_owned();
     ensure!(
         reason.contains("proven orphan")
@@ -757,25 +726,51 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
             && reason.contains(&format!("{ORPHAN_CONFIRMATIONS} confirmations")),
         "the orphan reason does not carry the chain's evidence: {reason:?}"
     );
-    // The disposition preserves everything an operator (#268) needs and
-    // everything a reactivation credits from.
+    // The disposition releases the payload the way a submitted or abandoned
+    // row does, and keeps the offer record and the reason (#268).
     ensure!(
-        row["has_document"] == true
-            && row["has_block"] == true
-            && !row["window_anchor_ms"].is_null()
-            && row["offer_outcome"] == "accepted"
+        row["has_document"] == false
+            && row["has_block"] == false
+            && [
+                "window_anchor_ms",
+                "window_prior_balances_sha256",
+                "window_first_share_seq",
+                "window_last_share_seq",
+                "window_share_count",
+                "window_snapshot_sha256",
+            ]
+            .iter()
+            .all(|column| row[*column].is_null()),
+        "the orphaned row kept its document, block bytes or window reference: {row}"
+    );
+    ensure!(
+        row["offer_outcome"] == "accepted"
+            && !row["offer_reserved_at"].is_null()
             && !row["offer_reserved_by"].is_null()
             && !row["offered_at_ms"].is_null(),
-        "the orphaned row lost its document, block bytes, window reference or offer record: {row}"
+        "the orphaned row lost its offer record: {row}"
     );
     ensure!(
         fixture.arrivals(&hash).await.len() == 1,
         "the orphan settlement offered the block again"
     );
+    // The block's durable evidence stays: its landed audit, and its pool row,
+    // inactive, with no disconnection time because it never connected.
     ensure!(
         fixture.chain_state(&hash).await?.as_deref() == Some("inactive"),
         "the orphaned block is not inactive in the ledger"
     );
+    ensure!(
+        fixture.block_markers(&hash).await? == (true, true),
+        "a never-confirmed orphan recorded a disconnection or a confirmation"
+    );
+    let audit: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
+    )
+    .bind(&hash)
+    .fetch_one(&fixture.pool)
+    .await?;
+    ensure!(audit, "the orphan settlement removed the landed audit");
 
     // The gauges no longer count it, and the settlement is attributed once.
     let (pending, oldest) = fixture.gauges().await?;
@@ -795,6 +790,10 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    ensure!(
+        fixture.blocks_total() == 0,
+        "an orphan settlement counted a confirmed block"
+    );
 
     // A share whose only proof is the orphan now has its verdict: the
     // acknowledgement path fails it rather than waiting out its bound.
@@ -811,14 +810,10 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
     // The reactivation: a deep reorg puts our block back on the active chain.
     // The terminal row never reopens; the ordinary reorg reconciler credits
     // the block from the audit the lost race had already landed, its deferred
-    // share included.
-    {
-        let mut node = fixture.node.lock().await;
-        node.reorg_to(HEIGHT, &hash);
-        node.advance();
-    }
-    let tip_height = fixture.node.lock().await.height;
-    ledger
+    // share included, and reports it as the orphan's first confirmation.
+    fixture.reorg_at_height(&hash).await;
+    let tip_height = fixture.chain().await.height;
+    let reactivated = ledger
         .reconcile_blocks(
             &[BlockObservation {
                 block_hash: hash.clone(),
@@ -827,6 +822,10 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
             tip_height,
         )
         .await?;
+    ensure!(
+        reactivated == 1,
+        "the reconciler reported {reactivated} first orphan confirmations, not 1"
+    );
     ensure!(
         fixture.chain_state(&hash).await?.as_deref() == Some("confirmed"),
         "the reactivated block was not confirmed by the reorg reconciler"
@@ -837,8 +836,8 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
     );
     let row = fixture.row(&hash).await?;
     ensure!(
-        row["state"] == "orphaned" && row["has_document"] == true,
-        "the reactivation reopened or cleared the terminal row: {row}"
+        row["state"] == "orphaned" && row["offer_outcome"] == "accepted",
+        "the reactivation reopened or rewrote the terminal row: {row}"
     );
     ensure!(
         fixture.arrivals(&hash).await.len() == 1,
@@ -846,9 +845,232 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
     );
     eprintln!(
         "#415: a competitor proven at {ORPHAN_CONFIRMATIONS} confirmations settles the row \
-         `orphaned` (terminal, evidence kept, out of the pending gauges, counted once); a later \
-         reorg back confirms the block and credits its deferred share from the landed audit, \
-         without reopening the row or offering the block again."
+         `orphaned` (terminal, payload released, offer record kept, out of the pending gauges, \
+         counted once); a later reorg back confirms the block and credits its deferred share \
+         from the landed audit, without reopening the row or offering the block again."
+    );
+    Ok(())
+}
+
+/// A reactivated orphan joins `qbit_prism_blocks_total` exactly once, through
+/// the coordinator's own reconciliation: on its first confirmation, and not
+/// again when a later reorg disconnects it and another reconnects it. Its
+/// deferred share is credited once across the flap, and the block is never
+/// offered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reactivated_orphan_is_counted_and_credited_once_across_a_flap() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = reactivated_orphan_counted_once(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn reactivated_orphan_counted_once(fixture: &Fixture) -> Result<()> {
+    let (hash, _) = lose_the_race(fixture, Some(deferred_share())).await?;
+    let solver = deferred_share().share_id;
+    prove_orphan(fixture, &hash).await?;
+    ensure!(
+        fixture.blocks_total() == 0,
+        "the orphan was counted before any confirmation"
+    );
+
+    // Reactivated: our block is back at HEIGHT, on a longer chain.
+    fixture.reorg_at_height(&hash).await;
+    fixture.coordinator.refresh_once().await?;
+    ensure!(
+        fixture.chain_state(&hash).await?.as_deref() == Some("confirmed"),
+        "the coordinator's reconciliation did not confirm the reactivated orphan"
+    );
+    ensure!(
+        fixture.blocks_total() == 1,
+        "the orphan's first confirmation counted {} blocks, not 1",
+        fixture.blocks_total()
+    );
+    ensure!(fixture.credited(&solver).await? == 1);
+    // A refresh on the same chain changes nothing and counts nothing.
+    fixture.chain().await.advance();
+    fixture.coordinator.refresh_once().await?;
+    ensure!(
+        fixture.blocks_total() == 1,
+        "a steady tip counted the block again"
+    );
+
+    // Disconnected again by a second competitor: a real disconnection time.
+    fixture.reorg_at_height(&SECOND_COMPETITOR.repeat(32)).await;
+    fixture.coordinator.refresh_once().await?;
+    ensure!(
+        fixture.chain_state(&hash).await?.as_deref() == Some("inactive"),
+        "the second reorg did not disconnect the block"
+    );
+    ensure!(
+        fixture.block_markers(&hash).await? == (false, false),
+        "a disconnected, once-confirmed block lost its disconnection time or its confirmation record"
+    );
+    ensure!(
+        fixture.blocks_total() == 1,
+        "a disconnection changed the count"
+    );
+
+    // Reactivated a second time: confirmed and credited, never counted again.
+    fixture.reorg_at_height(&hash).await;
+    fixture.coordinator.refresh_once().await?;
+    ensure!(
+        fixture.chain_state(&hash).await?.as_deref() == Some("confirmed"),
+        "the second reactivation did not confirm the block"
+    );
+    ensure!(
+        fixture.blocks_total() == 1,
+        "the second reactivation counted the orphan again ({})",
+        fixture.blocks_total()
+    );
+    ensure!(
+        fixture.credited(&solver).await? == 1,
+        "the flap credited the deferred share more than once"
+    );
+    ensure!(
+        fixture.row(&hash).await?["state"] == "orphaned",
+        "the flap reopened the terminal row"
+    );
+    ensure!(
+        fixture.arrivals(&hash).await.len() == 1,
+        "the flap offered the block again"
+    );
+    Ok(())
+}
+
+/// The counter's ordinary owner is unchanged: a block whose row finishes as
+/// `submitted` is counted there, once, and the reorg reconciler never counts
+/// it again when a reorg disconnects and reconnects it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ordinary_confirmation_is_counted_once_across_a_reorg_and_back() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = ordinary_confirmation_counted_once(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn ordinary_confirmation_counted_once(fixture: &Fixture) -> Result<()> {
+    let claim = claim_found(fixture, Some(deferred_share())).await?;
+    let hash = claim.candidate.block_hash.clone();
+    let solver = deferred_share().share_id;
+    tokio::time::timeout(PROCESS_BOUND, fixture.coordinator.process_candidate(&claim))
+        .await
+        .context("the offer did not complete")??;
+    ensure!(
+        fixture.row(&hash).await?["state"] == "submitted",
+        "the accepted block did not finish as submitted"
+    );
+    ensure!(
+        fixture.blocks_total() == 1,
+        "the submitted block was not counted once"
+    );
+
+    // Out and back in, through the coordinator's reconciliation.
+    fixture.reorg_at_height(&COMPETITOR.repeat(32)).await;
+    fixture.coordinator.refresh_once().await?;
+    ensure!(fixture.chain_state(&hash).await?.as_deref() == Some("inactive"));
+    fixture.reorg_at_height(&hash).await;
+    fixture.coordinator.refresh_once().await?;
+    ensure!(fixture.chain_state(&hash).await?.as_deref() == Some("confirmed"));
+    ensure!(
+        fixture.blocks_total() == 1,
+        "the reorg reconciler counted an ordinary block again ({})",
+        fixture.blocks_total()
+    );
+    ensure!(fixture.credited(&solver).await? == 1);
+    Ok(())
+}
+
+/// Reconciliation can confirm a block before its outbox row finishes. Both
+/// later dispositions must preserve that one count, including a disconnect
+/// followed by orphan settlement and another reactivation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_confirmation_is_counted_before_outbox_terminalization() -> Result<()> {
+    for orphaned in [false, true] {
+        let Some(fixture) = Fixture::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let (hash, _) = lose_the_race(&fixture, Some(deferred_share())).await?;
+            fixture.reorg_at_height(&hash).await;
+            fixture.coordinator.refresh_once().await?;
+            ensure!(fixture.row(&hash).await?["state"] == "reconciliation");
+            ensure!(
+                fixture.blocks_total() == 1,
+                "first confirmation was lost while the outbox was unfinished"
+            );
+            if orphaned {
+                fixture.reorg_at_height(&SECOND_COMPETITOR.repeat(32)).await;
+                fixture.coordinator.refresh_once().await?;
+                prove_orphan(&fixture, &hash).await?;
+                fixture.reorg_at_height(&hash).await;
+                fixture.coordinator.refresh_once().await?;
+                ensure!(fixture.row(&hash).await?["state"] == "orphaned");
+            } else {
+                fixture.retry(&hash).await?;
+                ensure!(fixture.row(&hash).await?["state"] == "submitted");
+            }
+            ensure!(
+                fixture.blocks_total() == 1,
+                "terminalization or reactivation counted the same block twice"
+            );
+            ensure!(fixture.credited(&deferred_share().share_id).await? == 1);
+            ensure!(fixture.arrivals(&hash).await.len() == 1);
+            Ok(())
+        }
+        .await;
+        fixture.close(result).await?;
+    }
+    Ok(())
+}
+
+/// Reservation-only uncertainty stays unknown: a row whose call may never
+/// have happened settles `orphaned` with the `unknown` outcome and no call
+/// time and no reply, releases its payload, and no submission is invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_only_orphan_stays_unknown_and_releases_its_payload() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = reservation_only_orphan(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn reservation_only_orphan(fixture: &Fixture) -> Result<()> {
+    let ledger = fixture.ledger();
+    let claim = claim_found(fixture, None).await?;
+    let hash = claim.candidate.block_hash.clone();
+    ledger.reserve_offer(&claim).await?;
+    let revision = ledger.payout_revision().await?;
+    ledger
+        .orphan_candidate_at_revision(&claim, "proven orphan: reservation only", revision)
+        .await?;
+    let row = fixture.row(&hash).await?;
+    ensure!(
+        row["state"] == "orphaned"
+            && row["offer_outcome"] == "unknown"
+            && row["offered_at_ms"].is_null()
+            && row["offer_reply"].is_null()
+            && !row["offer_reserved_at"].is_null()
+            && !row["offer_reserved_by"].is_null(),
+        "a reservation-only orphan did not keep an unknown offer with no call: {row}"
+    );
+    ensure!(
+        row["has_document"] == false
+            && row["has_block"] == false
+            && row["window_anchor_ms"].is_null()
+            && row["window_snapshot_sha256"].is_null(),
+        "a reservation-only orphan kept its payload: {row}"
+    );
+    ensure!(
+        fixture.arrivals(&hash).await.is_empty(),
+        "the node was offered a block whose call was only reserved"
+    );
+    ensure!(
+        fixture.chain_state(&hash).await?.is_none(),
+        "a block that never landed gained a pool block"
     );
     Ok(())
 }
@@ -864,17 +1086,14 @@ async fn a_stale_orphan_verdict_cannot_overwrite_a_newer_active_proof() -> Resul
         return Ok(());
     };
     let result = stale_orphan_verdict(&fixture).await;
-    fixture.close().await?;
-    result
+    fixture.close(result).await
 }
 
 async fn stale_orphan_verdict(fixture: &Fixture) -> Result<()> {
     let ledger = fixture.ledger();
     let (hash, _) = lose_the_race(fixture, Some(deferred_share())).await?;
     let solver = deferred_share().share_id;
-    while fixture.node.lock().await.height < HEIGHT + ORPHAN_CONFIRMATIONS - 1 {
-        fixture.node.lock().await.advance();
-    }
+    fixture.advance_to(HEIGHT + ORPHAN_CONFIRMATIONS - 1).await;
     // The observation an orphan settlement would be written at.
     let stale_revision = ledger.payout_revision().await?;
     fixture.make_due(&hash).await?;
@@ -884,8 +1103,9 @@ async fn stale_orphan_verdict(fixture: &Fixture) -> Result<()> {
         .context("the reconciliation row was not claimable")?;
 
     // A newer reorg reconciler proves the block active first, and credits it.
-    let tip_height = fixture.node.lock().await.height;
-    ledger
+    // Count this first confirmation even while its outbox row is unfinished.
+    let tip_height = fixture.chain().await.height;
+    let reactivated = ledger
         .reconcile_blocks(
             &[BlockObservation {
                 block_hash: hash.clone(),
@@ -894,6 +1114,10 @@ async fn stale_orphan_verdict(fixture: &Fixture) -> Result<()> {
             tip_height,
         )
         .await?;
+    ensure!(
+        reactivated == 1,
+        "the unfinished row's first confirmation was not counted"
+    );
     ensure!(
         ledger.payout_revision().await? != stale_revision,
         "the reorg reconciler did not advance the payout revision"
@@ -909,9 +1133,10 @@ async fn stale_orphan_verdict(fixture: &Fixture) -> Result<()> {
         format!("{refused:#}").contains("payout revision changed"),
         "the stale verdict was refused for the wrong reason: {refused:#}"
     );
+    let row = fixture.row(&hash).await?;
     ensure!(
-        fixture.row(&hash).await?["state"] == "reconciliation",
-        "the stale verdict settled the row anyway"
+        row["state"] == "reconciliation" && row["has_block"] == true,
+        "the stale verdict settled or released the row anyway: {row}"
     );
     ensure!(
         fixture.chain_state(&hash).await?.as_deref() == Some("confirmed"),
@@ -940,18 +1165,15 @@ async fn a_failed_observation_never_settles_a_row_as_orphaned() -> Result<()> {
         return Ok(());
     };
     let result = failed_observation(&fixture).await;
-    fixture.close().await?;
-    result
+    fixture.close(result).await
 }
 
 async fn failed_observation(fixture: &Fixture) -> Result<()> {
     let ledger = fixture.ledger();
     let (hash, _) = lose_the_race(fixture, Some(deferred_share())).await?;
-    while fixture.node.lock().await.height < HEIGHT + ORPHAN_CONFIRMATIONS - 1 {
-        fixture.node.lock().await.advance();
-    }
+    fixture.advance_to(HEIGHT + ORPHAN_CONFIRMATIONS - 1).await;
     // The node is gone: every observation this retry makes fails.
-    fixture.server.abort();
+    fixture.node.stop();
     fixture.make_due(&hash).await?;
     let claim = ledger
         .claim_candidate(120)
@@ -960,10 +1182,9 @@ async fn failed_observation(fixture: &Fixture) -> Result<()> {
     // The retry keeps the row: a post-offer failure is settled back into
     // reconciliation with its reason, never into a terminal disposition. The
     // settlement itself must not fail, or the claim would simply expire.
-    fixture
-        .coordinator
-        .process_candidate(&claim)
+    tokio::time::timeout(PROCESS_BOUND, fixture.coordinator.process_candidate(&claim))
         .await
+        .context("the retry did not complete")?
         .context("a retry whose observations all fail must still settle its row")?;
     let row = fixture.row(&hash).await?;
     ensure!(
@@ -982,6 +1203,13 @@ async fn failed_observation(fixture: &Fixture) -> Result<()> {
     ensure!(
         pending == 1,
         "a failed observation took the row out of the pending gauges"
+    );
+    let rendered = fixture.metrics.render();
+    ensure!(
+        !rendered
+            .lines()
+            .any(|line| line == "qbit_prism_block_candidates_orphaned_total 1"),
+        "a failed observation counted an orphan settlement"
     );
     Ok(())
 }
