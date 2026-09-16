@@ -1492,7 +1492,8 @@ impl Ledger {
 
     /// Abandon one candidate, as the single statement whose `WHERE` *is* the
     /// safety property: `pending` (never offered, so no `submitblock` can
-    /// have been made for it), no live claim, and no landed block. The
+    /// have been made for it), supported storage version 1, no live claim,
+    /// and no landed block. The
     /// column list is the supersession path's
     /// (`policy_transition.rs`), with the operator's reason taking
     /// `last_error`'s place; `next_attempt_at` is left untouched there and
@@ -1511,7 +1512,7 @@ impl Ledger {
         // writer during a cutover.
         writable(&mut tx).await?;
         let abandoned: Option<String> = sqlx::query_scalar(
-            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
             .bind(block_hash).bind(reason).fetch_optional(&mut *tx).await?;
         let outcome = match abandoned {
             Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
@@ -1560,12 +1561,13 @@ async fn diagnose_abandon_refusal(
     block_hash: &str,
 ) -> Result<Value> {
     let Some(row) = sqlx::query(
-        "SELECT o.state,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
+        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
         .bind(block_hash).fetch_optional(&mut **tx).await?
     else {
         return Ok(json!({"outcome":"missing"}));
     };
     let state: String = row.try_get("state")?;
+    let storage_version: i32 = row.try_get("storage_version")?;
     let landed: bool = row.try_get("landed")?;
     let claim_live: bool = row
         .try_get::<Option<bool>, _>("claim_live")?
@@ -1578,6 +1580,10 @@ async fn diagnose_abandon_refusal(
         // A landed block is reported ahead of a live claim: the claim expires
         // on its own, and the accounting does not.
         "pending" if landed => json!({"outcome":"landed"}),
+        "pending" if storage_version != 1 => json!({
+            "outcome": "unsupported_storage_version",
+            "storage_version": storage_version,
+        }),
         "pending" if claim_live => json!({
             "outcome": "claimed",
             "claim_instance_id": row.try_get::<Option<String>, _>("claim_instance_id")?,

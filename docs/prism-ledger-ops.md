@@ -139,8 +139,10 @@ exactly that. `--json` prints one
 `{"schema":"qbit.prism.candidates.list.v1","candidates":[...]}` document with
 every field untruncated and every unknown value as `null`.
 
-`abandon` finishes one `pending` row. `pending` is the only state it touches,
-because it is the only unfinished state from which no `submitblock` can yet
+`abandon` finishes one `pending` row with `storage_version = 1`. Other storage
+versions are refused atomically and their evidence is preserved. `pending` is
+the only state it touches, because it is the only unfinished state from which
+no `submitblock` can yet
 have been made: a row in `offer_reserved`, `offered` or `reconciliation` is the
 record that a call may already have happened, and discarding it would discard
 that record. The rule is the statement's `WHERE` clause, not a check the
@@ -161,14 +163,15 @@ there stays as evidence that the row had been parked.
 | 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned>; nothing to do` |
 | 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
+| 7 | Unsupported storage version; evidence preserved. | Names the version and directs legacy rows to the pinned `2.x.x` drain, newer formats to a compatible release. |
 
-Codes 3 and 6 are the two refusals that protect the invariant. Code 4 is kept
-distinct from code 2 so that re-running a successful abandon reads as
+Codes 3, 6 and 7 protect offer, accounting and storage-format evidence. Code 4
+is kept distinct from code 2 so that re-running a successful abandon reads as
 "nothing to do" rather than as a lost row. An **expired** claim is not a live
-claim, so a row whose owner died is abandonable without waiting for anything;
-code 5 applies only while the claim is still live. A pending row that has both
-a live claim and a landed block reports code 6, because the claim expires on
-its own and the accounting does not.
+claim, so a supported row whose owner died is abandonable without waiting;
+code 5 applies only while the claim is still live. Unsupported versions report
+code 7 ahead of claim status. A pending row whose block has landed always
+reports code 6, because the accounting must be reconciled.
 
 `abandon` connects as a one-shot tool and writes through the ordinary ledger
 write transaction, so it is fenced twice, both reported as exit 1:

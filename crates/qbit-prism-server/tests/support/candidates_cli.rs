@@ -732,6 +732,57 @@ async fn abandon_refuses_every_offered_state_and_leaves_the_row_byte_identical()
 }
 
 #[tokio::test]
+async fn abandon_refuses_unsupported_storage_versions_without_changing_evidence() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    for (byte, version, parked) in [
+        ("11", 2, true),
+        ("22", 3, true),
+        ("33", 2, false),
+        ("44", 3, false),
+    ] {
+        let mut row = Row::new(byte, "pending");
+        row.storage_version = version;
+        row.parked = parked;
+        row.attempt_count = 2;
+        row.last_error = Some(format!(
+            "candidate storage_version {version} is not supported"
+        ));
+        // Even an expired claim must not allow an unsupported row to be deleted.
+        row.claim = Some(("frontend-b".to_owned(), -60.0));
+        seed(&ledger.pool, &row).await?;
+        let before = whole_row(&ledger.pool, &row.hash).await?;
+        let refused = cli(
+            &db,
+            &node,
+            &[
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &row.hash,
+                "--reason",
+                "operator sweep",
+            ],
+        )
+        .await?;
+        assert_eq!(code(&refused), 7, "{}", stderr(&refused));
+        let message = stderr(&refused);
+        assert!(
+            message.contains(&format!("unsupported storage_version {version}")),
+            "{message}"
+        );
+        assert!(message.contains("evidence preserved"), "{message}");
+        assert_eq!(whole_row(&ledger.pool, &row.hash).await?, before);
+    }
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
 async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
