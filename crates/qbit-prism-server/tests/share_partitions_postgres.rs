@@ -491,6 +491,26 @@ async fn latest_evidence_counts_lifetime_shares_across_the_rollup_watermark() ->
             "counts before the first rollup sweep are not the raw lifetime counts: {before:?} against {raw:?}"
         );
 
+        // Public-read databases may lack the optional rollup schema. Any
+        // missing rollup table must preserve the raw-ledger count fallback.
+        for table in [
+            "qbit_hashrate_rollup_progress",
+            "qbit_hashrate_rollup_pool",
+            "qbit_hashrate_rollup_miner",
+        ] {
+            sqlx::raw_sql(&format!("ALTER TABLE {table} RENAME TO absent_rollup"))
+                .execute(db.pool())
+                .await?;
+            let without_rollups = latest_evidence_counts(&app).await;
+            sqlx::raw_sql(&format!("ALTER TABLE absent_rollup RENAME TO {table}"))
+                .execute(db.pool())
+                .await?;
+            ensure!(
+                without_rollups? == raw,
+                "counts without {table} did not fall back to the raw ledger"
+            );
+        }
+
         // After it every share is folded and the raw tail is empty.
         ensure!(
             rollups::advance(db.pool(), 1000).await?.advanced,

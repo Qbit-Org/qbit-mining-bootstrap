@@ -542,7 +542,9 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     // have never run has no `qbit_hashrate_rollup_progress` row; it reads the
     // raw lifetime counts as before, which is also correct because nothing
     // can have been detached yet.
-    let counts: Value = sqlx::query_scalar(
+    let rollups_present: bool = sqlx::query_scalar("SELECT to_regclass('qbit_hashrate_rollup_progress') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_pool') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_miner') IS NOT NULL")
+        .fetch_one(&state.pool).await?;
+    let counts: Value = sqlx::query_scalar(if rollups_present {
         "WITH progress AS (
              SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton
          ), watermark AS (
@@ -572,8 +574,10 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
          SELECT jsonb_build_object(
              'accepted_share_count',
              (SELECT accepted_share_count FROM rolled)+(SELECT accepted_share_count FROM tail),
-             'distinct_miner_count',(SELECT distinct_miner_count FROM miners))",
-    )
+             'distinct_miner_count',(SELECT distinct_miner_count FROM miners))"
+    } else {
+        "SELECT jsonb_build_object('accepted_share_count',count(*),'distinct_miner_count',count(DISTINCT miner_id)) FROM qbit_share_ledger WHERE accepted"
+    })
     .fetch_one(&state.pool)
     .await?;
     let payout_count: i64 =
