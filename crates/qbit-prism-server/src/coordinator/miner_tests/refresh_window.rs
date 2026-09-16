@@ -1,5 +1,79 @@
 use super::*;
 
+#[tokio::test]
+async fn economic_drift_during_fee_probe_defers_until_next_refresh() {
+    let f = Fixture::build(
+        Duration::from_secs(10),
+        |config| {
+            config.ctv_enabled = true;
+            config.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 12000));
+        },
+        None,
+    )
+    .await;
+    f.coordinator.refresh_once().await.unwrap();
+    let first = f.coordinator.prepared.read().await.clone().unwrap();
+    let saves = f.store.compact.save_calls.lock().unwrap().len();
+    let calls = f.store.compact.state_calls.load(Ordering::SeqCst);
+    let gate = Arc::new(Gate::default());
+    f.node.lock().unwrap().gate = Some(("getmempoolinfo".into(), gate.clone()));
+    let c = f.coordinator.clone();
+    let pending =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { c.refresh_once().await },
+        ));
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    // A real wait between the old early and late reads. The revision stays
+    // fixed; the immutable published work still names the original digest.
+    f.store
+        .snapshot
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .prior_balances
+        .push(qbit_prism::CarryForwardBalance {
+            recipient_id: "during-fee".into(),
+            order_key: "during-fee".into(),
+            p2mr_program_hex: "34".repeat(32),
+            balance_sats: 123,
+        });
+    gate.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("payout state changed during work reuse"));
+    assert!(Arc::ptr_eq(
+        &first,
+        f.coordinator.prepared.read().await.as_ref().unwrap()
+    ));
+    assert_eq!(f.store.compact.save_calls.lock().unwrap().len(), saves);
+    assert_eq!(
+        f.store.compact.state_calls.load(Ordering::SeqCst) - calls,
+        2
+    );
+    eprintln!(
+        "baseline economic drift after early probe: error, 2 state reads, 0 new reservations"
+    );
+    f.coordinator.refresh_once().await.unwrap();
+    let current = f.coordinator.prepared.read().await.clone().unwrap();
+    assert_eq!(
+        current.snapshot.payout_revision,
+        first.snapshot.payout_revision
+    );
+    assert_ne!(
+        current.window.prior_balances_digest,
+        first.window.prior_balances_digest
+    );
+    assert!(current.generation > first.generation);
+    assert!(first.reservation.balances.is_empty());
+    assert_eq!(current.reservation.balances[0].balance_sats, 123);
+}
+
 async fn cached_inputs_change_during_build_wait(expire: bool) {
     let interval = Duration::from_secs(2);
     let f = Fixture::build(
