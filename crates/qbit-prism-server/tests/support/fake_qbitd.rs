@@ -183,6 +183,19 @@ async fn answer(
         "getmempoolinfo" => json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
         "getbestblockhash" => json!(state.tip),
         "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
+        // Above the tip qbitd has no block, and neither does this fake
+        // node: the same error `support/scripted_node.rs` answers, never the
+        // tip. At or below the tip every height still answers the tip.
+        "getblockhash"
+            if request["params"][0]
+                .as_u64()
+                .is_none_or(|height| height > state.height) =>
+        {
+            return Json(json!({
+                "id":request["id"],"result":null,
+                "error":{"code":-8,"message":"Block height out of range"}
+            }))
+        }
         "getblockhash" => json!(state.tip),
         "getblockheader" => json!({"previousblockhash": state.tip_parent}),
         "validateaddress" => {
@@ -245,6 +258,7 @@ pub fn coordinator_config_at(
         share_commit_timeout: Duration::from_secs(15),
         share_commit_grace: Duration::from_secs(5),
         block_only_ack_timeout: Duration::from_secs(60),
+        candidate_orphan_confirmations: 6,
         extranonce2_size: 8,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),

@@ -88,6 +88,128 @@ async fn frozen_2x_cli_import_restores_all_body_layouts_and_serves_exact_artifac
     result
 }
 
+/// Every session setting `pg_restore` emits, other than `search_path`, is
+/// one PostgreSQL defaults to `0`, so the fixture would not notice a leak on
+/// its own. This target carries the ledger's own operator values instead,
+/// exactly as `Ledger::connect` pins them on every pooled connection.
+const RESTORE_TARGET_SESSION: [(&str, &str); 3] = [
+    ("lock_timeout", "5s"),
+    ("statement_timeout", "15s"),
+    ("idle_in_transaction_session_timeout", "30s"),
+];
+
+/// The session `pg_restore` uses must not come back to the fixture pool: its
+/// script opens with `SET` statements that survive `COMMIT`. #391 restored
+/// `search_path` on that pooled session; the timeouts it also zeroed were
+/// still returned. sqlx hands a connection back through a spawned task, so
+/// the probe waits for every connection to be idle and then reads all of
+/// them, which finds a leaked session without depending on scheduling.
+#[tokio::test]
+async fn frozen_2x_backup_restore_session_settings_stay_off_the_fixture_pool() -> Result<()> {
+    let Some(inputs) = gate::inputs(
+        gate::site!(),
+        &[gate::Input::DatabaseUrl, gate::Input::PgBinDir],
+    )?
+    else {
+        return Ok(());
+    };
+    let raw = &inputs[0];
+    let pg_bin = std::path::Path::new(&inputs[1]);
+    let mut target_url = url::Url::parse(raw)?;
+    target_url.query_pairs_mut().append_pair(
+        "options",
+        &RESTORE_TARGET_SESSION
+            .iter()
+            .map(|(name, value)| format!("-c{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let source = recovery::Database::open(raw).await?;
+    let restored = recovery::Database::open(target_url.as_str()).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        let before = recovery::accounting_state(&source.pool).await?;
+        let archive = recovery::backup(&source, pg_bin).await?;
+        assert_pooled_session(&restored, "before restore").await?;
+
+        recovery::restore(&archive, &source, &restored, pg_bin).await?;
+        assert_pooled_session(&restored, "after restore").await?;
+        ensure!(recovery::accounting_state(&restored.pool).await? == before);
+        let restored_schema: Option<String> =
+            sqlx::query_scalar("SELECT schemaname::text FROM pg_catalog.pg_tables WHERE tablename='qbit_share_ledger' AND schemaname=$1")
+                .bind(&restored.schema)
+                .fetch_optional(&restored.pool)
+                .await?;
+        ensure!(
+            restored_schema.as_deref() == Some(restored.schema.as_str()),
+            "restore landed outside the target fixture schema"
+        );
+
+        // A restore that fails inside its transaction reports that failure
+        // and leaves the pool exactly as it was.
+        let failed = recovery::restore(&archive, &source, &restored, pg_bin)
+            .await
+            .expect_err("restoring over an existing schema must fail");
+        ensure!(
+            format!("{failed:#}").contains("already exists"),
+            "unexpected restore error: {failed:#}"
+        );
+        ensure!(recovery::accounting_state(&restored.pool).await? == before);
+        assert_pooled_session(&restored, "after a failed restore").await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    source.close().await?;
+    restored.close().await?;
+    result
+}
+
+/// Reads the session settings of every connection in the fixture pool, once
+/// each in-flight release has finished so none of them can be missed.
+async fn assert_pooled_session(db: &recovery::Database, when: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.pool.size() == 0 || db.pool.num_idle() != db.pool.size() as usize {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "{when}: the fixture pool never got all of its connections back"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut connections = Vec::new();
+    for _ in 0..db.pool.size() {
+        connections.push(db.pool.acquire().await?);
+    }
+    for connection in &mut connections {
+        assert_session(connection, when, &db.schema).await?;
+    }
+    Ok(())
+}
+
+async fn assert_session(
+    connection: &mut sqlx::PgConnection,
+    when: &str,
+    schema: &str,
+) -> Result<()> {
+    let search_path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&mut *connection)
+        .await?;
+    ensure!(
+        search_path == schema,
+        "{when}: pooled search_path is {search_path:?}, expected {schema:?}"
+    );
+    for (name, expected) in RESTORE_TARGET_SESSION {
+        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            .fetch_one(&mut *connection)
+            .await?;
+        ensure!(
+            value == expected,
+            "{when}: pooled {name} is {value:?}, expected {expected:?}: the pg_restore session reached the fixture pool"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_loss() -> Result<()> {
     let Some(inputs) = gate::inputs(
@@ -1347,7 +1469,7 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
@@ -1379,6 +1501,16 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='instance_offer_startup'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='instance_offer_startup'".into(),
             "instance_offer_startup",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_orphan_disposition'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_orphan_disposition',1)".into(),
+            "candidate_orphan_disposition",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_orphan_disposition'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_orphan_disposition'".into(),
+            "candidate_orphan_disposition",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),
@@ -1705,18 +1837,26 @@ async fn assert_candidate_payload_fingerprints(
 }
 
 /// A reservation's authority and every unfinished state's balance evidence
-/// survive recovery. Claim ownership remains ephemeral; offer ownership does
-/// not. The test restores its original pending row only to leave the parent
-/// fixture unchanged, never as a production recovery operation.
+/// survive recovery, and so does the offer record of the terminal `orphaned`
+/// disposition migration 015 added (#415): the row is cleared like every
+/// terminal row, so it no longer counts as unfinished and no longer holds a
+/// balance snapshot, but its reservation, outcome, call time and reason are
+/// evidence a restore must not lose. Claim ownership remains ephemeral;
+/// offer ownership does not. The test restores its original pending row only
+/// to leave the parent fixture unchanged, never as a production recovery
+/// operation.
 async fn assert_offer_recovery_fingerprints(
     source: &recovery::Database,
     ledger: &Ledger,
     pg_bin: &std::path::Path,
     candidate: &qbit_prism_server::ledger::Candidate,
 ) -> Result<()> {
-    use qbit_prism_server::ledger::OfferOutcome;
+    use qbit_prism_server::ledger::{OfferOutcome, ORPHANED_STATE};
 
-    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
+    // `completed_at` and the payload are restored with the rest: an orphaned
+    // row is terminal and cleared, and the lifecycle CHECK refuses a pending
+    // row that kept a completion or lost its document.
+    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,completed_at,candidate,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
     let restore = format!("UPDATE qbit_block_candidate_outbox SET ({COLUMNS})=(SELECT {COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$2)) WHERE block_hash=$1");
     let original: serde_json::Value = sqlx::query_scalar(
         "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
@@ -1730,7 +1870,12 @@ async fn assert_offer_recovery_fingerprints(
         .await?
         .expect("pending recovery fixture");
     ledger.reserve_offer(&claim).await?;
-    for state in ["offer_reserved", "offered", "reconciliation"] {
+    for state in [
+        "offer_reserved",
+        "offered",
+        "reconciliation",
+        ORPHANED_STATE,
+    ] {
         match state {
             "offered" => {
                 ledger
@@ -1747,6 +1892,27 @@ async fn assert_offer_recovery_fingerprints(
                     .reconcile_candidate(&claim, "delivery unknown")
                     .await?
             }
+            ORPHANED_STATE => {
+                // Reconciliation released the claim with its backoff; the
+                // recovery lane re-claims the row before it writes the
+                // proven-orphan verdict, at the revision it observed.
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+                    .bind(&candidate.block_hash)
+                    .execute(&source.pool)
+                    .await?;
+                let reclaimed = ledger
+                    .claim_candidate(600)
+                    .await?
+                    .expect("the reconciliation row must be claimable again");
+                let revision = ledger.payout_revision().await?;
+                ledger
+                    .orphan_candidate_at_revision(
+                        &reclaimed,
+                        "proven orphan: a different block is active at this height",
+                        revision,
+                    )
+                    .await?
+            }
             _ => {}
         }
         let row: serde_json::Value = sqlx::query_scalar(
@@ -1758,15 +1924,35 @@ async fn assert_offer_recovery_fingerprints(
         ensure!(row["state"] == state);
         let baseline = recovery::evidence(source, pg_bin).await?;
         ensure!(baseline["pending_candidates"] == 0);
+        // An orphaned row is terminal, so it is out of the unfinished set
+        // (and out of the pending gauges), and its cleared window reference
+        // no longer holds its balance snapshot; its offer record is checked
+        // below like every other state's.
+        let orphaned = state == ORPHANED_STATE;
         ensure!(
-            baseline["unfinished_candidates"] == 1,
-            "{state} looked drained"
+            baseline["unfinished_candidates"] == i32::from(!orphaned),
+            "{state} counted as unfinished: {}",
+            baseline["unfinished_candidates"]
         );
-        ensure!(
-            baseline["records"]["candidate_balances"]["count"] == 1,
-            "{state} lost retained balance evidence"
-        );
-        assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        if orphaned {
+            ensure!(
+                row["candidate"].is_null()
+                    && row["block_bytes"].is_null()
+                    && row["window_anchor_ms"].is_null()
+                    && row["window_prior_balances_sha256"].is_null(),
+                "{state} kept a payload: {row}"
+            );
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 0,
+                "{state} still exported a balance snapshot it no longer references"
+            );
+        } else {
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 1,
+                "{state} lost retained balance evidence"
+            );
+            assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        }
         let mut mutations = vec![
             "proof_observed_at_ms=1800000002122",
             "offer_reserved_at=offer_reserved_at-interval '1 second'",

@@ -374,13 +374,13 @@ impl work_ledger::WorkLedger for MemoryLedger {
         _observations: &'a [BlockObservation],
         _height: u64,
         revision: i64,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, Result<u64>> {
         Box::pin(async move {
             ensure!(
                 revision == self.revision.load(Ordering::SeqCst),
                 "revision changed"
             );
-            Ok(())
+            Ok(0)
         })
     }
     fn save_job<'a>(

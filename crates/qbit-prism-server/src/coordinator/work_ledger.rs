@@ -61,12 +61,14 @@ pub(super) trait WorkLedger: Send + Sync {
         completion: ReadAdmission,
     ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>>;
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>>;
+    /// Returns how many blocks the committed reconciliation confirmed
+    /// for the first time (`Ledger::reconcile_blocks_at_revision`).
     fn reconcile<'a>(
         &'a self,
         observations: &'a [BlockObservation],
         height: u64,
         revision: i64,
-    ) -> BoxFuture<'a, Result<()>>;
+    ) -> BoxFuture<'a, Result<u64>>;
     #[cfg(test)]
     fn save_job<'a>(
         &'a self,
@@ -183,7 +185,7 @@ impl WorkLedger for Ledger {
         observations: &'a [BlockObservation],
         height: u64,
         revision: i64,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, Result<u64>> {
         Box::pin(Ledger::reconcile_blocks_at_revision(
             self,
             observations,

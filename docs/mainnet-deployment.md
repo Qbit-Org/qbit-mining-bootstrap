@@ -155,13 +155,10 @@ export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-qbit-mining-bootstrap}"
 default base Compose build context. Production commands pull immutable images
 and use `--no-build`; they do not build from that context.
 
-Run the static gate for the enabled lanes, then render an explicit service
-graph. The example enables all three lanes; remove profiles and services that
-are not part of the deployment.
+Render an explicit service graph. The example enables all three lanes; remove
+profiles and services that are not part of the deployment.
 
 ```sh
-MINING_LANES=ckpool,auxpow,prism make doctor
-
 docker compose \
   --project-name "$COMPOSE_PROJECT_NAME" \
   --env-file config/upstream.env \
@@ -174,9 +171,11 @@ docker compose \
   config --quiet qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
 ```
 
-Pull reviewed artifacts before stopping the prior release. Start operator
-services with `--no-build` so the host cannot replace a reviewed artifact with
-a locally built tag. On a fresh host, start only the nodes first:
+Pull reviewed artifacts before running doctor or stopping the prior release.
+Doctor runs the selected PRISM image's reader-configuration validator, so that
+image must already exist even on a fresh host. Start operator services with
+`--no-build` so the host cannot replace a reviewed artifact with a locally built
+tag. On a fresh host, start only the nodes first:
 
 ```sh
 docker compose \
@@ -186,6 +185,8 @@ docker compose \
   -f compose.yaml \
   -f compose.production.yaml \
   pull qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
+
+MINING_LANES=ckpool,auxpow,prism make doctor
 
 docker compose \
   --project-name "$COMPOSE_PROJECT_NAME" \
@@ -394,13 +395,24 @@ Budget database connections for all frontends together and measure ACK latency,
 job delivery, and build/refresh work under representative load. The old Python
 batch-writer, lease, subprocess, and refresh-scheduler variables were removed.
 
-Use `compose.prism-external-db.yaml` last in the Compose file list for a managed
+Use `compose.prism-external-db.yaml` after the production overlay (and before
+the HA overlay, if enabled) in the Compose file list for a managed
 shared database, set `PRISM_DATABASE_URL` on each host, and render the effective
 service graph before starting. `QBIT_RPC_HOST` is overridable; each frontend may
 use a local synchronized qbitd or an explicitly configured external node. The
 external database overlay removes the local Postgres dependency. With an
 external qbitd, start the coordinator using `--no-deps` as described in the
 migration guide.
+
+For Make entry points, set `COMPOSE_OVERLAY_FILES` to the ordered additional
+files used by the pull/render/start commands, for example
+`export COMPOSE_OVERLAY_FILES="compose.prism-external-db.yaml compose.prism-ha.yaml"`.
+Doctor and `make up-prism-pool` then use those same overlays after the automatic
+production overlay; HA must remain last. For a two-frontend Make launch, also
+set `PRISM_COMPOSE_SERVICES="qbitd prism-coordinator prism-coordinator-2 prism-public-api"`.
+Local databases are selected through service dependencies, so the external-DB
+overlay does not start them. Explicit Docker commands still need the matching
+`-f` flags; Make variables do not configure Docker itself.
 
 ### Native process health and shutdown
 

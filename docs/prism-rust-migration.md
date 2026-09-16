@@ -464,13 +464,16 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 13,
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 15,
 each checked on its own rather than as a high-water mark: a later migration
 being present never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
 quarantines previously attempted candidates for reconciliation without
 another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
-for the quiesce and recovery steps. 013 is recorded only once its online
+for the quiesce and recovery steps. Stop all frontends again before applying
+015 and restart only upgraded binaries; its capability gate runs at connect
+and does not evict older processes already serving the database. Keep automatic
+restarts disabled throughout the cutover. 013 is recorded only once its online
 index builds have completed, so a start after an interrupted build is
 refused until `migrate` finishes them. A database missing any of them is refused
 at connect, naming the gap, before any accounting statement runs, and so is
