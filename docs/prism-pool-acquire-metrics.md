@@ -23,7 +23,7 @@ Advisory-lock observations retain their separate standard monotonic clock.
 ## Coverage
 
 In addition to the existing ledger transaction and metrics collector
-acquisitions, the shared ledger helper covers these direct statements:
+acquisitions, these direct statements use the shared checkout timer:
 
 - `payout_revision` and `release_session_owner_reservations`;
 - `SessionId::release` and its spawned drop cleanup;
@@ -69,8 +69,9 @@ the unchanged token-fenced DELETE. A successful explicit release disarms drop
 cleanup and records once. An error or cancellation retains the existing drop
 fallback: if that task runs, it attempts and records a separate checkout.
 Dropping an unpolled release future records nothing for that release, but still
-spawns its background cleanup. An unpolled background task records nothing;
-runtime shutdown during checkout records one failure. SQL waits and errors
+spawns its background cleanup when a Tokio runtime is current. Without a current
+runtime, drop retains the reservation and records nothing. An unpolled background
+task records nothing; runtime shutdown during checkout records one failure. SQL waits and errors
 after checkout keep the successful observation. Failed cleanup can retain a
 reservation for the existing owner cleanup/reclamation paths; timing adds no
 retry, deadline or change to reservation ownership.
