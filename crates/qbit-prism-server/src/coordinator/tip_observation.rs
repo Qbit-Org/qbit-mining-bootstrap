@@ -231,6 +231,15 @@ impl TipState {
         self.current.as_ref().map(|tip| tip.hash.as_str())
     }
 
+    /// Background settlement yields until work for the detected tip is published.
+    pub(crate) fn refresh_pending(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| {
+            self.published
+                .as_ref()
+                .is_none_or(|published| published.hash != current.hash)
+        })
+    }
+
     pub(super) fn reserve(&mut self) -> u64 {
         self.requested = self
             .requested

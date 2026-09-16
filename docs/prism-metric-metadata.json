@@ -1,5 +1,14 @@
 {
   "native": {
+    "ctv_fanout_broadcaster_tip_refresh_yields_total": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]
+    },
+    "ctv_fanout_broadcaster_chunk_rows": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_rows"]
+    },
+    "ctv_fanout_broadcaster_chunk_seconds": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_seconds"]
+    },
     "accepted_shares_total": {
       "replaces": [
         "qbit_prism_accepted_shares_total"

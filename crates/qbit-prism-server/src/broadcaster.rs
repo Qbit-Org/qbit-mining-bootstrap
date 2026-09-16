@@ -40,11 +40,26 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
         )
         .await?;
     let limit = config::number("PRISM_CTV_BROADCASTER_LIMIT", 100usize)?.min(1000);
+    let pass_tip = chain["bestblockhash"]
+        .as_str()
+        .context("chain tip missing")?;
     let mut count = 0;
     for _ in 0..limit {
+        // A native chunk is one claimed fanout. Never interrupt its durable
+        // completion, but leave subsequent rows claimable by a later pass.
+        // Compare hashes, not poll sequence numbers: same-tip polls must not
+        // starve settlement. Also yield if the replacement already published.
+        let tip = coordinator.observed_tip.read().await;
+        let superseded = tip.as_deref().is_some_and(|hash| hash != pass_tip);
+        if tip.refresh_pending() || superseded {
+            coordinator.metrics.record_ctv_tip_refresh_yield();
+            break;
+        }
+        drop(tip);
         let Some(claim) = coordinator.ledger.claim_fanout(120).await? else {
             break;
         };
+        let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(90),
             process(coordinator, &claim),
@@ -73,6 +88,7 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
             }
         }
         count += 1;
+        coordinator.metrics.observe_ctv_chunk(started.elapsed());
         tokio::task::yield_now().await;
     }
     Ok(count)
