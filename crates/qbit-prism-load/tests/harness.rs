@@ -1025,6 +1025,10 @@ struct FakeStratum {
     address: String,
     release_authorize: tokio::sync::watch::Sender<bool>,
     release_submits: tokio::sync::watch::Sender<bool>,
+    /// Set to close every served connection where it stands, so a test can
+    /// end a socket at a moment of its choosing rather than by dropping the
+    /// server: a peer that goes away mid-conversation.
+    close_sockets: tokio::sync::watch::Sender<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
     /// How many of the next accepted connections are closed at once, before
     /// a line is read: a frontend that is up but not yet serving.
@@ -1053,6 +1057,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     let address = listener.local_addr().unwrap().to_string();
     let (release_authorize, release) = tokio::sync::watch::channel(!options.hold_authorize);
     let (release_submits, submit_release) = tokio::sync::watch::channel(!options.hold_submits);
+    let (close_sockets, close) = tokio::sync::watch::channel(false);
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = submits.clone();
     let drop_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1073,19 +1078,35 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
                 drop(socket);
                 continue;
             }
-            tokio::spawn(serve_stratum(
+            let serving = serve_stratum(
                 socket,
                 release.clone(),
                 submit_release.clone(),
                 counter.clone(),
                 options.advertised_difficulty,
-            ));
+            );
+            // Cancelling `serve_stratum` drops the socket it owns, so the
+            // peer sees the connection end wherever this task had got to.
+            let mut closing = close.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = serving => {}
+                    () = async move {
+                        while !*closing.borrow() {
+                            if closing.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    } => {}
+                }
+            });
         }
     });
     FakeStratum {
         address,
         release_authorize,
         release_submits,
+        close_sockets,
         submits,
         drop_connections,
         _task: task,
@@ -5834,6 +5855,263 @@ async fn a_no_response_queued_before_the_kill_stays_out_of_the_census_and_still_
         run::EXIT_ACK_COMMIT_DIVERGENCE,
         "an unrelated mid-run disconnect on a committed share still exits 5"
     );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The fence closed the gap between a session *emitting* a record and the
+/// collector *applying* it. It did not close the gap between a session
+/// *observing* the cause and *building* the records, and on the socket-closure
+/// path those are two different moments with a kill able to land between them.
+///
+/// The reader task queues `Incoming::Closed` the instant the socket ends.
+/// `outstanding` is still non-zero -- nothing has failed the pending submits
+/// yet -- so a `KillDriver` polling just then sees work in flight, pauses the
+/// session and bumps the fence. The session's `select!` is biased on control,
+/// so it takes that pause first and only reaches the queued closure on the
+/// next pass; `fail_pending` read `shared.fence()` there, which by then is the
+/// kill's value. A disconnect that happened *before* the kill, for its own
+/// unrelated reason, therefore came out stamped as kill-induced: the census
+/// re-offered it and `classify_gaps` exempted it from the ordinary mid-run
+/// no-response check, so a share PostgreSQL holds could evade the
+/// acknowledgement-loss check and the run exit 0. That is the one outcome this
+/// harness exists to prevent.
+///
+/// So the fence is read in the reader, at the instant the socket ends, and
+/// carried on the value all the way to the records (EP-STATE,
+/// EP-OBSERVABILITY). This drives the real ordering through a real session on
+/// a real socket: the closure is observed and queued, the pause and the bump
+/// land while it is still queued, and `fail_pending` runs only afterwards.
+///
+/// The gate is a write guard held across an await, which is exactly what
+/// `clippy::await_holding_lock` warns about and exactly what this test is
+/// for: the lock is the interleaving, and the thread it parks is the
+/// session's own, not one this test needs.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_socket_closed_before_the_kill_is_not_stamped_as_kill_induced() -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use qbit_prism_load::run::{classify_gaps, offered_and_acknowledged, RunOutcome};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const PHASE: &str = "mid_flight_kill";
+
+    // A real session on a real socket, with one submit the server is holding.
+    let server = fake_stratum_with(StratumOptions {
+        hold_submits: true,
+        ..Default::default()
+    })
+    .await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new(PHASE.to_owned()),
+        events,
+        record_notifies: AtomicBool::new(false),
+        kill_fence: kill_fence.clone(),
+    });
+    // The session gets its own single-threaded runtime on its own thread. The
+    // gate below parks the session task on a `std` lock, and a parked thread
+    // must not be one this test's own timers and sockets are driven by: a
+    // blocked tokio worker starves the runtime it belongs to. On a thread of
+    // its own the block is total and harmless -- the reader has already
+    // delivered, and the session has nothing else to do until the gate lifts.
+    // The thread parks for the rest of the process rather than shutting the
+    // runtime down, which would abort the session mid-test.
+    let (session_ready, session_handle) = std::sync::mpsc::channel();
+    let session_shared = shared.clone();
+    let session_address = server.address.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the session's runtime")
+            .block_on(async move {
+                let handle =
+                    client::spawn_session(session_config(0), 0, session_address, session_shared, 1);
+                let _ = session_ready.send(handle);
+                std::future::pending::<()>().await;
+            });
+    });
+    let handle = session_handle.recv().expect("the session task starts");
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session connects within the deadline")
+            .expect("the session is still running");
+        let connected = matches!(event, client::Event::Connected { .. });
+        collected.lock().unwrap().apply(event);
+        if connected {
+            break;
+        }
+    }
+    let phase: Arc<str> = Arc::from(PHASE);
+    assert!(handle.try_offer(1, &phase), "the session takes one share");
+    submits_received(&server, 1).await;
+    assert_eq!(
+        handle.outstanding.load(Ordering::Relaxed),
+        1,
+        "the submit is in flight and unanswered"
+    );
+
+    // The frontend the kill will take, and the driver that takes it. Nothing
+    // is decided until the first poll.
+    let dir = ScratchDir::new("kill-closure-fence");
+    let stand_in = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![stand_in_frontend(&stand_in, dir.path(), 0, audit_port)];
+    let mut driver = KillDriver::start(
+        0,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    let sessions = vec![handle];
+
+    // Hold the session between observing the closure and building its
+    // records. `run_session` reads `shared.phase()` in that arm, immediately
+    // before `fail_pending`; taking the write lock stops it exactly there, so
+    // the interleaving under test is pinned rather than raced.
+    let gate = shared.phase.write().expect("phase lock");
+    // The socket ends, for its own reason, with no kill anywhere near it.
+    server.close_sockets.send(true)?;
+    // Wait for the reader to pick up a FIN that is already on the wire and
+    // queue its `Incoming::Closed`. This waits for something that has
+    // happened, not for a race to fall our way, and if it were ever too short
+    // the fence assertion below would fail rather than pass silently.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        sessions[0].outstanding.load(Ordering::Relaxed),
+        1,
+        "the closure is still queued: nothing has been failed yet, which is why \
+         the kill about to land still sees work in flight"
+    );
+
+    // The kill lands now: it pauses the session and publishes its fence while
+    // the closure the session already saw is still sitting in the queue.
+    assert!(driver
+        .poll(&sessions, &mut frontends, &[], &collected)?
+        .is_none());
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the kill published its fence"
+    );
+    // Only now does the session get to build the records for the closure it
+    // observed before any of that.
+    drop(gate);
+
+    let started = Instant::now();
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(event) = inbox.try_recv() {
+            collected.lock().unwrap().apply(event);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
+    let submits: Vec<client::SubmitRecord> = collected.lock().unwrap().submits.to_vec();
+    assert_eq!(
+        submits.len(),
+        1,
+        "the run has exactly the one no-response the closure produced: {:?}",
+        submits
+            .iter()
+            .map(|record| (record.share_id.clone(), record.outcome.label()))
+            .collect::<Vec<_>>()
+    );
+    let stranded = &submits[0];
+    match &stranded.outcome {
+        Outcome::NoResponse { reason } => assert!(
+            reason.contains("end of stream"),
+            "the socket ended under the server's own closure: {reason:?}"
+        ),
+        other => panic!("the held submit is a no-response: {other:?}"),
+    }
+    assert_eq!(
+        stranded.fence, 0,
+        "the record carries the fence the reader read when the socket ended, not \
+         the one the kill published while the closure waited in the queue"
+    );
+
+    // So it is not the kill's: not in the census, and not re-offered.
+    assert_eq!(record.index, 0);
+    assert_eq!(
+        record.outstanding_at_kill, 1,
+        "the victim did hold work when it was killed"
+    );
+    let census: Vec<&str> = record
+        .indeterminate
+        .iter()
+        .map(|record| record.share_id.as_str())
+        .collect();
+    assert!(
+        census.is_empty(),
+        "the kill destroyed no answer of its own: {census:?}"
+    );
+    assert!(
+        !submits.iter().any(|record| record.reoffer),
+        "and the share the session had already given up on is never re-offered"
+    );
+
+    // And it still reaches the ordinary acknowledgement-loss path: PostgreSQL
+    // holds the share, the server never acknowledged it, and no census
+    // explains it away, so the run says so.
+    let (offered, acknowledged) = offered_and_acknowledged(&submits, PHASE);
+    let committed: BTreeSet<String> = offered.clone();
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution =
+        digest::attribute_unexpected(&committed, &[(PHASE.to_owned(), &reconciliation)]);
+    let gaps = classify_gaps(
+        &[driven(PHASE, &census)],
+        &[(PHASE.to_owned(), reconciliation)],
+        &attribution,
+        &submits,
+        15.0,
+    );
+    assert_eq!(gaps.findings, json!([]), "nothing was lost: {gaps:?}");
+    assert_eq!(
+        gaps.no_response_commits
+            .iter()
+            .map(|share| share["share_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(stranded.share_id)],
+        "the closure is an ordinary mid-run no-response on a committed share: {gaps:?}"
+    );
+    assert_eq!(gaps.no_response_commits[0]["window_ended"], json!(false));
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: gaps.findings.as_array().map(Vec::len).unwrap_or(0),
+        harness_bug_rejections: 0,
+        divergences: gaps.divergences.len(),
+        unknown_outcome_commits: gaps.unknown_outcome_commits.len(),
+        no_response_commits: gaps.no_response_commits.len(),
+        no_response_commits_mid_run: gaps
+            .no_response_commits
+            .iter()
+            .filter(|share| share["window_ended"] != json!(true))
+            .count(),
+    };
+    assert_eq!(
+        outcome.exit_code(),
+        run::EXIT_ACK_COMMIT_DIVERGENCE,
+        "a disconnect the kill did not cause still exits 5"
+    );
+
+    let _ = sessions[0].control.send(client::Control::Stop);
     for child in frontends.iter_mut() {
         child.kill();
     }

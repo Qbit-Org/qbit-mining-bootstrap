@@ -190,11 +190,14 @@ pub struct SubmitRecord {
     /// A deliberate re-offer of an indeterminate share, with the same header.
     pub reoffer: bool,
     /// The value of the run's kill fence (`SessionShared::kill_fence`) when
-    /// this record was built, read in the thread that built it. It is the
-    /// record's identity with respect to the mid-flight kill: a record whose
-    /// fence is below the value the kill stamped existed before the kill,
-    /// however long it then took to reach the collector, and no delivery lag
-    /// can move it into the kill's census (EP-STATE).
+    /// the outcome this record reports was observed -- the answer arriving,
+    /// the socket ending, the deadline expiring -- read where and when that
+    /// happened. It is the record's identity with respect to the mid-flight
+    /// kill: a record whose fence is below the value the kill stamped
+    /// reports something that happened before the kill, however long it then
+    /// took to be turned into a record and reach the collector, and neither
+    /// that lag nor delivery lag can move it into the kill's census
+    /// (EP-STATE).
     pub fence: u64,
     pub header_hex: String,
     pub extranonce2_hex: String,
@@ -527,7 +530,29 @@ struct Pending {
 
 enum Incoming {
     Line(String),
-    Closed(String),
+    /// The socket ended. `fence` is [`SessionShared::kill_fence`] as the
+    /// reader read it at the instant the end was observed, and it travels
+    /// with the reason all the way to the records the closure fails.
+    ///
+    /// The value cannot be read where the records are built. The reader
+    /// queues this the instant the socket ends, while `outstanding` is still
+    /// non-zero because nothing has failed the pending submits yet, so a
+    /// `KillDriver` polling just then still sees work in flight, pauses the
+    /// session and bumps the fence. The session's `select!` is `biased` on
+    /// control, so it takes that pause first and only reaches this value on
+    /// the next pass -- by which time `SessionShared::fence` reads the
+    /// kill's value, and a disconnect that happened before the kill, for its
+    /// own unrelated reason, would be stamped as the kill's. The census
+    /// would then re-offer it and `run::classify_gaps` would exempt it from
+    /// the ordinary mid-run no-response check, so a share that committed
+    /// could evade the acknowledgement-loss check entirely.
+    ///
+    /// So the identity is captured when the event happens, not when the
+    /// record is convenient to build (EP-STATE, EP-OBSERVABILITY).
+    Closed {
+        reason: String,
+        fence: u64,
+    },
 }
 
 struct Connection {
@@ -819,12 +844,17 @@ async fn run_session(
                         }
                     }
                     other => {
-                        let reason = match other {
-                            Some(Incoming::Closed(reason)) => reason_or_default(reason),
-                            _ => "reader stopped".to_owned(),
+                        // The closure carries the fence it was observed
+                        // under; a reader that simply stopped has no earlier
+                        // observation to carry, so this is its moment.
+                        let (reason, fence) = match other {
+                            Some(Incoming::Closed { reason, fence }) => {
+                                (reason_or_default(reason), fence)
+                            }
+                            _ => ("reader stopped".to_owned(), shared.fence()),
                         };
                         reconnect_phase = shared.phase();
-                        fail_pending(active, &reason, &shared, &config, &outstanding);
+                        fail_pending(active, &reason, fence, &shared, &config, &outstanding);
                         let _ = shared.events.send(Event::Disconnected {
                             session: config.index,
                             frontend: frontend.load(Ordering::Relaxed),
@@ -859,7 +889,15 @@ async fn run_session(
         }
     }
     if let Some(mut active) = connection {
-        fail_pending(&mut active, RUN_ENDED, &shared, &config, &outstanding);
+        // The run stopping is the cause, and it is happening now.
+        fail_pending(
+            &mut active,
+            RUN_ENDED,
+            shared.fence(),
+            &shared,
+            &config,
+            &outstanding,
+        );
         active.drop_reader();
     }
 }
@@ -908,11 +946,11 @@ async fn quiesce(
                 let _ = handle_line(connection, &line, config, shared, frontend, outstanding);
             }
             Ok(other) => {
-                let reason = match other {
-                    Some(Incoming::Closed(reason)) => reason_or_default(reason),
-                    _ => "reader stopped".to_owned(),
+                let (reason, fence) = match other {
+                    Some(Incoming::Closed { reason, fence }) => (reason_or_default(reason), fence),
+                    _ => ("reader stopped".to_owned(), shared.fence()),
                 };
-                fail_pending(connection, &reason, shared, config, outstanding);
+                fail_pending(connection, &reason, fence, shared, config, outstanding);
                 return;
             }
             Err(_) => {}
@@ -924,7 +962,15 @@ async fn quiesce(
              margin, with the submit still unanswered",
             config.quiesce_limit
         );
-        fail_pending(connection, &reason, shared, config, outstanding);
+        // The deadline expiring *is* the cause, and it is happening now.
+        fail_pending(
+            connection,
+            &reason,
+            shared.fence(),
+            shared,
+            config,
+            outstanding,
+        );
     }
 }
 
@@ -936,9 +982,19 @@ fn reason_or_default(reason: String) -> String {
     }
 }
 
+/// Fail every submit still outstanding on `connection`, as `reason`.
+///
+/// `fence` is the run's kill fence as it stood **when the cause these records
+/// report was observed** -- the instant the reader saw the socket end, the
+/// instant the quiesce deadline expired, the instant the run stopped waiting.
+/// It is a parameter rather than a `shared.fence()` read here because those
+/// two moments are not always the same one, and the gap between them is
+/// exactly where a mid-flight kill can land (see `Incoming::Closed`). Every
+/// caller states which moment its records belong to.
 fn fail_pending(
     connection: &mut Connection,
     reason: &str,
+    fence: u64,
     shared: &Arc<SessionShared>,
     config: &SessionConfig,
     outstanding: &Arc<AtomicUsize>,
@@ -958,7 +1014,7 @@ fn fail_pending(
             },
             scheduled_block: pending.scheduled_block,
             reoffer: pending.reoffer,
-            fence: shared.fence(),
+            fence,
             header_hex: pending.header_hex,
             extranonce2_hex: pending.extranonce2_hex,
             ntime_hex: pending.ntime_hex,
@@ -980,6 +1036,9 @@ async fn connect(
     stream.set_nodelay(true)?;
     let (read_half, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel(256);
+    // The reader's own handle on the run's fence, so the moment the socket
+    // ends is the moment the fence is read. See `Incoming::Closed`.
+    let kill_fence = shared.kill_fence.clone();
     let reader_task = tokio::spawn(async move {
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
@@ -987,7 +1046,14 @@ async fn connect(
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => {
-                    let _ = tx.send(Incoming::Closed("end of stream".into())).await;
+                    // Read before the send, not after: the send can await.
+                    let fence = kill_fence.load(Ordering::SeqCst);
+                    let _ = tx
+                        .send(Incoming::Closed {
+                            reason: "end of stream".into(),
+                            fence,
+                        })
+                        .await;
                     break;
                 }
                 Ok(_) => {
@@ -1000,7 +1066,13 @@ async fn connect(
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(Incoming::Closed(error.to_string())).await;
+                    let fence = kill_fence.load(Ordering::SeqCst);
+                    let _ = tx
+                        .send(Incoming::Closed {
+                            reason: error.to_string(),
+                            fence,
+                        })
+                        .await;
                     break;
                 }
             }
@@ -1088,7 +1160,9 @@ async fn connect(
                     frontend,
                 )?;
             }
-            Ok(Some(Incoming::Closed(reason))) => bail!("socket closed during handshake: {reason}"),
+            Ok(Some(Incoming::Closed { reason, .. })) => {
+                bail!("socket closed during handshake: {reason}")
+            }
             Ok(None) => bail!("reader stopped during handshake"),
             Err(_) => bail!("no job arrived after authorize"),
         }
@@ -1126,7 +1200,7 @@ async fn await_response(
                     frontend,
                 )?;
             }
-            Ok(Some(Incoming::Closed(reason))) => bail!("socket closed: {reason}"),
+            Ok(Some(Incoming::Closed { reason, .. })) => bail!("socket closed: {reason}"),
             Ok(None) => bail!("reader stopped"),
             Err(_) => bail!("no response to request {id}"),
         }
