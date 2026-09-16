@@ -9,8 +9,10 @@ use std::{env, time::Duration};
 
 mod database;
 mod environment;
+mod policy_transition;
 pub use database::DatabaseConfig;
 pub use environment::check_environment;
+pub(crate) use policy_transition::transition_configs;
 
 #[derive(Clone)]
 pub struct Config {
@@ -542,6 +544,13 @@ impl Config {
     /// Every node in a cluster must construct the same payouts and attestations.
     /// Credentials and local resource limits are intentionally absent.
     pub fn fingerprint(&self, genesis: &str) -> Result<String> {
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+            &self.policy_document(genesis)?,
+        )?)))
+    }
+
+    /// Public policy inputs only; signing seeds and credentials never enter the journal.
+    pub(crate) fn policy_document(&self, genesis: &str) -> Result<serde_json::Value> {
         let mut policy = json!({
             "schema":2,"genesis":genesis,"ledger_key":self.ledger_public_key,
             "manifest_key":ManifestSigningKey::from_seed_hex(&self.manifest_seed)?.public_key_hex(),
@@ -555,7 +564,7 @@ impl Config {
         if self.ctv_enabled && self.ctv_fee.is_none() {
             policy["ctv_auto_fee_premium_bps"] = json!(self.ctv_fee_premium_bps);
         }
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&policy)?)))
+        Ok(policy)
     }
 }
 

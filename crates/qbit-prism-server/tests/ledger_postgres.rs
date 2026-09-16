@@ -22,8 +22,18 @@ mod two_x;
 #[path = "support/session_sequence.rs"]
 mod session_sequence;
 
+#[allow(dead_code)]
+#[path = "support/fake_qbitd.rs"]
+mod fake_qbitd;
+
 #[path = "support/fatal_state.rs"]
 mod fatal_state;
+
+#[path = "support/index_trim.rs"]
+mod index_trim;
+
+#[path = "support/policy_transition.rs"]
+mod policy_transition;
 
 struct Database {
     admin: PgPool,

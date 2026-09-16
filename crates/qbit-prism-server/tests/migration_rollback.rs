@@ -146,7 +146,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         for kind in [
             "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
-            "fatal_state", "fatal_state_events", "cluster_config", "payout_revision",
+            "fatal_state", "fatal_state_events", "policy_transitions", "cluster_config", "payout_revision",
             "ledger_clock",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
@@ -488,6 +488,20 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(cleared["records"]["sequences"] != before_halt["records"]["sequences"]);
         unchanged["records"]["sequences"] = before_halt["records"]["sequences"].clone();
         ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
+
+        // The policy journal is evidence independently of the active fingerprint
+        // and revision. Its complete row and allocator must survive the native
+        // backup roundtrip below, even if every other accounting row is identical.
+        sqlx::query("INSERT INTO qbit_prism_policy_transitions(previous_fingerprint,config_fingerprint,previous_policy,policy,previous_revision,payout_revision,instances,abandoned_candidates,retained_candidates) SELECT 'prior-recovery-fingerprint',config_fingerprint,'{\"fee_bps\":100}','{\"fee_bps\":200}',payout_revision-1,payout_revision,'[]',2,3 FROM qbit_prism_cluster")
+            .execute(&source.pool).await?;
+        let transitioned = recovery::evidence(&source, pg_bin).await?;
+        ensure!(transitioned["records"]["policy_transitions"]["count"] == 1);
+        ensure!(transitioned["records"]["policy_transitions"] != cleared["records"]["policy_transitions"]);
+        ensure!(transitioned["records"]["sequences"] != cleared["records"]["sequences"]);
+        let mut unchanged = transitioned;
+        unchanged["records"]["policy_transitions"] = cleared["records"]["policy_transitions"].clone();
+        unchanged["records"]["sequences"] = cleared["records"]["sequences"].clone();
+        ensure!(unchanged == cleared, "policy journal must change only its own evidence");
 
         assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
         assert_candidate_payload_fingerprints(raw, pg_bin, &artifacts[0]).await?;
@@ -864,6 +878,7 @@ async fn assert_allocator_sequence_fingerprints(
             .await?;
     if native {
         sequences.push("qbit_prism_fatal_state_events_event_id_seq");
+        sequences.push("qbit_prism_policy_transitions_transition_id_seq");
     }
     for sequence in sequences {
         let original: (i64, bool) =
@@ -1173,6 +1188,7 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
                 "qbit_prism_audit_snapshots",
                 "qbit_prism_cluster",
                 "qbit_prism_fatal_state_events",
+                "qbit_prism_policy_transitions",
                 "qbit_prism_balance_snapshots",
                 "qbit_share_ledger",
                 "qbit_pool_blocks",
@@ -1331,13 +1347,38 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=2".into(),
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=1".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_storage_version'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_storage_version'".into(),
             "declares candidate_storage_version = 2",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_offer_lifecycle'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_offer_lifecycle',1)".into(),
+            "has no candidate_offer_lifecycle row",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=0 WHERE capability='candidate_offer_lifecycle'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_offer_lifecycle'".into(),
+            "declares candidate_offer_lifecycle = 0",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_offer_lifecycle'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_offer_lifecycle'".into(),
+            "declares candidate_offer_lifecycle = 2",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='instance_offer_startup'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('instance_offer_startup',1)".into(),
+            "instance_offer_startup",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='instance_offer_startup'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='instance_offer_startup'".into(),
+            "instance_offer_startup",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),
@@ -1615,6 +1656,7 @@ async fn assert_candidate_payload_fingerprints(
             let mut unchanged = paired.clone();
             unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
             unchanged["pending_candidates"] = baseline["pending_candidates"].clone();
+            unchanged["unfinished_candidates"] = baseline["unfinished_candidates"].clone();
             ensure!(unchanged == baseline, "unrelated evidence changed with a sibling candidate");
             let distinct: bool = sqlx::query_scalar(
                 "SELECT count(DISTINCT created_at)=2 FROM qbit_block_candidate_outbox WHERE block_hash IN ($1,$2)"
@@ -1638,6 +1680,7 @@ async fn assert_candidate_payload_fingerprints(
                 .bind(&sibling.block_hash).execute(&source.pool).await?;
             ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
             assert_candidate_balance_fingerprints(&source, &ledger, pg_bin, &candidate).await?;
+            assert_offer_recovery_fingerprints(&source, &ledger, pg_bin, &candidate).await?;
             let archive = recovery::backup(&source, pg_bin).await?;
             recovery::restore(&archive, &source, &restored, pg_bin).await?;
             ensure!(recovery::evidence(&restored, pg_bin).await? == baseline);
@@ -1659,6 +1702,116 @@ async fn assert_candidate_payload_fingerprints(
     source.close().await?;
     restored.close().await?;
     result
+}
+
+/// A reservation's authority and every unfinished state's balance evidence
+/// survive recovery. Claim ownership remains ephemeral; offer ownership does
+/// not. The test restores its original pending row only to leave the parent
+/// fixture unchanged, never as a production recovery operation.
+async fn assert_offer_recovery_fingerprints(
+    source: &recovery::Database,
+    ledger: &Ledger,
+    pg_bin: &std::path::Path,
+    candidate: &qbit_prism_server::ledger::Candidate,
+) -> Result<()> {
+    use qbit_prism_server::ledger::OfferOutcome;
+
+    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
+    let restore = format!("UPDATE qbit_block_candidate_outbox SET ({COLUMNS})=(SELECT {COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$2)) WHERE block_hash=$1");
+    let original: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
+    )
+    .bind(&candidate.block_hash)
+    .fetch_one(&source.pool)
+    .await?;
+    let before = recovery::evidence(source, pg_bin).await?;
+    let claim = ledger
+        .claim_candidate(600)
+        .await?
+        .expect("pending recovery fixture");
+    ledger.reserve_offer(&claim).await?;
+    for state in ["offer_reserved", "offered", "reconciliation"] {
+        match state {
+            "offered" => {
+                ledger
+                    .record_offer(
+                        &claim,
+                        1_800_000_002_123,
+                        OfferOutcome::Unknown,
+                        Some("transport failed"),
+                    )
+                    .await?
+            }
+            "reconciliation" => {
+                ledger
+                    .reconcile_candidate(&claim, "delivery unknown")
+                    .await?
+            }
+            _ => {}
+        }
+        let row: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
+        )
+        .bind(&candidate.block_hash)
+        .fetch_one(&source.pool)
+        .await?;
+        ensure!(row["state"] == state);
+        let baseline = recovery::evidence(source, pg_bin).await?;
+        ensure!(baseline["pending_candidates"] == 0);
+        ensure!(
+            baseline["unfinished_candidates"] == 1,
+            "{state} looked drained"
+        );
+        ensure!(
+            baseline["records"]["candidate_balances"]["count"] == 1,
+            "{state} lost retained balance evidence"
+        );
+        assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        let mut mutations = vec![
+            "proof_observed_at_ms=1800000002122",
+            "offer_reserved_at=offer_reserved_at-interval '1 second'",
+            "offer_reserved_by=offer_reserved_by||'-changed'",
+        ];
+        if state != "offer_reserved" {
+            mutations.extend([
+                "offered_at_ms=offered_at_ms+1",
+                "offer_outcome='rejected'",
+                "offer_reply=offer_reply||'-changed'",
+            ]);
+        }
+        for mutation in mutations {
+            sqlx::query(&format!(
+                "UPDATE qbit_block_candidate_outbox SET {mutation} WHERE block_hash=$1"
+            ))
+            .bind(&candidate.block_hash)
+            .execute(&source.pool)
+            .await?;
+            let changed = recovery::evidence(source, pg_bin).await?;
+            ensure!(
+                changed["records"]["candidates"] != baseline["records"]["candidates"],
+                "{state}: offer evidence mutation was invisible: {mutation}"
+            );
+            let mut unrelated = changed;
+            unrelated["records"]["candidates"] = baseline["records"]["candidates"].clone();
+            ensure!(
+                unrelated == baseline,
+                "{state}: unrelated evidence changed: {mutation}"
+            );
+            sqlx::query(&restore)
+                .bind(&candidate.block_hash)
+                .bind(&row)
+                .execute(&source.pool)
+                .await?;
+            ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+        }
+    }
+    sqlx::query(&restore)
+        .bind(&candidate.block_hash)
+        .bind(&original)
+        .execute(&source.pool)
+        .await?;
+    ensure!(recovery::evidence(source, pg_bin).await? == before);
+    Ok(())
 }
 
 async fn assert_candidate_balance_fingerprints(

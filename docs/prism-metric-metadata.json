@@ -12,7 +12,8 @@
       ],
       "labels": {
         "result": "AckResult"
-      }
+      },
+      "status": "Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines."
     },
     "rejections_total": {
       "replaces": [
@@ -20,7 +21,8 @@
       ],
       "labels": {
         "reason_id": "RejectReason"
-      }
+      },
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response."
     },
     "stale_shares_total": {
       "replaces": [
@@ -67,17 +69,19 @@
       "replaces": [
         "qbit_prism_block_submit_seconds"
       ],
-      "status": "Declared, rule deferred to A/#266; no production observations yet."
+      "status": "Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule."
     },
     "block_candidates_pending": {
       "replaces": [
         "qbit_prism_block_candidates_pending"
-      ]
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
     },
     "block_candidate_oldest_pending_seconds": {
       "replaces": [
         "qbit_prism_block_candidate_oldest_pending_seconds"
-      ]
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
     },
     "process_resident_memory_bytes": {
       "replaces": [

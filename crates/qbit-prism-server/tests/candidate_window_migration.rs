@@ -13,7 +13,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     probe_share_rows, put_balance_snapshot, read_range_paged, BalanceSource, Candidate, Ledger,
-    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef,
+    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef, REQUIRED_SCHEMA_VERSIONS,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -28,13 +28,17 @@ const ANCHOR: i64 = 1_700_000_000_000;
 const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sql");
 /// Every version the membership runner installs except 007, so a database can
 /// be built in exactly the pre-007 state the runner then completes.
-/// Every native migration except 007, so a connect applies exactly 007 and
-/// nothing else. #360's 010 and #321's 006 belong here for the same reason 008
-/// and 009 do: leaving one out makes the connect apply two migrations, and the
-/// "only 007 ran" assertion then fails for a reason unrelated to 007. 006
-/// matters most, because its own drain check refuses the very rows these tests
-/// hand to 007's, so without it the refusal under test never runs.
-const PRE_007: [(i32, &str); 8] = [
+/// Every native migration except 007, 011 and 012, so a connect applies
+/// those three and nothing else. #289's 014, #153's 013, #360's 010 and
+/// #321's 006 belong here for the
+/// same reason 008 and 009 do: leaving one out makes the connect apply a
+/// further migration, and the timestamp assertions then fail for a reason
+/// unrelated to 007. 006 matters most, because its own drain check refuses
+/// the very rows these tests hand to 007's, so without it the refusal under
+/// test never runs. #266's 011 cannot be pre-applied: its lifecycle CHECK
+/// names the columns 007 adds, so the runner always applies it after 007,
+/// followed by 012's startup fence, and these tests accept all three.
+const PRE_007: [(i32, &str); 10] = [
     (2, include_str!("../migrations/002_multi_instance.sql")),
     (3, include_str!("../migrations/003_2x_compatibility.sql")),
     (
@@ -52,6 +56,21 @@ const PRE_007: [(i32, &str); 8] = [
         10,
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
+    (
+        13,
+        include_str!("../migrations/013_share_ledger_index_trim.sql"),
+    ),
+    (14, include_str!("../migrations/014_policy_transition.sql")),
+];
+/// The columns 011 adds to the outbox, which the connect that applies 007
+/// adds as well.
+const OFFER_COLUMNS: [&str; 6] = [
+    "proof_observed_at_ms",
+    "offer_reserved_at",
+    "offer_reserved_by",
+    "offered_at_ms",
+    "offer_outcome",
+    "offer_reply",
 ];
 const WINDOW_COLUMNS: [&str; 7] = [
     "window_anchor_ms",
@@ -348,7 +367,7 @@ async fn legacy_2x_schema_with_terminal_outbox_rows_gains_007_and_keeps_every_ro
 
             let _ledger = db.ledger("legacy-upgrade").await?;
             ensure!(
-                db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10],
+                db.versions().await? == REQUIRED_SCHEMA_VERSIONS,
                 "007 did not join the applied set"
             );
             let after: Vec<Value> = sqlx::query_scalar(
@@ -485,7 +504,7 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
             sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp()")
                 .execute(&db.pool).await?;
             let _ledger = db.ledger("drained").await?;
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10], "007 did not apply after the drain");
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS, "007 did not apply after the drain");
             Ok(())
         })).await?;
     }
@@ -513,13 +532,14 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
                     .iter()
                     .map(|(version, _)| *version)
                     .collect::<Vec<_>>()
-                    == [2, 3, 4, 5, 6, 7, 8, 9, 10]
+                    == REQUIRED_SCHEMA_VERSIONS
             );
-            // Only 007 ran: every other version keeps the row it already had.
+            // Every migration installed before this run keeps its original
+            // timestamp; only missing migrations are applied.
             ensure!(
                 after
                     .iter()
-                    .filter(|(version, _)| *version != 7)
+                    .filter(|(version, _)| before.iter().any(|(installed, _)| installed == version))
                     .copied()
                     .collect::<Vec<_>>()
                     == before,
@@ -533,7 +553,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
             }
             // A restart applies nothing further.
             let _restarted = db.ledger("membership-restart").await?;
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS);
             Ok(())
         })
     })
@@ -547,12 +567,14 @@ async fn outbox_window_check_accepts_exactly_the_three_states_and_indexes_the_di
         db.apply_pre_007().await?;
         let before = outbox_columns(&db.pool).await?;
         let _ledger = db.ledger("check").await?;
-        // 007 adds exactly its own columns to the table and nothing else.
+        // 007 adds exactly its own columns to the table, and 011, which the
+        // same connect applies after it, exactly its own.
         let added: Vec<String> = outbox_columns(&db.pool).await?
             .into_iter().filter(|column| !before.contains(column)).collect();
         let mut expected = WINDOW_COLUMNS.map(str::to_owned).to_vec();
+        expected.extend(OFFER_COLUMNS.map(str::to_owned));
         expected.sort();
-        ensure!(added == expected, "007 changed the outbox column set: {added:?}");
+        ensure!(added == expected, "007 and 011 changed the outbox column set: {added:?}");
         // Every partial-null combination matters: a CHECK that evaluates to
         // NULL passes, so only num_nulls/num_nonnulls rejects a partial group.
         for mask in 0..64u32 {
