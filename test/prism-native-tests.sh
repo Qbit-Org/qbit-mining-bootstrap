@@ -9,6 +9,10 @@
 #   test/prism-native-tests.sh replica      the physical replica and failover suite
 #   test/prism-native-tests.sh cargo-args <cargo test arguments...>
 #
+# Database mode runs storm scenarios at the observed 3,120 candidates. Set
+# PRISM_TEST_STORM_CANDIDATES=100 for the reduced cardinality CI uses;
+# cargo-args mode keeps the Rust default unless explicitly overridden.
+#
 # Inputs: PRISM_TEST_DATABASE_URL (otherwise a private cluster is started from
 # PRISM_TEST_PG_BIN_DIR or `pg_config --bindir`), PRISM_TEST_PG_BIN_DIR, and
 # QBITD_BIN (otherwise QBIT_BIN_DIR/qbitd, otherwise qbitd on PATH). Once every
@@ -28,6 +32,13 @@ case "${mode}" in
     exit 1
     ;;
 esac
+
+# CI invokes the shard runner directly and keeps the Rust reader's default
+# of 100. This local harness exercises the incident cardinality unless the
+# caller supplies a value; preserve even an empty value for Rust to reject.
+if [[ "${mode}" == database ]]; then
+  export PRISM_TEST_STORM_CANDIDATES="${PRISM_TEST_STORM_CANDIDATES-3120}"
+fi
 
 prism_test_tmp="$(mktemp -d -t prism-native-tests.XXXXXX)"
 prism_pg_bin=""
