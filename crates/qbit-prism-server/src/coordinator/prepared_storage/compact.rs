@@ -298,12 +298,12 @@ impl Coordinator {
         #[cfg(test)]
         let drop_probe = self.work_ledger.compact_drop_probe();
         let result = source
-            .spawn_blocking(move |(source, permit)| {
+            .spawn_blocking(move |(inputs, permit)| {
                 // Bind admission first so later locals drop before it on error.
                 let admission = permit;
                 #[cfg(test)]
                 let _cleanup = drop_probe;
-                let source = source;
+                let source = inputs;
                 let snapshot = &source.window.snapshot;
                 let window = source.window.reference;
                 let body = if window.shares.is_some() {
