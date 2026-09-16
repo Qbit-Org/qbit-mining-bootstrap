@@ -1506,6 +1506,11 @@ impl Ledger {
     /// operator's message and exit status alone.
     pub async fn abandon_candidate(&self, block_hash: &str, reason: &str) -> Result<Value> {
         let mut tx = self.begin().await?;
+        // Landing keeps FOR KEY SHARE so its owner can renew the lease. That
+        // row lock also permits this non-key UPDATE after the lease expires.
+        // Take landing's settlement lock first, in a separate statement: the
+        // UPDATE must see accounting committed while we waited for the lock.
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         // The write guard, kept even though the one-shot tool connection has
         // already refused a halted cluster: it is what refuses a live legacy
         // Python writer lease, so an operator abandon never races the 2.x.x

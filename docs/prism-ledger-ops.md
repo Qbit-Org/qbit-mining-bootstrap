@@ -147,8 +147,11 @@ have been made: a row in `offer_reserved`, `offered` or `reconciliation` is the
 record that a call may already have happened, and discarding it would discard
 that record. The rule is the statement's `WHERE` clause, not a check the
 command makes first, so a row that moves between reading and writing is still
-refused. A successful abandon releases the document, the block bytes and the
-six window columns, clears the claim, sets `completed_at`, and writes the
+refused. Before evaluating these predicates, `abandon` takes the settlement
+lock shared with candidate landing. If a landing is still in flight when its
+claim expires, the command waits, then sees the committed accounting and
+refuses with exit 6. A successful abandon releases the document, the block
+bytes and the six window columns, clears the claim, sets `completed_at`, and writes the
 operator's `--reason` into `last_error` — exactly the columns the offline
 epoch supersession writes. `next_attempt_at` is deliberately left as it is: no
 lane selects a terminal row, so its value is inert, and an `infinity` left
