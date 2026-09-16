@@ -1,6 +1,9 @@
 //! Durable window boundary contracts, sharing the audit fixture in the parent.
 
 use super::*;
+use acquire_metrics::counts;
+use qbit_prism_server::metrics::Metrics;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // The durable-range proof
@@ -207,7 +210,8 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let ledger = db.ledger("truncated-window").await?;
+    let metrics = Arc::new(Metrics::default());
+    let ledger = acquire_metrics::ledger(&db, &metrics).await?;
     let result = async {
         let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
         plan.load(&ledger.pool, "truncated-window").await?;
@@ -228,6 +232,7 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
         ensure!(truncated.len() > 2 * PROOF_PAGE_ROWS);
         let candidate = signed_candidate(truncated, &snapshot, &plan, 3560)?;
         let claim = claim_enqueued(&ledger, candidate).await?;
+        let before = counts(&metrics);
         let error = ledger
             .land_candidate(&claim, &ledger_public_key())
             .await
@@ -237,6 +242,10 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
             format!("{error:#}").contains(expected),
             "wrong refusal: {error:#}"
         );
+        // Probe + three pages + newest; partial history also checks oldest.
+        // A proof refusal follows successful checkouts and never starts BEGIN.
+        let acquired = if newest { 5. } else { 6. };
+        assert_eq!(counts(&metrics), (before.0 + acquired, before.1));
         ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
         let snapshots: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_audit_snapshots")
             .fetch_one(&ledger.pool)
@@ -249,7 +258,10 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
         let candidate = signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3561)?;
         let canonical = canonical_audit_bundle_bytes(&candidate.bundle)?;
         let claim = claim_enqueued(&ledger, candidate).await?;
+        let before = counts(&metrics);
         let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
+        // The full crossing window skips oldest: probe + three pages + newest + BEGIN.
+        assert_eq!(counts(&metrics), (before.0 + 6., before.1));
         ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
         let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
         ensure!(served.as_deref() == Some(canonical.as_slice()));
@@ -270,10 +282,18 @@ async fn durable_range_proof_refuses_oldest_truncation_of_a_multi_page_window() 
     refuses_truncated_window(false).await
 }
 
-async fn lands_identically(ledger: &Ledger, candidate: TestCandidate) -> Result<()> {
+async fn lands_identically(
+    ledger: &Ledger,
+    candidate: TestCandidate,
+    checkout_counts: Option<(&Metrics, f64)>,
+) -> Result<()> {
     let canonical = canonical_audit_bundle_bytes(&candidate.bundle)?;
     let claim = claim_enqueued(ledger, candidate).await?;
+    let before = checkout_counts.map(|(metrics, _)| counts(metrics));
     let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
+    if let Some(((metrics, acquired), before)) = checkout_counts.zip(before) {
+        assert_eq!(counts(metrics), (before.0 + acquired, before.1));
+    }
     ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
     let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
     ensure!(served.as_deref() == Some(canonical.as_slice()));
@@ -320,6 +340,7 @@ async fn durable_range_proof_retains_the_crossing_share_and_refuses_an_extra_pre
         lands_identically(
             &ledger,
             signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3563)?,
+            None,
         )
         .await
     }
@@ -334,7 +355,8 @@ async fn durable_range_proof_accepts_partial_history_and_ignores_ineligible_endp
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let ledger = db.ledger("partial-window").await?;
+    let metrics = Arc::new(Metrics::default());
+    let ledger = acquire_metrics::ledger(&db, &metrics).await?;
     let result = async {
         // Rejected rows precede and follow the real range; the gap also
         // proves boundaries are about eligibility, not sequence adjacency.
@@ -355,7 +377,8 @@ async fn durable_range_proof_accepts_partial_history_and_ignores_ineligible_endp
         sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),7)")
             .execute(&ledger.pool).await?;
         ledger.append(plan.share(8), None).await?;
-        lands_identically(&ledger, signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3564)?).await
+        // Probe + one page + newest + oldest + BEGIN, using a single pool slot.
+        lands_identically(&ledger, signed_candidate(snapshot.shares.clone(), &snapshot, &plan, 3564)?, Some((&metrics, 5.))).await
     }.await;
     let cleanup = db.close(vec![ledger]).await;
     result.and(cleanup)
@@ -366,7 +389,8 @@ async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> R
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let ledger = db.ledger("bootstrap-window").await?;
+    let metrics = Arc::new(Metrics::default());
+    let ledger = acquire_metrics::ledger(&db, &metrics).await?;
     let result = async {
         let plan = WindowPlan::new(PROOF_WINDOW_SHARES)?;
         let empty = ledger.snapshot(plan.window_network_difficulty()).await?;
@@ -385,9 +409,33 @@ async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> R
             Ok(candidate)
         };
         // The first share arrived after issuance of this empty window.
-        lands_identically(&ledger, bootstrap(&empty, 3565)?).await?;
+        // Probe + bootstrap EXISTS + BEGIN; no range pages or boundary scans.
+        lands_identically(&ledger, bootstrap(&empty, 3565)?, Some((&metrics, 3.))).await?;
         let nonempty = ledger.snapshot(plan.window_network_difficulty()).await?;
         let claim = claim_enqueued(&ledger, bootstrap(&nonempty, 3566)?).await?;
+        // Fail the bootstrap query after its checkout, preserving SQLSTATE and
+        // returning the sole pool slot before retrying the boundary refusal.
+        sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN accepted TO acquire_test_hidden")
+            .execute(&ledger.pool)
+            .await?;
+        let before = counts(&metrics);
+        let error = ledger
+            .land_candidate(&claim, &ledger_public_key())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<sqlx::Error>()
+                .and_then(sqlx::Error::as_database_error)
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("42703")
+        );
+        assert_eq!(counts(&metrics), (before.0 + 2., before.1));
+        sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN acquire_test_hidden TO accepted")
+            .execute(&ledger.pool)
+            .await?;
+        let before = counts(&metrics);
         let error = ledger
             .land_candidate(&claim, &ledger_public_key())
             .await
@@ -397,6 +445,7 @@ async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> R
             format!("{error:#}").contains("bootstrap audit window omits canonical shares"),
             "wrong refusal: {error:#}"
         );
+        assert_eq!(counts(&metrics), (before.0 + 2., before.1));
         ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
         Ok(())
     }
