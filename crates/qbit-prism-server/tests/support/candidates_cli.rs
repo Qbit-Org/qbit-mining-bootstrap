@@ -1,0 +1,909 @@
+//! The operator candidate commands (#268): the `candidates list` inventory and
+//! the one `candidates abandon` an operator may perform.
+//!
+//! Every test here runs the real binary against a counting proxy in front of
+//! the fake node, and asserts that the process made **no** RPC call at all —
+//! `submitblock` included — and registered no instance. Neither command is
+//! given a chain, a signing seed or a fallback address, so a command that
+//! loaded `Config` or started a listener could not have succeeded.
+use super::*;
+use serde_json::Value;
+use sqlx::{Column, Executor};
+use std::{
+    process::Output,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::process::Command;
+
+use super::fake_qbitd as fake;
+
+/// The fake node behind a recorder. "Zero `submitblock` calls" is asserted
+/// against a real socket the child process could have reached, not against
+/// the absence of a call site.
+struct CountingNode {
+    url: String,
+    methods: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+    _upstream: fake::FakeNode,
+}
+
+impl Drop for CountingNode {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl CountingNode {
+    async fn open() -> Result<Self> {
+        use axum::{extract::State, routing::post, Json, Router};
+        let upstream = fake::FakeNode::open().await?;
+        let methods: Arc<Mutex<Vec<String>>> = Arc::default();
+        let state = (upstream.url.clone(), methods.clone());
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    |State((upstream, methods)): State<(String, Arc<Mutex<Vec<String>>>)>,
+                     Json(request): Json<Value>| async move {
+                        methods
+                            .lock()
+                            .unwrap()
+                            .push(request["method"].as_str().unwrap_or("<unnamed>").to_owned());
+                        Json(
+                            reqwest::Client::new()
+                                .post(&upstream)
+                                .json(&request)
+                                .send()
+                                .await
+                                .unwrap()
+                                .json::<Value>()
+                                .await
+                                .unwrap(),
+                        )
+                    },
+                ),
+            )
+            .with_state(state);
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/", socket.local_addr()?);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(socket, app).await;
+        });
+        Ok(Self {
+            url,
+            methods,
+            task,
+            _upstream: upstream,
+        })
+    }
+
+    /// No RPC of any kind, so in particular no `submitblock`.
+    fn assert_never_reached(&self) {
+        assert_eq!(
+            self.methods.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "the candidate commands must never call the node"
+        );
+    }
+}
+
+/// The real binary with the database URL, a node URL and nothing else. Every
+/// `PRISM_`/`QBIT_` variable is stripped first: the child has no chain, no
+/// signing seeds and no fallback address.
+async fn cli(db: &Database, node: &CountingNode, args: &[&str]) -> Result<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    for (key, _) in
+        std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
+    {
+        command.env_remove(key);
+    }
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .env("PRISM_DATABASE_URL", &db.url)
+        .env("QBIT_RPC_URL", &node.url)
+        .env("PRISM_RUNTIME_WORKERS", "2");
+    Ok(tokio::time::timeout(Duration::from_secs(20), command.output()).await??)
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The exit status decision 4 assigns to this outcome.
+fn code(output: &Output) -> i32 {
+    output.status.code().expect("the command was signalled")
+}
+
+/// One seeded outbox row. The defaults are an ordinary retrying `pending`
+/// row; each test changes only the fields its case is about.
+#[derive(Clone)]
+struct Row {
+    hash: String,
+    state: &'static str,
+    height: Option<i64>,
+    storage_version: i32,
+    attempt_count: i32,
+    last_error: Option<String>,
+    parked: bool,
+    due_in_seconds: f64,
+    claim: Option<(String, f64)>,
+    proof_observed_at_ms: Option<i64>,
+}
+
+impl Row {
+    fn new(byte: &str, state: &'static str) -> Self {
+        Self {
+            hash: byte.repeat(32),
+            state,
+            height: Some(101),
+            storage_version: 1,
+            attempt_count: 0,
+            last_error: None,
+            parked: false,
+            due_in_seconds: 30.0,
+            claim: None,
+            proof_observed_at_ms: Some(1_800_000_000_000),
+        }
+    }
+}
+
+/// Seed `row` exactly as migration 011's lifecycle, payload and offer rules
+/// require for its state, so all four unfinished states and both terminal
+/// states can be held at once without driving six claims.
+async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
+    let terminal = matches!(row.state, "submitted" | "abandoned");
+    let offered = matches!(row.state, "offer_reserved" | "offered" | "reconciliation");
+    let candidate = (!terminal).then(|| match row.height {
+        Some(height) => json!({"found_block":{"block_height":height},"job_id":"job"}),
+        // A document an unknown writer left behind: no readable height.
+        None => json!({"job_id":"job"}),
+    });
+    let last_error = match (row.state, &row.last_error) {
+        // 011 requires a nonblank reason on a reconciliation row.
+        ("reconciliation", None) => Some("node answer was lost in transport".to_owned()),
+        (_, other) => other.clone(),
+    };
+    sqlx::query(
+        "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate_sha256,candidate,block_bytes,state,storage_version,attempt_count,last_error,next_attempt_at,completed_at,window_anchor_ms,window_prior_balances_sha256,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,proof_observed_at_ms,claim_token,claim_instance_id,claim_expires_at) \
+         VALUES($1,$1,$2,$3,$4,$5,$6,$7,\
+         CASE WHEN $8 THEN 'infinity'::timestamptz ELSE clock_timestamp()+make_interval(secs=>$9) END,\
+         CASE WHEN $4 IN ('submitted','abandoned') THEN clock_timestamp() END,$10,$11,\
+         CASE WHEN $12::text IS NOT NULL THEN clock_timestamp() END,$12,$13,$14,$15,\
+         CASE WHEN $16::text IS NOT NULL THEN 'token-'||$16 END,$16,\
+         CASE WHEN $16::text IS NOT NULL THEN clock_timestamp()+make_interval(secs=>$17) END)")
+        .bind(&row.hash)
+        .bind(candidate)
+        .bind((!terminal).then(|| vec![0u8; 80]))
+        .bind(row.state)
+        .bind(row.storage_version)
+        .bind(row.attempt_count)
+        .bind(last_error)
+        .bind(row.parked)
+        .bind(row.due_in_seconds)
+        .bind((!terminal).then_some(1_800_000_000_000i64))
+        .bind((!terminal).then(|| "aa".repeat(32)))
+        .bind(offered.then(|| "frontend-b".to_owned()))
+        .bind((row.state == "offered").then_some(1_800_000_001_000i64))
+        .bind(match row.state {
+            "offered" => Some("accepted"),
+            "reconciliation" => Some("unknown"),
+            _ => None,
+        })
+        .bind(row.proof_observed_at_ms)
+        .bind(row.claim.as_ref().map(|(instance, _)| instance.clone()))
+        .bind(row.claim.as_ref().map_or(0.0, |(_, seconds)| *seconds))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The whole row, for a byte-identical comparison across a refusal.
+async fn whole_row(pool: &PgPool, hash: &str) -> Result<Value> {
+    Ok(sqlx::query_scalar(
+        "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
+    )
+    .bind(hash)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn landed_block(pool: &PgPool, hash: &str) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state,maturity_state) VALUES($1,101,'parent','coinbase','manifest','prepared','immature')")
+        .bind(hash).execute(pool).await?;
+    Ok(())
+}
+
+/// The one document `--json` prints, checked for its versioned schema field.
+fn listed(output: &Output) -> Vec<Value> {
+    let document: Value = serde_json::from_slice(&output.stdout).expect("candidates list --json");
+    assert_eq!(document["schema"], "qbit.prism.candidates.list.v1");
+    document["candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn row_of<'a>(listed: &'a [Value], hash: &str) -> &'a Value {
+    listed
+        .iter()
+        .find(|row| row["block_hash"] == hash)
+        .unwrap_or_else(|| panic!("{hash} is missing from the inventory"))
+}
+
+/// Operator tools never register a frontend, so the only instance row is the
+/// ledger this test opened.
+async fn assert_no_new_instances(pool: &PgPool) -> Result<()> {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_prism_instances")
+            .fetch_one(pool)
+            .await?,
+        1,
+        "operator tools must not create heartbeats"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_shows_every_unfinished_state_without_claiming_or_loading_payloads() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let mut pending = Row::new("11", "pending");
+    pending.attempt_count = 4;
+    pending.last_error = Some("node RPC transport failed".to_owned());
+    let mut reserved = Row::new("22", "offer_reserved");
+    reserved.height = Some(102);
+    reserved.claim = Some(("frontend-b".to_owned(), 3600.0));
+    let mut offered = Row::new("33", "offered");
+    offered.height = Some(103);
+    // A claim whose owner died: the row is workable again, and `list` must
+    // say `expired` rather than drop the holder.
+    offered.claim = Some(("frontend-c".to_owned(), -60.0));
+    let mut reconciliation = Row::new("44", "reconciliation");
+    reconciliation.height = Some(104);
+    reconciliation.attempt_count = 9;
+    for row in [&pending, &reserved, &offered, &reconciliation] {
+        seed(&ledger.pool, row).await?;
+    }
+    // Terminal rows are not unfinished work and never appear.
+    seed(&ledger.pool, &Row::new("55", "submitted")).await?;
+    seed(&ledger.pool, &Row::new("66", "abandoned")).await?;
+    let before: Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(o) ORDER BY o.block_hash) FROM qbit_block_candidate_outbox o",
+    )
+    .fetch_one(&ledger.pool)
+    .await?;
+    let dispatches: i64 =
+        sqlx::query_scalar("SELECT last_value FROM qbit_prism_candidate_dispatch_sequence")
+            .fetch_one(&ledger.pool)
+            .await?;
+
+    // Proof one that no write path is involved: every ledger write refuses
+    // while the cluster is halted, and the inventory is exactly what an
+    // operator needs then.
+    sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='test halt' WHERE singleton")
+        .execute(&ledger.pool)
+        .await?;
+    let text = cli(&db, &node, &["candidates", "list"]).await?;
+    assert!(text.status.success(), "{}", stderr(&text));
+    let json = cli(&db, &node, &["candidates", "list", "--json"]).await?;
+    assert!(json.status.success(), "{}", stderr(&json));
+    sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL WHERE singleton")
+        .execute(&ledger.pool)
+        .await?;
+
+    let printed = stdout(&text);
+    let rows = listed(&json);
+    assert_eq!(rows.len(), 4, "{printed}");
+    for row in [&pending, &reserved, &offered, &reconciliation] {
+        let listed = row_of(&rows, &row.hash);
+        assert_eq!(listed["state"], row.state);
+        assert_eq!(listed["block_height"], json!(row.height));
+        assert_eq!(listed["attempt_count"], json!(row.attempt_count));
+        // The full hash is printed so it can be pasted into `abandon`.
+        assert!(printed.contains(&row.hash), "{printed}");
+        assert!(printed.contains(row.state), "{printed}");
+    }
+    assert!(printed.contains("node RPC transport failed"), "{printed}");
+    assert_eq!(
+        row_of(&rows, &pending.hash)["last_error"],
+        "node RPC transport failed"
+    );
+    assert_eq!(
+        row_of(&rows, &reserved.hash)["claim_instance_id"],
+        "frontend-b"
+    );
+    assert_eq!(row_of(&rows, &reserved.hash)["claim_live"], true);
+    assert!(row_of(&rows, &reserved.hash)["claim_expires_at"].is_string());
+    assert!(
+        printed.contains("frontend-b until "),
+        "a live claim names its holder and expiry: {printed}"
+    );
+    assert_eq!(
+        row_of(&rows, &offered.hash)["claim_instance_id"],
+        "frontend-c"
+    );
+    assert_eq!(row_of(&rows, &offered.hash)["claim_live"], false);
+    assert!(
+        printed.contains("expired"),
+        "a stale claim is `expired`, never absent: {printed}"
+    );
+    assert_eq!(
+        row_of(&rows, &reconciliation.hash)["last_error"],
+        "node answer was lost in transport"
+    );
+
+    // Proof two: nothing about the claim or the retry state moved.
+    assert_eq!(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT jsonb_agg(to_jsonb(o) ORDER BY o.block_hash) FROM qbit_block_candidate_outbox o"
+        )
+        .fetch_one(&ledger.pool)
+        .await?,
+        before,
+        "list must leave every row byte-identical"
+    );
+    for row in [&pending, &reserved, &offered, &reconciliation] {
+        let after = whole_row(&ledger.pool, &row.hash).await?;
+        for field in [
+            "claim_token",
+            "claim_instance_id",
+            "claim_expires_at",
+            "attempt_count",
+        ] {
+            assert_eq!(
+                after[field],
+                before
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|seeded| seeded["block_hash"] == row.hash.as_str())
+                    .unwrap()[field],
+                "list changed {field}"
+            );
+        }
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT last_value FROM qbit_prism_candidate_dispatch_sequence"
+        )
+        .fetch_one(&ledger.pool)
+        .await?,
+        dispatches,
+        "list must consume no dispatch slot"
+    );
+
+    // Proof three: neither payload column is a selected column of the
+    // statement the command runs. PostgreSQL names the result columns, so
+    // this reads the projection rather than the SQL text.
+    let described = (&ledger.pool)
+        .describe(&qbit_prism_server::ledger::Ledger::candidate_list_sql())
+        .await?;
+    let columns: Vec<&str> = described
+        .columns()
+        .iter()
+        .map(|column| column.name())
+        .collect();
+    assert!(
+        !columns.contains(&"candidate") && !columns.contains(&"block_bytes"),
+        "list must not transfer a payload: {columns:?}"
+    );
+    assert!(columns.contains(&"block_height"));
+
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn list_separates_parked_rows_from_retrying_rows_and_shows_unknown_storage_versions(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let retrying = Row::new("11", "pending");
+    let mut parked = Row::new("22", "pending");
+    parked.parked = true;
+    parked.attempt_count = 2;
+    parked.last_error = Some("block digest did not authenticate".to_owned());
+    // The claim lane parks an unknown storage version with a reason naming
+    // it; it is unfinished work and must be visible.
+    let mut unknown_version = Row::new("33", "pending");
+    unknown_version.parked = true;
+    unknown_version.storage_version = 3;
+    unknown_version.height = None;
+    unknown_version.last_error = Some(
+        "candidate storage_version 3 is not supported by this server; only version 1 JSONB candidates are".to_owned(),
+    );
+    // A row an older binary wrote: no proof observation and no offer record.
+    let mut older_binary = Row::new("44", "pending");
+    older_binary.proof_observed_at_ms = None;
+    older_binary.due_in_seconds = 5.0;
+    for row in [&retrying, &parked, &unknown_version, &older_binary] {
+        seed(&ledger.pool, row).await?;
+    }
+
+    let text = cli(&db, &node, &["candidates", "list"]).await?;
+    assert!(text.status.success(), "{}", stderr(&text));
+    let printed = stdout(&text);
+    let rows = listed(&cli(&db, &node, &["candidates", "list", "--json"]).await?);
+
+    assert_eq!(row_of(&rows, &retrying.hash)["parked"], false);
+    assert!(row_of(&rows, &retrying.hash)["next_attempt_at"].is_string());
+    for row in [&parked, &unknown_version] {
+        assert_eq!(row_of(&rows, &row.hash)["parked"], true);
+        assert_eq!(
+            row_of(&rows, &row.hash)["next_attempt_at"],
+            Value::Null,
+            "a parked row has no due time to report"
+        );
+        assert_eq!(
+            row_of(&rows, &row.hash)["last_error"],
+            json!(row.last_error)
+        );
+    }
+    assert_eq!(
+        printed.matches("parked").count(),
+        2,
+        "exactly the two quarantined rows read as parked: {printed}"
+    );
+    assert_eq!(row_of(&rows, &unknown_version.hash)["storage_version"], 3);
+    assert!(
+        printed.contains("storage_version 3 is not supported"),
+        "{printed}"
+    );
+
+    // Unknown is never zero and never blank, in either mode.
+    assert_eq!(
+        row_of(&rows, &unknown_version.hash)["block_height"],
+        Value::Null
+    );
+    assert_eq!(
+        row_of(&rows, &older_binary.hash)["proof_observed_at_ms"],
+        Value::Null
+    );
+    for field in [
+        "offer_outcome",
+        "offer_reply",
+        "offered_at_ms",
+        "offer_reserved_by",
+    ] {
+        assert_eq!(row_of(&rows, &older_binary.hash)[field], Value::Null);
+    }
+    assert_eq!(row_of(&rows, &older_binary.hash)["claim_live"], false);
+
+    // Oldest due first, and parked rows last: the claim lane's own ordering.
+    let order: Vec<&str> = rows
+        .iter()
+        .map(|row| row["block_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            older_binary.hash.as_str(),
+            retrying.hash.as_str(),
+            parked.hash.as_str(),
+            unknown_version.hash.as_str()
+        ],
+        "{printed}"
+    );
+
+    // An empty inventory is this command's success case.
+    sqlx::query("DELETE FROM qbit_block_candidate_outbox")
+        .execute(&ledger.pool)
+        .await?;
+    let empty = cli(&db, &node, &["candidates", "list"]).await?;
+    assert!(empty.status.success(), "{}", stderr(&empty));
+    assert_eq!(stdout(&empty).trim(), "no unfinished candidates");
+    let empty_json = cli(&db, &node, &["candidates", "list", "--json"]).await?;
+    assert!(empty_json.status.success());
+    assert!(listed(&empty_json).is_empty());
+
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn abandon_terminalizes_a_pending_row_exactly_as_supersession_does() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    // Two identical rows: one the operator abandons, one the epoch
+    // supersession abandons with its own statement.
+    let mut operator = Row::new("11", "pending");
+    operator.attempt_count = 3;
+    operator.parked = true;
+    operator.last_error = Some("block digest did not authenticate".to_owned());
+    let mut superseded = operator.clone();
+    superseded.hash = "22".repeat(32);
+    seed(&ledger.pool, &operator).await?;
+    seed(&ledger.pool, &superseded).await?;
+    let before = whole_row(&ledger.pool, &operator.hash).await?;
+    let reason = "INC-311: block proven superseded before any offer";
+
+    // The two fences the ordinary ledger write path gives `abandon` for free.
+    sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='test halt' WHERE singleton")
+        .execute(&ledger.pool)
+        .await?;
+    let halted = cli(
+        &db,
+        &node,
+        &[
+            "candidates",
+            "abandon",
+            "--block-hash",
+            &operator.hash,
+            "--reason",
+            reason,
+        ],
+    )
+    .await?;
+    assert_eq!(code(&halted), 1);
+    assert!(
+        stderr(&halted).contains("cluster halted"),
+        "{}",
+        stderr(&halted)
+    );
+    assert_eq!(whole_row(&ledger.pool, &operator.hash).await?, before);
+    sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL WHERE singleton")
+        .execute(&ledger.pool)
+        .await?;
+
+    sqlx::raw_sql(
+        "ALTER TABLE qbit_ledger_writer_lease DISABLE TRIGGER qbit_prism_no_legacy_writer",
+    )
+    .execute(&ledger.pool)
+    .await?;
+    sqlx::query("INSERT INTO qbit_ledger_writer_lease(singleton,writer_id,writer_epoch,writer_session_token,lease_expires_at) VALUES(true,'python',1,'session',clock_timestamp()+interval '1 hour')")
+        .execute(&ledger.pool).await?;
+    let legacy = cli(
+        &db,
+        &node,
+        &[
+            "candidates",
+            "abandon",
+            "--block-hash",
+            &operator.hash,
+            "--reason",
+            reason,
+        ],
+    )
+    .await?;
+    assert_eq!(code(&legacy), 1);
+    assert!(
+        stderr(&legacy).contains("live legacy Python writer lease"),
+        "{}",
+        stderr(&legacy)
+    );
+    assert_eq!(whole_row(&ledger.pool, &operator.hash).await?, before);
+    sqlx::raw_sql("DELETE FROM qbit_ledger_writer_lease; ALTER TABLE qbit_ledger_writer_lease ENABLE TRIGGER qbit_prism_no_legacy_writer")
+        .execute(&ledger.pool)
+        .await?;
+
+    let done = cli(
+        &db,
+        &node,
+        &[
+            "candidates",
+            "abandon",
+            "--block-hash",
+            &operator.hash,
+            "--reason",
+            reason,
+        ],
+    )
+    .await?;
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert_eq!(
+        stdout(&done).trim(),
+        format!("abandoned {}: {reason}", operator.hash)
+    );
+
+    let after = whole_row(&ledger.pool, &operator.hash).await?;
+    assert_eq!(after["state"], "abandoned");
+    assert_eq!(after["last_error"], reason);
+    assert!(after["completed_at"].is_string());
+    for released in [
+        "candidate",
+        "block_bytes",
+        "window_anchor_ms",
+        "window_prior_balances_sha256",
+        "window_first_share_seq",
+        "window_last_share_seq",
+        "window_share_count",
+        "window_snapshot_sha256",
+        "claim_token",
+        "claim_instance_id",
+        "claim_expires_at",
+    ] {
+        assert_eq!(after[released], Value::Null, "{released} was not released");
+    }
+    // The parked marker is evidence, and the supersession path keeps it too.
+    assert_eq!(after["next_attempt_at"], before["next_attempt_at"]);
+
+    // The supersession statement, verbatim from ledger/policy_transition.rs.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error='epoch-superseded',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE state='pending'")
+        .execute(&ledger.pool).await?;
+    let supersession = whole_row(&ledger.pool, &superseded.hash).await?;
+    let comparable = |row: &Value| {
+        let mut row = row.clone();
+        for varying in [
+            "block_hash",
+            "candidate_sha256",
+            "last_error",
+            "completed_at",
+            "updated_at",
+            "created_at",
+        ] {
+            row[varying] = Value::Null;
+        }
+        row
+    };
+    assert_eq!(
+        comparable(&after),
+        comparable(&supersession),
+        "the operator abandon must leave the same row shape as the supersession path"
+    );
+
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn abandon_refuses_every_offered_state_and_leaves_the_row_byte_identical() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    for (byte, state) in [
+        ("11", "offer_reserved"),
+        ("22", "offered"),
+        ("33", "reconciliation"),
+    ] {
+        let row = Row::new(byte, state);
+        seed(&ledger.pool, &row).await?;
+        let before = whole_row(&ledger.pool, &row.hash).await?;
+        let refused = cli(
+            &db,
+            &node,
+            &[
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &row.hash,
+                "--reason",
+                "INC-311: operator believes the block is superseded",
+            ],
+        )
+        .await?;
+        assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+        let message = stderr(&refused);
+        assert!(
+            message.contains(&format!("is in state {state}")),
+            "{message}"
+        );
+        assert!(
+            message.contains("it was offered to the node and is never abandoned"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Its block may already have been submitted"),
+            "{message}"
+        );
+        assert_eq!(
+            whole_row(&ledger.pool, &row.hash).await?,
+            before,
+            "{state} must be left byte-identical"
+        );
+    }
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let mut held = Row::new("11", "pending");
+    held.claim = Some(("frontend-b".to_owned(), 3600.0));
+    seed(&ledger.pool, &held).await?;
+    let before = whole_row(&ledger.pool, &held.hash).await?;
+    let reason = "INC-311: superseded before any offer";
+    let args = [
+        "candidates",
+        "abandon",
+        "--block-hash",
+        &held.hash,
+        "--reason",
+        reason,
+    ];
+
+    let refused = cli(&db, &node, &args).await?;
+    assert_eq!(code(&refused), 5, "{}", stderr(&refused));
+    let message = stderr(&refused);
+    assert!(
+        message.contains("is held by frontend-b until "),
+        "{message}"
+    );
+    assert!(
+        message.contains("retry after the claim expires"),
+        "{message}"
+    );
+    assert_eq!(whole_row(&ledger.pool, &held.hash).await?, before);
+
+    // An expired claim is not a live claim: the row is abandonable again.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
+        .bind(&held.hash).execute(&ledger.pool).await?;
+    let done = cli(&db, &node, &args).await?;
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    let after = whole_row(&ledger.pool, &held.hash).await?;
+    assert_eq!(after["state"], "abandoned");
+    assert_eq!(after["last_error"], reason);
+    assert_eq!(after["claim_instance_id"], Value::Null);
+    assert_eq!(after["claim_token"], Value::Null);
+
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn abandon_refuses_a_terminal_row_and_a_pending_row_whose_block_landed() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let reason = "INC-311: operator sweep";
+    let abandon = |hash: String| {
+        let db = &db;
+        let node = &node;
+        async move {
+            cli(
+                db,
+                node,
+                &[
+                    "candidates",
+                    "abandon",
+                    "--block-hash",
+                    &hash,
+                    "--reason",
+                    reason,
+                ],
+            )
+            .await
+        }
+    };
+
+    // Already terminal: legible as "nothing to do", and distinct from a row
+    // that was never there, so a repeated abandon is not a lost row.
+    for (byte, state) in [("11", "submitted"), ("22", "abandoned")] {
+        let row = Row::new(byte, state);
+        seed(&ledger.pool, &row).await?;
+        let before = whole_row(&ledger.pool, &row.hash).await?;
+        let refused = abandon(row.hash.clone()).await?;
+        assert_eq!(code(&refused), 4, "{}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains(&format!("is already {state}; nothing to do")),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            whole_row(&ledger.pool, &row.hash).await?,
+            before,
+            "a terminal row must never be re-applied"
+        );
+    }
+
+    // Pending, but its accounting has landed.
+    let landed = Row::new("33", "pending");
+    seed(&ledger.pool, &landed).await?;
+    landed_block(&ledger.pool, &landed.hash).await?;
+    let before = whole_row(&ledger.pool, &landed.hash).await?;
+    let refused = abandon(landed.hash.clone()).await?;
+    assert_eq!(code(&refused), 6, "{}", stderr(&refused));
+    let message = stderr(&refused);
+    assert!(
+        message.contains("is already in qbit_pool_blocks"),
+        "{message}"
+    );
+    assert!(
+        message.contains("abandoning would discard landed accounting"),
+        "{message}"
+    );
+    assert_eq!(whole_row(&ledger.pool, &landed.hash).await?, before);
+
+    // No such row at all.
+    let missing = "ee".repeat(32);
+    let absent = abandon(missing.clone()).await?;
+    assert_eq!(code(&absent), 2, "{}", stderr(&absent));
+    assert!(
+        stderr(&absent).contains(&format!("no candidate row for {missing}")),
+        "{}",
+        stderr(&absent)
+    );
+
+    // Malformed, missing and out-of-range inputs are refused at the entry
+    // boundary, in the formats the row itself uses.
+    for (args, expected) in [
+        (
+            vec!["candidates", "abandon", "--reason", reason],
+            "--block-hash",
+        ),
+        (
+            vec![
+                "candidates",
+                "abandon",
+                "--block-hash",
+                "abc",
+                "--reason",
+                reason,
+            ],
+            "--block-hash",
+        ),
+        (
+            vec![
+                "candidates",
+                "abandon",
+                "--block-hash",
+                "AB".repeat(32).leak(),
+                "--reason",
+                reason,
+            ],
+            "--block-hash",
+        ),
+        (
+            vec![
+                "candidates",
+                "abandon",
+                "--block-hash",
+                "ab".repeat(32).leak(),
+                "--reason",
+                "   ",
+            ],
+            "--reason",
+        ),
+        (
+            vec![
+                "candidates",
+                "abandon",
+                "--block-hash",
+                "ab".repeat(32).leak(),
+            ],
+            "--reason",
+        ),
+        (vec!["candidates", "list", "--limit", "0"], "limit"),
+        (vec!["candidates", "list", "--limit", "10001"], "limit"),
+    ] {
+        let output = cli(&db, &node, &args).await?;
+        assert!(!output.status.success(), "{args:?} was accepted");
+        assert!(
+            stderr(&output).contains(expected),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
