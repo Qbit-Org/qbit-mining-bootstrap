@@ -729,6 +729,23 @@ async fn attached_partitions(connection: &mut PgConnection) -> Result<Vec<String
     .await?)
 }
 
+/// The archived partition with the next-lower `upper_seq`: what a new
+/// manifest links to, and what a verified one has to link to.
+async fn archived_predecessor(
+    connection: &mut PgConnection,
+    upper_seq: i64,
+) -> Result<Option<PartitionRecord>> {
+    sqlx::query(&format!(
+        "{SELECT_PARTITION} WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1"
+    ))
+    .bind(upper_seq)
+    .fetch_optional(&mut *connection)
+    .await?
+    .as_ref()
+    .map(PartitionRecord::from_row)
+    .transpose()
+}
+
 /// The next `share_seq` the sequence will hand out. A partition whose
 /// `upper_seq` is above it can still receive appends, so no archive of it can
 /// be complete, and no comparison with its live rows proves anything about the
@@ -1353,6 +1370,22 @@ pub async fn archive(
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&mut *connection)
             .await?;
+    // The chain: the archived partition with the next-lower upper_seq. It has
+    // to end exactly where this one starts, so partitions are archived in
+    // order and the chain never has to be repaired later.
+    let previous = archived_predecessor(&mut connection, record.upper_seq).await?;
+    ensure!(
+        chain_is_adjacent(previous.as_ref().map(|row| row.upper_seq), record.lower_seq),
+        "refusing to archive {partition_name}: its chain link would not be adjacent. {} while {partition_name} starts at {}; archive the partitions between them first, in order, so the chain stays contiguous",
+        match &previous {
+            Some(row) => format!(
+                "The nearest archived partition below it, {}, ends at {}",
+                row.partition_name, row.upper_seq
+            ),
+            None => "No partition below it is archived".to_owned(),
+        },
+        number_or(record.lower_seq, "MINVALUE")
+    );
 
     let directory = partition_dir(root, partition_name);
     std::fs::create_dir_all(&directory)
@@ -1377,15 +1410,6 @@ pub async fn archive(
     let (rows_gz_sha256, rows_gz_bytes) =
         file.context("the archive writer closed without a file digest")?;
 
-    let previous = sqlx::query(&format!(
-        "{SELECT_PARTITION} WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1"
-    ))
-    .bind(record.upper_seq)
-    .fetch_optional(&mut *connection)
-    .await?
-    .as_ref()
-    .map(PartitionRecord::from_row)
-    .transpose()?;
     let manifest = ArchiveManifest {
         schema: ARCHIVE_SCHEMA_V1.to_owned(),
         partition_name: partition_name.to_owned(),
@@ -1481,11 +1505,12 @@ fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
 }
 
 /// Re-read the archive, recompute both digests, check the manifest against the
-/// catalog row and the chain, and, while the partition is still attached,
-/// stream the live rows again and compare the stream digest and the count.
-/// Records `archive_verified_at` only when everything agreed and the live
-/// rows were compared, and only once the share sequence has passed the
-/// partition; after a detach the verification is reported only.
+/// catalog row and the chain, including that the chain has no gap, and, while
+/// the partition is still attached, stream the live rows again and compare the
+/// stream digest and the count. Records `archive_verified_at` only when
+/// everything agreed and the live rows were compared, and only once the share
+/// sequence has passed the partition; after a detach the verification is
+/// reported only.
 pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
     let mut connection = ledger.acquire().await?;
@@ -1543,15 +1568,7 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
     }
 
     // The chain: the archived partition with the next-lower upper_seq.
-    let previous = sqlx::query(&format!(
-        "{SELECT_PARTITION} WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1"
-    ))
-    .bind(record.upper_seq)
-    .fetch_optional(&mut *connection)
-    .await?
-    .as_ref()
-    .map(PartitionRecord::from_row)
-    .transpose()?;
+    let previous = archived_predecessor(&mut connection, record.upper_seq).await?;
     let expected_link = previous
         .as_ref()
         .and_then(|row| row.archive_manifest_sha256.clone());
@@ -1566,7 +1583,16 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         expected_link,
         expected_upper
     );
-    let chain_adjacent = chain_is_adjacent(manifest.previous_upper_seq, manifest.lower_seq);
+    // A link to the nearest archived partition is not enough: it has to end
+    // where this one starts, or the chain no longer proves the archived
+    // history is contiguous, and that is nothing to certify.
+    ensure!(
+        chain_is_adjacent(manifest.previous_upper_seq, manifest.lower_seq),
+        "{}: the manifest chains to a predecessor ending at {} while the partition starts at {}; a partition between them is missing from the chain",
+        path.display(),
+        number_or(manifest.previous_upper_seq, "nothing"),
+        number_or(manifest.lower_seq, "MINVALUE")
+    );
 
     let rows_path_for_read = rows_path.clone();
     let manifest_for_read = manifest.clone();
@@ -1636,7 +1662,6 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         "rows_sha256": manifest.rows_sha256,
         "rows_gz_sha256": manifest.rows_gz_sha256,
         "chain_previous_upper_seq": manifest.previous_upper_seq,
-        "chain_adjacent": chain_adjacent,
         "live_rows_compared": live_rows_compared,
         "live": live,
         "archive_verified_at": verified_at,

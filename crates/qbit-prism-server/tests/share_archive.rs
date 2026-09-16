@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 const P0: &str = "qbit_share_ledger_p0";
 const P1: &str = "qbit_share_ledger_p1";
+const P2: &str = "qbit_share_ledger_p2";
 
 // ---------------------------------------------------------------------------
 // Per-test schema, the fixture of tests/audit_body_normalization.rs
@@ -402,10 +403,11 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         let root = tempfile::tempdir()?;
         let (p0_lower, p0_upper) = bounds(&ledger.pool, P0).await?;
         let (p1_lower, p1_upper) = bounds(&ledger.pool, P1).await?;
+        let (p2_lower, p2_upper) = bounds(&ledger.pool, P2).await?;
         ensure!(p0_lower.is_none(), "the first partition is not MINVALUE");
         ensure!(
-            p1_lower == Some(p0_upper),
-            "the grid is not contiguous: {p1_lower:?} after {p0_upper}"
+            p1_lower == Some(p0_upper) && p2_lower == Some(p1_upper),
+            "the grid is not contiguous: {p1_lower:?} after {p0_upper}, {p2_lower:?} after {p1_upper}"
         );
         insert_shares(&ledger.pool, 1, 300, 7, "server-a", 3600.0).await?;
         insert_shares(&ledger.pool, p0_upper, p0_upper + 9, 5, "server-b", 60.0).await?;
@@ -510,7 +512,7 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         ensure!(
             verified["live_rows_compared"] == true
                 && verified["live"]["rows_sha256"] == serde_json::json!(disk.rows_sha256)
-                && verified["chain_adjacent"] == true,
+                && verified["chain_previous_upper_seq"].is_null(),
             "verify did not compare the live rows: {verified}"
         );
         let row = catalog(&ledger.pool, P0).await?;
@@ -533,7 +535,22 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             error.contains("share sequence stands at") && error.contains("still land in it"),
             "{error}"
         );
-        set_sequence(&ledger.pool, p1_upper - 1).await?;
+        set_sequence(&ledger.pool, p2_upper - 1).await?;
+
+        // The chain stays contiguous: a partition whose nearest archived
+        // predecessor does not end where it starts is refused until the
+        // partitions between them are archived.
+        let error = archive::archive(&ledger, P2, root.path(), false, "operator-a")
+            .await
+            .expect_err("archived past a partition that is not archived")
+            .to_string();
+        ensure!(
+            error.contains("would not be adjacent")
+                && error.contains(P0)
+                && error.contains(&format!("ends at {p0_upper}"))
+                && error.contains(&format!("starts at {p1_upper}")),
+            "{error}"
+        );
 
         // The chain: the second archive links to the first by manifest digest
         // and starts exactly where it ended.
@@ -553,7 +570,10 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             "the chain link is not adjacent"
         );
         let verified = archive::verify(&ledger, P1, root.path()).await?;
-        ensure!(verified["chain_adjacent"] == true, "{verified}");
+        ensure!(
+            verified["chain_previous_upper_seq"] == serde_json::json!(p0_upper),
+            "{verified}"
+        );
         // A verification is refused the same way whenever the sequence is
         // found below the partition, whatever put it there.
         set_sequence(&ledger.pool, p0_upper + 9).await?;
@@ -562,7 +582,7 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             .expect_err("verified a partition the sequence is inside")
             .to_string();
         ensure!(error.contains("share sequence stands at"), "{error}");
-        set_sequence(&ledger.pool, p1_upper - 1).await?;
+        set_sequence(&ledger.pool, p2_upper - 1).await?;
 
         // Re-archiving is refused without --force, and --force clears the
         // recorded verification: a new archive has not been verified.
