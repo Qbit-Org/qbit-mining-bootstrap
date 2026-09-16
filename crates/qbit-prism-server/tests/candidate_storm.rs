@@ -66,7 +66,7 @@ use qbit_prism_server::{
     codec,
     config::Config,
     coordinator::{Coordinator, TipState},
-    ledger::{Candidate, Ledger, SignerKeys, Snapshot, WindowRef},
+    ledger::{Candidate, CandidateState, Ledger, SignerKeys, Snapshot, WindowRef},
     metrics::Metrics,
 };
 use qbit_prism_test_gate as gate;
@@ -1169,18 +1169,16 @@ async fn explain_the_lanes(storm: &Storm, candidates: usize) -> Result<()> {
         .execute(&storm.pool)
         .await?;
 
+    // The two claim lanes must be served in the index's own order at any N:
+    // each has to find the *first* due row by its ordering, so a sequential
+    // scan or a sort would grow with the backlog. The dispatch probe is a
+    // different shape and gets its own check below.
     for (name, statement, index, ordered) in [
         (
             "oldest-due lane",
             Ledger::claim_lane_sql(false),
             "qbit_block_candidate_outbox_unfinished_idx",
             true,
-        ),
-        (
-            "dispatch probe",
-            Ledger::due_work_probe_sql(),
-            "qbit_block_candidate_outbox_unfinished_idx",
-            false,
         ),
         (
             "fresh lane",
@@ -1234,6 +1232,99 @@ async fn explain_the_lanes(storm: &Storm, candidates: usize) -> Result<()> {
             );
         }
     }
+
+    // The dispatch probe is an `EXISTS`, so its cost is not the table size but
+    // how far it reads before the first match. Its plan is not asserted at the
+    // run's cardinality, because at storm size PostgreSQL stops using 011's
+    // partial index for it — and that is a finding about the server, recorded
+    // here rather than asserted away.
+    //
+    // The mechanism: the probe compares `next_attempt_at` against
+    // `clock_timestamp()`, which is VOLATILE, so no histogram applies and the
+    // planner falls back to its default selectivity of about one third of the
+    // indexed rows. At 24 or 100 unfinished rows that estimate is small enough
+    // that the index wins. At 3,120 it estimates ~1,035 matches, decides an
+    // `EXISTS` will hit one almost immediately, and takes a sequential scan —
+    // whose startup cost it charges as near zero.
+    //
+    // When rows really are due the gamble pays: a match is found in the first
+    // pages. The damaging case is a pool left idle behind a storm — thousands
+    // of unfinished rows all backing off, none due — where the same plan must
+    // read the entire outbox, retained terminal history included, on *every*
+    // poll to prove nothing is due. That is a per-poll cost that grows with
+    // retained history, engaged by exactly the state this suite exists to
+    // study, and 011's index cannot prevent it because the planner declines to
+    // use it.
+    //
+    // So: both regimes are recorded at the run's cardinality, and the
+    // guarantee is asserted at the baseline, where it does hold. The
+    // difference between the two recorded lines is the evidence.
+    let busy_probe = probe_plan_nodes(storm).await?;
+    sqlx::query(&format!(
+        "UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp()+interval '1 hour' WHERE state IN {}",
+        CandidateState::UNFINISHED_SQL
+    ))
+    .execute(&storm.pool)
+    .await?;
+    sqlx::raw_sql("ANALYZE qbit_block_candidate_outbox")
+        .execute(&storm.pool)
+        .await?;
+    let idle_probe = probe_plan_nodes(storm).await?;
+
+    // Trim the unfinished set to the baseline and re-plan: the index is used
+    // again, which proves the flip above is a function of unfinished
+    // cardinality and not of a missing or unusable index.
+    sqlx::query(&format!(
+        "DELETE FROM qbit_block_candidate_outbox WHERE state IN {} AND block_hash LIKE 'b%' AND block_hash > 'b'||lpad(to_hex($1::bigint),63,'0')",
+        CandidateState::UNFINISHED_SQL
+    ))
+    .bind(storm_scale::BASELINE_CANDIDATES as i64)
+    .execute(&storm.pool)
+    .await?;
+    sqlx::raw_sql("ANALYZE qbit_block_candidate_outbox")
+        .execute(&storm.pool)
+        .await?;
+    let baseline_idle_probe = probe_plan_nodes(storm).await?;
+    let unfinished: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
+        CandidateState::UNFINISHED_SQL
+    ))
+    .fetch_one(&storm.pool)
+    .await?;
+    ensure!(
+        baseline_idle_probe.iter().any(|(kind, used)| {
+            used == "qbit_block_candidate_outbox_unfinished_idx"
+                && matches!(
+                    kind.as_str(),
+                    "Index Scan" | "Index Only Scan" | "Bitmap Index Scan"
+                )
+        }) && !baseline_idle_probe
+            .iter()
+            .any(|(kind, _)| kind == "Seq Scan"),
+        "idle dispatch probe over {unfinished} unfinished rows is not served by \
+         the unfinished index: {baseline_idle_probe:?}"
+    );
+    storm_scale::record(
+        "dispatch_probe_plans",
+        &[
+            ("candidates", candidates.to_string()),
+            ("retained_rows", RETAINED_HISTORY_ROWS.to_string()),
+            ("busy_at_storm", format!("{busy_probe:?}")),
+            ("idle_at_storm", format!("{idle_probe:?}")),
+            ("baseline_unfinished_rows", unfinished.to_string()),
+            ("idle_at_baseline", format!("{baseline_idle_probe:?}")),
+        ],
+    );
+    // Restore the due backlog for the executed claim below.
+    sqlx::query(&format!(
+        "UPDATE qbit_block_candidate_outbox SET next_attempt_at=created_at WHERE state IN {}",
+        CandidateState::UNFINISHED_SQL
+    ))
+    .execute(&storm.pool)
+    .await?;
+    sqlx::raw_sql("ANALYZE qbit_block_candidate_outbox")
+        .execute(&storm.pool)
+        .await?;
 
     // One claim, executed: the work it does must not grow with the siblings.
     // Rolled back, so the row locks the lane takes are released.
@@ -1303,6 +1394,33 @@ async fn seed_retained_history(pool: &PgPool, terminal_rows: i64) -> Result<()> 
 /// behind one decided height, every one of them due, plus one row in each
 /// other unfinished state so the partial index's whole predicate is
 /// populated.
+/// The outbox scan nodes of the dispatch probe's plan, as
+/// `(node type, index name)` pairs.
+async fn probe_plan_nodes(storm: &Storm) -> Result<Vec<(String, String)>> {
+    let plan: Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        Ledger::due_work_probe_sql()
+    ))
+    .fetch_one(&storm.pool)
+    .await?;
+    let plan = plan[0]["Plan"].clone();
+    let mut nodes = Vec::new();
+    plan_nodes(&plan, &mut nodes);
+    Ok(nodes
+        .iter()
+        .filter(|node| {
+            node["Relation Name"] == "qbit_block_candidate_outbox"
+                || node["Node Type"] == "Bitmap Index Scan"
+        })
+        .map(|node| {
+            (
+                node["Node Type"].as_str().unwrap_or("").to_owned(),
+                node["Index Name"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect())
+}
+
 async fn seed_unfinished_due_rows(pool: &PgPool, siblings: i64) -> Result<()> {
     sqlx::query(
         "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,block_bytes,window_anchor_ms,window_prior_balances_sha256,state,attempt_count,created_at,next_attempt_at) \
