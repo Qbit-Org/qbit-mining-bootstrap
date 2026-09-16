@@ -795,10 +795,8 @@ fn check_sequence_passed(record: &PartitionRecord, next_share_seq: i64, what: &s
 /// rolled back; an append that starts afterwards draws a value at or above
 /// what the sequence reported, outside the partition. Only after this is a
 /// stream of the live rows complete.
-async fn drain_appends(connection: &mut PgConnection) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(super::ORDER_LOCK)
-        .execute(&mut *connection)
+async fn drain_appends(ledger: &Ledger, connection: &mut PgConnection) -> Result<()> {
+    super::connect::lock(connection, super::ORDER_LOCK, ledger.metrics.as_deref())
         .await
         .context("waiting for in-flight appends under the ledger's ordering lock")?;
     Ok(())
@@ -1401,7 +1399,7 @@ pub async fn archive(
     );
     let next_share_seq = next_share_seq(&mut connection).await?;
     check_sequence_passed(&record, next_share_seq, "archive")?;
-    drain_appends(&mut connection).await?;
+    drain_appends(ledger, &mut connection).await?;
     ensure!(
         record.archived_at.is_none() || force,
         "refusing to archive {partition_name}: it was already archived at {} into {}. Pass --force to write it again, which also clears the recorded verification, its own and that of every later archive",
@@ -1687,7 +1685,7 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         // append can reach it, and the immutability trigger holds the rest.
         let next_share_seq = next_share_seq(&mut connection).await?;
         check_sequence_passed(&record, next_share_seq, "verify")?;
-        drain_appends(&mut connection).await?;
+        drain_appends(ledger, &mut connection).await?;
         let stream = RowStream::new(partition_name, record.lower_seq, record.upper_seq, None);
         let stream = stream_partition(&mut connection, partition_name, stream).await?;
         let (summary, _) = stream.finish()?;

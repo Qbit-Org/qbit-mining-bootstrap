@@ -1,5 +1,6 @@
 use super::*;
 use crate::metrics::{time_pool_acquire, LockKind, Metrics, Outcome};
+use sqlx::PgConnection;
 
 mod acquire;
 
@@ -521,7 +522,7 @@ fn lock_kind(key: i64) -> Option<LockKind> {
 /// The error type is `sqlx::Error`, exactly what the raw statement returns, so
 /// every call site's `?` converts as it did before this helper existed.
 pub(super) async fn lock(
-    tx: &mut Transaction<'_, Postgres>,
+    connection: &mut PgConnection,
     key: i64,
     metrics: Option<&Metrics>,
 ) -> Result<(), sqlx::Error> {
@@ -533,7 +534,7 @@ pub(super) async fn lock(
     };
     let acquired = sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
-        .execute(&mut **tx)
+        .execute(&mut *connection)
         .await;
     if let Some(guard) = guard {
         guard.complete(if acquired.is_ok() {
