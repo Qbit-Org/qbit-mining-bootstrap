@@ -20,7 +20,10 @@ from lab.prism.coordinator_config import (
 )
 from lab.prism.job_bundle import CachedJobBundle, JobBuildSuperseded
 from lab.prism.job_delivery import PrismJobContext
-from lab.prism.payout_state import PayoutStatePublicationBlocked
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked,
+    TemplateRefreshBlocked,
+)
 from lab.prism.stratum_session import (
     ClientState,
     WorkerIdentity,
@@ -81,6 +84,10 @@ PRISM_VARDIFF_RETARGET_SKIP_REASONS = (
     # landed accepted-block transition or an accepted-parent preview wait),
     # so the paired difficulty/job send cannot be built right now (#414).
     "payout_publication_blocked",
+    # Any other coordination fence from the paired build (a superseded
+    # template refresh, an untrusted chain view): the same benign,
+    # retry-later state as above, distinct from a real build failure.
+    "template_refresh_blocked",
 )
 # Bounded outcomes for one retarget taken under the fast-arrival initial
 # convergence policy; also the metric label order for
@@ -89,7 +96,8 @@ PRISM_VARDIFF_RETARGET_SKIP_REASONS = (
 PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES = (
     "applied",     # committed together with its paired job
     "suppressed",  # the computed step landed inside the retarget tolerance
-    "superseded",  # difficulty or job state moved before the paired send
+    "superseded",  # difficulty/job state moved, or a coordination fence
+                   # skipped the paired send, before it reached the miner
     "failed",      # the build or send raised; speculative state was restored
 )
 # Seconds and accepted-share buckets for the high-difficulty arrival
@@ -995,21 +1003,28 @@ class VardiffService:
                     initial_convergence=initial_convergence,
                 )
             )
-        except PayoutStatePublicationBlocked as exc:
-            # The retarget's paired job build reached reorg reconciliation
-            # while a landed accepted-block transition (or an accepted-parent
-            # preview wait) fences payout publication. That is a coordination
-            # state of the pool, not a fault of this share: the share is
-            # already accepted and durably appended, and retarget_locked
-            # restored every speculative client mutation before re-raising.
-            # Skip the retarget -- the client keeps its connection, its
-            # current difficulty, and gets its next job from the scheduled
-            # refresh once the fence lifts -- instead of letting the
-            # exception escape handle_submit and kill the client thread
-            # before the share's own acknowledgement is written (#414).
+        except TemplateRefreshBlocked as exc:
+            # The retarget's paired job build hit a coordination fence: a
+            # landed accepted-block transition (or an accepted-parent
+            # preview wait) fencing payout publication, or a superseded
+            # template refresh. That is a state of the pool, not a fault of
+            # this share: the share is already accepted and durably
+            # appended, and retarget_locked restored every speculative
+            # client mutation before re-raising. Skip the retarget -- the
+            # client keeps its connection, its current difficulty, and gets
+            # its next job from the scheduled refresh once the fence lifts
+            # -- instead of letting the exception escape handle_submit and
+            # kill the client thread before the share's own acknowledgement
+            # is written (#414). The job-delivery reorg boundary already
+            # returns False for these fences on the non-raising share path,
+            # so this is the second line of defence, not the first.
             self._note_retarget_skipped(
                 client,
-                "payout_publication_blocked",
+                (
+                    "payout_publication_blocked"
+                    if isinstance(exc, PayoutStatePublicationBlocked)
+                    else "template_refresh_blocked"
+                ),
                 exc,
             )
         finally:
@@ -2419,6 +2434,17 @@ class VardiffService:
                     initial_convergence=initial_convergence,
                 )
                 return True
+        except TemplateRefreshBlocked:
+            # A coordination fence (a landed accepted-block transition, a
+            # superseded refresh) skipped the paired send before anything
+            # reached the miner. Undo the speculative state exactly like a
+            # failure, but attribute it as a superseded attempt -- not a
+            # failed one -- so a fenced fast-arrival retarget is not counted
+            # as a failure on top of the skip the caller records.
+            restore_speculative_retarget()
+            if initial_convergence:
+                self._count_initial_retarget_outcome("superseded")
+            raise
         except Exception:
             # Cached stamping can surface _JobBuildFailed before delivery, and
             # socket errors can surface during the paired send. Both must undo
@@ -2525,7 +2551,7 @@ class VardiffService:
             "# HELP qbit_prism_vardiff_idle_task_failures_total Idle retarget tasks that failed during cached delivery.",
             "# TYPE qbit_prism_vardiff_idle_task_failures_total counter",
             f"qbit_prism_vardiff_idle_task_failures_total {failures}",
-            "# HELP qbit_prism_vardiff_retargets_skipped_total Share-driven vardiff retargets skipped by bounded reason after the share was accepted; the client keeps its connection and current difficulty, and the scheduled refresh delivers its next job. payout_publication_blocked: the paired job build was fenced behind a pending payout publication (a landed accepted-block transition).",
+            "# HELP qbit_prism_vardiff_retargets_skipped_total Share-driven vardiff retargets skipped by bounded reason after the share was accepted; the client keeps its connection and current difficulty, and the scheduled refresh delivers its next job. payout_publication_blocked: the paired job build was fenced behind a pending payout publication (a landed accepted-block transition). template_refresh_blocked: another coordination fence (a superseded template refresh, an untrusted chain view) skipped the paired build.",
             "# TYPE qbit_prism_vardiff_retargets_skipped_total counter",
             *[
                 f'qbit_prism_vardiff_retargets_skipped_total{{reason="{reason}"}} {int(retarget_skips.get(reason, 0))}'

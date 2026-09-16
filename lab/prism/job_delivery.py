@@ -2157,14 +2157,37 @@ class JobDeliveryService:
                             "qbit chain view became untrusted before client job build"
                         )
                     return False
-            except AcceptedParentPayoutPreviewPending:
-                # Propagated verbatim: a late accepted-parent preview must
-                # never be relabelled into a reorg-reconciliation failure by
-                # the generic clause below, which would arm the ordinary
-                # template-refresh failure budget.
-                raise
+            except AcceptedParentPayoutPreviewPending as exc:
+                # Coordination backpressure typed all the way up, exactly as
+                # at the build boundary below: never relabelled into a
+                # reorg-reconciliation failure by the generic clause (which
+                # would arm the ordinary template-refresh failure budget),
+                # coalesced onto the tip-refresh retry, and raised only to
+                # callers that asked for reorg failures. A non-raising
+                # caller -- the share-driven vardiff retarget, the first-job
+                # seam -- skips this job and keeps its client.
+                runtime._schedule_tip_refresh_retry()
+                self._log_accepted_parent_preview_pending(
+                    exc,
+                    connection_id=client.connection_id,
+                )
+                if guarded_refresh or raise_on_reorg_failure:
+                    raise
+                return False
             except TemplateRefreshBlocked:
-                raise
+                # Symmetric with the build boundary below (#414 review): a
+                # coordination fence raised by reconciliation -- a landed
+                # accepted-block transition (PayoutStatePublicationBlocked)
+                # or a superseded refresh (TemplateRefreshSuperseded) -- is
+                # not a failure of this job and must not escape a
+                # non-raising caller: from the share-driven retarget it
+                # propagated out of handle_submit and killed the client
+                # thread before the share's own acknowledgement. Schedule
+                # the coalesced retry; raise only for callers that asked.
+                runtime._schedule_tip_refresh_retry()
+                if guarded_refresh or raise_on_reorg_failure:
+                    raise
+                return False
             except Exception as exc:
                 print(
                     f"prism coordinator: reorg reconciliation failed before job build "

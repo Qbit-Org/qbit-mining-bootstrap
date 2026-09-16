@@ -355,6 +355,17 @@ DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS = 30.0
 # once the window expires with the hash still absent from the active chain,
 # the candidate is genuinely stale and abandons terminally.
 DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS = 300.0
+# #414: a block candidate the node has proven off the active chain (its
+# header held with ``confirmations == -1`` while a different block is active
+# at its height) releases its landed payout barrier at once so job delivery
+# resumes, but a same-height tie is not yet a settled orphan: the chain can
+# flip back to the pool's block. The prepared payout rows are therefore
+# rejected only once the competitor block has at least this many
+# confirmations (its own child buries the tie) or the verdict has aged past
+# PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS, whichever comes first. Until
+# then the candidate keeps deferring with its ledger row ``prepared`` and a
+# flip-back restores it for finalization.
+DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS = 2
 # Fail-closed bound on unresolved accepted-parent transitions (landed
 # candidates whose durable bookkeeping has not reached a terminal state).
 # Child jobs may keep issuing against published previews while landings
@@ -1410,6 +1421,10 @@ class BlockConfig:
     candidate_cleanup_retry_backlog_max: int = (
         DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
     )
+    # #414: competitor confirmations that settle a proven-orphan candidate.
+    candidate_orphan_terminal_confirmations: int = (
+        DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS
+    )
     replay_page_size: int = MAX_BLOCK_REPLAY_PAGE_SIZE
 
 
@@ -1921,6 +1936,11 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
                     environ=source,
                 )
             )
+        ),
+        candidate_orphan_terminal_confirmations=env_positive_int(
+            "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
+            DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS,
+            environ=source,
         ),
     )
 

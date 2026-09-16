@@ -3493,6 +3493,9 @@ class PayoutStateService:
                 landed_monotonic=None,
             )
             runtime._accepted_block_payout_preview_condition.notify_all()
+        # The bar this attempt armed is gone: reconciliation and payout
+        # publication are admissible again, so wake delivery now (#414).
+        self._wake_tip_refresh_after_landed_release(block_hash)
 
     def _publish_accepted_block_payout_preview(
         self,
@@ -3765,6 +3768,47 @@ class PayoutStateService:
         *,
         invalidate_published: bool = False,
     ) -> None:
+        """Drop a candidate's payout transition, withdrawing a published preview.
+
+        Every path that drops a LANDED transition releases the barrier that
+        fenced reorg reconciliation, payout-state publication, and (through
+        both) job delivery, so the pending external-tip refresh is woken
+        here -- at the release itself -- rather than by whichever caller
+        remembers to (#414 review): the abandon path, the landing's
+        already-confirmed replay, the ancestor re-drive sweep, and the
+        exact-idempotent clears all resume delivery on the same wave
+        instead of waiting out the poller's failure holdoff.
+        """
+        released_landed = self._drop_accepted_block_payout_preview(
+            block_hash,
+            invalidate_published=invalidate_published,
+        )
+        if released_landed:
+            self._wake_tip_refresh_after_landed_release(block_hash)
+
+    def _wake_tip_refresh_after_landed_release(self, block_hash: str) -> None:
+        """Wake the pending tip refresh once a landed barrier is gone.
+
+        Runs with no payout lock held: the retry signal takes the runtime
+        lock, and the barrier locks are never nested inside it.
+        """
+        runtime = self._runtime
+        schedule = getattr(runtime, "_schedule_tip_refresh_retry", None)
+        if not callable(schedule):
+            return
+        schedule()
+
+    def _drop_accepted_block_payout_preview(
+        self,
+        block_hash: str,
+        *,
+        invalidate_published: bool,
+    ) -> bool:
+        """Body of ``_clear_accepted_block_payout_preview``.
+
+        Returns whether the dropped transition had landed, i.e. whether this
+        call released the reconciliation/publication barrier.
+        """
         runtime = self._runtime
         runtime._ensure_job_cache_state()
         key = block_hash.lower()
@@ -3781,14 +3825,15 @@ class PayoutStateService:
                             None,
                         )
                     runtime._accepted_block_payout_preview_condition.notify_all()
-                    return
+                    return False
+                released_landed = bool(existing.landed)
                 if not invalidate_published:
                     # Durable state now equals the published prospective view;
                     # removing the override changes no logical payout state.
                     runtime._accepted_block_payout_previews.pop(key, None)
                     runtime._invalidated_accepted_block_payout_previews.pop(key, None)
                     runtime._accepted_block_payout_preview_condition.notify_all()
-                    return
+                    return released_landed
                 if existing.preview is None:
                     # Nothing crossed a generation boundary. A landed
                     # transition still becomes a tombstone so descendants
@@ -3799,7 +3844,7 @@ class PayoutStateService:
                             existing.block_height
                         )
                     runtime._accepted_block_payout_preview_condition.notify_all()
-                    return
+                    return released_landed
 
             captured = runtime._capture_payout_state_source()
             reserved = runtime._reserve_payout_state_source_if_current(
@@ -3856,6 +3901,7 @@ class PayoutStateService:
                         existing.block_height
                     )
                     runtime._accepted_block_payout_preview_condition.notify_all()
+            return released_landed
 
     def _accepted_block_payout_transition_landed(self, block_hash: str) -> bool:
         runtime = self._runtime
