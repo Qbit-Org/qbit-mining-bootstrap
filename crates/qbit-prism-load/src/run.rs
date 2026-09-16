@@ -29,7 +29,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -1014,10 +1014,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             }
         })
     };
+    // One fence for the whole run: every session stamps the records it builds
+    // with it, and each mid-flight kill bumps it once at the instant of the
+    // SIGKILL, so "before this kill" is the same fact for the sessions, the
+    // collector and the driver.
+    let kill_fence = Arc::new(AtomicU64::new(0));
     let shared_session = Arc::new(SessionShared {
         phase: std::sync::RwLock::new("setup".to_owned()),
         events: events_tx,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: kill_fence.clone(),
     });
     let mut sessions: Vec<SessionHandle> = Vec::with_capacity(args.sessions);
     // One deadline for everything that waits on the server to answer a
@@ -1217,6 +1223,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &mut remaining_blocks,
             &mut remaining_tips,
             &collected,
+            &kill_fence,
         )
         .await?;
         // The phase's bounds are when it started and stopped scheduling; a
@@ -1954,6 +1961,10 @@ pub async fn drive_phase(
     remaining_blocks: &mut usize,
     remaining_tips: &mut usize,
     collected: &Arc<Mutex<Collected>>,
+    // The run's mid-flight kill fence, shared with every session through
+    // `client::SessionShared`: a kill in this phase bumps it once, and the
+    // bumped value is the census boundary.
+    kill_fence: &Arc<AtomicU64>,
 ) -> Result<PhaseOutcome> {
     let started = Instant::now();
     let duration = Duration::from_secs(plan.seconds);
@@ -2139,7 +2150,7 @@ pub async fn drive_phase(
                 index,
                 restart_ready_limit,
                 restart_drain_limit,
-                collected,
+                kill_fence.clone(),
             ));
         }
         if let Some(driver) = kill.as_mut() {
@@ -2266,21 +2277,33 @@ fn offer_round_robin(
     false
 }
 
-/// The submits whose answer the kill destroyed: every no-response recorded
-/// since the kill began -- `since` is the length of the submit log at that
-/// instant -- on the killed frontend's own sessions. A no-response from a
-/// session on another frontend in the same window (a socket closed for its
-/// own reasons) is not the kill's and is neither counted in its census nor
-/// re-offered as one of its shares (EP-STATE).
+/// The submits whose answer the kill destroyed: every no-response on the
+/// killed frontend's own sessions that was *built* at or after the kill.
+///
+/// Membership is the record's own identity, not its position in the log.
+/// `fence_at_kill` is the value [`crate::kill::KillDriver`] published from the
+/// run's kill fence immediately before the SIGKILL, and each record carries
+/// the fence its session read as it built the record. So a no-response the
+/// session emitted before the kill and that reached the collector afterwards
+/// -- queued behind a slow collector, then flushed by the kill's own census
+/// barriers -- is below the fence and is not the kill's, even though it lands
+/// in the log after records that are. Treating it as the kill's exempted an
+/// unrelated mid-run disconnect from the ordinary no-response check and could
+/// suppress exit 5 on a share that had committed (EP-STATE).
+///
+/// A no-response from a session on another frontend (a socket closed for its
+/// own reasons), and a re-offer's own record, are likewise not the kill's and
+/// are neither counted in its census nor re-offered as one of its shares.
 pub fn indeterminate_after_kill(
     records: &[SubmitRecord],
-    since: usize,
+    fence_at_kill: u64,
     frontend: usize,
 ) -> Vec<SubmitRecord> {
-    records[since.min(records.len())..]
+    records
         .iter()
         .filter(|record| {
-            record.frontend == frontend
+            record.fence >= fence_at_kill
+                && record.frontend == frontend
                 && !record.reoffer
                 && matches!(record.outcome, Outcome::NoResponse { .. })
         })

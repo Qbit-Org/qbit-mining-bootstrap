@@ -145,8 +145,9 @@ async fn physically_pruned_dependency_repairs_exact_original_after_tip_returns_a
 }
 
 #[tokio::test]
-async fn delayed_publication_repairs_dependency_without_renewing_issued_deadline() {
+async fn delayed_publication_rejects_expired_reservation_without_renewing_it() {
     let f = Fixture::new(Duration::from_secs(10)).await;
+    let original = f.coordinator.prepared.read().await.clone().unwrap();
     let save = Arc::new(Gate::default());
     *f.store.save_gate.lock().unwrap() = Some(save.clone());
     let refresh = tokio::spawn({
@@ -160,30 +161,22 @@ async fn delayed_publication_repairs_dependency_without_renewing_issued_deadline
     ready.entered.notified().await;
     f.store.clock_offset_ms.store(200_000, Ordering::SeqCst);
     ready.release.notify_one();
-    refresh.await.unwrap().unwrap();
-    let issued = job(&f).await;
-    assert!(f
-        .store
-        .job(&issued.context.prepared.storage_key)
+    assert!(refresh
         .await
         .unwrap()
-        .is_none());
-    persist(&f, &issued).await.unwrap();
-    assert!(f
-        .coordinator
-        .resume_job(&issued.context.worker, &issued.wire.job_id)
-        .await
-        .unwrap()
-        .is_some());
-    f.store.clock_offset_ms.store(201_000, Ordering::SeqCst);
-    assert!(
-        persist(&f, &issued).await.is_err(),
-        "a duplicate must not extend its original deadline"
-    );
-    assert_eq!(
-        f.store.jobs.lock().unwrap()[&issued.wire.job_id].expires_at_ms,
-        330_000
-    );
+        .unwrap_err()
+        .to_string()
+        .contains("reservation deadline elapsed"));
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &original
+    ));
+    let rows = f.store.jobs.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    let reserved = rows.values().next().unwrap();
+    assert_eq!(reserved.payload["original_expires_at_ms"], 265_000);
+    assert_eq!(reserved.expires_at_ms, 265_000);
+    assert!(reserved.expires_at_ms < f.store.database_now());
 }
 
 #[tokio::test]
@@ -286,7 +279,14 @@ async fn canceled_serializer_keeps_capacity_and_repair_guard_until_actual_comple
         2,
         "canceled leader never committed; follower repairs once after it finishes"
     );
+    // Persistence completion queues CompactOwner cleanup off runtime. The
+    // returned follower task does not join that cleanup, which still owns its
+    // repair guard. Synchronize on that actual owner instead of racing Drop.
+    let cleaned_up = tokio::time::timeout(Duration::from_secs(5), prepared.repair.lock())
+        .await
+        .expect("completed repair must release its cleanup owner");
     assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+    drop(cleaned_up);
     assert!(prepared.repair.try_lock().is_ok());
     assert!(!f.store.jobs.lock().unwrap().contains_key(&first_id));
 }
@@ -322,9 +322,12 @@ async fn competing_repair_preserves_immutable_original_or_rejects() {
         let (f, probe) = probe_fixture().await;
         let issued = job(&f).await;
         let key = issued.context.prepared.storage_key.clone();
-        let mut original = serde_json::to_value(&issued.context.prepared.stored).unwrap();
+        let mut original =
+            serde_json::to_value(&issued.context.prepared.reservation.record).unwrap();
+        original["original_expires_at_ms"] =
+            json!(issued.context.prepared.reservation.original_expires_at_ms);
         if conflict {
-            original["coinbase_suffix"] = json!("changed");
+            original["coinbase_suffix_hex"] = json!("abcdef");
         }
         let pending = spawn_save(&f, issued);
         probe.0.entered.notified().await;
@@ -362,11 +365,12 @@ async fn normal_issuance_shares_backing_without_running_cold_serializer() {
     let f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
     let prepared = f.coordinator.prepared.read().await.clone().unwrap();
-    assert!(Arc::ptr_eq(&prepared.stored.snapshot, &prepared.snapshot));
-    assert!(Arc::ptr_eq(
-        prepared.stored.bundle.as_ref().unwrap(),
-        prepared.bundle.as_ref().unwrap()
-    ));
+    assert_eq!(prepared.snapshot.anchor_ms, prepared.window.anchor_ms);
+    assert_eq!(prepared.reservation.record.window, prepared.window);
+    assert_eq!(
+        prepared.reservation.record.payout_revision,
+        prepared.snapshot.payout_revision
+    );
     let probe = Arc::new(prepared_storage::RepairProbe::default());
     probe.release();
     *prepared.repair_probe.lock().unwrap() = Some(probe.clone());

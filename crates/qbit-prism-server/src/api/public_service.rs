@@ -2,6 +2,8 @@
 //! mutation is available through this role.
 #[cfg(test)]
 mod metrics_tests;
+#[cfg(test)]
+mod readiness_tests;
 
 use super::*;
 use anyhow::{ensure, Context, Result};
@@ -99,12 +101,102 @@ impl ServiceConfig {
     }
 }
 
+/// Only fixed diagnostics cross the readiness boundary. Never retain a driver
+/// message, source chain, DSN, SQL identifier, or unrecognized SQLSTATE here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeFailure {
+    Authentication,
+    Access,
+    Connection,
+    Configuration,
+    Schema,
+    Timeout,
+    Canceled,
+    Readiness,
+}
+impl ProbeFailure {
+    fn from_sqlx(error: &sqlx::Error) -> Self {
+        match error {
+            sqlx::Error::Database(error) => match error.code().as_deref() {
+                Some("28000" | "28P01") => Self::Authentication,
+                Some("42501") => Self::Access,
+                Some("3F000" | "42P01" | "42703") => Self::Schema,
+                Some(
+                    "08000" | "08001" | "08003" | "08004" | "08006" | "08007" | "08P01" | "53300"
+                    | "57P01" | "57P02" | "57P03" | "3D000",
+                ) => Self::Connection,
+                // PostgreSQL uses the same code for statement_timeout and an
+                // operator cancellation; neither the code nor the probe phase
+                // proves which happened. Do not inspect localized driver text.
+                Some("57014") => Self::Canceled,
+                _ => Self::Readiness,
+            },
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed => Self::Connection,
+            sqlx::Error::Configuration(_) => Self::Configuration,
+            sqlx::Error::PoolTimedOut => Self::Timeout,
+            _ => Self::Readiness,
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Access => "access",
+            Self::Connection => "connection",
+            Self::Configuration => "configuration",
+            Self::Schema => "schema",
+            Self::Timeout => "timeout",
+            Self::Canceled => "cancellation",
+            Self::Readiness => "readiness",
+        }
+    }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::Authentication => "database authentication failed",
+            Self::Access => "database access denied",
+            Self::Connection => "database connection failed",
+            Self::Configuration => "database connection configuration is invalid",
+            Self::Schema => "native public read schema is incomplete",
+            Self::Timeout => "database probe timed out",
+            Self::Canceled => "database readiness query was canceled",
+            Self::Readiness => "database readiness query failed",
+        }
+    }
+
+    fn operator_action(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "check public-reader credentials and database authentication rules"
+            }
+            Self::Access => "check public-reader schema, table, and monitoring grants",
+            Self::Connection => {
+                "check database availability, network, TLS, database name, and connection limits"
+            }
+            Self::Configuration => "check public-reader connection configuration",
+            Self::Schema => "check schema migrations and public-reader search_path",
+            Self::Timeout => "check database availability, network, connection limits, pool availability, load, and query latency",
+            Self::Canceled => "check database statement deadlines and operator query cancellations",
+            Self::Readiness => "check database service logs and readiness query compatibility",
+        }
+    }
+
+    fn log(self, phase: &'static str) {
+        tracing::warn!(
+            category = self.category(),
+            phase,
+            action = self.operator_action(),
+            "public readiness probe failed"
+        );
+    }
+}
+
 #[derive(Default)]
 struct ProbeSnapshot {
     ready: bool,
     checked: Option<Instant>,
     checked_at: Option<String>,
-    last_error: Option<String>,
+    last_error: Option<ProbeFailure>,
     replica: Option<Value>,
     replica_at: Option<Instant>,
 }
@@ -137,16 +229,18 @@ impl ServiceState {
             let schema_ready =
                 sqlx::query_scalar::<_, bool>(include_str!("queries/read_schema_ready.sql"))
                     .fetch_one(&self.pool)
-                    .await?;
+                    .await
+                    .map_err(|error| ("schema", error))?;
             let mut value = if self.config.replica_required {
                 sqlx::query_scalar::<_, Value>(include_str!("queries/read_replica_status.sql"))
                     .fetch_one(&self.pool)
-                    .await?
+                    .await
+                    .map_err(|error| ("replica", error))?
             } else {
                 json!({})
             };
             value["schema_ready"] = json!(schema_ready);
-            Ok::<_, sqlx::Error>(value)
+            Ok::<_, (&str, sqlx::Error)>(value)
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let result = READ_DEADLINE
@@ -155,25 +249,35 @@ impl ServiceState {
         let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         snapshot.checked = Some(Instant::now());
         snapshot.checked_at = Some(now());
-        match result {
+        let failure = match result {
             Ok(Ok(value)) => {
                 snapshot.ready = value["schema_ready"] == true
                     && (!self.config.replica_required || value["in_recovery"] == true);
-                snapshot.last_error = (value["schema_ready"] != true)
-                    .then(|| "native public read schema is incomplete".into());
+                snapshot.last_error =
+                    (value["schema_ready"] != true).then_some(ProbeFailure::Schema);
                 if self.config.replica_required {
                     snapshot.replica = Some(value);
                     snapshot.replica_at = Some(Instant::now());
                 }
+                snapshot.last_error.map(|failure| (failure, "schema"))
             }
-            Ok(Err(error)) => {
+            Ok(Err((phase, error))) => {
                 snapshot.ready = false;
-                snapshot.last_error = Some(error.to_string());
+                let failure = ProbeFailure::from_sqlx(&error);
+                snapshot.last_error = Some(failure);
+                Some((failure, phase))
             }
             Err(_) => {
                 snapshot.ready = false;
-                snapshot.last_error = Some("database probe timed out".into());
+                snapshot.last_error = Some(ProbeFailure::Timeout);
+                Some((ProbeFailure::Timeout, "probe"))
             }
+        };
+        // A synchronous operator log sink can block. Publish the snapshot and
+        // release its lock first so health requests can still read the result.
+        drop(snapshot);
+        if let Some((failure, phase)) = failure {
+            failure.log(phase);
         }
     }
     pub(super) fn view(&self) -> ServiceView {
@@ -200,7 +304,7 @@ impl ServiceState {
         } else if age.is_some_and(|age| age > stale_after) {
             payload["error"] = json!("readiness probe is stale");
         } else if let Some(error) = &snapshot.last_error {
-            payload["error"] = json!(error);
+            payload["error"] = json!(error.public_message());
         } else if !database_ready {
             payload["error"] = json!("readiness probe returned false");
         }
@@ -551,6 +655,7 @@ mod tests {
             error.as_database_error().and_then(|e| e.code()).as_deref(),
             Some("57014")
         );
+        assert_eq!(ProbeFailure::from_sqlx(&error), ProbeFailure::Canceled);
         assert!(
             started.elapsed() < Duration::from_millis(850),
             "second query received a fresh budget"

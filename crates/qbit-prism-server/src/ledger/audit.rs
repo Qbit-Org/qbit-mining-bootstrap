@@ -344,8 +344,7 @@ fn oldest_boundary(weight: u128, shares: &[AcceptedShare]) -> Result<OldestBound
 /// change, so nothing this proves can change before the transaction; the
 /// in-transaction count guard in [`persist_audit_snapshot`] covers cardinality
 /// again under the lock. It does not establish the boundaries by itself.
-// Keep the pool + metrics seam that composes #379's independent boundary proof;
-// revisit it with the remaining #352 callers, retaining the shared observer.
+// Observe each checkout at its statement boundary, before comparison or folding.
 pub(super) async fn verify_durable_range(
     pool: &PgPool,
     snapshot: &AuditSnapshotWrite,
@@ -361,7 +360,7 @@ pub(super) async fn verify_durable_range(
             anchored_eligibility_sql(1)
         ))
         .bind(snapshot.anchor_ms)
-        .fetch_one(pool)
+        .fetch_one(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?)
         .await?;
         ensure!(!any, "bootstrap audit window omits canonical shares");
         return Ok(());
@@ -419,7 +418,7 @@ pub(super) async fn verify_durable_range(
     // ordering lock but not by legacy/raw rows. Those rows may hide a later
     // eligible share behind an ineligible one, so keep both timestamp filters.
     let newer: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 ORDER BY share_seq LIMIT 1", anchored_eligibility_sql(2)))
-        .bind(last).bind(anchor).fetch_optional(pool).await?;
+        .bind(last).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
     ensure!(
         newer.is_none(),
         "audit share snapshot omits newest canonical share"
@@ -434,7 +433,7 @@ pub(super) async fn verify_durable_range(
     .await??;
     if boundary == OldestBoundary::Partial {
         let older: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 1", anchored_eligibility_sql(2)))
-            .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(pool).await?;
+            .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         ensure!(
             older.is_none(),
             "audit share snapshot omits oldest canonical shares"

@@ -90,11 +90,14 @@ pub fn assert_refresh_measurements(
     ensure!(jsonb > 0, "no refresh JSONB write was observed");
     ensure!(
         jsonb < JSONB_LIMIT_BYTES,
-        "refresh JSONB value is not under 1 MB"
+        "refresh JSONB value is not under 1 MB: observed={jsonb} limit={JSONB_LIMIT_BYTES}"
     );
     let wal = wal_bytes.context("refresh WAL measurement unavailable")?;
     ensure!(wal > 0, "no WAL was observed for the logged refresh write");
-    ensure!(wal < WAL_LIMIT_BYTES, "refresh WAL is not under 5 MB");
+    ensure!(
+        wal < WAL_LIMIT_BYTES,
+        "refresh WAL is not under 5 MB: observed={wal} limit={WAL_LIMIT_BYTES}"
+    );
     Ok(())
 }
 

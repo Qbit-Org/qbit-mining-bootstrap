@@ -173,11 +173,14 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 7. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.
    A third of the way in, one frontend is killed while its sessions hold
    work. Its sessions are paused before the kill so new offers cannot hide
-   the old pending work. After relaunch and `/healthz`, the harness waits
-   for their outstanding counts to reach zero and for the collector to
-   acknowledge each session's queued records. Only then are the sessions
-   resumed and every share whose answer the kill destroyed re-offered with
-   exactly the header it carried. The census has one shared deadline of the
+   the old pending work, and the kill bumps a run-wide fence in the instant
+   before the SIGKILL. Every submit record carries the fence its session read
+   as it built the record, so what the kill owns is decided by the record's
+   own identity rather than by where it landed in the submit log. After
+   relaunch and `/healthz`, the harness waits for their outstanding counts to
+   reach zero and for the collector to acknowledge each session's queued
+   records. Only then are the sessions resumed and every share whose answer
+   the kill destroyed re-offered with exactly the header it carried. The census has one shared deadline of the
    share-commit timeout plus the 10 s drain margin; incomplete accounting
    aborts the run (exit 6) and withholds the artifact. Like the restart above,
    it is polled from the scheduler loop and never awaited, so the healthy
@@ -796,8 +799,12 @@ The side report repeats all of this under `honest_value_notes`.
   `unknown` with the reason rather than as `none` in one direction or
   `async` in the other, and it is a contradicted premise as well: a run
   that cannot tell whether its standby exists has not established the
-  conditions it claims. `database.replication` in the side report carries
-  the same observations.
+  conditions it claims. A standby is synchronous when `pg_stat_replication`
+  reports it `sync`, as under the managed `FIRST 1 (...)`, or `quorum`, as
+  under an external `synchronous_standby_names = 'ANY n (...)'`; a
+  `potential` standby is not synchronous, since no commit waits on it, and
+  a cluster with only `potential` and `async` rows is observed as `async`.
+  `database.replication` in the side report carries the same observations.
 
 ## Reconciliation
 
@@ -876,6 +883,24 @@ cause -- a socket on the healthy frontend closing for its own reasons -- is in
 of the kill's indeterminate shares is left to the census, where its re-offer
 and its PostgreSQL outcome already are. A kill that found nothing outstanding
 has an empty census and exempts nothing.
+
+Membership in that census is the record's fence, not its arrival order. The
+boundary used to be the submit log's length at the kill, and pausing the
+sessions first does not close the hole: a no-response the session had already
+emitted could still be queued behind a busy collector, and the kill's own
+post-kill barriers then flushed it into the log *after* the kill's own
+records. It was read as kill-induced, exempted from the ordinary mid-run
+no-response check, and if that share had committed the run stopped exiting 5
+on an unrelated disconnect. Each record now carries the fence value that was
+current when it was built, and the census is the killed frontend's own
+non-re-offered no-responses whose fence is at or above the one the kill
+published; delivery lag cannot move a record across it. The fence is
+published immediately before the signal rather than after it, so a
+no-response the SIGKILL itself caused cannot fall below the boundary: a
+nanosecond of over-inclusion costs a re-offer, while under-inclusion would
+report the kill's own share as a transport loss the run has to answer for.
+The post-kill barriers stay: the fence decides which records are the kill's,
+the barriers prove they have all been applied before the census is read.
 
 ## Measurement hygiene
 
