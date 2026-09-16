@@ -12,6 +12,9 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CHECK_ENV = ROOT_DIR / "scripts" / "check-env.sh"
+FAKE_PUBLIC_VALIDATION = ('if [ "$1" = compose ]; then\n'
+                          '  echo "PRISM public database configuration valid; authentication is checked by readiness"\n'
+                          'fi\n')
 class CheckEnvProductionGateTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -96,7 +99,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         fake_bin = root / "bin"
         fake_bin.mkdir()
         docker = fake_bin / "docker"
-        docker.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+        # These tests isolate the surrounding production gates. Credential
+        # validation itself is qualified through the native CLI/image tests.
+        docker.write_text(
+            '#!/bin/sh\n' + FAKE_PUBLIC_VALIDATION + f'exit {exit_code}\n', encoding="utf-8")
         docker.chmod(0o755)
         return fake_bin
 
@@ -1075,7 +1081,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             docker_calls = root / "docker-calls"
             docker = minimal_bin / "docker"
             docker.write_text(
-                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n',
+                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n' + FAKE_PUBLIC_VALIDATION,
                 encoding="utf-8",
             )
             docker.chmod(0o755)
@@ -1210,7 +1216,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             docker = fake_bin / "docker"
-            docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            docker.write_text("#!/bin/sh\n" + FAKE_PUBLIC_VALIDATION + "exit 0\n", encoding="utf-8")
             docker.chmod(0o755)
             common = self.production_prism_env(root)
             common.update({
@@ -1314,7 +1320,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             fake_bin = self.write_fake_docker(root)
             docker_calls = root / "docker-calls"
             (fake_bin / "docker").write_text(
-                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n',
+                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n' + FAKE_PUBLIC_VALIDATION,
                 encoding="utf-8",
             )
             common = self.production_prism_env(root)

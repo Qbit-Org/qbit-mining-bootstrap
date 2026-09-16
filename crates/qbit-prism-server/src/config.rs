@@ -10,7 +10,7 @@ use std::{env, time::Duration};
 mod database;
 mod environment;
 mod policy_transition;
-pub use database::DatabaseConfig;
+pub use database::{public_database_options_from_env, DatabaseConfig};
 pub use environment::check_environment;
 pub(crate) use policy_transition::transition_configs;
 
