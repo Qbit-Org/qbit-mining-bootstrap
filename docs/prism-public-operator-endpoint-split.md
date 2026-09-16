@@ -29,7 +29,7 @@ database names, hostnames, addresses, or server-provided SQL identifiers:
 | Connection | `database connection failed` | Database availability, network, TLS, database name, connection limits |
 | Configuration | `database connection configuration is invalid` | Public-reader connection configuration |
 | Schema | `native public read schema is incomplete` | Schema migrations and public-reader `search_path` |
-| Timeout | `database probe timed out` | Database load, pool availability, probe query latency |
+| Timeout | `database probe timed out` | Database availability, network, connection limits, pool availability, load, query latency |
 | Cancellation | `database readiness query was canceled` | Database statement deadlines and operator query cancellations |
 | Other query/driver failure | `database readiness query failed` | Database service logs and readiness query compatibility |
 
@@ -48,6 +48,15 @@ its source chain, or even an unrecognized SQLSTATE. Consult access-controlled
 database logs and deployment configuration for detailed investigation; do not
 publish those sources or enable verbose driver logging on a public diagnostics
 surface. This boundary applies to readiness diagnostics, not every runtime log.
+
+Categories describe the error that reaches the probe, not necessarily the first
+underlying cause. SQLx retries refused connections and PostgreSQL connection
+errors `53300` (connection limit) and `57P03` (cannot connect now). The existing
+five-second probe deadline expires before the pool's acquisition deadline, so
+these outages report timeout, as does an exhausted pool. Check reachability and
+connection limits as well as query latency for timeout warnings. Non-retried
+connection errors, such as a missing database, can report connection directly.
+No retry or deadline policy is changed by this diagnostic categorization.
 
 Compatibility: this intentionally reduces database error detail in the existing
 string-valued `error` field. The `qbit.prism.public-read-health.v1` schema, all

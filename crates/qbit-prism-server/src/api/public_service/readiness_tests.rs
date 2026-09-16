@@ -76,7 +76,7 @@ async fn health(app: &Router, expected_status: StatusCode) -> Value {
 // Return a real PostgreSQL ErrorResponse to SQLx using entirely synthetic
 // fields. This tests the actual probe -> driver -> HTTP/log boundary without
 // requiring a database or connecting to the caller's database.
-async fn error_pool(code: &str) -> (PgPool, tokio::task::JoinHandle<()>) {
+async fn error_pool(code: &str, responses: usize) -> (PgPool, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let fields = format!(
@@ -84,14 +84,16 @@ async fn error_pool(code: &str) -> (PgPool, tokio::task::JoinHandle<()>) {
     )
     .into_bytes();
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let size = socket.read_u32().await.unwrap();
-        assert!((8..4096).contains(&size));
-        let mut startup = vec![0; size as usize - 4];
-        socket.read_exact(&mut startup).await.unwrap();
-        socket.write_u8(b'E').await.unwrap();
-        socket.write_u32(fields.len() as u32 + 4).await.unwrap();
-        socket.write_all(&fields).await.unwrap();
+        for _ in 0..responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let size = socket.read_u32().await.unwrap();
+            assert!((8..4096).contains(&size));
+            let mut startup = vec![0; size as usize - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            socket.write_u8(b'E').await.unwrap();
+            socket.write_u32(fields.len() as u32 + 4).await.unwrap();
+            socket.write_all(&fields).await.unwrap();
+        }
     });
     let options = PgConnectOptions::new_without_pgpass()
         .host("127.0.0.1")
@@ -127,7 +129,7 @@ async fn database_failures_are_categorized_without_public_or_operator_secrets() 
             "database readiness query failed",
         ),
     ] {
-        let (pool, server) = error_pool(code).await;
+        let (pool, server) = error_pool(code, 1).await;
         let (app, service) = service(pool, ServiceConfig::default());
         let logs = LogCapture::default();
         let writer = logs.clone();
@@ -365,4 +367,58 @@ async fn blocked_operator_log_does_not_hold_the_health_snapshot_lock() {
     probe.join().unwrap();
     entered_log.unwrap();
     assert_eq!(published, Some((false, Some(ProbeFailure::Connection))));
+}
+
+#[tokio::test]
+async fn retried_connection_failures_report_timeout_with_outage_guidance() {
+    for code in [None, Some("53300"), Some("57P03")] {
+        let (pool, server) = if let Some(code) = code {
+            // Prove SQLx actually retries these PostgreSQL errors. After three
+            // responses, closing the fixture listener leaves refused retries.
+            let (pool, server) = error_pool(code, 3).await;
+            (pool, Some(server))
+        } else {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let options = PgConnectOptions::new_without_pgpass()
+                .host("127.0.0.1")
+                .port(listener.local_addr().unwrap().port())
+                .username("synthetic_role")
+                .password("synthetic_password")
+                .database("synthetic_database")
+                .ssl_mode(PgSslMode::Disable);
+            drop(listener);
+            (read_pool(options, 1), None)
+        };
+        let (app, service) = service(pool, ServiceConfig::default());
+        let logs = LogCapture::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            service.probe_once().with_subscriber(subscriber),
+        )
+        .await
+        .unwrap();
+        if let Some(server) = server {
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(body["error"], "database probe timed out");
+        assert_eq!(body["database_ready"], false);
+        let logs = logs.text();
+        assert!(logs.contains("category=\"timeout\""), "{logs}");
+        assert!(logs.contains("phase=\"probe\""), "{logs}");
+        assert!(logs.contains("check database availability, network, connection limits"));
+        assert_private_absent(&logs);
+        tokio::time::timeout(Duration::from_secs(1), service.pool.close())
+            .await
+            .unwrap();
+    }
 }

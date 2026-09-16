@@ -176,7 +176,7 @@ impl ProbeFailure {
             }
             Self::Configuration => "check public-reader connection configuration",
             Self::Schema => "check schema migrations and public-reader search_path",
-            Self::Timeout => "check database load, pool availability, and probe query latency",
+            Self::Timeout => "check database availability, network, connection limits, pool availability, load, and query latency",
             Self::Canceled => "check database statement deadlines and operator query cancellations",
             Self::Readiness => "check database service logs and readiness query compatibility",
         }
