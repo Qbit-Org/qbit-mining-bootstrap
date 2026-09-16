@@ -102,6 +102,33 @@ idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
 
+### Two drains, one for each era
+
+**Legacy rows and native rows have different drains.** Every `2.x.x` candidate
+must be drained with the pinned legacy image *before* migrating, as in step 1
+above and in [the drain requirement](#supported-2xx-source-schemas); the
+migrator refuses while any remains. The native `qbit-prism-server candidates`
+commands act on native-era rows only — they cannot read a chunked v2 body or a
+pre-migration v1 document, and running them neither satisfies nor bypasses the
+migrator's drain check.
+
+Use them after the cutover, on rows this release wrote:
+
+```sh
+qbit-prism-server candidates list
+qbit-prism-server candidates abandon --block-hash <hash> --reason "<nonblank explanation>"
+```
+
+`candidates list` exits zero on an empty list, so it is the check a `set -e`
+runbook waits on before stopping native frontends; `candidates abandon` applies
+to a `pending` row only and refuses everything the node may already have been
+offered. Both are documented in full under
+[Candidate commands](prism-ledger-ops.md#candidate-commands). A pre-migration
+row reaching a native frontend is parked by the claim lane with a `last_error`
+naming its `storage_version`; `candidates list` shows it, but the answer is
+still the legacy drain, with the pinned `2.x.x` image, never an operator
+abandon.
+
 ### Supported 2.x.x source schemas
 
 The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0
