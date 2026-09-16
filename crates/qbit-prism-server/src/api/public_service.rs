@@ -8,10 +8,9 @@ mod readiness_tests;
 use super::*;
 use anyhow::{ensure, Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use std::{
-    str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+#[cfg(test)]
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 tokio::task_local! { pub(super) static READ_DEADLINE: Option<tokio::time::Instant>; }
@@ -462,9 +461,7 @@ pub async fn run_from_env(mut shutdown: watch::Receiver<bool>) -> Result<()> {
         "PRISM_PUBLIC_STRATUM_URL must be a stratum+tcp URL"
     );
     let config = ServiceConfig::from_env()?;
-    let database = std::env::var("PRISM_DATABASE_URL")
-        .context("PRISM_DATABASE_URL is required by the public service")?;
-    let options = PgConnectOptions::from_str(&database)?.application_name("prism-public-read");
+    let options = config::public_database_options_from_env()?;
     let pool = read_pool(options, config.read_concurrency);
     let (app, service) = router(
         ApiState::new(

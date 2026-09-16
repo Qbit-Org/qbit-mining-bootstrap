@@ -3,7 +3,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy};
 use qbit_prism_server::api::{self, ApiConfig, ApiState};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::{io::Write, path::Path, process::Stdio, sync::Arc};
 use tokio::process::Command;
 use tower::ServiceExt;
@@ -343,17 +343,91 @@ pub async fn restore(
         .join("\n")
         .replace(&format!("CREATE SCHEMA {};", source.schema), "")
         .replace(&source.schema, &target.schema);
-    let mut transaction = target.pool.begin().await?;
-    sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
-    // pg_restore's SQL clears search_path. Return this pooled connection to
-    // the fixture's schema before reusing it: qualifying an outer DELETE is
-    // insufficient when its trigger body resolves unqualified ledger tables.
-    sqlx::query("SELECT pg_catalog.set_config('search_path',$1,false)")
-        .bind(&target.schema)
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
-    Ok(())
+    // The SQL opens with session SET statements (search_path, lock_timeout,
+    // statement_timeout, ...) that survive COMMIT, so it runs on a session of
+    // its own that is closed afterwards, never on one that would carry those
+    // settings back into `target.pool`. Only the URL, which pins search_path
+    // to the fixture schema, is shared with the pool.
+    let mut connection = PgConnection::connect(&target.url).await?;
+    let restored = async {
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&mut connection)
+            .await?;
+        ensure!(
+            schema == target.schema,
+            "restore session resolves {schema:?}, not the target schema {:?}",
+            target.schema
+        );
+        let mut transaction = connection.begin().await?;
+        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    // The session is closed on both paths; `restore_outcome` pins which
+    // error is reported when the close fails as well.
+    let closed = connection.close().await.map_err(anyhow::Error::from);
+    restore_outcome(restored, closed)
+}
+
+/// Combines the restore result with the result of closing its session.
+///
+/// The restore error wins: a failed close must not hide why the restore itself
+/// failed. A close failure is reported on its own only when the restore
+/// succeeded, and is appended to the restore error's message when both fail
+/// so it is not silently lost.
+fn restore_outcome(restored: Result<()>, closed: Result<()>) -> Result<()> {
+    match (restored, closed) {
+        (Ok(()), closed) => closed,
+        (Err(restore), Ok(())) => Err(restore),
+        (Err(restore), Err(close)) => {
+            let message =
+                format!("{restore:#}; closing the restore session also failed: {close:#}");
+            Err(restore.context(message))
+        }
+    }
+}
+
+#[test]
+fn restore_outcome_is_ok_when_restore_and_close_succeed() {
+    assert!(restore_outcome(Ok(()), Ok(())).is_ok());
+}
+
+#[test]
+fn restore_outcome_reports_the_restore_error_when_close_succeeds() {
+    let error = restore_outcome(Err(anyhow::anyhow!("restore boom")), Ok(()))
+        .expect_err("a failed restore must fail the outcome");
+    assert_eq!(error.to_string(), "restore boom");
+}
+
+#[test]
+fn restore_outcome_reports_the_close_error_when_restore_succeeds() {
+    let error = restore_outcome(Ok(()), Err(anyhow::anyhow!("close boom")))
+        .expect_err("a failed close must fail the outcome");
+    assert_eq!(error.to_string(), "close boom");
+}
+
+#[test]
+fn restore_outcome_prefers_the_restore_error_when_both_fail() {
+    let error = restore_outcome(
+        Err(anyhow::anyhow!("restore boom")),
+        Err(anyhow::anyhow!("close boom")),
+    )
+    .expect_err("two failures must fail the outcome");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("restore boom"),
+        "the restore error must lead the message: {message:?}"
+    );
+    assert!(
+        message.contains("close boom"),
+        "the close failure must not be lost from the message: {message:?}"
+    );
+    assert_eq!(
+        error.root_cause().to_string(),
+        "restore boom",
+        "the root cause must be the restore error, not the close error"
+    );
 }
 
 pub async fn evidence(db: &Database, pg_bin: &Path) -> Result<Value> {

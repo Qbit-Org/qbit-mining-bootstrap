@@ -176,6 +176,74 @@ reader credentials to that process, including any `PGPASSWORD` or password file.
 The shipped Compose service sets `PGPASSWORD` to empty when its reader carrier
 is unset, so it does not select a password file as an implicit replacement.
 
+#### Preflight and production policy
+
+`public-api` and `check-public-database-config` use the same SQLx options parser
+and production policy. The existing `DatabaseConfig` contract rejects the
+`change-this` marker anywhere in a production DSN. Public-reader validation also
+rejects that marker in the **effective decoded password**, including a URI or
+query password, `PGPASSWORD`, or a native SQLx password-file entry. An unused
+carrier does not override or invalidate an explicit non-default DSN password.
+The `qbit` role name is permitted; the lab password remains permitted outside
+production. This is a default-credential check, not a password-strength or
+database-role privilege check.
+
+Production is selected by the public process's `QBIT_PRODUCTION`,
+`QBIT_TOOLS_PRODUCTION`, or a `QBIT_CHAIN` of `main`/`mainnet`, following
+`DatabaseConfig`. A missing, empty, malformed, unsupported-scheme, or invalid
+SQLx-options **effective DSN** fails before connecting or opening the listener,
+with a value-free configuration error. Missing, empty, or incorrect **passwords**
+are not rejected solely for their absence: PostgreSQL may use another supported
+authentication mechanism. Password authentication failures remain readiness
+failures as described above. Validation neither connects to PostgreSQL nor
+proves authentication, grants, schema availability, or replication health.
+
+`scripts/check-env.sh` now runs this native validator for the Prism lane through
+the selected Compose public service, using the image and effective environment
+that deployment will use. `make doctor` and `make up-prism-pool` prepare tagged
+lab images before validation, including rebuilding an older image that lacks
+the validator. Production and digest-pinned artifacts must be pulled explicitly
+before doctor, following the mainnet runbook. The standalone script likewise
+requires a prepared image. The check starts no service dependencies and publishes no ports;
+its one-shot container is removed on exit. A missing/old image or failed
+launcher is a failed preflight, never a passing or skipped credential check.
+For Make entry points, use the same additional overlays in deployment order:
+
+```sh
+export COMPOSE_OVERLAY_FILES="compose.prism-external-db.yaml compose.prism-ha.yaml"
+MINING_LANES=prism make doctor
+make up-prism-pool
+```
+
+Make inserts `compose.production.yaml` before these overlays when either
+production flag or the main chain selects production. Set
+`PRISM_COMPOSE_SERVICES="qbitd prism-coordinator prism-coordinator-2 prism-public-api"`
+to start both HA frontends. Database dependencies follow the selected overlay.
+For standalone preflight, pass every overlay explicitly, for example from the
+repository root (relative `--compose-file` paths use the caller's directory):
+
+```sh
+DEPLOY_ENV_FILE=/absolute/path/deployment.env bash scripts/check-env.sh \
+  --compose-file compose.production.yaml \
+  --compose-file compose.prism-external-db.yaml \
+  --compose-file compose.prism-ha.yaml
+```
+
+`--public-reader-only` runs just this credential configuration preflight; it
+does not replace the other deployment checks. The preflight preserves Compose's
+environment precedence, explicit empty overrides, and base/external DSN
+fallbacks, without sourcing shell example defaults into the container. It
+uses only the public service's reader carrier and does not add a bootstrap or
+writer password. For direct binary execution, export the reader's
+`PRISM_DATABASE_URL` and, if needed, its `PGPASSWORD` or `PGPASSFILE`, then run
+`qbit-prism-server check-public-database-config` before `public-api`.
+Parser warnings are suppressed because they can contain configuration values.
+When a native password file does not authenticate, check its existence,
+ownership, restrictive permissions, and matching reader entry locally without
+printing its contents. Authentication tests require a disposable PostgreSQL
+fixture with password authentication enabled; a trust-auth fixture cannot
+exercise rejected passwords.
+
 ### What the bound actually bounds
 
 The enforced number is the **walreceiver heartbeat age**, not replay lag.

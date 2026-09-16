@@ -33,6 +33,8 @@ enum Command {
     PublicApi,
     /// Validate local configuration and key pairing without starting listeners.
     CheckConfig,
+    /// Validate public reader database options without connecting or listening.
+    CheckPublicDatabaseConfig,
     /// Probe HTTP or Stratum readiness without signing keys or database access.
     Healthcheck {
         #[arg(long)]
@@ -133,6 +135,13 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             println!(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
+            );
+            Ok(())
+        }
+        Command::CheckPublicDatabaseConfig => {
+            config::public_database_options_from_env()?;
+            println!(
+                "PRISM public database configuration valid; authentication is checked by readiness"
             );
             Ok(())
         }
