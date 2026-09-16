@@ -122,16 +122,16 @@ async fn cli_with_env(
     Ok(tokio::time::timeout(Duration::from_secs(20), command.output()).await??)
 }
 
-fn stdout(output: &Output) -> String {
+pub(super) fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn stderr(output: &Output) -> String {
+pub(super) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// The exit status decision 4 assigns to this outcome.
-fn code(output: &Output) -> i32 {
+pub(super) fn code(output: &Output) -> i32 {
     output.status.code().expect("the command was signalled")
 }
 
@@ -140,7 +140,7 @@ fn code(output: &Output) -> i32 {
 /// document at version 1 rather than rewriting it, which is exactly why
 /// `abandon` cannot read the version alone (#425).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Shape {
+pub(super) enum Shape {
     /// What this release writes since 007: the `window` reference beside
     /// `payout_revision` and `block_hash`, with the block out in
     /// `block_bytes`. The field names are `ledger::Candidate`'s.
@@ -163,22 +163,22 @@ enum Shape {
 /// One seeded outbox row. The defaults are an ordinary retrying `pending`
 /// row; each test changes only the fields its case is about.
 #[derive(Clone)]
-struct Row {
-    hash: String,
-    state: &'static str,
-    height: Option<i64>,
-    shape: Shape,
-    storage_version: i32,
-    attempt_count: i32,
-    last_error: Option<String>,
-    parked: bool,
-    due_in_seconds: f64,
-    claim: Option<(String, f64)>,
-    proof_observed_at_ms: Option<i64>,
+pub(super) struct Row {
+    pub(super) hash: String,
+    pub(super) state: &'static str,
+    pub(super) height: Option<i64>,
+    pub(super) shape: Shape,
+    pub(super) storage_version: i32,
+    pub(super) attempt_count: i32,
+    pub(super) last_error: Option<String>,
+    pub(super) parked: bool,
+    pub(super) due_in_seconds: f64,
+    pub(super) claim: Option<(String, f64)>,
+    pub(super) proof_observed_at_ms: Option<i64>,
 }
 
 impl Row {
-    fn new(byte: &str, state: &'static str) -> Self {
+    pub(super) fn new(byte: &str, state: &'static str) -> Self {
         Self {
             hash: byte.repeat(32),
             state,
@@ -282,7 +282,7 @@ fn candidate_document(row: &Row) -> Value {
 /// Seed `row` exactly as migration 011's lifecycle, payload and offer rules
 /// require for its state, so all four unfinished states and both terminal
 /// states can be held at once without driving six claims.
-async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
+pub(super) async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
     let terminal = matches!(row.state, "submitted" | "abandoned");
     let offered = matches!(row.state, "offer_reserved" | "offered" | "reconciliation");
     // `block_bytes` and the six window columns arrived with 007. A parked
@@ -332,7 +332,7 @@ async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
 }
 
 /// The whole row, for a byte-identical comparison across a refusal.
-async fn whole_row(pool: &PgPool, hash: &str) -> Result<Value> {
+pub(super) async fn whole_row(pool: &PgPool, hash: &str) -> Result<Value> {
     Ok(sqlx::query_scalar(
         "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
     )
@@ -366,7 +366,7 @@ fn row_of<'a>(listed: &'a [Value], hash: &str) -> &'a Value {
 
 /// Operator tools never register a frontend, so the only instance row is the
 /// ledger this test opened.
-async fn assert_no_new_instances(pool: &PgPool) -> Result<()> {
+pub(super) async fn assert_no_new_instances(pool: &PgPool) -> Result<()> {
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_prism_instances")
             .fetch_one(pool)
