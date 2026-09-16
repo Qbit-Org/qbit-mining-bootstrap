@@ -807,11 +807,13 @@ mod diagnostics {
             .any(|flag| value.trim().eq_ignore_ascii_case(flag))
     }
 
-    /// A value as written and as the inside of the Rust `{:?}` and JSON
-    /// string literals a child might print it in. The written value covers a
-    /// decoded password that carries a line break or a control character,
-    /// because `sanitize` matches secrets against the tail before anything
-    /// splits or rewrites it.
+    /// A value as written, as the inside of the Rust `{:?}` and JSON string
+    /// literals a child might print it in, and each of those with CRLF line
+    /// breaks collapsed. The written value covers a decoded password that
+    /// carries a line break or a control character, because `sanitize` matches
+    /// secrets against the tail before anything splits or rewrites it — but
+    /// `read_tail` strips a line's trailing carriage return before that, so a
+    /// CRLF inside a secret has to be registered as it will be seen.
     fn add(secrets: &mut Vec<String>, value: &str) {
         let value = value.trim();
         if value.is_empty() {
@@ -821,8 +823,15 @@ mod diagnostics {
         let json = serde_json::Value::from(value).to_string();
         // Both literals are quoted, so the inner slice is at ASCII boundaries.
         for form in [value, &debug[1..debug.len() - 1], &json[1..json.len() - 1]] {
-            if !secrets.iter().any(|known| known == form) {
-                secrets.push(form.into());
+            let stripped = form.replace("\r\n", "\n");
+            let mut forms = vec![form.to_owned()];
+            if stripped != form {
+                forms.push(stripped);
+            }
+            for form in forms {
+                if !secrets.contains(&form) {
+                    secrets.push(form);
+                }
             }
         }
     }
@@ -1786,6 +1795,15 @@ mod startup_diagnostics_tests {
                 "postgres://prism:multi%0Aline9@db/prism",
                 vec!["start multi\nline9 end".to_owned()],
                 strings(&["start [redacted] end"]),
+            ),
+            (
+                // read_tail strips each line's trailing carriage return, so a
+                // CRLF inside a secret is not there to match by the time
+                // sanitize runs.
+                "CRLF inside a decoded password".into(),
+                "postgres://prism:crlf%0D%0Apw9@db/prism",
+                vec!["before crlf\r\npw9 after".to_owned()],
+                strings(&["before [redacted] after"]),
             ),
             (
                 // Two URLs with only punctuation between them: the safe one
