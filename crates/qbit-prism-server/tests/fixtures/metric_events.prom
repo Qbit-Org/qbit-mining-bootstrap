@@ -10,6 +10,8 @@ qbit_prism_share_ack_seconds_bucket{result="accepted",le="1"} 5
 qbit_prism_share_ack_seconds_bucket{result="accepted",le="2.5"} 5
 qbit_prism_share_ack_seconds_bucket{result="accepted",le="5"} 6
 qbit_prism_share_ack_seconds_bucket{result="accepted",le="10"} 7
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="15"} 8
+qbit_prism_share_ack_seconds_bucket{result="accepted",le="20"} 8
 qbit_prism_share_ack_seconds_bucket{result="accepted",le="30"} 8
 qbit_prism_share_ack_seconds_bucket{result="accepted",le="+Inf"} 9
 qbit_prism_share_ack_seconds_sum{result="accepted"} 60.166
@@ -24,6 +26,8 @@ qbit_prism_share_ack_seconds_bucket{result="rejected",le="1"} 5
 qbit_prism_share_ack_seconds_bucket{result="rejected",le="2.5"} 5
 qbit_prism_share_ack_seconds_bucket{result="rejected",le="5"} 6
 qbit_prism_share_ack_seconds_bucket{result="rejected",le="10"} 7
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="15"} 8
+qbit_prism_share_ack_seconds_bucket{result="rejected",le="20"} 8
 qbit_prism_share_ack_seconds_bucket{result="rejected",le="30"} 8
 qbit_prism_share_ack_seconds_bucket{result="rejected",le="+Inf"} 9
 qbit_prism_share_ack_seconds_sum{result="rejected"} 60.166
@@ -43,6 +47,7 @@ qbit_prism_rejections_total{reason_id="pool-closed"} 1
 qbit_prism_rejections_total{reason_id="stale-job"} 1
 qbit_prism_rejections_total{reason_id="unauthorized-worker"} 1
 qbit_prism_rejections_total{reason_id="unknown-job"} 1
+qbit_prism_rejections_total{reason_id="unrecognised"} 1
 # HELP qbit_prism_stale_shares_total Shares rejected as stale or unknown jobs.
 # TYPE qbit_prism_stale_shares_total counter
 qbit_prism_stale_shares_total 2

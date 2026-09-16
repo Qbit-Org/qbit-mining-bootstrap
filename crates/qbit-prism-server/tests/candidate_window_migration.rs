@@ -13,7 +13,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     probe_share_rows, put_balance_snapshot, read_range_paged, BalanceSource, Candidate, Ledger,
-    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef,
+    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef, REQUIRED_SCHEMA_VERSIONS,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -28,16 +28,17 @@ const ANCHOR: i64 = 1_700_000_000_000;
 const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sql");
 /// Every version the membership runner installs except 007, so a database can
 /// be built in exactly the pre-007 state the runner then completes.
-/// Every native migration except 007 and 011, so a connect applies exactly
-/// those two and nothing else. #360's 010 and #321's 006 belong here for the
+/// Every native migration except 007, 011 and 012, so a connect applies
+/// those three and nothing else. #289's 014, #153's 013, #360's 010 and
+/// #321's 006 belong here for the
 /// same reason 008 and 009 do: leaving one out makes the connect apply a
-/// third migration, and the "only 007 ran" assertions then fail for a reason
+/// further migration, and the timestamp assertions then fail for a reason
 /// unrelated to 007. 006 matters most, because its own drain check refuses
 /// the very rows these tests hand to 007's, so without it the refusal under
 /// test never runs. #266's 011 cannot be pre-applied: its lifecycle CHECK
 /// names the columns 007 adds, so the runner always applies it after 007,
-/// and these tests accept the pair.
-const PRE_007: [(i32, &str); 8] = [
+/// followed by 012's startup fence, and these tests accept all three.
+const PRE_007: [(i32, &str); 10] = [
     (2, include_str!("../migrations/002_multi_instance.sql")),
     (3, include_str!("../migrations/003_2x_compatibility.sql")),
     (
@@ -55,8 +56,12 @@ const PRE_007: [(i32, &str); 8] = [
         10,
         include_str!("../migrations/010_fatal_state_recovery.sql"),
     ),
+    (
+        13,
+        include_str!("../migrations/013_share_ledger_index_trim.sql"),
+    ),
+    (14, include_str!("../migrations/014_policy_transition.sql")),
 ];
-const ALL_VERSIONS: [i32; 11] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 /// The columns 011 adds to the outbox, which the connect that applies 007
 /// adds as well.
 const OFFER_COLUMNS: [&str; 6] = [
@@ -77,7 +82,16 @@ const WINDOW_COLUMNS: [&str; 7] = [
     "block_bytes",
 ];
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Database {
+    fixture: FixtureDatabase,
+    /// A default-size pool on the fixture database, separate from `pool`: the
+    /// permit test holds an advisory gate on one of its connections and polls
+    /// `pg_locks` through another.
     admin: PgPool,
     pool: PgPool,
     url: String,
@@ -86,32 +100,38 @@ struct Database {
 }
 
 impl Database {
-    /// An empty schema. Each test installs exactly the starting state it needs,
-    /// because the whole point here is which migrations have already run.
+    /// An empty schema in its own database. Each test installs exactly the
+    /// starting state it needs, because the whole point here is which
+    /// migrations have already run.
     async fn open() -> Result<Option<Self>> {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_candidate_window_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        let fixture = FixtureDatabase::open(&raw, "prism_candidate_window_").await?;
+        let admin = match PgPool::connect(&fixture.url).await {
+            Ok(admin) => admin,
+            Err(error) => return Err(fixture.abandon(error.into()).await),
+        };
         // One connection, and none of `Ledger::connect`'s statement/lock
         // timeouts, so a test can park a reader on a gate for as long as it
         // needs to.
-        let pool = PgPoolOptions::new()
+        let pool = match PgPoolOptions::new()
             .max_connections(1)
-            .connect(url.as_str())
-            .await?;
+            .connect(&fixture.url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                admin.close().await;
+                return Err(fixture.abandon(error.into()).await);
+            }
+        };
         Ok(Some(Self {
             admin,
             pool,
-            url: url.to_string(),
-            schema,
+            url: fixture.url.clone(),
+            schema: fixture.schema.clone(),
+            fixture,
             ledgers: Mutex::new(Vec::new()),
         }))
     }
@@ -159,16 +179,15 @@ impl Database {
             .bind(table).bind(column).fetch_one(&self.pool).await?)
     }
 
-    async fn close(self) -> Result<()> {
+    /// Closes every pool this fixture owns, then drops its database. A test
+    /// error wins; a cleanup error is attached to it as context.
+    async fn close(self, result: Result<()>) -> Result<()> {
         for pool in self.ledgers.into_inner().unwrap() {
             pool.close().await;
         }
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
         self.admin.close().await;
-        Ok(())
+        self.fixture.close(result).await
     }
 }
 
@@ -179,14 +198,7 @@ async fn run(
         return Ok(());
     };
     let result = body(&db).await;
-    let cleanup = db.close().await;
-    match (result, cleanup) {
-        (Ok(()), cleanup) => cleanup,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-        }
-    }
+    db.close(result).await
 }
 
 async fn outbox_columns(pool: &PgPool) -> Result<Vec<String>> {
@@ -362,7 +374,7 @@ async fn legacy_2x_schema_with_terminal_outbox_rows_gains_007_and_keeps_every_ro
 
             let _ledger = db.ledger("legacy-upgrade").await?;
             ensure!(
-                db.versions().await? == ALL_VERSIONS,
+                db.versions().await? == REQUIRED_SCHEMA_VERSIONS,
                 "007 did not join the applied set"
             );
             let after: Vec<Value> = sqlx::query_scalar(
@@ -499,7 +511,7 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
             sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp()")
                 .execute(&db.pool).await?;
             let _ledger = db.ledger("drained").await?;
-            ensure!(db.versions().await? == ALL_VERSIONS, "007 did not apply after the drain");
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS, "007 did not apply after the drain");
             Ok(())
         })).await?;
     }
@@ -527,7 +539,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
                     .iter()
                     .map(|(version, _)| *version)
                     .collect::<Vec<_>>()
-                    == ALL_VERSIONS
+                    == REQUIRED_SCHEMA_VERSIONS
             );
             // Every migration installed before this run keeps its original
             // timestamp; only missing migrations are applied.
@@ -548,7 +560,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> R
             }
             // A restart applies nothing further.
             let _restarted = db.ledger("membership-restart").await?;
-            ensure!(db.versions().await? == ALL_VERSIONS);
+            ensure!(db.versions().await? == REQUIRED_SCHEMA_VERSIONS);
             Ok(())
         })
     })
@@ -955,14 +967,7 @@ fn read_window_permit_outlives_a_cancelled_page_and_is_released_off_the_runtime(
             return Ok(());
         };
         let result = permit_release_body(&db).await;
-        let cleanup = db.close().await;
-        match (result, cleanup) {
-            (Ok(()), cleanup) => cleanup,
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-            }
-        }
+        db.close(result).await
     })
 }
 

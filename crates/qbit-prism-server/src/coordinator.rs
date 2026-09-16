@@ -503,12 +503,12 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 }
 
 #[derive(Debug)]
-struct ValidatedFeePolicy {
+pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
 }
 
-async fn validated_ctv_fee_policy(
+pub(crate) async fn validated_ctv_fee_policy(
     rpc: &Rpc,
     configured: Option<FanoutFeeRatePolicy>,
     premium_bps: u64,
@@ -555,9 +555,32 @@ fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result
 }
 
 impl Coordinator {
-    pub async fn new(
+    /// Start a `run` frontend's coordinator: validate the node and the
+    /// configuration, register the frontend with a `starting` heartbeat and
+    /// pin or verify the cluster fingerprint.
+    pub async fn new(config: Config, metrics: Arc<crate::metrics::Metrics>) -> Result<Arc<Self>> {
+        Self::connect(config, metrics, true).await
+    }
+
+    /// Start a one-shot command's coordinator (`self-check`, `broadcast-ctv`).
+    /// Every gate of [`Coordinator::new`] still applies: the node's genesis
+    /// and chain, the schema and capability checks, the halt guard and the
+    /// cluster fingerprint. The difference is [`Ledger::connect_tool`] in
+    /// place of the registering connection: the command writes no heartbeat,
+    /// so its exit leaves no frontend row behind and a live frontend sharing
+    /// its instance ID is not touched. Claims it takes remain fenced by their
+    /// own tokens.
+    pub async fn new_tool(
+        config: Config,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Arc<Self>> {
+        Self::connect(config, metrics, false).await
+    }
+
+    async fn connect(
         mut config: Config,
         metrics: Arc<crate::metrics::Metrics>,
+        register_frontend: bool,
     ) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
             config.rpc_url.clone(),
@@ -599,7 +622,7 @@ impl Coordinator {
                 || (configured_chain == "testnet3" && actual_chain == "test"),
             "configured QBIT_CHAIN differs from connected node"
         );
-        let ledger = Arc::new(
+        let ledger = Arc::new(if register_frontend {
             Ledger::connect_with_metrics(
                 &config.database_url,
                 config.instance_id.clone(),
@@ -607,8 +630,17 @@ impl Coordinator {
                 config.initialize_schema,
                 Some(metrics.clone()),
             )
-            .await?,
-        );
+            .await?
+        } else {
+            Ledger::connect_tool(
+                &config.database_url,
+                config.instance_id.clone(),
+                config.database_connections,
+                config.initialize_schema,
+                Some(metrics.clone()),
+            )
+            .await?
+        });
         if !config.initialize_schema {
             let ready: bool = sqlx::query_scalar(
                 "SELECT count(*)=2 FROM qbit_prism_schema_migrations WHERE version IN (7,9)",
@@ -621,6 +653,10 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
+        // Keep a frontend's initial heartbeat non-quiescent if configuration
+        // fails. Another live incarnation may share this instance ID, so this
+        // rejected startup cannot safely publish `stopped` for the shared row.
+        // A one-shot command wrote no heartbeat and has nothing to retract.
         ledger
             .configure(
                 &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,

@@ -13,7 +13,7 @@
 //! NOTICE that a statement-level fixture trigger raises on the durable table,
 //! never by its SQL text or its position in the transaction. Each test body
 //! runs under [`Database::run`], which closes its pools, finishes its proxy
-//! and drops its schema even when the body fails or panics.
+//! and drops its database even when the body fails or panics.
 //!
 //! Faults are seeded inside each test's disposable schema: a real server
 //! `statement_timeout`, armed for the rest of the transaction by the first
@@ -38,7 +38,6 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use uuid::Uuid;
 
 #[path = "support/ledger_execution_proxy.rs"]
 mod proxy;
@@ -122,9 +121,15 @@ CREATE TRIGGER prism_execution_stall BEFORE INSERT
     ON qbit_ctv_fanout_broadcast_attempts FOR EACH ROW EXECUTE FUNCTION prism_execution_stall();
 "#;
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Database {
-    admin: PgPool,
-    schema: String,
+    /// Taken by [`Self::cleanup`]; if a test never gets there, dropping it
+    /// drops the database.
+    fixture: Mutex<Option<FixtureDatabase>>,
     url: String,
     /// Every pool and proxy a test opened, closed by [`Self::run`] whatever
     /// the outcome of the test body.
@@ -137,25 +142,17 @@ impl Database {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let schema = format!("prism_exec_{}", Uuid::new_v4().simple());
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let admin = PgPool::connect(&raw).await?;
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
+        let fixture = FixtureDatabase::open(&raw, "prism_exec_").await?;
         Ok(Some(Self {
-            admin,
-            schema,
-            url: url.to_string(),
+            url: fixture.url.clone(),
+            fixture: Mutex::new(Some(fixture)),
             pools: Mutex::default(),
             proxies: Mutex::default(),
         }))
     }
 
     /// Run a test body, then always close its pools, finish its proxies and
-    /// drop the disposable schema, whether the body returned, failed or
+    /// drop the fixture database, whether the body returned, failed or
     /// panicked. The body's own failure is what the test reports; a cleanup
     /// failure after it is printed, and fails the test only on its own.
     async fn run(&self, body: impl Future<Output = Result<()>>) -> Result<()> {
@@ -206,16 +203,15 @@ impl Database {
                     .and_then(|finished| finished),
             );
         }
-        keep(
-            tokio::time::timeout(
-                CALL_BUDGET,
-                sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema)).execute(&self.admin),
-            )
-            .await
-            .context("dropping the disposable schema did not finish within its budget")
-            .and_then(|dropped| dropped.map(|_| ()).map_err(Into::into)),
-        );
-        self.admin.close().await;
+        let fixture = self.fixture.lock().expect("fixture database").take();
+        if let Some(fixture) = fixture {
+            keep(
+                tokio::time::timeout(CALL_BUDGET, fixture.close(Ok(())))
+                    .await
+                    .context("dropping the fixture database did not finish within its budget")
+                    .and_then(|dropped| dropped),
+            );
+        }
         outcome
     }
 

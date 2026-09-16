@@ -2,7 +2,7 @@
 //! The gated database case uses a private schema and a loopback fake qbit RPC.
 use anyhow::{ensure, Result};
 use axum::{routing::post, Json, Router};
-use qbit_prism_server::ledger::Ledger;
+use qbit_prism_server::ledger::{HeartbeatStatus, Ledger};
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use std::{process::Output, time::Duration};
@@ -230,6 +230,9 @@ async fn postgres_reports(database_url: &str) -> Result<()> {
 }
 
 async fn sample_slow_heartbeats(database_url: &str, ledger: &Ledger) -> Result<()> {
+    // The frontend under test has stopped. The diagnostic no longer registers
+    // over its row, so only the seeded frontends can count as live.
+    ledger.heartbeat(HeartbeatStatus::Stopped).await?;
     sqlx::query(
         "INSERT INTO qbit_prism_instances(instance_id,heartbeat_at,status) VALUES
          ('frontend-a',clock_timestamp()-interval '20 seconds',$1),
@@ -269,13 +272,24 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         axum::serve(listener, Router::new().route("/", post(startup_only_rpc))).await
     });
     // Seed the exact pre-existing JSON shape, bypassing the new typed writer.
+    // The session-owner token stands in for the live frontend's own: a
+    // diagnostic sharing its instance ID must leave it alone.
     let legacy_health = json!({
         "schema": "qbit.prism.audit-health.v1",
         "ready": false,
-        "legacy_detail": {"reason": "waiting for template"}
+        "legacy_detail": {"reason": "waiting for template"},
+        "session_owner_token": "live-frontend-token"
     });
     sqlx::query("UPDATE qbit_prism_instances SET heartbeat_at=clock_timestamp(),status=$1 WHERE instance_id='self-check-cli'")
         .bind(&legacy_health).execute(&ledger.pool).await?;
+    let live_row = || async {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(i) FROM qbit_prism_instances i WHERE instance_id='self-check-cli'",
+        )
+        .fetch_one(&ledger.pool)
+        .await
+    };
+    let before = live_row().await?;
     let output = self_check(
         &[
             ("PRISM_DATABASE_URL", database_url),
@@ -284,7 +298,6 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         Duration::from_secs(15),
     )
     .await;
-    server.abort();
     let report = failed_report(&output);
     let error = String::from_utf8_lossy(&output.stderr);
     ensure!(
@@ -331,16 +344,47 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         report == expected,
         "self-check did not retain the complete sample taken before local startup: {report}"
     );
-    let stored: Value = sqlx::query_scalar(
-        "SELECT status FROM qbit_prism_instances WHERE instance_id='self-check-cli'",
-    )
-    .fetch_one(&ledger.pool)
-    .await?;
+    // The diagnostic ran its local startup under the live frontend's ID and
+    // must not have registered over it: status, session-owner token and
+    // heartbeat time are exactly as the frontend left them (#381).
+    let after = live_row().await?;
     ensure!(
-        stored["state"] == "starting"
-            && stored["session_owner_token"].as_str().is_some()
-            && stored.get("schema").is_none(),
-        "local startup did not replace the stored legacy heartbeat: {stored}"
+        after == before,
+        "self-check changed the live frontend's row: before={before} after={after}"
     );
+    // Without a configured ID the command generates one per invocation. A
+    // heartbeat under that ID would outlive the process and block fatal-state
+    // recovery, so the table must still hold only the frontend's row.
+    let output = self_check(
+        &[
+            ("PRISM_DATABASE_URL", database_url),
+            ("QBIT_RPC_URL", &rpc_url),
+            ("PRISM_INSTANCE_ID", ""),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    server.abort();
+    let report = failed_report(&output);
+    let generated = report["instance_id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+    ensure!(
+        generated.is_some(),
+        "expected a generated instance ID in the report: {report}"
+    );
+    ensure!(
+        report["live_instances"]["instance_ids"] == json!(["self-check-cli"]),
+        "the generated ID must not appear as a frontend: {report}"
+    );
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT instance_id FROM qbit_prism_instances ORDER BY instance_id")
+            .fetch_all(&ledger.pool)
+            .await?;
+    ensure!(
+        rows == ["self-check-cli"],
+        "a generated instance ID must leave no heartbeat row behind: {rows:?}"
+    );
+    ensure!(live_row().await? == before);
     Ok(())
 }

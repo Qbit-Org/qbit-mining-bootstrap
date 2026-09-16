@@ -102,6 +102,7 @@ connection from host ...`.
 | `PRISM_POSTGRES_REPLICATION_SLOT` | `prism_public_replica` | Physical slot the standby creates and streams through. |
 | `PRISM_POSTGRES_REPLICA_DATA_SOURCE` | `prism-postgres-replica-data` | Volume or host path backing the standby's data directory. |
 | `PRISM_PUBLIC_DATABASE_URL` | `postgresql://qbit:change-this@prism-postgres-replica:5432/qbit` | Read-only DSN `prism-public-api` uses. Compose passes it into the container as `PRISM_DATABASE_URL`; it is a separate operator knob because `PRISM_DATABASE_URL` names the primary, which the coordinator needs it to. |
+| `PRISM_PUBLIC_POSTGRES_PASSWORD` | Empty | Optional dedicated public-reader password, passed by Compose as `PGPASSWORD`. Used when the public DSN omits its password; never defaults to `PRISM_POSTGRES_PASSWORD`. |
 | `PRISM_PUBLIC_REPLICA_MODE` | `require` in compose, `off` in code | `require` refuses replica-backed routes unless the backing server is in recovery with a live replication stream. `off` serves whatever the DSN names — the behaviour before a standby existed. |
 | `PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS` | `60` | How long the standby's replication stream may be silent before its answers stop counting as current. |
 
@@ -111,6 +112,69 @@ shipped compose. That split is deliberate: merging the replica work must not
 the stack up from this repository's compose gets the enforced contract without
 having to opt in. Cut over by provisioning the standby, pointing
 `PRISM_PUBLIC_DATABASE_URL` at it, and then setting `require`.
+
+### Public-reader credentials
+
+For a dedicated reader, set `PRISM_PUBLIC_DATABASE_URL` to that role's complete
+DSN, including its own password (percent-encode reserved URL characters):
+
+```dotenv
+PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader:<encoded-reader-password>@standby.internal:5432/qbit?sslmode=verify-full
+```
+
+Alternatively, omit the password from the DSN and set
+`PRISM_PUBLIC_POSTGRES_PASSWORD` to the reader's raw password. In `.env` files,
+single-quote that value so Compose preserves dollar signs and comment characters
+literally; do not percent-encode this separate carrier. For example, these
+synthetic values preserve the password `reader$literal #:@/383`:
+
+```dotenv
+PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader@standby.internal:5432/qbit?sslmode=verify-full
+PRISM_PUBLIC_POSTGRES_PASSWORD='reader$literal #:@/383'
+```
+
+If the password contains a single quote, use the percent-encoded DSN form above
+so the `.env` file also remains valid for the shell-based preflight scripts.
+Set the passwordless reader DSN as well: the carrier alone does not select a
+reader role, and a default DSN with an embedded bootstrap password still takes
+precedence.
+Compose maps these two settings to `PRISM_DATABASE_URL` and `PGPASSWORD` inside
+`prism-public-api`.
+The native SQLx driver loads PostgreSQL environment defaults before applying
+the DSN; a DSN password takes precedence over `PGPASSWORD`. The public process
+receives no extra bootstrap password, even when production, external-database
+or HA overlays are applied. Keep reader and bootstrap passwords distinct.
+
+Create the reader on the primary so the role and grants reach its physical
+standby. Grant `CONNECT` on the database, `USAGE` on the application schema and
+`SELECT` on the tables used by the public read models. It must not own the
+database or tables, inherit a writer role, or have superuser, replication,
+create-role or create-database privileges. Reconcile read grants when migrations
+add public tables. In `require` mode it also needs `pg_read_all_stats` so the
+readiness probe can see `pg_stat_wal_receiver.last_msg_receipt_time`; this
+monitoring grant does not permit replication or application writes. Role
+provisioning remains an operator task.
+
+With password authentication required by PostgreSQL, an omitted, empty or
+incorrect reader password leaves `/healthz` unready with an authentication
+error; database-backed public reads return 503 and
+`qbit-prism-server healthcheck --public-api` exits unsuccessfully. The listener
+stays up to report the failure and retry its readiness probe. It does not borrow
+`PRISM_POSTGRES_PASSWORD`. The HTTP healthcheck needs no database password of
+its own. Non-database public metadata can still be served while unready.
+
+Compatibility: an unset or empty `PRISM_PUBLIC_DATABASE_URL` retains the base
+Compose lab DSN with the bootstrap password embedded; the external-database
+overlay instead retains its fallback to `PRISM_DATABASE_URL` and replica mode
+`off`. These defaults do not provide a dedicated-reader boundary. For an
+external fallback DSN without a password, explicitly supply the intended
+public credential with `PRISM_PUBLIC_POSTGRES_PASSWORD`. The former implicit
+bootstrap `PGPASSWORD` is no longer supplied. A direct binary or `docker run`
+invocation still uses `PRISM_DATABASE_URL` and SQLx's native PostgreSQL settings;
+the `PRISM_PUBLIC_*` credential names above are Compose inputs only. Supply only
+reader credentials to that process, including any `PGPASSWORD` or password file.
+The shipped Compose service sets `PGPASSWORD` to empty when its reader carrier
+is unset, so it does not select a password file as an implicit replacement.
 
 ### What the bound actually bounds
 

@@ -7,9 +7,7 @@ use serde_json::Value;
 use std::{process::Output, time::Duration};
 use tokio::process::Command;
 
-#[allow(dead_code)]
-#[path = "fake_qbitd.rs"]
-mod fake;
+use super::fake_qbitd as fake;
 
 async fn setup(db: &Database) -> Result<(Ledger, fake::FakeNode, Config)> {
     let ledger = db.ledger("frontend-a").await?;
@@ -48,6 +46,17 @@ async fn block(ledger: &Ledger, hash: &str, height: i64, mature: bool) -> Result
 }
 
 async fn cli(db: &Database, node: &fake::FakeNode, args: &[&str]) -> Result<Output> {
+    cli_with_env(db, node, args, &[]).await
+}
+
+/// `cli` with extra environment, for a configured PRISM_INSTANCE_ID or a
+/// deterministic probe failure. `extra` is applied last, so it overrides.
+async fn cli_with_env(
+    db: &Database,
+    node: &fake::FakeNode,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
@@ -71,6 +80,9 @@ async fn cli(db: &Database, node: &fake::FakeNode, args: &[&str]) -> Result<Outp
                 "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX",
                 ManifestSigningKey::from_seed_hex(&"22".repeat(32))?.public_key_hex(),
             );
+    }
+    for (key, value) in extra {
+        command.env(key, value);
     }
     Ok(tokio::time::timeout(Duration::from_secs(20), command.output()).await??)
 }
@@ -193,6 +205,157 @@ async fn show_and_clear_cli_resume_appends_and_record_operator_decision() -> Res
             .status
             .success()
     );
+    db.close(vec![ledger]).await
+}
+
+/// The four one-shot commands that write ordinary ledger rows. `self-check`
+/// exits nonzero here because nothing serves the audit API; PRISM_AUDIT_PORT=1
+/// keeps that probe failing deterministically instead of finding a listener.
+const TOOLS: [&str; 4] = [
+    "import-audits",
+    "backfill-ctv",
+    "broadcast-ctv",
+    "self-check",
+];
+const TOOL_ENV: [(&str, &str); 1] = [("PRISM_AUDIT_PORT", "1")];
+
+fn tool_stdout(tool: &str) -> Option<&'static str> {
+    match tool {
+        "import-audits" => Some("Imported 0 audit bodies"),
+        "backfill-ctv" => Some("Backfilled 0 CTV manifest sets"),
+        "broadcast-ctv" => Some("Processed 0 CTV fanouts"),
+        _ => None,
+    }
+}
+
+/// Assert a tool exit: the three importers succeed with their count line;
+/// `self-check` fails (no audit API) but still prints one complete report
+/// with `ok: false`, whose live-instance sample is returned for inspection.
+fn assert_tool_exit(tool: &str, output: &Output, halted: bool) -> Result<Option<Value>> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if halted {
+        assert!(
+            !output.status.success(),
+            "{tool} ran during a halt: {stdout}"
+        );
+        assert!(stderr.contains("cluster halted"), "{tool}: {stderr}");
+    }
+    match tool_stdout(tool) {
+        Some(expected) => {
+            if !halted {
+                assert!(output.status.success(), "{tool}: {stderr}");
+                assert!(stdout.contains(expected), "{tool}: {stdout}");
+            }
+            Ok(None)
+        }
+        None => {
+            assert!(
+                !output.status.success(),
+                "{tool} must fail without an audit API"
+            );
+            let report: Value = serde_json::from_slice(&output.stdout)
+                .with_context(|| format!("{tool} report: {stdout}; stderr={stderr}"))?;
+            assert_eq!(report["ok"], false, "{report}");
+            assert!(report["live_instances"]["status"].is_string(), "{report}");
+            Ok(Some(report["live_instances"].clone()))
+        }
+    }
+}
+
+async fn instance_count(ledger: &Ledger) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM qbit_prism_instances")
+            .fetch_one(&ledger.pool)
+            .await?,
+    )
+}
+
+async fn frontend_row(ledger: &Ledger) -> Result<Value> {
+    Ok(sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM qbit_prism_instances i WHERE instance_id='frontend-a'",
+    )
+    .fetch_one(&ledger.pool)
+    .await?)
+}
+
+#[tokio::test]
+async fn one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (ledger, node, _) = setup(&db).await?;
+    // 1. A generated instance ID leaves no row, on success and on failure:
+    // `cli` sets no PRISM_INSTANCE_ID, so each command generates its own.
+    for tool in TOOLS {
+        let output = cli_with_env(&db, &node, &[tool], &TOOL_ENV).await?;
+        if let Some(live) = assert_tool_exit(tool, &output, false)? {
+            assert_eq!(live["status"], "inactive", "{live}");
+        }
+        assert_eq!(instance_count(&ledger).await?, 1, "{tool} registered a row");
+    }
+    // 2. A live frontend's row (status with its session-owner token,
+    // heartbeat_at, started_at) is untouched when a tool runs under its ID.
+    ledger
+        .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+            true,
+            Default::default(),
+        )))
+        .await?;
+    let live_row = frontend_row(&ledger).await?;
+    assert_eq!(live_row["status"]["ready"], true, "{live_row}");
+    assert!(
+        live_row["status"]["session_owner_token"].is_string(),
+        "{live_row}"
+    );
+    let shared = [("PRISM_INSTANCE_ID", "frontend-a"), TOOL_ENV[0]];
+    for tool in TOOLS {
+        let output = cli_with_env(&db, &node, &[tool], &shared).await?;
+        if let Some(live) = assert_tool_exit(tool, &output, false)? {
+            assert_eq!(live["status"], "observed", "{live}");
+            assert_eq!(live["instance_ids"], json!(["frontend-a"]), "{live}");
+        }
+        assert_eq!(
+            frontend_row(&ledger).await?,
+            live_row,
+            "{tool} touched the live row"
+        );
+        assert_eq!(instance_count(&ledger).await?, 1, "{tool} registered a row");
+    }
+    // 3. The halt guard is preserved and failing exits leave no row.
+    halt(&ledger, "test halt").await?;
+    for tool in TOOLS {
+        let output = cli_with_env(&db, &node, &[tool], &TOOL_ENV).await?;
+        assert_tool_exit(tool, &output, true)?;
+        assert_eq!(
+            frontend_row(&ledger).await?,
+            live_row,
+            "{tool} touched the live row"
+        );
+        assert_eq!(instance_count(&ledger).await?, 1, "{tool} registered a row");
+    }
+    // 4. Recovery succeeds once the real frontend stops: no tool row is left
+    // for `fatal-state clear` to refuse.
+    stopped(&ledger).await?;
+    let reason = "INC-381: operator tools ran while frontend-a was live";
+    let cleared = cli(&db, &node, &["fatal-state", "clear", "--reason", reason]).await?;
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let event: Value = serde_json::from_slice(&cleared.stdout)?;
+    let instances = event["instances"].as_array().context("instances")?;
+    assert_eq!(instances.len(), 1, "{event}");
+    assert_eq!(instances[0]["instance_id"], "frontend-a");
+    assert_eq!(instances[0]["status"]["state"], "stopped");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_prism_fatal_state_events")
+            .fetch_one(&ledger.pool)
+            .await?,
+        1
+    );
+    assert!(ledger.append(share(1), None).await?.inserted);
     db.close(vec![ledger]).await
 }
 

@@ -41,6 +41,7 @@ struct Backend {
     fail_builds: AtomicU32,
     hint_reads_unavailable: AtomicBool,
     submit_gate: Mutex<Option<Arc<observability::Gate>>>,
+    submit_error: Mutex<Option<StratumError>>,
     build_gate: Mutex<Option<Arc<observability::Gate>>>,
     hint_gate: Mutex<Option<Arc<observability::Gate>>>,
 }
@@ -184,6 +185,9 @@ impl MiningBackend for Backend {
         let gate = self.submit_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.wait().await;
+        }
+        if let Some(error) = self.submit_error.lock().unwrap().take() {
+            return Err(error);
         }
         let tip = format!("{:064x}", self.generation.load(Ordering::SeqCst));
         let grace = grace.eligible_for(&tip);

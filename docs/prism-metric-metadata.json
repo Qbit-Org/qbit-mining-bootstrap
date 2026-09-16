@@ -12,7 +12,8 @@
       ],
       "labels": {
         "result": "AckResult"
-      }
+      },
+      "status": "Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines."
     },
     "rejections_total": {
       "replaces": [
@@ -20,7 +21,8 @@
       ],
       "labels": {
         "reason_id": "RejectReason"
-      }
+      },
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response."
     },
     "stale_shares_total": {
       "replaces": [

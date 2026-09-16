@@ -39,7 +39,11 @@ use qbit_prism_server::ledger::{Ledger, Snapshot};
 use qbit_prism_test_gate as gate;
 use serde::Deserialize;
 use sqlx::PgPool;
-use uuid::Uuid;
+
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
 
 // ---------------------------------------------------------------------------
 // Integration guard
@@ -59,78 +63,35 @@ use uuid::Uuid;
 // Schema harness
 // ---------------------------------------------------------------------------
 
-/// A throwaway schema on the configured server, dropped when the test ends.
-struct Database {
-    admin: PgPool,
-    schema: String,
-    url: String,
-}
-
-impl Database {
-    /// Creates one throwaway schema on the configured server.
-    async fn create(raw: &str) -> Result<Self> {
-        let admin = PgPool::connect(raw).await?;
-        let schema = format!("prism_test_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        Ok(Self {
-            admin,
-            schema,
-            url: url.to_string(),
-        })
-    }
-
-    async fn ledger(&self) -> Result<Ledger> {
-        Ledger::connect(&self.url, "window-read-oracle".to_owned(), 8, true).await
-    }
-
-    /// Closes the pool, if one was opened, and drops the schema.
-    ///
-    /// Every path reaches this, a failing one included, so a red run leaves no
-    /// `prism_test_%` schema behind on a server that outlives it.
-    async fn close(self, ledger: Option<Ledger>) -> Result<()> {
-        if let Some(ledger) = ledger {
-            ledger.pool.close().await;
-        }
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
-    }
-}
-
-/// Runs `body` against a ledger on a schema of its own, and drops that schema
-/// afterwards whether the body passed or failed.
+/// Runs `body` against a ledger on a schema of its own, in a database of its
+/// own, and drops that database afterwards whether the body passed or failed.
+/// PostgreSQL scopes advisory locks to a database, so a shared database would
+/// queue this ledger's migration and order keys behind other tests' ledgers.
 ///
 /// The body's own error is what a failing test reports; a cleanup failure is
-/// attached to it as context rather than replacing it, so a leaked schema can
+/// attached to it as context rather than replacing it, so a leaked database can
 /// never hide the assertion that actually failed. When the body passed, a
-/// cleanup failure is the result, because a schema this file could not drop is
-/// worth knowing about.
+/// cleanup failure is the result, because a database this file could not drop
+/// is worth knowing about. Every path reaches the cleanup, a failing one
+/// included, so a red run leaves no fixture database behind on a server that
+/// outlives it.
 async fn in_fresh_schema<F, Fut>(raw: &str, body: F) -> Result<()>
 where
     F: FnOnce(Ledger) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let db = Database::create(raw).await?;
-    // A failure to connect still has to drop the schema `create` just made.
-    let (outcome, ledger) = match db.ledger().await {
-        Ok(ledger) => (body(ledger.clone()).await, Some(ledger)),
-        Err(error) => (Err(error), None),
-    };
-    let cleanup = db.close(ledger).await;
-    match (outcome, cleanup) {
-        (Ok(()), cleanup) => cleanup,
-        (Err(failure), Ok(())) => Err(failure),
-        (Err(failure), Err(cleanup)) => {
-            Err(failure.context(format!("the test schema also failed to drop: {cleanup:#}")))
-        }
+    let fixture = FixtureDatabase::open(raw, "prism_test_").await?;
+    // A failure to connect still has to drop the database `open` just made.
+    let (outcome, ledger) =
+        match Ledger::connect(&fixture.url, "window-read-oracle".to_owned(), 8, true).await {
+            Ok(ledger) => (body(ledger.clone()).await, Some(ledger)),
+            Err(error) => (Err(error), None),
+        };
+    // The ledger's pool closes before its database is dropped.
+    if let Some(ledger) = ledger {
+        ledger.pool.close().await;
     }
+    fixture.close(outcome).await
 }
 
 /// The integration guard followed by `in_fresh_schema`, for a test that wants

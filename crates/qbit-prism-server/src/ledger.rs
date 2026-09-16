@@ -37,6 +37,7 @@ mod difficulty;
 mod fanout;
 mod fatal_state;
 mod instances;
+mod policy_transition;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
@@ -63,6 +64,13 @@ use window::{read_prior_balances, share_from_row};
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
 const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
+/// The class of the two-key session-level advisory lock the online
+/// migration runner takes on its own connection, outside any transaction
+/// (`migration::apply_online_migration`), so two starting frontends never
+/// build the same index twice. The second key is the ledger's schema: the
+/// migration's DDL creates there, and a database hosting several ledger
+/// schemas builds each on its own.
+const ONLINE_DDL_LOCK_CLASS: i32 = 0x5052_4953;
 const SELECT_SHARE: &str = "SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,share_difficulty::text AS difficulty,network_difficulty::text AS network_difficulty,template_height,job_id,job_issued_at,accepted_at,ntime,credit_policy FROM qbit_share_ledger";
 
 #[derive(Clone)]
@@ -72,7 +80,8 @@ pub struct Ledger {
     session_owner: std::sync::Arc<connect::SessionOwner>,
     /// Native wait telemetry, when the process has a registry to record into.
     /// Without a handle nothing is recorded and behaviour is identical, so
-    /// tools and tests keep using [`Ledger::connect`].
+    /// tests keep using [`Ledger::connect`] and the database-only commands
+    /// [`Ledger::connect_tool`] without one.
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
     /// back through [`Ledger::config_fingerprint`]. Shared across clones, so
