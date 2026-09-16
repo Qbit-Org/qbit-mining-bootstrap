@@ -385,7 +385,11 @@ pub(super) async fn verify_durable_range(
     while cursor < last {
         // Release this page's checkout before its blocking comparison and the
         // next page, observing each acquisition rather than the whole proof.
+        // Planned per page with its bounds, as `read_range_owned` does
+        // (`ledger/window.rs`): a cached generic plan for a `share_seq` range
+        // sorts the partitioned ledger instead of walking it in order.
         let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
+            .persistent(false)
             .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         if rows.is_empty() {
             break;
@@ -497,6 +501,8 @@ async fn read_range<'e>(
         "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
         anchored_eligibility_sql(3)
     ))
+    // Planned with its bounds; see `read_range_owned` in `ledger/window.rs`.
+    .persistent(false)
     .bind(first)
     .bind(last)
     .bind(anchor)

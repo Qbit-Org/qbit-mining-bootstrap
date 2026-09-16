@@ -899,11 +899,20 @@ where
     // bounds are known here, so rows arrive in canonical order and a digest
     // over them can stream. `$1` is the exclusive cursor, which starts one
     // below `first` and advances to each page's last `share_seq`.
+    //
+    // Each page is planned with its bounds (`persistent(false)`: an unnamed
+    // statement, never a cached generic plan). On the partitioned ledger the
+    // generic plan for a `share_seq` range with unknown bounds estimates a
+    // few hundred rows, so it appends the leaves and sorts them instead of
+    // walking the primary key in order; against a 400k-row window that sort
+    // reads the whole remaining range on every page, forty times the cost
+    // of the ordered scan. Planning a page costs a fraction of a millisecond.
     let page = format!(
         "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}"
     );
     while carried.get().2 < last {
         let rows = sqlx::query(&page)
+            .persistent(false)
             .bind(carried.get().2)
             .bind(last)
             .bind(anchor_ms)
