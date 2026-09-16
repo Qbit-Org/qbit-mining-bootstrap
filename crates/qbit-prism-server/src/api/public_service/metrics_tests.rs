@@ -34,7 +34,7 @@ async fn metrics_headers_follow_probe_age_not_database_success_or_wall_time() {
                 ready,
                 checked,
                 checked_at: checked.map(|_| wall_time.into()),
-                last_error: (!ready).then(|| "database unavailable".into()),
+                last_error: (!ready).then_some(ProbeFailure::Connection),
                 ..Default::default()
             };
             for method in ["GET", "HEAD"] {
