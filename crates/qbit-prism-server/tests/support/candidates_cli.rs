@@ -7,6 +7,7 @@
 //! given a chain, a signing seed or a fallback address, so a command that
 //! loaded `Config` or started a listener could not have succeeded.
 use super::*;
+use qbit_prism_server::ledger::{HeartbeatHealth, HeartbeatStatus};
 use serde_json::Value;
 use sqlx::{Column, Executor};
 use std::{
@@ -92,6 +93,17 @@ impl CountingNode {
 /// `PRISM_`/`QBIT_` variable is stripped first: the child has no chain, no
 /// signing seeds and no fallback address.
 async fn cli(db: &Database, node: &CountingNode, args: &[&str]) -> Result<Output> {
+    cli_with_env(db, node, args, &[]).await
+}
+
+/// `cli` with extra environment, for a configured `PRISM_INSTANCE_ID`.
+/// `extra` is applied last, so it overrides.
+async fn cli_with_env(
+    db: &Database,
+    node: &CountingNode,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
@@ -104,6 +116,9 @@ async fn cli(db: &Database, node: &CountingNode, args: &[&str]) -> Result<Output
         .env("PRISM_DATABASE_URL", &db.url)
         .env("QBIT_RPC_URL", &node.url)
         .env("PRISM_RUNTIME_WORKERS", "2");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
     Ok(tokio::time::timeout(Duration::from_secs(20), command.output()).await??)
 }
 
@@ -929,5 +944,132 @@ async fn abandon_refuses_a_terminal_row_and_a_pending_row_whose_block_landed() -
 
     node.assert_never_reached();
     assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+/// `abandon` writes an ordinary ledger row, so it is a one-shot tool and owes
+/// the same four properties #412 asserts for the other four: no heartbeat on
+/// success or failure, a live frontend's row untouched when the tool runs
+/// under that frontend's instance ID, the halt guard preserved, and nothing
+/// left behind for `fatal-state clear` to refuse.
+#[tokio::test]
+async fn abandon_registers_no_heartbeat_and_keeps_the_halt_guard() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let instances = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_prism_instances")
+            .fetch_one(&pool)
+            .await
+    };
+    let frontend_row = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(i) FROM qbit_prism_instances i WHERE instance_id='frontend-a'",
+        )
+        .fetch_one(&pool)
+        .await
+    };
+    let reason = "INC-381: operator abandon ran while frontend-a was live";
+    let run = |hash: String, extra: Vec<(&'static str, &'static str)>| {
+        let db = &db;
+        let node = &node;
+        async move {
+            cli_with_env(
+                db,
+                node,
+                &[
+                    "candidates",
+                    "abandon",
+                    "--block-hash",
+                    &hash,
+                    "--reason",
+                    reason,
+                ],
+                &extra,
+            )
+            .await
+        }
+    };
+
+    // 1. A generated instance ID leaves no row, on the success path and on a
+    // refusal: `cli` sets no PRISM_INSTANCE_ID, so each run generates one.
+    let generated = Row::new("11", "pending");
+    seed(&ledger.pool, &generated).await?;
+    let done = run(generated.hash.clone(), vec![]).await?;
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert_eq!(
+        instances(ledger.pool.clone()).await?,
+        1,
+        "abandon registered"
+    );
+    let refused = run("ee".repeat(32), vec![]).await?;
+    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+    assert_eq!(
+        instances(ledger.pool.clone()).await?,
+        1,
+        "a failing abandon registered"
+    );
+
+    // 2. A live frontend's row — its status with the session-owner token, its
+    // heartbeat and start times — is untouched when abandon shares its ID.
+    ledger
+        .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+            true,
+            Default::default(),
+        )))
+        .await?;
+    let live_row = frontend_row(ledger.pool.clone()).await?;
+    assert_eq!(live_row["status"]["ready"], true, "{live_row}");
+    assert!(
+        live_row["status"]["session_owner_token"].is_string(),
+        "{live_row}"
+    );
+    let shared = Row::new("22", "pending");
+    seed(&ledger.pool, &shared).await?;
+    let under_frontend = run(
+        shared.hash.clone(),
+        vec![("PRISM_INSTANCE_ID", "frontend-a")],
+    )
+    .await?;
+    assert_eq!(code(&under_frontend), 0, "{}", stderr(&under_frontend));
+    assert_eq!(
+        frontend_row(ledger.pool.clone()).await?,
+        live_row,
+        "abandon touched the live frontend row"
+    );
+    assert_eq!(instances(ledger.pool.clone()).await?, 1);
+
+    // 3. The halt guard holds, and a halted run leaves no row behind.
+    let halted_row = Row::new("33", "pending");
+    seed(&ledger.pool, &halted_row).await?;
+    let before = whole_row(&ledger.pool, &halted_row.hash).await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='test halt' WHERE singleton")
+        .execute(&ledger.pool)
+        .await?;
+    let halted = run(halted_row.hash.clone(), vec![]).await?;
+    assert!(!halted.status.success(), "{}", stdout(&halted));
+    assert!(
+        stderr(&halted).contains("cluster halted"),
+        "{}",
+        stderr(&halted)
+    );
+    assert_eq!(whole_row(&ledger.pool, &halted_row.hash).await?, before);
+    assert_eq!(frontend_row(ledger.pool.clone()).await?, live_row);
+    assert_eq!(instances(ledger.pool.clone()).await?, 1);
+
+    // 4. Nothing is left for `fatal-state clear` to refuse. Its instance gate
+    // requires every stored row to be `stopped` or `drained`; once the one
+    // real frontend stops, that is the whole table, because no abandon run —
+    // generated ID, shared ID, or halted — added a row of its own.
+    ledger.heartbeat(HeartbeatStatus::Stopped).await?;
+    let unfinished: Vec<Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM qbit_prism_instances i WHERE coalesce(i.status->>'state','') NOT IN ('stopped','drained') ORDER BY i.instance_id")
+        .fetch_all(&ledger.pool).await?;
+    assert!(unfinished.is_empty(), "{unfinished:?}");
+    assert_eq!(instances(ledger.pool.clone()).await?, 1);
+
+    node.assert_never_reached();
     db.close(vec![ledger]).await
 }

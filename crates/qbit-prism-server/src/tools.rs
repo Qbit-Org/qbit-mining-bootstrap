@@ -318,10 +318,12 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
     }
 }
 
-/// The operator candidate commands (#268). Both read `PRISM_DATABASE_URL`
-/// and nothing else: neither builds a node client, reads a signing key,
-/// loads `Config` or starts a listener, so "never calls `submitblock`" is a
-/// property of the code's shape rather than of its discipline.
+/// The operator candidate commands (#268). Neither builds a node client,
+/// reads a signing key, loads `Config` or starts a listener, so "never calls
+/// `submitblock`" is a property of the code's shape rather than of its
+/// discipline. `list` needs only the database URL, the way `fatal-state
+/// show` reads it; `abandon` writes an ordinary ledger row, so it takes the
+/// one-shot tool connection and the database configuration behind it.
 async fn candidates(command: CandidatesCommand) -> Result<()> {
     match command {
         CandidatesCommand::List { json, limit } => {
@@ -359,9 +361,19 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
                 !reason.trim().is_empty() && reason.len() <= 4096,
                 "--reason must contain 1 to 4096 bytes of nonblank text"
             );
-            let url =
-                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
-            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            // A one-shot writer of ordinary ledger rows, not a recovery
+            // command: `connect_tool` refuses a halted cluster at connect
+            // exactly as a frontend would, and writes no heartbeat, so a
+            // live frontend sharing this instance ID keeps its row.
+            let config = config::DatabaseConfig::from_env()?;
+            let ledger = crate::ledger::Ledger::connect_tool(
+                &config.database_url,
+                config.instance_id,
+                config.database_connections,
+                false,
+                None,
+            )
+            .await?;
             let outcome = ledger.abandon_candidate(&block_hash, &reason).await;
             // Closed before the outcome is inspected, so a refusal releases
             // the pool exactly as a success does.

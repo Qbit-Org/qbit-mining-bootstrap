@@ -81,10 +81,13 @@ accounting after it, and the row records where the block is between them:
 
 ### Candidate commands
 
-Two operator commands read and finish the rows above. Both take
-`PRISM_DATABASE_URL` and nothing else: neither builds a node client, reads a
-signing key, loads the server configuration or starts a listener, so neither
-can offer a block.
+Two operator commands read and finish the rows above. Neither builds a node
+client, reads a signing key, loads the server configuration or starts a
+listener, so neither can offer a block. `list` needs only
+`PRISM_DATABASE_URL`, as `fatal-state show` does. `abandon` writes an ordinary
+ledger row, so it uses the one-shot tool connection and the stored-data
+settings behind it — `PRISM_DATABASE_URL`, `PRISM_INSTANCE_ID` (generated when
+unset) and `PRISM_DATABASE_MAX_CONNECTIONS`.
 
 ```sh
 qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
@@ -167,16 +170,22 @@ code 5 applies only while the claim is still live. A pending row that has both
 a live claim and a landed block reports code 6, because the claim expires on
 its own and the accounting does not.
 
-`abandon` writes through the ordinary ledger write transaction and so inherits
-its two fences, both reported as exit 1:
+`abandon` connects as a one-shot tool and writes through the ordinary ledger
+write transaction, so it is fenced twice, both reported as exit 1:
 
-- **A halted cluster.** While `qbit_prism_cluster.fatal_error` is set, every
-  ledger write fails with `cluster halted: ...`. Use
+- **A halted cluster.** While `qbit_prism_cluster.fatal_error` is set,
+  `abandon` is refused at connect with `cluster halted: ...`, exactly as a
+  frontend would be, and the write guard would refuse it again. Use
   [fatal-state recovery](#fatal-state-recovery) first. `list` is unaffected and
   stays available throughout.
 - **A live legacy Python writer lease.** While a `qbit_ledger_writer_lease` row
   has not expired, the write fails with `live legacy Python writer lease`. This
   is what stops an operator abandon racing the `2.x.x` writer during a cutover.
+
+Like the other one-shot commands, `abandon` writes no heartbeat: it leaves no
+`qbit_prism_instances` row for `fatal-state clear` to refuse, and a live
+frontend that shares its configured `PRISM_INSTANCE_ID` keeps its status and
+session-owner token untouched.
 
 Neither command takes a batch or an allowlist, and neither offers a block.
 
