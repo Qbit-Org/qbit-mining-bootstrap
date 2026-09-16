@@ -6,6 +6,9 @@ use crate::coordinator::{
 use serde_json::json;
 use std::sync::atomic::Ordering;
 
+#[path = "issued_batcher_pg_tests.rs"]
+mod postgres;
+
 async fn fixture() -> (Fixture, Arc<Prepared>) {
     let f = Fixture::new(Duration::from_secs(60)).await;
     f.coordinator.refresh_once().await.unwrap();
@@ -144,7 +147,7 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
 }
 
 #[tokio::test]
-async fn active_member_cancellation_fails_peers_but_other_groups_continue() {
+async fn active_member_cancellation_preserves_live_peers_and_exact_expiry() {
     let (f, prepared) = fixture().await;
     let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
     let gate = Arc::new(Gate::default());
@@ -156,13 +159,25 @@ async fn active_member_cancellation_fails_peers_but_other_groups_continue() {
     assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[2]);
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
-    assert!(peer
-        .await
-        .unwrap()
-        .unwrap_err()
-        .to_string()
-        .contains("before commit"));
+    assert!(!peer.is_finished());
     assert!(!f.store.jobs.lock().unwrap().contains_key("peer"));
+    gate.release.notify_one();
+    assert_eq!(peer.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    {
+        let rows = f.store.jobs.lock().unwrap();
+        // The canceled member owns no notification, but its immutable row can
+        // commit with an interested peer. Neither child's expiry slides.
+        for (id, expiry) in [("cancel", 300_000), ("peer", 310_000)] {
+            assert_eq!(rows[id].expires_at_ms, expiry);
+            assert_eq!(
+                rows[id].payload,
+                json!({
+                    "prepared_key": prepared.storage_key, "expires_at_ms": expiry,
+                })
+            );
+        }
+        assert_eq!(rows[&prepared.storage_key].expires_at_ms, 370_000);
+    }
     assert_eq!(
         enqueue(batcher.clone(), prepared, "later", 320_000)
             .await
@@ -171,6 +186,161 @@ async fn active_member_cancellation_fails_peers_but_other_groups_continue() {
         IssuedJobSave::Saved
     );
     settled(&batcher).await;
+}
+
+#[tokio::test]
+async fn all_active_members_canceled_before_commit_leave_no_rows_or_retry() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    tokio::time::pause();
+    let first = enqueue(batcher.clone(), prepared.clone(), "cancel-all-1", 300_000);
+    let peer = enqueue(batcher.clone(), prepared.clone(), "cancel-all-2", 310_000);
+    gate.entered.notified().await;
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[2]);
+    first.abort();
+    peer.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(peer.await.unwrap_err().is_cancelled());
+    settled(&batcher).await;
+    {
+        let rows = f.store.jobs.lock().unwrap();
+        assert!(!rows.contains_key("cancel-all-1") && !rows.contains_key("cancel-all-2"));
+    }
+    assert_eq!(
+        enqueue(batcher.clone(), prepared, "after-all-canceled", 320_000)
+            .await
+            .unwrap()
+            .unwrap(),
+        IssuedJobSave::Saved,
+    );
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[2, 1]
+    );
+}
+
+#[tokio::test]
+async fn canceled_member_original_deadline_still_bounds_live_peers() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    tokio::time::pause();
+    let started = Instant::now();
+    let first = {
+        let batcher = batcher.clone();
+        let prepared = prepared.clone();
+        tokio::spawn(async move {
+            batcher
+                .save(
+                    "earliest-canceled",
+                    &json!({
+                        "prepared_key": prepared.storage_key, "expires_at_ms": 300_000,
+                    }),
+                    0,
+                    &prepared.reservation.record.parent_hash,
+                    300_000,
+                    prepared.reservation.dependency(&prepared.storage_key),
+                    started + Duration::from_secs(5),
+                )
+                .await
+        })
+    };
+    let peer = enqueue(batcher.clone(), prepared, "later-deadline", 310_000);
+    gate.entered.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let error = peer.await.unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("deadline elapsed") && error.contains("before commit"),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
+    settled(&batcher).await;
+    let rows = f.store.jobs.lock().unwrap();
+    assert!(!rows.contains_key("earliest-canceled") && !rows.contains_key("later-deadline"));
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[2]);
+}
+
+#[tokio::test]
+async fn canceled_member_during_commit_does_not_hide_live_peers_acknowledgement() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let gate = Arc::new(Gate::default());
+    *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
+    tokio::time::pause();
+    let first = enqueue(
+        batcher.clone(),
+        prepared.clone(),
+        "committing-canceled",
+        300_000,
+    );
+    let peer = enqueue(batcher.clone(), prepared, "committing-peer", 310_000);
+    gate.entered.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(!peer.is_finished());
+    gate.release.notify_one();
+    assert_eq!(peer.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    settled(&batcher).await;
+    let rows = f.store.jobs.lock().unwrap();
+    assert_eq!(rows["committing-canceled"].expires_at_ms, 300_000);
+    assert_eq!(rows["committing-peer"].expires_at_ms, 310_000);
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[2]);
+}
+
+#[tokio::test]
+async fn all_members_canceled_during_commit_leave_exact_identity_for_reconciliation() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let gate = Arc::new(Gate::default());
+    *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
+    tokio::time::pause();
+    let first = enqueue(
+        batcher.clone(),
+        prepared.clone(),
+        "all-gone-commit-1",
+        300_000,
+    );
+    let peer = enqueue(
+        batcher.clone(),
+        prepared.clone(),
+        "all-gone-commit-2",
+        310_000,
+    );
+    gate.entered.notified().await;
+    first.abort();
+    peer.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(peer.await.unwrap_err().is_cancelled());
+    settled(&batcher).await;
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[2]);
+    let count = f.store.jobs.lock().unwrap().len();
+    // This fake COMMIT became durable but its acknowledgement was never
+    // received. All-gone cancellation must not remove or remint these rows.
+    for (id, expiry) in [
+        ("all-gone-commit-1", 300_000),
+        ("all-gone-commit-2", 310_000),
+    ] {
+        assert_eq!(f.store.jobs.lock().unwrap()[id].expires_at_ms, expiry);
+        assert_eq!(
+            enqueue(batcher.clone(), prepared.clone(), id, expiry)
+                .await
+                .unwrap()
+                .unwrap(),
+            IssuedJobSave::Saved
+        );
+    }
+    settled(&batcher).await;
+    assert_eq!(f.store.jobs.lock().unwrap().len(), count);
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[2, 1, 1]
+    );
 }
 
 #[tokio::test]
@@ -183,16 +353,19 @@ async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent(
     let first = enqueue(batcher.clone(), prepared.clone(), "committed", 300_000);
     let peer = enqueue(batcher.clone(), prepared.clone(), "committed-peer", 300_000);
     gate.entered.notified().await;
-    first.abort();
-    assert!(first.await.unwrap_err().is_cancelled());
-    assert!(peer
-        .await
-        .unwrap()
-        .unwrap_err()
-        .to_string()
-        .contains("commit outcome uncertain"));
+    // Lose the acknowledgement for the whole attempt, independently of any
+    // member canceling. Live peers must not mistake shutdown for rollback.
+    batcher.shutdown.cancel();
+    for result in [first.await.unwrap(), peer.await.unwrap()] {
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("commit outcome uncertain"));
+    }
+    settled(&batcher).await;
     let count = f.store.jobs.lock().unwrap().len();
     assert!(f.store.jobs.lock().unwrap().contains_key("committed-peer"));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
     assert_eq!(
         enqueue(batcher.clone(), prepared, "committed", 300_000)
             .await

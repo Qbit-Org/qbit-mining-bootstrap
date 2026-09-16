@@ -72,10 +72,17 @@ identity and each child's absolute expiry never change.
 
 A conflicting child fails its whole transaction, including renewal. Other
 groups can succeed independently; no SQL failure is silently replayed. Canceled
-queued children are discarded, and cancellation of an active member interrupts
-the whole batch. A batch-local statement limit preserves stricter session
+queued children are discarded. Once a batch is active, it continues while any
+member still waits: an individually canceled child's immutable metadata may
+commit undelivered alongside live peers, with its original expiry unchanged.
+Cancellation of all active members interrupts the shared attempt; before COMMIT
+this rolls back every child, including the singleton case. The minimum original
+deadline and earliest child expiry still govern the whole atomic batch, even
+when the earliest member has canceled. These limits can fail otherwise live
+peers; avoiding that would require a different transaction partition or a retry.
+A batch-local statement limit preserves stricter session
 settings and otherwise caps statements at 15 seconds or the remaining original
-deadline. Cancellation drains queued rollback before starting the next batch;
+deadline. An interrupted attempt drains rollback before starting the next batch;
 cleanup is bounded at 16 seconds and discards an unresponsive connection.
 Dropping the Coordinator closes admissions and resolves pending waiters.
 COMMIT already started means an uncertain outcome after cancellation or lost

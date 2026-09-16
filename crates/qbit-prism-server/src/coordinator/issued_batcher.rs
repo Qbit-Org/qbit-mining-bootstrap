@@ -144,9 +144,9 @@ impl IssuedBatcher {
             .await
             .context("issued job deadline elapsed")?
             .map_err(|_| anyhow!("compact issued batcher shut down"))?;
-        // A caller keeps its own deadline even while another member's canceled
-        // SQL is draining. Timeout drops enrollment; the worker interrupts the
-        // shared attempt and preserves uncertainty once COMMIT has started.
+        // A caller keeps its own deadline even while SQL or cleanup is pending.
+        // Dropping enrollment leaves active work to live peers; the last caller
+        // cancels it. A lost reply cannot prove that COMMIT rolled back.
         tokio::time::timeout_at(deadline, result).await
             .context("compact issued batch deadline elapsed; durability unknown; reconcile original job identity")?
             .context("compact issued batcher shut down")?
@@ -257,7 +257,10 @@ async fn run(
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => Err(interrupted(&attempt, "shutdown")),
-            _ = cancellations.next() => Err(interrupted(&attempt, "caller canceled")),
+            // Once SQL owns the immutable children, a caller losing interest
+            // must not abort live peers. A canceled child may commit undelivered;
+            // its original expiry and the shared minimum deadline still apply.
+            _ = async { while cancellations.next().await.is_some() {} } => Err(interrupted(&attempt, "all callers canceled")),
             _ = tokio::time::sleep_until(deadline) => Err(interrupted(&attempt, "deadline elapsed")),
             result = ledger.save_issued_jobs_compact(&jobs, group.revision, &group.parent, group.dependency(), &attempt) => result,
         };
