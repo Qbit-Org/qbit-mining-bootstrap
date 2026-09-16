@@ -9295,6 +9295,12 @@ class PrismCoordinator:
             block_hash
         )
 
+    def _block_candidate_orphan_verdict_standing(self, block_hash: str) -> bool:
+        """Whether the node proved this candidate orphaned and the tie is unsettled (#414)."""
+        return self._ensure_block_candidate_service()._block_candidate_orphan_verdict_standing(
+            block_hash
+        )
+
     def _block_candidate_chain_probe(
         self,
         block_hash: str,

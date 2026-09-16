@@ -335,6 +335,27 @@ def _active_chain_header_height(header: object) -> int | None:
     return height if confirmations > 0 else None
 
 
+def _exact_int(value: object) -> int | None:
+    """``value`` if it is a genuine integer (not a bool, str, or float)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _block_hash_or_none(value: object) -> str | None:
+    """Lower-cased ``value`` if it is a well-formed 32-byte hex block hash."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    if len(candidate) != 64:
+        return None
+    try:
+        bytes.fromhex(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
 # -- decided-height candidate collapse (#183) --------------------------
 # Bounded, fixed-label outcome keys for the collapse selector/apply. They
 # are the whole metric label space: no block hash, parent hash, or job ID
@@ -6685,6 +6706,7 @@ class BlockCandidateService:
         # the phase state it accumulated has no consumer left (issue #224).
         self._discard_accepted_landing_attribution(block_hash)
         stale_job_class = getattr(outcome, "stale_job_class", None)
+        orphan_terminal_trigger = getattr(outcome, "orphan_terminal_trigger", None)
         key = block_hash.lower()
         with self._coordinator.lock:
             counted_abandonments = self._counted_block_candidate_abandonments
@@ -6696,6 +6718,23 @@ class BlockCandidateService:
                 counts = {}
                 self.abandoned_counts = counts
             counts[reason] = int(counts.get(reason, 0)) + 1
+            if orphan_terminal_trigger in PRISM_BLOCK_CANDIDATE_ORPHAN_TERMINAL_TRIGGERS:
+                # A proven orphan's terminal step, attributed to the trigger
+                # that settled the tie (EP-OBSERVABILITY) and committed here
+                # with the abandonment so a failed prepared-row rejection
+                # cannot count it before the rows are actually rejected.
+                terminal_counts = getattr(
+                    self, "block_candidate_orphan_terminal_counts", None
+                )
+                if terminal_counts is None:
+                    terminal_counts = {
+                        trigger: 0
+                        for trigger in PRISM_BLOCK_CANDIDATE_ORPHAN_TERMINAL_TRIGGERS
+                    }
+                    self.block_candidate_orphan_terminal_counts = terminal_counts
+                terminal_counts[orphan_terminal_trigger] = (
+                    int(terminal_counts.get(orphan_terminal_trigger, 0)) + 1
+                )
             if stale_job_class is not None:
                 stale_counts = getattr(self, "stale_job_abandon_counts", None)
                 if stale_counts is None:
@@ -7963,6 +8002,7 @@ class BlockCandidateService:
         outcome.reason = reason
         outcome.error = None
         outcome.stale_job_class = None
+        outcome.orphan_terminal_trigger = None
         print(
             f"prism coordinator: block candidate deferred reason={reason}: {message}",
             flush=True,
@@ -8167,11 +8207,10 @@ class BlockCandidateService:
         through the same coordinator RPC client, and therefore the same
         per-call timeout, as the rest of the probe.
         """
-        try:
-            confirmations = int(header.get("confirmations"))
-        except (TypeError, ValueError):
-            return None
-        if confirmations != -1:
+        # Exactly the integer -1: a string, a float, or a boolean is not the
+        # node's off-chain statement, and a coerced value must not become
+        # the first half of an irreversible disposition.
+        if _exact_int(header.get("confirmations")) != -1:
             return None
         raw_height = header.get("height")
         if raw_height is None:
@@ -8179,10 +8218,10 @@ class BlockCandidateService:
                 return None
             height = int(expected_height)
         else:
-            try:
-                height = int(raw_height)
-            except (TypeError, ValueError):
+            height_value = _exact_int(raw_height)
+            if height_value is None:
                 return None
+            height = height_value
             if expected_height is not None and int(expected_height) != height:
                 print(
                     "prism coordinator: orphan verdict withheld hash="
@@ -8193,9 +8232,7 @@ class BlockCandidateService:
                 )
                 return None
         try:
-            active_hash = str(
-                self._coordinator.rpc.call("getblockhash", [height])
-            ).lower()
+            active_reply = self._coordinator.rpc.call("getblockhash", [height])
         except Exception:
             print(
                 "prism coordinator: orphan verdict active-header probe failed "
@@ -8204,6 +8241,19 @@ class BlockCandidateService:
                 flush=True,
             )
             traceback.print_exc()
+            return None
+        # Only a well-formed block hash is "a different block": a null or
+        # malformed reply proves nothing (an out-of-range height is a JSON-RPC
+        # error and lands in the unknown branch above).
+        active_hash = _block_hash_or_none(active_reply)
+        if active_hash is None:
+            print(
+                "prism coordinator: orphan verdict withheld hash="
+                f"{block_hash}: getblockhash at height {height} returned "
+                f"{active_reply!r}, not a block hash; leaving the chain view "
+                "unknown",
+                flush=True,
+            )
             return None
         if active_hash == block_hash:
             return None
@@ -8232,11 +8282,10 @@ class BlockCandidateService:
             return None
         if not isinstance(header, dict):
             return None
-        try:
-            confirmations = int(header.get("confirmations"))
-        except (TypeError, ValueError):
+        confirmations = _exact_int(header.get("confirmations"))
+        if confirmations is None or confirmations <= 0:
             return None
-        return confirmations if confirmations > 0 else None
+        return confirmations
 
     def _note_block_candidate_orphan_verdict(self, block_hash: str) -> float:
         """Register a proven-orphan verdict; return the first verdict's stamp.
@@ -8279,6 +8328,21 @@ class BlockCandidateService:
         with self._coordinator.lock:
             return self._block_candidate_orphan_verdicts.get(block_hash.lower())
 
+    def _block_candidate_orphan_verdict_standing(self, block_hash: str) -> bool:
+        """Whether the node has proven this candidate orphaned and the tie is unsettled.
+
+        True from the first orphan verdict until the verdict is retired (the
+        chain flipped back) or the candidate's terminal disposition is
+        finalized. The payout-preview ancestor scan consults this so the
+        candidate's withdrawn-transition tombstone keeps failing the
+        candidate's OWN descendants closed (a flip-back must not let a
+        child snapshot pre-accept balances before the barrier is re-armed)
+        without fencing unrelated builds on the competitor's chain for the
+        length of the wait -- which would recreate the stall the verdict
+        exists to end.
+        """
+        return self._block_candidate_orphan_verdict_since(block_hash) is not None
+
     def _retire_block_candidate_orphan_verdict(self, block_hash: str) -> bool:
         """Drop a standing orphan verdict; return whether one stood."""
         self._coordinator._ensure_job_cache_state()
@@ -8301,23 +8365,16 @@ class BlockCandidateService:
         confirmations, ``window_expired`` once the first verdict is older
         than the observed-tip acceptance window, and None while neither
         holds. Confirmations come first ("whichever comes first"), and an
-        unknown count (RPC failure, competitor itself reorged out) can
-        never fire that trigger -- the wait then ends only through the
-        window, so RPC failures stay unknown without making the wait
-        unbounded. A non-positive window disables the age bound, matching
-        the evidence semantics of the same setting.
+        unknown count (RPC failure, competitor itself reorged out, or the
+        candidate's own probe unknown on this pass so no competitor is
+        named) can never fire that trigger -- the wait then ends only
+        through the window, so RPC failures stay unknown without making
+        the wait unbounded. A non-positive window disables the age bound,
+        matching the evidence semantics of the same setting (the loader
+        rejects it; only embedders can set it).
         """
         coordinator = self._coordinator
-        required = max(
-            1,
-            int(
-                getattr(
-                    coordinator,
-                    "candidate_orphan_terminal_confirmations",
-                    DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS,
-                )
-            ),
-        )
+        required = self._orphan_terminal_confirmations_required()
         confirmations: int | None = None
         if verdict.active_hash is not None:
             confirmations = self._block_candidate_competitor_confirmations(
@@ -8360,15 +8417,22 @@ class BlockCandidateService:
         What the reorg reconciler already covers, and what it does not:
         the reconciler watches ``confirmed`` rows (marking them
         ``inactive`` when they leave the active chain) and ``inactive``
-        rows (reactivating them when they return), and rejects
-        ``prepared`` rows only when they are stranded without an outbox
-        entry. A candidate in an orphan confirmation wait still owns its
-        outbox entry and its row is still ``prepared``, so the reconciler
-        never touches it either way; the live path here is the only owner
-        of the flip-back, and once the accepted tail confirms the row any
-        later reorg is the reconciler's. A row rejected by the terminal
-        step is revived by nothing, which is why the terminal step waits
-        for the competitor to settle.
+        rows (reactivating them when they return), and its
+        stranded-prepared sweep rejects a ``prepared`` row only once the
+        chain is ``STRANDED_PREPARED_REJECT_MIN_DEPTH`` blocks past it --
+        the proxy for a row that lost its live owner. A candidate in an
+        orphan confirmation wait still owns its outbox entry, its row is
+        still ``prepared``, and the wait is bounded by the observed-tip
+        window (minutes, not a hundred blocks), so the reconciler never
+        touches it either way: the live path here is the only owner of
+        the flip-back, and only once the accepted tail confirms the row
+        does any later reorg become the reconciler's. A row rejected by
+        the terminal step is revived by nothing, which is why the terminal
+        step waits for the competitor to settle.
+
+        Re-arming pops the withdrawn transition's tombstone (``begin``
+        does), so the candidate's descendants move from failing closed to
+        waiting on its preview.
         """
         if not self._retire_block_candidate_orphan_verdict(block_hash):
             return
@@ -8489,12 +8553,18 @@ class BlockCandidateService:
         window, whichever comes first; each retry re-probes from live chain
         state, so a chain that flips back to the pool's block is restored
         for finalization (see ``_restore_block_candidate_after_orphan_verdict``),
-        and RPC failures leave the view unknown -- never a terminal step --
-        with the wait still bounded by the window. The terminal seal
-        re-reads observation evidence atomically, so callers can order
-        follow-up durable work (rejecting prepared payout rows) strictly
-        afterward. Abandonment metrics commit only once that cleanup succeeds
-        or a false finalize-only disposition is frozen.
+        and RPC failures leave the view unknown -- never a terminal step:
+        an unknown probe under a standing verdict keeps waiting on the
+        standing clock, so the wait stays bounded by the window without
+        the flake itself deciding anything. The withdrawn transition's
+        tombstone stands for the wait (the candidate's own descendants
+        fail closed; unrelated builds skip it while the verdict stands)
+        and is popped by the terminal writer or the flip-back re-arm. The
+        terminal seal re-reads observation evidence atomically, so callers
+        can order follow-up durable work (rejecting prepared payout rows)
+        strictly afterward. Abandonment metrics -- the orphan terminal
+        trigger included -- commit only once that cleanup succeeds or a
+        false finalize-only disposition is frozen.
         """
         coordinator = self._coordinator
         if reason in self.retryable_reasons:
@@ -8525,6 +8595,18 @@ class BlockCandidateService:
         )
         chain_probe = verdict.probe
         orphaned = verdict.state == BLOCK_CANDIDATE_CHAIN_ORPHANED
+        standing_verdict_since = self._block_candidate_orphan_verdict_since(
+            block_hash
+        )
+        # A standing verdict outlives one unknown probe (EP-ERRORS): an RPC
+        # flake during the confirmation wait keeps the candidate waiting --
+        # still bounded by the window -- instead of handing it to the
+        # evidence-only terminal route below, where an already-expired
+        # observation would abandon it on a view that proved nothing.
+        orphan_wait_view = orphaned or (
+            verdict.state == BLOCK_CANDIDATE_CHAIN_UNKNOWN
+            and standing_verdict_since is not None
+        )
         if chain_probe is True or (
             chain_probe is None
             and (
@@ -8554,11 +8636,17 @@ class BlockCandidateService:
         orphan_terminal_trigger: str | None = None
         competitor_confirmations: int | None = None
         orphan_verdict_age = 0.0
-        if orphaned:
+        if orphan_wait_view:
             # Stamp (and count, once) the verdict before the withdrawal so
             # the wait clock starts at the node's first proof, then read the
-            # competitor's confirmations outside every lock.
-            verdict_since = self._note_block_candidate_orphan_verdict(block_hash)
+            # competitor's confirmations outside every lock. An unknown
+            # probe under a standing verdict reuses the standing clock and
+            # names no competitor, so only the window can end its wait.
+            verdict_since = (
+                self._note_block_candidate_orphan_verdict(block_hash)
+                if orphaned
+                else float(standing_verdict_since)  # type: ignore[arg-type]
+            )
             (
                 orphan_terminal_trigger,
                 competitor_confirmations,
@@ -8579,7 +8667,12 @@ class BlockCandidateService:
             )
         # The withdrawal releases the landed barrier (and wakes the pending
         # tip refresh itself, so job delivery resumes on this pass whether
-        # the outcome below is terminal or an orphan confirmation wait).
+        # the outcome below is terminal or an orphan confirmation wait). Its
+        # tombstone deliberately stands for the wait: the candidate's own
+        # descendants fail closed on it (a flip-back must not let a child
+        # snapshot pre-accept balances before the barrier is re-armed),
+        # while the preview ancestor scan skips it for unrelated builds on
+        # the competitor's chain because the verdict is standing.
         coordinator._clear_accepted_block_payout_preview(
             block_hash,
             invalidate_published=True,
@@ -8596,15 +8689,23 @@ class BlockCandidateService:
         # the withdrawal. On that re-probe only a proven-active view can
         # overturn the verdict; an unknown view (an RPC flake) cannot, or
         # stale evidence would re-arm the barrier the verdict released.
-        if chain_probe is False and orphan_terminal_trigger is None:
-            late_probe: bool | None = False
+        if orphan_wait_view:
+            if orphan_terminal_trigger is None:
+                late_probe: bool | None = False
+            else:
+                late_probe = coordinator._block_candidate_chain_probe(
+                    block_hash,
+                    expected_height=expected_height,
+                )
+                if late_probe is not True:
+                    late_probe = False
+        elif chain_probe is False:
+            late_probe = False
         else:
             late_probe = coordinator._block_candidate_chain_probe(
                 block_hash,
                 expected_height=expected_height,
             )
-            if orphaned and late_probe is not True:
-                late_probe = False
         with coordinator.lock:
             accepted_race_won = bool(
                 preserve_if_accepted
@@ -8635,7 +8736,7 @@ class BlockCandidateService:
                 )
             )
             orphan_wait = bool(
-                orphaned
+                orphan_wait_view
                 and orphan_terminal_trigger is None
                 and not accepted_race_won
                 and not late_acceptance_observed
@@ -8644,6 +8745,10 @@ class BlockCandidateService:
                 outcome.reason = reason
                 outcome.error = message
                 outcome.stale_job_class = stale_job_class
+                # Carried to the commit: the terminal trigger is counted
+                # with the abandonment itself, once the prepared rows are
+                # rejected, under the same once-per-candidate dedup.
+                outcome.orphan_terminal_trigger = orphan_terminal_trigger
                 # Seal the disposition in the same critical section that
                 # commits it: stop matching tip observations for this hash so
                 # no acceptance evidence can register between this terminal
@@ -8652,6 +8757,11 @@ class BlockCandidateService:
                 # same lock, so exclusion across the gap is total. A crash
                 # before the durable outbox update replays the candidate,
                 # which re-registers and re-evaluates from live chain state.
+                # The orphan verdict itself is NOT retired here: if that
+                # follow-up work fails and the candidate retries, the
+                # standing clock keeps the wait from restarting and the
+                # verdict counter from counting twice; the terminal
+                # finalization (or terminal-outcome eviction) retires it.
                 self._outstanding_block_candidate_hashes.discard(
                     block_hash.lower()
                 )
@@ -8659,11 +8769,6 @@ class BlockCandidateService:
                     block_hash.lower(),
                     None,
                 )
-                self._block_candidate_orphan_verdicts.pop(block_hash.lower(), None)
-                if orphaned and orphan_terminal_trigger is not None:
-                    self.block_candidate_orphan_terminal_counts[
-                        orphan_terminal_trigger
-                    ] += 1
         if accepted_race_won:
             coordinator._clear_accepted_block_payout_preview(block_hash)
             outcome.reason = None
@@ -8740,12 +8845,16 @@ class BlockCandidateService:
             # for the competitor to settle the tie. The ledger row stays
             # ``prepared`` and the retry re-probes from live chain state.
             self._count_orphan_wait_defer()
+            competitor_view = (
+                f"a different block is active at height {verdict.height}"
+                if orphaned
+                else "this pass's probe was unknown; the standing verdict holds"
+            )
             coordinator._defer_block_candidate(
                 PRISM_REJECTION_BLOCK_ORPHAN_CONFIRMATION_WAIT,
-                "node proved the candidate off the active chain (a different "
-                f"block is active at height {verdict.height}); landed payout "
-                "barrier released, holding the prepared payout rows until "
-                "the competitor has "
+                "node proved the candidate off the active chain "
+                f"({competitor_view}); landed payout barrier released, "
+                "holding the prepared payout rows until the competitor has "
                 f"{self._orphan_terminal_confirmations_required()} "
                 "confirmations (now "
                 f"{'unknown' if competitor_confirmations is None else competitor_confirmations}) "
@@ -8760,7 +8869,7 @@ class BlockCandidateService:
             f"prism coordinator: block candidate abandoned reason={reason}: {message}",
             flush=True,
         )
-        if orphaned:
+        if orphan_wait_view:
             print(
                 "prism coordinator: block candidate orphan verdict settled "
                 f"hash={block_hash.lower()} trigger={orphan_terminal_trigger} "

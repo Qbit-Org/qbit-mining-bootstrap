@@ -4009,9 +4009,27 @@ class PayoutStateService:
                 "could not validate an accepted payout preview on the active chain"
             ) from exc
         if not active_ancestors:
+            # A withdrawn transition whose block the node has proven
+            # orphaned (#414) is already withdrawn and published as such;
+            # its tombstone keeps fencing the orphan's OWN descendants (the
+            # exact-parent branch above) but must not fence unrelated builds
+            # on the competitor's chain for the length of the orphan
+            # confirmation wait, or the stall the verdict ends would just
+            # move from the landed barrier to the tombstone. A landed
+            # transition (not yet withdrawn) always fails closed here.
+            orphan_verdict_standing = getattr(
+                runtime,
+                "_block_candidate_orphan_verdict_standing",
+                None,
+            )
             if any(
                 candidate_hash in fail_closed_candidate_hashes
-                for candidate_hash, _candidate_height, _invalidated in (
+                and not (
+                    candidate_invalidated
+                    and callable(orphan_verdict_standing)
+                    and orphan_verdict_standing(candidate_hash)
+                )
+                for candidate_hash, _candidate_height, candidate_invalidated in (
                     ancestor_candidates
                 )
             ):
