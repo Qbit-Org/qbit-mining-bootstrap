@@ -145,30 +145,41 @@ pub enum CandidateState {
     Reconciliation,
 }
 
-/// The terminal disposition of a proven orphan (#415, migration 015): an
-/// offered row whose block the chain has proven not to be on the active
-/// chain, a DIFFERENT block being active at its height with at least
+/// The terminal processing disposition of a proven orphan (#415, migration
+/// 015): an offered row whose block the chain has proven not to be on the
+/// active chain, a DIFFERENT block being active at its height with at least
 /// `Config::candidate_orphan_confirmations` confirmations, observed on one
-/// coherent tip after the row's audit landed. Terminal like `submitted` and
-/// `abandoned`: never claimed again, never offered again, and no longer
-/// counted by the pending-candidate gauges. Unlike those two it keeps its
-/// document, its block bytes, its window reference and its offer record, so
-/// an operator reading the outbox (#268) sees exactly what was offered and
-/// why it was settled. The block itself keeps its landed audit and its
-/// `qbit_pool_blocks` row, marked `inactive`: a later reorg that reactivates
-/// the block is credited by the ordinary reorg reconciler from that
-/// preserved evidence, deferred share included, and this row never reopens.
-/// Written by [`Ledger::orphan_candidate_at_revision`] only.
+/// coherent tip after the row's audit landed. It records why processing
+/// stopped, not a permanent chain fact: the block's chain state stays in
+/// `qbit_pool_blocks`, which a later reorg may still move to `confirmed`.
+/// Terminal like `submitted` and `abandoned`: never claimed again, never
+/// offered again, and no longer counted by the pending-candidate gauges. Like
+/// those two it releases its document, its block bytes and its window
+/// reference; it keeps its offer record and its reason, so an operator
+/// reading the outbox (#268) sees what was offered and why it was settled.
+/// The block itself keeps its landed audit and its `qbit_pool_blocks` row,
+/// marked `inactive`: a later reorg that reactivates the block is confirmed
+/// and credited by the ordinary reorg reconciler from that evidence, deferred
+/// share included, and this row never reopens. Written by
+/// [`Ledger::orphan_candidate_at_revision`] only.
 pub const ORPHANED_STATE: &str = "orphaned";
 
 impl CandidateState {
     /// The SQL list of every unfinished state, for `state IN` predicates.
+    /// Every other state is terminal, so `state NOT IN` this list is the
+    /// terminal test.
     pub const UNFINISHED_SQL: &'static str =
         "('pending','offer_reserved','offered','reconciliation')";
 
-    /// The SQL list of every terminal state, for `state IN` predicates: the
-    /// complement of [`Self::UNFINISHED_SQL`] under 015's lifecycle rule.
-    pub const TERMINAL_SQL: &'static str = "('submitted','abandoned','orphaned')";
+    /// The SQL list of the three offer states, for `state IN` predicates:
+    /// the unfinished states a block may already have reached the node from,
+    /// which only reconciliation or a terminal chain verdict may settle.
+    pub const OFFERED_SQL: &'static str = "('offer_reserved','offered','reconciliation')";
+
+    /// Why a settlement that must hold a live claim on an offered row wrote
+    /// nothing.
+    pub(super) const OFFERED_CLAIM_LOST: &'static str =
+        "candidate claim was lost or expired, or the row was never offered";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -960,12 +971,9 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let moved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN ('offer_reserved','offered','reconciliation') AND claim_expires_at>clock_timestamp()")
+        let moved = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
-        ensure!(
-            moved == 1,
-            "candidate claim was lost or expired, or the row was never offered"
-        );
+        ensure!(moved == 1, CandidateState::OFFERED_CLAIM_LOST);
         tx.commit().await?;
         Ok(())
     }

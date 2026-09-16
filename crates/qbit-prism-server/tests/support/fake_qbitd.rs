@@ -16,6 +16,9 @@ use tokio::task::JoinHandle;
 /// a network difficulty of 1,000,000, which is what sizes the payout window.
 pub const TEMPLATE_BITS: &str = "207fffff";
 
+/// The static tip's height.
+const TIP_HEIGHT: u64 = 100;
+
 pub struct FakeNode {
     pub url: String,
     task: JoinHandle<()>,
@@ -54,12 +57,12 @@ async fn answer(State(state): State<Arc<NodeState>>, Json(request): Json<Value>)
     let now = chrono::Utc::now().timestamp();
     let result = match request["method"].as_str().unwrap_or("") {
         "getblockchaininfo" => json!({
-            "chain":"test","initialblockdownload":false,"blocks":100,"headers":100,
+            "chain":"test","initialblockdownload":false,"blocks":TIP_HEIGHT,"headers":TIP_HEIGHT,
             "bestblockhash":state.tip,"chainwork":"01"
         }),
         "getnetworkinfo" => json!({"connections": 2}),
         "getblocktemplate" => json!({
-            "height":101,"coinbasevalue":5_000_000_000u64,"previousblockhash":state.tip,
+            "height":TIP_HEIGHT + 1,"coinbasevalue":5_000_000_000u64,"previousblockhash":state.tip,
             "version":0x20000000u32,"bits":TEMPLATE_BITS,"curtime":now,"mintime":now-1,
             "transactions":[]
         }),
@@ -67,6 +70,19 @@ async fn answer(State(state): State<Arc<NodeState>>, Json(request): Json<Value>)
         "getmempoolinfo" => json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
         "getbestblockhash" => json!(state.tip),
         "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
+        // Above the tip qbitd has no block, and neither does this static
+        // node: the same error `support/scripted_node.rs` answers, never the
+        // tip. At or below the tip every height still answers the tip.
+        "getblockhash"
+            if request["params"][0]
+                .as_u64()
+                .is_none_or(|height| height > TIP_HEIGHT) =>
+        {
+            return Json(json!({
+                "id":request["id"],"result":null,
+                "error":{"code":-8,"message":"Block height out of range"}
+            }))
+        }
         "getblockhash" => json!(state.tip),
         "getblockheader" => json!({"previousblockhash": state.tip_parent}),
         "validateaddress" => {

@@ -1715,10 +1715,11 @@ async fn assert_candidate_payload_fingerprints(
 }
 
 /// A reservation's authority and every unfinished state's balance evidence
-/// survive recovery, and so does the terminal `orphaned` disposition
-/// migration 015 added (#415): its document, block bytes, window reference
-/// and offer record are evidence a restore must not lose, even though the
-/// row no longer counts as unfinished. Claim ownership remains ephemeral;
+/// survive recovery, and so does the offer record of the terminal `orphaned`
+/// disposition migration 015 added (#415): the row is cleared like every
+/// terminal row, so it no longer counts as unfinished and no longer holds a
+/// balance snapshot, but its reservation, outcome, call time and reason are
+/// evidence a restore must not lose. Claim ownership remains ephemeral;
 /// offer ownership does not. The test restores its original pending row only
 /// to leave the parent fixture unchanged, never as a production recovery
 /// operation.
@@ -1730,9 +1731,10 @@ async fn assert_offer_recovery_fingerprints(
 ) -> Result<()> {
     use qbit_prism_server::ledger::{OfferOutcome, ORPHANED_STATE};
 
-    // `completed_at` is restored with the rest: an orphaned row is terminal,
-    // and the lifecycle CHECK refuses a pending row that kept a completion.
-    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,completed_at,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
+    // `completed_at` and the payload are restored with the rest: an orphaned
+    // row is terminal and cleared, and the lifecycle CHECK refuses a pending
+    // row that kept a completion or lost its document.
+    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,completed_at,candidate,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
     let restore = format!("UPDATE qbit_block_candidate_outbox SET ({COLUMNS})=(SELECT {COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$2)) WHERE block_hash=$1");
     let original: serde_json::Value = sqlx::query_scalar(
         "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
@@ -1801,17 +1803,34 @@ async fn assert_offer_recovery_fingerprints(
         let baseline = recovery::evidence(source, pg_bin).await?;
         ensure!(baseline["pending_candidates"] == 0);
         // An orphaned row is terminal, so it is out of the unfinished set
-        // (and out of the pending gauges) while keeping its evidence.
+        // (and out of the pending gauges), and its cleared window reference
+        // no longer holds its balance snapshot; its offer record is checked
+        // below like every other state's.
+        let orphaned = state == ORPHANED_STATE;
         ensure!(
-            baseline["unfinished_candidates"] == i32::from(state != ORPHANED_STATE),
+            baseline["unfinished_candidates"] == i32::from(!orphaned),
             "{state} counted as unfinished: {}",
             baseline["unfinished_candidates"]
         );
-        ensure!(
-            baseline["records"]["candidate_balances"]["count"] == 1,
-            "{state} lost retained balance evidence"
-        );
-        assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        if orphaned {
+            ensure!(
+                row["candidate"].is_null()
+                    && row["block_bytes"].is_null()
+                    && row["window_anchor_ms"].is_null()
+                    && row["window_prior_balances_sha256"].is_null(),
+                "{state} kept a payload: {row}"
+            );
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 0,
+                "{state} still exported a balance snapshot it no longer references"
+            );
+        } else {
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 1,
+                "{state} lost retained balance evidence"
+            );
+            assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        }
         let mut mutations = vec![
             "proof_observed_at_ms=1800000002122",
             "offer_reserved_at=offer_reserved_at-interval '1 second'",

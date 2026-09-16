@@ -51,7 +51,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
 | `qbit_prism_authorized_with_current_work` | gauge | none | run | Authorized connections holding the current semantic work generation. | `qbit_prism_stratum_clients_with_current_tip_jobs` |
 | `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidate_oldest_pending_seconds` |
-| `qbit_prism_block_candidates_orphaned_total` | counter | none | run | Offered block candidates this instance settled as proven orphans since process start. Increments once per offered candidate this instance settled terminal as a proven orphan (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. Attributed to the committed settlement, never to a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule. | none |
+| `qbit_prism_block_candidates_orphaned_total` | counter | none | run | Offered block candidates this instance settled as proven orphans since process start. Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule. | none |
 | `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidates_pending` |
 | `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule. | `qbit_prism_block_submit_seconds` |
 | `qbit_prism_blocks_total` | counter | none | run | Blocks confirmed by this instance since process start. Native confirmed-block process counter; not the legacy node-acceptance accounting boundary. | `qbit_prism_blocks_accepted_total` |
@@ -202,11 +202,12 @@ forever: once its audit has landed and one coherent tip observation shows a
 `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted from
 the observed tip as `tip_height - height + 1`), the post-offer settlement marks
 the row terminal as `orphaned`, in the same transaction as its reason and its
-block's `inactive` chain state, and increments
-`qbit_prism_block_candidates_orphaned_total` once the commit returned. Both
-pending gauges then stop counting the row. The row keeps its document, block
-bytes, window reference and offer record for the operator surface (#268); it
-is never claimed or offered again. A failed observation settles nothing, so
+block's `inactive` chain state. Both pending gauges then stop counting the row.
+The process increments `qbit_prism_block_candidates_orphaned_total` after it
+observes a successful commit; cancellation or restart between commit and
+recording can lose that increment. The row releases its document, block bytes
+and window reference while preserving offer metadata and the reason for the
+operator surface (#268); it is never claimed or offered again. A failed observation settles nothing, so
 unknown stays distinct from zero: the row waits in reconciliation and the
 gauges report -1 only when the collector itself fails. A later reorg that
 reactivates the block is credited by the ordinary reorg reconciler from the

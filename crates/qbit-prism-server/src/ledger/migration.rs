@@ -55,7 +55,11 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     ("instance_offer_startup", 1),
     // 015: the terminal `orphaned` disposition of a proven orphan (#415). A
     // binary without this entry has no name for the state and refuses the
-    // migrated database at connect, so no mixed-version frontend meets it.
+    // migrated database in a capability check made after 015 committed.
+    // Nothing evicts one that is already running or already past that
+    // check, so 015 is applied only once every earlier instance has
+    // reported shutdown, and old frontends must stay stopped until it has
+    // committed.
     ("candidate_orphan_disposition", 1),
 ];
 
@@ -583,7 +587,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}, then start or migrate again");
+        let orphan_remedy = if versions.contains(&15) {
+            " and restore the candidate_orphan_disposition = 1 declaration from migrations/015_candidate_orphan_disposition.sql after verifying its three lifecycle CHECK constraints on qbit_block_candidate_outbox are present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -625,7 +634,11 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
     // restored selectively; it is not read as a pre-006 database, which
     // would let 006 declare a storage version above an outbox 011 already
     // owns without the lifecycle declaration being checked first.
-    if !versions.contains(&6) && !versions.contains(&11) && !versions.contains(&12) {
+    if !versions.contains(&6)
+        && !versions.contains(&11)
+        && !versions.contains(&12)
+        && !versions.contains(&15)
+    {
         return Ok(());
     }
     if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref(), versions)
@@ -3002,9 +3015,15 @@ pub(super) async fn migrate_schema(
         // 015 (#415) replaces 011's lifecycle rules under their own names to
         // admit the terminal `orphaned` disposition, so it runs above 011
         // and 012, which the blocks above have applied or found recorded.
-        // A pre-015 frontend never writes the state and never claims a row
-        // in it, so no shutdown proof is needed; the capability 015
-        // declares refuses such a frontend at its next connect instead.
+        // The capability it declares is read at connect only: it refuses a
+        // pre-015 binary whose check runs after the commit and does nothing
+        // to one already running, or to a startup already past its check,
+        // either of which could meet an orphaned row it has no name for. So
+        // 015 takes the same shutdown proof 011 and 012 take, before its SQL
+        // locks the outbox (bounded by the session's lock_timeout) and
+        // replaces the rules; old frontends must stay stopped until the
+        // commit. The instance lock is kept until the commit.
+        refuse_unquiesced_instances(tx, 15).await?;
         sqlx::raw_sql(native_migration(15))
             .execute(&mut **tx)
             .await?;
@@ -5086,6 +5105,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains("candidate_offer_lifecycle"), "{error}");
+    }
+
+    #[test]
+    fn a_database_at_15_names_the_orphan_disposition_in_its_capability_remedies() {
+        let at_15 = REQUIRED_SCHEMA_VERSIONS;
+        let declared = [
+            ("candidate_storage_version", 1),
+            ("candidate_offer_lifecycle", 1),
+            ("instance_offer_startup", 1),
+        ];
+        let error = declared_at(&declared, at_15).unwrap_err().to_string();
+        assert!(
+            error.starts_with("database is at schema migration 15 but does not declare candidate_orphan_disposition = 1"),
+            "{error}"
+        );
+        let mut all = declared.to_vec();
+        all.push(("candidate_orphan_disposition", 1));
+        declared_at(&all, at_15).unwrap();
+        // A dropped table held 015's declaration too: the one refusal names
+        // it beside 006's, 011's and 012's, and names it only once 15 is
+        // recorded.
+        let error = require_declared_capabilities(None, at_15)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("006_source_schema.sql")
+                && error.contains("VALUES('candidate_offer_lifecycle',1)")
+                && error.contains("012_offer_startup_fence.sql")
+                && error.contains("candidate_orphan_disposition = 1")
+                && error.contains("015_candidate_orphan_disposition.sql")
+                && error.ends_with("then start or migrate again"),
+            "{error}"
+        );
+        let before_15: Vec<i32> = at_15.iter().copied().filter(|v| *v != 15).collect();
+        let error = require_declared_capabilities(None, &before_15)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("candidate_orphan_disposition"), "{error}");
+        // A record with 15 alone of the declaring migrations was restored
+        // selectively: the pre-DDL fence still checks it.
+        let inventory = SourceInventory {
+            share_ledger: true,
+            outbox: true,
+            present: vec![false; OBJECTS_002.len()],
+            capabilities: None,
+        };
+        let error = refuse_undeclared_native_database(&[2, 3, 4, 5, 15], &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no qbit_prism_schema_capabilities")
+                && error.contains("015_candidate_orphan_disposition.sql"),
+            "{error}"
+        );
     }
 
     #[test]

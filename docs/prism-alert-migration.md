@@ -82,7 +82,8 @@ critical variants) count the four unfinished outbox states; since #415
 different block has `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (default 6)
 confirmations at its height, so an orphan raises the oldest-pending age for a
 few block intervals and then clears without operator action, and
-`qbit_prism_block_candidates_orphaned_total` records each such settlement.
+`qbit_prism_block_candidates_orphaned_total` records completions observed by
+the process after commit (cancellation or restart can lose an increment).
 Size the oldest-pending `for` clause against that window when qualifying the
 provisional 15/60 s bounds in #291: a backlog that persists past it is a row
 automation cannot land or an unknown offer outcome, which is operator work.
