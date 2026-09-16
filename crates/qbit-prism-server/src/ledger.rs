@@ -53,6 +53,7 @@ pub use migration::{
 };
 mod window;
 pub use difficulty::WorkerDifficulty;
+pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
 pub use window::CommitGateClosed;
 pub use window::{
     probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
@@ -88,4 +89,14 @@ pub struct Ledger {
     /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
     /// SHARE` in its own transaction and compares it against this.
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    #[cfg(test)]
+    pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
+    #[cfg(test)]
+    pub(crate) snapshot_decode_hook: std::sync::Arc<std::sync::Mutex<Option<SnapshotDecodeHook>>>,
 }
+
+#[cfg(test)]
+type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;

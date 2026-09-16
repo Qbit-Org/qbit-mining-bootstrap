@@ -181,6 +181,56 @@ pub(super) fn test_config(
 // Projection and comparison
 // ---------------------------------------------------------------------------
 
+/// Explicit test observation of original rows. Runtime work retains only the
+/// reference; these fixtures own their full comparison inputs independently.
+pub(super) async fn original_snapshot(
+    coordinator: &Coordinator,
+    prepared: &Prepared,
+) -> Result<Snapshot> {
+    let window = coordinator
+        .ledger
+        .read_window(&prepared.window, BalanceSource::AsIssued)
+        .await?;
+    Ok(Snapshot {
+        anchor_ms: prepared.snapshot.anchor_ms,
+        share_seq: prepared.snapshot.share_seq,
+        payout_revision: prepared.snapshot.payout_revision,
+        shares: window.shares,
+        prior_balances: window.prior_balances,
+    })
+}
+
+pub(super) async fn original_audit(
+    coordinator: &Coordinator,
+    prepared: &Prepared,
+    bootstrap: Option<Worker>,
+) -> Result<AuditBundle> {
+    let snapshot = Arc::new(original_snapshot(coordinator, prepared).await?);
+    let (bundle, _) = coordinator
+        .build_bundle(
+            snapshot,
+            prepared.template.clone(),
+            bootstrap,
+            prepared.reservation.record.coinbase_suffix_hex.clone(),
+            prepared.inputs.clone(),
+        )
+        .await?;
+    if let Some(hashes) = &prepared.reservation.record.audit_hashes {
+        ensure!(
+            prepared_storage::compact::canonical_json_sha256(&bundle)?
+                == hashes.audit_bundle_sha256,
+            "test reconstruction differs from the original refresh audit"
+        );
+        ensure!(
+            prepared_storage::compact::canonical_json_sha256(
+                &bundle.signed_coinbase_manifest.manifest
+            )? == hashes.coinbase_manifest_sha256,
+            "test reconstruction differs from the original refresh coinbase"
+        );
+    }
+    Ok(bundle)
+}
+
 /// The payout consequence of one bundle, in exactly the shape
 /// `crates/qbit-prism/tests/money_path_vectors.rs` `bundle_payout` records:
 /// the counted window, the entitlements it produces and the payout policy

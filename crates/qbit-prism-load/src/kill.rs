@@ -25,7 +25,10 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::{
-    sync::{atomic::Ordering, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -71,9 +74,15 @@ enum Stage {
 pub struct KillDriver {
     index: usize,
     stage: Stage,
-    /// The submit log's length when the kill began: the census is every
-    /// no-response the killed frontend's sessions recorded after it.
-    submits_before: usize,
+    /// The run's kill fence, shared with every session through
+    /// [`client::SessionShared`]. Bumped once, immediately before the
+    /// SIGKILL.
+    kill_fence: Arc<AtomicU64>,
+    /// The value the bump published. Every record whose own `fence` is at
+    /// least this one was built after the kill was decided; every record
+    /// below it was built before, whatever order the collector applied them
+    /// in. Set in `WaitingForWork`, read once in `Collecting`.
+    fence_at_kill: Option<u64>,
     outstanding_at_kill: Option<usize>,
     ready_limit: Duration,
     census_limit: Duration,
@@ -91,19 +100,25 @@ impl KillDriver {
     /// Begin: wait for `index` to hold work, for up to [`WORK_WAIT`].
     /// `ready_limit` bounds the relaunched process's start-up.
     /// `census_limit` is the configured share-commit timeout plus drain margin.
+    /// `kill_fence` is the run's fence, the same counter the sessions stamp
+    /// their records with.
+    ///
+    /// Nothing about the census is decided here. The census boundary is the
+    /// fence value published in `poll`, at the kill itself; a length or an
+    /// instant taken now would only describe when the driver was constructed.
     pub fn start(
         index: usize,
         ready_limit: Duration,
         census_limit: Duration,
-        collected: &Mutex<Collected>,
+        kill_fence: Arc<AtomicU64>,
     ) -> Self {
-        let submits_before = collected.lock().expect("collector lock").submits.len();
         Self {
             index,
             stage: Stage::WaitingForWork {
                 deadline: Instant::now() + WORK_WAIT,
             },
-            submits_before,
+            kill_fence,
+            fence_at_kill: None,
             outstanding_at_kill: None,
             ready_limit,
             census_limit,
@@ -135,7 +150,6 @@ impl KillDriver {
                     // Freeze new offers, but do not drain before killing: the
                     // scenario must interrupt real pending submits. Pause also
                     // discards queued offers that were never sent.
-                    self.submits_before = collected.lock().expect("collector lock").submits.len();
                     for session in sessions {
                         if session.frontend.load(Ordering::Relaxed) == index {
                             session.paused.store(true, Ordering::Relaxed);
@@ -145,6 +159,27 @@ impl KillDriver {
                                 .context("pausing a killed session for its census")?;
                         }
                     }
+                    // The census boundary, published the instant before the
+                    // signal. A pause stops a session taking new work; it does
+                    // not fence a no-response the session has already emitted
+                    // and that is still queued behind a slow collector, and
+                    // the post-kill barriers then flush that record into the
+                    // suffix of the submit log. Membership is therefore the
+                    // record's own identity, not its arrival order: every
+                    // record built from here on reads at least `fence`.
+                    //
+                    // Bumped before the kill rather than after it. A bump
+                    // after `kill()` returned would leave a genuinely
+                    // kill-induced no-response emitted in between outside the
+                    // census, so it would not be re-offered and its committed
+                    // row would be reported as an ordinary mid-run
+                    // acknowledgement loss. Over-including a nanosecond of
+                    // pre-kill time is the safe side of that trade;
+                    // under-including invents durability findings.
+                    //
+                    // Nothing may come between these two statements: no
+                    // await, no syscall, no lock.
+                    self.fence_at_kill = Some(self.kill_fence.fetch_add(1, Ordering::SeqCst) + 1);
                     // SIGKILL and reap: synchronous, milliseconds.
                     frontends[index].kill();
                     self.outstanding_at_kill = Some(outstanding);
@@ -225,9 +260,16 @@ impl KillDriver {
                             }
                         }
                     }
+                    // The barriers above prove every record the killed
+                    // sessions emitted has been applied; the fence decides
+                    // which of them the kill owns. Completeness and
+                    // membership are two facts, and the census needs both.
+                    let fence_at_kill = self
+                        .fence_at_kill
+                        .expect("the census is read only after the kill published its fence");
                     let indeterminate = {
                         let state = collected.lock().expect("collector lock");
-                        indeterminate_after_kill(&state.submits, self.submits_before, index)
+                        indeterminate_after_kill(&state.submits, fence_at_kill, index)
                     };
                     // Only now resume these sessions. Resuming at /healthz
                     // allowed new work to hide whether old work had settled.

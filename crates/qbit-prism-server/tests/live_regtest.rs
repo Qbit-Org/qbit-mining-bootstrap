@@ -18,6 +18,9 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
+#[path = "support/live_compact_runtime.rs"]
+mod compact_runtime_tests;
+
 #[path = "support/live_highdiff.rs"]
 mod highdiff_tests;
 
@@ -112,6 +115,7 @@ struct Launch {
     qbitd: String,
     server: PathBuf,
     ctv: bool,
+    start_servers: bool,
 }
 
 /// The fixture's database handles, created before any child starts.
@@ -201,19 +205,33 @@ where
 
 impl Fixture {
     async fn open(ctv: bool) -> Result<Option<Self>> {
-        let Some((qbitd, database)) = gate::qbitd_and_database_url(gate::site!())? else {
+        Self::open_with_servers(ctv, true).await
+    }
+
+    async fn open_with_servers(ctv: bool, start_servers: bool) -> Result<Option<Self>> {
+        Self::open_on_database(ctv, start_servers, None).await
+    }
+
+    async fn open_on_database(
+        ctv: bool,
+        start_servers: bool,
+        database: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let Some((qbitd, default_database)) = gate::qbitd_and_database_url(gate::site!())? else {
             return Ok(None);
         };
+        let database = database.unwrap_or(&default_database);
         let launch = Launch {
             qbitd,
             server: env!("CARGO_BIN_EXE_qbit-prism-server").into(),
             ctv,
+            start_servers,
         };
         let mut startup = Startup {
             serial: Some(SERIAL.lock().await),
             ..Startup::default()
         };
-        let result = Self::start(&database, launch, &mut startup).await;
+        let result = Self::start(database, launch, &mut startup).await;
         startup.finish(result).map(Some)
     }
 
@@ -319,6 +337,9 @@ impl Fixture {
         fixture
             .rpc("generatetoaddress", json!([1, fixture.address]))
             .await?;
+        if !launch.start_servers {
+            return Ok(());
+        }
         for index in 0..2 {
             let process = fixture.start_server(index)?;
             fixture.servers.push(process);
@@ -1362,6 +1383,7 @@ mod startup_diagnostics_tests {
             qbitd,
             server: "/nonexistent/qbit-prism-server".into(),
             ctv: false,
+            start_servers: true,
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
         assert!(serial.try_lock().is_err(), "guard released before cleanup");
@@ -1414,6 +1436,7 @@ mod startup_diagnostics_tests {
             qbitd,
             server: server.into(),
             ctv: false,
+            start_servers: true,
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
         assert!(serial.try_lock().is_err(), "guard released before cleanup");
@@ -1472,6 +1495,7 @@ mod startup_diagnostics_tests {
             qbitd,
             server: server.into(),
             ctv: false,
+            start_servers: true,
         };
         let result = Fixture::start_children(lazy_database()?, launch, &mut startup).await;
         let mut fixture = startup.finish(result)?;

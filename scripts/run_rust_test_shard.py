@@ -15,15 +15,19 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+COMPACT_SCALE = ("qbit-prism-server", "test", "compact_runtime_scale")
 # These ignored database contracts must be selected explicitly. Run each only
 # on the shard that owns its ordinary test target; test/prism-native-tests.sh
-# runs the same selections locally. Measurement runs stay opt-in.
+# runs the same selections locally.
 IGNORED = {
     ("qbit-prism-server", "test", "stratum_admission_postgres"): [
         "--exact",
         "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence",
     ],
     ("qbit-prism-server", "test", "observability_database"): [],
+    # Run the real scale cases serially under optimized runtime code; each
+    # owns a private durable primary for its insert-LSN measurements.
+    COMPACT_SCALE: ["--test-threads=1"],
     ("qbit-prism-server", "test", "issued_job_dependency"): ["--test-threads=2"],
 }
 
@@ -56,7 +60,8 @@ def shard_commands(metadata: dict, index: int, count: int) -> list[list[str]]:
             command.append(name)
         commands.append(command + ["--", "--nocapture"])
         if (package, kind, name) in IGNORED:
-            commands.append(command + ["--", "--ignored", "--nocapture"] + IGNORED[package, kind, name])
+            profile = ["--release"] if (package, kind, name) == COMPACT_SCALE else []
+            commands.append(command + profile + ["--", "--ignored", "--nocapture"] + IGNORED[package, kind, name])
     return commands
 
 

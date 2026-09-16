@@ -39,6 +39,17 @@ pub struct CompactRepair {
 }
 
 impl CompactRepair {
+    #[cfg(test)]
+    pub(crate) fn observation_for_test(&self) -> Result<StoredCompactPrepared> {
+        Ok(StoredCompactPrepared {
+            record: self.record.clone(),
+            template: self.template.value_for_test()?,
+            prior_balances: serde_json::from_slice(&self.balance_bytes)?,
+            original_expires_at_ms: self.original_expires_at_ms,
+            expires_at_ms: self.original_expires_at_ms,
+        })
+    }
+
     pub fn encode(
         record: &CompactPrepared,
         template: &PreparedTemplate,

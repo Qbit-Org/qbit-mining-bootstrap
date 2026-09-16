@@ -1,7 +1,7 @@
 use super::*;
 use crate::ledger::{
-    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
-    StoredCompactPrepared,
+    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
+    PreparedTemplate, StoredCompactPrepared,
 };
 use std::collections::VecDeque;
 
@@ -11,8 +11,11 @@ use std::collections::VecDeque;
 pub(crate) struct CompactStore {
     pub reads: StdMutex<VecDeque<Result<Option<StoredCompactPrepared>>>>,
     pub read_keys: StdMutex<Vec<String>>,
+    pub metadata: StdMutex<HashMap<String, StoredCompactPrepared>>,
     pub saves: StdMutex<VecDeque<Result<bool>>>,
     pub save_calls: StdMutex<Vec<CompactSave>>,
+    pub issued_saves: StdMutex<VecDeque<Result<IssuedJobSave>>>,
+    pub issued_calls: StdMutex<Vec<CompactIssuedSave>>,
     pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
     pub state_gate: StdMutex<Option<Arc<Gate>>>,
     pub state_calls: AtomicUsize,
@@ -34,6 +37,21 @@ pub(crate) struct CompactSave {
     pub balances: Vec<qbit_prism::CarryForwardBalance>,
     pub current_revision: i64,
     pub original_expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactIssuedSave {
+    pub id: String,
+    pub payload: Value,
+    pub current_revision: i64,
+    pub parent: String,
+    pub expires_at_ms: i64,
+    pub key: String,
+    pub original_revision: i64,
+    pub original_expires_at_ms: i64,
+    pub template_sha256: String,
+    pub prior_balances_digest: [u8; 32],
+    pub repair: bool,
 }
 
 pub(crate) struct MemoryJob {
@@ -98,12 +116,29 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.compact
-                .windows
+            if let Some(scripted) = self.compact.windows.lock().unwrap().pop_front() {
+                return scripted;
+            }
+            let snapshot = self
+                .snapshots
                 .lock()
                 .unwrap()
-                .pop_front()
-                .expect("script window")
+                .iter()
+                .chain(
+                    self.originals
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .map(|stored| &*stored.snapshot),
+                )
+                .find(|snapshot| WindowRef::from_snapshot(snapshot).unwrap() == *window)
+                .cloned()
+                .expect("fixture retained the referenced original rows");
+            Ok(Window {
+                shares: snapshot.shares,
+                prior_balances: snapshot.prior_balances,
+                payout_revision: self.revision.load(Ordering::SeqCst),
+            })
         })
     }
     fn save_compact_prepared<'a>(
@@ -124,23 +159,74 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 current_revision: expected_current_revision,
                 original_expires_at_ms: expires_at_ms,
             });
-            let gate = self.compact.save_gate.lock().unwrap().take();
+            let gate = self
+                .compact
+                .save_gate
+                .lock()
+                .unwrap()
+                .take()
+                .or_else(|| self.save_gate.lock().unwrap().take());
             if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            // Inline and compact payloads cannot reserve the same immutable
-            // key. Do not let a scripted success hide this producer conflict.
             ensure!(
-                !self.jobs.lock().unwrap().contains_key(key),
-                "immutable compact prepared conflict"
+                !self.fail_save.load(Ordering::SeqCst),
+                "controlled persistence failure"
             );
+            ensure!(
+                expected_current_revision == self.revision.load(Ordering::SeqCst),
+                "revision changed"
+            );
+            let scripted = self.compact.saves.lock().unwrap().pop_front().transpose()?;
+            let observed = StoredCompactPrepared {
+                record: record.clone(),
+                template: template.value_for_test()?,
+                prior_balances: balances.to_vec(),
+                original_expires_at_ms: expires_at_ms,
+                expires_at_ms,
+            };
+            let mut payload = serde_json::to_value(record)?;
+            payload["original_expires_at_ms"] = json!(expires_at_ms);
+            let mut jobs = self.jobs.lock().unwrap();
+            let inserted = !jobs.contains_key(key);
+            if let Some(original) = jobs.get(key) {
+                ensure!(
+                    original.payload == payload
+                        && original.revision == record.payout_revision
+                        && original.parent == record.parent_hash,
+                    "immutable compact prepared conflict"
+                );
+            } else {
+                jobs.insert(
+                    key.into(),
+                    MemoryJob {
+                        payload,
+                        expires_at_ms,
+                        revision: record.payout_revision,
+                        parent: record.parent_hash.clone(),
+                    },
+                );
+            }
             self.compact
-                .saves
+                .metadata
                 .lock()
                 .unwrap()
-                .pop_front()
-                .expect("script compact save")
+                .entry(key.into())
+                .or_insert(observed);
+            Ok(scripted.unwrap_or(inserted))
+        })
+    }
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: crate::ledger::ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<crate::ledger::BlockingDrop<StoredCompactPrepared>>>> {
+        Box::pin(async move {
+            Ok(self
+                .compact_prepared(key)
+                .await?
+                .map(|stored| completion.own(stored)))
         })
     }
     fn compact_prepared<'a>(
@@ -149,12 +235,48 @@ impl work_ledger::WorkLedger for MemoryLedger {
     ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>> {
         Box::pin(async move {
             self.compact.read_keys.lock().unwrap().push(key.into());
-            self.compact
-                .reads
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("script compact read")
+            if let Some(scripted) = self.compact.reads.lock().unwrap().pop_front() {
+                return scripted;
+            }
+            let jobs = self.jobs.lock().unwrap();
+            let Some(job) = jobs
+                .get(key)
+                .filter(|job| job.expires_at_ms > self.database_now())
+            else {
+                return Ok(None);
+            };
+            if job.payload.get("format_version").is_none() && job.payload.get("snapshot").is_some()
+            {
+                return Ok(None);
+            }
+            let mut payload = job.payload.clone();
+            let expiry = payload
+                .as_object_mut()
+                .context("compact object")?
+                .remove("original_expires_at_ms")
+                .and_then(|value| value.as_i64())
+                .context("original expiry missing")?;
+            let record: CompactPrepared = serde_json::from_value(payload.clone())?;
+            ensure!(
+                serde_json::to_value(&record)? == payload,
+                "noncanonical compact prepared"
+            );
+            ensure!(
+                record.payout_revision == job.revision && record.parent_hash == job.parent,
+                "compact prepared payload/column mismatch"
+            );
+            let metadata = self.compact.metadata.lock().unwrap();
+            let metadata = metadata.get(key).context("fixture compact blobs missing")?;
+            let template = PreparedTemplate::encode(&metadata.template)?;
+            // Reuse the actual typed codec for validation, not a fake codec.
+            CompactRepair::encode(&record, &template, &metadata.prior_balances, expiry)?;
+            Ok(Some(StoredCompactPrepared {
+                record,
+                template: metadata.template.clone(),
+                prior_balances: metadata.prior_balances.clone(),
+                original_expires_at_ms: expiry,
+                expires_at_ms: job.expires_at_ms,
+            }))
         })
     }
     fn observe_chain_view<'a>(
@@ -172,11 +294,16 @@ impl work_ledger::WorkLedger for MemoryLedger {
             Ok(self.revision.load(Ordering::SeqCst))
         })
     }
-    fn snapshot(&self, _network: u128) -> BoxFuture<'_, Result<Snapshot>> {
+    fn snapshot_with_admission(
+        &self,
+        _network: u128,
+        completion: crate::ledger::ReadAdmission,
+    ) -> BoxFuture<'_, Result<crate::ledger::BlockingDrop<Snapshot>>> {
         Box::pin(async move {
             let mut snapshot = self.snapshot.lock().unwrap().clone().unwrap();
             snapshot.payout_revision = self.revision.load(Ordering::SeqCst);
-            Ok(snapshot)
+            self.snapshots.lock().unwrap().push(snapshot.clone());
+            Ok(completion.own(snapshot))
         })
     }
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>> {
@@ -231,21 +358,44 @@ impl work_ledger::WorkLedger for MemoryLedger {
             Ok(())
         })
     }
-    fn save_issued_job<'a>(
+    fn save_issued_job_compact<'a>(
         &'a self,
         id: &'a str,
         payload: &'a Value,
         revision: i64,
         parent: &'a str,
         expires_at_ms: i64,
-        dependency: PreparedDependency<'a>,
-        repair: Option<&'a Value>,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
     ) -> BoxFuture<'a, Result<IssuedJobSave>> {
         Box::pin(async move {
+            self.compact
+                .issued_calls
+                .lock()
+                .unwrap()
+                .push(CompactIssuedSave {
+                    id: id.into(),
+                    payload: payload.clone(),
+                    current_revision: revision,
+                    parent: parent.into(),
+                    expires_at_ms,
+                    key: dependency.key.into(),
+                    original_revision: dependency.original_revision,
+                    original_expires_at_ms: dependency.original_expires_at_ms,
+                    template_sha256: dependency.template_sha256.into(),
+                    prior_balances_digest: dependency.prior_balances_digest,
+                    repair: repair.is_some(),
+                });
             let gate = self.save_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
+            }
+            if let Some(scripted) = self.compact.issued_saves.lock().unwrap().pop_front() {
+                match scripted? {
+                    IssuedJobSave::PreparedMissing => return Ok(IssuedJobSave::PreparedMissing),
+                    IssuedJobSave::Saved => {}
+                }
             }
             ensure!(
                 !self.fail_save.load(Ordering::SeqCst),
@@ -275,36 +425,60 @@ impl work_ledger::WorkLedger for MemoryLedger {
                     "immutable job ID conflict"
                 );
             }
+            let repaired = repair
+                .map(CompactRepair::observation_for_test)
+                .transpose()?;
+            let mut repair_payload = repaired
+                .as_ref()
+                .map(|stored| serde_json::to_value(&stored.record))
+                .transpose()?;
+            if let (Some(payload), Some(stored)) = (&mut repair_payload, &repaired) {
+                payload["original_expires_at_ms"] = json!(stored.original_expires_at_ms);
+                ensure!(
+                    stored.record.payout_revision == dependency.original_revision
+                        && stored.record.parent_hash == dependency.parent
+                        && stored.original_expires_at_ms == dependency.original_expires_at_ms
+                        && stored.record.template_sha256 == dependency.template_sha256
+                        && stored.record.window.prior_balances_digest
+                            == dependency.prior_balances_digest,
+                    "prepared repair identity mismatch"
+                );
+            }
             if let Some(original) = jobs.get(dependency.key) {
                 ensure!(
                     original.revision == dependency.original_revision
                         && original.parent == dependency.parent
-                        && repair.is_none_or(|repair| *repair == original.payload),
+                        && original.payload["original_expires_at_ms"]
+                            == dependency.original_expires_at_ms
+                        && original.payload["template_sha256"] == dependency.template_sha256
+                        && original.payload["window"]["prior_balances_digest"]
+                            == hex::encode(dependency.prior_balances_digest)
+                        && repair_payload
+                            .as_ref()
+                            .is_none_or(|repair| *repair == original.payload),
                     "immutable prepared dependency conflict"
                 );
             } else {
-                let Some(repair) = repair else {
+                let Some(repaired) = repaired else {
                     return Ok(IssuedJobSave::PreparedMissing);
                 };
-                ensure!(
-                    repair["snapshot"]["payout_revision"] == dependency.original_revision
-                        && repair["template"]["previousblockhash"] == dependency.parent,
-                    "prepared repair identity mismatch"
-                );
                 jobs.insert(
                     dependency.key.into(),
                     MemoryJob {
-                        payload: repair.clone(),
-                        expires_at_ms: expires_at_ms + 60_000,
-                        revision: dependency.original_revision,
-                        parent: dependency.parent.into(),
+                        payload: repair_payload.unwrap(),
+                        expires_at_ms: repaired.original_expires_at_ms,
+                        revision: repaired.record.payout_revision,
+                        parent: repaired.record.parent_hash.clone(),
                     },
                 );
+                self.compact
+                    .metadata
+                    .lock()
+                    .unwrap()
+                    .insert(dependency.key.into(), repaired);
             }
             let original = jobs.get_mut(dependency.key).unwrap();
-            if original.expires_at_ms < expires_at_ms {
-                original.expires_at_ms = expires_at_ms + 60_000;
-            }
+            original.expires_at_ms = original.expires_at_ms.max(expires_at_ms + 60_000);
             jobs.entry(id.into()).or_insert(MemoryJob {
                 payload: payload.clone(),
                 expires_at_ms,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -267,7 +268,8 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         body, code = result.stdout.rsplit("\n", 1)
         return int(code), json.loads(body)
 
-    def assert_health(self, healthy: bool) -> None:
+    def assert_health(self, healthy: bool, *, error: str = "database authentication failed",
+                      category: str = "authentication") -> None:
         deadline = time.monotonic() + 30
         while True:
             try:
@@ -285,7 +287,18 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         self.assertIs(body["ok"], healthy, body)
         self.assertIs(body["database_ready"], healthy, body)
         if not healthy:
-            self.assertIn("password authentication failed", body.get("error", ""), body)
+            self.assertEqual(body.get("error"), error, body)
+            logs = self.command("docker", "logs", self.public)
+            # The runtime formatter may color fields even in captured logs.
+            diagnostic = re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)
+            self.assertIn("public readiness probe failed", diagnostic)
+            self.assertIn(f'category="{category}"', diagnostic)
+            self.assertIn('action="check ', diagnostic)
+            for private in (BOOTSTRAP_PASSWORD, READER_PASSWORD, LITERAL_PASSWORD,
+                            "prism_bootstrap", "prism_reader", "prism-postgres",
+                            "prism_fixture", "fixture_private_schema_405", "fixture_missing_database_405"):
+                self.assertNotIn(private, json.dumps(body))
+                self.assertNotIn(private, diagnostic)
         self.assertNotIn(BOOTSTRAP_PASSWORD, json.dumps(body))
         self.assertNotIn(READER_PASSWORD, json.dumps(body))
         self.assertNotIn(LITERAL_PASSWORD, json.dumps(body))
@@ -345,6 +358,15 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("permission denied", denied.stderr)
         self.assertEqual(self.sql("SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication FROM pg_roles WHERE rolname=current_user", reader=True).stdout.strip(), "f")
+
+    def test_connection_and_schema_readiness_failures_are_sanitized(self) -> None:
+        stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
+        self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=READER_URL.replace(
+            "/prism_fixture", "/fixture_missing_database_405"))
+        self.assert_health(False, error="database connection failed", category="connection")
+        self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=(
+            READER_URL + "?options=-csearch_path%3Dfixture_private_schema_405"))
+        self.assert_health(False, error="native public read schema is incomplete", category="schema")
 
 
 if __name__ == "__main__":

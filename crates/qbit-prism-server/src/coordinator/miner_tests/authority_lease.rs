@@ -999,6 +999,34 @@ async fn unchanged_balances_keep_original_identity_and_current_transaction_revis
         assert_eq!(rows[&job.wire.job_id].expires_at_ms, 130_000);
         assert_eq!(rows[&job.wire.job_id].payload["expires_at_ms"], 130_000);
     }
+    {
+        let calls = f.store.compact.issued_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let saved = &calls[0];
+        assert_eq!(saved.id, job.wire.job_id);
+        assert_eq!(
+            saved.payload,
+            f.store.jobs.lock().unwrap()[&saved.id].payload
+        );
+        assert_eq!(saved.current_revision, 7);
+        assert_eq!(saved.parent, hash(1));
+        assert_eq!(saved.expires_at_ms, 130_000);
+        assert_eq!(saved.key, original.storage_key);
+        assert_eq!(saved.original_revision, 0);
+        assert_eq!(
+            saved.original_expires_at_ms,
+            original.reservation.original_expires_at_ms
+        );
+        assert_eq!(
+            saved.template_sha256,
+            original.reservation.record.template_sha256
+        );
+        assert_eq!(
+            saved.prior_balances_digest,
+            original.window.prior_balances_digest
+        );
+        assert!(!saved.repair);
+    }
     f.node.lock().unwrap().calls.clear();
     f.submit(&resumed, false).await.unwrap();
     let records = f.store.records.lock().unwrap();
@@ -1019,6 +1047,7 @@ async fn changed_balances_refuse_issue_resume_and_share_only_on_replacement_leas
             f.detect(2).await;
             f.store.revision.store(7, Ordering::SeqCst);
         }
+        let state_calls = f.store.compact.state_calls.load(Ordering::SeqCst);
         change_balances(&f);
         // The non-lease control deliberately holds revision fixed: existing
         // admission uses that transaction fence, not the new lease digest API.
@@ -1039,7 +1068,10 @@ async fn changed_balances_refuse_issue_resume_and_share_only_on_replacement_leas
         if leased {
             assert!(persist(&f, &job).await.is_err());
         } else {
-            assert_eq!(f.store.compact.state_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                f.store.compact.state_calls.load(Ordering::SeqCst),
+                state_calls
+            );
         }
     }
 }
@@ -1062,15 +1094,24 @@ async fn stored_same_parent_revision_copy_cannot_borrow_another_publications_lea
                     revision: original.revision,
                     parent: original.parent.clone(),
                 };
-                rows.insert("prepared:other".into(), copy);
+                rows.insert(
+                    "prepared:other:11111111111111111111111111111111".into(),
+                    copy,
+                );
+                let mut metadata = f.store.compact.metadata.lock().unwrap();
+                let original_blobs = metadata.remove(&key).unwrap();
+                metadata.insert(
+                    "prepared:other:11111111111111111111111111111111".into(),
+                    original_blobs,
+                );
                 rows.get_mut(&job.wire.job_id).unwrap().payload["prepared_key"] =
-                    json!("prepared:other");
+                    json!("prepared:other:11111111111111111111111111111111");
             } else {
                 let payload = &mut rows.get_mut(&key).unwrap().payload;
                 match changed {
                     "generation" => payload["generation"] = json!(999),
                     "fingerprint" => payload["fingerprint"] = json!("other"),
-                    "window" => payload["snapshot"]["anchor_ms"] = json!(99_999),
+                    "window" => payload["window"]["anchor_ms"] = json!(99_999),
                     _ => unreachable!(),
                 }
             }

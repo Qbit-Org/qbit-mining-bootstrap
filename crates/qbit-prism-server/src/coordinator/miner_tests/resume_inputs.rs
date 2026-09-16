@@ -107,10 +107,12 @@ async fn stored_inputs_resume_unchanged_with_original_work_and_expiry() {
             let key = &issued.context.prepared.storage_key;
             let original = f.store.jobs.lock().unwrap()[key].payload.clone();
             assert_eq!(
-                original["inputs"],
-                serde_json::to_value(&issued.context.prepared.inputs).unwrap()
+                original["payout_policy"],
+                serde_json::to_value(&issued.context.prepared.inputs.payout_policy).unwrap()
             );
-            assert_eq!(original["bundle"].is_null(), bootstrap);
+            assert_eq!(original["audit_hashes"].is_null(), bootstrap);
+            assert!(original.get("bundle").is_none());
+            assert!(original.get("snapshot").is_none());
             let deadline = f.store.jobs.lock().unwrap()[&issued.wire.job_id].expires_at_ms;
             f.store.clock_offset_ms.store(5_000, Ordering::SeqCst);
             let resumed = f
@@ -164,17 +166,15 @@ async fn stored_builder_version_mismatch_is_a_resume_miss() {
         // Model an issued row from a different binary without changing its
         // original bundle or hashes. The bundle itself cannot prove this.
         edit_prepared(&f, &issued, |payload| {
-            payload["inputs"]["audit_builder_version"] =
-                json!(qbit_prism::AUDIT_BUILDER_VERSION + 1);
+            payload["audit_builder_version"] = json!(qbit_prism::AUDIT_BUILDER_VERSION + 1);
         });
         assert_miss(&f, &issued).await;
     }
 }
 
 #[tokio::test]
-async fn changed_ctv_configuration_is_a_stored_job_resume_miss() {
-    let changes: [(bool, Edit<Config>); 4] = [
-        (false, |config| config.ctv_enabled = true),
+async fn changed_ctv_configuration_preserves_original_job_inputs() {
+    let changes: [(bool, Edit<Config>); 3] = [
         (true, |config| config.ctv_enabled = false),
         (true, |config| config.ctv_direct_floor += 1),
         (true, |config| {
@@ -187,98 +187,147 @@ async fn changed_ctv_configuration_is_a_stored_job_resume_miss() {
             let config =
                 Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
             change(config);
-            assert_miss(&f, &issued).await;
+            assert_original_resume(&f, &issued).await;
         }
     }
+}
+
+#[tokio::test]
+async fn enabling_ctv_without_established_fee_readiness_remains_an_error() {
+    let (mut f, issued) = issue(false, false).await;
+    Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config)
+        .unwrap()
+        .ctv_enabled = true;
+    // Stored policy compatibility cannot manufacture a missing live relay floor.
+    assert_corruption(&f, &issued).await;
+    assert!(f.store.compact.window_calls.lock().unwrap().is_empty());
+}
+
+async fn assert_original_resume(f: &Fixture, issued: &MiningJob<JobContext>) {
+    let resumed = f
+        .coordinator
+        .resume_job(&issued.context.worker, &issued.wire.job_id)
+        .await
+        .unwrap()
+        .expect("compatible original inputs resume independently of current policy");
+    assert_eq!(
+        resumed.context.prepared.inputs,
+        issued.context.prepared.inputs
+    );
+    assert_eq!(
+        resumed.context.prepared.reservation.record,
+        issued.context.prepared.reservation.record
+    );
+    assert_eq!(
+        resumed.context.prepared.reservation.original_expires_at_ms,
+        issued.context.prepared.reservation.original_expires_at_ms
+    );
+    assert_eq!(resumed.wire.coinb1, issued.wire.coinb1);
+    assert_eq!(resumed.wire.coinb2, issued.wire.coinb2);
+}
+
+async fn assert_corruption(f: &Fixture, issued: &MiningJob<JobContext>) {
+    let error = match f
+        .coordinator
+        .resume_job(&issued.context.worker, &issued.wire.job_id)
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("corrupt stored work must remain an error"),
+    };
+    assert_error(error, "backend-rpc-unavailable", "job resume unavailable");
 }
 
 #[tokio::test]
 async fn stored_ctv_fee_inputs_must_match_the_issued_fee() {
     let (f, issued) = issue(true, false).await;
     edit_prepared(&f, &issued, |payload| {
-        payload["inputs"]["ctv"]["fanout_fee_policy"] = Value::Null;
+        payload["ctv"]["fanout_fee_policy"] = Value::Null;
     });
-    assert_miss(&f, &issued).await;
+    assert_corruption(&f, &issued).await;
+    assert!(f.store.compact.window_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn legacy_prepared_rows_without_inputs_are_resume_misses() {
+async fn explicit_legacy_prepared_rows_are_resume_misses() {
     for bootstrap in [false, true] {
         let (f, issued) = issue(false, bootstrap).await;
-        edit_prepared(&f, &issued, |payload| {
-            payload.as_object_mut().unwrap().remove("inputs");
-        });
+        let legacy = serde_json::to_value(f.original(&issued.context.prepared)).unwrap();
+        edit_prepared(&f, &issued, |payload| *payload = legacy);
         assert_miss(&f, &issued).await;
     }
 }
 
 #[tokio::test]
-async fn malformed_stored_inputs_and_legacy_records_remain_resume_errors() {
-    let corruptions: [(&str, Edit<Value>); 5] = [
-        ("null", |payload| payload["inputs"] = Value::Null),
-        ("partial", |payload| {
-            payload["inputs"]
+async fn malformed_compact_inputs_remain_resume_errors() {
+    let corruptions: [(&str, Edit<Value>); 6] = [
+        ("null policy", |payload| {
+            payload["payout_policy"] = Value::Null
+        }),
+        ("missing builder", |payload| {
+            payload
                 .as_object_mut()
                 .unwrap()
                 .remove("audit_builder_version");
         }),
         ("missing ctv", |payload| {
-            payload["inputs"].as_object_mut().unwrap().remove("ctv");
+            payload.as_object_mut().unwrap().remove("ctv");
         }),
         ("bad ctv", |payload| {
-            payload["inputs"]["ctv"] = json!({"direct_floor_sats":"invalid"});
+            payload["ctv"] = json!({"direct_floor_sats":"invalid"})
         }),
-        ("legacy snapshot", |payload| {
-            payload.as_object_mut().unwrap().remove("inputs");
-            payload["snapshot"] = Value::Null;
+        ("unexpected snapshot", |payload| {
+            payload["snapshot"] = Value::Null
+        }),
+        ("missing format", |payload| {
+            payload.as_object_mut().unwrap().remove("format_version");
         }),
     ];
     for (corruption, edit) in corruptions {
         let (f, issued) = issue(false, false).await;
         edit_prepared(&f, &issued, edit);
-        let error = match f
-            .coordinator
-            .resume_job(&issued.context.worker, &issued.wire.job_id)
-            .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("{corruption} must remain an error"),
-        };
-        assert_error(error, "backend-rpc-unavailable", "job resume unavailable");
+        assert_corruption(&f, &issued).await;
+        assert!(
+            f.store.compact.window_calls.lock().unwrap().is_empty(),
+            "{corruption}"
+        );
     }
 }
 
 #[tokio::test]
-async fn stored_job_resume_preserves_current_policy_and_signer_checks() {
-    let changes: [Edit<Config>; 3] = [
-        |config| config.payout_policy.safety_multiplier += 1,
+async fn current_policy_changes_preserve_original_but_signer_changes_miss() {
+    let (mut f, issued) = issue(false, false).await;
+    Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config)
+        .unwrap()
+        .payout_policy
+        .safety_multiplier += 1;
+    assert_original_resume(&f, &issued).await;
+    let changes: [Edit<Config>; 2] = [
         |config| config.manifest_seed = hash(0x33),
         |config| config.ledger_seed = hash(0x44),
     ];
     for change in changes {
         let (mut f, issued) = issue(false, false).await;
-        let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
-        change(config);
+        change(Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap());
         assert_miss(&f, &issued).await;
     }
 }
 
 #[tokio::test]
-async fn matching_stored_inputs_still_require_the_original_bundle_policy_and_signers() {
+async fn original_audit_and_manifest_hashes_authenticate_reconstructed_policy() {
     let changes: [Edit<Value>; 3] = [
-        |payload| payload["bundle"]["payout_policy"]["safety_multiplier"] = json!(999),
-        |payload| {
-            payload["bundle"]["signed_coinbase_manifest"]["signature"]["public_key_hex"] =
-                json!(hash(0x33));
-        },
-        |payload| {
-            payload["bundle"]["ledger_window_attestation"]["signature"]["public_key_hex"] =
-                json!(hash(0x44));
-        },
+        |payload| payload["payout_policy"]["safety_multiplier"] = json!(999),
+        |payload| payload["audit_hashes"]["audit_bundle_sha256"] = json!(hash(0x33)),
+        |payload| payload["audit_hashes"]["coinbase_manifest_sha256"] = json!(hash(0x44)),
     ];
     for change in changes {
         let (f, issued) = issue(false, false).await;
         edit_prepared(&f, &issued, change);
-        assert_miss(&f, &issued).await;
+        assert_corruption(&f, &issued).await;
+        assert_eq!(
+            f.store.compact.window_calls.lock().unwrap().len(),
+            1,
+            "structurally valid corruption must be detected by reconstruction"
+        );
     }
 }

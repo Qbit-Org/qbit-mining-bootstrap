@@ -260,7 +260,7 @@ pub(super) async fn submission_candidate(
             coinbase_suffix_hex: suffix,
             deferred_share: (!submission.share_pass).then_some(share),
             block_bytes,
-            as_issued_balances: context.prepared.snapshot.prior_balances.clone(),
+            as_issued_balances: (*context.prepared.reservation.balances).clone(),
         })
     })
     .await

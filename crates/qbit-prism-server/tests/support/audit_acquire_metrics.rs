@@ -19,7 +19,7 @@ fn sample(metrics: &Metrics, outcome: &str, suffix: &str) -> f64 {
         .map_or(0., |value| value.parse().unwrap())
 }
 
-fn counts(metrics: &Metrics) -> (f64, f64) {
+pub(super) fn counts(metrics: &Metrics) -> (f64, f64) {
     (
         sample(metrics, "success", "count"),
         sample(metrics, "failure", "count"),
@@ -35,7 +35,7 @@ fn family(metrics: &Metrics) -> Vec<String> {
         .collect()
 }
 
-async fn ledger(db: &Database, metrics: &Arc<Metrics>) -> Result<Ledger> {
+pub(super) async fn ledger(db: &Database, metrics: &Arc<Metrics>) -> Result<Ledger> {
     let mut ledger = Ledger::connect_with_metrics(
         &db.url,
         "audit-acquire".into(),
@@ -360,8 +360,8 @@ async fn landing_cases(db: &Database, ledger: &Ledger, metrics: &Metrics) -> Res
     drop(gate);
     worker.await?;
     tokio::time::timeout(WAIT, task).await???;
-    // Probe + three independent pages + BEGIN, all successful checkouts.
-    assert_eq!(counts(metrics), (before.0 + 5., before.1));
+    // Probe + three independent pages + newest boundary + BEGIN.
+    assert_eq!(counts(metrics), (before.0 + 6., before.1));
     assert_eq!(
         audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash)
             .await?

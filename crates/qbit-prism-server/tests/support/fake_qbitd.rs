@@ -5,23 +5,26 @@
 //! No gate phase submits a block, so there is no `submitblock` arm and the gate
 //! never needs `QBITD_BIN`.
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use axum::{extract::State, routing::post, Json, Router};
 use qbit_prism_server::config::Config;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// The stock template bits from `tests/readiness_rpc.rs`. `codec` maps them to
 /// a network difficulty of 1,000,000, which is what sizes the payout window.
 pub const TEMPLATE_BITS: &str = "207fffff";
 
-/// The static tip's height.
-const TIP_HEIGHT: u64 = 100;
-
 pub struct FakeNode {
     pub url: String,
     task: JoinHandle<()>,
+    state: Arc<Mutex<NodeState>>,
 }
 
 impl Drop for FakeNode {
@@ -33,50 +36,160 @@ impl Drop for FakeNode {
 struct NodeState {
     tip: String,
     tip_parent: String,
+    height: u64,
+    chainwork: String,
+    template: Option<Value>,
+    pauses: HashMap<String, PauseRequest>,
+    next_pause: u64,
 }
 
-impl FakeNode {
-    pub async fn open() -> Result<Self> {
-        let state = Arc::new(NodeState {
-            tip: "ab".repeat(32),
-            tip_parent: "cd".repeat(32),
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let url = format!("http://{}/", listener.local_addr()?);
-        let app = Router::new().route("/", post(answer)).with_state(state);
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        Ok(Self { url, task })
+struct PauseRequest {
+    #[allow(dead_code)]
+    id: u64,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+/// Holds exactly one captured HTTP reply. Dropping the guard releases it and
+/// removes an unused gate, so a cancelled test cannot poison a later request.
+#[allow(dead_code)]
+pub struct RpcPause {
+    state: Weak<Mutex<NodeState>>,
+    method: String,
+    id: u64,
+    entered: Option<oneshot::Receiver<()>>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+#[allow(dead_code)]
+impl RpcPause {
+    pub async fn entered(&mut self) -> Result<()> {
+        self.entered
+            .take()
+            .context("pause already observed")?
+            .await
+            .context("node stopped before paused request")
+    }
+
+    pub fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
     }
 }
 
-async fn answer(State(state): State<Arc<NodeState>>, Json(request): Json<Value>) -> Json<Value> {
+impl Drop for RpcPause {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            let mut state = state.lock().expect("fake node state");
+            if state
+                .pauses
+                .get(&self.method)
+                .is_some_and(|pause| pause.id == self.id)
+            {
+                state.pauses.remove(&self.method);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl FakeNode {
+    pub async fn open() -> Result<Self> {
+        let state = Arc::new(Mutex::new(NodeState {
+            tip: "ab".repeat(32),
+            tip_parent: "cd".repeat(32),
+            height: 100,
+            chainwork: "01".into(),
+            template: None,
+            pauses: HashMap::new(),
+            next_pause: 0,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/", listener.local_addr()?);
+        let app = Router::new()
+            .route("/", post(answer))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self { url, task, state })
+    }
+
+    pub fn set_tip(&self, tip: &str, parent: &str, height: u64, chainwork: &str) {
+        let mut state = self.state.lock().expect("fake node state");
+        state.tip = tip.into();
+        state.tip_parent = parent.into();
+        state.height = height;
+        state.chainwork = chainwork.into();
+    }
+
+    /// Exact response for deterministic template/large-transaction fixtures.
+    /// None restores the default template with a fresh time on every request.
+    pub fn set_template(&self, template: Option<Value>) {
+        self.state.lock().expect("fake node state").template = template;
+    }
+
+    pub fn pause_next(&self, method: &str) -> Result<RpcPause> {
+        let mut state = self.state.lock().expect("fake node state");
+        ensure!(!state.pauses.contains_key(method), "method already paused");
+        state.next_pause = state
+            .next_pause
+            .checked_add(1)
+            .context("pause id overflow")?;
+        let id = state.next_pause;
+        let (entered, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        state.pauses.insert(
+            method.into(),
+            PauseRequest {
+                id,
+                entered,
+                release: released,
+            },
+        );
+        Ok(RpcPause {
+            state: Arc::downgrade(&self.state),
+            method: method.into(),
+            id,
+            entered: Some(observed),
+            release: Some(release),
+        })
+    }
+}
+
+async fn answer(
+    State(state): State<Arc<Mutex<NodeState>>>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
     // `curtime` is generated per call so a long fixture load cannot age the
     // template past `template_max_age` before the refresh phase runs.
     let now = chrono::Utc::now().timestamp();
-    let result = match request["method"].as_str().unwrap_or("") {
+    let method = request["method"].as_str().unwrap_or("");
+    let (result, pause) = {
+        let mut state = state.lock().expect("fake node state");
+        let result = match method {
         "getblockchaininfo" => json!({
-            "chain":"test","initialblockdownload":false,"blocks":TIP_HEIGHT,"headers":TIP_HEIGHT,
-            "bestblockhash":state.tip,"chainwork":"01"
+            "chain":"test","initialblockdownload":false,"blocks":state.height,"headers":state.height,
+            "bestblockhash":state.tip,"chainwork":state.chainwork
         }),
         "getnetworkinfo" => json!({"connections": 2}),
-        "getblocktemplate" => json!({
-            "height":TIP_HEIGHT + 1,"coinbasevalue":5_000_000_000u64,"previousblockhash":state.tip,
+        "getblocktemplate" => state.template.clone().unwrap_or_else(|| json!({
+            "height":state.height+1,"coinbasevalue":5_000_000_000u64,"previousblockhash":state.tip,
             "version":0x20000000u32,"bits":TEMPLATE_BITS,"curtime":now,"mintime":now-1,
             "transactions":[]
-        }),
+        })),
         "estimatesmartfee" => json!({"feerate":"0.00001"}),
         "getmempoolinfo" => json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
         "getbestblockhash" => json!(state.tip),
         "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
-        // Above the tip qbitd has no block, and neither does this static
+        // Above the tip qbitd has no block, and neither does this fake
         // node: the same error `support/scripted_node.rs` answers, never the
         // tip. At or below the tip every height still answers the tip.
         "getblockhash"
             if request["params"][0]
                 .as_u64()
-                .is_none_or(|height| height > TIP_HEIGHT) =>
+                .is_none_or(|height| height > state.height) =>
         {
             return Json(json!({
                 "id":request["id"],"result":null,
@@ -95,6 +208,12 @@ async fn answer(State(state): State<Arc<NodeState>>, Json(request): Json<Value>)
             }))
         }
     };
+        (result, state.pauses.remove(method))
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.await;
+    }
     Json(json!({"id":request["id"],"result":result,"error":null}))
 }
 
@@ -102,6 +221,16 @@ async fn answer(State(state): State<Arc<NodeState>>, Json(request): Json<Value>)
 pub fn coordinator_config(
     database_url: String,
     node: &FakeNode,
+    instance_id: &str,
+) -> Result<Config> {
+    coordinator_config_at(database_url, node.url.clone(), instance_id)
+}
+
+/// Same explicit test configuration for an actual node RPC endpoint.
+/// This constructor never reads environment variables or starts a fake node.
+pub fn coordinator_config_at(
+    database_url: String,
+    rpc_url: String,
     instance_id: &str,
 ) -> Result<Config> {
     Ok(Config {
@@ -115,7 +244,7 @@ pub fn coordinator_config(
         template_max_age: Duration::from_secs(120),
         submit_tip_max_age: Duration::from_secs(10),
         template_refresh_failure_exit: Duration::from_secs(120),
-        rpc_url: node.url.clone(),
+        rpc_url,
         rpc_user: "test".into(),
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(30),

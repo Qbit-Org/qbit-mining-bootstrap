@@ -2,7 +2,7 @@ use super::*;
 
 mod payout_state;
 pub use payout_state::PayoutState;
-mod blocking_drop;
+pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 
 #[derive(Clone, Debug)]
@@ -556,6 +556,19 @@ impl Ledger {
     /// shares, prior balances and their revision. Timestamp barriers preserve
     /// the existing public audit format without relying on host clock sync.
     pub async fn snapshot(&self, network_difficulty: u128) -> Result<Snapshot> {
+        Ok(self
+            .snapshot_with_admission(network_difficulty, ReadAdmission::default())
+            .await?
+            .into_inner())
+    }
+
+    /// Carry runtime build admission through balance/page decoding and cleanup.
+    /// The anchor transaction and immutable share query contract are unchanged.
+    pub(crate) async fn snapshot_with_admission(
+        &self,
+        network_difficulty: u128,
+        completion: ReadAdmission,
+    ) -> Result<BlockingDrop<Snapshot>> {
         let weight = network_difficulty
             .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
             .context("window difficulty overflow")?;
@@ -572,46 +585,75 @@ impl Ledger {
         )
         .fetch_one(&mut *tx)
         .await?;
-        let prior_balances = read_prior_balances(&mut tx).await?;
+        let rows = prior_balance_rows(&mut tx).await?;
+        #[cfg(test)]
+        let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
+        let prior_balances = completion
+            .own(rows)
+            .map_anyhow(move |rows| {
+                #[cfg(test)]
+                if let Some(hook) = decode_hook {
+                    hook("balances");
+                }
+                decode_prior_balances(rows)
+            })
+            .await?;
         tx.commit().await?;
         // Ledger rows are immutable and later commits receive a timestamp
         // strictly greater than this anchor. Release the ordering barrier
         // before scanning a potentially large payout window.
         let mut tx = self.begin().await?;
-        let mut shares = Vec::new();
-        let mut remaining = weight;
-        let mut cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
-        while remaining > 0 {
+        let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
+        let mut scan = completion.own((Vec::<AcceptedShare>::new(), weight, cursor));
+        while scan.1 > 0 {
             let rows = sqlx::query(&format!(
                 "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 4096",
                 super::audit::anchored_eligibility_sql(2)
             ))
-            .bind(cursor)
+            .bind(scan.2)
             .bind(anchor_ms)
             .fetch_all(&mut *tx)
             .await?;
             if rows.is_empty() {
                 break;
             }
-            for row in rows {
-                let share = share_from_row(&row)?;
-                cursor = i64::try_from(share.share_seq)?;
-                remaining = remaining.saturating_sub(share.share_difficulty);
-                shares.push(share);
-                if remaining == 0 {
-                    break;
-                }
-            }
+            #[cfg(test)]
+            let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
+            scan = completion
+                .own(rows)
+                .map_anyhow(move |rows| {
+                    #[cfg(test)]
+                    if let Some(hook) = decode_hook {
+                        hook("shares");
+                    }
+                    let (mut shares, mut remaining, mut cursor) = scan.into_inner();
+                    for row in rows {
+                        let share = share_from_row(&row)?;
+                        cursor = i64::try_from(share.share_seq)?;
+                        remaining = remaining.saturating_sub(share.share_difficulty);
+                        shares.push(share);
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    Ok((shares, remaining, cursor))
+                })
+                .await?;
         }
-        shares.reverse();
+        let snapshot = scan
+            .map_anyhow(move |(mut shares, _, _)| {
+                shares.reverse();
+                Ok(Snapshot {
+                    anchor_ms,
+                    share_seq: u64::try_from(cutoff)?,
+                    payout_revision,
+                    shares,
+                    prior_balances: prior_balances.into_inner(),
+                })
+            })
+            .await?;
         tx.commit().await?;
-        Ok(Snapshot {
-            anchor_ms,
-            share_seq: u64::try_from(cutoff)?,
-            payout_revision,
-            shares,
-            prior_balances,
-        })
+        Ok(snapshot)
     }
 }
 

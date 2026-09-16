@@ -375,9 +375,10 @@ async fn load_and_refresh(frontends: &[&Arc<Coordinator>], n: u64) -> Result<Dur
         let prepared = frontend.prepared.read().await.clone();
         let prepared = prepared.context("the refresh published no work")?;
         ensure!(
-            prepared.snapshot.shares.len() as u64 == n && prepared.bundle.is_some(),
+            prepared.window.shares.map_or(0, |range| range.share_count) == n
+                && prepared.bundle.is_some(),
             "the refresh published a {}-share window, expected {n}",
-            prepared.snapshot.shares.len()
+            prepared.window.shares.map_or(0, |range| range.share_count)
         );
     }
     Ok(clock.elapsed())

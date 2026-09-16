@@ -1,8 +1,8 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
-    StoredCompactPrepared,
+    BlockingDrop, CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState,
+    PoolBlock, PreparedTemplate, ReadAdmission, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -15,14 +15,13 @@ pub(super) trait WorkLedger: Send + Sync {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
-    #[allow(dead_code)]
     fn read_window_with_permit<'a>(
         &'a self,
         window: &'a WindowRef,
         balances: BalanceSource,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> BoxFuture<'a, Result<Window, WindowError>>;
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn save_compact_prepared<'a>(
         &'a self,
         key: &'a str,
@@ -32,18 +31,27 @@ pub(super) trait WorkLedger: Send + Sync {
         expected_current_revision: i64,
         expires_at_ms: i64,
     ) -> BoxFuture<'a, Result<bool>>;
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn compact_prepared<'a>(
         &'a self,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>>;
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<BlockingDrop<StoredCompactPrepared>>>>;
     fn observe_chain_view<'a>(
         &'a self,
         tip: &'a str,
         height: u64,
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>>;
-    fn snapshot(&self, network: u128) -> BoxFuture<'_, Result<Snapshot>>;
+    fn snapshot_with_admission(
+        &self,
+        network: u128,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>>;
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>>;
     /// Returns how many blocks the committed reconciliation confirmed
     /// for the first time (`Ledger::reconcile_blocks_at_revision`).
@@ -53,6 +61,7 @@ pub(super) trait WorkLedger: Send + Sync {
         height: u64,
         revision: i64,
     ) -> BoxFuture<'a, Result<u64>>;
+    #[cfg(test)]
     fn save_job<'a>(
         &'a self,
         id: &'a str,
@@ -62,15 +71,15 @@ pub(super) trait WorkLedger: Send + Sync {
         ttl: i64,
     ) -> BoxFuture<'a, Result<()>>;
     #[allow(clippy::too_many_arguments)]
-    fn save_issued_job<'a>(
+    fn save_issued_job_compact<'a>(
         &'a self,
         id: &'a str,
         payload: &'a Value,
         revision: i64,
         parent: &'a str,
         expires_at_ms: i64,
-        dependency: PreparedDependency<'a>,
-        repair_payload: Option<&'a Value>,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
     ) -> BoxFuture<'a, Result<IssuedJobSave>>;
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>>;
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>>;
@@ -112,11 +121,21 @@ impl WorkLedger for Ledger {
             expires_at_ms,
         ))
     }
+    #[cfg(test)]
     fn compact_prepared<'a>(
         &'a self,
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>> {
         Box::pin(Ledger::compact_prepared(self, key))
+    }
+    fn compact_prepared_with_admission<'a>(
+        &'a self,
+        key: &'a str,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'a, Result<Option<BlockingDrop<StoredCompactPrepared>>>> {
+        Box::pin(Ledger::compact_prepared_with_admission(
+            self, key, completion,
+        ))
     }
     fn observe_chain_view<'a>(
         &'a self,
@@ -126,8 +145,12 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(Ledger::observe_chain_view(self, tip, height, chainwork))
     }
-    fn snapshot(&self, network: u128) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(Ledger::snapshot(self, network))
+    fn snapshot_with_admission(
+        &self,
+        network: u128,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>> {
+        Box::pin(Ledger::snapshot_with_admission(self, network, completion))
     }
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>> {
         Box::pin(Ledger::pool_blocks_for_reconcile(self))
@@ -145,6 +168,7 @@ impl WorkLedger for Ledger {
             revision,
         ))
     }
+    #[cfg(test)]
     fn save_job<'a>(
         &'a self,
         id: &'a str,
@@ -155,17 +179,17 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(Ledger::save_job(self, id, payload, revision, parent, ttl))
     }
-    fn save_issued_job<'a>(
+    fn save_issued_job_compact<'a>(
         &'a self,
         id: &'a str,
         payload: &'a Value,
         revision: i64,
         parent: &'a str,
         expires_at_ms: i64,
-        dependency: PreparedDependency<'a>,
-        repair_payload: Option<&'a Value>,
+        dependency: CompactDependency<'a>,
+        repair: Option<&'a CompactRepair>,
     ) -> BoxFuture<'a, Result<IssuedJobSave>> {
-        Box::pin(Ledger::save_issued_job(
+        Box::pin(Ledger::save_issued_job_compact(
             self,
             id,
             payload,
@@ -173,7 +197,7 @@ impl WorkLedger for Ledger {
             parent,
             expires_at_ms,
             dependency,
-            repair_payload,
+            repair,
         ))
     }
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {

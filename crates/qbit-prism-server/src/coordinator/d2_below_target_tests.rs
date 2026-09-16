@@ -381,10 +381,11 @@ impl Fixture {
             .await
             .clone()
             .context("no prepared work after refresh")?;
-        let bundle = prepared
-            .bundle
-            .clone()
-            .context("prepared work carries no payout bundle")?;
+        ensure!(
+            prepared.bundle.is_some(),
+            "prepared work carries no payout bundle"
+        );
+        let bundle = d2_test_support::original_audit(&self.coordinator, &prepared, None).await?;
         bundle_payout(&bundle)
     }
 
