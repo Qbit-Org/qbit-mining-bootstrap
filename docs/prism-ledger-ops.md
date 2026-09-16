@@ -321,6 +321,19 @@ epoch; cancellation, unknown COMMIT outcomes and failed publication cannot
 rearm them. Lower-work refusals retain the previous local tip without
 restoring consumed retry authority.
 
+Epochs order fresh observation attempts against committed cluster changes;
+they do not timestamp node choices that occurred between polls. A new
+observation started after a completed peer round trip can establish a new
+transition from the currently accepted predecessor, using the current epoch.
+That is distinct from retaining an older in-flight witness across the round
+trip. Subsequent unchanged polls cannot repeat the replacement.
+
+A scheduler tick or wake permits at most one immediate fresh retry after a
+definite accounting-only refusal. Another refusal returns to normal polling,
+and shutdown prevents the extra attempt. The original witness epoch and all
+publication checks still apply; repeated concurrent interference has no
+unconditional two-second completion guarantee.
+
 This is an **offline development-line upgrade**, not a rolling upgrade.
 Stop every earlier frontend and one-shot writer, disable automatic restarts,
 and finish or cancel any old startup already past its capability check.

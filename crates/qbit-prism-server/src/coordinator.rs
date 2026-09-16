@@ -1191,13 +1191,27 @@ impl Coordinator {
         let mut last_hint_prune = Instant::now();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
-            match self.refresh_once().await {
-                Ok(()) => {
-                    *self.last_error.write().await = None;
+            // One definite accounting-only refusal may retry immediately with
+            // a fresh proof. The allowance belongs to this external trigger:
+            // another refusal must return to tick/wake cadence, not replenish
+            // it. refresh_once retains the original witness epoch itself.
+            for attempt in 0..2 {
+                if attempt > 0 && shutdown.has_changed().unwrap_or(true) {
+                    return;
                 }
-                Err(error) => {
-                    tracing::warn!(%error,"template refresh deferred");
-                    *self.last_error.write().await = Some(error.to_string());
+                match self.refresh_once().await {
+                    Ok(()) => {
+                        *self.last_error.write().await = None;
+                        break;
+                    }
+                    Err(error) => {
+                        let retry = error.is::<crate::ledger::ChainObservationRetry>();
+                        tracing::warn!(%error,"template refresh deferred");
+                        *self.last_error.write().await = Some(error.to_string());
+                        if !retry {
+                            break;
+                        }
+                    }
                 }
             }
             if last_hint_prune.elapsed() >= Duration::from_secs(300) {
