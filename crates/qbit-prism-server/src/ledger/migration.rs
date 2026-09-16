@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 mod online;
+mod partition;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 
 /// The schema migrations every native start requires, each checked on its
@@ -22,10 +23,10 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013 online (`ONLINE_MIGRATIONS`) and record it after its
-/// last index change, so a start refuses the database until that has
+/// ledgers apply 013 and 016 online (`ONLINE_MIGRATIONS`) and record each
+/// after its last change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -1137,7 +1138,7 @@ async fn fingerprint_schema(
     namespace: &str,
 ) -> Result<SchemaFingerprint> {
     let mut fingerprint = SchemaFingerprint::default();
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,c.relpersistence::text AS persistence,c.relrowsecurity AS row_security,c.relforcerowsecurity AS force_row_security,(SELECT coalesce(array_agg(i.inhparent::regclass::text ORDER BY i.inhseqno),'{}') FROM pg_inherits i WHERE i.inhrelid=c.oid) AS parents,(SELECT coalesce(array_agg(i.inhrelid::regclass::text ORDER BY i.inhrelid::regclass::text),'{}') FROM pg_inherits i WHERE i.inhparent=c.oid) AS children FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,c.relpersistence::text AS persistence,c.relrowsecurity AS row_security,c.relforcerowsecurity AS force_row_security,(SELECT coalesce(array_agg(i.inhparent::regclass::text ORDER BY i.inhseqno),'{}') FROM pg_inherits i WHERE i.inhrelid=c.oid) AS parents,(SELECT coalesce(array_agg(i.inhrelid::regclass::text ORDER BY i.inhrelid::regclass::text),'{}') FROM pg_inherits i WHERE i.inhparent=c.oid) AS children FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let parents: Vec<String> = row.try_get("parents")?;
@@ -1160,7 +1161,7 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,(SELECT typtype='d' FROM pg_type WHERE oid=a.atttypid) AS is_domain,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,(SELECT typtype='d' FROM pg_type WHERE oid=a.atttypid) AS is_domain,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
@@ -1183,7 +1184,7 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition,k.convalidated AS validated,(SELECT coalesce(array_agg(t.tgenabled::text ORDER BY t.tgenabled),'{}') FROM pg_trigger t WHERE t.tgconstraint=k.oid AND t.tgisinternal) AS enforcement FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition,k.convalidated AS validated,(SELECT coalesce(array_agg(t.tgenabled::text ORDER BY t.tgenabled),'{}') FROM pg_trigger t WHERE t.tgconstraint=k.oid AND t.tgisinternal) AS enforcement FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
@@ -1212,7 +1213,7 @@ async fn fingerprint_schema(
             referenced_table: row.try_get("referenced_table")?,
         });
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid,x.indisunique AS unique,x.indexprs IS NOT NULL AS expression,x.indpred IS NOT NULL AS partial FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid,x.indisunique AS unique,x.indexprs IS NOT NULL AS expression,x.indpred IS NOT NULL AS partial FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p') AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let definition: String = row.try_get("definition")?;
@@ -1313,9 +1314,11 @@ async fn fingerprint_schema(
         );
     }
     // Every other relation that holds a name: the constraint-backed indexes
-    // the index reading left out, and the kinds no map above models. TOAST
+    // the index reading left out, and the kinds no map above models. A
+    // partitioned table is a table and a partitioned index an index above,
+    // as their partitions are (016 partitions the share ledger). TOAST
     // tables live in pg_toast and never here.
-    let rows = sqlx::query("SELECT c.relname::text AS name,c.relkind::text AS kind,(SELECT t.relname::text FROM pg_index x JOIN pg_class t ON t.oid=x.indrelid WHERE x.indexrelid=c.oid) AS table_name,(SELECT k.conname::text FROM pg_constraint k WHERE k.conindid=c.oid AND k.contype IN ('p','u','x') ORDER BY k.conname LIMIT 1) AS constraint_name FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('i','I','v','m','p','f','c') ORDER BY 1")
+    let rows = sqlx::query("SELECT c.relname::text AS name,c.relkind::text AS kind,(SELECT t.relname::text FROM pg_index x JOIN pg_class t ON t.oid=x.indrelid WHERE x.indexrelid=c.oid) AS table_name,(SELECT k.conname::text FROM pg_constraint k WHERE k.conindid=c.oid AND k.contype IN ('p','u','x') ORDER BY k.conname LIMIT 1) AS constraint_name FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('i','I','v','m','f','c') ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let name: String = row.try_get("name")?;
@@ -1330,12 +1333,11 @@ async fn fingerprint_schema(
                 constraint_table = Some(table);
                 description
             }
-            // A plain index is in `indexes`; a partitioned one is not.
-            ("i", _, None) => continue,
-            ("I", Some(table), None) => format!("partitioned index {name} on {table}"),
+            // A plain or partitioned index that backs no constraint is in
+            // `indexes`.
+            ("i" | "I", _, None) => continue,
             ("v", ..) => format!("view {name}"),
             ("m", ..) => format!("materialized view {name}"),
-            ("p", ..) => format!("partitioned table {name}"),
             ("f", ..) => format!("foreign table {name}"),
             ("c", ..) => format!("composite type {name}"),
             (kind, ..) => format!("relation {name} of kind {kind}"),
@@ -2077,21 +2079,52 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         14,
         include_str!("../../migrations/014_policy_transition.sql"),
     ),
+    (
+        15,
+        include_str!("../../migrations/015_share_ledger_partition_catalog.sql"),
+    ),
+    (
+        16,
+        include_str!("../../migrations/016_share_ledger_partitions.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
 /// ledgers, even when no shares are visible: writers do not take the
-/// migration lock. Each creates and drops indexes on that table and nothing
-/// else. It reaches the source statement by statement with `CONCURRENTLY`,
-/// through `apply_online_migration` (see `online.rs`): `CREATE INDEX
-/// CONCURRENTLY` cannot run in a transaction block, and a plain `CREATE
-/// INDEX` on the share ledger would hold every append for the whole build.
-/// Recorded last then, so the startup gate refuses the database until the
-/// indexes are in place. Fresh and empty 2.x.x sources apply these inside
-/// the transaction while holding the cutover locks that exclude writers.
-/// A later transactional migration must not depend on an online one's
-/// indexes: within one run it is applied first.
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13];
+/// migration lock. 013 creates and drops indexes on the share ledger and
+/// nothing else, and reaches the source statement by statement with
+/// `CONCURRENTLY` (see `online.rs`): `CREATE INDEX CONCURRENTLY` cannot run
+/// in a transaction block, and a plain `CREATE INDEX` on the share ledger
+/// would hold every append for the whole build. 016 converts the share
+/// ledger into a partitioned table (see `partition.rs`): its validation
+/// scan runs for hours on a large ledger and its swap must take the table
+/// lock with a short timeout and retries, neither of which the migration
+/// transaction can do. Each is recorded last, so the startup gate refuses
+/// the database until it has completed. Fresh and empty 2.x.x sources apply
+/// these inside the transaction while holding the cutover locks that
+/// exclude writers. A later transactional migration must not depend on an
+/// online one's objects: within one run it is applied first. 016 depends on
+/// 013's indexes and on 015's functions; 013 is applied before it by
+/// version order, and 015 is transactional.
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 16];
+
+/// The online migration a version declares, from the scratch apply's
+/// before and after readings.
+fn derive_online(
+    version: i32,
+    before: &SchemaFingerprint,
+    after: &SchemaFingerprint,
+) -> Result<OnlineMigration> {
+    match version {
+        13 => Ok(OnlineMigration::Indexes(online::derive(
+            version, before, after,
+        )?)),
+        16 => Ok(OnlineMigration::Partitions(partition::derive(
+            version, before, after,
+        )?)),
+        _ => bail!("migration {version} is listed in ONLINE_MIGRATIONS but has no online runner"),
+    }
+}
 
 /// Whether a legacy share ledger has no rows, checked only after the
 /// cutover locks exclude writers so transactional index DDL cannot block
@@ -2221,7 +2254,7 @@ async fn release_fingerprint(
                 // which adopts an identical earlier build of its own.
                 // Fresh/2.x.x sources also check all reserved names before
                 // any source DDL.
-                online_migrations.insert(*version, online::derive(*version, &before, &after)?);
+                online_migrations.insert(*version, derive_online(*version, &before, &after)?);
                 continue;
             }
             let mut reserved = reserved_objects(&after, &before);
@@ -2984,12 +3017,25 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
+    if !versions.contains(&15) {
+        // The partition catalog, the conversion functions 016 calls, the
+        // two inbound foreign keys onto share_id, and solver attribution on
+        // qbit_pool_blocks; 016 depends on all of it, so it comes before
+        // the online loop below whichever path 016 takes.
+        sqlx::raw_sql(native_migration(15))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(15)")
+            .execute(&mut **tx)
+            .await?;
+    }
     // Only a fresh or empty 2.x.x source reaches this DDL, with writers
     // excluded by the cutover locks. Existing native ledgers and populated
     // 2.x.x sources returned their changes above for the caller to apply
     // after the commit with CONCURRENTLY, recording the version then.
     for version in ONLINE_MIGRATIONS {
-        if versions.contains(version) || online.iter().any(|pending| pending.version == *version) {
+        if versions.contains(version) || online.iter().any(|pending| pending.version() == *version)
+        {
             continue;
         }
         sqlx::raw_sql(native_migration(*version))

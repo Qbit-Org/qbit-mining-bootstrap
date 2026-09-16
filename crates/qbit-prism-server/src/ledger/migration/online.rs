@@ -46,11 +46,29 @@ use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
 
-/// What one online migration changes on the source, derived from the
+/// One migration applied after the commit, by the runner its kind names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OnlineMigration {
+    /// Index creates and drops, applied with `CONCURRENTLY` (013).
+    Indexes(IndexMigration),
+    /// The share ledger partition conversion (016, `partition.rs`).
+    Partitions(super::partition::PartitionMigration),
+}
+
+impl OnlineMigration {
+    pub(super) fn version(&self) -> i32 {
+        match self {
+            OnlineMigration::Indexes(migration) => migration.version,
+            OnlineMigration::Partitions(migration) => migration.version,
+        }
+    }
+}
+
+/// What one index migration changes on the source, derived from the
 /// scratch apply: the indexes it creates, rendered by `pg_get_indexdef`,
 /// and the original definitions of the indexes it drops.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OnlineMigration {
+pub(crate) struct IndexMigration {
     pub(super) version: i32,
     pub(super) creates: BTreeMap<String, IndexDefinition>,
     pub(super) drops: BTreeMap<String, IndexDefinition>,
@@ -65,7 +83,7 @@ pub(super) fn derive(
     version: i32,
     before: &SchemaFingerprint,
     after: &SchemaFingerprint,
-) -> Result<OnlineMigration> {
+) -> Result<IndexMigration> {
     ensure!(
         before.tables == after.tables
             && before.constraints == after.constraints
@@ -100,7 +118,7 @@ pub(super) fn derive(
         !creates.is_empty() || !drops.is_empty(),
         "migration {version} is applied online but creates and drops no index"
     );
-    Ok(OnlineMigration {
+    Ok(IndexMigration {
         version,
         creates,
         drops,
@@ -115,22 +133,46 @@ pub(crate) async fn apply_online_migration(
     migration: &OnlineMigration,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
-    let version = migration.version;
+    let version = migration.version();
     // A connection of its own, never returned to the pool: the session
     // settings and the session-level lock below end with it.
     let mut connection = crate::metrics::time_pool_acquire(metrics, pool.acquire())
         .await?
         .detach();
-    let outcome = apply(&mut connection, migration, metrics).await;
+    let outcome = match migration {
+        OnlineMigration::Indexes(migration) => apply(&mut connection, migration, metrics).await,
+        OnlineMigration::Partitions(migration) => {
+            super::partition::apply(&mut connection, migration, metrics).await
+        }
+    };
     let closed = connection.close().await;
     outcome?;
     closed.with_context(|| format!("closing the connection that applied migration {version}"))?;
     Ok(())
 }
 
+/// Take the session-level runner lock on this connection, keyed by the
+/// ledger's schema. A blocking advisory-lock SELECT keeps its statement
+/// snapshot while waiting. A concurrent partial-index build can wait for
+/// that snapshot to end, deadlocking with the next runner waiting for this
+/// lock. End each attempt before sleeping, outside any database
+/// transaction.
+pub(super) async fn acquire_runner_lock(connection: &mut PgConnection) -> Result<()> {
+    while !sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_lock($1,hashtext(current_schema()))",
+    )
+    .bind(ONLINE_DDL_LOCK_CLASS)
+    .fetch_one(&mut *connection)
+    .await?
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
 async fn apply(
     connection: &mut PgConnection,
-    migration: &OnlineMigration,
+    migration: &IndexMigration,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     let version = migration.version;
@@ -142,19 +184,7 @@ async fn apply(
     )
     .execute(&mut *connection)
     .await?;
-    // A blocking advisory-lock SELECT keeps its statement snapshot while
-    // waiting. A concurrent partial-index build can wait for that snapshot
-    // to end, deadlocking with the next runner waiting for this lock. End
-    // each attempt before sleeping, outside any database transaction.
-    while !sqlx::query_scalar::<_, bool>(
-        "SELECT pg_try_advisory_lock($1,hashtext(current_schema()))",
-    )
-    .bind(ONLINE_DDL_LOCK_CLASS)
-    .fetch_one(&mut *connection)
-    .await?
-    {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    acquire_runner_lock(connection).await?;
     if recorded(connection, version).await? {
         tracing::info!(version, "online migration already recorded");
         return Ok(());
@@ -331,7 +361,7 @@ async fn live_relation(connection: &mut PgConnection, name: &str) -> Result<Live
     })
 }
 
-fn relation_kind(kind: &str) -> &'static str {
+pub(super) fn relation_kind(kind: &str) -> &'static str {
     match kind {
         "r" => "table",
         "S" => "sequence",
@@ -505,7 +535,7 @@ async fn drop_planned(
 /// open is that round trip, not the hours of a build.
 async fn verify_declared(
     connection: &mut PgConnection,
-    migration: &OnlineMigration,
+    migration: &IndexMigration,
     progress: &Progress<'_>,
 ) -> Result<()> {
     let version = migration.version;
@@ -561,7 +591,7 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-async fn recorded(connection: &mut PgConnection, version: i32) -> Result<bool> {
+pub(super) async fn recorded(connection: &mut PgConnection, version: i32) -> Result<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_migrations WHERE version=$1)",
     )

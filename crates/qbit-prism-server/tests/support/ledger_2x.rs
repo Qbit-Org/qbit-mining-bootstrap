@@ -102,7 +102,7 @@ fn live_sql_stays_pinned_to_the_frozen_2x_release() {
              release: {:?}). The migrator applies this file to every 2.x.x database, so its DDL \
              must stay identical to tests/fixtures/schema_2x/001_share_ledger.sql. Revert the DDL \
              change here and put it in a new numbered migration under \
-             crates/qbit-prism-server/migrations/ (015 is next; 007 to 014 are taken), then add it to \
+             crates/qbit-prism-server/migrations/ (017 is next; 007 to 016 are taken), then add it to \
              REQUIRED_SCHEMA_VERSIONS in src/ledger/migration.rs",
             index + 1,
             live.get(index).map(String::as_str).unwrap_or("<end of file>"),

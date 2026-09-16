@@ -504,10 +504,45 @@ impl Ledger {
         let program = hex::decode(&share.p2mr_program_hex)?;
         ensure!(program.len() == 32, "P2MR program must be 32 bytes");
         share.p2mr_program_hex = hex::encode(program);
-        let existing = sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
-            .bind(&share.share_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+        // The ledger is partitioned by share_seq (migration 016) and its
+        // share_id uniqueness is per leaf, so a share_id probe without a
+        // share_seq bound descends one index per attached partition.
+        // qbit_prism_share_hashes, written with every ledger row in the
+        // same transaction, is the global authority: one primary-key probe
+        // says whether this header was ever credited, and under which
+        // share_id. The ledger is then read only for a replay, bounded to
+        // the newest partitions first (qbit_prism_share_probe_floor) and
+        // unbounded on a miss, so a replay of any online row is still
+        // matched exactly; a row that has left the online ledger cannot be
+        // compared and is refused as the duplicate it is.
+        let header_hash = share_header_hash(&share.share_id);
+        let credited: Option<String> =
+            sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1")
+                .bind(&header_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some(credited) = &credited {
+            ensure!(
+                *credited == share.share_id,
+                "duplicate-share: header already credited globally"
+            );
+        }
+        let mut existing = sqlx::query(&format!(
+            "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()"
+        ))
+        .bind(&share.share_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if existing.is_none() && credited.is_some() {
+            existing = sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
+                .bind(&share.share_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            ensure!(
+                existing.is_some(),
+                "duplicate-share: header already credited globally, and its share is archived"
+            );
+        }
         if let Some(row) = existing {
             let previous = share_from_row(&row)?;
             share.share_seq = previous.share_seq;
@@ -518,17 +553,6 @@ impl Ledger {
                 inserted: false,
             });
         }
-        let header_hash = share_header_hash(&share.share_id);
-        let duplicate: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM qbit_prism_share_hashes WHERE header_hash=$1)",
-        )
-        .bind(&header_hash)
-        .fetch_one(&mut **tx)
-        .await?;
-        ensure!(
-            !duplicate,
-            "duplicate-share: header already credited globally"
-        );
         let accepted_at_ms: i64 = sqlx::query_scalar("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms").fetch_one(&mut **tx).await?;
         ensure!(
             share.job_issued_at_ms <= accepted_at_ms,
