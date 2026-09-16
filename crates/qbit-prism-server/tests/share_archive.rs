@@ -1012,6 +1012,64 @@ async fn verification_refuses_a_concurrent_archive_rewrite() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn archive_requires_durable_parent_directories_before_recording() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("archive-sync-a").await?;
+        insert_shares(&ledger.pool, 1, 250, 7, "server-a", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        let temporary = tempfile::tempdir()?;
+        let parent = temporary.path().join("parent");
+        std::fs::create_dir(&parent)?;
+        let root = parent.join("new-root");
+        let permissions = std::fs::metadata(&parent)?.permissions();
+        // Write/search permission still permits creation and promotion of
+        // the archive. Without read permission this ancestor cannot be
+        // opened for fsync, so certifying its new directory entries must fail.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))?;
+        let archived = archive::archive(&ledger, P0, &root, false, "operator-a").await;
+        std::fs::set_permissions(&parent, permissions)?;
+        let error = archived
+            .err()
+            .context("recorded an archive without syncing its parent directory")?
+            .to_string();
+        ensure!(error.contains("syncing archive directory"), "{error}");
+        let directory = root.join("qbit_share_ledger").join(P0);
+        ensure!(
+            directory.join("manifest.json").is_file() && directory.join("rows.ndjson.gz").is_file(),
+            "the failure did not follow both file promotions"
+        );
+        let row = catalog(&ledger.pool, P0).await?;
+        ensure!(
+            row.try_get::<Option<String>, _>("archive_manifest_sha256")?
+                .is_none()
+                && row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archived_at")?
+                    .is_none(),
+            "the catalog certified an archive whose directory could not be synced"
+        );
+        // A retry must sync even the directories left by the failed attempt,
+        // then the archive can be verified and used as the copy of record.
+        archive::archive(&ledger, P0, &root, false, "operator-a").await?;
+        archive::verify(&ledger, P0, &root).await?;
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Acceptance criterion 5 of #144: a block whose payout window lay inside a
 /// partition keeps serving its advertised artifact after that partition has
 /// been sealed, archived, verified, detached and dropped. Nothing can rebuild

@@ -424,6 +424,22 @@ fn partition_dir(root: &Path, partition_name: &str) -> PathBuf {
     root.join(PARENT).join(partition_name)
 }
 
+/// Persist the promoted filenames, then every directory entry leading to
+/// them. File fsync alone does not make a rename durable, and create_dir_all
+/// may have created the archive root and its parents too. Sync existing
+/// ancestors as well: they may be left over from an interrupted attempt.
+fn sync_archive_directories(directory: &Path) -> Result<()> {
+    let directory = directory
+        .canonicalize()
+        .with_context(|| format!("resolving archive directory {}", directory.display()))?;
+    for ancestor in directory.ancestors() {
+        std::fs::File::open(ancestor)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("syncing archive directory {}", ancestor.display()))?;
+    }
+    Ok(())
+}
+
 /// A temp file that removes itself unless it is renamed into place.
 /// EP-ERRORS: a failed archive leaves no half-written file behind for the next
 /// run, or for a verifier, to mistake for an archive.
@@ -1501,6 +1517,7 @@ pub async fn archive(
     let manifest_path = directory.join("manifest.json");
     rows_temp.promote(&rows_path)?;
     manifest_temp.promote(&manifest_path)?;
+    sync_archive_directories(&directory)?;
 
     let uri = manifest_path.display().to_string();
     // The operator pool holds two connections; give this one back before the
