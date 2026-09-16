@@ -42,6 +42,57 @@ async fn one_read(f: &Fixture, mark: u64, rows: u64) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_empty_and_nonempty_refresh_probe_execution_counts() -> Result<()> {
+    for has_shares in [false, true] {
+        run(qbit_prism_test_gate::site!(), |f| Box::pin(async move {
+            sqlx::query("INSERT INTO qbit_payout_carry_forward_current(miner_id,payout_order_key,p2mr_program,balance_sats,active_row_count) VALUES('prior','prior',decode(repeat('22',32),'hex'),12345,1)")
+                .execute(f.pool()).await?;
+            f.refresh(has_shares).await?;
+            let first = prepared(&f.a).await?;
+            let mark = f.proxy.mark();
+            let started = std::time::Instant::now();
+            f.a.refresh_once().await?;
+            let wall = started.elapsed();
+            ensure!(Arc::ptr_eq(&first, &prepared(&f.a).await?), "idle refresh replaced immutable work");
+            one_read(f, mark, 0).await?;
+            let executions = f.proxy.executions_since(mark)?;
+            let mut transactions = std::collections::HashMap::<u64, Vec<&support::execution::Execution>>::new();
+            let mut probes = Vec::new();
+            let mut cutoff_queries = 0;
+            for execution in &executions {
+                ensure!(execution.complete_response(), "incomplete SQL observation: {execution:?}");
+                if execution.sql == "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted" {
+                    cutoff_queries += 1;
+                }
+                if execution.sql == "BEGIN" {
+                    transactions.insert(execution.connection, Vec::new());
+                }
+                if let Some(transaction) = transactions.get_mut(&execution.connection) {
+                    transaction.push(execution);
+                }
+                if execution.is_commit() {
+                    if let Some(transaction) = transactions.remove(&execution.connection) {
+                        if transaction.iter().any(|e| e.sql == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                            && transaction.iter().any(|e| e.sql.contains("qbit_current_carry_forward_balances()")) {
+                            probes.push(transaction);
+                        }
+                    }
+                }
+            }
+            let probe_sql: usize = probes.iter().map(Vec::len).sum();
+            let balance_reads: Vec<_> = probes.iter().flatten().filter(|e| e.sql.contains("qbit_current_carry_forward_balances()")).collect();
+            ensure!(probes.len() == 2 && probe_sql == 10 && cutoff_queries == 1,
+                "idle probe cost changed: {} probe transactions / {probe_sql} executions / {cutoff_queries} standalone cutoffs", probes.len());
+            ensure!(balance_reads.len() == 2, "idle balance-read count differs");
+            for read in balance_reads { ensure!(read.returned_rows()? == 1, "balance DataRows differ"); }
+            eprintln!("idle has_shares={has_shares}: payout_component_sql={} balance_reads=2 balance_rows=2 refresh_wall_us={}", probe_sql + cutoff_queries, wall.as_micros());
+            Ok(())
+        })).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transaction_churn_reuses_window_and_preserves_as_issued_work() -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {
