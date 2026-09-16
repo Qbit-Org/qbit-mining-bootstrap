@@ -807,11 +807,11 @@ mod diagnostics {
             .any(|flag| value.trim().eq_ignore_ascii_case(flag))
     }
 
-    /// A value as written, as the inside of the Rust `{:?}` and JSON string
-    /// literals a child might print it in, and each of those as `sanitize_line`
-    /// leaves it. A password may carry a control character once it is decoded,
-    /// and a child that writes the decoded value raw would otherwise survive
-    /// normalization unmatched.
+    /// A value as written and as the inside of the Rust `{:?}` and JSON
+    /// string literals a child might print it in. The written value covers a
+    /// decoded password that carries a line break or a control character,
+    /// because `sanitize` matches secrets against the tail before anything
+    /// splits or rewrites it.
     fn add(secrets: &mut Vec<String>, value: &str) {
         let value = value.trim();
         if value.is_empty() {
@@ -821,17 +821,8 @@ mod diagnostics {
         let json = serde_json::Value::from(value).to_string();
         // Both literals are quoted, so the inner slice is at ASCII boundaries.
         for form in [value, &debug[1..debug.len() - 1], &json[1..json.len() - 1]] {
-            let mut forms = vec![form.to_owned()];
-            // A form that normalizes to replacement characters alone would
-            // match every normalized control byte, so it is not stored.
-            let normalized = normalize_controls(form);
-            if normalized != form && normalized.chars().any(|c| c != REPLACEMENT) {
-                forms.push(normalized);
-            }
-            for form in forms {
-                if !secrets.contains(&form) {
-                    secrets.push(form);
-                }
+            if !secrets.iter().any(|known| known == form) {
+                secrets.push(form.into());
             }
         }
     }
@@ -907,10 +898,18 @@ mod diagnostics {
                 .any(|part| part.ends_with("key") || matches!(part, "pwd" | "dsn" | "auth"))
     }
 
-    /// Removes armored blocks, then sanitizes each remaining line. A tail
-    /// that shows an END marker before any BEGIN started inside a block, so
-    /// everything up to that marker is withheld; a block with no visible END
-    /// withholds the rest of the tail.
+    /// Removes armored blocks, replaces known secrets across the whole tail,
+    /// then redacts what is left line by line. A tail that shows an END marker
+    /// before any BEGIN started inside a block, so everything up to that
+    /// marker is withheld; a block with no visible END withholds the rest of
+    /// the tail.
+    ///
+    /// Secrets are replaced before the tail is split apart again, and before
+    /// anything rewrites the text. A decoded password may hold a line break or
+    /// a control character: the child writes it raw, the tail reader splits it
+    /// across two lines and normalization would rewrite the control character,
+    /// and in either case neither part matches the value on its own. A secret
+    /// spanning a break therefore joins the lines it was split across.
     pub fn sanitize(lines: &[String], secrets: &[String]) -> Vec<String> {
         const BEGIN: &str = "-----BEGIN";
         const END: &str = "-----END";
@@ -923,7 +922,7 @@ mod diagnostics {
             })
             .unwrap_or(false);
         let mut withheld = 0;
-        let mut output = Vec::new();
+        let mut retained: Vec<String> = Vec::new();
         for line in lines {
             // True when the line's last marker is an END, closing any block.
             let closes = line.rfind(END) > line.rfind(BEGIN);
@@ -933,33 +932,39 @@ mod diagnostics {
                 continue;
             }
             if withheld > 0 {
-                output.push(format!(
+                retained.push(format!(
                     "[withheld {withheld} line(s) of armored key material]"
                 ));
                 withheld = 0;
             }
-            output.push(sanitize_line(line, secrets));
+            retained.push(line.clone());
         }
         if withheld > 0 {
-            output.push(format!(
+            retained.push(format!(
                 "[withheld {withheld} line(s) of armored key material]"
             ));
         }
-        output
+        if retained.is_empty() {
+            return Vec::new();
+        }
+        // Only a secret that contains a line break can match across the join,
+        // since every other one is separated by the newline itself.
+        let mut joined = retained.join("\n");
+        for secret in secrets {
+            joined = replace_ignoring_ascii_case(&joined, secret);
+        }
+        joined.split('\n').map(redact_line).collect()
     }
 
-    pub fn sanitize_line(line: &str, secrets: &[String]) -> String {
-        let mut text = normalize_controls(line);
-        for secret in secrets {
-            text = replace_ignoring_ascii_case(&text, secret);
-        }
+    /// What is left to remove from one line once known secrets are gone.
+    fn redact_line(line: &str) -> String {
+        let text = normalize_controls(line);
         redact_encoded(&redact_assignment(&redact_urls(&text)))
     }
 
     /// Every control character but tab becomes the replacement character, so
-    /// a child's raw bytes never reach the output. `command_secrets` stores
-    /// the result of this for each secret as well, because it runs before the
-    /// secrets are replaced and would otherwise stop them matching.
+    /// a child's raw bytes never reach the output. This runs after known
+    /// secrets are already gone, so it cannot stop one from matching.
     fn normalize_controls(text: &str) -> String {
         text.chars()
             .map(|c| {
@@ -1773,6 +1778,14 @@ mod startup_diagnostics_tests {
                 "postgres://prism:tab%09pw7%01z@db/prism",
                 vec![format!("raw {control} end")],
                 strings(&["raw [redacted] end"]),
+            ),
+            (
+                // A decoded password holding a line break: the child writes it
+                // raw, so the tail reader splits it across two lines.
+                "line break inside a decoded password".into(),
+                "postgres://prism:multi%0Aline9@db/prism",
+                vec!["start multi\nline9 end".to_owned()],
+                strings(&["start [redacted] end"]),
             ),
             (
                 // Two URLs with only punctuation between them: the safe one
