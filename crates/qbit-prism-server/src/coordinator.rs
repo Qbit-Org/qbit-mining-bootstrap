@@ -876,6 +876,9 @@ impl Coordinator {
         // survive an older successful proof completing afterwards.
         let proof = self.begin_compact_build().await;
         let readiness_generation = proof.readiness_epoch();
+        // Capture before node I/O, so a delayed equal-work observation cannot
+        // overwrite a replacement accepted while its proof was in flight.
+        let chain_revision = self.work_ledger.payout_revision().await?;
         let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
@@ -911,7 +914,7 @@ impl Coordinator {
         self.cache_tip_parent(parent).await?;
         let observed_revision = self
             .work_ledger
-            .observe_chain_view(parent, height - 1, chainwork)
+            .observe_chain_view_at_revision(parent, height - 1, chainwork, chain_revision)
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;

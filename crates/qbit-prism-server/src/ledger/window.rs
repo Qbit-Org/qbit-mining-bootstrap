@@ -307,13 +307,43 @@ impl Ledger {
             .await
     }
 
-    /// Coordinate nodes by cumulative proof of work. A slower peer or an
-    /// equal-work sibling cannot reverse another instance's accepted chain.
+    /// Coordinate nodes by cumulative proof of work. Unsequenced observations
+    /// cannot replace an accepted tip with an equal-work sibling.
     pub async fn observe_chain_view(
         &self,
         tip: &str,
         height: u64,
         chainwork_hex: &str,
+    ) -> Result<i64> {
+        self.observe_chain_view_checked(tip, height, chainwork_hex, None)
+            .await
+    }
+
+    /// Follow the node's equal-work, same-height fork choice only when the
+    /// cluster still has the revision read *before* the coherent node proof.
+    /// A delayed observation must not reverse a replacement another observer
+    /// has already committed. Fresh observations of disagreeing nodes can still
+    /// change fork choice; every change revokes old payout authority atomically.
+    /// Callers must prove that tip, height and work describe the same active tip.
+    /// Candidate/settlement observers without that pre-observation revision use
+    /// the strict [`Self::observe_chain_view`] path instead.
+    pub async fn observe_chain_view_at_revision(
+        &self,
+        tip: &str,
+        height: u64,
+        chainwork_hex: &str,
+        expected_revision: i64,
+    ) -> Result<i64> {
+        self.observe_chain_view_checked(tip, height, chainwork_hex, Some(expected_revision))
+            .await
+    }
+
+    async fn observe_chain_view_checked(
+        &self,
+        tip: &str,
+        height: u64,
+        chainwork_hex: &str,
+        expected_revision: Option<i64>,
     ) -> Result<i64> {
         ensure!(
             tip.len() == 64 && tip.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -346,15 +376,21 @@ impl Ledger {
             "local node is behind the cluster's cumulative chainwork"
         );
         let mut revision: i64 = row.try_get("payout_revision")?;
+        if let Some(expected) = expected_revision {
+            ensure!(revision == expected, "chain observation revision changed");
+        }
+        let same_tip = row
+            .try_get::<Option<String>, _>("best_tip_hash")?
+            .as_deref()
+            == Some(&tip);
         if same {
             ensure!(
-                row.try_get::<Option<String>, _>("best_tip_hash")?
-                    .as_deref()
-                    == Some(&tip)
+                (same_tip || expected_revision.is_some())
                     && row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height),
                 "local node follows a conflicting equal-work chain tip"
             );
-        } else {
+        }
+        if greater || !same_tip {
             revision=sqlx::query_scalar("UPDATE qbit_prism_cluster SET best_chainwork=$1::text::numeric,best_tip_hash=$2,best_tip_height=$3,payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision")
                 .bind(work).bind(tip).bind(height).fetch_one(&mut *tx).await?;
         }

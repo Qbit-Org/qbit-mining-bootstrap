@@ -47,6 +47,13 @@ pub(super) trait WorkLedger: Send + Sync {
         height: u64,
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>>;
+    fn observe_chain_view_at_revision<'a>(
+        &'a self,
+        tip: &'a str,
+        height: u64,
+        chainwork: &'a str,
+        expected_revision: i64,
+    ) -> BoxFuture<'a, Result<i64>>;
     fn snapshot_with_admission(
         &self,
         network: u128,
@@ -142,6 +149,21 @@ impl WorkLedger for Ledger {
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(Ledger::observe_chain_view(self, tip, height, chainwork))
+    }
+    fn observe_chain_view_at_revision<'a>(
+        &'a self,
+        tip: &'a str,
+        height: u64,
+        chainwork: &'a str,
+        expected_revision: i64,
+    ) -> BoxFuture<'a, Result<i64>> {
+        Box::pin(Ledger::observe_chain_view_at_revision(
+            self,
+            tip,
+            height,
+            chainwork,
+            expected_revision,
+        ))
     }
     fn snapshot_with_admission(
         &self,
