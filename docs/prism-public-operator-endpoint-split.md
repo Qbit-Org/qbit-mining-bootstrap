@@ -69,6 +69,21 @@ the warning records any underlying database probe failure. No client should
 depend on the former raw driver text. The combined coordinator listener and
 its authentication policy are outside this diagnostic change.
 
+This page classifies HTTP endpoints. Operator commands are not endpoints and
+are not listed here: `migrate`, `import-audits`, `backfill-ctv`,
+`policy-transition`, `share-archive` and the rest run from a shell against the
+primary and reach neither listener. `share-archive`, the share ledger retention
+path, is documented in
+[ledger operations](prism-ledger-ops.md#share-ledger-partitions-and-retention).
+
+One operator route's answer depends on retention. `/audit/share-window?anchor=`
+reads the online share ledger, so an anchor inside a range whose partition has
+been archived returns no rows rather than an error. Those shares are in the
+archive and in every sealed artifact whose window covers them; an
+anchor-to-archive index is deferred. Public artifact and audit bundle routes
+are unaffected, because a block whose shares have been archived is served from
+its stored canonical bytes under the same digest.
+
 Read concurrency, SQL statement deadlines, cache capacity, and stale response
 budgets are bounded independently of mining. Replica mode additionally checks
 recovery state and WAL receiver heartbeat age; promotion or a stale stream

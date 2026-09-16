@@ -9,10 +9,11 @@ shared local filesystem.
 
 | Data | Storage and lifetime |
 | --- | --- |
-| Accepted shares and proof identity | Permanent immutable PostgreSQL rows |
+| Accepted shares | Immutable PostgreSQL rows, never updated, deleted or truncated. Online while the share is inside the online horizon, then archived outside PostgreSQL one whole partition at a time and the partition dropped |
+| Proof identity (`qbit_prism_share_hashes`) | Permanent immutable PostgreSQL rows, one per share, about 150 B each. Not partitioned and never removed: it is the global `share_id` authority the append path consults first |
 | Blocks, payouts, carry-forward, maturity/reorg state | Permanent PostgreSQL accounting history |
 | Native audit share snapshots | Permanent range/count/anchor/digest metadata referencing immutable shares |
-| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL: the logical bundle minus its top-level `shares` and minus `reward_manifest.shares`, both rebuilt on read. Rows landed before 3.x.x #267 still hold `reward_manifest.shares` and stay readable as they are |
+| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL: the logical bundle minus its top-level `shares` and minus `reward_manifest.shares`, both rebuilt on read. Rows landed before 3.x.x #267 still hold `reward_manifest.shares` and stay readable as they are. Before the shares a body depends on are archived, the body is sealed: its full canonical artifact is stored in `canonical_audit_bytes` and served from there instead of being rebuilt, which costs the artifact size back per archived block, about 22 MB at a 20,000-share window and about 111 MB at 100,000 (`audit_body_byte_len` in the table below), TOAST-compressed in the column |
 | Imported legacy audits | Digest-checked canonical bytes (bytea) plus non-share metadata in PostgreSQL; an inline body survives only on inline-only rows; original backup retained |
 | CTV manifests, transactions, outcomes | Durable PostgreSQL recovery and audit state |
 | CPFP funding reservations and signed child packages | Durable recovery records; retain until reconciled |
@@ -27,8 +28,34 @@ window of `reward_manifest` from that slice (the stored header must match the
 rebuilt one field for field), and verify the snapshot digest and the canonical
 bundle hash of the whole body. Overlapping windows therefore share ledger
 storage instead of embedding another copy of every share in every
-accepted-block audit. There is no supported archive/prune command for this
-immutable history.
+accepted-block audit.
+
+Retention of that history is detach-and-archive, never deletion. There is no
+row-level prune or share-compaction command, and no `DELETE` runs on the
+ledger. `qbit-prism-server share-archive` retires a whole partition once no
+online reader can still need it: seal the audits that depend on it, write the
+partition to an archive outside PostgreSQL, verify the archive against the live
+rows, detach, and only then drop the detached relation, with the archive as the
+copy of record from then on. Size and retain that archive as accounting data,
+not as a cache. The procedure, the online horizon it checks and the archive
+format are in
+[ledger operations](prism-ledger-ops.md#share-ledger-partitions-and-retention).
+
+### Archived share partitions
+
+A partition at the default width holds 2^24 = 16,777,216 rows, about 7.5 GB of
+heap plus about 20 GB of indexes at the production row shape. Archiving it
+writes newline-delimited canonical JSON, one object per ledger row with every
+column, gzipped. Uncompressed that JSON is larger than the heap it came from,
+since numerics and timestamps become decimal strings and the program becomes
+hex; gzip on rows of this shape should recover roughly 5:1. Treat that as an
+estimate to be replaced by a measurement, not a planning number: the manifest
+of the first real `archive` run records `rows_bytes` and `rows_gz_bytes` and
+gives the exact ratio for this pool's row shape.
+
+The archive is an additional copy, not a saving on the database volume until
+the partition is dropped. Budget both for the interval between `archive` and
+`drop`, plus whatever the archive retention policy keeps off-host.
 
 ### Native audit body size
 
@@ -227,6 +254,8 @@ docker system df
 
 Use explicit retention for logs, expired operational records, and image caches.
 Do not delete inactive pool blocks, referenced shares, snapshots, or canonical
-settlement evidence as routine cleanup. Track storage growth and restore time
-against the measured ingest model rather than relying on the former Python
-pilot's repeated-audit-file footprint.
+settlement evidence as routine cleanup. Aged shares leave through
+`share-archive` and its checks, one partition at a time, and never through a
+`DELETE`. Track storage growth and restore time against the measured ingest
+model rather than relying on the former Python pilot's repeated-audit-file
+footprint.

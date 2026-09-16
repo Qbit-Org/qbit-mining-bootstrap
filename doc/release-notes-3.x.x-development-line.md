@@ -54,6 +54,28 @@ carries a banner with the same statement.
   check-version-skew`) fails when `VERSION` differs from the version Cargo
   resolves for any workspace crate, and CI runs it in the Rust tests job that
   the merge gate requires.
+- #144: the share ledger is partitioned and has a retention path. Migration
+  015 drops the two foreign keys onto `qbit_share_ledger(share_id)`, adds the
+  partition catalog (`qbit_prism_share_partitioning`,
+  `qbit_prism_share_partitions`) and its maintenance functions, and moves
+  block solver attribution onto `qbit_pool_blocks.solver_*`, backfilled for
+  existing blocks. Migration 016 converts `qbit_share_ledger` into a
+  `RANGE (share_seq)` partitioned table by attaching the release table as its
+  first partition behind a validated bound, so nothing is copied and no index
+  is rebuilt; it is applied inside the migration transaction on an empty
+  ledger and by a resumable online runner otherwise, and is recorded only
+  after the swap. `qbit-prism-server share-archive` is the retention path:
+  plan, seal, archive, verify, detach, drop and restore a whole partition,
+  never a `DELETE`, with the archive outside PostgreSQL as the copy of record.
+  Readers changed with it: the append path consults `qbit_prism_share_hashes`
+  first and bounds its ledger probe with `qbit_prism_share_probe_floor()`,
+  `share_id` uniqueness is per leaf with that table as the global authority,
+  and the four dashboard solver lookups read `qbit_pool_blocks` instead of
+  suffix-matching the ledger. Two behaviour changes are documented and
+  intended: a miner's `last_share_at` reads `null` once its last share has
+  been archived, and `/audit/share-window` for an anchor inside an archived
+  range returns no rows. See `docs/prism-share-ledger-partitioning.md`,
+  `docs/prism-ledger-ops.md` and `docs/prism-rust-migration.md`.
 
 The following 2.x.x changes were deliberately not carried, because the code
 they fixed or configured no longer exists on this line:
