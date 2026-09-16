@@ -6,7 +6,7 @@ use crate::{
         LiveInstancesReport,
     },
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -55,6 +55,11 @@ enum Command {
         #[command(subcommand)]
         command: FatalStateCommand,
     },
+    /// Inspect unfinished block candidates, or abandon a pending one.
+    Candidates {
+        #[command(subcommand)]
+        command: CandidatesCommand,
+    },
     /// Validate compact target bits and print Prism's exact scaled difficulty.
     HeaderDifficulty {
         #[arg(long)]
@@ -93,6 +98,25 @@ enum FatalStateCommand {
     Show,
     /// Reconcile a stopped/drained cluster and durably record why it was cleared.
     Clear {
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CandidatesCommand {
+    /// Print every unfinished candidate, oldest due first; zero when none.
+    List {
+        /// Print the versioned JSON document instead of the operator table.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(i64).range(1..=10_000))]
+        limit: i64,
+    },
+    /// Abandon one pending, unclaimed candidate the node was never offered.
+    Abandon {
+        #[arg(long)]
+        block_hash: String,
         #[arg(long)]
         reason: String,
     },
@@ -158,6 +182,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             Ok(())
         }
         Command::FatalState { command } => fatal_state(command).await,
+        Command::Candidates { command } => candidates(command).await,
         Command::HeaderDifficulty { bits } => {
             let compact = crate::codec::parse_u32_hex(&bits)?;
             let target = crate::codec::target_from_compact(compact)?;
@@ -291,6 +316,216 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The operator candidate commands (#268). Both read `PRISM_DATABASE_URL`
+/// and nothing else: neither builds a node client, reads a signing key,
+/// loads `Config` or starts a listener, so "never calls `submitblock`" is a
+/// property of the code's shape rather than of its discipline.
+async fn candidates(command: CandidatesCommand) -> Result<()> {
+    match command {
+        CandidatesCommand::List { json, limit } => {
+            let url =
+                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
+            let rows = crate::ledger::Ledger::list_candidates(&url, limit).await?;
+            if json {
+                let document = json!({
+                    "schema": "qbit.prism.candidates.list.v1",
+                    "candidates": rows,
+                });
+                println!("{}", serde_json::to_string_pretty(&document)?);
+            } else if rows.is_empty() {
+                // Nothing pending is this command's success case: it is what
+                // the cutover runbook waits for, so it exits zero.
+                println!("no unfinished candidates");
+            } else {
+                print!("{}", candidate_table(&rows));
+            }
+            Ok(())
+        }
+        CandidatesCommand::Abandon { block_hash, reason } => {
+            // Both inputs are checked before any connection is opened, in the
+            // formats the row itself uses: `candidate_sha256 ~
+            // '^[0-9a-f]{64}$'` for the hash, and `fatal-state clear`'s rule
+            // for the reason, which lands in `last_error`.
+            ensure!(
+                block_hash.len() == 64
+                    && block_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "--block-hash must be exactly 64 lowercase hexadecimal characters"
+            );
+            ensure!(
+                !reason.trim().is_empty() && reason.len() <= 4096,
+                "--reason must contain 1 to 4096 bytes of nonblank text"
+            );
+            let url =
+                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            let outcome = ledger.abandon_candidate(&block_hash, &reason).await;
+            // Closed before the outcome is inspected, so a refusal releases
+            // the pool exactly as a success does.
+            ledger.pool.close().await;
+            let (code, message) = abandon_report(&outcome?, &block_hash, &reason)?;
+            if code == 0 {
+                println!("{message}");
+                return Ok(());
+            }
+            eprintln!("{message}");
+            std::process::exit(code)
+        }
+    }
+}
+
+/// One exit status per abandon outcome, so a runbook can tell a row that was
+/// never there (2) from one already abandoned (4), and both from the two
+/// refusals that protect the invariant: a block that may already have been
+/// offered to the node (3) and a block whose accounting has landed (6).
+/// An outcome this function does not recognise is a failure, never a
+/// "nothing to do".
+fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i32, String)> {
+    let field = |name: &str| outcome[name].as_str().unwrap_or("unknown").to_owned();
+    Ok(match outcome["outcome"].as_str().unwrap_or_default() {
+        "abandoned" => (0, format!("abandoned {block_hash}: {reason}")),
+        "missing" => (2, format!("no candidate row for {block_hash}")),
+        "offered" => (
+            3,
+            format!(
+                "candidate {block_hash} is in state {}; it was offered to the node and is never \
+                 abandoned. Its block may already have been submitted. Leave it to reconciliation",
+                field("state")
+            ),
+        ),
+        "terminal" => (
+            4,
+            format!(
+                "candidate {block_hash} is already {}; nothing to do",
+                field("state")
+            ),
+        ),
+        "claimed" => (
+            5,
+            format!(
+                "candidate {block_hash} is held by {} until {}; retry after the claim expires",
+                field("claim_instance_id"),
+                field("claim_expires_at")
+            ),
+        ),
+        "landed" => (
+            6,
+            format!(
+                "candidate {block_hash} is pending but its block is already in qbit_pool_blocks; \
+                 reconcile it before abandoning — abandoning would discard landed accounting"
+            ),
+        ),
+        other => bail!("unrecognized abandon outcome {other:?} for candidate {block_hash}"),
+    })
+}
+
+/// The text inventory an operator reads at 3 a.m. The block hash is printed
+/// whole so it can be pasted straight into `candidates abandon`; a parked row
+/// says `parked` where a retrying row shows its due time; and `last_error`,
+/// the only unbounded field, is the only one truncated, and says so when it is.
+fn candidate_table(rows: &[Value]) -> String {
+    const HEADERS: [&str; 8] = [
+        "block_hash",
+        "state",
+        "height",
+        "attempts",
+        "next_attempt",
+        "claim",
+        "sv",
+        "last_error",
+    ];
+    let mut table = vec![HEADERS.map(str::to_owned)];
+    table.extend(rows.iter().map(|row| {
+        [
+            cell(&row["block_hash"]),
+            cell(&row["state"]),
+            cell(&row["block_height"]),
+            cell(&row["attempt_count"]),
+            if row["parked"] == Value::Bool(true) {
+                "parked".to_owned()
+            } else {
+                cell(&row["next_attempt_at"])
+            },
+            claim_cell(row),
+            cell(&row["storage_version"]),
+            last_error_cell(&row["last_error"]),
+        ]
+    }));
+    let widths: Vec<usize> = (0..HEADERS.len())
+        .map(|column| {
+            table
+                .iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or_default()
+        })
+        .collect();
+    table
+        .iter()
+        .map(|row| {
+            let line = row
+                .iter()
+                .zip(&widths)
+                .map(|(value, width)| format!("{value:<width$}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            format!("{}\n", line.trim_end())
+        })
+        .collect()
+}
+
+/// An unknown value is `-`, never `0` and never blank: a candidate whose
+/// document holds no readable height has an unknown height, which is
+/// information, not a zero.
+fn cell(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_owned(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A live claim names its holder and expiry, a claim past its expiry is
+/// `expired` (the row is workable again, and abandonable), and no claim at
+/// all is `-`. `--json` keeps the stale holder and expiry.
+fn claim_cell(row: &Value) -> String {
+    match (
+        row["claim_instance_id"].as_str(),
+        row["claim_live"].as_bool(),
+    ) {
+        (None, _) => "-".to_owned(),
+        (Some(_), Some(false) | None) => "expired".to_owned(),
+        (Some(instance), Some(true)) => {
+            format!("{instance} until {}", cell(&row["claim_expires_at"]))
+        }
+    }
+}
+
+fn last_error_cell(value: &Value) -> String {
+    const WIDTH: usize = 72;
+    let Some(text) = value.as_str() else {
+        return "-".to_owned();
+    };
+    let flat: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if flat.chars().count() <= WIDTH {
+        return flat;
+    }
+    format!(
+        "{}…(truncated)",
+        flat.chars().take(WIDTH).collect::<String>()
+    )
 }
 
 fn diagnostic_host(bind: &str) -> String {
