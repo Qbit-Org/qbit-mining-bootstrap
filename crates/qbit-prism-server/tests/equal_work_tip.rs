@@ -116,6 +116,14 @@ async fn equal_work_replacement_preserves_strict_and_revision_fences() -> Result
             .observe_chain_view_at_revision(&replacement, 100, "0100", before)
             .await?;
         ensure!(current == before + 1);
+        // A peer can finish observing the same replacement after another peer
+        // accepts it. This is a no-op, not a conflicting stale replacement.
+        ensure!(
+            ledger
+                .observe_chain_view_at_revision(&replacement, 100, "100", before)
+                .await?
+                == current
+        );
         ensure!(
             ledger
                 .observe_chain_view_at_revision(&replacement, 100, "100", current)
@@ -145,10 +153,16 @@ async fn equal_work_replacement_preserves_strict_and_revision_fences() -> Result
             .observe_chain_view_at_revision(&original, 100, "100", current)
             .await?;
         ensure!(returned == current + 1);
+        // Returning to the initial hash does not make the original revision
+        // current again: a third sibling from that old poll still loses.
+        ensure!(ledger
+            .observe_chain_view_at_revision(&"12".repeat(32), 100, "100", before)
+            .await
+            .is_err());
         // Existing greater-work semantics permit a shorter, heavier chain.
         ensure!(
             ledger
-                .observe_chain_view(&"34".repeat(32), 99, "101")
+                .observe_chain_view_at_revision(&"34".repeat(32), 99, "101", before)
                 .await?
                 == returned + 1
         );

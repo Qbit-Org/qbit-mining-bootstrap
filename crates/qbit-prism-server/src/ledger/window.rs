@@ -324,6 +324,8 @@ impl Ledger {
     /// A delayed observation must not reverse a replacement another observer
     /// has already committed. Fresh observations of disagreeing nodes can still
     /// change fork choice; every change revokes old payout authority atomically.
+    /// Greater-work observations and the already accepted tip retain their
+    /// existing monotonic/no-op semantics, even if the revision has advanced.
     /// Callers must prove that tip, height and work describe the same active tip.
     /// Candidate/settlement observers without that pre-observation revision use
     /// the strict [`Self::observe_chain_view`] path instead.
@@ -376,14 +378,16 @@ impl Ledger {
             "local node is behind the cluster's cumulative chainwork"
         );
         let mut revision: i64 = row.try_get("payout_revision")?;
-        if let Some(expected) = expected_revision {
-            ensure!(revision == expected, "chain observation revision changed");
-        }
         let same_tip = row
             .try_get::<Option<String>, _>("best_tip_hash")?
             .as_deref()
             == Some(&tip);
         if same {
+            if !same_tip {
+                if let Some(expected) = expected_revision {
+                    ensure!(revision == expected, "chain observation revision changed");
+                }
+            }
             ensure!(
                 (same_tip || expected_revision.is_some())
                     && row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height),

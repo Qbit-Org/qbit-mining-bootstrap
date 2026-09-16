@@ -297,16 +297,22 @@ impl work_ledger::WorkLedger for MemoryLedger {
     fn observe_chain_view_at_revision<'a>(
         &'a self,
         tip: &'a str,
-        height: u64,
-        work: &'a str,
+        _height: u64,
+        _work: &'a str,
         expected_revision: i64,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
+            let mut previous = self.tip.lock().unwrap();
             ensure!(
-                self.revision.load(Ordering::SeqCst) == expected_revision,
+                previous.as_deref() == Some(tip)
+                    || self.revision.load(Ordering::SeqCst) == expected_revision,
                 "chain observation revision changed"
             );
-            self.observe_chain_view(tip, height, work).await
+            if previous.as_deref().is_some_and(|old| old != tip) {
+                self.revision.fetch_add(1, Ordering::SeqCst);
+            }
+            *previous = Some(tip.into());
+            Ok(self.revision.load(Ordering::SeqCst))
         })
     }
     fn snapshot_with_admission(
