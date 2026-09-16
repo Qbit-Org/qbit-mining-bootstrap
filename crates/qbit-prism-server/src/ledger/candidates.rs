@@ -1424,7 +1424,7 @@ impl Ledger {
 /// `list` is an inventory that cannot write, and `abandon` applies to a
 /// `pending` row only, because `pending` is the one unfinished state from
 /// which no `submitblock` can yet have been made. Neither reads a node, a
-/// signing key or any configuration beyond the database URL.
+/// signing key or anything beyond the stored-data configuration.
 impl Ledger {
     /// The statement [`Ledger::list_candidates`] issues, without its bind.
     /// Public so a test can describe the statement the command runs rather
@@ -1505,9 +1505,10 @@ impl Ledger {
     /// operator's message and exit status alone.
     pub async fn abandon_candidate(&self, block_hash: &str, reason: &str) -> Result<Value> {
         let mut tx = self.begin().await?;
-        // A cluster halt and a live legacy Python writer lease both refuse
-        // here, before the statement: an operator abandon never races the
-        // 2.x.x writer during a cutover.
+        // The write guard, kept even though the one-shot tool connection has
+        // already refused a halted cluster: it is what refuses a live legacy
+        // Python writer lease, so an operator abandon never races the 2.x.x
+        // writer during a cutover.
         writable(&mut tx).await?;
         let abandoned: Option<String> = sqlx::query_scalar(
             "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
