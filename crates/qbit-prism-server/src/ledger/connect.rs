@@ -511,7 +511,7 @@ fn lock_kind(key: i64) -> Option<LockKind> {
         ORDER_LOCK => Some(LockKind::Order),
         SETTLEMENT_LOCK => Some(LockKind::Settlement),
         // not observed: no LockKind value; see #328
-        super::fanout::CPFP_FUNDING_LOCK => None,
+        super::fanout::CPFP_FUNDING_LOCK | super::archive::LIFECYCLE_LOCK => None,
         _ => {
             debug_assert!(false, "advisory lock key {key:#018x} has no LockKind");
             None
@@ -526,16 +526,51 @@ pub(super) async fn lock(
     key: i64,
     metrics: Option<&Metrics>,
 ) -> Result<(), sqlx::Error> {
+    lock_with_scope(connection, key, metrics, false).await
+}
+
+pub(super) async fn session_lock(
+    connection: &mut PgConnection,
+    key: i64,
+    metrics: Option<&Metrics>,
+) -> Result<(), sqlx::Error> {
+    lock_with_scope(connection, key, metrics, true).await
+}
+
+async fn lock_with_scope(
+    connection: &mut PgConnection,
+    key: i64,
+    metrics: Option<&Metrics>,
+    session: bool,
+) -> Result<(), sqlx::Error> {
     // Time the advisory lock statement and nothing else: the clock starts
     // immediately before the wait begins.
     let guard = match (metrics, lock_kind(key)) {
         (Some(metrics), Some(kind)) => Some(WaitGuard::arm(metrics, kind)),
         _ => None,
     };
-    let acquired = sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(key)
-        .execute(&mut *connection)
-        .await;
+    let acquired = if session {
+        // A blocking SELECT keeps a snapshot while waiting for the session
+        // lock. Concurrent detach waits for older snapshots, so that waiter
+        // could deadlock the very lifecycle command holding the lock.
+        loop {
+            match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut *connection)
+                .await
+            {
+                Ok(true) => break Ok(()),
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+                Err(error) => break Err(error),
+            }
+        }
+    } else {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(key)
+            .execute(&mut *connection)
+            .await
+            .map(|_| ())
+    };
     if let Some(guard) = guard {
         guard.complete(if acquired.is_ok() {
             Outcome::Success
@@ -600,5 +635,6 @@ mod lock_kind_tests {
         assert_eq!(lock_kind(ORDER_LOCK), Some(LockKind::Order));
         assert_eq!(lock_kind(SETTLEMENT_LOCK), Some(LockKind::Settlement));
         assert_eq!(lock_kind(super::super::fanout::CPFP_FUNDING_LOCK), None);
+        assert_eq!(lock_kind(super::super::archive::LIFECYCLE_LOCK), None);
     }
 }

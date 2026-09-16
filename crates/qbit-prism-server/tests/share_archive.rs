@@ -1637,6 +1637,88 @@ async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() 
     }
 }
 
+/// A predecessor rewrite must wait until a successor's concurrent detach and
+/// catalog update both finish, then refuse to invalidate the departed archive.
+#[tokio::test]
+async fn archive_rewrite_waits_for_detach_and_catalog_reconciliation() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = tokio::task::LocalSet::new().run_until(async {
+        let ledger = db.ledger("detach-race-a").await?;
+        let detacher = Ledger::connect(&db.url, "detach-race-b".into(), 2, true).await?;
+        let application = format!("rewrite-{}", Uuid::new_v4().simple());
+        let mut url = url::Url::parse(&db.url)?;
+        url.query_pairs_mut().append_pair("application_name", &application);
+        let rewriter = Ledger::connect(url.as_str(), "detach-race-c".into(), 2, true).await?;
+        let root = tempfile::tempdir()?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        let (_, p1_upper) = bounds(&ledger.pool, P1).await?;
+        insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+        insert_shares(&ledger.pool, p0_upper, p0_upper + 4, 7, "server-a", 7200.0).await?;
+        insert_shares(&ledger.pool, p1_upper, p1_upper + 4, 1_000_000, "server-a", 1.0).await?;
+        set_sequence(&ledger.pool, p1_upper + 4).await?;
+        advance_rollups(&ledger.pool).await?;
+        for partition in [P0, P1] {
+            archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+            archive::verify(&ledger, partition, root.path()).await?;
+            archive::seal(&ledger, partition).await?;
+        }
+        let mut reader = ledger.pool.begin().await?;
+        sqlx::query("SELECT count(*) FROM qbit_share_ledger")
+            .fetch_one(&mut *reader).await?;
+        let detaching = tokio::task::spawn_local(async move {
+            let result = archive::detach(&detacher, P1, &retention(0)).await;
+            (detacher, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let pending: bool = sqlx::query_scalar("SELECT COALESCE((SELECT inhdetachpending FROM pg_inherits WHERE inhrelid=to_regclass($1) AND inhparent=to_regclass('qbit_share_ledger')),false)")
+                    .bind(P1).fetch_one(&ledger.pool).await?;
+                if pending { return Ok::<(), anyhow::Error>(()); }
+                ensure!(!detaching.is_finished(), "detach did not reach its second phase");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.context("detach never reached its second phase")??;
+        let rewriting = tokio::spawn({
+            let root = root.path().to_path_buf();
+            async move {
+                let result = archive::archive(&rewriter, P0, &root, true, "operator-b").await;
+                (rewriter, result)
+            }
+        });
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND query='SELECT pg_try_advisory_lock($1)' AND state='idle')")
+                    .bind(&application).fetch_one(&db.admin).await?;
+                if blocked { return Ok::<(), anyhow::Error>(()); }
+                ensure!(!rewriting.is_finished(), "rewrite invalidated verification during detach");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await;
+        reader.rollback().await?;
+        let (detacher, detached) = detaching.await?;
+        let (rewriter, rewritten) = rewriting.await?;
+        waited.context("rewrite never waited for detach")??;
+        ensure!(detached?["action"] == "detached", "detach did not complete");
+        let error = rewritten.expect_err("rewrote a departed archive's predecessor").to_string();
+        ensure!(error.contains("have left the ledger"), "{error}");
+        let row = catalog(&ledger.pool, P1).await?;
+        ensure!(row.try_get::<String, _>("state")? == "detached"
+            && row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archive_verified_at")?.is_some(),
+            "detach left an unverified or unreconciled partition");
+        archive::verify(&ledger, P1, root.path()).await?;
+        Ok(vec![ledger, detacher, rewriter])
+    }).await;
+    match result {
+        Ok(ledgers) => db.close(ledgers).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// EP-ERRORS: a `DETACH PARTITION ... CONCURRENTLY` that was interrupted
 /// after PostgreSQL marked the partition detach-pending is finished with
 /// FINALIZE, never restarted, and the catalog records it once it is out.

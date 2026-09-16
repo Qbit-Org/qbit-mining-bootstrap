@@ -34,6 +34,22 @@ use std::path::{Path, PathBuf};
 /// either this constant or a partition name proved by [`check_partition_name`].
 const PARENT: &str = "qbit_share_ledger";
 
+pub(super) const LIFECYCLE_LOCK: i64 = 0x505249534d000007;
+
+/// A rewrite invalidates successor verifications too, so lifecycle commands
+/// serialize across the entire chain, including DDL and catalog reconciliation.
+/// A detached connection reserves no pool slot while another command waits;
+/// dropping it releases the session lock even on cancellation or an error.
+async fn lifecycle_guard(ledger: &Ledger) -> Result<PgConnection> {
+    let mut connection = ledger.acquire().await?.detach();
+    sqlx::query("SELECT set_config('statement_timeout','0',false),set_config('lock_timeout','0',false),set_config('idle_session_timeout','0',false)")
+        .execute(&mut connection)
+        .await?;
+    super::connect::session_lock(&mut connection, LIFECYCLE_LOCK, ledger.metrics.as_deref())
+        .await?;
+    Ok(connection)
+}
+
 /// The only archive format this binary writes, and the only one it reads.
 /// EP-COMPAT: the format is persisted outside the database and outlives the
 /// binary that wrote it, so the version travels in the manifest and an
@@ -1416,6 +1432,7 @@ pub async fn archive(
     created_by: &str,
 ) -> Result<Value> {
     check_partition_name(partition_name)?;
+    let _lifecycle = lifecycle_guard(ledger).await?;
     let mut connection = ledger.acquire().await?;
     let record = catalog_row(&mut connection, partition_name).await?;
     let attachment = attachment(&mut connection, partition_name).await?;
@@ -1619,6 +1636,7 @@ fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
 /// reported only.
 pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
+    let _lifecycle = lifecycle_guard(ledger).await?;
     let mut connection = ledger.acquire().await?;
     let record = catalog_row(&mut connection, partition_name).await?;
     let attachment = attachment(&mut connection, partition_name).await?;
@@ -1830,6 +1848,7 @@ async fn ddl_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConnection<Po
 /// reconciled into the catalog instead of being detached again.
 pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions) -> Result<Value> {
     check_partition_name(partition_name)?;
+    let _lifecycle = lifecycle_guard(ledger).await?;
     let report = plan(ledger, options).await?;
     let entry = report
         .partitions
@@ -1967,6 +1986,7 @@ async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option
 /// share row is ever rewritten by this.
 pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Value> {
     check_partition_name(partition_name)?;
+    let _lifecycle = lifecycle_guard(ledger).await?;
     let (record, attachment) = {
         let mut connection = ledger.acquire().await?;
         let record = catalog_row(&mut connection, partition_name).await?;
@@ -2050,6 +2070,7 @@ pub async fn restore(
     root: &Path,
     attach: bool,
 ) -> Result<Value> {
+    let _lifecycle = lifecycle_guard(ledger).await?;
     let path = if manifest_path.is_absolute() || manifest_path.exists() {
         manifest_path.to_path_buf()
     } else {
