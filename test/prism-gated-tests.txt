@@ -354,6 +354,13 @@ qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_bootstr
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_single_share_from_another_miner_takes_the_whole_coinbase
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_held_and_renewed_lease_before_any_call_is_not_offer_evidence
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_known_call_keeps_its_call_evidence_through_orphan_terminalization
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_pre_offer_retry_records_no_call_and_leaves_the_row_pending
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_pre_offer_supersession_terminalizes_without_any_call
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_replay_adoption_after_restart_records_an_unknown_offer_with_no_call
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::an_interrupted_reservation_orphans_unknown_without_inventing_a_call
+qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::offer_path_records_a_counted_call_with_a_durable_timestamp_and_reply
 qbit-prism-server::qbit_prism_server::coordinator::window_incident_tests::claim_rebuild_has_the_canonical_bytes_refresh_built_for_the_job
 qbit-prism-server::qbit_prism_server::coordinator::window_incident_tests::incident_1_lease_renewal_is_not_delayed_by_a_large_window_claim
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::a_refresh_over_an_empty_ledger_publishes_an_empty_window_reference
@@ -382,6 +389,10 @@ qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::replacemen
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::transient_decode_database_error_is_not_parked
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::unclassified_decode_error_is_not_parked
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::unknown_persisted_offer_outcome_parks_as_lifecycle
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_failed_or_shifting_chain_observation_leaves_the_drain_recoverable
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_landing_acknowledgement_rolls_back_and_the_next_attempt_lands
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_renewal_acknowledgement_cancels_only_that_attempt
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_terminal_commit_acknowledgement_stays_terminal
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_compact_read_releases_checkout_before_blocking_decode
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_checkouts_start_on_first_poll_and_recover
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_sql_wait_errors_and_cancellation_do_not_change_checkout_samples
