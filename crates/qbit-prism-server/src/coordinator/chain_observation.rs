@@ -20,6 +20,7 @@ impl ChainObservation {
         work: &str,
         revision: i64,
     ) -> Result<i64> {
+        let previous_tip = self.tip.clone();
         if self
             .tip
             .as_deref()
@@ -39,13 +40,23 @@ impl ChainObservation {
             }
             None => ledger.observe_chain_view(tip, height, work).await,
         };
-        // Only this typed, pre-write refusal proves there was no tip mutation
-        // and that the predecessor was still accepted. A retry must pass through
-        // refresh's fresh RPC proof and revision capture; never replay this one.
+        // Reconsideration can pass through ancestors below the durable work
+        // checkpoint. A definite pre-write refusal must not replace the local
+        // predecessor with such an ineligible tip. Restore only the prior tip:
+        // this attempt still consumes any pending retry, just as before. A
+        // lower-work excursion must not extend that retry across a peer's ABA.
+        // Cancellation or an unknown outcome never reaches this branch.
         if result
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::ledger::ChainObservationBehind>())
+        {
+            self.tip = previous_tip;
+        } else if result
             .as_ref()
             .is_err_and(|error| error.is::<crate::ledger::ChainObservationRetry>())
         {
+            // This pre-write revision refusal retains the existing witness.
+            // A retry still needs a fresh coherent proof and revision capture.
             self.retry_from = predecessor;
         }
         result
@@ -87,6 +98,38 @@ mod tests {
         assert_eq!(fixture.store.revision.load(Ordering::SeqCst), revision);
     }
 
+    async fn lower_work_cannot_recreate_a_consumed_transition(fixture: &Fixture) {
+        let calls = fixture
+            .store
+            .compact
+            .transition_calls
+            .load(Ordering::SeqCst);
+        let revision = fixture.store.revision.load(Ordering::SeqCst);
+        fixture.node.lock().unwrap().tip = hash(3);
+        fixture
+            .store
+            .compact
+            .observation_behind
+            .store(true, Ordering::SeqCst);
+        let error = fixture.coordinator.refresh_once().await.unwrap_err();
+        assert!(error.is::<crate::ledger::ChainObservationBehind>());
+        fixture.node.lock().unwrap().tip = hash(2);
+        for _ in 0..2 {
+            let error = fixture.coordinator.refresh_once().await.unwrap_err();
+            assert!(error.to_string().contains("conflicting equal-work"));
+        }
+        assert_eq!(
+            fixture
+                .store
+                .compact
+                .transition_calls
+                .load(Ordering::SeqCst),
+            calls + 1,
+            "the lower-work refusal recreated a consumed transition"
+        );
+        assert_eq!(fixture.store.revision.load(Ordering::SeqCst), revision);
+    }
+
     #[tokio::test]
     async fn unknown_observation_commit_never_recreates_a_transition() {
         for outcome in [FailCommit::NotRecorded, FailCommit::Recorded] {
@@ -121,6 +164,7 @@ mod tests {
                 );
             }
             unchanged_cannot_replay(&fixture).await;
+            lower_work_cannot_recreate_a_consumed_transition(&fixture).await;
         }
     }
 
@@ -145,6 +189,7 @@ mod tests {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
             unchanged_cannot_replay(&fixture).await;
+            lower_work_cannot_recreate_a_consumed_transition(&fixture).await;
         }
     }
 
@@ -159,6 +204,67 @@ mod tests {
         );
         fixture.store.fail_save.store(false, Ordering::SeqCst);
         unchanged_cannot_replay(&fixture).await;
+        lower_work_cannot_recreate_a_consumed_transition(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_lower_work_observation_does_not_restore_the_previous_tip() {
+        let fixture = baseline().await;
+        let gate = Arc::new(Gate::default());
+        *fixture.store.compact.observation_before.lock().unwrap() = Some(gate.clone());
+        fixture
+            .store
+            .compact
+            .observation_behind
+            .store(true, Ordering::SeqCst);
+        let coordinator = fixture.coordinator.clone();
+        let task = tokio::spawn(async move { coordinator.refresh_once().await });
+        timeout(BOUND, gate.entered.notified()).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        unchanged_cannot_replay(&fixture).await;
+        lower_work_cannot_recreate_a_consumed_transition(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn lower_work_consumes_an_already_eligible_accounting_retry() {
+        let fixture = baseline().await;
+        let gate = Arc::new(Gate::default());
+        fixture.node.lock().unwrap().gate = Some(("getblockheader".into(), gate.clone()));
+        let coordinator = fixture.coordinator.clone();
+        let task = tokio::spawn(async move { coordinator.refresh_once().await });
+        timeout(BOUND, gate.entered.notified()).await.unwrap();
+        fixture.store.revision.fetch_add(1, Ordering::SeqCst);
+        gate.release.notify_one();
+        let error = timeout(BOUND, task).await.unwrap().unwrap().unwrap_err();
+        assert!(error.is::<crate::ledger::ChainObservationRetry>());
+        for _ in 0..2 {
+            fixture.node.lock().unwrap().tip = hash(3);
+            fixture
+                .store
+                .compact
+                .observation_behind
+                .store(true, Ordering::SeqCst);
+            let error = fixture.coordinator.refresh_once().await.unwrap_err();
+            assert!(error.is::<crate::ledger::ChainObservationBehind>());
+            assert_eq!(fixture.store.revision.load(Ordering::SeqCst), 1);
+        }
+        fixture.node.lock().unwrap().tip = hash(2);
+        let error = timeout(BOUND, fixture.coordinator.refresh_once())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicting equal-work"));
+        assert_eq!(fixture.store.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .store
+                .compact
+                .transition_calls
+                .load(Ordering::SeqCst),
+            3,
+            "a lower-work observation must consume the pending retry"
+        );
     }
 
     #[tokio::test]

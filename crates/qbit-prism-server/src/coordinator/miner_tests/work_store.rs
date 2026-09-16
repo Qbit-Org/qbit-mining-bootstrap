@@ -13,6 +13,7 @@ pub(crate) struct CompactStore {
     pub observation_before: StdMutex<Option<Arc<Gate>>>,
     pub observation_after: StdMutex<Option<Arc<Gate>>>,
     pub observation_unknown: StdMutex<Option<FailCommit>>,
+    pub observation_behind: AtomicBool,
     pub transition_calls: AtomicUsize,
     pub reads: StdMutex<VecDeque<Result<Option<StoredCompactPrepared>>>>,
     pub read_keys: StdMutex<Vec<String>>,
@@ -313,10 +314,17 @@ impl work_ledger::WorkLedger for MemoryLedger {
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
             self.compact.transition_calls.fetch_add(1, Ordering::SeqCst);
+            let behind = self
+                .compact
+                .observation_behind
+                .swap(false, Ordering::SeqCst);
             let before = self.compact.observation_before.lock().unwrap().take();
             if let Some(gate) = before {
                 gate.entered.notify_one();
                 gate.release.notified().await;
+            }
+            if behind {
+                return Err(crate::ledger::ChainObservationBehind.into());
             }
             let unknown = self.compact.observation_unknown.lock().unwrap().take();
             if matches!(unknown, Some(FailCommit::NotRecorded)) {

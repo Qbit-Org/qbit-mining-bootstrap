@@ -18,6 +18,142 @@ mod ledger_database;
 const ISSUE_BOUND: Duration = Duration::from_secs(2);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lower_work_consumes_an_accounting_retry_even_after_peer_aba() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = ledger_database::FixtureDatabase::open(&raw, "equal_work_retry_aba_").await?;
+    let node = fake_qbitd::FakeNode::open().await?;
+    let peer_node = fake_qbitd::FakeNode::open().await?;
+    let old = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &node, "old-retry")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let peer = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &peer_node, "retry-peer")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let result = async {
+        let original = "ab".repeat(32);
+        let replacement = "ef".repeat(32);
+        for endpoint in [&node, &peer_node] {
+            endpoint.set_tip(&original, &"cd".repeat(32), 100, "03");
+        }
+        old.refresh_once().await?;
+        peer.refresh_once().await?;
+        node.set_tip(&replacement, &"cd".repeat(32), 100, "03");
+        let mut pause = node.pause_next("getblockheader")?;
+        let observer = old.clone();
+        let mut pending = tokio::spawn(async move { observer.refresh_once().await });
+        let abort = pending.abort_handle();
+        let raced = async {
+            timeout(ISSUE_BOUND, pause.entered()).await??;
+            sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
+                .execute(&peer.ledger.pool).await?;
+            pause.release();
+            let error = timeout(ISSUE_BOUND, &mut pending).await??.unwrap_err();
+            ensure!(error.to_string().contains("chain observation revision changed"));
+            peer_node.set_tip(&"12".repeat(32), &"cd".repeat(32), 100, "03");
+            peer.refresh_once().await?;
+            peer_node.set_tip(&original, &"cd".repeat(32), 100, "03");
+            peer.refresh_once().await?;
+            let revision = peer.ledger.payout_revision().await?;
+            node.set_tip(&"cd".repeat(32), &"34".repeat(32), 99, "02");
+            let error = old.refresh_once().await.unwrap_err();
+            ensure!(error.to_string().contains("behind the cluster"));
+            node.set_tip(&replacement, &"cd".repeat(32), 100, "03");
+            for _ in 0..2 {
+                let retried = old.refresh_once().await;
+                let (tip, current): (String, i64) = sqlx::query_as(
+                    "SELECT best_tip_hash,payout_revision FROM qbit_prism_cluster WHERE singleton",
+                ).fetch_one(&peer.ledger.pool).await?;
+                ensure!(retried.is_err() && tip == original && current == revision,
+                    "lower-work observation revived the accounting retry after ABA: accepted={}, revision {} -> {}", retried.is_ok(), revision, current);
+            }
+            Ok(())
+        }.await;
+        abort.abort();
+        if !pending.is_finished() {
+            let _ = pending.await;
+        }
+        raced
+    }.await;
+    old.ledger.pool.close().await;
+    peer.ledger.pool.close().await;
+    db.close(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lower_work_reconsideration_preserves_the_equal_work_predecessor() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = ledger_database::FixtureDatabase::open(&raw, "equal_work_reconsider_").await?;
+    let node = fake_qbitd::FakeNode::open().await?;
+    let a = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &node, "reconsider-a")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let b = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &node, "reconsider-b")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let result = async {
+        let original = "ab".repeat(32);
+        let restored = "ef".repeat(32);
+        node.set_tip(&original, &"cd".repeat(32), 102, "03");
+        a.refresh_once().await?;
+        b.refresh_once().await?;
+        let before = a.ledger.payout_revision().await?;
+        // invalidateblock/reconsiderblock exposes lower-work intermediate tips.
+        // Neither may move the durable checkpoint or replace its predecessor.
+        for (tip, height, work) in [("cd", 100, "01"), ("de", 101, "02")] {
+            node.set_tip(&tip.repeat(32), &"12".repeat(32), height, work);
+            for observer in [&a, &b] {
+                let error = observer.refresh_once().await.unwrap_err();
+                ensure!(error.to_string().contains("behind the cluster"));
+                ensure!(observer.ledger.payout_revision().await? == before);
+            }
+        }
+        node.set_tip(&restored, &"de".repeat(32), 102, "03");
+        timeout(ISSUE_BOUND, async {
+            tokio::try_join!(a.refresh_once(), b.refresh_once())
+        })
+        .await??;
+        ensure!(a.ledger.payout_revision().await? == before + 1);
+        for observer in [&a, &b] {
+            let worker = observer.authorize("alice.reconsider").await?;
+            let job = observer.build_job(&worker, "1a2b3c4d", 1e-12, 0.0).await?;
+            ensure!(job.wire.previousblockhash == restored);
+        }
+        // A peer returns the accepted tip. A rejected lower-work excursion
+        // must not recreate either observer's already consumed transition.
+        let returned = a
+            .ledger
+            .observe_chain_transition(&restored, &original, 102, "03", before + 1)
+            .await?;
+        node.set_tip(&"de".repeat(32), &"12".repeat(32), 101, "02");
+        ensure!(a.refresh_once().await.is_err());
+        ensure!(b.refresh_once().await.is_err());
+        node.set_tip(&restored, &"de".repeat(32), 102, "03");
+        for _ in 0..2 {
+            ensure!(a.refresh_once().await.is_err());
+            ensure!(b.refresh_once().await.is_err());
+            ensure!(a.ledger.payout_revision().await? == returned);
+        }
+        Ok(())
+    }
+    .await;
+    a.ledger.pool.close().await;
+    b.ledger.pool.close().await;
+    db.close(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accounting_revision_refusal_retains_only_an_uncommitted_transition() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());

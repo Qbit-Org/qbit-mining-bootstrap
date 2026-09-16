@@ -40,6 +40,18 @@ impl std::fmt::Display for ChainObservationRetry {
 
 impl std::error::Error for ChainObservationRetry {}
 
+/// A strictly lower-work view was refused before any write or COMMIT.
+#[derive(Debug)]
+pub(crate) struct ChainObservationBehind;
+
+impl std::fmt::Display for ChainObservationBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local node is behind the cluster's cumulative chainwork")
+    }
+}
+
+impl std::error::Error for ChainObservationBehind {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchor_ms: i64,
@@ -405,10 +417,9 @@ impl Ledger {
             .bind(&work).fetch_one(&mut *tx).await?;
         let same: bool = row.try_get("same_work")?;
         let greater: bool = row.try_get("more_work")?;
-        ensure!(
-            greater || same,
-            "local node is behind the cluster's cumulative chainwork"
-        );
+        if !greater && !same {
+            return Err(ChainObservationBehind.into());
+        }
         let mut revision: i64 = row.try_get("payout_revision")?;
         let accepted_tip: Option<String> = row.try_get("best_tip_hash")?;
         let same_tip = accepted_tip.as_deref() == Some(&tip);
