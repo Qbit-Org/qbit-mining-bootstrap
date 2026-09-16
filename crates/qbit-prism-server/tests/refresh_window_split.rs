@@ -444,6 +444,21 @@ async fn cancelled_reservation_retains_bounded_cache_without_holding_build_admis
                 "cancelled refresh published its replacement"
             );
             drop(all);
+            // Aborting a SQLx transaction queues rollback on its connection.
+            // Cycle every checkout before marking the next refresh, so a late
+            // cleanup response cannot be mistaken for that refresh's SQL.
+            let drained = timeout(Duration::from_secs(5), async {
+                let mut checkouts = Vec::new();
+                for _ in 0..f.a.config.database_connections {
+                    let mut connection = f.pool().acquire().await?;
+                    sqlx::query("SELECT 1").execute(&mut *connection).await?;
+                    checkouts.push(connection);
+                }
+                Ok::<_, anyhow::Error>(checkouts)
+            })
+            .await
+            .context("cancelled checkout did not finish cleanup")??;
+            drop(drained);
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
             ensure!(
