@@ -211,9 +211,9 @@ added it; on a pre-#258 source 006 adds it, so it is reserved), stays
 governed by the release checks.
 
 Migration 016 reserves a family of names rather than a list. The partitions of
-the share ledger are named `qbit_share_ledger_p<k>` for grid cell k, and their
+the share ledger are named `qbit_share_ledger_p<n>` in creation order, and their
 indexes take that name as a prefix, so any relation in the ledger's schema
-matching `qbit_share_ledger_p<k>` or `qbit_share_ledger_p<k>_<suffix>` is
+matching `qbit_share_ledger_p<n>` or `qbit_share_ledger_p<n>_<suffix>` is
 refused before the conversion takes its first step, whatever kind of relation
 it is. The names the swap itself takes are `qbit_share_ledger_p0` for the
 converted release table and `qbit_share_ledger_p0_pkey`,

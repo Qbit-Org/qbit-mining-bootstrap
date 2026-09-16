@@ -88,9 +88,13 @@ bounds, the archive location, the digests and the timestamps of each step.
 - **A grid of cells.** Partition width is `partition_rows` in
   `qbit_prism_share_partitioning` (default 2^24 = 16,777,216 rows; about
   7.5 GB of heap and 20 GB of indexes at the production row shape, five
-  days at 39 shares/s, nine hours at 500 shares/s). Cell k covers
-  `[k*rows, (k+1)*rows)` and is `qbit_share_ledger_p<k>`. Changing the
-  width affects partitions created afterwards. The release table becomes
+  days at 39 shares/s, nine hours at 500 shares/s). Each new partition is
+  one width wide and starts where the highest attached one ends, so with
+  the width unchanged cell k covers `[k*rows, (k+1)*rows)`. Names are
+  `qbit_share_ledger_p<n>`, n from a counter over every name the catalog
+  has recorded (`qbit_prism_share_partition_next_number()`), so a name is
+  never reused and never depends on the width. Changing the width affects
+  partitions created afterwards. The release table becomes
   `qbit_share_ledger_p0`, `[MINVALUE, bound)`, spanning as many cells as
   it needs.
 - **Lead partitions.** `qbit_prism_share_partition_ensure()` keeps

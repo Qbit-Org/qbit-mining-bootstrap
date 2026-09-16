@@ -713,3 +713,95 @@ async fn partition_ensure_restores_the_lead_and_creates_nothing_when_it_is_intac
     db.close().await?;
     result
 }
+
+/// `partition_rows` is documented as changeable after the conversion. The
+/// next partition always starts where the last attached one ends, so the
+/// bounds stay contiguous whatever the width; its name comes from the
+/// catalog's counter, never from the bound divided by the width, which after
+/// a change maps back onto a name that is already taken.
+#[tokio::test]
+async fn changing_the_partition_width_keeps_names_unique_and_bounds_contiguous() -> Result<()> {
+    let Some(db) = Database::open("width").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let width = db.partition_rows().await?;
+        let start = db.attached().await?;
+        ensure!(start.len() == 5, "unexpected attached set: {start:?}");
+        let covered: i64 = sqlx::query_scalar(
+            "SELECT max(upper_seq) FROM qbit_prism_share_partitions WHERE state='attached'",
+        )
+        .fetch_one(db.pool())
+        .await?;
+        ensure!(
+            covered == 5 * width,
+            "the conversion did not leave five cells of width {width}: covered {covered}"
+        );
+        // Doubling the width makes the next bound, 5 widths, the second
+        // cell of the new grid: 5W / 2W = 2, and qbit_share_ledger_p2 is
+        // attached. The lead of four new-width partitions above a sequence
+        // still at 1 is 8W, so two partitions are created above 5W.
+        sqlx::query(
+            "UPDATE qbit_prism_share_partitioning SET partition_rows=partition_rows*2,updated_at=clock_timestamp() WHERE singleton",
+        )
+        .execute(db.pool())
+        .await?;
+        let next: i64 = sqlx::query_scalar("SELECT qbit_prism_share_partition_next_number()")
+            .fetch_one(db.pool())
+            .await?;
+        ensure!(next == 5, "the name counter reads {next} over p0..p4");
+        ensure!(
+            partitions::ensure(db.pool()).await? == 2,
+            "ensure did not create the two partitions the wider lead needs"
+        );
+        let mut expected = start.clone();
+        expected.push("qbit_share_ledger_p5".to_owned());
+        expected.push("qbit_share_ledger_p6".to_owned());
+        ensure!(
+            db.attached().await? == expected && db.cataloged().await? == expected,
+            "the wider partitions were not named past the existing ones: {:?}",
+            db.attached().await?
+        );
+        let bounds: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT partition_name,lower_seq,upper_seq FROM qbit_prism_share_partitions WHERE state='attached' ORDER BY upper_seq",
+        )
+        .fetch_all(db.pool())
+        .await?;
+        for pair in bounds.windows(2) {
+            ensure!(
+                pair[1].1 == Some(pair[0].2),
+                "a gap or an overlap between {} ending at {} and {} starting at {:?}",
+                pair[0].0,
+                pair[0].2,
+                pair[1].0,
+                pair[1].1
+            );
+        }
+        ensure!(
+            bounds[5] == ("qbit_share_ledger_p5".to_owned(), Some(5 * width), 7 * width)
+                && bounds[6] == ("qbit_share_ledger_p6".to_owned(), Some(7 * width), 9 * width),
+            "the new partitions are not two double-width cells above the old grid: {bounds:?}"
+        );
+        ensure!(
+            partitions::ensure(db.pool()).await? == 0,
+            "ensure is not idempotent after the width change"
+        );
+        // The parent routes an append past the old grid into the wider cell.
+        db.set_next_seq(5 * width + 1).await?;
+        let landed = db.ledger.append(share(1, "alice"), None).await?;
+        let leaf: String = sqlx::query_scalar(
+            "SELECT tableoid::regclass::text FROM qbit_share_ledger WHERE share_seq=$1",
+        )
+        .bind(i64::try_from(landed.share.share_seq)?)
+        .fetch_one(db.pool())
+        .await?;
+        ensure!(
+            leaf == "qbit_share_ledger_p5",
+            "the share past the old grid landed in {leaf}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    db.close().await?;
+    result
+}

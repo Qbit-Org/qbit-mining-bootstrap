@@ -49,7 +49,9 @@ CREATE TABLE qbit_prism_share_partitioning (
     -- Rows per partition. 2^24 rows is about 7.5 GB of heap plus about
     -- 20 GB of indexes at the production row shape, five days at 39
     -- shares/s and nine hours at 500 shares/s. Changing it affects
-    -- partitions created afterwards only; bounds already attached stay.
+    -- partitions created afterwards only: bounds already attached stay,
+    -- the next partition starts where the last one ends, and names come
+    -- from a counter in the catalog, never from the width.
     partition_rows bigint NOT NULL DEFAULT 16777216
         CHECK (partition_rows >= 1048576 AND partition_rows <= 1073741824),
     -- Empty partitions kept attached ahead of the sequence.
@@ -202,14 +204,29 @@ BEGIN
 END;
 $$;
 
+-- The number the next partition is named with: one above the highest
+-- qbit_share_ledger_p<n> the catalog has ever recorded, in any state. A
+-- name is never reused, so a partition that was detached and dropped keeps
+-- its name reserved for its archive, and the names stay in bound order
+-- however partition_rows changes over time. Deriving the number from the
+-- bound divided by the width would map a bound back onto an existing name
+-- as soon as the width changed.
+CREATE FUNCTION qbit_prism_share_partition_next_number()
+RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT COALESCE(max(substring(partition_name FROM '^qbit_share_ledger_p(\d+)$')::bigint), -1) + 1
+    FROM qbit_prism_share_partitions;
+$$;
+
 -- Keep lead_partitions partitions attached above the next share_seq.
 -- Returns how many were created. Serialized per schema with the online
 -- migration runner's lock class, so two frontends never race on one name
 -- and no partition is created while a conversion swaps the table. Before
--- the conversion it does nothing. Partitions are grid cells of
--- partition_rows: cell k is [k*rows, (k+1)*rows) and is named
--- qbit_share_ledger_p<k>; the release table converted by 016 is
--- qbit_share_ledger_p0 whatever its upper bound.
+-- the conversion it does nothing. Each new partition is partition_rows
+-- wide and starts at the highest attached upper bound, so the bounds are
+-- contiguous; with the width never changed they are the grid cells
+-- [k*rows, (k+1)*rows). Names are qbit_share_ledger_p<n> with n from
+-- qbit_prism_share_partition_next_number(); the release table converted by
+-- 016 is qbit_share_ledger_p0 whatever its upper bound.
 CREATE FUNCTION qbit_prism_share_partition_ensure()
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE
@@ -231,7 +248,7 @@ BEGIN
     target := qbit_prism_share_next_seq() + settings.lead_partitions * settings.partition_rows;
     WHILE covered < target LOOP
         PERFORM qbit_prism_share_partition_create(
-            'qbit_share_ledger_p' || (covered / settings.partition_rows),
+            'qbit_share_ledger_p' || qbit_prism_share_partition_next_number(),
             covered,
             covered + settings.partition_rows
         );

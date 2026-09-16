@@ -881,14 +881,19 @@ read already carries, a `bigserial` routing key cannot fail, and
 partition: a missing partition would otherwise silently collect rows that a
 later ATTACH would have to move.
 
-Partitions are cells of a fixed grid. Cell k covers `[k*rows, (k+1)*rows)` and
-is named `qbit_share_ledger_p<k>`, where `rows` is `partition_rows` in
+Partitions are cells of a grid. Each new one is `partition_rows` wide and
+starts where the highest attached one ends, so with the width unchanged cell k
+covers `[k*rows, (k+1)*rows)`; `rows` is `partition_rows` in
 `qbit_prism_share_partitioning`. The default is 2^24 = 16,777,216 rows, about
 7.5 GB of heap plus about 20 GB of indexes at the production row shape, five
-days at 39 shares per second and nine hours at 500. Changing the width affects
-partitions created afterwards only; bounds already attached stay as they are.
-The release table becomes `qbit_share_ledger_p0`, `[MINVALUE, bound)`, and
-spans as many cells as it needs.
+days at 39 shares per second and nine hours at 500. Names are
+`qbit_share_ledger_p<n>`, n one above the highest number the catalog has ever
+recorded in any state (`qbit_prism_share_partition_next_number()`): a name is
+never reused, and never derived from the width. Changing the width affects
+partitions created afterwards only; bounds already attached stay as they are,
+and the next partition starts at the last bound with the new width. The
+release table becomes `qbit_share_ledger_p0`, `[MINVALUE, bound)`, and spans
+as many cells as it needs.
 
 Two catalog tables record the settings and what happened to each partition.
 PostgreSQL's `pg_inherits` remains the authority on what is attached and with
