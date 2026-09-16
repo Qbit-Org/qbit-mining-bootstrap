@@ -1025,6 +1025,10 @@ struct FakeStratum {
     address: String,
     release_authorize: tokio::sync::watch::Sender<bool>,
     release_submits: tokio::sync::watch::Sender<bool>,
+    /// Set to close every served connection where it stands, so a test can
+    /// end a socket at a moment of its choosing rather than by dropping the
+    /// server: a peer that goes away mid-conversation.
+    close_sockets: tokio::sync::watch::Sender<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
     /// How many of the next accepted connections are closed at once, before
     /// a line is read: a frontend that is up but not yet serving.
@@ -1053,6 +1057,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     let address = listener.local_addr().unwrap().to_string();
     let (release_authorize, release) = tokio::sync::watch::channel(!options.hold_authorize);
     let (release_submits, submit_release) = tokio::sync::watch::channel(!options.hold_submits);
+    let (close_sockets, close) = tokio::sync::watch::channel(false);
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = submits.clone();
     let drop_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1073,19 +1078,35 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
                 drop(socket);
                 continue;
             }
-            tokio::spawn(serve_stratum(
+            let serving = serve_stratum(
                 socket,
                 release.clone(),
                 submit_release.clone(),
                 counter.clone(),
                 options.advertised_difficulty,
-            ));
+            );
+            // Cancelling `serve_stratum` drops the socket it owns, so the
+            // peer sees the connection end wherever this task had got to.
+            let mut closing = close.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = serving => {}
+                    () = async move {
+                        while !*closing.borrow() {
+                            if closing.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    } => {}
+                }
+            });
         }
     });
     FakeStratum {
         address,
         release_authorize,
         release_submits,
+        close_sockets,
         submits,
         drop_connections,
         _task: task,
@@ -1213,6 +1234,7 @@ async fn quiesced_submit(
         phase: std::sync::RwLock::new("reconnect".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let config = client::SessionConfig {
         quiesce_limit,
@@ -1277,6 +1299,7 @@ async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -
         phase: std::sync::RwLock::new("reconnect".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let handle = client::spawn_session(session_config(0), 0, server.address.clone(), shared, 1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1364,6 +1387,7 @@ async fn a_disconnected_session_flushes_its_census_through_the_collector() -> Re
         phase: std::sync::RwLock::new("mid_flight_kill".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let handle = client::spawn_session(session_config(0), 0, "127.0.0.1:1".into(), shared, 1);
     assert!(handle.try_offer(1, &Arc::from("mid_flight_kill")));
@@ -1409,6 +1433,7 @@ async fn work_that_reaches_a_disconnected_session_is_reported_not_dropped() -> R
         phase: std::sync::RwLock::new("mid_flight_kill".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     // Nothing listens on port 1, so the session never holds a connection.
     let handle = client::spawn_session(session_config(3), 1, "127.0.0.1:1".into(), shared, 1);
@@ -1534,6 +1559,7 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
         phase: std::sync::RwLock::new("steady_state".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1610,6 +1636,7 @@ async fn a_reconnect_is_attributed_to_the_phase_that_asked_for_it() -> Result<()
         phase: std::sync::RwLock::new("reconnect".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1693,6 +1720,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         phase: std::sync::RwLock::new("setup".to_owned()),
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1961,6 +1989,209 @@ async fn a_replication_mode_other_than_the_declared_one_refuses_qualification() 
     };
     assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
     Ok(())
+}
+
+/// `detect_replication` recognized only `sync` as synchronous. An external
+/// cluster with `synchronous_standby_names = 'ANY n (...)'` reports its
+/// candidates as `quorum`, which fell through to `async`: a correct
+/// `--replication sync` run was refused at the premise check, and a
+/// `--replication async` declaration agreed with the wrong observation. The
+/// classification is now a pure function over the `sync_state` column, and
+/// PostgreSQL 16's four values, null and no rows each have a decided answer.
+#[test]
+fn quorum_and_mixed_standby_rows_classify_as_the_replication_postgres_applies() {
+    use qbit_prism_load::cluster::{classify_replication, ObservedReplication, Replication};
+    fn rows(states: &[Option<&str>]) -> Vec<Option<String>> {
+        states
+            .iter()
+            .map(|state| state.map(str::to_owned))
+            .collect()
+    }
+    let sync = ObservedReplication::Observed {
+        mode: Replication::Sync,
+    };
+    let asynchronous = ObservedReplication::Observed {
+        mode: Replication::Async,
+    };
+    let none = ObservedReplication::Observed {
+        mode: Replication::None,
+    };
+
+    // Quorum-only: what an `ANY 1 (...)` primary shows for its one standby.
+    assert_eq!(classify_replication(&rows(&[Some("quorum")])), sync);
+    // Mixed rows use `any` semantics, as PostgreSQL does: a commit waits on
+    // the quorum candidate, and an extra asynchronous standby does not make
+    // the cluster asynchronous.
+    assert_eq!(
+        classify_replication(&rows(&[Some("quorum"), Some("async")])),
+        sync
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("async"), Some("quorum")])),
+        sync
+    );
+    // The existing `sync` behaviour is unchanged, alone and mixed.
+    assert_eq!(classify_replication(&rows(&[Some("sync")])), sync);
+    assert_eq!(
+        classify_replication(&rows(&[Some("sync"), Some("async")])),
+        sync
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential"), Some("sync")])),
+        sync
+    );
+    // `potential` is not synchronous: under `FIRST n` it is a standby that
+    // would be promoted if a member left, and no commit waits on it.
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential")])),
+        asynchronous
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential"), Some("async")])),
+        asynchronous
+    );
+    assert_eq!(classify_replication(&rows(&[Some("async")])), asynchronous);
+    // No rows is no standby.
+    assert_eq!(classify_replication(&[]), none);
+    // A null state is a role that cannot see the column: unknown, with the
+    // reason, whatever else is visible. The arm runs before the synchronous
+    // one, so a quorum row beside a hidden one is still unknown.
+    for (label, states) in [
+        ("all null", rows(&[None])),
+        ("two nulls", rows(&[None, None])),
+        ("quorum beside null", rows(&[Some("quorum"), None])),
+        ("null beside quorum", rows(&[None, Some("quorum")])),
+        ("sync beside null", rows(&[Some("sync"), None])),
+    ] {
+        let observed = classify_replication(&states);
+        let ObservedReplication::Unknown { reason } = &observed else {
+            panic!("{label} is unknown, not a mode: {observed:?}");
+        };
+        assert!(
+            reason.contains(&format!("{} pg_stat_replication row(s)", states.len())),
+            "{label}: {reason}"
+        );
+        assert!(reason.contains("pg_read_all_stats"), "{label}: {reason}");
+        assert_eq!(observed.as_str(), "unknown");
+        assert_ne!(observed, none, "{label}: unknown is not none");
+        assert_ne!(observed, asynchronous, "{label}: unknown is not async");
+    }
+}
+
+/// A quorum observation is a synchronous one at both premise checks: it
+/// agrees with `--replication sync` at entry and after the load, and it
+/// contradicts `--replication async` at both, through the same block and
+/// the same exit 8 as every other contradicted premise.
+#[test]
+fn a_quorum_observation_agrees_with_sync_and_contradicts_async_at_both_checks() {
+    use qbit_prism_load::artifact::Withhold;
+    use qbit_prism_load::cluster::{classify_replication, ObservedReplication, Replication};
+    use qbit_prism_load::run::{premise_block, withhold_decision, ReplicationPremise, RunOutcome};
+
+    // The observation is whatever the classifier makes of a quorum row, not
+    // a hand-built `Sync`: the premise checks see exactly this.
+    let quorum = classify_replication(&[Some("quorum".to_owned())]);
+    assert_eq!(
+        quorum,
+        ObservedReplication::Observed {
+            mode: Replication::Sync
+        }
+    );
+    assert_eq!(quorum.as_str(), "sync");
+    assert_eq!(quorum.reason(), None);
+
+    // Declared sync: agreement at entry alone, and at both checks.
+    let sync_at_entry = ReplicationPremise {
+        declared: Replication::Sync,
+        at_entry: quorum.clone(),
+        after_load: None,
+    };
+    assert_eq!(sync_at_entry.contradiction(), None);
+    assert!(sync_at_entry.agreed());
+    let sync_both = ReplicationPremise {
+        after_load: Some(quorum.clone()),
+        ..sync_at_entry.clone()
+    };
+    assert_eq!(sync_both.contradiction(), None);
+    assert!(sync_both.agreed());
+    let agreed = premise_block(None, &[], &sync_both);
+    assert_eq!(agreed["replication_agreed"], json!(true));
+    assert_eq!(agreed["contradicted"], json!(false));
+    assert_eq!(agreed["replication"]["declared"], json!("sync"));
+    assert_eq!(agreed["replication"]["observed_at_entry"], json!("sync"));
+    assert_eq!(agreed["replication"]["observed_after_load"], json!("sync"));
+    assert_eq!(agreed["replication"]["checked_after_load"], json!(true));
+    assert_eq!(agreed["replication"]["agreed"], json!(true));
+    assert_eq!(withhold_decision(None, None, None), None);
+
+    // Declared async: contradicted at entry, before any frontend runs.
+    let async_at_entry = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: quorum.clone(),
+        after_load: None,
+    };
+    let entry_reason = async_at_entry
+        .contradiction()
+        .expect("a quorum standby contradicts a declared asynchronous one at entry");
+    assert!(
+        entry_reason.contains("declared replication async"),
+        "{entry_reason}"
+    );
+    assert!(entry_reason.contains("observed sync"), "{entry_reason}");
+    assert!(entry_reason.contains("at entry"), "{entry_reason}");
+    assert!(!entry_reason.contains("after the load"), "{entry_reason}");
+    assert!(!async_at_entry.agreed());
+
+    // Declared async, agreed at entry only because the observation was made
+    // late: contradicted after the load.
+    let async_after_load = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: ObservedReplication::Observed {
+            mode: Replication::Async,
+        },
+        after_load: Some(quorum.clone()),
+    };
+    let late_reason = async_after_load
+        .contradiction()
+        .expect("a quorum standby contradicts a declared asynchronous one after the load");
+    assert!(late_reason.contains("observed sync"), "{late_reason}");
+    assert!(late_reason.contains("after the load"), "{late_reason}");
+    assert!(!late_reason.contains("at entry"), "{late_reason}");
+
+    // Both checks contradicted name both positions.
+    let async_both = ReplicationPremise {
+        after_load: Some(quorum.clone()),
+        ..async_at_entry.clone()
+    };
+    let both_reason = async_both.contradiction().expect("contradicted twice");
+    assert!(both_reason.contains("at entry"), "{both_reason}");
+    assert!(both_reason.contains("after the load"), "{both_reason}");
+
+    // The contradiction reaches the premise block and the exit-8 path.
+    let block = premise_block(Some(&both_reason), &[], &async_both);
+    assert_eq!(block["contradicted"], json!(true));
+    assert_eq!(block["replication_agreed"], json!(false));
+    assert_eq!(block["share_difficulty_agreed"], json!(true));
+    assert_eq!(block["replication"]["declared"], json!("async"));
+    assert_eq!(block["replication"]["observed_at_entry"], json!("sync"));
+    assert_eq!(block["replication"]["observed_after_load"], json!("sync"));
+    assert_eq!(block["replication"]["agreed"], json!(false));
+    let withheld = withhold_decision(None, Some(&entry_reason), None).expect("withheld");
+    assert_eq!(
+        withheld,
+        Withhold::PremiseContradicted(entry_reason.clone())
+    );
+    let outcome = RunOutcome {
+        withhold: Some(&withheld),
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: 0,
+        no_response_commits_mid_run: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
+    assert_ne!(outcome.exit_code(), run::EXIT_OK);
 }
 
 // --- server revision evidence --------------------------------------------
@@ -2961,6 +3192,7 @@ fn submit_record(
         outcome,
         scheduled_block: false,
         reoffer: false,
+        fence: 0,
         header_hex: String::new(),
         extranonce2_hex: String::new(),
         ntime_hex: String::new(),
@@ -2972,12 +3204,19 @@ fn submit_record(
 /// kill, whichever frontend's session produced it. A session on the other
 /// frontend whose socket closed in the same few seconds was counted as one
 /// of the kill's indeterminate shares and re-offered as such. The census is
-/// now the killed frontend's own sessions, since the kill.
+/// now the killed frontend's own sessions, at or after the kill's fence.
+///
+/// Membership is the record's own fence, not its position in the log: the
+/// boundary used to be the log's length at the kill, so a pre-kill record
+/// that reached the collector late landed in the suffix and was read as the
+/// kill's. Here the pre-kill record is deliberately placed *last*, after
+/// every post-kill one, and must still be outside the census.
 #[test]
 fn the_mid_flight_census_is_the_killed_frontend_s_own_no_responses() {
     use qbit_prism_load::client::Outcome;
     use qbit_prism_load::run::indeterminate_after_kill;
-    let no_response = |frontend: usize, share: &str| {
+    const FENCE_AT_KILL: u64 = 1;
+    let no_response = |frontend: usize, share: &str, fence: u64| {
         let mut record = submit_record(
             "mid_flight_kill",
             Outcome::NoResponse {
@@ -2985,35 +3224,42 @@ fn the_mid_flight_census_is_the_killed_frontend_s_own_no_responses() {
             },
         );
         record.frontend = frontend;
+        record.fence = fence;
         record.share_id = format!("pload1abc.s00001:{}", share.repeat(64));
         record
     };
     let mut accepted_after = submit_record("mid_flight_kill", Outcome::Accepted);
     accepted_after.frontend = 1;
-    let mut reoffer = no_response(1, "4");
+    accepted_after.fence = FENCE_AT_KILL;
+    let mut reoffer = no_response(1, "4", FENCE_AT_KILL);
     reoffer.reoffer = true;
     let records = vec![
-        // Before the kill: not in the window however it ended.
-        no_response(1, "0"),
-        // Since the kill: the killed frontend's victim, another frontend's
-        // own closed socket, an answered submit, and a re-offer.
-        no_response(1, "1"),
-        no_response(0, "2"),
+        // At or after the kill: the killed frontend's victim, another
+        // frontend's own closed socket, an answered submit, and a re-offer.
+        no_response(1, "1", FENCE_AT_KILL),
+        no_response(0, "2", FENCE_AT_KILL),
         accepted_after,
         reoffer,
+        // Built before the kill, applied after all of those: not the kill's
+        // however late it arrived.
+        no_response(1, "0", FENCE_AT_KILL - 1),
     ];
-    let census = indeterminate_after_kill(&records, 1, 1);
+    let census = indeterminate_after_kill(&records, FENCE_AT_KILL, 1);
     assert_eq!(
         census
             .iter()
             .map(|record| record.share_id.as_str())
             .collect::<Vec<_>>(),
         vec![format!("pload1abc.s00001:{}", "1".repeat(64)).as_str()],
-        "one victim: frontend 1's no-response since the kill, and nothing from frontend 0"
+        "one victim: frontend 1's no-response at the kill's fence, nothing from frontend 0,          and not the late-arriving pre-kill record"
     );
     assert!(
         indeterminate_after_kill(&records, 10, 1).is_empty(),
-        "a since past the end is an empty window, not a panic"
+        "a fence above every record's is an empty census, not a panic"
+    );
+    assert!(
+        indeterminate_after_kill(&[], FENCE_AT_KILL, 1).is_empty(),
+        "and an empty log is an empty census"
     );
 }
 
@@ -5209,7 +5455,7 @@ async fn a_drained_restart_never_stalls_the_scheduler() -> Result<()> {
 async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     use qbit_prism_load::client::Outcome;
     use qbit_prism_load::kill::{KillDriver, RELAUNCH_DELAY};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     let dir = ScratchDir::new("kill");
@@ -5226,9 +5472,13 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     // One submit was already recorded before the kill began; it is not the
     // kill's, whatever its outcome.
     let collected = Arc::new(Mutex::new(run::Collected::default()));
+    // The run's fence, as the sessions would read it: this record is built
+    // before the kill, so it carries the pre-kill value.
+    let kill_fence = Arc::new(AtomicU64::new(0));
     let earlier = client::SubmitRecord {
         session: 1,
         frontend: 1,
+        fence: kill_fence.load(Ordering::SeqCst),
         ..submit_record(
             "mid_flight_kill",
             Outcome::NoResponse {
@@ -5245,7 +5495,7 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
         1,
         Duration::from_secs(20),
         Duration::from_secs(10),
-        &collected,
+        kill_fence.clone(),
     );
     let started = Instant::now();
     let mut longest_poll = Duration::ZERO;
@@ -5289,6 +5539,7 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
                 share_id: "pload1abc.s00001:lost".into(),
                 session: 1,
                 frontend: 1,
+                fence: kill_fence.load(Ordering::SeqCst),
                 ..submit_record(
                     "mid_flight_kill",
                     Outcome::NoResponse {
@@ -5300,6 +5551,7 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
                 share_id: "pload1abc.s00000:other".into(),
                 session: 0,
                 frontend: 0,
+                fence: kill_fence.load(Ordering::SeqCst),
                 ..submit_record(
                     "mid_flight_kill",
                     Outcome::NoResponse {
@@ -5392,6 +5644,981 @@ async fn a_mid_flight_kill_never_stalls_the_scheduler() -> Result<()> {
     Ok(())
 }
 
+/// A no-response the victim's own session emitted *before* the kill, held
+/// behind a slow collector and applied to `Collected` after it, is not the
+/// kill's.
+///
+/// The census boundary used to be the submit log's length at the kill, so a
+/// record built before the kill but applied after it landed in the suffix
+/// and was counted as kill-induced. Pausing the session does not help: the
+/// event is already in flight when the pause is sent, and the kill's own
+/// post-kill barriers are what flush it. `classify_gaps` then exempted that
+/// share from the ordinary mid-run no-response check, so an unrelated
+/// disconnect on a share PostgreSQL holds stopped producing exit 5 -- a
+/// false negative in harness attribution (EP-STATE, EP-OBSERVABILITY).
+///
+/// Membership is now the record's own identity: the fence its session read
+/// as it built the record, against the fence the driver published at the
+/// kill. Delivery lag cannot move a record across that boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_no_response_queued_before_the_kill_stays_out_of_the_census_and_still_exits_5(
+) -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use qbit_prism_load::run::{classify_gaps, offered_and_acknowledged, RunOutcome};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const STRANDED: &str = "pload1abc.s00001:stranded-before-the-kill";
+    const LOST: &str = "pload1abc.s00001:lost-to-the-kill";
+    let closed = || Outcome::NoResponse {
+        reason: "socket closed: end of stream".into(),
+    };
+
+    let dir = ScratchDir::new("kill-fence");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let (_healthy, mut healthy_control) = detached_session(0, 0, 1);
+    let (victim, mut victim_control) = detached_session(1, 1, 2);
+    let sessions = vec![_healthy, victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let kill_fence = Arc::new(AtomicU64::new(0));
+
+    // Built in the session thread before the kill, and then held: the
+    // collector is behind, so `Collected` has not seen it when the kill lands.
+    let stranded = client::SubmitRecord {
+        share_id: STRANDED.into(),
+        session: 1,
+        frontend: 1,
+        fence: kill_fence.load(Ordering::SeqCst),
+        ..submit_record("mid_flight_kill", closed())
+    };
+    assert_eq!(
+        stranded.fence, 0,
+        "the record carries the fence that was current when it was built"
+    );
+
+    let mut driver = KillDriver::start(
+        1,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    let started = Instant::now();
+    let mut lost: Option<client::SubmitRecord> = None;
+    let mut released = false;
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::Pause => {}
+                // The collector acknowledges a barrier after applying this
+                // session's prior events; everything queued is applied by now.
+                client::Control::CensusBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        let fence_now = kill_fence.load(Ordering::SeqCst);
+        if lost.is_none() && fence_now != 0 {
+            // The process is gone: the victim reports the no-response the
+            // kill destroyed the answer to, stamped with the fence the kill
+            // published.
+            let killed = client::SubmitRecord {
+                share_id: LOST.into(),
+                session: 1,
+                frontend: 1,
+                fence: fence_now,
+                ..submit_record("mid_flight_kill", closed())
+            };
+            collected
+                .lock()
+                .unwrap()
+                .apply(client::Event::Submit(Box::new(killed.clone())));
+            lost = Some(killed);
+        } else if lost.is_some() && !released {
+            // Only now does the slow collector catch up with the record built
+            // before the kill. It is applied *after* the kill-induced one --
+            // the ordering a suffix boundary reads backwards.
+            released = true;
+            collected
+                .lock()
+                .unwrap()
+                .apply(client::Event::Submit(Box::new(stranded.clone())));
+            sessions[1].outstanding.store(0, Ordering::Relaxed);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+
+    let log: Vec<String> = collected
+        .lock()
+        .unwrap()
+        .submits
+        .iter()
+        .map(|record| record.share_id.clone())
+        .collect();
+    assert_eq!(
+        log,
+        vec![LOST.to_owned(), STRANDED.to_owned()],
+        "the pre-kill record really was applied last, inside the window a length-based \
+         boundary would have claimed"
+    );
+    let census: Vec<&str> = record
+        .indeterminate
+        .iter()
+        .map(|record| record.share_id.as_str())
+        .collect();
+    assert_eq!(
+        census,
+        vec![LOST],
+        "the census is the share the kill destroyed the answer to, and not the one the \
+         session had already given up on"
+    );
+    assert_eq!(record.index, 1);
+    assert_eq!(
+        record.outstanding_at_kill, 2,
+        "the victim held work when it was killed"
+    );
+    // And the re-offers follow the census, so the stranded share is not
+    // re-offered as one of the kill's either.
+    match victim_control.try_recv() {
+        Ok(client::Control::Retarget { frontend: 1, .. }) => {}
+        other => panic!("the victim is retargeted once the relaunch answers: {other:?}"),
+    }
+    match victim_control.try_recv() {
+        Ok(client::Control::Reoffer { share_id, .. }) => assert_eq!(share_id, LOST),
+        other => panic!("then sent the re-offer for its lost share: {other:?}"),
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "the stranded share is not re-offered as one of the kill's"
+    );
+    assert!(healthy_control.try_recv().is_err());
+
+    // Through the whole classification, with PostgreSQL holding both shares.
+    // The kill's own is its census's business; the stranded one is an
+    // ordinary mid-run no-response on a committed share, and the run must
+    // still say so.
+    let lost = lost.expect("the kill produced a no-response");
+    let submits = vec![lost, stranded];
+    let (offered, acknowledged) = offered_and_acknowledged(&submits, "mid_flight_kill");
+    let committed: BTreeSet<String> = offered.clone();
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution = digest::attribute_unexpected(
+        &committed,
+        &[("mid_flight_kill".to_owned(), &reconciliation)],
+    );
+    let gaps = classify_gaps(
+        &[driven("mid_flight_kill", &census)],
+        &[("mid_flight_kill".to_owned(), reconciliation)],
+        &attribution,
+        &submits,
+        15.0,
+    );
+    assert_eq!(gaps.findings, json!([]), "nothing was lost: {gaps:?}");
+    assert_eq!(
+        gaps.no_response_commits
+            .iter()
+            .map(|share| share["share_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(STRANDED)],
+        "the kill explains its own share and no other: {gaps:?}"
+    );
+    assert_eq!(gaps.no_response_commits[0]["window_ended"], json!(false));
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: gaps.findings.as_array().map(Vec::len).unwrap_or(0),
+        harness_bug_rejections: 0,
+        divergences: gaps.divergences.len(),
+        unknown_outcome_commits: gaps.unknown_outcome_commits.len(),
+        no_response_commits: gaps.no_response_commits.len(),
+        no_response_commits_mid_run: gaps
+            .no_response_commits
+            .iter()
+            .filter(|share| share["window_ended"] != json!(true))
+            .count(),
+    };
+    assert_eq!(
+        outcome.exit_code(),
+        run::EXIT_ACK_COMMIT_DIVERGENCE,
+        "an unrelated mid-run disconnect on a committed share still exits 5"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The fence closed the gap between a session *emitting* a record and the
+/// collector *applying* it. It did not close the gap between a session
+/// *observing* the cause and *building* the records, and on the socket-closure
+/// path those are two different moments with a kill able to land between them.
+///
+/// The reader task queues `Incoming::Closed` the instant the socket ends.
+/// `outstanding` is still non-zero -- nothing has failed the pending submits
+/// yet -- so a `KillDriver` polling just then sees work in flight, pauses the
+/// session and bumps the fence. The session's `select!` is biased on control,
+/// so it takes that pause first and only reaches the queued closure on the
+/// next pass; `fail_pending` read `shared.fence()` there, which by then is the
+/// kill's value. A disconnect that happened *before* the kill, for its own
+/// unrelated reason, therefore came out stamped as kill-induced: the census
+/// re-offered it and `classify_gaps` exempted it from the ordinary mid-run
+/// no-response check, so a share PostgreSQL holds could evade the
+/// acknowledgement-loss check and the run exit 0. That is the one outcome this
+/// harness exists to prevent.
+///
+/// So the fence is read in the reader, at the instant the socket ends, and
+/// carried on the value all the way to the records (EP-STATE,
+/// EP-OBSERVABILITY). This drives the real ordering through a real session on
+/// a real socket: the closure is observed and queued, the pause and the bump
+/// land while it is still queued, and `fail_pending` runs only afterwards.
+///
+/// The gate is a write guard held across an await, which is exactly what
+/// `clippy::await_holding_lock` warns about and exactly what this test is
+/// for: the lock is the interleaving, and the thread it parks is the
+/// session's own, not one this test needs.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_socket_closed_before_the_kill_is_not_stamped_as_kill_induced() -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use qbit_prism_load::run::{classify_gaps, offered_and_acknowledged, RunOutcome};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const PHASE: &str = "mid_flight_kill";
+
+    // A real session on a real socket, with one submit the server is holding.
+    let server = fake_stratum_with(StratumOptions {
+        hold_submits: true,
+        ..Default::default()
+    })
+    .await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new(PHASE.to_owned()),
+        events,
+        record_notifies: AtomicBool::new(false),
+        kill_fence: kill_fence.clone(),
+    });
+    // The session gets its own single-threaded runtime on its own thread. The
+    // gate below parks the session task on a `std` lock, and a parked thread
+    // must not be one this test's own timers and sockets are driven by: a
+    // blocked tokio worker starves the runtime it belongs to. On a thread of
+    // its own the block is total and harmless -- the reader has already
+    // delivered, and the session has nothing else to do until the gate lifts.
+    // The thread parks for the rest of the process rather than shutting the
+    // runtime down, which would abort the session mid-test.
+    let (session_ready, session_handle) = std::sync::mpsc::channel();
+    let session_shared = shared.clone();
+    let session_address = server.address.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the session's runtime")
+            .block_on(async move {
+                let handle =
+                    client::spawn_session(session_config(0), 0, session_address, session_shared, 1);
+                let _ = session_ready.send(handle);
+                std::future::pending::<()>().await;
+            });
+    });
+    let handle = session_handle.recv().expect("the session task starts");
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session connects within the deadline")
+            .expect("the session is still running");
+        let connected = matches!(event, client::Event::Connected { .. });
+        collected.lock().unwrap().apply(event);
+        if connected {
+            break;
+        }
+    }
+    let phase: Arc<str> = Arc::from(PHASE);
+    assert!(handle.try_offer(1, &phase), "the session takes one share");
+    submits_received(&server, 1).await;
+    assert_eq!(
+        handle.outstanding.load(Ordering::Relaxed),
+        1,
+        "the submit is in flight and unanswered"
+    );
+
+    // The frontend the kill will take, and the driver that takes it. Nothing
+    // is decided until the first poll.
+    let dir = ScratchDir::new("kill-closure-fence");
+    let stand_in = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![stand_in_frontend(&stand_in, dir.path(), 0, audit_port)];
+    let mut driver = KillDriver::start(
+        0,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    let sessions = vec![handle];
+
+    // Hold the session between observing the closure and building its
+    // records. `run_session` reads `shared.phase()` in that arm, immediately
+    // before `fail_pending`; taking the write lock stops it exactly there, so
+    // the interleaving under test is pinned rather than raced.
+    let gate = shared.phase.write().expect("phase lock");
+    // The socket ends, for its own reason, with no kill anywhere near it.
+    server.close_sockets.send(true)?;
+    // Wait for the reader to pick up a FIN that is already on the wire and
+    // queue its `Incoming::Closed`. This waits for something that has
+    // happened, not for a race to fall our way, and if it were ever too short
+    // the fence assertion below would fail rather than pass silently.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        sessions[0].outstanding.load(Ordering::Relaxed),
+        1,
+        "the closure is still queued: nothing has been failed yet, which is why \
+         the kill about to land still sees work in flight"
+    );
+
+    // The kill lands now: it pauses the session and publishes its fence while
+    // the closure the session already saw is still sitting in the queue.
+    assert!(driver
+        .poll(&sessions, &mut frontends, &[], &collected)?
+        .is_none());
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the kill published its fence"
+    );
+    // Only now does the session get to build the records for the closure it
+    // observed before any of that.
+    drop(gate);
+
+    let started = Instant::now();
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(event) = inbox.try_recv() {
+            collected.lock().unwrap().apply(event);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
+    let submits: Vec<client::SubmitRecord> = collected.lock().unwrap().submits.to_vec();
+    assert_eq!(
+        submits.len(),
+        1,
+        "the run has exactly the one no-response the closure produced: {:?}",
+        submits
+            .iter()
+            .map(|record| (record.share_id.clone(), record.outcome.label()))
+            .collect::<Vec<_>>()
+    );
+    let stranded = &submits[0];
+    match &stranded.outcome {
+        Outcome::NoResponse { reason } => assert!(
+            reason.contains("end of stream"),
+            "the socket ended under the server's own closure: {reason:?}"
+        ),
+        other => panic!("the held submit is a no-response: {other:?}"),
+    }
+    assert_eq!(
+        stranded.fence, 0,
+        "the record carries the fence the reader read when the socket ended, not \
+         the one the kill published while the closure waited in the queue"
+    );
+
+    // So it is not the kill's: not in the census, and not re-offered.
+    assert_eq!(record.index, 0);
+    assert_eq!(
+        record.outstanding_at_kill, 1,
+        "the victim did hold work when it was killed"
+    );
+    let census: Vec<&str> = record
+        .indeterminate
+        .iter()
+        .map(|record| record.share_id.as_str())
+        .collect();
+    assert!(
+        census.is_empty(),
+        "the kill destroyed no answer of its own: {census:?}"
+    );
+    assert!(
+        !submits.iter().any(|record| record.reoffer),
+        "and the share the session had already given up on is never re-offered"
+    );
+
+    // And it still reaches the ordinary acknowledgement-loss path: PostgreSQL
+    // holds the share, the server never acknowledged it, and no census
+    // explains it away, so the run says so.
+    let (offered, acknowledged) = offered_and_acknowledged(&submits, PHASE);
+    let committed: BTreeSet<String> = offered.clone();
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution =
+        digest::attribute_unexpected(&committed, &[(PHASE.to_owned(), &reconciliation)]);
+    let gaps = classify_gaps(
+        &[driven(PHASE, &census)],
+        &[(PHASE.to_owned(), reconciliation)],
+        &attribution,
+        &submits,
+        15.0,
+    );
+    assert_eq!(gaps.findings, json!([]), "nothing was lost: {gaps:?}");
+    assert_eq!(
+        gaps.no_response_commits
+            .iter()
+            .map(|share| share["share_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(stranded.share_id)],
+        "the closure is an ordinary mid-run no-response on a committed share: {gaps:?}"
+    );
+    assert_eq!(gaps.no_response_commits[0]["window_ended"], json!(false));
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: gaps.findings.as_array().map(Vec::len).unwrap_or(0),
+        harness_bug_rejections: 0,
+        divergences: gaps.divergences.len(),
+        unknown_outcome_commits: gaps.unknown_outcome_commits.len(),
+        no_response_commits: gaps.no_response_commits.len(),
+        no_response_commits_mid_run: gaps
+            .no_response_commits
+            .iter()
+            .filter(|share| share["window_ended"] != json!(true))
+            .count(),
+    };
+    assert_eq!(
+        outcome.exit_code(),
+        run::EXIT_ACK_COMMIT_DIVERGENCE,
+        "a disconnect the kill did not cause still exits 5"
+    );
+
+    let _ = sessions[0].control.send(client::Control::Stop);
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The fence narrows the census; it must not narrow it past the shares the
+/// kill actually destroyed. A no-response the victim's session emitted after
+/// the kill is the kill's: it is in the census, it is re-offered, and when
+/// the server acknowledges that re-offer while PostgreSQL does not hold the
+/// share the run still exits 4.
+///
+/// This is why the fence is published immediately *before* the SIGKILL and
+/// not after it: a bump after `kill()` returned would leave a no-response
+/// emitted in between below the fence, out of the census, never re-offered,
+/// and reported as an ordinary transport loss instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_induced_no_response_is_re_offered_and_an_uncommitted_acknowledged_re_offer_exits_4(
+) -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use qbit_prism_load::run::{classify_gaps, offered_and_acknowledged, RunOutcome};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const LOST: &str = "pload1abc.s00001:lost-to-the-kill";
+
+    let dir = ScratchDir::new("kill-reoffer");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![stand_in_frontend(&server, dir.path(), 0, audit_port)];
+    let (victim, mut victim_control) = detached_session(0, 0, 1);
+    let sessions = vec![victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let mut driver = KillDriver::start(
+        0,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    let started = Instant::now();
+    let mut lost: Option<client::SubmitRecord> = None;
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::Pause => {}
+                client::Control::CensusBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        let fence_now = kill_fence.load(Ordering::SeqCst);
+        if lost.is_none() && fence_now != 0 {
+            let killed = client::SubmitRecord {
+                share_id: LOST.into(),
+                session: 0,
+                frontend: 0,
+                fence: fence_now,
+                ..submit_record(
+                    "mid_flight_kill",
+                    Outcome::NoResponse {
+                        reason: "socket closed: end of stream".into(),
+                    },
+                )
+            };
+            collected
+                .lock()
+                .unwrap()
+                .apply(client::Event::Submit(Box::new(killed.clone())));
+            lost = Some(killed);
+            sessions[0].outstanding.store(0, Ordering::Relaxed);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    let lost = lost.expect("the kill produced a no-response");
+    assert_eq!(
+        record
+            .indeterminate
+            .iter()
+            .map(|record| record.share_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![LOST],
+        "a no-response built at or after the kill's fence is the kill's"
+    );
+    match victim_control.try_recv() {
+        Ok(client::Control::Retarget { frontend: 0, .. }) => {}
+        other => panic!("the victim is retargeted once the relaunch answers: {other:?}"),
+    }
+    match victim_control.try_recv() {
+        Ok(client::Control::Reoffer { share_id, .. }) => assert_eq!(
+            share_id, LOST,
+            "a kill-induced no-response stays eligible for re-offer"
+        ),
+        other => panic!("the census is re-offered: {other:?}"),
+    }
+
+    // The server accepts the re-offer and PostgreSQL does not hold the share:
+    // an acknowledged share the database lacks, which is a durability finding
+    // whatever else the phase did.
+    let reoffer = client::SubmitRecord {
+        share_id: LOST.into(),
+        session: 0,
+        frontend: 0,
+        reoffer: true,
+        fence: kill_fence.load(Ordering::SeqCst),
+        ..submit_record("mid_flight_kill", Outcome::Accepted)
+    };
+    let submits = vec![lost, reoffer];
+    let (offered, acknowledged) = offered_and_acknowledged(&submits, "mid_flight_kill");
+    assert!(
+        acknowledged.contains(LOST),
+        "the accepted re-offer is an acknowledgement"
+    );
+    let committed = BTreeSet::new();
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    assert_eq!(
+        reconciliation.missing.len(),
+        1,
+        "PostgreSQL does not hold the acknowledged share"
+    );
+    let attribution = digest::attribute_unexpected(
+        &committed,
+        &[("mid_flight_kill".to_owned(), &reconciliation)],
+    );
+    let gaps = classify_gaps(
+        &[driven("mid_flight_kill", &[LOST])],
+        &[("mid_flight_kill".to_owned(), reconciliation)],
+        &attribution,
+        &submits,
+        15.0,
+    );
+    let findings = gaps.findings.as_array().expect("an array").len();
+    assert_eq!(findings, 1, "{gaps:?}");
+    assert_eq!(
+        gaps.findings[0]["kind"],
+        json!("acknowledged share missing from PostgreSQL")
+    );
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: findings,
+        harness_bug_rejections: 0,
+        divergences: gaps.divergences.len(),
+        unknown_outcome_commits: gaps.unknown_outcome_commits.len(),
+        no_response_commits: gaps.no_response_commits.len(),
+        no_response_commits_mid_run: 0,
+    };
+    assert_eq!(
+        outcome.exit_code(),
+        run::EXIT_DURABILITY,
+        "the kill's census never makes a real acknowledged-share loss reachable-free"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The scenario itself, pinned: the kill interrupts submits that are still
+/// pending rather than draining them first, the frontends that are up stay
+/// schedulable across the whole kill, and `outstanding_at_kill` is the count
+/// at the kill itself rather than after the victim settled.
+///
+/// A kill that drained first would make the census trivially correct and
+/// measure nothing: there would be no destroyed answer to re-offer, and
+/// `outstanding_at_kill` would be zero, which the report reads as "the
+/// scenario did not exercise" (EP-OBSERVABILITY).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kill_interrupts_pending_submits_and_records_the_count_at_the_kill_boundary(
+) -> Result<()> {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    let dir = ScratchDir::new("kill-scenario");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![
+        stand_in_frontend(&server, dir.path(), 0, audit_port),
+        stand_in_frontend(&server, dir.path(), 1, audit_port),
+    ];
+    let (healthy, mut healthy_control, mut healthy_work) = queued_session(0, 0, 0, 64);
+    let (victim, mut victim_control) = detached_session(1, 1, 3);
+    let sessions = vec![healthy, victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let phase: Arc<str> = Arc::from("mid_flight_kill");
+    let mut driver = KillDriver::start(
+        1,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+
+    // The very first poll finds work outstanding and kills on it. Nothing
+    // here ever lets the victim settle beforehand, so a driver that waited
+    // for a drain would still be in `WaitingForWork`.
+    assert!(driver
+        .poll(&sessions, &mut frontends, &[], &collected)?
+        .is_none());
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the kill published its fence on the poll that found work outstanding"
+    );
+    assert!(
+        frontends[1].pid().is_none(),
+        "and the process was killed on that same poll"
+    );
+    assert_eq!(
+        sessions[1].outstanding.load(Ordering::Relaxed),
+        3,
+        "with three submits still pending: the kill interrupts real work rather than \
+         draining it first"
+    );
+
+    let started = Instant::now();
+    let mut offers = 0usize;
+    let mut reported = false;
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        // The healthy frontend keeps taking scheduled work for the whole kill.
+        assert!(
+            !sessions[0].paused.load(Ordering::Relaxed),
+            "the healthy frontend's session is never paused"
+        );
+        if sessions[0].try_offer(64, &phase) {
+            offers += 1;
+            sessions[0].outstanding.store(0, Ordering::Relaxed);
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::Pause => {}
+                client::Control::CensusBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        if !reported && kill_fence.load(Ordering::SeqCst) != 0 {
+            reported = true;
+            let killed = client::SubmitRecord {
+                share_id: "pload1abc.s00001:interrupted".into(),
+                session: 1,
+                frontend: 1,
+                fence: kill_fence.load(Ordering::SeqCst),
+                ..submit_record(
+                    "mid_flight_kill",
+                    Outcome::NoResponse {
+                        reason: "socket closed: end of stream".into(),
+                    },
+                )
+            };
+            collected
+                .lock()
+                .unwrap()
+                .apply(client::Event::Submit(Box::new(killed)));
+            // Only now does the victim settle -- after the kill, never before.
+            sessions[1].outstanding.store(0, Ordering::Relaxed);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        record.outstanding_at_kill, 3,
+        "the reported count is the one at the kill boundary, not after the sessions settled"
+    );
+    assert_eq!(
+        record.indeterminate.len(),
+        1,
+        "the interrupted submit is the kill's to re-offer"
+    );
+    assert!(
+        offers > 20,
+        "the scheduler kept placing work on the healthy frontend throughout: {offers} offers"
+    );
+    let mut delivered = 0usize;
+    while healthy_work.try_recv().is_ok() {
+        delivered += 1;
+    }
+    assert_eq!(delivered, offers, "and every offer reached its session");
+    assert!(
+        healthy_control.try_recv().is_err(),
+        "the healthy frontend's sessions are never paused, retargeted or re-offered"
+    );
+    assert_eq!(frontends[0].restarts, 0);
+    assert_eq!(frontends[1].restarts, 1);
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
+/// The census fence is published at the kill itself, not when the driver is
+/// constructed. `KillDriver::start` runs when the phase *decides* to kill;
+/// `poll` then waits up to `WORK_WAIT` for the target to actually hold
+/// work. A fence published at construction would stamp every record any
+/// session built during that wait with the post-kill value, sweeping up to
+/// twenty seconds of ordinary mid-run no-responses into the kill's census
+/// and exempting them from the ordinary check -- the mirror image of the
+/// defect the fence was introduced to fix, and it can suppress exit 5 on a
+/// share that committed. The fence is the operation identity of one event,
+/// the SIGKILL, so it must be published there and nowhere earlier
+/// (EP-STATE, EP-OBSERVABILITY).
+///
+/// The nanosecond between the bump and `kill()` is not observable, but the
+/// publication point is: the counter is unchanged across construction and
+/// across every poll that finds no work, and it advances exactly once, on
+/// the poll that kills. A record built during the wait carries the pre-kill
+/// value and stays out of the census; one built after the kill is in it.
+/// That membership also pins the value the driver used: with the two
+/// records at 0 and 1, only a boundary of exactly 1 keeps one and drops the
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_census_fence_is_published_at_the_kill_not_when_the_driver_is_constructed() -> Result<()>
+{
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const DURING_THE_WAIT: &str = "pload1abc.s00000:disconnected-during-the-wait";
+    const KILLED: &str = "pload1abc.s00000:lost-to-the-kill";
+
+    let dir = ScratchDir::new("kill-fence-point");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![stand_in_frontend(&server, dir.path(), 0, audit_port)];
+    let first_pid = frontends[0].pid().expect("the stand-in is running");
+    // The target holds no work yet: the driver must wait for some.
+    let (victim, mut victim_control) = detached_session(0, 0, 0);
+    let sessions = vec![victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let no_response = |share_id: &str, reason: &str| client::SubmitRecord {
+        share_id: share_id.into(),
+        session: 0,
+        frontend: 0,
+        // As the session thread reads it while building the record.
+        fence: kill_fence.load(Ordering::SeqCst),
+        ..submit_record(
+            "mid_flight_kill",
+            Outcome::NoResponse {
+                reason: reason.into(),
+            },
+        )
+    };
+
+    let mut driver = KillDriver::start(
+        0,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        0,
+        "constructing the driver decides nothing about the census: the fence is unchanged"
+    );
+
+    // The wait for work. Every poll finds nothing outstanding, returns
+    // without killing, and leaves the fence alone.
+    for _ in 0..25 {
+        assert!(
+            driver
+                .poll(&sessions, &mut frontends, &[], &collected)?
+                .is_none(),
+            "a driver still waiting for work is not done"
+        );
+        assert_eq!(
+            kill_fence.load(Ordering::SeqCst),
+            0,
+            "a poll that found no work published no fence"
+        );
+        assert_eq!(frontends[0].pid(), Some(first_pid), "and killed nothing");
+        assert!(
+            !sessions[0].paused.load(Ordering::Relaxed),
+            "and paused nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "the session was sent nothing while the driver waited for work"
+    );
+    // An ordinary mid-run disconnect on the target, emitted while the
+    // driver is waiting: not the kill's, whatever happens next.
+    let during_the_wait = no_response(DURING_THE_WAIT, "socket closed: end of stream");
+    assert_eq!(
+        during_the_wait.fence, 0,
+        "a record built while the driver waits for work carries the pre-kill fence"
+    );
+    collected
+        .lock()
+        .unwrap()
+        .apply(client::Event::Submit(Box::new(during_the_wait)));
+
+    // Work arrives. The next poll kills on it, and that poll -- no earlier
+    // one -- publishes the fence.
+    sessions[0].outstanding.store(1, Ordering::Relaxed);
+    assert!(driver
+        .poll(&sessions, &mut frontends, &[], &collected)?
+        .is_none());
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the poll that found work published the fence, once"
+    );
+    assert!(
+        frontends[0].pid().is_none(),
+        "and killed the process on that same poll"
+    );
+    assert!(matches!(
+        victim_control.try_recv(),
+        Ok(client::Control::Pause)
+    ));
+    // The no-response the kill destroyed the answer to, as the session's
+    // reader reports it on end of stream.
+    let killed = no_response(KILLED, "socket closed: end of stream");
+    assert_eq!(
+        killed.fence, 1,
+        "a record built after the kill carries the published fence"
+    );
+    collected
+        .lock()
+        .unwrap()
+        .apply(client::Event::Submit(Box::new(killed)));
+    sessions[0].outstanding.store(0, Ordering::Relaxed);
+
+    let started = Instant::now();
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::CensusBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the whole kill advanced the fence exactly once"
+    );
+    assert_eq!(
+        record.outstanding_at_kill, 1,
+        "the victim held the work the driver waited for when it was killed"
+    );
+    assert_eq!(
+        record
+            .indeterminate
+            .iter()
+            .map(|r| r.share_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![KILLED],
+        "the census is the record built after the kill and not the one built while the \
+         driver waited for work: the boundary the driver used is the value it published \
+         at the kill"
+    );
+    match victim_control.try_recv() {
+        Ok(client::Control::Retarget {
+            frontend: 0,
+            reconnect: false,
+            ..
+        }) => {}
+        other => panic!("the victim's session is retargeted once the relaunch answers: {other:?}"),
+    }
+    match victim_control.try_recv() {
+        Ok(client::Control::Reoffer { share_id, .. }) => assert_eq!(share_id, KILLED),
+        other => panic!("only the kill's own share is re-offered: {other:?}"),
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "the disconnect during the wait is not re-offered as one of the kill's"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
 /// Neither an unfinished victim nor a stalled collector may turn a partial
 /// census into a successful run. Both waits share the configured deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5412,7 +6639,7 @@ async fn a_kill_census_times_out_on_unfinished_sessions_or_uncollected_records()
             0,
             Duration::from_secs(5),
             Duration::from_millis(100),
-            &collected,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         let started = Instant::now();
         let mut held_barrier = None;
@@ -5471,7 +6698,7 @@ async fn a_kill_whose_relaunch_never_answers_is_reported_within_its_limit() -> R
         1,
         Duration::from_millis(800),
         Duration::from_secs(10),
-        &collected,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     let started = Instant::now();
     let mut longest_poll = Duration::ZERO;
@@ -5731,6 +6958,7 @@ async fn a_restart_that_outruns_the_phase_deadline_is_completed_outside_the_meas
         &mut remaining_blocks,
         &mut remaining_tips,
         &collected,
+        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
     let returned = started.elapsed();
@@ -6236,6 +7464,7 @@ fn dense_submit(
         outcome,
         scheduled_block,
         reoffer: false,
+        fence: 0,
         header_hex: String::new(),
         extranonce2_hex: String::new(),
         ntime_hex: String::new(),
