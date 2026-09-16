@@ -1,11 +1,12 @@
 //! A repeated local preference is not a new fork-choice transition.
 use super::work_ledger::WorkLedger;
+use crate::ledger::{ChainObservationState, ChainTransition};
 use anyhow::Result;
 
 #[derive(Default)]
 pub(super) struct ChainObservation {
     tip: Option<String>,
-    retry_from: Option<String>,
+    retry_from: Option<ChainTransition>,
 }
 
 impl ChainObservation {
@@ -18,7 +19,7 @@ impl ChainObservation {
         tip: &str,
         height: u64,
         work: &str,
-        revision: i64,
+        observed: &ChainObservationState,
     ) -> Result<i64> {
         let previous_tip = self.tip.clone();
         if self
@@ -26,16 +27,26 @@ impl ChainObservation {
             .as_deref()
             .is_none_or(|previous| !previous.eq_ignore_ascii_case(tip))
         {
-            self.retry_from = self.tip.replace(tip.to_ascii_lowercase());
+            self.retry_from = self
+                .tip
+                .replace(tip.to_ascii_lowercase())
+                .and_then(|predecessor| {
+                    (observed.best_tip_hash.as_deref() == Some(predecessor.as_str())).then_some(
+                        ChainTransition {
+                            predecessor,
+                            origin_chain_epoch: observed.chain_epoch,
+                        },
+                    )
+                });
         }
         // Consume before any possibly committing I/O. Cancellation, lost COMMIT
         // replies and later publication failures leave the new local tip recorded
         // and cannot recreate a witness on the next unchanged poll.
         let predecessor = self.retry_from.take();
-        let result = match predecessor.as_deref() {
+        let result = match predecessor.as_ref() {
             Some(from) => {
                 ledger
-                    .observe_chain_transition(from, tip, height, work, revision)
+                    .observe_chain_transition(from, tip, height, work, observed)
                     .await
             }
             None => ledger.observe_chain_view(tip, height, work).await,
@@ -81,7 +92,11 @@ mod tests {
     async fn unchanged_cannot_replay(fixture: &Fixture) {
         // Another observer genuinely returned the cluster to the original tip.
         // Local node 2 did not transition again, so it has no replacement proof.
-        *fixture.store.tip.lock().unwrap() = Some(hash(1));
+        {
+            let mut tip = fixture.store.tip.lock().unwrap();
+            *tip = Some(hash(1));
+            fixture.store.chain_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         let revision = fixture.store.revision.fetch_add(1, Ordering::SeqCst) + 1;
         for _ in 0..2 {
             let error = fixture.coordinator.refresh_once().await.unwrap_err();
@@ -124,7 +139,7 @@ mod tests {
                 .compact
                 .transition_calls
                 .load(Ordering::SeqCst),
-            calls + 1,
+            calls,
             "the lower-work refusal recreated a consumed transition"
         );
         assert_eq!(fixture.store.revision.load(Ordering::SeqCst), revision);
@@ -262,7 +277,7 @@ mod tests {
                 .compact
                 .transition_calls
                 .load(Ordering::SeqCst),
-            3,
+            1,
             "a lower-work observation must consume the pending retry"
         );
     }

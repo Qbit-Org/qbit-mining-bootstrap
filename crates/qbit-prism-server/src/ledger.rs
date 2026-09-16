@@ -57,7 +57,8 @@ pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
 pub use window::CommitGateClosed;
 pub use window::{
     probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
-    PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
+    ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot, Window, WindowError,
+    WindowRef,
 };
 use window::{read_prior_balances, share_from_row};
 pub(crate) use window::{ChainObservationBehind, ChainObservationRetry};

@@ -43,6 +43,7 @@ pub(crate) struct Gate {
 #[derive(Default)]
 pub(crate) struct MemoryLedger {
     pub revision: AtomicI64,
+    pub chain_epoch: AtomicI64,
     pub records: StdMutex<Vec<(AcceptedShare, Option<Candidate>, i64)>>,
     pub revision_gate: StdMutex<Option<Arc<Gate>>>,
     pub append_gate: StdMutex<Option<Arc<Gate>>>,

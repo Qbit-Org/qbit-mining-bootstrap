@@ -912,7 +912,7 @@ impl Coordinator {
         let readiness_generation = proof.readiness_epoch();
         // Capture before node I/O, so a delayed equal-work observation cannot
         // overwrite a replacement accepted while its proof was in flight.
-        let chain_revision = self.work_ledger.payout_revision().await?;
+        let chain_observation = self.work_ledger.chain_observation_state().await?;
         let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
@@ -952,7 +952,7 @@ impl Coordinator {
                 parent,
                 height - 1,
                 chainwork,
-                chain_revision,
+                &chain_observation,
             )
             .await?;
         self.reconcile(parent, height - 1, observed_revision)

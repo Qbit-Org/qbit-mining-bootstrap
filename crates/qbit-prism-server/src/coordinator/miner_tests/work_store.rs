@@ -83,6 +83,24 @@ impl work_ledger::WorkLedger for MemoryLedger {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         submit_ledger::SubmitLedger::payout_revision(self)
     }
+    fn chain_observation_state(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::ledger::ChainObservationState>> {
+        Box::pin(async move {
+            // Preserve the fixture's existing error/cancellation gate, then
+            // take the same lock as its chain writers for a coherent token.
+            let captured = {
+                let tip = self.tip.lock().unwrap();
+                crate::ledger::ChainObservationState {
+                    payout_revision: self.revision.load(Ordering::SeqCst),
+                    chain_epoch: self.chain_epoch.load(Ordering::SeqCst),
+                    best_tip_hash: tip.clone(),
+                }
+            };
+            submit_ledger::SubmitLedger::payout_revision(self).await?;
+            Ok(captured)
+        })
+    }
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>> {
         Box::pin(async {
             self.compact.state_calls.fetch_add(1, Ordering::SeqCst);
@@ -295,22 +313,32 @@ impl work_ledger::WorkLedger for MemoryLedger {
         _work: &'a str,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
+            if self
+                .compact
+                .observation_behind
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(crate::ledger::ChainObservationBehind.into());
+            }
             let mut previous = self.tip.lock().unwrap();
             ensure!(
                 previous.as_deref().is_none_or(|old| old == tip),
                 "local node follows a conflicting equal-work chain tip"
             );
+            if previous.is_none() {
+                self.chain_epoch.fetch_add(1, Ordering::SeqCst);
+            }
             *previous = Some(tip.into());
             Ok(self.revision.load(Ordering::SeqCst))
         })
     }
     fn observe_chain_transition<'a>(
         &'a self,
-        predecessor: &'a str,
+        transition: &'a crate::ledger::ChainTransition,
         tip: &'a str,
         _height: u64,
         _work: &'a str,
-        expected_revision: i64,
+        observed: &'a crate::ledger::ChainObservationState,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
             self.compact.transition_calls.fetch_add(1, Ordering::SeqCst);
@@ -332,6 +360,16 @@ impl work_ledger::WorkLedger for MemoryLedger {
             }
             let revision = {
                 let mut previous = self.tip.lock().unwrap();
+                let predecessor = transition.predecessor.as_str();
+                let expected_revision = observed.payout_revision;
+                if previous.as_deref() != Some(tip) {
+                    ensure!(
+                        self.chain_epoch.load(Ordering::SeqCst) == transition.origin_chain_epoch
+                            && observed.chain_epoch == transition.origin_chain_epoch
+                            && observed.best_tip_hash.as_deref() == Some(predecessor),
+                        "chain observation epoch changed"
+                    );
+                }
                 if previous.as_deref() == Some(predecessor)
                     && self.revision.load(Ordering::SeqCst) != expected_revision
                 {
@@ -350,6 +388,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 );
                 if previous.as_deref().is_some_and(|old| old != tip) {
                     self.revision.fetch_add(1, Ordering::SeqCst);
+                    self.chain_epoch.fetch_add(1, Ordering::SeqCst);
                 }
                 *previous = Some(tip.into());
                 self.revision.load(Ordering::SeqCst)

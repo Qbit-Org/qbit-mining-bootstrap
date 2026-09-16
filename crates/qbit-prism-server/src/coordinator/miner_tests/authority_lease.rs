@@ -44,16 +44,20 @@ async fn prepare_replacement_lease(f: &Fixture) -> i64 {
     f.node.lock().unwrap().fail = None;
     // Another frontend may observe this chain change before our replacement
     // finishes. The later local publication must not advance this fence again.
+    let state = f
+        .coordinator
+        .work_ledger
+        .chain_observation_state()
+        .await
+        .unwrap();
+    let transition = crate::ledger::ChainTransition {
+        predecessor: hash(1),
+        origin_chain_epoch: state.chain_epoch,
+    };
     let revision = f
         .coordinator
         .work_ledger
-        .observe_chain_transition(
-            &hash(1),
-            &hash(2),
-            100,
-            "01",
-            f.store.revision.load(Ordering::SeqCst),
-        )
+        .observe_chain_transition(&transition, &hash(2), 100, "01", &state)
         .await
         .unwrap();
     assert!(revision > original.snapshot.payout_revision);

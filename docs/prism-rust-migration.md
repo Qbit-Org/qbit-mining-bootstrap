@@ -464,7 +464,7 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 15,
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 15 and 18,
 each checked on its own rather than as a high-water mark: a later migration
 being present never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
@@ -475,7 +475,17 @@ for the quiesce and recovery steps. Stop all frontends again before applying
 and does not evict older processes already serving the database. Keep automatic
 restarts disabled throughout the cutover. 013 is recorded only once its online
 index builds have completed, so a start after an interrupted build is
-refused until `migrate` finishes them. A database missing any of them is refused
+refused until `migrate` finishes them. Migration 018 adds the durable chain epoch
+and declares `chain_observation_epoch = 1`; 016/017 are reserved by the separate
+share-partitioning change. Apply 018 only after stopping every old frontend,
+one-shot writer and paused startup, with restarts disabled, then start only
+epoch-aware binaries. The registered-instance shutdown check does not evict a
+connected writer or discover an unregistered old tool. See the
+[offline epoch upgrade contract](prism-ledger-ops.md#chain-observation-epoch-upgrade-018).
+The capability refuses older binaries at subsequent connects; deleting it or
+resetting the epoch is not a supported downgrade. A preexisting undeclared
+epoch column or capability causes migration refusal and transaction rollback.
+A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
 capability or a runtime `candidate_storage_version` other than 1. A native

@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18];
     applied integer[];
     missing integer[];
     metadata text;
@@ -54,6 +54,8 @@ DECLARE
     offer_declared boolean := false;
     startup_declared boolean := false;
     orphan_declared boolean := false;
+    epoch_declared boolean := false;
+    epoch_state record;
     source record;
     source_rows bigint;
 BEGIN
@@ -151,13 +153,13 @@ BEGIN
     END LOOP;
     -- Startup decodes capability as text and capability_value as int4, and
     -- understands storage version 1, offer lifecycle 1, startup fence 1 and
-    -- orphan disposition 1 (migration 015).
-    -- All four declarations are required on this native schema; a missing row is never repaired.
+    -- orphan disposition 1 (015) and chain observation epoch 1 (018).
+    -- Every declaration is required on this native schema; a missing row is never repaired.
     FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s ORDER BY capability DESC', capability_table) LOOP
         IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
            OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
             RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
-        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup', 'candidate_orphan_disposition') THEN
+        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup', 'candidate_orphan_disposition', 'chain_observation_epoch') THEN
             RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
         ELSIF capability.capability_value <> 1 THEN
             RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to 1 only', capability.capability, capability.capability_value, capability.capability USING HINT = hint;
@@ -166,6 +168,7 @@ BEGIN
         offer_declared := offer_declared OR capability.capability = 'candidate_offer_lifecycle';
         startup_declared := startup_declared OR capability.capability = 'instance_offer_startup';
         orphan_declared := orphan_declared OR capability.capability = 'candidate_orphan_disposition';
+        epoch_declared := epoch_declared OR capability.capability = 'chain_observation_epoch';
     END LOOP;
     IF NOT declared THEN
         RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row' USING HINT = hint;
@@ -179,6 +182,9 @@ BEGIN
     IF NOT orphan_declared THEN
         RAISE EXCEPTION 'database is at schema migration 15 but does not declare candidate_orphan_disposition = 1' USING HINT = hint;
     END IF;
+    IF NOT epoch_declared THEN
+        RAISE EXCEPTION 'database is at schema migration 18 but does not declare chain_observation_epoch = 1' USING HINT = hint;
+    END IF;
     -- The singleton row startup decodes into MigrationSource.
     EXECUTE format('SELECT concat_ws('','', pg_typeof(source_state), pg_typeof(source_release), pg_typeof(source_commit), pg_typeof(candidate_storage_version), pg_typeof(prior_schema_version), pg_typeof(migrated_by), pg_typeof(migrated_at)) AS types, source_state IS NULL OR prior_schema_version IS NULL OR migrated_by IS NULL OR migrated_at IS NULL AS incomplete FROM %s WHERE singleton LIMIT 1', source_table) INTO source;
     GET DIAGNOSTICS source_rows = ROW_COUNT;
@@ -190,6 +196,10 @@ BEGIN
     SELECT count(*) INTO source_rows FROM qbit_prism_cluster WHERE singleton;
     IF source_rows <> 1 THEN
         RAISE EXCEPTION 'qbit_prism_cluster must contain exactly one singleton row' USING HINT = hint;
+    END IF;
+    EXECUTE 'SELECT chain_epoch,pg_typeof(chain_epoch)::text AS type FROM qbit_prism_cluster WHERE singleton' INTO epoch_state;
+    IF epoch_state.chain_epoch IS NULL OR epoch_state.chain_epoch < 0 OR epoch_state.type <> 'bigint' THEN
+        RAISE EXCEPTION 'migration 018 chain_epoch metadata is missing or unreadable; restore the full backup, never reset the epoch' USING HINT = hint;
     END IF;
 END
 $metadata$;
@@ -497,9 +507,11 @@ FROM qbit_prism_cluster c WHERE fatal_error IS NOT NULL ORDER BY singleton;
 -- (zero work, no tip) are omitted so fresh and migrated evidence still match.
 SELECT jsonb_build_object('kind', 'chain_checkpoint', 'row', jsonb_build_object(
     'best_chainwork', best_chainwork::text, 'best_tip_hash', best_tip_hash,
-    'best_tip_height', best_tip_height))
+    'best_tip_height', best_tip_height) ||
+    CASE WHEN chain_epoch = 0 THEN '{}'::jsonb
+         ELSE jsonb_build_object('chain_epoch', chain_epoch) END)
 FROM qbit_prism_cluster c
-WHERE best_chainwork <> 0 OR best_tip_hash IS NOT NULL OR best_tip_height IS NOT NULL
+WHERE best_chainwork <> 0 OR best_tip_hash IS NOT NULL OR best_tip_height IS NOT NULL OR chain_epoch <> 0
 ORDER BY singleton;
 -- Ledger::configure pins the frontend's consensus, payout and signing
 -- configuration onto a NULL fingerprint and rejects a mismatch otherwise, so

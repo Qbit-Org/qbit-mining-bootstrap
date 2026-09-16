@@ -2,7 +2,10 @@
 //! stale-observation and payout fences. Each test owns a disposable database.
 use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
-    coordinator::Coordinator, ledger::Ledger, metrics::Metrics, stratum::MiningBackend,
+    coordinator::Coordinator,
+    ledger::{ChainTransition, Ledger},
+    metrics::Metrics,
+    stratum::MiningBackend,
 };
 use qbit_prism_test_gate as gate;
 use std::{sync::Arc, time::Duration};
@@ -16,6 +19,150 @@ mod fake_qbitd;
 mod ledger_database;
 
 const ISSUE_BOUND: Duration = Duration::from_secs(2);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounting_retries_keep_original_epoch_across_multiple_refusals_and_peer_aba() -> Result<()>
+{
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    for peer_aba in [false, true] {
+        let db = ledger_database::FixtureDatabase::open(&raw, "epoch_retry_").await?;
+        let node = fake_qbitd::FakeNode::open().await?;
+        let peer_node = fake_qbitd::FakeNode::open().await?;
+        let old = Coordinator::new(
+            fake_qbitd::coordinator_config(db.url.clone(), &node, "epoch-retry")?,
+            Arc::new(Metrics::default()),
+        )
+        .await?;
+        let peer = Coordinator::new(
+            fake_qbitd::coordinator_config(db.url.clone(), &peer_node, "epoch-peer")?,
+            Arc::new(Metrics::default()),
+        )
+        .await?;
+        let result = async {
+            old.refresh_once().await?;
+            peer.refresh_once().await?;
+            let original = old.ledger.chain_observation_state().await?;
+            node.set_tip(&"ef".repeat(32), &"cd".repeat(32), 100, "01");
+            // Repeated accounting races need fresh node proofs, but must not
+            // replace the witness's epoch with the attempt's newer token.
+            for _ in 0..2 {
+                let mut pause = node.pause_next("getblockchaininfo")?;
+                let observer = old.clone();
+                let mut pending = tokio::spawn(async move { observer.refresh_once().await });
+                let raced = async {
+                    timeout(ISSUE_BOUND, pause.entered()).await??;
+                    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton").execute(&old.ledger.pool).await?;
+                    pause.release();
+                    let error = timeout(ISSUE_BOUND, &mut pending).await??.unwrap_err();
+                    ensure!(error.to_string().contains("chain observation revision changed"));
+                    ensure!(old.ledger.chain_observation_state().await?.chain_epoch == original.chain_epoch);
+                    Ok::<_, anyhow::Error>(())
+                }.await;
+                pending.abort();
+                if !pending.is_finished() { let _ = pending.await; }
+                raced?;
+            }
+            if peer_aba {
+                peer_node.set_tip(&"12".repeat(32), &"cd".repeat(32), 100, "01");
+                peer.refresh_once().await?;
+                peer_node.set_tip(&"ab".repeat(32), &"cd".repeat(32), 100, "01");
+                peer.refresh_once().await?;
+            }
+            let before = old.ledger.chain_observation_state().await?;
+            if peer_aba {
+                ensure!(before.chain_epoch == original.chain_epoch + 2);
+                let error = timeout(ISSUE_BOUND, old.refresh_once()).await?.unwrap_err();
+                ensure!(error.to_string().contains("chain observation epoch changed"));
+                for _ in 0..2 { ensure!(old.refresh_once().await.is_err()); }
+                let after = old.ledger.chain_observation_state().await?;
+                ensure!(after.chain_epoch == before.chain_epoch && after.payout_revision == before.payout_revision && after.best_tip_hash == before.best_tip_hash);
+            } else {
+                timeout(ISSUE_BOUND, old.refresh_once()).await??;
+                let after = old.ledger.chain_observation_state().await?;
+                ensure!(after.chain_epoch == original.chain_epoch + 1 && after.payout_revision == before.payout_revision + 1);
+                ensure!(after.best_tip_hash.as_deref() == Some("ef".repeat(32).as_str()));
+                let worker = old.authorize("alice.epoch").await?;
+                ensure!(old.build_job(&worker, "1a2b3c4d", 1e-12, 0.0).await?.wire.previousblockhash == "ef".repeat(32));
+            }
+            Ok(())
+        }.await;
+        old.ledger.pool.close().await;
+        peer.ledger.pool.close().await;
+        db.close(result).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_transition_cannot_retry_after_peer_aba() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = ledger_database::FixtureDatabase::open(&raw, "equal_work_aba_").await?;
+    let old_node = fake_qbitd::FakeNode::open().await?;
+    let peer_node = fake_qbitd::FakeNode::open().await?;
+    let old = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &old_node, "old-transition")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let peer = Coordinator::new(
+        fake_qbitd::coordinator_config(db.url.clone(), &peer_node, "aba-peer")?,
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    let result = async {
+        old.refresh_once().await?;
+        peer.refresh_once().await?;
+        let original = "ab".repeat(32);
+        let older_choice = "ef".repeat(32);
+        old_node.set_tip(&older_choice, &"cd".repeat(32), 100, "01");
+        let mut pause = old_node.pause_next("getblockheader")?;
+        let observer = old.clone();
+        let mut pending = tokio::spawn(async move { observer.refresh_once().await });
+        let abort = pending.abort_handle();
+        let raced = async {
+            timeout(ISSUE_BOUND, pause.entered()).await??;
+            peer_node.set_tip(&"12".repeat(32), &"cd".repeat(32), 100, "01");
+            peer.refresh_once().await?;
+            peer_node.set_tip(&original, &"cd".repeat(32), 100, "01");
+            peer.refresh_once().await?;
+            let newest_revision = peer.ledger.payout_revision().await?;
+            pause.release();
+            ensure!(timeout(ISSUE_BOUND, &mut pending).await??.is_err());
+            let retried = old.refresh_once().await;
+            let (tip, revision): (String, i64) = sqlx::query_as(
+                "SELECT best_tip_hash,payout_revision FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&peer.ledger.pool)
+            .await?;
+            eprintln!(
+                "ABA retry: unchanged older choice accepted={}, revision {} -> {}, tip={}",
+                retried.is_ok(),
+                newest_revision,
+                revision,
+                tip
+            );
+            ensure!(
+                retried.is_err() && tip == original && revision == newest_revision,
+                "unchanged old transition reversed newer accepted tip after ABA"
+            );
+            Ok(())
+        }
+        .await;
+        abort.abort();
+        if !pending.is_finished() {
+            let _ = pending.await;
+        }
+        raced
+    }
+    .await;
+    old.ledger.pool.close().await;
+    peer.ledger.pool.close().await;
+    db.close(result).await
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lower_work_consumes_an_accounting_retry_even_after_peer_aba() -> Result<()> {
@@ -132,9 +279,14 @@ async fn lower_work_reconsideration_preserves_the_equal_work_predecessor() -> Re
         }
         // A peer returns the accepted tip. A rejected lower-work excursion
         // must not recreate either observer's already consumed transition.
+        let state = a.ledger.chain_observation_state().await?;
+        let witness = ChainTransition {
+            predecessor: restored.clone(),
+            origin_chain_epoch: state.chain_epoch,
+        };
         let returned = a
             .ledger
-            .observe_chain_transition(&restored, &original, 102, "03", before + 1)
+            .observe_chain_transition(&witness, &original, 102, "03", &state)
             .await?;
         node.set_tip(&"de".repeat(32), &"12".repeat(32), 101, "02");
         ensure!(a.refresh_once().await.is_err());
@@ -407,7 +559,7 @@ async fn delayed_coherent_poll_cannot_reverse_a_newer_equal_work_tip() -> Result
             ensure!(old
                 .unwrap_err()
                 .to_string()
-                .contains("chain observation revision changed"));
+                .contains("chain observation epoch changed"));
             let tip: String =
                 sqlx::query_scalar("SELECT best_tip_hash FROM qbit_prism_cluster WHERE singleton")
                     .fetch_one(&b.ledger.pool)
@@ -469,6 +621,11 @@ async fn equal_work_replacement_preserves_strict_and_revision_fences() -> Result
         let original = "ab".repeat(32);
         let replacement = "ef".repeat(32);
         let before = ledger.observe_chain_view(&original, 100, "100").await?;
+        let original_state = ledger.chain_observation_state().await?;
+        let from_original = ChainTransition {
+            predecessor: original.clone(),
+            origin_chain_epoch: original_state.chain_epoch,
+        };
         // Unsequenced candidate and settlement observers remain conservative.
         ensure!(ledger
             .observe_chain_view(&replacement, 100, "100")
@@ -476,35 +633,60 @@ async fn equal_work_replacement_preserves_strict_and_revision_fences() -> Result
             .is_err());
         for (height, work) in [(99, "100"), (101, "100"), (100, "ff")] {
             ensure!(ledger
-                .observe_chain_transition(&original, &replacement, height, work, before)
+                .observe_chain_transition(
+                    &from_original,
+                    &replacement,
+                    height,
+                    work,
+                    &original_state
+                )
                 .await
                 .is_err());
             ensure!(ledger.payout_revision().await? == before);
         }
         let current = ledger
-            .observe_chain_transition(&original, &replacement, 100, "0100", before)
+            .observe_chain_transition(&from_original, &replacement, 100, "0100", &original_state)
             .await?;
         ensure!(current == before + 1);
+        let replacement_state = ledger.chain_observation_state().await?;
+        let from_replacement = ChainTransition {
+            predecessor: replacement.clone(),
+            origin_chain_epoch: replacement_state.chain_epoch,
+        };
+        let mut stale_revision = replacement_state.clone();
+        stale_revision.payout_revision = before;
         // A peer can finish observing the same replacement after another peer
         // accepts it. This is a no-op, not a conflicting stale replacement.
         ensure!(
             ledger
-                .observe_chain_transition(&original, &replacement, 100, "100", before)
+                .observe_chain_transition(&from_original, &replacement, 100, "100", &original_state)
                 .await?
                 == current
         );
         ensure!(
             ledger
-                .observe_chain_transition(&original, &replacement, 100, "100", current)
+                .observe_chain_transition(
+                    &from_original,
+                    &replacement,
+                    100,
+                    "100",
+                    &replacement_state
+                )
                 .await?
                 == current
         );
         ensure!(ledger
-            .observe_chain_transition(&replacement, &original, 100, "100", before)
+            .observe_chain_transition(&from_replacement, &original, 100, "100", &stale_revision)
             .await
             .is_err());
         ensure!(ledger
-            .observe_chain_transition(&original, &"12".repeat(32), 100, "100", before)
+            .observe_chain_transition(
+                &from_original,
+                &"12".repeat(32),
+                100,
+                "100",
+                &original_state
+            )
             .await
             .is_err());
         ensure!(ledger
@@ -519,24 +701,41 @@ async fn equal_work_replacement_preserves_strict_and_revision_fences() -> Result
         // A fresh proof can return to a previously seen tip. The revision
         // orders observations; it does not blacklist hashes.
         let returned = ledger
-            .observe_chain_transition(&replacement, &original, 100, "100", current)
+            .observe_chain_transition(&from_replacement, &original, 100, "100", &replacement_state)
             .await?;
         ensure!(returned == current + 1);
         // Returning to the initial hash does not make the original revision
         // current again: a third sibling from that old poll still loses.
         ensure!(ledger
-            .observe_chain_transition(&original, &"12".repeat(32), 100, "100", before)
+            .observe_chain_transition(
+                &from_original,
+                &"12".repeat(32),
+                100,
+                "100",
+                &original_state
+            )
             .await
             .is_err());
         // Existing greater-work semantics permit a shorter, heavier chain.
         ensure!(
             ledger
-                .observe_chain_transition(&original, &"34".repeat(32), 99, "101", before)
+                .observe_chain_transition(
+                    &from_original,
+                    &"34".repeat(32),
+                    99,
+                    "101",
+                    &original_state
+                )
                 .await?
                 == returned + 1
         );
+        let heavier_state = ledger.chain_observation_state().await?;
+        let heavier = ChainTransition {
+            predecessor: "34".repeat(32),
+            origin_chain_epoch: heavier_state.chain_epoch,
+        };
         ensure!(ledger
-            .observe_chain_transition(&"34".repeat(32), &replacement, 100, "100", returned + 1)
+            .observe_chain_transition(&heavier, &replacement, 100, "100", &heavier_state)
             .await
             .is_err());
         Ok(())
