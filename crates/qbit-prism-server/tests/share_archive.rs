@@ -643,6 +643,8 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         archive::verify(&ledger, P1, root.path()).await?;
         // Once a later archive has left the ledger it cannot be written again
         // to follow a new manifest, so the manifest it chains to is fixed.
+        // The catalog records a detach that ran by hand only over a seal.
+        archive::seal(&ledger, P1).await?;
         sqlx::raw_sql(&format!(
             "ALTER TABLE qbit_share_ledger DETACH PARTITION {P1} CONCURRENTLY"
         ))
@@ -1903,6 +1905,139 @@ async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() 
         ensure!(
             present && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "detached",
             "the refused drop changed something"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// A `DETACH PARTITION` run by hand after the archive was verified but before
+/// the audits were sealed is the one detach the tool's own gates never saw.
+/// The recovery run that reconciles the catalog with pg_inherits, and the drop
+/// after it, hold the seal to the same standard as a detach: a canonical
+/// artifact can be rebuilt only while the shares it paid on are still
+/// attached, so recording, and then dropping, an unsealed relation would
+/// leave the block without its advertised artifact. Both refuse it, both name
+/// the way back, and a recorded `sealed_at` is not taken on its own: an audit
+/// row that intersects the partition without its canonical bytes blocks them
+/// the way it blocks a detach.
+#[tokio::test]
+async fn reconcile_and_drop_hold_a_hand_detached_partition_to_the_seal() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("unsealed-a").await?;
+        let root = tempfile::tempdir()?;
+        let landed = land_block(&ledger, 1451).await?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        let reattach = format!(
+            "ALTER TABLE qbit_share_ledger ATTACH PARTITION {P0} FOR VALUES FROM (MINVALUE) TO ({p0_upper})"
+        );
+        let detach_by_hand =
+            format!("ALTER TABLE qbit_share_ledger DETACH PARTITION {P0} CONCURRENTLY");
+
+        // Detached by hand with the block's audit unsealed: the recovery run
+        // refuses to record it and names the way back.
+        sqlx::raw_sql(&detach_by_hand).execute(&ledger.pool).await?;
+        let error = archive::detach(&ledger, P0, &retention(0))
+            .await
+            .expect_err("reconciled a hand-detached partition that was never sealed")
+            .to_string();
+        ensure!(
+            error.contains("no sealed_at")
+                && error.contains(&reattach)
+                && error.contains(&format!("share-archive seal {P0}")),
+            "{error}"
+        );
+        ensure!(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "attached",
+            "the refused reconcile recorded the detach"
+        );
+        // The drop refuses it too, whatever the catalog says about the state.
+        let error = archive::drop_partition(&ledger, P0, root.path())
+            .await
+            .expect_err("dropped a relation the catalog records attached")
+            .to_string();
+        ensure!(error.contains("recorded attached"), "{error}");
+        sqlx::query("UPDATE qbit_prism_share_partitions SET state='detached',detached_at=clock_timestamp() WHERE partition_name=$1")
+            .bind(P0)
+            .execute(&ledger.pool)
+            .await?;
+        let error = archive::drop_partition(&ledger, P0, root.path())
+            .await
+            .expect_err("dropped a detached relation that was never sealed")
+            .to_string();
+        ensure!(
+            error.contains("no sealed_at") && error.contains(&reattach),
+            "{error}"
+        );
+        let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(P0)
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(present, "the refused drop removed {P0}");
+        sqlx::query("UPDATE qbit_prism_share_partitions SET state='attached',detached_at=NULL WHERE partition_name=$1")
+            .bind(P0)
+            .execute(&ledger.pool)
+            .await?;
+
+        // Attached again, the seal goes through. A recorded sealed_at is
+        // then not the whole check: the audit row without its canonical
+        // bytes blocks the reconcile on its own.
+        sqlx::raw_sql(&reattach).execute(&ledger.pool).await?;
+        let sealed = archive::seal(&ledger, P0).await?;
+        ensure!(
+            sealed["sealed_now"] == 1 && sealed["unsealed_remaining"] == 0,
+            "{sealed}"
+        );
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=NULL WHERE block_hash=$1")
+            .bind(&landed.block_hash)
+            .execute(&ledger.pool)
+            .await?;
+        sqlx::raw_sql(&detach_by_hand).execute(&ledger.pool).await?;
+        let error = archive::detach(&ledger, P0, &retention(0))
+            .await
+            .expect_err("reconciled a partition an unsealed audit still depends on")
+            .to_string();
+        ensure!(
+            error.contains("1 of 1 audit row(s)") && error.contains(&reattach),
+            "{error}"
+        );
+        ensure!(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "attached",
+            "the refused reconcile recorded the detach"
+        );
+
+        // Sealed again while attached, the same detach by hand is reconciled,
+        // the drop goes through, and the block still serves its artifact.
+        sqlx::raw_sql(&reattach).execute(&ledger.pool).await?;
+        let sealed = archive::seal(&ledger, P0).await?;
+        ensure!(
+            sealed["sealed_now"] == 1 && sealed["unsealed_remaining"] == 0,
+            "{sealed}"
+        );
+        sqlx::raw_sql(&detach_by_hand).execute(&ledger.pool).await?;
+        let reconciled = archive::detach(&ledger, P0, &retention(0)).await?;
+        ensure!(reconciled["action"] == "reconciled", "{reconciled}");
+        let dropped = archive::drop_partition(&ledger, P0, root.path()).await?;
+        ensure!(dropped["relation_dropped"] == true, "{dropped}");
+        let served = audit_canonical_bytes(&ledger.pool, &landed.block_hash)
+            .await?
+            .context("the archived block serves no canonical bytes")?;
+        ensure!(
+            served == landed.canonical,
+            "the served canonical bytes differ from the artifact the block committed to"
         );
         Ok(ledger)
     }

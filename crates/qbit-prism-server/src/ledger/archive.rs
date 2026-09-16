@@ -1990,7 +1990,11 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
     let attachment = attachment(&mut *ledger.acquire().await?, partition_name).await?;
 
     if !attachment.attached {
-        // The DDL of an earlier run succeeded and its catalog update did not.
+        // The DDL of an earlier run succeeded and its catalog update did not,
+        // or the DDL was run by hand. The catalog records either one only as
+        // a detach the gates below would have allowed: the archive verified,
+        // and the audits sealed. `plan` no longer evaluates the seal for a
+        // relation that is off the parent, so it is taken here directly.
         ensure!(
             attachment.relation_present,
             "{partition_name} is neither a partition of {PARENT} nor a relation; it was dropped. Restore it from its archive with share-archive restore"
@@ -1999,6 +2003,12 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
             record.archive_verified_at.is_some(),
             "{partition_name} is no longer a partition of {PARENT} but its archive was never verified, so the catalog cannot record the detach. Verify the archive with share-archive verify {partition_name} --dir <root>"
         );
+        check_seal_off_parent(
+            &mut *ledger.acquire().await?,
+            record,
+            "record the detach of",
+        )
+        .await?;
         let reconciled = record_detached(ledger, partition_name).await?;
         return Ok(json!({
             "schema": "qbit.prism.share-archive-detach.v1",
@@ -2095,8 +2105,41 @@ async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option
     Ok(detached_at)
 }
 
-/// Drop a detached, verified partition whose rows still number what the
-/// archive recorded, once that archive has been read back from disk. The
+/// The seal, held to for a relation that is no longer an attached partition:
+/// once it is recorded detached the drop is one command away, and a canonical
+/// artifact can only be rebuilt while the shares it paid on are still online
+/// under the parent. `plan` marks every condition not applicable for a
+/// relation off the parent, so the `audits_sealed` condition that gates a
+/// detach is taken here directly, from the catalog and from the audit rows.
+/// The seal itself needs the rows online, so the way forward is to attach the
+/// relation again under its recorded bounds, not to record the state.
+async fn check_seal_off_parent(
+    connection: &mut PgConnection,
+    record: &PartitionRecord,
+    what: &str,
+) -> Result<()> {
+    let name = &record.partition_name;
+    let reattach = format!(
+        "ALTER TABLE {PARENT} ATTACH PARTITION {name} FOR VALUES FROM ({}) TO ({})",
+        record
+            .lower_seq
+            .map_or_else(|| "MINVALUE".into(), |lower| lower.to_string()),
+        record.upper_seq
+    );
+    ensure!(
+        record.sealed_at.is_some(),
+        "refusing to {what} {name}: no sealed_at is recorded, so audit rows whose snapshot intersects it may still depend on its rows, and a seal needs them online in {PARENT}. Run {reattach}, then share-archive seal {name}, and start again from share-archive detach {name}"
+    );
+    let (intersecting, unsealed) = intersecting_audits(connection, record).await?;
+    ensure!(
+        unsealed == 0,
+        "refusing to {what} {name}: {unsealed} of {intersecting} audit row(s) whose snapshot intersects it have no canonical_audit_bytes, and a seal needs its rows online in {PARENT}. Run {reattach}, then share-archive seal {name}, and start again from share-archive detach {name}"
+    );
+    Ok(())
+}
+
+/// Drop a detached, sealed and verified partition whose rows still number
+/// what the archive recorded, once that archive has been read back from disk. The
 /// archive is the copy of record from here on, and `archive_verified_at` only
 /// proves it was complete when the comparison was taken, not that its files
 /// are still there and intact now; so the manifest and rows the catalog
@@ -2128,7 +2171,11 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) 
     );
     let mut archive_checked = None;
     if attachment.relation_present {
-        // The archive first: what the catalog recorded has to be readable,
+        // The seal first: the rows are about to become the archive's alone,
+        // and an audit that still depends on them can be rebuilt only while
+        // they are attached, which no drop can be undone into.
+        check_seal_off_parent(&mut *ledger.acquire().await?, &record, "drop").await?;
+        // The archive next: what the catalog recorded has to be readable,
         // canonical and whole now, not only when verify recorded it. The
         // lifecycle lock keeps every rewrite off until the drop is done, so
         // what is read here is what remains after the relation is gone.
