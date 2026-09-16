@@ -79,7 +79,8 @@ pub struct Ledger {
     session_owner: std::sync::Arc<connect::SessionOwner>,
     /// Native wait telemetry, when the process has a registry to record into.
     /// Without a handle nothing is recorded and behaviour is identical, so
-    /// tools and tests keep using [`Ledger::connect`].
+    /// tests keep using [`Ledger::connect`] and the database-only commands
+    /// [`Ledger::connect_tool`] without one.
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
     /// back through [`Ledger::config_fingerprint`]. Shared across clones, so

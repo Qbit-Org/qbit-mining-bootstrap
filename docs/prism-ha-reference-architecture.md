@@ -387,8 +387,11 @@ bound and re-entry after two successes. This is the #186 carry-over to #291.
 `qbit-prism-server self-check` adds `live_instances` to its existing JSON report.
 It snapshots `qbit_prism_instances` through a **read-only connection using the
 same resolved writer DSN**, before the existing self-check initializes its own
-coordinator (which writes a `starting` heartbeat). No new configuration reader,
-ledger method, migration or HA election is introduced.
+coordinator. That coordinator writes no heartbeat: the diagnostic is not a
+frontend, so it never appears in its own sample, leaves no row behind when it
+exits, and does not touch the row of a running frontend that shares its
+`PRISM_INSTANCE_ID`. No new configuration reader, migration or HA election is
+introduced.
 
 The server attempts to publish a heartbeat every **2 seconds**. `observed_at` is
 one PostgreSQL `clock_timestamp()` sample through `PRISM_DATABASE_URL`; counts

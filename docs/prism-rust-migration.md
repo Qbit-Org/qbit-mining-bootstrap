@@ -525,6 +525,13 @@ continuing; a matching hash without recoverable bytes is insufficient.
 Run import first. It is idempotent for matching existing records and replaces the
 old Python repair command's individual-path/block selection interface.
 
+Neither `import-audits` nor `backfill-ctv` registers a frontend. Both pass the
+frontend's startup gates (schema version, declared capabilities, migration
+source and the halt refusal) and then write only the rows they repair, so a run
+leaves no `qbit_prism_instances` heartbeat for fatal-state recovery to refuse
+and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
+behave the same way.
+
 ### Migration 013: the share ledger index trim, applied online
 
 Migration 013 (#153) trims the secondary indexes of `qbit_share_ledger` to
