@@ -58,6 +58,7 @@ impl Metrics {
             Family::LowDifficulty,
             Family::Grace,
             Family::LateConfirmed,
+            Family::CandidatesOrphaned,
         ] {
             registry.register(family, vec![], 0.);
         }

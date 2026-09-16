@@ -124,8 +124,8 @@ pub struct ClaimParts {
 /// Where an outbox row is in the offer-before-landing lifecycle (migration
 /// 011). Every variant is unfinished: the row keeps its document, its block
 /// bytes and its window reference, and a claim can hold it. The terminal
-/// states, `submitted` and `abandoned`, are never claimed and have no
-/// variant here.
+/// states, `submitted`, `abandoned` and `orphaned` (migration 015), are
+/// never claimed and have no variant here; see [`ORPHANED_STATE`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CandidateState {
     /// Never offered. The only state a claim may offer from, and the only
@@ -145,10 +145,30 @@ pub enum CandidateState {
     Reconciliation,
 }
 
+/// The terminal disposition of a proven orphan (#415, migration 015): an
+/// offered row whose block the chain has proven not to be on the active
+/// chain, a DIFFERENT block being active at its height with at least
+/// `Config::candidate_orphan_confirmations` confirmations, observed on one
+/// coherent tip after the row's audit landed. Terminal like `submitted` and
+/// `abandoned`: never claimed again, never offered again, and no longer
+/// counted by the pending-candidate gauges. Unlike those two it keeps its
+/// document, its block bytes, its window reference and its offer record, so
+/// an operator reading the outbox (#268) sees exactly what was offered and
+/// why it was settled. The block itself keeps its landed audit and its
+/// `qbit_pool_blocks` row, marked `inactive`: a later reorg that reactivates
+/// the block is credited by the ordinary reorg reconciler from that
+/// preserved evidence, deferred share included, and this row never reopens.
+/// Written by [`Ledger::orphan_candidate_at_revision`] only.
+pub const ORPHANED_STATE: &str = "orphaned";
+
 impl CandidateState {
     /// The SQL list of every unfinished state, for `state IN` predicates.
     pub const UNFINISHED_SQL: &'static str =
         "('pending','offer_reserved','offered','reconciliation')";
+
+    /// The SQL list of every terminal state, for `state IN` predicates: the
+    /// complement of [`Self::UNFINISHED_SQL`] under 015's lifecycle rule.
+    pub const TERMINAL_SQL: &'static str = "('submitted','abandoned','orphaned')";
 
     pub fn as_str(self) -> &'static str {
         match self {

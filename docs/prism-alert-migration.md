@@ -75,7 +75,19 @@ instead of the coordinator's snapshot gauge families.
 Candidate and RSS rules additionally require the relevant
 `collector_available == 1`. Unknown, failed or expired collections render -1 and
 fire the collector-unavailable rule; a successful zero remains healthy. Unknown
-work gauges have their own rule. Runtime wake/poll/progress signals are evaluated
+work gauges have their own rule. The pending-candidate rules
+(`PrismBlockCandidateBacklog`, `PrismBlockCandidateOldestPending` and their
+critical variants) count the four unfinished outbox states; since #415
+(migration 015) a block that lost a tip race leaves that set on its own once a
+different block has `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (default 6)
+confirmations at its height, so an orphan raises the oldest-pending age for a
+few block intervals and then clears without operator action, and
+`qbit_prism_block_candidates_orphaned_total` records each such settlement.
+Size the oldest-pending `for` clause against that window when qualifying the
+provisional 15/60 s bounds in #291: a backlog that persists past it is a row
+automation cannot land or an unknown offer outcome, which is operator work.
+A rising orphan rate is a node or network signal (the qbitd first-seen question
+in #413), not a coordinator stall; no rule is attached to the counter here. Runtime wake/poll/progress signals are evaluated
 at scrape time and intentionally remain usable while the body publisher is
 stale. The latest wake lag can reset within 100 ms of recovery, so the wake-delay
 replacement also reads retained completed polls and the native progress budget.
