@@ -8,16 +8,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod online;
+pub(super) use online::{apply_online_migration, OnlineMigration};
+
 /// The schema migrations every native start requires, each checked on its
-/// own. Add every new migration file here. `Ledger::connect` refuses a
+/// own. Add every new migration file here and to the `required_versions`
+/// of `scripts/prism-recovery-evidence.sql`, whose export refuses the
+/// databases startup refuses. `Ledger::connect` refuses a
 /// database missing any of them even without `initialize`, so a newer binary
 /// never reaches the claim path on a database it has not migrated, and a
 /// later number never hides an earlier gap: 007 landed after 008, 009 and 010. A migration this
 /// binary does not know is accepted with a warning: native migrations are
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
-/// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10];
+/// `require_known_capabilities` refuses again at connect. Existing native
+/// ledgers apply 013 online (`ONLINE_MIGRATIONS`) and record it after its
+/// last index change, so a start refuses the database until that has
+/// completed.
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -37,7 +45,15 @@ pub fn schema_version_list(versions: &[i32]) -> String {
 const SOURCE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 2)];
 /// Formats the native claim lane can process. Migration 006 records the
 /// old declaration as provenance and declares this runtime format atomically.
-const NATIVE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 1)];
+const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
+    ("candidate_storage_version", 1),
+    // 011: the offer-before-landing outbox lifecycle. A binary without this
+    // entry refuses the migrated database at connect, which is what keeps a
+    // pre-011 frontend off rows the reservation lifecycle owns.
+    ("candidate_offer_lifecycle", 1),
+    // 012: startup proves support again in its initial heartbeat.
+    ("instance_offer_startup", 1),
+];
 
 /// How many blocking outbox rows a drain refusal names.
 const BLOCKING_ROWS_NAMED: usize = 16;
@@ -529,35 +545,81 @@ pub(super) fn refuse_unknown_capabilities(
 
 /// The capability every native database declares once 006 has run.
 const DECLARED_CAPABILITY: &str = "candidate_storage_version";
+/// The capability 011 declares, at the value it declares, once the offer
+/// lifecycle owns the outbox.
+const OFFER_LIFECYCLE_CAPABILITY: (&str, i32) = ("candidate_offer_lifecycle", 1);
 
-/// A database at migration 6 declares `candidate_storage_version`: 006
-/// created the table and the row, and nothing native removes either. Their
-/// absence is a dropped table or a deleted row, after which the database can
-/// no longer say which PRISM release wrote it, so it is refused rather than
-/// read as a legacy state, which has no meaning once 006 has run. `rows` is
-/// `None` when the table is missing. The caller has established that 6 is
-/// recorded.
-fn require_declared_capabilities(rows: Option<&[(String, i32)]>) -> Result<()> {
+/// A database at migration 6 declares `candidate_storage_version`, and one
+/// at migration 11 declares `candidate_offer_lifecycle = 1` as well: 006
+/// created the table and its row, 011 declared the lifecycle last, once
+/// every object it owns existed, and nothing native removes or edits any of
+/// them. An absent table or storage row is a dropped table or a deleted row,
+/// after which the database can no longer say which PRISM release wrote it,
+/// so it is refused rather than read as a legacy state, which has no meaning
+/// once 006 has run. A missing or edited lifecycle row beside 011's record
+/// is a selectively restored declaration, after which the database can no
+/// longer say that every unfinished outbox row belongs to the offer
+/// lifecycle, so it is refused rather than read as a pre-011 outbox, which
+/// 011's record contradicts. Nothing here repairs a declaration: the remedy
+/// is named for the operator, who knows what the rows are. `rows` is `None`
+/// when the table is missing; `versions` is the recorded migration set, and
+/// the caller has established that 6 or 11 is in it.
+fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32]) -> Result<()> {
+    let (lifecycle, declared) = OFFER_LIFECYCLE_CAPABILITY;
     let Some(rows) = rows else {
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1), then start or migrate again");
+        // At 11 the table also held 011's declaration: the remedy names both
+        // rows, so the operator is not refused a second time for the other.
+        let lifecycle_remedy = if versions.contains(&11) {
+            format!(" and, once every unfinished row of qbit_block_candidate_outbox is known to have been written or quarantined by a post-011 frontend, declare the offer lifecycle 011 declared in it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{lifecycle}',{declared})")
+        } else {
+            String::new()
+        };
+        let startup_remedy = if versions.contains(&12) {
+            " and restore the instance_offer_startup = 1 declaration from migrations/012_offer_startup_fence.sql after verifying its qbit_prism_instances_offer_startup constraint is present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
         "database is at schema migration 6 but qbit_prism_schema_capabilities has no {DECLARED_CAPABILITY} row: 006 declared it and nothing native deletes it, so the row was deleted and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, declare it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{DECLARED_CAPABILITY}',1), then start or migrate again"
     );
+    if versions.contains(&11) {
+        match rows.iter().find(|(capability, _)| capability == lifecycle) {
+            None => bail!("database is at schema migration 11 but qbit_prism_schema_capabilities has no {lifecycle} row: 011 declared it once the offer lifecycle owned the outbox and nothing native deletes it, so the row was deleted or the capability table was restored selectively, and the database can no longer declare that every unfinished block candidate belongs to the offer lifecycle. Restore the full backup, or, once every unfinished row of qbit_block_candidate_outbox is known to have been written or quarantined by a post-011 frontend, declare it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{lifecycle}',{declared}), then start or migrate again"),
+            Some((_, value)) => ensure!(
+                *value == declared,
+                "database is at schema migration 11 but qbit_prism_schema_capabilities declares {lifecycle} = {value}: 011 declares {declared} and this server understands {declared} only, so either the row was edited or a newer PRISM release wrote this database. Restore the full backup, or upgrade the server if a newer release wrote it; nothing native writes another value"
+            ),
+        }
+    }
+    if versions.contains(&12) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "instance_offer_startup" && *value == 1),
+            "database is at schema migration 12 but does not declare instance_offer_startup = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 012's startup constraint and capability; nothing was changed"
+        );
+    }
     Ok(())
 }
 
 /// The native path's refusal of a database at 6 that no longer declares
-/// its capabilities, before any DDL: otherwise 008 or 009 would run above
-/// the missing declaration and only the connect-time gate, after the
-/// commit, would refuse it. `versions` is the recorded migration set, named
-/// in the refusal.
+/// its capabilities, or at 11 that no longer declares the offer lifecycle
+/// as 011 declared it, before any DDL: otherwise a later migration would
+/// run above the missing declaration and only the connect-time gate, after
+/// the commit, would refuse it. `versions` is the recorded migration set,
+/// named in the refusal.
 fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInventory) -> Result<()> {
-    if !versions.contains(&6) {
+    // Checked whenever 6 or 11 is recorded. 011 postdates 006 and every
+    // native build records 6 first, so a record with 11 and not 6 was
+    // restored selectively; it is not read as a pre-006 database, which
+    // would let 006 declare a storage version above an outbox 011 already
+    // owns without the lifecycle declaration being checked first.
+    if !versions.contains(&6) && !versions.contains(&11) && !versions.contains(&12) {
         return Ok(());
     }
-    if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref()) {
+    if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref(), versions)
+    {
         bail!(
             "refusing to migrate a native database at schema migrations {} before any DDL: {reason}",
             schema_version_list(versions)
@@ -1999,7 +2061,48 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         10,
         include_str!("../../migrations/010_fatal_state_recovery.sql"),
     ),
+    (
+        11,
+        include_str!("../../migrations/011_offer_before_landing.sql"),
+    ),
+    (
+        12,
+        include_str!("../../migrations/012_offer_startup_fence.sql"),
+    ),
+    (
+        13,
+        include_str!("../../migrations/013_share_ledger_index_trim.sql"),
+    ),
+    (
+        14,
+        include_str!("../../migrations/014_policy_transition.sql"),
+    ),
 ];
+
+/// The native migrations applied after the commit on existing native
+/// ledgers, even when no shares are visible: writers do not take the
+/// migration lock. Each creates and drops indexes on that table and nothing
+/// else. It reaches the source statement by statement with `CONCURRENTLY`,
+/// through `apply_online_migration` (see `online.rs`): `CREATE INDEX
+/// CONCURRENTLY` cannot run in a transaction block, and a plain `CREATE
+/// INDEX` on the share ledger would hold every append for the whole build.
+/// Recorded last then, so the startup gate refuses the database until the
+/// indexes are in place. Fresh and empty 2.x.x sources apply these inside
+/// the transaction while holding the cutover locks that exclude writers.
+/// A later transactional migration must not depend on an online one's
+/// indexes: within one run it is applied first.
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13];
+
+/// Whether a legacy share ledger has no rows, checked only after the
+/// cutover locks exclude writers so transactional index DDL cannot block
+/// an append. Existing native upgrades always use the online runner.
+async fn ledger_is_empty(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM qbit_share_ledger)")
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
 
 /// The SQL of one native migration, by the version it records.
 fn native_migration(version: i32) -> &'static str {
@@ -2017,8 +2120,13 @@ struct ReleaseDefinitions {
     /// What the native migrations create and the release does not; a
     /// source that already has any of it is refused.
     reserved: ReservedObjects,
-    /// Objects introduced by each requested, missing native migration.
+    /// Objects introduced by each requested, missing native migration
+    /// that is applied inside the transaction.
     native_gaps: BTreeMap<i32, ReservedObjects>,
+    /// The index changes of each requested, missing online migration:
+    /// applied by `apply_online_migration` after the commit on existing
+    /// native ledgers and populated 2.x.x sources.
+    online: BTreeMap<i32, OnlineMigration>,
     /// The schema the source lives in.
     source_schema: String,
 }
@@ -2097,6 +2205,7 @@ async fn release_fingerprint(
     );
     let expected = fingerprint_schema(tx, &scratch).await?;
     let mut native_gaps = BTreeMap::new();
+    let mut online_migrations = BTreeMap::new();
     for (version, sql) in NATIVE_MIGRATIONS {
         let before = if missing_native_versions.contains(version) {
             Some(fingerprint_schema(tx, &scratch).await?)
@@ -2106,6 +2215,15 @@ async fn release_fingerprint(
         sqlx::raw_sql(sql).execute(&mut **tx).await?;
         if let Some(before) = before {
             let after = fingerprint_schema(tx, &scratch).await?;
+            if ONLINE_MIGRATIONS.contains(version) {
+                // Applied to the source from these definitions after the
+                // commit. Its names are checked by the online runner,
+                // which adopts an identical earlier build of its own.
+                // Fresh/2.x.x sources also check all reserved names before
+                // any source DDL.
+                online_migrations.insert(*version, online::derive(*version, &before, &after)?);
+                continue;
+            }
             let mut reserved = reserved_objects(&after, &before);
             // These migrations leave new tables' constraint indexes and
             // identity/serial sequences unnamed. PostgreSQL chooses another
@@ -2153,6 +2271,7 @@ async fn release_fingerprint(
         release: expected,
         reserved,
         native_gaps,
+        online: online_migrations,
         source_schema,
     })
 }
@@ -2252,25 +2371,33 @@ fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> 
 /// not silently adopt a pre-existing object. Derive each missing step's
 /// names from the same scratch replay used for fresh/2.x sources. Start
 /// with the #258 release: its capability table and storage_version column
-/// may legitimately predate 006, whose dedicated gates validate them.
+/// may legitimately predate 006, whose dedicated gates validate them. A
+/// missing online migration's names are the runner's to check, which
+/// adopts an identical earlier build of its own. Its derived index changes
+/// are always returned for the caller to apply after the commit, including
+/// when no shares are visible: native writers do not take MIGRATION_LOCK.
 async fn require_no_native_gap_collisions(
     tx: &mut Transaction<'_, Postgres>,
     versions: &[i32],
-) -> Result<()> {
+) -> Result<Vec<OnlineMigration>> {
     let missing: Vec<i32> = NATIVE_MIGRATIONS
         .iter()
         .map(|(version, _)| *version)
         .filter(|version| !versions.contains(version))
         .collect();
     if missing.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let base_schema =
         base_schema_transaction_body(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))?;
-    let definitions =
-        release_fingerprint(tx, SourceState::Applied258, &base_schema, &missing).await?;
-    let found = source_fingerprint(tx, &definitions.source_schema).await?;
-    for (version, reserved) in definitions.native_gaps {
+    let ReleaseDefinitions {
+        native_gaps,
+        online,
+        source_schema,
+        ..
+    } = release_fingerprint(tx, SourceState::Applied258, &base_schema, &missing).await?;
+    let found = source_fingerprint(tx, &source_schema).await?;
+    for (version, reserved) in native_gaps {
         let mut present = objects_present(&reserved.objects, &found);
         present.extend(columns_present(&reserved.columns, &found));
         for (table, names) in &reserved.constraints {
@@ -2288,7 +2415,7 @@ async fn require_no_native_gap_collisions(
             named_objects(&present)
         );
     }
-    Ok(())
+    Ok(online.into_values().collect())
 }
 
 /// The source schema as it is now, without the migrator's own version
@@ -2540,12 +2667,15 @@ async fn require_migration_history(connection: &mut sqlx::PgConnection) -> Resul
 /// Apply the base schema and every native migration inside the caller's
 /// transaction, which holds the migration lock throughout. Refusals happen
 /// before any DDL or roll the transaction back, so a refused database is
-/// unchanged.
+/// unchanged. The online migrations (`ONLINE_MIGRATIONS`) are applied here
+/// only for fresh or empty 2.x.x sources under the cutover locks; existing
+/// native ledgers always return their changes for the caller to apply with
+/// `apply_online_migration` after the commit, and they are recorded then.
 pub(super) async fn migrate_schema(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: &str,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<()> {
+) -> Result<Vec<OnlineMigration>> {
     lock(tx, MIGRATION_LOCK, metrics).await?;
     require_source_schema_resolution(tx).await?;
     let history_exists: bool =
@@ -2581,6 +2711,9 @@ pub(super) async fn migrate_schema(
     // `candidate_storage_version` the database declared before 006 declares
     // one for it.
     let mut source: (Option<SourceState>, Option<i32>) = (None, None);
+    // The online migrations this run must apply after the commit, from the
+    // definitions the scratch apply rendered.
+    let mut online = Vec::new();
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting.
@@ -2616,12 +2749,31 @@ pub(super) async fn migrate_schema(
         // The release definitions and the reserved native objects, taken
         // once under a savepoint and rolled back before the source is
         // touched.
+        // A fresh source has no ledger yet, and a 2.x.x one without shares
+        // has an empty one. The cutover locks above exclude writers, so an
+        // online migration can run inside this transaction there. Derive
+        // its definitions only for a ledger with rows, where they drive
+        // the build after the commit.
+        let ledger_empty = match state {
+            SourceState::Fresh => true,
+            SourceState::Pre258 | SourceState::Applied258 => ledger_is_empty(tx).await?,
+        };
+        let pending_online: Vec<i32> = if ledger_empty {
+            Vec::new()
+        } else {
+            ONLINE_MIGRATIONS
+                .iter()
+                .copied()
+                .filter(|version| !versions.contains(version))
+                .collect()
+        };
         let ReleaseDefinitions {
             release: expected,
             reserved,
             source_schema,
+            online: pending,
             ..
-        } = release_fingerprint(tx, state, &base_schema, &[]).await?;
+        } = release_fingerprint(tx, state, &base_schema, &pending_online).await?;
         let found = source_fingerprint(tx, &source_schema).await?;
         if state == SourceState::Fresh {
             // No share ledger and no 002 object: fresh only if nothing else
@@ -2636,6 +2788,8 @@ pub(super) async fn migrate_schema(
         // 001 repaired what it re-asserts; what it skipped must already be
         // the release definition before any native DDL alters those tables.
         require_release_schema(tx, state, &expected, &source_schema).await?;
+        // Its reserved names were checked with the others above.
+        online.extend(pending.into_values());
         if !versions.contains(&2) {
             sqlx::raw_sql(native_migration(2))
                 .execute(&mut **tx)
@@ -2700,7 +2854,7 @@ pub(super) async fn migrate_schema(
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }
-        require_no_native_gap_collisions(tx, &versions).await?;
+        online.extend(require_no_native_gap_collisions(tx, &versions).await?);
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(native_migration(4))
@@ -2800,6 +2954,127 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
+    if !versions.contains(&11) {
+        refuse_unquiesced_outbox(tx).await?;
+        sqlx::raw_sql(native_migration(11))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(11)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&12) {
+        if versions.contains(&11) {
+            // A database migrated by an earlier 011 build needs the same
+            // shutdown proof before installing the missing startup fence.
+            refuse_unquiesced_instances(tx, 12).await?;
+        }
+        sqlx::raw_sql(native_migration(12))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(12)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&14) {
+        sqlx::raw_sql(native_migration(14))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(14)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    // Only a fresh or empty 2.x.x source reaches this DDL, with writers
+    // excluded by the cutover locks. Existing native ledgers and populated
+    // 2.x.x sources returned their changes above for the caller to apply
+    // after the commit with CONCURRENTLY, recording the version then.
+    for version in ONLINE_MIGRATIONS {
+        if versions.contains(version) || online.iter().any(|pending| pending.version == *version) {
+            continue;
+        }
+        sqlx::raw_sql(native_migration(*version))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES($1)")
+            .bind(version)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(online)
+}
+
+/// Refuse any instance that has not explicitly shut down, including one
+/// whose heartbeat is stale or whose candidate lease has expired.
+async fn refuse_unquiesced_instances(
+    tx: &mut Transaction<'_, Postgres>,
+    version: i32,
+) -> Result<()> {
+    // Claim expiry proves nothing about an idle or paused frontend. Use the
+    // same explicit shutdown markers as fatal-state recovery, without a
+    // heartbeat-age cutoff. Serialize the scan with heartbeat registration
+    // and retain the lock until the capability change commits.
+    sqlx::query("LOCK TABLE qbit_prism_instances IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await?;
+    let instances: Vec<String> = sqlx::query_scalar(
+        "SELECT instance_id FROM qbit_prism_instances WHERE COALESCE(status->>'state','') NOT IN ('drained','stopped') ORDER BY instance_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        instances.is_empty(),
+        "migration {version:03} requires every earlier instance to report drained or stopped; offending instances: {}. \
+         Stop every earlier frontend gracefully and disable automatic restarts before migrating. \
+         An empty outbox or an expired heartbeat does not prove shutdown; nothing was changed",
+        named_objects(&instances)
+    );
+    Ok(())
+}
+
+/// 011's own quiesce check, before any of its DDL runs. Every registered
+/// instance must explicitly report shutdown, even if it holds no claim.
+/// A pending row whose
+/// claim is still live belongs to a pre-011 frontend that may be mid-offer:
+/// the reservation lifecycle cannot take over a row an old frontend may
+/// still send. And 011 quarantines every attempted pending row as an
+/// unknown-delivery reconciliation row, which must carry the evidence the
+/// lifecycle payload rule requires (the document, the block bytes and the
+/// window reference); a parked chunked row or a pre-007 row cannot be
+/// quarantined and is refused by name, exactly as 007 refused it.
+async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    refuse_unquiesced_instances(tx, 11).await?;
+    let outbox: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_block_candidate_outbox') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !outbox {
+        return Ok(());
+    }
+    let live: Vec<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND claim_expires_at>clock_timestamp() ORDER BY block_hash",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        live.is_empty(),
+        "migration 011 refuses to run while pending block candidates hold a live claim: {}. \
+         A pre-011 frontend may be offering them. Stop every pre-011 frontend, wait for their \
+         claims to expire (at most 120 s), then migrate again; nothing was changed",
+        named_objects(&live)
+    );
+    let bare: Vec<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND attempt_count>0 AND (candidate IS NULL OR block_bytes IS NULL OR window_anchor_ms IS NULL OR window_prior_balances_sha256 IS NULL) ORDER BY block_hash",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    ensure!(
+        bare.is_empty(),
+        "migration 011 refuses undrained attempted block candidates without a block and window reference: {}. \
+         They were attempted by a pre-007 frontend or parked as chunked rows, and 011 cannot quarantine them. \
+         Drain them with the frontend that wrote them (or the 2.x.x image for a parked chunked row), stop it, \
+         then migrate again; nothing was changed",
+        named_objects(&bare)
+    );
     Ok(())
 }
 
@@ -2853,20 +3128,29 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// The connect-time gate: the database must declare its capabilities, and
-/// every capability or storage version it declares must be one the binary
-/// understands. Every start runs it, with or without `initialize`, after
-/// `require_schema_version` has established that 006 ran in
-/// current_schema(), so a missing table or row is a dropped or deleted
-/// declaration, never a legacy state, and a table resolved from another
-/// schema is refused rather than read; `migrate_schema` refused the same
-/// database before any DDL.
+/// The connect-time gate: the database must declare the capabilities its
+/// recorded migrations declared (006's storage version, and 011's offer
+/// lifecycle once 11 is recorded), and every capability or storage version
+/// it declares must be one the binary understands. Every start runs it,
+/// with or without `initialize`, after `require_schema_version` has
+/// established that 006 ran in current_schema(), so a missing table or row
+/// is a dropped or deleted declaration, never a legacy state, and a table
+/// resolved from another schema is refused rather than read;
+/// `migrate_schema` refused the same database before any DDL, and runs this
+/// again once 006 has declared a database it is migrating. The recorded
+/// migrations are read on the connection the rows are read on, in the same
+/// schema.
 pub(super) async fn require_known_capabilities<'e, E>(executor: E) -> Result<()>
 where
     E: sqlx::Acquire<'e, Database = Postgres>,
 {
-    let rows = read_capabilities(executor).await?;
-    require_declared_capabilities(rows.as_deref())?;
+    let mut connection = executor.acquire().await?;
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
+            .fetch_all(&mut *connection)
+            .await?;
+    let rows = read_capabilities(&mut *connection).await?;
+    require_declared_capabilities(rows.as_deref(), &versions)?;
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)
 }
 
@@ -4654,18 +4938,25 @@ mod tests {
         );
     }
 
+    /// `require_declared_capabilities` over the given rows, at the given
+    /// recorded migrations.
+    fn declared_at(rows: &[(&str, i32)], versions: &[i32]) -> Result<()> {
+        let rows: Vec<(String, i32)> = rows
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), *value))
+            .collect();
+        require_declared_capabilities(Some(&rows), versions)
+    }
+
     #[test]
     fn a_database_at_6_must_declare_its_candidate_storage_version() {
-        let declared = |rows: &[(&str, i32)]| {
-            let rows: Vec<(String, i32)> = rows
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), *value))
-                .collect();
-            require_declared_capabilities(Some(&rows))
-        };
+        let at_6 = &[2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let declared = |rows: &[(&str, i32)]| declared_at(rows, at_6);
         declared(&[("candidate_storage_version", 1)]).unwrap();
         declared(&[("candidate_storage_version", 2), ("sealed_share_pages", 1)]).unwrap();
-        let error = require_declared_capabilities(None).unwrap_err().to_string();
+        let error = require_declared_capabilities(None, at_6)
+            .unwrap_err()
+            .to_string();
         assert!(
             error.starts_with(
                 "database is at schema migration 6 but has no qbit_prism_schema_capabilities"
@@ -4695,6 +4986,133 @@ mod tests {
     }
 
     #[test]
+    fn a_database_at_11_must_declare_the_offer_lifecycle_as_011_declared_it() {
+        let at_11: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let storage = ("candidate_storage_version", 1);
+        let lifecycle = ("candidate_offer_lifecycle", 1);
+        declared_at(&[storage, lifecycle], at_11).unwrap();
+        declared_at(&[lifecycle, storage, ("sealed_share_pages", 1)], at_11).unwrap();
+        // Before 011 there is no lifecycle row to require: the genuine
+        // upgrade, and a #258 source 006 has just declared, carry the
+        // storage version alone.
+        declared_at(&[storage], &[2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap();
+        declared_at(&[("candidate_storage_version", 2)], &[2, 3, 4, 5, 6]).unwrap();
+        let error = declared_at(&[storage], at_11).unwrap_err().to_string();
+        assert!(
+            error.starts_with("database is at schema migration 11 but qbit_prism_schema_capabilities has no candidate_offer_lifecycle row"),
+            "{error}"
+        );
+        assert!(
+            error.contains("VALUES('candidate_offer_lifecycle',1)")
+                && error.contains("start or migrate again"),
+            "{error}"
+        );
+        for value in [0, -1, 2] {
+            let error = declared_at(&[storage, ("candidate_offer_lifecycle", value)], at_11)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with(&format!("database is at schema migration 11 but qbit_prism_schema_capabilities declares candidate_offer_lifecycle = {value}")),
+                "{error}"
+            );
+            assert!(
+                error.contains("newer PRISM release")
+                    && error.contains("nothing native writes another value"),
+                "{error}"
+            );
+        }
+        // A record with 11 and not 6 was restored selectively: the row is
+        // required all the same.
+        let error = declared_at(&[storage], &[2, 3, 4, 5, 7, 8, 9, 10, 11])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no candidate_offer_lifecycle row"),
+            "{error}"
+        );
+        // The storage version is required first, at 11 as at 6, and so is
+        // the table.
+        let error = declared_at(&[lifecycle], at_11).unwrap_err().to_string();
+        assert!(
+            error.contains("has no candidate_storage_version row"),
+            "{error}"
+        );
+        // A dropped table held both declarations at 11: the one refusal
+        // names both remedies; before 011 it names 006's alone.
+        let error = require_declared_capabilities(None, at_11)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "database is at schema migration 6 but has no qbit_prism_schema_capabilities"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("006_source_schema.sql")
+                && error.contains("VALUES('candidate_offer_lifecycle',1)")
+                && error.ends_with("then start or migrate again"),
+            "{error}"
+        );
+        let error = require_declared_capabilities(None, &[2, 3, 4, 5, 6, 7, 8, 9, 10])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("candidate_offer_lifecycle"), "{error}");
+    }
+
+    #[test]
+    fn the_pre_ddl_declaration_fence_runs_whenever_6_or_11_is_recorded() {
+        let inventory = |capabilities: Option<Vec<(&str, i32)>>| SourceInventory {
+            share_ledger: true,
+            outbox: true,
+            present: vec![false; OBJECTS_002.len()],
+            capabilities: capabilities.map(|rows| {
+                rows.into_iter()
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect()
+            }),
+        };
+        let storage_only = inventory(Some(vec![("candidate_storage_version", 1)]));
+        let both = inventory(Some(vec![
+            ("candidate_storage_version", 1),
+            ("candidate_offer_lifecycle", 1),
+        ]));
+        // Before 006 nothing is declared, and before 011 the storage
+        // version alone is.
+        refuse_undeclared_native_database(&[2, 3, 4, 5], &inventory(None)).unwrap();
+        refuse_undeclared_native_database(&[2, 3, 4, 5, 6, 7, 8, 9, 10], &storage_only).unwrap();
+        refuse_undeclared_native_database(&[2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &both).unwrap();
+        let error = refuse_undeclared_native_database(REQUIRED_SCHEMA_VERSIONS, &storage_only)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!(
+                "refusing to migrate a native database at schema migrations {} before any DDL: database is at schema migration 11 but",
+                schema_version_list(REQUIRED_SCHEMA_VERSIONS)
+            )),
+            "{error}"
+        );
+        // 11 without 6 was restored selectively: checked all the same, the
+        // table included.
+        let restored = [2, 3, 4, 5, 7, 8, 9, 10, 11];
+        let error = refuse_undeclared_native_database(&restored, &storage_only)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11 before any DDL: database is at schema migration 11 but"),
+            "{error}"
+        );
+        let error = refuse_undeclared_native_database(&restored, &inventory(None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no qbit_prism_schema_capabilities"),
+            "{error}"
+        );
+        refuse_undeclared_native_database(&restored, &both).unwrap();
+    }
+
+    #[test]
     fn native_migrations_are_the_applied_versions_in_order() {
         let versions: Vec<i32> = NATIVE_MIGRATIONS.iter().map(|(v, _)| *v).collect();
         assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
@@ -4702,6 +5120,37 @@ mod tests {
             assert!(!sql.trim().is_empty(), "migration {version} is empty");
             assert_eq!(native_migration(*version), *sql);
         }
+    }
+
+    /// The recovery-evidence export mirrors this gate so that a database
+    /// startup refuses yields no evidence, but its PL/pgSQL constant shares
+    /// nothing with `REQUIRED_SCHEMA_VERSIONS`: read the declaration back
+    /// and compare, so a migration added to one and not the other fails here
+    /// rather than only in the PostgreSQL-gated recovery regression.
+    #[test]
+    fn recovery_evidence_requires_the_migrations_startup_requires() {
+        let script = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+        let declarations: Vec<&str> = script
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("required_versions constant integer[] := ARRAY[")
+                    .and_then(|rest| rest.strip_suffix("];"))
+            })
+            .collect();
+        let [declaration] = declarations[..] else {
+            panic!("expected one required_versions declaration, found {declarations:?}");
+        };
+        let versions: Vec<i32> = declaration
+            .split(',')
+            .map(|version| {
+                version
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|error| panic!("version {version:?}: {error}"))
+            })
+            .collect();
+        assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
     }
 
     #[test]

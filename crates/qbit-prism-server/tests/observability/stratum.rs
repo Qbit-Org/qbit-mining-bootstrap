@@ -34,6 +34,88 @@ fn sample(metrics: &qbit_prism_server::metrics::Metrics, key: &str) -> f64 {
 }
 
 #[tokio::test]
+async fn submit_reason_normalization_is_bounded_and_preserves_tcp_errors() {
+    let metrics = Arc::new(Metrics::default());
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(StratumConfig::default(), metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.reasons").await;
+    let cases = [
+        (None, "internal-error"),
+        (Some("internal-error"), "internal-error"),
+        (Some(""), "unrecognised"),
+        (Some("future-reason"), "unrecognised"),
+        (Some("another-new-reason"), "unrecognised"),
+        (Some("untrusted\"\\\nreason"), "unrecognised"),
+        (Some("ledger-outcome-unknown"), "ledger-outcome-unknown"),
+    ];
+    let mut expected = HashMap::<&str, usize>::new();
+    for (index, (reason, label)) in cases.into_iter().enumerate() {
+        let id = 20 + index as u64;
+        *backend.submit_error.lock().unwrap() = Some(StratumError {
+            code: 20,
+            message: "controlled refusal".into(),
+            reason_id: reason.map(str::to_owned),
+        });
+        client
+            .send(client.solved_submit(id, "miner.reasons", 0))
+            .await;
+        assert_eq!(
+            client.response(id).await,
+            json!({"id":id,"result":null,"error":[20,"controlled refusal",
+                reason.map(|value| json!({"reason_id":value}))]}),
+        );
+        *expected.entry(label).or_default() += 1;
+        let body = http_metrics(metrics.clone()).await;
+        let mut observed_labels = BTreeSet::new();
+        for line in body
+            .lines()
+            .filter(|line| line.starts_with("qbit_prism_rejections_total{"))
+        {
+            let (key, count) = line.rsplit_once(' ').unwrap();
+            let label = key
+                .strip_prefix("qbit_prism_rejections_total{reason_id=\"")
+                .and_then(|value| value.strip_suffix("\"}"))
+                .unwrap();
+            assert!(observed_labels.insert(label));
+            assert_eq!(
+                count.parse::<usize>().unwrap(),
+                *expected.get(label).unwrap_or(&0)
+            );
+        }
+        assert_eq!(
+            observed_labels,
+            RejectReason::ALL
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect()
+        );
+        assert_eq!(
+            observed_labels.len(),
+            14,
+            "free-form reasons must not create series"
+        );
+        assert_eq!(
+            sample(
+                &metrics,
+                "qbit_prism_share_ack_seconds_count{result=\"rejected\"}"
+            ),
+            (index + 1) as f64
+        );
+        assert_eq!(
+            sample(
+                &metrics,
+                "qbit_prism_share_ack_seconds_count{result=\"accepted\"}"
+            ),
+            0.
+        );
+    }
+    assert!(backend.shares.lock().unwrap().is_empty());
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn complete_submit_frame_to_successful_ack_excludes_partial_frame_and_post_ack_hint() {
     let config = StratumConfig::default();
     let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());

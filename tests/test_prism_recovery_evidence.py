@@ -65,6 +65,15 @@ class RecoveryEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.summarize(iter([record("future_format", {})] + closing()))
 
+    def test_offered_or_unknown_candidates_cannot_look_drained(self):
+        for state in ("offer_reserved", "offered", "reconciliation", "future_state"):
+            with self.subTest(state=state):
+                report = module.summarize(iter([record("candidates", {"state": state})] + closing()))
+                self.assertEqual(report["pending_candidates"], 0)
+                self.assertEqual(report["unfinished_candidates"], 1)
+        terminal = [record("candidates", {"state": state}) for state in ("submitted", "abandoned")]
+        self.assertEqual(module.summarize(iter(terminal + closing()))["unfinished_candidates"], 0)
+
     def test_recovery_obligations_change_summary_without_share_or_ctv_state_changes(self):
         baseline = module.summarize(iter(closing()))
         for kind, row, change in (

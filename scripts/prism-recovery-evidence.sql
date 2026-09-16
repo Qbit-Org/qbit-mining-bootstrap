@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
     applied integer[];
     missing integer[];
     metadata text;
@@ -51,6 +51,8 @@ DECLARE
     source_table text;
     capability record;
     declared boolean := false;
+    offer_declared boolean := false;
+    startup_declared boolean := false;
     source record;
     source_rows bigint;
 BEGIN
@@ -114,8 +116,9 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'native migration history must have the native logged-table, version primary-key and applied_at definitions, without extra columns, constraints, indexes, triggers, rules, inheritance or row security' USING HINT = hint;
     END IF;
-    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS. The
-    -- regression removes each version declared by the server in turn.
+    -- Keep this set aligned with ledger::REQUIRED_SCHEMA_VERSIONS: a migration
+    -- unit test compares the two, and the recovery regression removes each
+    -- version declared by the server in turn.
     EXECUTE format('SELECT array_agg(version ORDER BY version) FROM %s', history) INTO applied;
     SELECT array_agg(version ORDER BY version) INTO missing
     FROM unnest(required_versions) AS required(version)
@@ -146,20 +149,29 @@ BEGIN
         END IF;
     END LOOP;
     -- Startup decodes capability as text and capability_value as int4, and
-    -- understands candidate_storage_version 1 only once 006 has run.
-    FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s', capability_table) LOOP
+    -- understands storage version 1, offer lifecycle 1 and startup fence 1.
+    -- All three declarations are required on this native schema; a missing row is never repaired.
+    FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s ORDER BY capability DESC', capability_table) LOOP
         IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
            OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
             RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
-        ELSIF capability.capability <> 'candidate_storage_version' THEN
+        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup') THEN
             RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
         ELSIF capability.capability_value <> 1 THEN
-            RAISE EXCEPTION 'database declares candidate_storage_version = %, but this server understands candidate_storage_version 1 to 1 only', capability.capability_value USING HINT = hint;
+            RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to 1 only', capability.capability, capability.capability_value, capability.capability USING HINT = hint;
         END IF;
-        declared := true;
+        declared := declared OR capability.capability = 'candidate_storage_version';
+        offer_declared := offer_declared OR capability.capability = 'candidate_offer_lifecycle';
+        startup_declared := startup_declared OR capability.capability = 'instance_offer_startup';
     END LOOP;
     IF NOT declared THEN
         RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row' USING HINT = hint;
+    END IF;
+    IF NOT offer_declared THEN
+        RAISE EXCEPTION 'database is at schema migration 11 but qbit_prism_schema_capabilities has no candidate_offer_lifecycle row' USING HINT = hint;
+    END IF;
+    IF NOT startup_declared THEN
+        RAISE EXCEPTION 'database is at schema migration 12 but has no instance_offer_startup declaration' USING HINT = hint;
     END IF;
     -- The singleton row startup decodes into MigrationSource.
     EXECUTE format('SELECT concat_ws('','', pg_typeof(source_state), pg_typeof(source_release), pg_typeof(source_commit), pg_typeof(candidate_storage_version), pg_typeof(prior_schema_version), pg_typeof(migrated_by), pg_typeof(migrated_at)) AS types, source_state IS NULL OR prior_schema_version IS NULL OR migrated_by IS NULL OR migrated_at IS NULL AS incomplete FROM %s WHERE singleton LIMIT 1', source_table) INTO source;
@@ -203,6 +215,7 @@ SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
     'block_hash', block_hash, 'block_height', block_height,
     'parent_hash', parent_hash, 'coinbase_txid', coinbase_txid,
     'payout_manifest_sha256', payout_manifest_sha256,
+    'as_issued_audit_sha256', to_jsonb(b)->'as_issued_audit_sha256',
     'audit_publication_sequence', audit_publication_sequence,
     'chain_state', chain_state, 'maturity_state', maturity_state,
     'found_at', to_jsonb(found_at AT TIME ZONE 'UTC'),
@@ -287,10 +300,19 @@ FROM qbit_pool_payout_entries p ORDER BY payout_entry_seq;
 -- Claim ownership is not evidence, and neither is the clock-derived schedule:
 -- migration 002 backfills next_attempt_at from clock_timestamp(), so only the
 -- parked sentinel (infinity) is durable and clock-independent.
+-- An offer reservation is durable authority, unlike a renewable claim. Keep
+-- its owner/time and the observed proof/call/outcome, including unknowns, so
+-- restoring a row cannot silently rewind or alter its one-offer evidence.
 SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'block_hash', block_hash, 'share_id', share_id,
     'candidate_sha256', candidate_sha256, 'state', state,
     'candidate', candidate,
+    'proof_observed_at_ms', to_jsonb(o)->'proof_observed_at_ms',
+    'offer_reserved_at', to_jsonb((to_jsonb(o)->>'offer_reserved_at')::timestamptz AT TIME ZONE 'UTC'),
+    'offer_reserved_by', to_jsonb(o)->'offer_reserved_by',
+    'offered_at_ms', to_jsonb(o)->'offered_at_ms',
+    'offer_outcome', to_jsonb(o)->'offer_outcome',
+    'offer_reply', to_jsonb(o)->'offer_reply',
     'block_bytes', to_jsonb(o)->'block_bytes',
     'window_anchor_ms', to_jsonb(o)->'window_anchor_ms',
     'window_prior_balances_sha256', to_jsonb(o)->'window_prior_balances_sha256',
@@ -303,7 +325,8 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'created_at', to_jsonb(created_at AT TIME ZONE 'UTC'),
     'parked', CASE WHEN to_jsonb(o)->'next_attempt_at' = '"infinity"'::jsonb THEN true END))
 FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
--- Pending candidates retain the as-issued balances needed for replay.
+-- Every unfinished candidate retains the as-issued balances needed to land
+-- or reconcile its audit, including a row that must never be offered again.
 -- Ignore unreferenced snapshots, which ordinary garbage collection removes.
 SELECT (to_regclass('qbit_prism_balance_snapshots') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_candidate_balances
@@ -314,7 +337,7 @@ SELECT jsonb_build_object('kind', 'candidate_balances', 'row', jsonb_build_objec
     'balances_sha256', encode(pg_catalog.sha256(b.balances), 'hex')))
 FROM qbit_prism_balance_snapshots b
 WHERE EXISTS (SELECT 1 FROM qbit_block_candidate_outbox c
-              WHERE c.state = 'pending'
+              WHERE c.state IN ('pending','offer_reserved','offered','reconciliation')
                 AND c.window_prior_balances_sha256 = b.prior_balances_digest)
 ORDER BY b.prior_balances_digest COLLATE "C";
 \endif
@@ -405,7 +428,9 @@ SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
        (to_regclass('qbit_prism_cluster') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
        (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events,
+       (to_regclass('qbit_prism_policy_transitions') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions
 \gset
 -- Native replay protection must survive recovery. Frozen 2.x exports the
 -- exact mapping migration 002 will backfill, including its duplicate rule.
@@ -496,6 +521,16 @@ SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
     'sequence', 'qbit_prism_fatal_state_events_event_id_seq',
     'last_value', last_value, 'is_called', is_called))
 FROM qbit_prism_fatal_state_events_event_id_seq WHERE is_called OR last_value <> 1;
+\endif
+\if :has_policy_transitions
+SELECT jsonb_build_object('kind', 'policy_transitions', 'row', to_jsonb(t))
+FROM qbit_prism_policy_transitions t ORDER BY transition_id;
+-- Preserve journal allocation, including gaps from rolled-back transitions.
+-- Omit only the untouched native default, as for fatal-state history above.
+SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
+    'sequence', 'qbit_prism_policy_transitions_transition_id_seq',
+    'last_value', last_value, 'is_called', is_called))
+FROM qbit_prism_policy_transitions_transition_id_seq WHERE is_called OR last_value <> 1;
 \endif
 
 -- Exact row shape/order used by 2.x _carry_forward_audit_head_locked.

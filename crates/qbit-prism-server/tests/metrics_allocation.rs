@@ -201,7 +201,7 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
 }
 
 #[test]
-fn event_exposition_matches_the_pre_allocation_change_byte_for_byte() {
+fn event_exposition_preserves_the_pinned_contract_and_additive_telemetry() {
     let metrics = Metrics::default();
     for millis in [0, 5, 10, 25, 125, 5000, 5001, 15000, 35000] {
         observe_all(&metrics, Duration::from_millis(millis));
@@ -210,6 +210,8 @@ fn event_exposition_matches_the_pre_allocation_change_byte_for_byte() {
     let body = metrics.render();
     // Captured with the registry/events/labels and initialization from 2914a629,
     // and refreshed at e13051cf, which added the `ledger-outcome-unknown` reason.
+    // The #278 follow-up adds only four ACK buckets and `unrecognised` below;
+    // all previously captured samples and histogram metadata remain unchanged.
     // This pins HELP, TYPE, ordering, escaping, cumulative buckets, count and sum,
     // so adding a value to a closed label set has to be recorded here too.
     let expected = include_str!("fixtures/metric_events.prom");

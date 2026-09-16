@@ -208,6 +208,65 @@ impl Drop for AppendTask {
     }
 }
 
+/// Construct the durable candidate from the job's immutable issued inputs.
+pub(super) async fn submission_candidate(
+    job: &MiningJob<JobContext>,
+    submission: codec::Submission,
+    share: AcceptedShare,
+) -> Result<Candidate> {
+    let context = Arc::clone(&job.context);
+    let job_id = job.wire.job_id.clone();
+    let extranonce1 = job.wire.extranonce1.clone();
+    let extranonce2_size = job.wire.extranonce2_size;
+    // The job context is shared; the recipient-sized copy and block encoding
+    // belong on a blocking worker, before the ledger transaction begins.
+    tokio::task::spawn_blocking(move || {
+        let original = context
+            .bundle
+            .coinbase_script_sig_suffix_hex
+            .as_ref()
+            .context("job coinbase suffix missing")?;
+        let placeholder_length = (4 + extranonce2_size) * 2;
+        let prefix = original
+            .get(
+                ..original
+                    .len()
+                    .checked_sub(placeholder_length)
+                    .context("job coinbase suffix too short")?,
+            )
+            .context("invalid job suffix")?;
+        let suffix = format!("{prefix}{}{}", extranonce1, submission.extranonce2_hex);
+        // The slim candidate: the window reference `refresh_once`
+        // already computed, the stored inputs the job was built with,
+        // and the block as bytes. Nothing here walks the window, clones
+        // the bundle or reads configuration. The as-issued balances,
+        // O(recipients), travel beside the document so the enqueue can
+        // write the snapshot the post-offer landing rebuilds from.
+        let inputs = &context.prepared.inputs;
+        let block_bytes = hex::decode(&submission.block_hex)?;
+        anyhow::Ok(Candidate {
+            block_hash: submission.block_hash_hex,
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
+            job_id,
+            payout_revision: context.prepared.snapshot.payout_revision,
+            window: context.prepared.window,
+            bootstrap_share: context.bootstrap_share.clone(),
+            found_block: context.bundle.found_block.clone(),
+            payout_policy: inputs.payout_policy.clone(),
+            ctv: inputs.ctv.clone(),
+            audit_builder_version: inputs.audit_builder_version,
+            signer_keys: inputs.signer_keys.clone(),
+            leased: false,
+            coinbase_suffix_hex: suffix,
+            deferred_share: (!submission.share_pass).then_some(share),
+            block_bytes,
+            as_issued_balances: context.prepared.snapshot.prior_balances.clone(),
+        })
+    })
+    .await
+    .context("candidate construction worker failed")?
+}
+
 impl Coordinator {
     /// Record the internal cause at its refusal branch. The response stays the
     /// generic `stale-job` answer that miners and the share observation see.
@@ -223,6 +282,11 @@ impl Coordinator {
         submission: codec::Submission,
         stale_grace: StaleGrace,
     ) -> Result<(), StratumError> {
+        // The proof-observation boundary of the first-offer latency: this
+        // frontend's wall clock as the locally validated block proof enters
+        // the coordinator, before any await. Recorded on the candidate row
+        // at enqueue; a clock before the epoch leaves it unknown.
+        let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
         let (last_poll, readiness_generation) = {
             let readiness = self.readiness.read().await;
             let last_poll = readiness.last_poll.ok_or_else(|| {
@@ -355,53 +419,13 @@ impl Coordinator {
         let share_id = share.share_id.clone();
         let block_hash = submission.block_hash_hex.clone();
         let share_pass = submission.share_pass;
-        let candidate = (|| {
-            if !(submission.block_pass && candidate_current) {
-                return Ok(None);
-            }
-            let original = context
-                .bundle
-                .coinbase_script_sig_suffix_hex
-                .as_ref()
-                .context("job coinbase suffix missing")?;
-            let placeholder_length = (4 + job.wire.extranonce2_size) * 2;
-            let prefix = original
-                .get(
-                    ..original
-                        .len()
-                        .checked_sub(placeholder_length)
-                        .context("job coinbase suffix too short")?,
-                )
-                .context("invalid job suffix")?;
-            let suffix = format!(
-                "{prefix}{}{}",
-                job.wire.extranonce1, submission.extranonce2_hex
-            );
-            // The slim candidate: the window reference `refresh_once`
-            // already computed, the stored inputs the job was built with,
-            // and the block as bytes. Nothing here walks the window, clones
-            // the bundle or reads configuration.
-            let inputs = &context.prepared.inputs;
-            let block_bytes = hex::decode(&submission.block_hex)?;
-            anyhow::Ok(Some(Candidate {
-                block_hash: submission.block_hash_hex,
-                block_sha256: Candidate::block_digest_hex(&block_bytes),
-                job_id: job.wire.job_id.clone(),
-                payout_revision: context.prepared.snapshot.payout_revision,
-                window: context.prepared.window,
-                bootstrap_share: context.bootstrap_share.clone(),
-                found_block: context.bundle.found_block.clone(),
-                payout_policy: inputs.payout_policy.clone(),
-                ctv: inputs.ctv.clone(),
-                audit_builder_version: inputs.audit_builder_version,
-                signer_keys: inputs.signer_keys.clone(),
-                leased: false,
-                coinbase_suffix_hex: suffix,
-                deferred_share: (!share_pass).then(|| share.clone()),
-                block_bytes,
-                as_issued_balances: Vec::new(),
-            }))
-        })();
+        let candidate = if submission.block_pass && candidate_current {
+            submission_candidate(job, submission, share.clone())
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        };
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
             Ok(candidate) if share_pass => {
@@ -411,11 +435,18 @@ impl Coordinator {
                 let fence = lease
                     .filter(|_| selected.share_lease)
                     .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
-                self.persist_share_pass(share, candidate, revision, start, fence)
-                    .await
+                self.persist_share_pass(
+                    share,
+                    candidate,
+                    proof_observed_at_ms,
+                    revision,
+                    start,
+                    fence,
+                )
+                .await
             }
             Ok(candidate) => {
-                self.persist_block_only(&share, candidate, &block_hash, start)
+                self.persist_block_only(&share, candidate, proof_observed_at_ms, &block_hash, start)
                     .await
             }
         };
@@ -483,6 +514,7 @@ impl Coordinator {
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         revision: i64,
         start: tokio::time::Instant,
         lease: Option<publication_authority::LeaseCommitFence>,
@@ -497,7 +529,13 @@ impl Coordinator {
         let mut task = AppendTask {
             handle: Some(tokio::spawn(async move {
                 let result = ledger
-                    .append_at_revision(share, candidate, revision, task_gate.clone())
+                    .append_at_revision_observed(
+                        share,
+                        candidate,
+                        proof_observed_at_ms,
+                        revision,
+                        task_gate.clone(),
+                    )
                     .await;
                 // Measured here, not at the join: a coordinator task that is
                 // scheduled late must not turn a durable commit into unknown.
@@ -562,6 +600,7 @@ impl Coordinator {
         &self,
         share: &AcceptedShare,
         candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
         block_hash: &str,
         start: tokio::time::Instant,
     ) -> SaveOutcome {
@@ -597,8 +636,11 @@ impl Coordinator {
         // so a degraded database cannot hold the acknowledgement past `bound`.
         let mut phase = "candidate-pending";
         let ledger = self.ledger.clone();
-        let mut enqueue =
-            tokio::spawn(async move { ledger.enqueue_candidate_once(candidate).await });
+        let mut enqueue = tokio::spawn(async move {
+            ledger
+                .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+                .await
+        });
         match tokio::time::timeout_at(bound, &mut enqueue).await {
             Ok(Ok(Ok(true))) => {}
             Ok(Ok(Ok(false))) => return SaveOutcome::Duplicate,
@@ -641,8 +683,8 @@ impl Coordinator {
             // finalization cannot fall between two separate reads.
             let poll = tokio::time::timeout_at(
                 bound,
-                sqlx::query_as::<_, (bool, Option<String>)>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)
@@ -651,17 +693,23 @@ impl Coordinator {
             .await;
             match poll {
                 Err(_) => break,
-                Ok(Ok((true, _))) => return SaveOutcome::Accepted,
-                // D2b's answer for an abandoned candidate. It is not a proof:
-                // reconciliation still credits the deferred share if the block
-                // later becomes active.
-                Ok(Ok((false, Some(state)))) if state != "pending" => {
+                Ok(Ok((true, _, _))) => return SaveOutcome::Accepted,
+                // D2b's answer for a candidate the pre-offer probe abandoned
+                // as superseded, or one the node refused after the offer
+                // (kept in reconciliation with the rejected outcome). It is
+                // not a proof: reconciliation still credits the deferred
+                // share if the block later becomes active.
+                Ok(Ok((false, Some(state), outcome)))
+                    if state == "abandoned"
+                        || (state == CandidateState::Reconciliation.as_str()
+                            && outcome.as_deref() == Some(OfferOutcome::Rejected.as_str())) =>
+                {
                     return SaveOutcome::Failed(anyhow::anyhow!(
                         "block-only proof was not accepted on the active chain"
                     ))
                 }
-                Ok(Ok((false, Some(_)))) => phase = "candidate-pending",
-                Ok(Ok((false, None))) => {}
+                Ok(Ok((false, Some(_), _))) => phase = "candidate-pending",
+                Ok(Ok((false, None, _))) => {}
                 // The candidate is already durable, so a failed read proves
                 // nothing about its credit.
                 Ok(Err(error)) => {

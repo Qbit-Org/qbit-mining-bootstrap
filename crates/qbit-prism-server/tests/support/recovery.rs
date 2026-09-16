@@ -3,7 +3,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy};
 use qbit_prism_server::api::{self, ApiConfig, ApiState};
 use serde_json::Value;
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use std::{io::Write, path::Path, process::Stdio, sync::Arc};
 use tokio::process::Command;
 use tower::ServiceExt;
@@ -343,20 +343,16 @@ pub async fn restore(
         .join("\n")
         .replace(&format!("CREATE SCHEMA {};", source.schema), "")
         .replace(&source.schema, &target.schema);
-    // The SQL clears search_path for its whole session, and COMMIT keeps that,
-    // so it runs on a connection of its own, closed afterwards, instead of one
-    // that would go back to `target.pool` and resolve later reads nowhere.
-    let mut connection = PgConnection::connect(&target.url).await?;
-    let restored = async {
-        let mut transaction = connection.begin().await?;
-        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
-        transaction.commit().await?;
-        anyhow::Ok(())
-    }
-    .await;
-    let closed = connection.close().await;
-    restored?;
-    closed?;
+    let mut transaction = target.pool.begin().await?;
+    sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+    // pg_restore's SQL clears search_path. Return this pooled connection to
+    // the fixture's schema before reusing it: qualifying an outer DELETE is
+    // insufficient when its trigger body resolves unqualified ledger tables.
+    sqlx::query("SELECT pg_catalog.set_config('search_path',$1,false)")
+        .bind(&target.schema)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(())
 }
 

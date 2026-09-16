@@ -42,6 +42,12 @@ enum Command {
     },
     /// Check node identity, database integrity, API readiness and cluster settings.
     SelfCheck,
+    /// Change pool fees or CTV fee rates after stopping every frontend.
+    PolicyTransition {
+        /// Env-file overrides for the target policy; the process env is the current policy.
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Inspect a cluster halt or reconcile and record an operator recovery.
     FatalState {
         #[command(subcommand)]
@@ -90,8 +96,18 @@ enum FatalStateCommand {
     },
 }
 
-pub async fn run() -> Result<()> {
-    match Cli::parse().command.unwrap_or(Command::Run) {
+/// Parse both configurations on the single-threaded entry path, before Tokio starts.
+pub fn prepare() -> Result<impl std::future::Future<Output = Result<()>>> {
+    let command = Cli::parse().command.unwrap_or(Command::Run);
+    let transition = match &command {
+        Command::PolicyTransition { to } => Some(config::transition_configs(to)?),
+        _ => None,
+    };
+    Ok(run(command, transition))
+}
+
+async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<()> {
+    match command {
         Command::Run => crate::server::run(Config::from_env()?).await,
         Command::PublicApi => {
             let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -122,6 +138,16 @@ pub async fn run() -> Result<()> {
         }
         Command::Healthcheck { url, public_api } => healthcheck(url, public_api).await,
         Command::SelfCheck => self_check().await,
+        Command::PolicyTransition { .. } => {
+            let (current, target) =
+                transition.context("policy transition configuration missing")?;
+            let ledger =
+                crate::ledger::Ledger::connect_operator(&current.database_url, false).await?;
+            let result = ledger.transition_policy(&current, &target).await;
+            ledger.pool.close().await;
+            println!("{}", serde_json::to_string_pretty(&result?)?);
+            Ok(())
+        }
         Command::FatalState { command } => fatal_state(command).await,
         Command::HeaderDifficulty { bits } => {
             let compact = crate::codec::parse_u32_hex(&bits)?;

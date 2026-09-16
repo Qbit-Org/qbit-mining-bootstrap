@@ -225,8 +225,16 @@ impl Ledger {
             .await?;
         if initialize {
             let mut tx = begin(&pool, metrics.as_deref()).await?;
-            migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
+            let online =
+                migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
             tx.commit().await?;
+            // Index rebuilds run after the commit, outside any transaction
+            // and with CONCURRENTLY, so appends continue; each is recorded
+            // once it has completed, and the gate below refuses the
+            // database until then.
+            for pending in &online {
+                migration::apply_online_migration(&pool, pending, metrics.as_deref()).await?;
+            }
         }
         // The startup gate. Every start, with or without `initialize`, reads
         // the schema version and the declared capabilities before any
@@ -268,33 +276,35 @@ impl Ledger {
     ///
     /// `signer_keys` are this frontend's public signing keys. Writing a
     /// fingerprint onto a reset (NULL) one is a rotation, and it is refused
-    /// in the same transaction while any pending outbox row stores other
-    /// keys: no frontend with the new keys could rebuild such a candidate,
-    /// and the rotation procedure drains and stops the old frontends first.
+    /// in the same transaction while any unfinished outbox row (pending or
+    /// offered but not yet landed) stores other keys: no frontend with the
+    /// new keys could rebuild such a candidate, and the rotation procedure
+    /// drains and stops the old frontends first.
     pub async fn configure(&self, fingerprint: &str, signer_keys: &SignerKeys) -> Result<()> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
-        let saved: Option<String> = sqlx::query_scalar(
-            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+        let (saved, revision): (Option<String>, i64) = sqlx::query_as(
+            "SELECT config_fingerprint,payout_revision FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
         )
         .fetch_one(&mut *tx)
         .await?;
         if let Some(saved) = saved {
             ensure!(
                 saved == fingerprint,
-                "cluster configuration fingerprint mismatch"
+                "cluster configuration fingerprint mismatch at payout revision {revision}; use the active policy (see qbit_prism_policy_transitions)"
             );
         } else {
-            let foreign: Vec<String> = sqlx::query_scalar(
-                "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND (candidate->'signer_keys'->>'manifest_key_hex' IS DISTINCT FROM $1 OR candidate->'signer_keys'->>'ledger_key_hex' IS DISTINCT FROM $2) ORDER BY block_hash",
-            )
+            let foreign: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state IN {} AND (candidate->'signer_keys'->>'manifest_key_hex' IS DISTINCT FROM $1 OR candidate->'signer_keys'->>'ledger_key_hex' IS DISTINCT FROM $2) ORDER BY block_hash",
+                CandidateState::UNFINISHED_SQL
+            ))
             .bind(&signer_keys.manifest_key_hex)
             .bind(&signer_keys.ledger_key_hex)
             .fetch_all(&mut *tx)
             .await?;
             ensure!(
                 foreign.is_empty(),
-                "refusing to pin a new cluster fingerprint: pending block candidates {} were signed with other keys. \
+                "refusing to pin a new cluster fingerprint: unfinished block candidates {} were signed with other keys. \
                  Drain the outbox with the frontends that hold those keys, stop them, and only then reset the fingerprint",
                 foreign.join(", ")
             );
