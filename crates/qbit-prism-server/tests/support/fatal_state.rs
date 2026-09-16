@@ -7,9 +7,7 @@ use serde_json::Value;
 use std::{process::Output, time::Duration};
 use tokio::process::Command;
 
-#[allow(dead_code)]
-#[path = "fake_qbitd.rs"]
-mod fake;
+use super::fake_qbitd as fake;
 
 async fn setup(db: &Database) -> Result<(Ledger, fake::FakeNode, Config)> {
     let ledger = db.ledger("frontend-a").await?;
@@ -209,7 +207,7 @@ async fn clear_refuses_live_starting_stale_and_unknown_instances() -> Result<()>
             Default::default(),
         )))
         .await?;
-    sqlx::raw_sql("INSERT INTO qbit_prism_instances(instance_id,status,heartbeat_at) VALUES ('starting','{\"state\":\"starting\"}',clock_timestamp()),('stale-live','{\"ready\":true}',clock_timestamp()-interval '1 day'),('unknown','{}',clock_timestamp())").execute(&ledger.pool).await?;
+    sqlx::raw_sql("INSERT INTO qbit_prism_instances(instance_id,status,heartbeat_at) VALUES ('starting','{\"state\":\"starting\",\"candidate_offer_lifecycle\":1}',clock_timestamp()),('stale-live','{\"ready\":true}',clock_timestamp()-interval '1 day'),('unknown','{}',clock_timestamp())").execute(&ledger.pool).await?;
     let before = ledger.fatal_state().await?;
     let out = cli(
         &db,
@@ -512,7 +510,7 @@ async fn recovery_serializes_new_heartbeats_and_concurrent_clear() -> Result<()>
     tokio::time::timeout(Duration::from_secs(5), proxy.state.entered.notified()).await?;
     let pool = ledger.pool.clone();
     let mut registration = tokio::spawn(async move {
-        sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES('new-frontend','{\"state\":\"starting\"}')").execute(&pool).await
+        sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES('new-frontend','{\"state\":\"starting\",\"candidate_offer_lifecycle\":1}')").execute(&pool).await
     });
     let recovering = ledger.clone();
     let mut second = tokio::spawn(async move {

@@ -3,6 +3,9 @@
 PRISM rejection reason IDs are stable machine-readable strings. Operator logs,
 Prometheus metrics, Stratum error data, ledger rejected-row fixtures, and future
 dashboard/API surfaces should use these IDs instead of parsing human messages.
+This reference includes legacy IDs retained for historical records. The
+[native metric inventory](prism-native-metrics.md) lists the current closed
+share-rejection label set.
 
 | Reason ID | Meaning |
 | --- | --- |
@@ -14,20 +17,30 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 | `unknown-job` | The job ID was unknown or no longer active for that client. |
 | `invalid-extranonce` | The extranonce field had an invalid shape for this coordinator. |
 | `invalid-ntime-or-nonce` | `ntime` or `nonce` was not a 4-byte hex string. |
-| `candidate-audit-mismatch` | The final PRISM audit bundle did not match the submitted coinbase. |
-| `submitblock-rejected` | qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
+| `candidate-audit-mismatch` | Legacy taxonomy; no native share producer. The final PRISM audit bundle did not match the submitted coinbase. |
+| `submitblock-rejected` | Legacy taxonomy; no native share producer. qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
 | `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. |
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
-| `block-stale` | The block candidate height was stale against the active qbit tip. |
+| `block-stale` | Legacy taxonomy; no native share producer. The block candidate height was stale against the active qbit tip. |
 | `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. For block-only proofs, the block was not on the active chain when its candidate was abandoned; a later reorg or late landing can still credit it. |
 | `ledger-outcome-unknown` | The ledger outcome was not known by the acknowledgement deadline; the share may still be credited (logged with `share_id`). |
 
-The coordinator exposes these IDs in:
+The native coordinator exposes its produced reason IDs in:
 
 - Stratum JSON-RPC error data as `{"reason_id": "<id>"}` when a rejection is
   classified.
 - Prometheus as `qbit_prism_rejections_total{reason_id="<id>"}`.
+
+For share telemetry, present unknown or empty IDs normalize to the bounded
+`unrecognised` label. This is a metrics-only fallback, not a new protocol
+response: the numeric error, message and reason metadata stay unchanged.
+Explicit `internal-error` and missing (`None`) IDs retain the `internal-error`
+label. The existing reason-less username-limit refusal is an authorization
+event and never enters share-rejection telemetry. See the
+[native inventory](prism-native-metrics.md) for the per-reason alert implications;
+an `unrecognised` count indicates a real rejection with a reason outside the
+known taxonomy, not a healthy or absent event.
 
 For ready-pool refreshes, share validation follows the last qbit tip for which
 the refresh path has a coherent, final-validated replacement bundle ready to

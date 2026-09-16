@@ -28,9 +28,10 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
     Ok(ProcessMetrics { resident_bytes })
 }
 
-/// One bounded read-only MVCC snapshot over pending candidate metadata.
-/// No share-table scan, candidate JSON decode, or accounting lock.
-/// A/#266 must extend the pending predicate when new outbox states land.
+/// One bounded read-only MVCC snapshot over unfinished candidate metadata:
+/// every row the offer lifecycle (migration 011) has not finished, pending
+/// and offered-but-not-landed alike. No share-table scan, candidate JSON
+/// decode, or accounting lock.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
@@ -40,7 +41,7 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")
             .execute(&mut *tx).await?;
         let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
-            "SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state='pending'"
+            "SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered','reconciliation')"
         ).fetch_one(&mut *tx).await?;
         let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)? };
         tx.commit().await?;

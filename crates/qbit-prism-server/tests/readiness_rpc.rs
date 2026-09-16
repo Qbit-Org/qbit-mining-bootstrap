@@ -3,7 +3,11 @@ use axum::{extract::State, routing::post, Json, Router};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::{
-    config::Config, coordinator::Coordinator, ledger::Candidate, readiness, rpc::Rpc,
+    config::Config,
+    coordinator::Coordinator,
+    ledger::{Candidate, CandidateClaim},
+    readiness,
+    rpc::Rpc,
     stratum::MiningBackend,
 };
 use qbit_prism_test_gate as gate;
@@ -28,6 +32,9 @@ struct NodeState {
     mempool: Value,
     fee_floor_calls: usize,
     network_calls: usize,
+    /// How many times `submitblock` was called; this node answers it with
+    /// an error, so every offer's outcome is unknown.
+    submit_calls: usize,
     drop_peers_after: Option<usize>,
     pause_network_after: Option<usize>,
     tip_parent: String,
@@ -55,6 +62,7 @@ impl Node {
             mempool: json!({"minrelaytxfee":"0.00001","mempoolminfee":"0.00001"}),
             fee_floor_calls: 0,
             network_calls: 0,
+            submit_calls: 0,
             drop_peers_after: None,
             pause_network_after: None,
             tip_parent: "cd".repeat(32),
@@ -120,6 +128,12 @@ async fn answer(
         "getblockheader" => json!({"previousblockhash":state.tip_parent}),
         "validateaddress" => {
             json!({"isvalid":true,"scriptPubKey":format!("5220{}","11".repeat(32))})
+        }
+        "submitblock" => {
+            state.submit_calls += 1;
+            return Json(
+                json!({"id":request["id"],"result":null,"error":{"code":-32601,"message":"unexpected RPC"}}),
+            );
         }
         _ => {
             return Json(
@@ -275,6 +289,61 @@ async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
     Ok(())
 }
 
+/// The candidate is not settled by an attempt whose node observation
+/// failed: its row is in reconciliation with that failure as its reason and
+/// the one unknown offer outcome, no pool block row exists, and the node saw
+/// exactly one `submitblock`.
+async fn assert_unsettled(
+    coordinator: &Coordinator,
+    node: &Node,
+    block_hash: &str,
+    label: &str,
+) -> Result<()> {
+    let (state, error, outcome): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state,last_error,offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+    )
+    .bind(block_hash)
+    .fetch_one(&coordinator.ledger.pool)
+    .await?;
+    ensure!(
+        state == "reconciliation",
+        "{label}: unsafe node observation left the candidate {state}"
+    );
+    ensure!(
+        outcome.as_deref() == Some("unknown"),
+        "{label}: {outcome:?}"
+    );
+    ensure!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("post-offer processing failed")),
+        "{label}: {error:?}"
+    );
+    let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_pool_blocks")
+        .fetch_one(&coordinator.ledger.pool)
+        .await?;
+    ensure!(
+        blocks == 0,
+        "{label}: unsafe node observation landed candidate payout rows"
+    );
+    let offers = node.state.lock().await.submit_calls;
+    ensure!(offers == 1, "{label}: the block was offered {offers} times");
+    Ok(())
+}
+
+/// Expire the row's released claim and take it again for the next attempt.
+async fn reclaim(coordinator: &Coordinator, block_hash: &str) -> Result<CandidateClaim> {
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+        .bind(block_hash)
+        .execute(&coordinator.ledger.pool)
+        .await?;
+    coordinator
+        .ledger
+        .claim_candidate(120)
+        .await?
+        .context("the reconciliation row was not claimable")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -372,8 +441,9 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             block_bytes,
             as_issued_balances: Vec::new(),
         };
+        let block_hash = proof.block_hash_hex.clone();
         coordinator.ledger.enqueue_candidate(candidate).await?;
-        let claim = coordinator
+        let mut claim = coordinator
             .ledger
             .claim_candidate(120)
             .await?
@@ -409,14 +479,16 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
                 .await
                 .is_err());
             if failure != "template" {
-                ensure!(coordinator.process_candidate(&claim).await.is_err());
-                let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_pool_blocks")
-                    .fetch_one(&coordinator.ledger.pool)
-                    .await?;
-                ensure!(
-                    blocks == 0,
-                    "unsafe node observation landed candidate payout rows"
-                );
+                // The offer precedes any chain observation (#266): the block
+                // is offered once (this node answers submitblock with an
+                // error, an unknown outcome) and every attempt's post-offer
+                // observation then fails on the unsafe node, so the row
+                // settles in reconciliation with that reason. It is never
+                // offered again, and nothing lands or confirms while the
+                // node is unsafe.
+                coordinator.process_candidate(&claim).await?;
+                assert_unsettled(&coordinator, &node, &block_hash, failure).await?;
+                claim = reclaim(&coordinator, &block_hash).await?;
             }
             {
                 let mut state = node.state.lock().await;
@@ -440,14 +512,9 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             state.network["connections"] = json!(2);
             state.drop_peers_after = Some(1);
         }
-        ensure!(coordinator.process_candidate(&claim).await.is_err());
-        let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_pool_blocks")
-            .fetch_one(&coordinator.ledger.pool)
-            .await?;
-        ensure!(
-            blocks == 0,
-            "peer loss during candidate proof landed payout rows"
-        );
+        coordinator.process_candidate(&claim).await?;
+        assert_unsettled(&coordinator, &node, &block_hash, "peer loss during proof").await?;
+        claim = reclaim(&coordinator, &block_hash).await?;
         {
             let mut state = node.state.lock().await;
             state.network["connections"] = json!(2);
@@ -513,10 +580,10 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             node.state.lock().await.network["connections"] = json!(2);
             gate.release.notify_one();
             let refresh_result = tokio::time::timeout(Duration::from_secs(5), refresh).await??;
-            ensure!(
-                candidate_result.is_err(),
-                "unsafe concurrent candidate observation succeeded"
-            );
+            candidate_result
+                .context("the unsafe concurrent candidate observation was not settled")?;
+            assert_unsettled(&coordinator, &node, &block_hash, "concurrent revocation").await?;
+            claim = reclaim(&coordinator, &block_hash).await?;
             ensure!(
                 refresh_result
                     .err()

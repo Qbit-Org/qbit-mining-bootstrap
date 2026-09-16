@@ -363,7 +363,14 @@ async fn incident_1_body(fixture: &Fixture, n: u64) -> Result<()> {
                 expires_micros,
                 live,
             };
-            if poll.state == "pending" && poll.token.as_deref() == Some(&claim.claim_token) {
+            // The owned lease is the row's, whatever unfinished state the
+            // attempt has moved it to: it is reserved and offered before the
+            // large window claim is rebuilt, and the renewals under test
+            // happen after that.
+            let unfinished = ["pending", "offer_reserved", "offered", "reconciliation"];
+            if unfinished.contains(&poll.state.as_str())
+                && poll.token.as_deref() == Some(&claim.claim_token)
+            {
                 let expires = poll.expires_micros.context("a claimed row has no expiry")?;
                 if expiries.last().is_none_or(|(last, _)| *last != expires) {
                     expiries.push((expires, Instant::now()));

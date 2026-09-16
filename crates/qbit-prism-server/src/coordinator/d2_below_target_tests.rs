@@ -777,45 +777,45 @@ async fn block_only_proof_with_a_lost_submitblock_reply_is_credited_once_by_reco
         let solved = solve(&fixture, &case).await?;
         assert_uncredited_intent(&fixture, &solved, name).await?;
 
-        // The node took the block and then lost its reply. The landing record
-        // survives; nothing about the payout may advance on it.
-        let error = fixture
-            .drive_candidate()
-            .await?
-            .expect_err("a lost submitblock reply is not a completed candidate");
+        // The node took the block and then lost its reply: the one offer's
+        // outcome is unknown and is recorded as such. The attempt never
+        // offers again; it reconciles the unknown delivery against the
+        // chain itself, where the block is active, so it lands the audit,
+        // confirms the block and credits the deferred share inside that
+        // confirmation. Nothing about the payout advanced on the lost reply.
+        fixture.drive_candidate().await??;
         ensure!(
             fixture.submissions().await == 1,
             "{name}: the block reached submitblock more than once"
         );
+        let (outcome, reply): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT offer_outcome,offer_reply FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        )
+        .bind(&solved.block_hash)
+        .fetch_one(&fixture.coordinator.ledger.pool)
+        .await?;
         ensure!(
-            error.to_string().contains("submitblock"),
-            "{name}: the candidate failed for an unrelated reason: {error}"
+            outcome.as_deref() == Some("unknown"),
+            "{name}: a lost reply was recorded as {outcome:?}"
         );
         ensure!(
-            fixture.chain_state(&solved.block_hash).await?.as_deref() == Some("prepared"),
-            "{name}: an unacknowledged block was treated as confirmed"
+            reply
+                .as_deref()
+                .is_some_and(|reply| reply.contains("submitblock") || reply.contains("work queue")),
+            "{name}: the lost reply's reason was not kept: {reply:?}"
         );
-        ensure!(
-            fixture.outbox_state(&solved.block_hash).await?.as_deref() == Some("pending"),
-            "{name}: the unresolved candidate reached a terminal state"
-        );
-        ensure!(
-            fixture.credit_rows(&solved.share_id).await? == 0,
-            "{name}: an unacknowledged block was credited"
-        );
-        ensure!(
-            !solved.submit.is_finished(),
-            "{name}: the submission was acknowledged before reconciliation"
-        );
-
-        // Reconciliation observes the block on the active chain and credits it
-        // inside the same confirmation transaction.
-        fixture.coordinator.refresh_once().await?;
         ensure!(
             fixture.chain_state(&solved.block_hash).await?.as_deref() == Some("confirmed"),
-            "{name}: reconciliation did not confirm the active block"
+            "{name}: the reconciling attempt did not confirm the active block"
+        );
+        ensure!(
+            fixture.outbox_state(&solved.block_hash).await?.as_deref() == Some("submitted"),
+            "{name}: the reconciled candidate did not finish"
         );
         assert_credited(&fixture, &case, &solved.share_id).await?;
+        // The next refresh observes the confirmed block and prepares the
+        // following block's work on the window that now holds the credit.
+        fixture.coordinator.refresh_once().await?;
         let projection = fixture.projection().await?;
         let share_id = solved.share_id.clone();
         let response = submission_result(solved, name).await?;
@@ -907,8 +907,8 @@ async fn block_only_proof_the_node_rejects_fails_the_submission_without_credit()
             "{name}: the block reached submitblock more than once"
         );
         ensure!(
-            fixture.outbox_state(&solved.block_hash).await?.as_deref() == Some("abandoned"),
-            "{name}: a refused block did not end abandoned"
+            fixture.outbox_state(&solved.block_hash).await?.as_deref() == Some("reconciliation"),
+            "{name}: a block the node refused after its offer must stay in reconciliation, never abandoned"
         );
         ensure!(
             fixture.credit_rows(&solved.share_id).await? == 0,
