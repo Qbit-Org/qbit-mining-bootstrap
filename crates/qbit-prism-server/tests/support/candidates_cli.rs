@@ -731,6 +731,93 @@ async fn abandon_refuses_every_offered_state_and_leaves_the_row_byte_identical()
     db.close(vec![ledger]).await
 }
 
+/// Pause the real landing after require_claim and its block insert, then expire
+/// the claim while that insert is still invisible to the operator connection.
+#[tokio::test]
+async fn abandon_waits_for_inflight_landing_after_claim_expiry() -> Result<()> {
+    const LANDING_GATE: i64 = 0x42500001;
+    const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    ledger.append(share(1), None).await?;
+    let block = candidate(&ledger.snapshot(100).await?, 425)?;
+    let hash = block.block_hash.clone();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
+
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION pause_candidate_landing() RETURNS trigger LANGUAGE plpgsql AS $$          BEGIN PERFORM pg_advisory_xact_lock({LANDING_GATE}); RETURN NEW; END $$;          CREATE TRIGGER pause_candidate_landing AFTER INSERT ON qbit_pool_blocks          FOR EACH ROW EXECUTE FUNCTION pause_candidate_landing();"
+    )).execute(&ledger.pool).await?;
+    let mut gate = ledger.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(LANDING_GATE)
+        .execute(&mut *gate)
+        .await?;
+    let landing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+        let ledger = ledger.clone();
+        async move {
+            ledger
+                .land_candidate(&claim, &keys().1.public_key_hex())
+                .await
+        }
+    }));
+    let waiting_for = |key: i64| {
+        let pool = &ledger.pool;
+        async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid::bigint=($1>>32) AND objid::bigint=($1&4294967295) AND objsubid=1)"
+                    ).bind(key).fetch_one(pool).await?;
+                    if waiting { return anyhow::Ok(()); }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.context("transaction did not wait for the expected lock")?
+        }
+    };
+    waiting_for(LANDING_GATE).await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
+        .bind(&hash).execute(&ledger.pool).await?;
+    let before = whole_row(&ledger.pool, &hash).await?;
+    let visible: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1)")
+            .bind(&hash)
+            .fetch_one(&ledger.pool)
+            .await?;
+    assert!(!visible, "the landing must still be uncommitted");
+
+    let args = [
+        "candidates",
+        "abandon",
+        "--block-hash",
+        &hash,
+        "--reason",
+        "operator sweep",
+    ];
+    let refused = {
+        let abandon = cli(&db, &node, &args);
+        tokio::pin!(abandon);
+        tokio::select! {
+            result = &mut abandon => bail!("abandon finished before landing committed: {:?}", result?),
+            queued = waiting_for(SETTLEMENT_LOCK) => queued?,
+        }
+        assert_eq!(whole_row(&ledger.pool, &hash).await?, before);
+        gate.commit().await?;
+        tokio::time::timeout(Duration::from_secs(10), landing).await???;
+        abandon.await?
+    };
+    assert_eq!(code(&refused), 6, "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("already in qbit_pool_blocks"));
+    assert_eq!(whole_row(&ledger.pool, &hash).await?, before);
+    assert!(ledger.audit_bundle(&hash).await?.is_some());
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
 #[tokio::test]
 async fn abandon_refuses_unsupported_storage_versions_without_changing_evidence() -> Result<()> {
     let Some(db) = Database::open().await? else {
