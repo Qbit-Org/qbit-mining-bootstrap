@@ -39,6 +39,10 @@ impl Drop for ResumeFlight {
 
 pub(super) struct ResumeFlights {
     entries: StdMutex<HashMap<(String, usize), Weak<ResumeFlight>>>,
+    // Unlike build_slots, this bounds distinct metadata reads and their
+    // retained template/balance decoders, including while awaiting authority
+    // or build admission. Keep the flight until its last waiter finishes;
+    // dropping it early would let overlapping resumes repeat the same work.
     slots: Arc<Semaphore>,
     changed: Arc<Notify>,
 }
@@ -76,6 +80,10 @@ impl ResumeFlights {
                     let ledger = coordinator.work_ledger.clone();
                     let config = coordinator.config.clone();
                     let lookup = key.0.clone();
+                    // An overlapping cohort observes one read outcome,
+                    // including a failure. The weak map owns no result: once
+                    // the last waiter/decoder leaves, a later request retries
+                    // under its own original deadline and admission.
                     let metadata = async move {
                         let result = async {
                             let Some(stored) = ledger
@@ -191,6 +199,7 @@ async fn reconstruct(
                 elapsed_seconds = started.elapsed().as_secs_f64(),
                 "compact reconstruction progress"
             );
+            // Bind admission first so later locals drop before it on error.
             let admission = permit;
             #[cfg(test)]
             let _cleanup = drop_probe;
@@ -248,15 +257,10 @@ async fn reconstruct(
             let wire = body
                 .as_ref()
                 .map(|body| {
-                    codec::Job::from_manifest(
-                        "shared".into(),
+                    bundle_build::shared_base_wire(
                         &metadata.template,
                         &body.signed_coinbase_manifest.manifest,
-                        "00000000",
                         extra_size,
-                        1.0,
-                        0.0,
-                        true,
                     )
                 })
                 .transpose()?;

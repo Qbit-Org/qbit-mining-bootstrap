@@ -15,14 +15,13 @@ pub(super) trait WorkLedger: Send + Sync {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
-    #[allow(dead_code)]
     fn read_window_with_permit<'a>(
         &'a self,
         window: &'a WindowRef,
         balances: BalanceSource,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> BoxFuture<'a, Result<Window, WindowError>>;
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn save_compact_prepared<'a>(
         &'a self,
         key: &'a str,

@@ -48,6 +48,7 @@ impl From<&qbit_prism::AuditBundleBody> for PreparedBundle {
     }
 }
 
+#[cfg(test)]
 impl From<&AuditBundle> for PreparedBundle {
     fn from(bundle: &AuditBundle) -> Self {
         Self {
@@ -127,6 +128,7 @@ impl Coordinator {
         let config = self.config.clone();
         let output = owned
             .spawn_blocking(move |(source, permit)| {
+                // Bind admission first so later locals drop before it on error.
                 let admission = permit;
                 let prepared = source;
                 let snapshot = prepared.bootstrap_snapshot()?;
@@ -138,15 +140,10 @@ impl Coordinator {
                     prepared.reservation.record.coinbase_suffix_hex.clone(),
                     prepared.inputs.clone(),
                 )?;
-                let wire = codec::Job::from_manifest(
-                    "shared".into(),
+                let wire = bundle_build::shared_base_wire(
                     &prepared.template,
                     &body.signed_coinbase_manifest.manifest,
-                    "00000000",
                     extranonce2_size,
-                    1.0,
-                    0.0,
-                    true,
                 )?;
                 let bundle = Arc::new(PreparedBundle::from(&body));
                 drop(body);

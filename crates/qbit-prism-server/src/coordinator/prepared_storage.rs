@@ -85,6 +85,7 @@ impl Coordinator {
         let admitted = compact::CompactOwner::new((original, repair, permit));
         let encoded = admitted
             .spawn_blocking(move |(source, repair, permit)| {
+                // Bind admission first so later locals drop before it on error.
                 let admission = permit;
                 let repair_guard = repair;
                 let original = source;

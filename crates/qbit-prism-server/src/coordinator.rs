@@ -14,7 +14,9 @@ use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use qbit_pool_builder::ManifestSigningKey;
-use qbit_prism::{AcceptedShare, AuditBundle, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy};
+#[cfg(test)]
+use qbit_prism::AuditBundle;
+use qbit_prism::{AcceptedShare, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -37,7 +39,6 @@ mod publication_authority;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
-#[cfg_attr(not(test), allow(dead_code))]
 mod tip_observation;
 mod work_ledger;
 pub use compact_runtime::{PreparedBundle, PreparedSnapshot};
@@ -144,7 +145,7 @@ pub struct Prepared {
     pub parent_of_tip: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct StoredPrepared {
     template: Value,
@@ -165,7 +166,7 @@ struct StoredPrepared {
     coinbase_suffix: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl StoredPrepared {
     /// Legacy rows cannot prove their CTV inputs or builder version. A resumed
     /// candidate (including bootstrap work) must use the exact issued inputs,

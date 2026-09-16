@@ -1,6 +1,25 @@
 //! Borrow the admitted original window for both refresh and reconstruction.
 use super::*;
 
+/// Neutral wire shared by original builds and reconstruction. Each issued job
+/// restores its own identity, entropy, difficulty, mask and expiry afterward.
+pub(super) fn shared_base_wire(
+    template: &Value,
+    manifest: &qbit_pool_builder::PayoutManifest,
+    extranonce2_size: usize,
+) -> Result<codec::Job> {
+    codec::Job::from_manifest(
+        "shared".into(),
+        template,
+        manifest,
+        "00000000",
+        extranonce2_size,
+        1.0,
+        0.0,
+        true,
+    )
+}
+
 /// The caller owns the blocking executor admission through construction and
 /// cleanup. This function never takes another slot or selects current inputs.
 pub(super) fn build_body(
