@@ -1462,6 +1462,16 @@ async fn offer(
         },
     );
     if let Err(error) = write_line(&mut connection.writer, &request).await {
+        // First, before the pending entry goes and the record is assembled.
+        // The submit stays counted as outstanding until this function's
+        // caller decrements it, so a `KillDriver` polling in between still
+        // sees work in flight and can pause, bump the fence and kill while
+        // this branch is running. A fence read further down would then stamp
+        // a write failure that preceded the kill as the kill's, and the
+        // census would re-offer it and report that the kill interrupted work
+        // it never touched. Same rule as `Incoming::Closed`: the identity is
+        // captured when the cause is observed (EP-STATE).
+        let fence = shared.fence();
         if let Some(pending) = connection.pending.remove(&id) {
             let _ = shared.events.send(Event::Submit(Box::new(SubmitRecord {
                 share_id: pending.share_id,
@@ -1477,7 +1487,7 @@ async fn offer(
                 },
                 scheduled_block: pending.scheduled_block,
                 reoffer: pending.reoffer,
-                fence: shared.fence(),
+                fence,
                 header_hex: pending.header_hex,
                 extranonce2_hex: pending.extranonce2_hex,
                 ntime_hex: pending.ntime_hex,
