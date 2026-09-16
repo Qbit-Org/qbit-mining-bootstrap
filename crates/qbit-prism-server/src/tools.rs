@@ -391,8 +391,9 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
 
 /// One exit status per abandon outcome, so a runbook can tell a row that was
 /// never there (2) from one already abandoned (4), and both from the two
-/// refusals that protect the invariant: a block that may already have been
+/// lifecycle refusals: a block that may already have been
 /// offered to the node (3) and a block whose accounting has landed (6).
+/// Unsupported storage versions (7) retain their evidence for a compatible reader.
 /// An outcome this function does not recognise is a failure, never a
 /// "nothing to do".
 fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i32, String)> {
@@ -428,6 +429,15 @@ fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i3
             format!(
                 "candidate {block_hash} is pending but its block is already in qbit_pool_blocks; \
                  reconcile it before abandoning — abandoning would discard landed accounting"
+            ),
+        ),
+        "unsupported_storage_version" => (
+            7,
+            format!(
+                "candidate {block_hash} has unsupported storage_version {}; evidence preserved. \
+                 Only version 1 is supported; drain legacy rows with the pinned 2.x.x image, \
+                 and use a compatible release for newer formats",
+                outcome["storage_version"]
             ),
         ),
         other => bail!("unrecognized abandon outcome {other:?} for candidate {block_hash}"),
