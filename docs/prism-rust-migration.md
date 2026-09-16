@@ -117,12 +117,17 @@ Use them after the cutover, on rows this release wrote:
 ```sh
 qbit-prism-server candidates list
 qbit-prism-server candidates abandon --block-hash <hash> --reason "<nonblank explanation>"
+qbit-prism-server candidates recover --block-hash <hash> [--block-hash <hash> ...] [--apply]
 ```
 
 `candidates list` exits zero on an empty list, so it is the check a `set -e`
 runbook waits on before stopping native frontends; `candidates abandon` applies
 to a `pending` row only and refuses everything the node may already have been
-offered. Both are documented in full under
+offered. `candidates recover` lands a native-era block the node has already
+accepted, under an explicit allowlist, and never offers one; like the other
+two it cannot read a chunked v2 body or a pre-migration v1 document (exit 7
+and exit 8, evidence preserved), so it neither satisfies nor bypasses the
+migrator's drain check. All three are documented in full under
 [Candidate commands](prism-ledger-ops.md#candidate-commands). A pre-migration
 row reaching a native frontend is parked by the claim lane with a `last_error`
 naming its `storage_version`; `candidates list` shows it, but the answer is

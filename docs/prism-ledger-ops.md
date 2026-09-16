@@ -81,17 +81,19 @@ accounting after it, and the row records where the block is between them:
 
 ### Candidate commands
 
-Two operator commands read and finish the rows above. Neither builds a node
-client, reads a signing key, loads the server configuration or starts a
-listener, so neither can offer a block. `list` needs only
-`PRISM_DATABASE_URL`, as `fatal-state show` does. `abandon` writes an ordinary
-ledger row, so it uses the one-shot tool connection and the stored-data
-settings behind it — `PRISM_DATABASE_URL`, `PRISM_INSTANCE_ID` (generated when
-unset) and `PRISM_DATABASE_MAX_CONNECTIONS`.
+Three operator commands read and finish the rows above. Neither `list` nor
+`abandon` builds a node client, reads a signing key, loads the server
+configuration or starts a listener, so neither can offer a block. `list`
+needs only `PRISM_DATABASE_URL`, as `fatal-state show` does. `abandon` writes
+an ordinary ledger row, so it uses the one-shot tool connection and the
+stored-data settings behind it — `PRISM_DATABASE_URL`, `PRISM_INSTANCE_ID`
+(generated when unset) and `PRISM_DATABASE_MAX_CONNECTIONS`. `recover` is the
+one of the three that reads the node, and is described after the other two.
 
 ```sh
 qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
 qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>"
+qbit-prism-server candidates recover --block-hash <64 lowercase hex> [--block-hash <hash> ...] [--apply] [--timeout-seconds <1..3600, default 600>]
 ```
 
 `list` prints unfinished rows up to the selected limit — `pending`, `offer_reserved`, `offered`
@@ -215,7 +217,181 @@ Like the other one-shot commands, `abandon` writes no heartbeat: it leaves no
 frontend that shares its configured `PRISM_INSTANCE_ID` keeps its status and
 session-owner token untouched.
 
-Neither command takes a batch or an allowlist, and neither offers a block.
+`recover` lands a native-era block the node has already accepted and the
+claim lane cannot finish — a window whose rebuild exceeds the lane's 60 s
+rebuild deadline, for example, so the row sits in `reconciliation` retrying
+forever. `abandon` is correctly refused for every state the node may already
+have been offered, so before #418 such a row had no operator path. `recover`
+lands it at the proven chain revision, under an explicit allowlist, through
+the same in-process machinery the coordinator uses
+(`land_candidate_at_revision`, driven the way `process_candidate_inner`
+drives it for an offered row), and it never calls `submitblock`. It starts no
+listener. The invariant is #268's: no operator command may discard or
+duplicate the effect of a `submitblock` that may already have been made.
+`recover` lands an already-accepted block; it never offers one. `abandon`
+stays `pending`-only; `recover` does not widen it and adds no `--force`, and
+it adds no candidate state and no column.
+
+`recover` is the only one of the three that reads the node, and what it
+loads depends on the mode. The plan needs `PRISM_DATABASE_URL` plus the node
+RPC settings — `QBIT_RPC_URL` (or `QBIT_RPC_HOST`/`QBIT_RPC_PORT`),
+`QBIT_RPC_USER`, `QBIT_RPC_PASSWORD` and `PRISM_RPC_TIMEOUT_SECONDS` — and no
+signing seed, no chain setting and no instance ID. `--apply` needs the
+frontend's full configuration, exactly as `self-check`, `broadcast-ctv` and
+`fatal-state clear` do: database, qbit RPC, `QBIT_CHAIN`/genesis, payout
+policy and the signing seeds, because the audit is rebuilt from the
+candidate's stored inputs and signed with this frontend's seeds, and the
+command verifies the node's genesis/chain and the cluster fingerprint at
+connect. Run it from a frontend's environment. Setting `PRISM_INSTANCE_ID`
+(for example `operator-recovery-INC-123`) is recommended, so that
+`candidates list` names the recovery as the claim holder while it runs.
+Frontends do not need to be stopped: the durable claim is the fence. A row
+another instance holds is refused (exit 5), and while the recovery holds a
+row no frontend's claim lane can take it. (`2.x.x` required stopping the
+coordinator because its runner used the writer lease; the native command
+does not.) `--apply` connects as a one-shot tool (`Ledger::connect_tool`,
+#412), as `abandon` does: no heartbeat, no `qbit_prism_instances` row left
+behind, a halted cluster refused at connect with `cluster halted: ...`
+(exit 1), and every write refused while a legacy Python writer lease is live
+(exit 1).
+
+**Plan.** Without `--apply` the command plans and writes nothing, ever. It
+reads the outbox rows for the listed hashes on a
+`default_transaction_read_only=on` pool with one connection, the shape
+`list` uses, so taking a claim is impossible by construction. It loads no
+payload: `candidate` and `block_bytes` are not in the projection, and the
+stored height is extracted server-side exactly as `list` extracts it. It
+calls the node read-only — `getblockheader` for each hash and `getblockhash`
+at its height — to prove each block is on the active chain and to learn its
+parent, and it prints the selection ordered by height ascending, parent
+before child, one table and one summary line on stdout:
+
+```
+block_hash                                                        height  state           parent                                                            claim                                              action
+<hash>                                                            184018  reconciliation  <parent hash>                                                     -                                                  recover
+<hash>                                                            184019  pending         <parent hash>                                                     prism-frontend-b until 2026-09-16T15:03:50+00:00   recover
+<hash>                                                            184020  submitted       <parent hash>                                                     -                                                  complete
+plan: 2 to recover, 1 already complete; rerun with --apply to land them
+```
+
+`action` is `recover` for an unfinished row the node proves active, or
+`complete` for a `submitted` row whose accounting is proven — a `confirmed`
+`qbit_pool_blocks` row and an audit row — which `--apply` verifies and
+skips. `claim` is rendered as in `list`: `<instance> until <expiry>`,
+`expired` or `-`. A live claim is reported in the plan but does not fail it;
+it is a moment-in-time fact, and `--apply`'s own claim is the fence. When
+nothing is left to recover the summary reads `plan: nothing to recover;
+every listed block is already complete`. The plan exits zero whenever the
+selection is valid.
+
+The selection fails closed: every listed hash must pass, or the whole plan is
+refused. The plan reports every problem it finds on stderr, one line each,
+and exits with the code of the first one, in argument order. The allowlist
+itself is checked at the entry boundary, before any connection is opened:
+one to 32 hashes (the bound of the `2.x.x` runner, #259), each 64 lowercase
+hex characters, no duplicates. Zero hashes or an out-of-range
+`--timeout-seconds` is refused by the argument parser (exit 2, as for every
+command); a duplicate, more than 32 or a malformed hash is refused by the
+command itself (exit 1). There is no "recover everything" mode.
+
+**Apply.** `--apply` runs the plan first, and a refused plan applies nothing.
+Then, for each planned block in height order:
+
+1. A block the plan marked `complete` prints `verified <hash> at height <h>:
+   already complete` on stdout and is skipped idempotently.
+2. Otherwise the command prints `recovering <hash> at height <h> from
+   <state>` and takes the durable, token-fenced claim on that row by hash,
+   through the existing claim mechanism: `attempt_count` increments,
+   `claim_instance_id` and `claim_expires_at` name this process, and the
+   ordinary lease heartbeat renews the claim while the work runs. The claim
+   statement's `WHERE` is the safety property — an unfinished state, no live
+   claim, `storage_version = 1` and a document this release wrote, the same
+   shape test `abandon` uses. A row parked with `next_attempt_at =
+   'infinity'` is claimable here, because a parked row is operator work,
+   but its schedule is left untouched.
+3. It decodes and authenticates the row exactly as the claim lane does
+   (document digest, block digest, window columns, header hashes to
+   `block_hash`), then verifies the block against the node: it is on the
+   active chain at its height, the node's header height equals the
+   candidate's recorded height, and the node's `previousblockhash` equals
+   the parent in the candidate's block bytes.
+4. A `pending` row is first adopted into `reconciliation` with the node's
+   evidence, exactly as the coordinator's pre-offer probe adopts an active
+   pending block. From that commit on, no claim on any frontend can ever
+   offer it, whatever happens next.
+5. It runs the normal post-offer landing: builder admission, the audit
+   rebuild from the as-issued balance snapshot (or the current balances when
+   they still hash to the reference), signature and coinbase verification,
+   the durable range proof, and `land_candidate_at_revision` at the chain
+   revision observed immediately before the landing transaction. An audit
+   that already landed is authenticated against the block and not rebuilt
+   over.
+6. It observes the chain again and finishes the row as `submitted` at a
+   revision proven now — the same `finish_candidate_at_revision` the
+   coordinator uses — which confirms the pool block and credits any deferred
+   share, then prints `recovered <hash> at height <h>`.
+
+The final line is `recovered N, verified M already complete`, and the command
+exits 0. Rerunning the same allowlist after a success prints only the
+`verified` lines and exits 0.
+
+**Deadline.** `--timeout-seconds N` (1 to 3600, default 600) is one deadline
+carried across the whole operation: the plan's database read, every node RPC
+call, the coordinator connection, and each candidate's claim, window read,
+audit rebuild, landing transaction and confirmation. When it expires the
+in-flight candidate's claim is released, with bounded cleanup, and the
+command exits 11.
+
+**Failure and resume.** On any failure the command stops at that candidate,
+releases its claim (bounded), records the reason in the row's `last_error`,
+leaves the row in whatever unfinished state it is in — a pending row that
+was adopted stays `reconciliation`, and a landed audit stays landed and is
+reused by the next attempt — leaves `next_attempt_at` untouched, and exits
+nonzero. Later blocks in the plan are not attempted. Repeating the same
+allowlist resumes: finished blocks are verified and skipped, and the failed
+one is retried.
+
+Messages are written to stderr; only the exit-0 output above is on stdout.
+Codes shared with `abandon` keep their meaning.
+
+| Exit | Outcome | Message |
+| --- | --- | --- |
+| 0 | Plan printed, or every listed block recovered or verified complete. | The stdout described above. |
+| 1 | Configuration, database or node failure, including a halted cluster, a live legacy Python writer lease, a node that is unreachable or not caught up, and an allowlist the command refuses (a duplicate, more than 32 or a malformed hash). | The underlying error, as for every other command. |
+| 2 | A listed hash has no outbox row. | `no candidate row for <hash>` |
+| 4 | A listed row is terminal and cannot be recovered. | `candidate <hash> is already abandoned; its evidence was released and it cannot be recovered` or `candidate <hash> is submitted but its accounting is not proven complete (<what is missing>); inspect qbit_pool_blocks and qbit_pool_audit_bundles before retrying` |
+| 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 7 | Unsupported storage version; evidence preserved. | Names the version, as for `abandon`. |
+| 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | As for `abandon`, ending in `drain it with the pinned 2.x.x image` |
+| 9 | Not on the active chain: the node does not hold the block at its height. Nothing to recover; `recover` never offers. | `candidate <hash> is not on the active chain (<node detail>); nothing to recover. recover never offers a block: a block the node never accepted stays with the coordinator (or, while pending, may be abandoned); a block a reorg removed stays in reconciliation` |
+| 10 | Selection refused: an unfinished parent is not in the allowlist, or the stored height is unreadable or disagrees with the node. | `candidate <hash> has an unfinished parent <parent> (<state>) that is not in the allowlist; add --block-hash <parent> so it lands first` or `candidate <hash> is stored at height <h> but the node holds it at height <node height>` |
+| 11 | The deadline expired; the candidate was left recoverable. | `recovery deadline of <N> seconds exceeded (landing); candidate <hash> was left recoverable and its claim released`; before any claim was taken the phase is `planning`, `connecting` or `claiming` and the message says so (`nothing was claimed`, `candidate <hash> was not claimed`) |
+| 12 | Landing refused or failed; the candidate was left recoverable with the reason in `last_error`. | `recovery of <hash> stopped: <reason>; the candidate was left recoverable` |
+
+Codes 3 (offered; never abandonable) and 6 (pending but landed) do not occur
+for `recover`: every unfinished state is recoverable, and a landed audit is
+exactly what an idempotent landing reuses.
+
+A native recovery, step by step:
+
+1. Plan the exact hashes. Take them from `candidates list`, run
+   `candidates recover --block-hash <hash> ...` without `--apply`, and add
+   every unfinished parent the plan names (exit 10) until it exits zero and
+   the table shows what you expect.
+2. Apply from a frontend's environment, with a named `PRISM_INSTANCE_ID`
+   such as `operator-recovery-INC-123`, by rerunning the same allowlist with
+   `--apply`. Frontends may stay up.
+3. Check the exit status and the final line (`recovered N, verified M
+   already complete`). On a nonzero exit read the stderr line and the row's
+   `last_error`, resolve the cause, and rerun the same allowlist to resume:
+   finished blocks are verified and skipped, the failed one is retried.
+4. Verify with `candidates list` — the recovered rows are gone, because
+   `submitted` rows are finished work — and with the audit and dashboard
+   reads for the landed blocks.
+
+`recover` is the one command of the three that takes an allowlist — at most
+32 hashes, named one by one, never "everything" — and none of the three
+offers a block.
 
 **Offer phase.** The minimum before the one `submitblock` call: the proof was
 validated at Stratum admission and the row authenticated at claim (document
@@ -343,8 +519,11 @@ ORDER BY updated_at;
 Nothing unparks a row automatically. No binary resets `next_attempt_at`,
 whether it is the one that parked the row or an earlier release. Reverting
 the binary therefore leaves every parked row parked, because a claim selects
-only due rows. Recovery is explicit operator work, and there is no recovery
-command for it yet (#268 tracks listing and abandonment). First preserve the
+only due rows. Recovery is explicit operator work. `candidates recover`
+(above) is the one command that claims a parked row, and only to land a
+block the node already holds: it authenticates the row exactly as the claim
+lane does and leaves the schedule untouched, so it does not make a row that
+failed validation pass. First preserve the
 row, from a backup or with `SELECT to_jsonb(o) FROM
 qbit_block_candidate_outbox o WHERE block_hash = '<hash>'`. Then establish
 why the stored evidence disagrees. Never edit the document, its digest, the
