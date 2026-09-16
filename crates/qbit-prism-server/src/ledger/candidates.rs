@@ -1535,12 +1535,18 @@ impl Ledger {
         // Python writer lease, so an operator abandon never races the 2.x.x
         // writer during a cutover.
         writable(&mut tx).await?;
+        // The claim decision and its later explanation must use the same
+        // instant, even if a lease expires between these statements. Capture
+        // database time after waiting for settlement, not transaction start.
+        let claim_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
         let abandoned: Option<String> = sqlx::query_scalar(
-            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
-            .bind(block_hash).bind(reason).fetch_optional(&mut *tx).await?;
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=$3) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
+            .bind(block_hash).bind(reason).bind(claim_at).fetch_optional(&mut *tx).await?;
         let outcome = match abandoned {
             Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
-            None => diagnose_abandon_refusal(&mut tx, block_hash).await?,
+            None => diagnose_abandon_refusal(&mut tx, block_hash, claim_at).await?,
         };
         tx.commit().await?;
         Ok(outcome)
@@ -1588,10 +1594,11 @@ fn candidate_summary(row: &PgRow) -> Result<Value> {
 async fn diagnose_abandon_refusal(
     tx: &mut Transaction<'_, Postgres>,
     block_hash: &str,
+    claim_at: DateTime<Utc>,
 ) -> Result<Value> {
     let Some(row) = sqlx::query(
-        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed,COALESCE((o.candidate ?& ARRAY['payout_revision','block_hash']) AND (o.candidate ? 'bundle' OR o.candidate ? 'window'),false) AS native FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
-        .bind(block_hash).fetch_optional(&mut **tx).await?
+        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>$2 AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed,COALESCE((o.candidate ?& ARRAY['payout_revision','block_hash']) AND (o.candidate ? 'bundle' OR o.candidate ? 'window'),false) AS native FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
+        .bind(block_hash).bind(claim_at).fetch_optional(&mut **tx).await?
     else {
         return Ok(json!({"outcome":"missing"}));
     };
