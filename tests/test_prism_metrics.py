@@ -1598,9 +1598,18 @@ def reference_render_metrics_payload(server) -> str:
         "# HELP qbit_prism_block_candidate_accept_pending_defers_total Terminal abandonments refused because the candidate is (or was recently observed as) an active chain block; the candidate retries until its accepted success tail finalizes it as submitted.",
         "# TYPE qbit_prism_block_candidate_accept_pending_defers_total counter",
         f"qbit_prism_block_candidate_accept_pending_defers_total {int(getattr(server, 'block_candidate_accept_pending_defer_count', 0))}",
-        "# HELP qbit_prism_block_candidate_orphan_verdicts_total Block candidates the node proved off the active chain (getblockheader confirmations -1 with a different block active at the candidate's height), counted once per candidate at the verdict. Such candidates abandon on that pass instead of deferring until the observed-tip acceptance window expires, so this separates proven orphans from window-expiry abandonments in qbit_prism_block_candidates_abandoned_total.",
+        "# HELP qbit_prism_block_candidate_orphan_verdicts_total Block candidates the node proved off the active chain (getblockheader confirmations -1 with a different block active at the header's height), counted once per candidate at the first verdict. The verdict releases the candidate's landed payout barrier at once; its prepared payout rows are rejected only once the competitor reaches PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS or the verdict ages past the observed-tip window (qbit_prism_block_candidate_orphan_terminals_total), and a chain that flips back restores the candidate. Separates proven orphans from evidence-window expiries in qbit_prism_block_candidates_abandoned_total.",
         "# TYPE qbit_prism_block_candidate_orphan_verdicts_total counter",
         f"qbit_prism_block_candidate_orphan_verdicts_total {int(getattr(server, 'block_candidate_orphan_verdict_count', 0))}",
+        "# HELP qbit_prism_block_candidate_orphan_wait_defers_total Terminal abandonments deferred because the candidate is a proven orphan whose competitor has not settled the tie yet: the landed barrier is already released and the ledger row stays prepared until a terminal trigger fires or the chain flips back. Distinct from qbit_prism_block_candidate_accept_pending_defers_total, which protects candidates the node has not proven orphaned.",
+        "# TYPE qbit_prism_block_candidate_orphan_wait_defers_total counter",
+        f"qbit_prism_block_candidate_orphan_wait_defers_total {int(getattr(server, 'block_candidate_orphan_wait_defer_count', 0))}",
+        "# HELP qbit_prism_block_candidate_orphan_terminals_total Proven-orphan candidates whose prepared payout rows were rejected, by the trigger that settled the tie: competitor_confirmed (the block active at the candidate's height reached the configured confirmations) or window_expired (the first verdict aged past the observed-tip window while the competitor's confirmations stayed below the bar or unknown). Counted once per candidate when the abandonment commits, after the rows are rejected.",
+        "# TYPE qbit_prism_block_candidate_orphan_terminals_total counter",
+        *[
+            f'qbit_prism_block_candidate_orphan_terminals_total{{trigger="{trigger}"}} {int(getattr(server, "block_candidate_orphan_terminal_counts", {}).get(trigger, 0))}'
+            for trigger in ("competitor_confirmed", "window_expired")
+        ],
         "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
         "# TYPE qbit_prism_block_candidate_poisoned_total counter",
         f"qbit_prism_block_candidate_poisoned_total {int(getattr(server, 'block_candidate_poisoned_count', 0))}",
@@ -1877,6 +1886,11 @@ class MetricsRenderParityTests(unittest.TestCase):
         server.block_candidate_retry_count = 2
         server.block_candidate_accept_pending_defer_count = 1
         server.block_candidate_orphan_verdict_count = 1
+        server.block_candidate_orphan_wait_defer_count = 3
+        server.block_candidate_orphan_terminal_counts = {
+            "competitor_confirmed": 1,
+            "window_expired": 2,
+        }
         server.block_candidate_poisoned_count = 1
         server.block_candidate_wakeups_coalesced = 3
         server.block_candidate_abandoned_counts = {"stale-job": 2}
@@ -2048,7 +2062,11 @@ class MetricsRenderParityTests(unittest.TestCase):
         for needle in (
             "qbit_prism_block_candidate_accept_pending_defers_total 1",
             "qbit_prism_block_candidate_orphan_verdicts_total 1",
+            "qbit_prism_block_candidate_orphan_wait_defers_total 3",
+            'qbit_prism_block_candidate_orphan_terminals_total{trigger="competitor_confirmed"} 1',
+            'qbit_prism_block_candidate_orphan_terminals_total{trigger="window_expired"} 2',
             'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 0',
+            'qbit_prism_vardiff_retargets_skipped_total{reason="template_refresh_blocked"} 0',
             'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
             "qbit_prism_block_submit_seconds_count 1",
             'qbit_prism_accepted_block_preview_publication_seconds_count{result="published"} 1',

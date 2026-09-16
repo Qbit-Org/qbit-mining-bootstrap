@@ -9,7 +9,11 @@ import tempfile
 import threading
 import unittest
 from lab.prism.job_delivery import JobBuildFailed
-from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
+from lab.prism.payout_state import (
+    AcceptedParentPayoutPreviewPending,
+    PayoutStatePublicationBlocked,
+    TemplateRefreshSuperseded,
+)
 from tests import prism_coordinator_test_support as _job_support
 from tests import prism_vardiff_test_support as _vardiff_support
 
@@ -1806,10 +1810,15 @@ class AcceptedParentPreviewDeliveryBoundaryTests(_VardiffSupportTestCase):
         # Boundary 2: the pre-build reorg-reconciliation guard. The generic
         # clause below it converts failures into a plain TemplateRefreshBlocked
         # (which is budgeted); the typed backpressure must pass through it
-        # unchanged instead.
+        # unchanged instead -- and, symmetric with the build boundary (#414
+        # review), only to callers that asked for reorg failures. A
+        # non-raising caller (the share-driven retarget, the first-job seam)
+        # skips the job, keeps its client, and coalesces onto the retry.
         server = coordinator()
         state = self._delivery_client(server)
         server.job_build_failure_count = 0
+        retries: list[int] = []
+        server._schedule_tip_refresh_retry = lambda: retries.append(1)  # type: ignore[method-assign]
         raised = self._preview_pending()
 
         def blocked_reconcile() -> bool:
@@ -1820,17 +1829,106 @@ class AcceptedParentPreviewDeliveryBoundaryTests(_VardiffSupportTestCase):
             self.fail("build must not run once the reorg guard blocks")
         )
 
-        with (
-            patch("builtins.print"),
-            self.assertRaises(AcceptedParentPayoutPreviewPending) as caught,
-        ):
-            server.maybe_send_job(state, clean_jobs=True)
+        with patch("builtins.print") as logged:
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
 
-        self.assertIs(caught.exception, raised)
+        self.assertEqual(len(retries), 1)
+        # The typed retry reason is logged, never a reconciliation failure.
+        self.assertTrue(
+            any(
+                "accepted_parent_preview_pending" in str(call.args[0])
+                for call in logged.call_args_list
+                if call.args
+            )
+        )
         self.assertEqual(server.job_build_failure_count, 0)
         self.assertIsNone(
             getattr(server, "template_refresh_failure_started_monotonic", None)
         )
+
+        with (
+            patch("builtins.print"),
+            self.assertRaises(AcceptedParentPayoutPreviewPending) as caught,
+        ):
+            server.maybe_send_job(
+                state,
+                clean_jobs=True,
+                raise_on_reorg_failure=True,
+            )
+
+        self.assertIs(caught.exception, raised)
+        self.assertEqual(len(retries), 2)
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+
+    def test_reorg_boundary_skips_coordination_fences_for_non_raising_callers(
+        self,
+    ) -> None:
+        # #414 review finding 2: a sibling fence raised by the same reconcile
+        # pass -- a landed accepted-block transition, a superseded refresh --
+        # used to escape the reorg clause regardless of raise_on_reorg_failure
+        # and kill the share-driven retarget's client thread. The clause is
+        # now symmetric with the build boundary: a non-raising caller gets
+        # False plus a coalesced retry, no failure count or budget is armed
+        # and no traceback is printed, and a raising caller gets the same
+        # instance back.
+        fences = (
+            PayoutStatePublicationBlocked(
+                "accepted block payout confirmation is still pending"
+            ),
+            TemplateRefreshSuperseded(
+                "tip refresh snapshot was superseded before client job build"
+            ),
+        )
+        for fence in fences:
+            with self.subTest(fence=type(fence).__name__):
+                server = coordinator()
+                state = self._delivery_client(server)
+                server.job_build_failure_count = 0
+                retries: list[int] = []
+                server._schedule_tip_refresh_retry = lambda: retries.append(1)  # type: ignore[method-assign]
+
+                def blocked_reconcile(*, fence: BaseException = fence) -> bool:
+                    raise fence
+
+                server.ensure_reorg_reconciled_for_current_tip = blocked_reconcile  # type: ignore[method-assign]
+                server.build_job_for_client = lambda *_a, **_k: (  # type: ignore[method-assign]
+                    self.fail("build must not run once the reorg guard blocks")
+                )
+
+                with (
+                    patch("builtins.print"),
+                    patch("lab.prism.job_delivery.traceback.print_exc") as traced,
+                ):
+                    self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+
+                traced.assert_not_called()
+                self.assertEqual(len(retries), 1)
+                self.assertEqual(server.job_build_failure_count, 0)
+                self.assertIsNone(
+                    getattr(server, "template_refresh_failure_started_monotonic", None)
+                )
+
+                with (
+                    patch("builtins.print"),
+                    patch("lab.prism.job_delivery.traceback.print_exc") as traced,
+                    self.assertRaises(type(fence)) as caught,
+                ):
+                    server.maybe_send_job(
+                        state,
+                        clean_jobs=True,
+                        raise_on_reorg_failure=True,
+                    )
+
+                self.assertIs(caught.exception, fence)
+                traced.assert_not_called()
+                self.assertEqual(len(retries), 2)
+                self.assertEqual(server.job_build_failure_count, 0)
+                self.assertIsNone(
+                    getattr(server, "template_refresh_failure_started_monotonic", None)
+                )
 
     def test_build_boundary_retries_preview_pending_without_counting_it(
         self,

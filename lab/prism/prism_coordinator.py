@@ -99,6 +99,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS,
     DEFAULT_PRISM_METRICS_REFRESH_SECONDS,  # noqa: F401 - compatibility re-export
     DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,  # noqa: F401
+    DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS,  # noqa: F401
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,  # noqa: F401
     DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,  # noqa: F401
     DEFAULT_PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS,  # noqa: F401
@@ -196,7 +197,9 @@ from lab.prism.block_candidates import (
     DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS,
     MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS,  # noqa: F401 - compatibility re-export
     MAX_PENDING_BLOCK_CANDIDATES,
+    PRISM_BLOCK_CANDIDATE_ORPHAN_TERMINAL_TRIGGERS,
     PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+    PRISM_REJECTION_BLOCK_ORPHAN_CONFIRMATION_WAIT,
     PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED,
     PRISM_STALE_JOB_ABANDON_CLASSES,
     PrismBlockCandidate,
@@ -451,6 +454,7 @@ PRISM_RETRYABLE_BLOCK_CANDIDATE_REASONS = frozenset(
         PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
         PRISM_REJECTION_CANDIDATE_AUDIT_MISMATCH,
         PRISM_REJECTION_BLOCK_ACCEPT_PENDING,
+        PRISM_REJECTION_BLOCK_ORPHAN_CONFIRMATION_WAIT,
     }
 )
 # Used only by lightweight embedders that bypass dataclass/coordinator
@@ -1991,6 +1995,12 @@ class PrismCoordinator:
     block_candidate_orphan_verdict_count = BlockCandidateStateField(
         "block_candidate_orphan_verdict_count"
     )
+    block_candidate_orphan_wait_defer_count = BlockCandidateStateField(
+        "block_candidate_orphan_wait_defer_count"
+    )
+    block_candidate_orphan_terminal_counts = BlockCandidateStateField(
+        "block_candidate_orphan_terminal_counts"
+    )
     _block_candidate_orphan_verdicts = BlockCandidateStateField(
         "_block_candidate_orphan_verdicts"
     )
@@ -2336,6 +2346,17 @@ class PrismCoordinator:
         self.observed_tip_accept_window_seconds = (
             block_config.observed_tip_accept_window_seconds
         )
+        # #414: a proven orphan releases its landed barrier at once but
+        # rejects its prepared payout rows only once the competitor block
+        # has this many confirmations (or the verdict aged past the window
+        # above), because a same-height tie can still flip back.
+        self.candidate_orphan_terminal_confirmations = int(
+            getattr(
+                block_config,
+                "candidate_orphan_terminal_confirmations",
+                DEFAULT_PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS,
+            )
+        )
         # After a FAILED refresh pass, the fallback poller re-attempts no
         # sooner than this many seconds (plus jitter) while the tip the failed
         # pass worked against is still current, so a persistent blockage or
@@ -2658,6 +2679,11 @@ class PrismCoordinator:
         self.block_candidate_poisoned_count = 0
         self.block_candidate_accept_pending_defer_count = 0
         self.block_candidate_orphan_verdict_count = 0
+        self.block_candidate_orphan_wait_defer_count = 0
+        self.block_candidate_orphan_terminal_counts = {
+            trigger: 0
+            for trigger in PRISM_BLOCK_CANDIDATE_ORPHAN_TERMINAL_TRIGGERS
+        }
         # Hashes of block candidates this process may still land (durable
         # outbox pending, queued, retained for retry, or mid-disposition).
         # Membership lets every tip-observation channel recognize the pool's
@@ -2706,7 +2732,7 @@ class PrismCoordinator:
         # same hash through that decision again; abandonment metrics count
         # candidates, not cleanup attempts.
         self._counted_block_candidate_abandonments: set[str] = set()
-        self._block_candidate_orphan_verdicts: dict[str, int] = {}
+        self._block_candidate_orphan_verdicts: dict[str, float] = {}
         self.stale_job_abandon_counts = {
             abandon_class: 0
             for abandon_class in PRISM_STALE_JOB_ABANDON_CLASSES
@@ -9266,6 +9292,12 @@ class PrismCoordinator:
     def _block_candidate_acceptance_observed(self, block_hash: str) -> bool:
         """Whether a recent tip observation already proved this candidate landed."""
         return self._ensure_block_candidate_service()._block_candidate_acceptance_observed(
+            block_hash
+        )
+
+    def _block_candidate_orphan_verdict_standing(self, block_hash: str) -> bool:
+        """Whether the node proved this candidate orphaned and the tie is unsettled (#414)."""
+        return self._ensure_block_candidate_service()._block_candidate_orphan_verdict_standing(
             block_hash
         )
 

@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import unittest
 
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked,
+    TemplateRefreshSuperseded,
+)
 from lab.prism.vardiff_service import (
     PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS,
     PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SHARES_BUCKETS,
@@ -266,6 +270,71 @@ class PrismVardiffFastArrivalTests(unittest.TestCase):
         harness.deliver(8, interval=ROUTER_SHARE_INTERVAL_SECONDS)
 
         self.assertEqual(harness.difficulty, STANDARD_LANE_START * 64)
+
+    def test_a_fenced_send_counts_as_superseded_not_failed(self) -> None:
+        # #414 review finding 4: a coordination fence raised by the paired
+        # build (a landed accepted-block transition, a superseded refresh) is
+        # skipped by the share path, not failed. Under initial convergence it
+        # is attributed exactly once, as superseded -- never as a failure on
+        # top of the skip the caller records -- and the relaxation is not
+        # spent, so delivery recovering still converges in one move.
+        fences = (
+            (
+                PayoutStatePublicationBlocked(
+                    "accepted block payout confirmation is still pending"
+                ),
+                "payout_publication_blocked",
+            ),
+            (
+                TemplateRefreshSuperseded(
+                    "tip refresh snapshot was superseded before client job build"
+                ),
+                "template_refresh_blocked",
+            ),
+        )
+        for fence, reason in fences:
+            with self.subTest(reason=reason):
+                harness = FastArrivalHarness(standard_lane_config())
+
+                def fenced_send(
+                    client: object,
+                    clean_jobs: bool,
+                    *,
+                    fence: BaseException = fence,
+                ) -> bool:
+                    raise fence
+
+                harness.server.maybe_send_job = fenced_send  # type: ignore[method-assign]
+
+                with patch("builtins.print"):
+                    harness.deliver(8, interval=ROUTER_SHARE_INTERVAL_SECONDS)
+
+                self.assertEqual(harness.difficulty, STANDARD_LANE_START)
+                self.assertIsNone(harness.client.pending_share_difficulty)
+                self.assertTrue(self.client_initial_pending(harness))
+                metrics = harness.metrics()
+                self.assertEqual(
+                    metrics['qbit_prism_vardiff_initial_retargets_total{outcome="superseded"}'],
+                    "1",
+                )
+                self.assertEqual(
+                    metrics['qbit_prism_vardiff_initial_retargets_total{outcome="failed"}'],
+                    "0",
+                )
+                self.assertEqual(
+                    metrics['qbit_prism_vardiff_initial_retargets_total{outcome="applied"}'],
+                    "0",
+                )
+                self.assertIn(
+                    f'qbit_prism_vardiff_retargets_skipped_total{{reason="{reason}"}} 1',
+                    harness.server.metrics_payload(),
+                )
+
+                # Delivery recovers, and the session still converges in one move.
+                harness.server.maybe_send_job = harness._send  # type: ignore[method-assign]
+                harness.deliver(8, interval=ROUTER_SHARE_INTERVAL_SECONDS)
+
+                self.assertEqual(harness.difficulty, STANDARD_LANE_START * 64)
 
     def test_explicit_request_outranks_a_converged_initial_difficulty(self) -> None:
         # The early path measures a session against the difficulty it is

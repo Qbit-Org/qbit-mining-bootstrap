@@ -12,7 +12,11 @@ import time
 import unittest
 
 from lab.auxpow import vardiff
-from lab.prism.payout_state import PayoutStatePublicationBlocked
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked,
+    TemplateRefreshBlocked,
+    TemplateRefreshSuperseded,
+)
 from lab.prism.vardiff_service import VardiffService
 
 
@@ -98,7 +102,7 @@ class VardiffServiceTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_submitted, 1)
 
     def test_payout_publication_block_skips_retarget_without_raising(self) -> None:
-        # #414 (page #284): a share-driven retarget builds a paired job, and
+        # #414: a share-driven retarget builds a paired job, and
         # that build can be fenced behind a pending payout publication (a
         # landed accepted-block transition). The fence must not escape
         # note_accepted -- it would propagate out of handle_submit and kill
@@ -141,6 +145,99 @@ class VardiffServiceTests(unittest.TestCase):
         state.vardiff_window_started_monotonic = time.monotonic() - 2
         with self.assertRaises(RuntimeError):
             service.note_accepted(state, Decimal("3"))  # type: ignore[arg-type]
+
+    def test_template_refresh_fences_skip_retarget_without_raising(self) -> None:
+        # #414 review finding 2: the sibling fences from the same reconcile
+        # pass -- a superseded template refresh, or any other
+        # TemplateRefreshBlocked coordination state -- take the same skip
+        # path as the payout fence, under their own bounded reason.
+        fences = (
+            TemplateRefreshSuperseded(
+                "tip refresh snapshot was superseded before client job build"
+            ),
+            TemplateRefreshBlocked(
+                "qbit chain view became untrusted before client job build"
+            ),
+        )
+        for fence in fences:
+            with self.subTest(fence=type(fence).__name__):
+                runtime = Runtime()
+                runtime.retarget_error = fence
+                service = VardiffService(runtime)  # type: ignore[arg-type]
+                state = client()
+
+                with redirect_stdout(io.StringIO()) as captured:
+                    service.note_accepted(state, Decimal("3"))  # type: ignore[arg-type]
+                    state.vardiff_window_submitted = 1
+                    state.vardiff_window_started_monotonic = time.monotonic() - 2
+                    service.note_accepted(state, Decimal("3"))  # type: ignore[arg-type]
+
+                self.assertEqual(len(runtime.retargets), 2)
+                self.assertEqual(
+                    captured.getvalue().count(
+                        "vardiff retarget skipped reason=template_refresh_blocked"
+                    ),
+                    1,
+                )
+                metrics = "\n".join(service.metrics_lines())
+                self.assertIn(
+                    'qbit_prism_vardiff_retargets_skipped_total{reason="template_refresh_blocked"} 2',
+                    metrics,
+                )
+                self.assertIn(
+                    'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 0',
+                    metrics,
+                )
+
+    def test_skip_log_re_arms_after_an_applied_retarget(self) -> None:
+        # The skip line is logged once per coordination hold, not once per
+        # connection lifetime (#414 review): a retarget that reaches the
+        # miner between two holds proves the first fence lifted, so the
+        # second hold logs once more while the counter records every skip.
+        runtime = Runtime()
+        service = VardiffService(runtime)  # type: ignore[arg-type]
+        state = client()
+
+        def share() -> None:
+            state.vardiff_window_submitted = 1
+            state.vardiff_window_started_monotonic = time.monotonic() - 2
+            service.note_accepted(state, Decimal("3"))  # type: ignore[arg-type]
+
+        with redirect_stdout(io.StringIO()) as captured:
+            runtime.retarget_error = PayoutStatePublicationBlocked(
+                "accepted block payout confirmation is still pending"
+            )
+            share()
+            share()
+            # The fence lifts: the next retarget is applied.
+            runtime.retarget_error = None
+            share()
+            # A second hold, this time the sibling fence, logs again.
+            runtime.retarget_error = TemplateRefreshSuperseded(
+                "tip refresh snapshot was superseded before client job build"
+            )
+            share()
+            share()
+
+        log = captured.getvalue()
+        self.assertEqual(
+            log.count("vardiff retarget skipped reason=payout_publication_blocked"),
+            1,
+        )
+        self.assertEqual(
+            log.count("vardiff retarget skipped reason=template_refresh_blocked"),
+            1,
+        )
+        self.assertEqual(len(runtime.retargets), 5)
+        metrics = "\n".join(service.metrics_lines())
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 2',
+            metrics,
+        )
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="template_refresh_blocked"} 2',
+            metrics,
+        )
 
     def test_idle_metrics_are_service_owned(self) -> None:
         service = VardiffService(Runtime())  # type: ignore[arg-type]
