@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -189,6 +189,13 @@ pub struct SubmitRecord {
     pub scheduled_block: bool,
     /// A deliberate re-offer of an indeterminate share, with the same header.
     pub reoffer: bool,
+    /// The value of the run's kill fence (`SessionShared::kill_fence`) when
+    /// this record was built, read in the thread that built it. It is the
+    /// record's identity with respect to the mid-flight kill: a record whose
+    /// fence is below the value the kill stamped existed before the kill,
+    /// however long it then took to reach the collector, and no delivery lag
+    /// can move it into the kill's census (EP-STATE).
+    pub fence: u64,
     pub header_hex: String,
     pub extranonce2_hex: String,
     pub ntime_hex: String,
@@ -415,11 +422,25 @@ pub struct SessionShared {
     /// Set for the phases that measure job arrival. Off everywhere else, so
     /// no existing run pays for a record it does not report.
     pub record_notifies: AtomicBool,
+    /// The run's mid-flight kill fence: bumped once by
+    /// [`crate::kill::KillDriver`] immediately before it SIGKILLs a frontend,
+    /// and read by every session as it builds a [`SubmitRecord`]. One counter
+    /// shared by the run, every session and the driver, so "before the kill"
+    /// and "after the kill" are the same fact for all of them.
+    pub kill_fence: Arc<AtomicU64>,
 }
 
 impl SessionShared {
     pub fn phase(&self) -> String {
         self.phase.read().expect("phase lock").clone()
+    }
+
+    /// The fence to stamp on a record being built now. `SeqCst` on both this
+    /// load and the driver's bump, so the two orderings agree: a record built
+    /// before the bump cannot read the bumped value, and one built after it
+    /// cannot read the earlier one.
+    pub fn fence(&self) -> u64 {
+        self.kill_fence.load(Ordering::SeqCst)
     }
 
     pub fn recording_notifies(&self) -> bool {
@@ -937,6 +958,7 @@ fn fail_pending(
             },
             scheduled_block: pending.scheduled_block,
             reoffer: pending.reoffer,
+            fence: shared.fence(),
             header_hex: pending.header_hex,
             extranonce2_hex: pending.extranonce2_hex,
             ntime_hex: pending.ntime_hex,
@@ -1161,6 +1183,7 @@ fn consume(
                 outcome,
                 scheduled_block: pending.scheduled_block,
                 reoffer: pending.reoffer,
+                fence: shared.fence(),
                 header_hex: pending.header_hex,
                 extranonce2_hex: pending.extranonce2_hex,
                 ntime_hex: pending.ntime_hex,
@@ -1380,6 +1403,7 @@ async fn offer(
                 },
                 scheduled_block: pending.scheduled_block,
                 reoffer: pending.reoffer,
+                fence: shared.fence(),
                 header_hex: pending.header_hex,
                 extranonce2_hex: pending.extranonce2_hex,
                 ntime_hex: pending.ntime_hex,
