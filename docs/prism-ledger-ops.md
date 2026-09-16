@@ -415,6 +415,18 @@ afterward the latest deep checkpoint is checked every 60 seconds. A shallow
 fanout disconnect returns the transaction to broadcast work. Disconnection of a
 deep checkpoint halts the shared cluster for explicit reconciliation.
 
+Between claimed fanouts a frontend's periodic pass yields to its own template
+refresh: it stops at the fanout boundary while the detected tip is unpublished,
+or when a tip observed after the pass began differs from the tip the pass
+started from, counted by
+`qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total`, and the remaining
+rows stay claimable for a later pass. The unpublished-tip yield lasts at most
+`PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` (default 120) from the first
+departure, the same replacement-build budget as the published-tip lease, so a
+refresh that keeps failing before publication cannot strand settlement. An
+observation older than the pass never yields, so a refresh that has not caught
+up with the node cannot strand it either, and same-tip polls never yield.
+
 Without transaction indexing, the broadcaster uses a durable block-scan cursor
 and chain anchor. `PRISM_CTV_SPEND_SCAN_BLOCKS` bounds each pass (default 32,
 range 1–256); a reorg resets the cursor. The node must retain the historical

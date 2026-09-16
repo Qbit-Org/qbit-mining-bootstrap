@@ -41,6 +41,9 @@ macro_rules! families {
     }
 }
 families! {
+    CtvTipRefreshYields: Counter, "ctv_fanout_broadcaster_tip_refresh_yields_total", "CTV passes deferred at a fanout boundary for a newer or unpublished tip.";
+    CtvChunkRows: Histogram, "ctv_fanout_broadcaster_chunk_rows", "Fanouts attempted per native broadcaster chunk; each chunk contains one row.";
+    CtvChunkSeconds: Histogram, "ctv_fanout_broadcaster_chunk_seconds", "Claimed fanout attempt duration including status persistence, in seconds.";
     Health: Gauge, "health_state", "Whether this instance is ready to serve mining work.";
     Workers: Gauge, "runtime_workers", "Configured Tokio runtime worker threads.";
     Connections: Gauge, "connections", "Current local Stratum connections.";
@@ -103,6 +106,9 @@ const _: () = {
 impl Family {
     fn buckets(self) -> &'static [f64] {
         match self {
+            // Rows, not seconds: a native chunk is one claimed fanout. See
+            // docs/prism-metrics-histogram-consumers.md before changing this.
+            Self::CtvChunkRows => &[1.],
             Self::ShareAck => SHARE_ACK_BUCKETS,
             _ => BUCKETS,
         }

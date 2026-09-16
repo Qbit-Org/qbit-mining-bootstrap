@@ -1,5 +1,16 @@
 {
   "native": {
+    "ctv_fanout_broadcaster_tip_refresh_yields_total": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]
+    },
+    "ctv_fanout_broadcaster_chunk_rows": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_rows"],
+      "status": "Values are rows, not seconds: instead of the default time ladder this histogram exports the single finite bound `le=\"1\"` plus `+Inf`, so `_count` is the number of claimed fanout attempts and `_sum` equals `_count`. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported; a query for a higher `le` matches no series."
+    },
+    "ctv_fanout_broadcaster_chunk_seconds": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_seconds"],
+      "status": "Default histogram ladder in seconds; one observation per claimed attempt, recorded even when persisting the attempt's completion fails."
+    },
     "accepted_shares_total": {
       "replaces": [
         "qbit_prism_accepted_shares_total"

@@ -231,6 +231,33 @@ impl TipState {
         self.current.as_ref().map(|tip| tip.hash.as_str())
     }
 
+    /// Background settlement yields while the detected tip awaits publication,
+    /// for at most the replacement-build budget from the first departure. Failed
+    /// refreshes and newer tips never renew it, so a publication outage cannot
+    /// strand settlement; a zero budget disables the yield like the lease.
+    pub(crate) fn refresh_pending(&self, build_budget: Duration) -> bool {
+        let unpublished = self.current.as_ref().is_some_and(|current| {
+            self.published
+                .as_ref()
+                .is_none_or(|published| published.hash != current.hash)
+        });
+        unpublished
+            && !build_budget.is_zero()
+            && self
+                .divergence_started
+                .is_some_and(|at| at.elapsed() <= build_budget)
+    }
+
+    /// Whether a tip recorded after `since` differs from `hash`. Only evidence
+    /// newer than a pass's own chain view can supersede that view. An older
+    /// observation is stale, not a newer tip: yielding to it would hold
+    /// settlement until a blocked or absent refresh caught up, with no budget.
+    pub(crate) fn superseded_since(&self, hash: &str, since: MonotonicInstant) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|tip| tip.hash != hash && tip.observed_at > since)
+    }
+
     pub(super) fn reserve(&mut self) -> u64 {
         self.requested = self
             .requested
@@ -262,12 +289,14 @@ impl TipState {
             });
         }
         if from_refresh {
-            if let Some(published) = self.published.as_mut() {
-                if published.hash == hash {
+            match self.published.as_mut() {
+                Some(published) if published.hash == hash => {
                     published.observed_at = now;
                     self.divergence_started = None;
-                } else {
-                    // A -> B -> C and retries never renew the first departure.
+                }
+                // A -> B -> C and retries never renew the first departure; an
+                // unpublished startup tip anchors its budget the same way.
+                _ => {
                     self.divergence_started.get_or_insert(now);
                 }
             }
