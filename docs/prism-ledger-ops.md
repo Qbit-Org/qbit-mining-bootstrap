@@ -1504,8 +1504,8 @@ primary, with the frontends running. Nothing here needs a maintenance window.
 | --- | --- |
 | `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written again in order, and is refused once a later archived partition has left the ledger |
-| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous, and refused over a predecessor whose archive is not verified, so every link is to a certified manifest; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written and verified again in order, each over its verified predecessor, and is refused once a later archived partition has left the ledger |
+| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, whose own archive has to be verified, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
 | `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
 | `drop <partition> --dir <root>` | requires `detached` and verified; reads the recorded archive back from disk, checking both digests against the catalog, and counts the rows against it again; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
@@ -1617,10 +1617,17 @@ archived in `upper_seq` order. The manifest's own SHA-256 is what the catalog
 and the next manifest record, so a manifest cannot be rewritten without
 breaking both: `archive --force` clears the verification of every later
 archive along with its own, and each has to be written again with `--force`,
-in `upper_seq` order, and verified again. It is refused once a later archived
-partition has been detached or dropped, because that partition can no longer
-be archived from its live rows; bring the missing files back from a copy of
-the archive root instead.
+in `upper_seq` order, and verified again. That order is enforced, not
+assumed: a link proves one hop, and `verify` checks only the manifest's own
+link, so both `archive` and `verify` refuse a partition whose nearest archived
+predecessor has no `archive_verified_at`. A verification therefore stands for
+the whole chain below it, and a repair proceeds from the rewritten partition
+up, verify then archive then verify; a later partition cannot be written
+against a middle manifest whose own link is obsolete, certified on that one
+hop, and detached over a chain that can then never be repaired. The rewrite
+is refused once a later archived partition has been detached or dropped,
+because that partition can no longer be archived from its live rows; bring
+the missing files back from a copy of the archive root instead.
 
 **Verifying an archive by hand.** `rows_sha256` is the SHA-256 of the
 uncompressed byte stream, so a verifier streams the file without materializing

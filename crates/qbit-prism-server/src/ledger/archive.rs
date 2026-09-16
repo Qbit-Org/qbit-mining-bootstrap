@@ -1430,8 +1430,10 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
 /// and the previous verification is cleared with it: a new archive has not
 /// been verified. Every later archive chains to the replaced manifest's digest,
 /// so their verifications are cleared too and each has to be written again in
-/// order; once one of them has left the ledger it cannot be, and the archive
-/// is refused instead.
+/// order, which is enforced rather than assumed: a manifest is written only
+/// over a verified predecessor, so the repair runs from the rewritten
+/// partition up. Once one of the later archives has left the ledger it cannot
+/// be written again, and the archive is refused instead.
 pub async fn archive(
     ledger: &Ledger,
     partition_name: &str,
@@ -1482,6 +1484,25 @@ pub async fn archive(
         },
         number_or(record.lower_seq, "MINVALUE")
     );
+    // Adjacent is not enough: the link is to the predecessor's digest, and
+    // that digest stands for the chain below it only while the predecessor's
+    // verification does, since verify certifies a link only over a verified
+    // predecessor and a rewrite below clears every verification above it. A
+    // manifest written over an unverified predecessor cannot be certified
+    // until that predecessor is, and if the predecessor's own link is
+    // obsolete, its rewrite changes the digest this manifest links to, so
+    // this pass over the partition would be wasted. Refuse it now, so the
+    // repair proceeds in order, from the rewritten partition up.
+    if let Some(row) = previous
+        .as_ref()
+        .filter(|row| row.archive_verified_at.is_none())
+    {
+        bail!(
+            "refusing to archive {partition_name}: its manifest would chain to {}, whose archive has no recorded verification, so nothing proves the chain below it is current. Verify {} first, or, if its own link was made obsolete by a rewrite below it, write it again with --force and verify it; then archive {partition_name}",
+            row.partition_name,
+            row.partition_name
+        );
+    }
     // Every later archive chains, directly or through the ones between, to
     // this partition's manifest digest, and a new manifest has a new digest.
     // Each of them has to be written again in order and verified again, so
@@ -1721,8 +1742,9 @@ async fn check_recorded_rows(rows_path: &Path, manifest: &ArchiveManifest) -> Re
 }
 
 /// Re-read the archive, recompute both digests, check the manifest against the
-/// catalog row and the chain, including that the chain has no gap, and, while
-/// the partition is still attached, stream the live rows again and compare the
+/// catalog row and the chain, including that the chain has no gap and that the
+/// predecessor it links to is itself verified, and, while the partition is
+/// still attached, stream the live rows again and compare the
 /// stream digest and the count. Records `archive_verified_at` only when
 /// everything agreed and the live rows were compared, and only once the share
 /// sequence has passed the partition; after a detach the verification is
@@ -1762,6 +1784,25 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         number_or(manifest.previous_upper_seq, "nothing"),
         number_or(manifest.lower_seq, "MINVALUE")
     );
+    // One link proves one hop. It stands for the whole chain only while the
+    // predecessor's own verification does: that was recorded on the same
+    // terms, and a rewrite anywhere below clears it, so a verified
+    // predecessor means every link below is current. Certifying a link to an
+    // unverified manifest would let this partition leave the ledger over a
+    // chain broken further down, where nothing can be rewritten once it has
+    // gone; the repair has to be certified in order, from the rewritten
+    // partition up.
+    if let Some(row) = previous
+        .as_ref()
+        .filter(|row| row.archive_verified_at.is_none())
+    {
+        bail!(
+            "{}: the manifest chains to {}, whose archive has no recorded verification, so nothing proves the chain below it is current. Verify {} first, in order from the lowest unverified archive, and then verify {partition_name}",
+            path.display(),
+            row.partition_name,
+            row.partition_name
+        );
+    }
 
     check_recorded_rows(&rows_path, &manifest).await?;
 
@@ -1799,16 +1840,19 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         // Fence the evidence checked above against archive rewrites. Lock
         // predecessor before successor, in the same order archive updates
         // its own digest and invalidates later verifications.
-        let previous: Option<(i64, String)> = sqlx::query_as(
-            "SELECT upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1 FOR SHARE",
+        let previous: Option<(i64, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT upper_seq,archive_manifest_sha256,archive_verified_at FROM qbit_prism_share_partitions WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1 FOR SHARE",
         )
         .bind(record.upper_seq)
         .fetch_optional(&mut *tx)
         .await?;
         ensure!(
-            previous.as_ref().map(|(upper, _)| *upper) == expected_upper
-                && previous.as_ref().map(|(_, digest)| digest) == expected_link.as_ref(),
-            "{partition_name}'s predecessor archive was rewritten during verification; verify the current archive chain again"
+            previous.as_ref().map(|(upper, _, _)| *upper) == expected_upper
+                && previous.as_ref().map(|(_, digest, _)| digest) == expected_link.as_ref()
+                && previous
+                    .as_ref()
+                    .is_none_or(|(_, _, verified_at)| verified_at.is_some()),
+            "{partition_name}'s predecessor archive was rewritten during verification, or lost its verification to a rewrite below it; verify the current archive chain again, in order"
         );
         // The timestamp is the proof detach and drop require: the archive
         // was compared with the live rows. A verify after the detach checks

@@ -157,12 +157,14 @@ enum ShareArchiveCommand {
         /// Write an archive again for a partition that already has one, into
         /// a new version directory that replaces the recorded one, clearing
         /// its verification and that of every later archive, which must then
-        /// be written again in order.
+        /// be written and verified again in order, each over its verified
+        /// predecessor.
         #[arg(long)]
         force: bool,
     },
     /// Re-read the archive, recompute both digests, check the manifest against
-    /// the catalog and the chain, and compare the live rows while they are there.
+    /// the catalog and the chain, including that the archive it links to is
+    /// verified, and compare the live rows while they are there.
     Verify {
         partition: String,
         #[arg(long)]

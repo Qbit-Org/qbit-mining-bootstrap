@@ -390,6 +390,15 @@ async fn catalog(pool: &PgPool, partition: &str) -> Result<sqlx::postgres::PgRow
     .await?)
 }
 
+async fn verified_at(
+    pool: &PgPool,
+    partition: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    Ok(catalog(pool, partition)
+        .await?
+        .try_get("archive_verified_at")?)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -672,6 +681,133 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             error.contains("rows_gz_sha256") && error.contains("altered"),
             "verify did not name the digest that differed: {error}"
         );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// A rewrite invalidates every later archive, and the repair has to proceed
+/// from the rewritten partition up: a manifest is neither written over, nor
+/// certified over, a predecessor whose own verification is not standing. With
+/// three archives, rewriting the first leaves the middle one linked to the
+/// replaced digest while the last one's link to the middle is unchanged, so a
+/// one-hop check would let the last be written and certified against a chain
+/// broken below it and leave the ledger on it, after which the middle one
+/// could never be written again.
+#[tokio::test]
+async fn chain_repairs_are_written_and_certified_in_order() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("chain-order").await?;
+        let root = tempfile::tempdir()?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        let (_, p1_upper) = bounds(&ledger.pool, P1).await?;
+        let (_, p2_upper) = bounds(&ledger.pool, P2).await?;
+        insert_shares(&ledger.pool, 1, 20, 7, "server-a", 3600.0).await?;
+        insert_shares(&ledger.pool, p0_upper, p0_upper + 9, 5, "server-a", 3600.0).await?;
+        insert_shares(&ledger.pool, p1_upper, p1_upper + 4, 5, "server-a", 3600.0).await?;
+        set_sequence(&ledger.pool, p2_upper).await?;
+
+        // A manifest chains only to a verified one, so the three are archived
+        // and verified in turn.
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        let error = archive::archive(&ledger, P1, root.path(), false, "operator-a")
+            .await
+            .expect_err("archived over an unverified predecessor")
+            .to_string();
+        ensure!(
+            error.contains("no recorded verification") && error.contains(P0),
+            "{error}"
+        );
+        archive::verify(&ledger, P0, root.path()).await?;
+        for partition in [P1, P2] {
+            archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+            archive::verify(&ledger, partition, root.path()).await?;
+        }
+        let middle_digest = read_archive(&ledger, P1).await?.manifest_sha256;
+
+        // Rewriting the first clears both later verifications. The middle
+        // manifest now links to a replaced digest; the last still links to
+        // the middle's unchanged one.
+        let rewritten = archive::archive(&ledger, P0, root.path(), true, "operator-a").await?;
+        ensure!(
+            rewritten["verification_cleared"] == serde_json::json!([P1, P2]),
+            "{rewritten}"
+        );
+        ensure!(
+            read_archive(&ledger, P2)
+                .await?
+                .manifest
+                .previous_manifest_sha256
+                == Some(middle_digest.clone()),
+            "the rewrite of the first archive changed the last one's link"
+        );
+        // The last is neither written again nor certified over the unverified
+        // middle, although its own link to the middle is intact.
+        let error = archive::archive(&ledger, P2, root.path(), true, "operator-a")
+            .await
+            .expect_err("rewrote the last archive over an unverified middle one")
+            .to_string();
+        ensure!(
+            error.contains("no recorded verification") && error.contains(P1),
+            "{error}"
+        );
+        let error = archive::verify(&ledger, P2, root.path())
+            .await
+            .expect_err("certified a link to an unverified manifest")
+            .to_string();
+        ensure!(
+            error.contains("no recorded verification") && error.contains(P1),
+            "{error}"
+        );
+        ensure!(
+            verified_at(&ledger.pool, P2).await?.is_none(),
+            "a refused verification was recorded"
+        );
+        // Nor is the middle written again before the first is verified.
+        let error = archive::archive(&ledger, P1, root.path(), true, "operator-a")
+            .await
+            .expect_err("rewrote the middle archive over the unverified first")
+            .to_string();
+        ensure!(
+            error.contains("no recorded verification") && error.contains(P0),
+            "{error}"
+        );
+
+        // In order, from the rewritten partition up, the chain is whole again.
+        archive::verify(&ledger, P0, root.path()).await?;
+        for partition in [P1, P2] {
+            archive::archive(&ledger, partition, root.path(), true, "operator-a").await?;
+            archive::verify(&ledger, partition, root.path()).await?;
+        }
+        let (first, middle, last) = (
+            read_archive(&ledger, P0).await?,
+            read_archive(&ledger, P1).await?,
+            read_archive(&ledger, P2).await?,
+        );
+        ensure!(
+            middle.manifest.previous_manifest_sha256.as_deref()
+                == Some(first.manifest_sha256.as_str())
+                && last.manifest.previous_manifest_sha256.as_deref()
+                    == Some(middle.manifest_sha256.as_str())
+                && middle.manifest_sha256 != middle_digest,
+            "the repaired chain does not link each manifest to the current one below it"
+        );
+        for partition in [P0, P1, P2] {
+            ensure!(
+                verified_at(&ledger.pool, partition).await?.is_some(),
+                "{partition} is not verified after the repair"
+            );
+        }
         Ok(ledger)
     }
     .await;
