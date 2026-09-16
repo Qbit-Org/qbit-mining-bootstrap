@@ -189,7 +189,10 @@ evidence. Code 4
 is kept distinct from code 2 so that re-running a successful abandon reads as
 "nothing to do" rather than as a lost row. An **expired** claim is not a live
 claim, so a supported row whose owner died is abandonable without waiting;
-code 5 applies only while the claim is still live. Unsupported versions report
+code 5 reflects whether the claim was live at one database timestamp captured
+after acquiring the settlement lock. The UPDATE and refusal diagnosis share that
+timestamp, so expiry between them still reports a claim refusal rather than an
+internal consistency error; a fresh invocation can abandon the now-expired row. Unsupported versions report
 code 7, and an unreplayable version-1 document code 8, both ahead of claim
 status: a claim expires on its own, and neither a storage format nor a document
 shape becomes replayable by waiting. A pending row whose block has landed always

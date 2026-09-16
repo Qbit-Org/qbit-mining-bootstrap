@@ -1142,6 +1142,59 @@ async fn abandon_refuses_a_parked_legacy_document_and_leaves_its_evidence_whole(
 }
 
 #[tokio::test]
+async fn abandon_reports_claimed_when_lease_expires_before_diagnosis() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let mut held = Row::new("11", "pending");
+    held.claim = Some(("frontend-b".to_owned(), 10.0));
+    seed(&ledger.pool, &held).await?;
+    let before = whole_row(&ledger.pool, &held.hash).await?;
+    // An AFTER STATEMENT trigger runs even when the UPDATE matches no rows.
+    // Delay its return until the rejected claim has expired, so the following
+    // diagnostic SELECT crosses the boundary without modifying the evidence.
+    sqlx::raw_sql("CREATE FUNCTION expire_before_diagnosis() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM changed_rows) THEN
+            RAISE EXCEPTION 'fixture claim expired before UPDATE evaluated';
+          END IF;
+          PERFORM pg_sleep(GREATEST(0, (SELECT EXTRACT(EPOCH FROM (claim_expires_at-clock_timestamp())) FROM qbit_block_candidate_outbox LIMIT 1))::double precision + 0.05);
+          RETURN NULL;
+        END $$;
+        CREATE TRIGGER expire_before_diagnosis AFTER UPDATE ON qbit_block_candidate_outbox
+        REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT EXECUTE FUNCTION expire_before_diagnosis();")
+        .execute(&ledger.pool).await?;
+    let args = [
+        "candidates",
+        "abandon",
+        "--block-hash",
+        &held.hash,
+        "--reason",
+        "operator sweep",
+    ];
+    let refused = cli(&db, &node, &args).await?;
+    assert_eq!(code(&refused), 5, "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("is held by frontend-b until"));
+    assert_eq!(whole_row(&ledger.pool, &held.hash).await?, before);
+    let expired: bool = sqlx::query_scalar("SELECT claim_expires_at <= clock_timestamp() FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+        .bind(&held.hash).fetch_one(&ledger.pool).await?;
+    assert!(
+        expired,
+        "diagnosis must happen after the original claim expires"
+    );
+    sqlx::query("DROP TRIGGER expire_before_diagnosis ON qbit_block_candidate_outbox")
+        .execute(&ledger.pool)
+        .await?;
+    let retried = cli(&db, &node, &args).await?;
+    assert_eq!(code(&retried), 0, "{}", stderr(&retried));
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
 async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
