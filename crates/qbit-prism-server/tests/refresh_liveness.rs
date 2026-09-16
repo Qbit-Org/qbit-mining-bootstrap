@@ -18,6 +18,7 @@ use tokio::{sync::watch, task::JoinSet, time::timeout};
 #[path = "support/compact_runtime_e2e/mod.rs"]
 mod support;
 use support::{
+    execution::{Fault, FaultPhase},
     run,
     socket::{ordinary_submit, Client, Listener},
     Fixture, DIFFICULTY,
@@ -470,9 +471,9 @@ async fn new_tip_serves_work_while_ctv_completion_is_held_then_ctv_yields() -> R
     .await
 }
 
-async fn ctv_yield_case(f: &Fixture, publish_before_completion: bool) -> Result<()> {
-    f.refresh(true).await?;
-    let count = mature_fanouts(f).await?;
+/// Mark the durable completion of a claimed fanout for the proxy; claims and
+/// renewals leave the recheck schedule alone, so only completions match.
+async fn mark_ctv_completions(f: &Fixture) -> Result<()> {
     sqlx::raw_sql(
         r#"
             CREATE FUNCTION observe_ctv_chunk() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -488,6 +489,13 @@ async fn ctv_yield_case(f: &Fixture, publish_before_completion: bool) -> Result<
     )
     .execute(f.pool())
     .await?;
+    Ok(())
+}
+
+async fn ctv_yield_case(f: &Fixture, publish_before_completion: bool) -> Result<()> {
+    f.refresh(true).await?;
+    let count = mature_fanouts(f).await?;
+    mark_ctv_completions(f).await?;
     let row = f.proxy.pause_after_commit("ctv_chunk", "UPDATE")?;
     let mut tasks = JoinSet::new();
     let a = f.a.clone();
@@ -600,6 +608,61 @@ async fn ctv_yield_case(f: &Fixture, publish_before_completion: bool) -> Result<
             == series
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctv_chunk_metrics_count_an_attempt_whose_completion_failed_to_persist() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f).await?;
+            mark_ctv_completions(f).await?;
+            // The attempt succeeds, then its completion write loses the socket
+            // after executing: the transaction aborts and the pass ends early.
+            f.proxy.plan(Fault {
+                table: "ctv_chunk".into(),
+                op: "UPDATE".into(),
+                phase: FaultPhase::AfterExecution,
+            });
+            let error = timeout(BOUND, broadcaster::run_once(&f.a))
+                .await?
+                .err()
+                .context("a lost completion acknowledgement reported success")?;
+            ensure!(
+                f.proxy.fired().is_some(),
+                "completion fault did not fire: {error:#}"
+            );
+            let body = f.a.metrics.render();
+            ensure!(
+                metric(&body, "chunk_rows_count")? == 1. && metric(&body, "chunk_rows_sum")? == 1.,
+                "chunk rows missed the attempt whose completion failed"
+            );
+            ensure!(
+                metric(&body, "chunk_seconds_count")? == 1.,
+                "chunk duration missed the attempt whose completion failed"
+            );
+            ensure!(metric(&body, "tip_refresh_yields_total")? == 0.);
+            let fenced: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE claim_token IS NOT NULL",
+            )
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(
+                fenced == 1,
+                "aborted completion left {fenced} fenced claims"
+            );
+            // The fenced row waits for its claim to expire; the rest finish now.
+            let later = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
+            ensure!(
+                later == count - 1,
+                "later pass finished {later} of {} unclaimed rows",
+                count - 1
+            );
+            ensure!(metric(&f.a.metrics.render(), "chunk_rows_count")? == count as f64);
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

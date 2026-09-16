@@ -67,12 +67,12 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
             process(coordinator, &claim),
         )
         .await;
-        match outcome {
+        let finished = match outcome {
             Ok(Ok((status, result))) => {
                 coordinator
                     .ledger
                     .finish_fanout(&claim, status, Some(result), None)
-                    .await?
+                    .await
             }
             result => {
                 let error = match result {
@@ -87,10 +87,13 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
                     tracing::warn!(%finish,"CTV claim completion deferred");
                 }
                 tracing::warn!(%error,fanout=%claim.fanout_txid,"CTV broadcast deferred");
+                Ok(())
             }
-        }
+        };
+        // The chunk was attempted whether or not its completion persisted.
         count += 1;
         coordinator.metrics.observe_ctv_chunk(started.elapsed());
+        finished?;
         tokio::task::yield_now().await;
     }
     Ok(count)
