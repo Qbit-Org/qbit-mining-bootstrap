@@ -288,3 +288,74 @@ async fn probe_deadline_still_fails_and_releases_waiting_acquisition() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn blocked_operator_log_does_not_hold_the_health_snapshot_lock() {
+    type Release = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    #[derive(Clone)]
+    struct BlockedLog {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Release,
+    }
+    impl std::io::Write for BlockedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let (lock, wake) = &*self.release;
+            let released = lock.lock().unwrap();
+            if !*released {
+                self.entered.send(()).unwrap();
+                drop(wake.wait_while(released, |released| !*released).unwrap());
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct ReleaseOnDrop(Release);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.0;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    let (app, service) = service(
+        read_pool(PgConnectOptions::new_without_pgpass(), 1),
+        ServiceConfig::default(),
+    );
+    service.pool.close().await;
+    let (entered, observed) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let guard = ReleaseOnDrop(release.clone());
+    let writer = BlockedLog { entered, release };
+    let probe_service = service.clone();
+    // Separate threads ensure the test can release the fake backpressured sink
+    // even if the old implementation holds a synchronous RwLock while logging.
+    let probe = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish();
+        runtime.block_on(probe_service.probe_once().with_subscriber(subscriber));
+    });
+    let entered_log = observed.recv_timeout(Duration::from_secs(3));
+    let published = service
+        .snapshot
+        .try_read()
+        .ok()
+        .map(|snapshot| (snapshot.ready, snapshot.last_error));
+    // Do not acquire a blocking read lock on the negative-control path. The
+    // normal path exercises HTTP while the warning writer is still blocked.
+    if published.is_some() {
+        let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(body["error"], "database connection failed");
+    }
+    drop(guard);
+    probe.join().unwrap();
+    entered_log.unwrap();
+    assert_eq!(published, Some((false, Some(ProbeFailure::Connection))));
+}

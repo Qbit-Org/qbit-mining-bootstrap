@@ -243,31 +243,35 @@ impl ServiceState {
         let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         snapshot.checked = Some(Instant::now());
         snapshot.checked_at = Some(now());
-        match result {
+        let failure = match result {
             Ok(Ok(value)) => {
                 snapshot.ready = value["schema_ready"] == true
                     && (!self.config.replica_required || value["in_recovery"] == true);
                 snapshot.last_error =
                     (value["schema_ready"] != true).then_some(ProbeFailure::Schema);
-                if let Some(failure) = snapshot.last_error {
-                    failure.log("schema");
-                }
                 if self.config.replica_required {
                     snapshot.replica = Some(value);
                     snapshot.replica_at = Some(Instant::now());
                 }
+                snapshot.last_error.map(|failure| (failure, "schema"))
             }
             Ok(Err((phase, error))) => {
                 snapshot.ready = false;
                 let failure = ProbeFailure::from_sqlx(&error);
-                failure.log(phase);
                 snapshot.last_error = Some(failure);
+                Some((failure, phase))
             }
             Err(_) => {
                 snapshot.ready = false;
-                ProbeFailure::Timeout.log("probe");
                 snapshot.last_error = Some(ProbeFailure::Timeout);
+                Some((ProbeFailure::Timeout, "probe"))
             }
+        };
+        // A synchronous operator log sink can block. Publish the snapshot and
+        // release its lock first so health requests can still read the result.
+        drop(snapshot);
+        if let Some((failure, phase)) = failure {
+            failure.log(phase);
         }
     }
     pub(super) fn view(&self) -> ServiceView {
