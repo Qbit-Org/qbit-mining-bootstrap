@@ -228,9 +228,15 @@ async fn commit_reconcile_candidate_bearing_append_is_never_refused() {
     .await;
     let append = Arc::new(Gate::default());
     *fixture_.store.append_gate.lock().unwrap() = Some(append.clone());
-    let started = TokioInstant::now();
+    // Keep slow setup outside the append hold: under load, proof construction
+    // or task scheduling can consume more than the old 350ms-200ms margin.
+    // This delay makes an anchor moved before submission fail deterministically.
+    tokio::time::sleep(MS(250)).await;
     let (submitted, _log) = submit(&fixture_, proof(&fixture_, true));
     append.entered.notified().await;
+    // The runtime acknowledgement clock has started by append entry. Hold the
+    // same 350ms from that observed event, not from earlier fixture/proof work.
+    let started = TokioInstant::now();
     tokio::time::sleep_until(started + MS(350)).await;
     assert!(
         !submitted.is_finished(),
