@@ -1970,6 +1970,209 @@ async fn a_replication_mode_other_than_the_declared_one_refuses_qualification() 
     Ok(())
 }
 
+/// `detect_replication` recognized only `sync` as synchronous. An external
+/// cluster with `synchronous_standby_names = 'ANY n (...)'` reports its
+/// candidates as `quorum`, which fell through to `async`: a correct
+/// `--replication sync` run was refused at the premise check, and a
+/// `--replication async` declaration agreed with the wrong observation. The
+/// classification is now a pure function over the `sync_state` column, and
+/// PostgreSQL 16's four values, null and no rows each have a decided answer.
+#[test]
+fn quorum_and_mixed_standby_rows_classify_as_the_replication_postgres_applies() {
+    use qbit_prism_load::cluster::{classify_replication, ObservedReplication, Replication};
+    fn rows(states: &[Option<&str>]) -> Vec<Option<String>> {
+        states
+            .iter()
+            .map(|state| state.map(str::to_owned))
+            .collect()
+    }
+    let sync = ObservedReplication::Observed {
+        mode: Replication::Sync,
+    };
+    let asynchronous = ObservedReplication::Observed {
+        mode: Replication::Async,
+    };
+    let none = ObservedReplication::Observed {
+        mode: Replication::None,
+    };
+
+    // Quorum-only: what an `ANY 1 (...)` primary shows for its one standby.
+    assert_eq!(classify_replication(&rows(&[Some("quorum")])), sync);
+    // Mixed rows use `any` semantics, as PostgreSQL does: a commit waits on
+    // the quorum candidate, and an extra asynchronous standby does not make
+    // the cluster asynchronous.
+    assert_eq!(
+        classify_replication(&rows(&[Some("quorum"), Some("async")])),
+        sync
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("async"), Some("quorum")])),
+        sync
+    );
+    // The existing `sync` behaviour is unchanged, alone and mixed.
+    assert_eq!(classify_replication(&rows(&[Some("sync")])), sync);
+    assert_eq!(
+        classify_replication(&rows(&[Some("sync"), Some("async")])),
+        sync
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential"), Some("sync")])),
+        sync
+    );
+    // `potential` is not synchronous: under `FIRST n` it is a standby that
+    // would be promoted if a member left, and no commit waits on it.
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential")])),
+        asynchronous
+    );
+    assert_eq!(
+        classify_replication(&rows(&[Some("potential"), Some("async")])),
+        asynchronous
+    );
+    assert_eq!(classify_replication(&rows(&[Some("async")])), asynchronous);
+    // No rows is no standby.
+    assert_eq!(classify_replication(&[]), none);
+    // A null state is a role that cannot see the column: unknown, with the
+    // reason, whatever else is visible. The arm runs before the synchronous
+    // one, so a quorum row beside a hidden one is still unknown.
+    for (label, states) in [
+        ("all null", rows(&[None])),
+        ("two nulls", rows(&[None, None])),
+        ("quorum beside null", rows(&[Some("quorum"), None])),
+        ("null beside quorum", rows(&[None, Some("quorum")])),
+        ("sync beside null", rows(&[Some("sync"), None])),
+    ] {
+        let observed = classify_replication(&states);
+        let ObservedReplication::Unknown { reason } = &observed else {
+            panic!("{label} is unknown, not a mode: {observed:?}");
+        };
+        assert!(
+            reason.contains(&format!("{} pg_stat_replication row(s)", states.len())),
+            "{label}: {reason}"
+        );
+        assert!(reason.contains("pg_read_all_stats"), "{label}: {reason}");
+        assert_eq!(observed.as_str(), "unknown");
+        assert_ne!(observed, none, "{label}: unknown is not none");
+        assert_ne!(observed, asynchronous, "{label}: unknown is not async");
+    }
+}
+
+/// A quorum observation is a synchronous one at both premise checks: it
+/// agrees with `--replication sync` at entry and after the load, and it
+/// contradicts `--replication async` at both, through the same block and
+/// the same exit 8 as every other contradicted premise.
+#[test]
+fn a_quorum_observation_agrees_with_sync_and_contradicts_async_at_both_checks() {
+    use qbit_prism_load::artifact::Withhold;
+    use qbit_prism_load::cluster::{classify_replication, ObservedReplication, Replication};
+    use qbit_prism_load::run::{premise_block, withhold_decision, ReplicationPremise, RunOutcome};
+
+    // The observation is whatever the classifier makes of a quorum row, not
+    // a hand-built `Sync`: the premise checks see exactly this.
+    let quorum = classify_replication(&[Some("quorum".to_owned())]);
+    assert_eq!(
+        quorum,
+        ObservedReplication::Observed {
+            mode: Replication::Sync
+        }
+    );
+    assert_eq!(quorum.as_str(), "sync");
+    assert_eq!(quorum.reason(), None);
+
+    // Declared sync: agreement at entry alone, and at both checks.
+    let sync_at_entry = ReplicationPremise {
+        declared: Replication::Sync,
+        at_entry: quorum.clone(),
+        after_load: None,
+    };
+    assert_eq!(sync_at_entry.contradiction(), None);
+    assert!(sync_at_entry.agreed());
+    let sync_both = ReplicationPremise {
+        after_load: Some(quorum.clone()),
+        ..sync_at_entry.clone()
+    };
+    assert_eq!(sync_both.contradiction(), None);
+    assert!(sync_both.agreed());
+    let agreed = premise_block(None, &[], &sync_both);
+    assert_eq!(agreed["replication_agreed"], json!(true));
+    assert_eq!(agreed["contradicted"], json!(false));
+    assert_eq!(agreed["replication"]["declared"], json!("sync"));
+    assert_eq!(agreed["replication"]["observed_at_entry"], json!("sync"));
+    assert_eq!(agreed["replication"]["observed_after_load"], json!("sync"));
+    assert_eq!(agreed["replication"]["checked_after_load"], json!(true));
+    assert_eq!(agreed["replication"]["agreed"], json!(true));
+    assert_eq!(withhold_decision(None, None, None), None);
+
+    // Declared async: contradicted at entry, before any frontend runs.
+    let async_at_entry = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: quorum.clone(),
+        after_load: None,
+    };
+    let entry_reason = async_at_entry
+        .contradiction()
+        .expect("a quorum standby contradicts a declared asynchronous one at entry");
+    assert!(
+        entry_reason.contains("declared replication async"),
+        "{entry_reason}"
+    );
+    assert!(entry_reason.contains("observed sync"), "{entry_reason}");
+    assert!(entry_reason.contains("at entry"), "{entry_reason}");
+    assert!(!entry_reason.contains("after the load"), "{entry_reason}");
+    assert!(!async_at_entry.agreed());
+
+    // Declared async, agreed at entry only because the observation was made
+    // late: contradicted after the load.
+    let async_after_load = ReplicationPremise {
+        declared: Replication::Async,
+        at_entry: ObservedReplication::Observed {
+            mode: Replication::Async,
+        },
+        after_load: Some(quorum.clone()),
+    };
+    let late_reason = async_after_load
+        .contradiction()
+        .expect("a quorum standby contradicts a declared asynchronous one after the load");
+    assert!(late_reason.contains("observed sync"), "{late_reason}");
+    assert!(late_reason.contains("after the load"), "{late_reason}");
+    assert!(!late_reason.contains("at entry"), "{late_reason}");
+
+    // Both checks contradicted name both positions.
+    let async_both = ReplicationPremise {
+        after_load: Some(quorum.clone()),
+        ..async_at_entry.clone()
+    };
+    let both_reason = async_both.contradiction().expect("contradicted twice");
+    assert!(both_reason.contains("at entry"), "{both_reason}");
+    assert!(both_reason.contains("after the load"), "{both_reason}");
+
+    // The contradiction reaches the premise block and the exit-8 path.
+    let block = premise_block(Some(&both_reason), &[], &async_both);
+    assert_eq!(block["contradicted"], json!(true));
+    assert_eq!(block["replication_agreed"], json!(false));
+    assert_eq!(block["share_difficulty_agreed"], json!(true));
+    assert_eq!(block["replication"]["declared"], json!("async"));
+    assert_eq!(block["replication"]["observed_at_entry"], json!("sync"));
+    assert_eq!(block["replication"]["observed_after_load"], json!("sync"));
+    assert_eq!(block["replication"]["agreed"], json!(false));
+    let withheld = withhold_decision(None, Some(&entry_reason), None).expect("withheld");
+    assert_eq!(
+        withheld,
+        Withhold::PremiseContradicted(entry_reason.clone())
+    );
+    let outcome = RunOutcome {
+        withhold: Some(&withheld),
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+        no_response_commits: 0,
+        no_response_commits_mid_run: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
+    assert_ne!(outcome.exit_code(), run::EXIT_OK);
+}
+
 // --- server revision evidence --------------------------------------------
 
 /// `coordinator_revision` is the checkout's HEAD; the binary has to be shown

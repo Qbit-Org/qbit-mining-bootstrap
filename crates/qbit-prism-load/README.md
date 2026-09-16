@@ -799,8 +799,12 @@ The side report repeats all of this under `honest_value_notes`.
   `unknown` with the reason rather than as `none` in one direction or
   `async` in the other, and it is a contradicted premise as well: a run
   that cannot tell whether its standby exists has not established the
-  conditions it claims. `database.replication` in the side report carries
-  the same observations.
+  conditions it claims. A standby is synchronous when `pg_stat_replication`
+  reports it `sync`, as under the managed `FIRST 1 (...)`, or `quorum`, as
+  under an external `synchronous_standby_names = 'ANY n (...)'`; a
+  `potential` standby is not synchronous, since no commit waits on it, and
+  a cluster with only `potential` and `async` rows is observed as `async`.
+  `database.replication` in the side report carries the same observations.
 
 ## Reconciliation
 
