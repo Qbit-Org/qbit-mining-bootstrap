@@ -33,6 +33,7 @@ use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 mod bundle_build;
 mod compact_resume;
 mod compact_runtime;
+mod issued_batcher;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
@@ -221,6 +222,7 @@ pub struct Coordinator {
     pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
+    issued_batcher: issued_batcher::IssuedBatcher,
     pub last_error: RwLock<Option<String>>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
@@ -702,6 +704,7 @@ impl Coordinator {
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
             ledger,
             rpc,
             refresh,

@@ -634,10 +634,22 @@ async fn issued_save_wait_preserves_original_deadline_and_lease_before_delivery(
             .unwrap();
         assert_eq!(result.is_ok(), changed == "unchanged", "{changed}");
         let rows = f.store.jobs.lock().unwrap();
-        let row = rows.get(&id).expect("the gated save completed its write");
-        assert_eq!(row.revision, revision);
-        assert_eq!(row.expires_at_ms, expires_at_ms);
-        assert_eq!(row.payload["expires_at_ms"], expires_at_ms);
+        let calls = f.store.compact.issued_calls.lock().unwrap();
+        let attempted = calls.iter().find(|call| call.id == id).unwrap();
+        assert_eq!(attempted.current_revision, revision);
+        assert_eq!(attempted.expires_at_ms, expires_at_ms);
+        assert_eq!(attempted.payload["expires_at_ms"], expires_at_ms);
+        if changed == "absolute-expiry" {
+            assert!(
+                !rows.contains_key(&id),
+                "an elapsed precommit batch deadline must cancel the write"
+            );
+        } else {
+            let row = rows.get(&id).expect("the gated save completed its write");
+            assert_eq!(row.revision, revision);
+            assert_eq!(row.expires_at_ms, expires_at_ms);
+            assert_eq!(row.payload["expires_at_ms"], expires_at_ms);
+        }
         assert!(f.store.records.lock().unwrap().is_empty());
     }
 }
@@ -683,9 +695,9 @@ async fn dependency_repair_wait_keeps_first_attempt_authority_payload_and_expiry
         .unwrap();
         assert!(f.store.compact.state_calls.load(Ordering::SeqCst) > 0);
         save.release.notify_one();
-        // Once released, the fake synchronously returns PreparedMissing. The
-        // next Pending point is the already-held repair mutex, without a sleep
-        // or a new fake callback deciding where persistence should stop.
+        // Wait for the real collector to send PreparedMissing and release the
+        // enrollment. Polling the caller then reaches the held repair mutex.
+        f.coordinator.issued_batcher.wait_for_idle_for_tests().await;
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
         if changed == "epoch" {
             f.coordinator.invalidate_readiness().await;

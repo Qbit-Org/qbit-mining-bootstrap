@@ -51,6 +51,45 @@ manifest public keys, reward multiplier, payout policy, and CTV policy. A
 mismatched instance fails startup. Coordinators can use different local resource
 limits and synchronized qbit nodes on the same chain.
 
+Compact issued-job hot writes use a per-Coordinator collector: at most 128
+admitted children (pending plus active), 64 children per transaction, and one
+active batch including cancellation cleanup. Collection dwells for up to 1 ms
+from the oldest admission when storage is available, flushing earlier when full
+or a deadline requires it. Time behind another batch and admission backpressure
+remain inside the original persistence deadline. These bounds are initial
+engineering choices, not evidence of a latency target or a speedup.
+
+Groups share the complete original compact dependency identity and the expected
+current revision and parent; each Coordinator is bound to its own ledger/frontend.
+Only small owned child metadata is queued. Prepared reservations, inline/direct
+single-job APIs, and missing-dependency cold repair keep their existing paths.
+Hot batches retain `SETTLEMENT_LOCK`, then cluster `FOR SHARE`, prepared
+`FOR KEY SHARE`, and template/balance `FOR KEY SHARE` locks in that order.
+Shared revision, configuration, writable-state and dependency checks happen
+after the row waits. Children and any retention extension through the largest
+child expiry plus existing headroom commit atomically; original reservation
+identity and each child's absolute expiry never change.
+
+A conflicting child fails its whole transaction, including renewal. Other
+groups can succeed independently; no SQL failure is silently replayed. Canceled
+queued children are discarded, and cancellation of an active member interrupts
+the whole batch. A batch-local statement limit preserves stricter session
+settings and otherwise caps statements at 15 seconds or the remaining original
+deadline. Cancellation drains queued rollback before starting the next batch;
+cleanup is bounded at 16 seconds and discards an unresponsive connection.
+Dropping the Coordinator closes admissions and resolves pending waiters.
+COMMIT already started means an uncertain outcome after cancellation or lost
+acknowledgement, never proof of rollback. Reconciliation must use the exact
+original IDs, payloads and expiries. A durable row may remain undelivered after
+authority revocation: the original caller still revalidates after persistence,
+and Stratum never sends work before successful durable commit and revalidation.
+
+The batch debug event records actual shared storage-attempt elapsed time and
+cardinality, including pool and lock waits; cleanup is separate. Concurrent pool
+and advisory wait totals overlap and cannot be subtracted to infer exclusive
+service time. The one-second delivery, two-frontend non-regression, and lock-free
+criteria of #275 remain unqualified by this batching change.
+
 A pool with no historical shares issues solver-paid bootstrap work. There is no
 three-miner gate. A network-valid candidate below its assigned share target is
 stored without ordinary share credit. Active-chain confirmation inserts its
