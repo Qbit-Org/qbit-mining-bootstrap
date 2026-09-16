@@ -1081,7 +1081,7 @@ class AcceptanceProbeRpc(FakeRpc):
 class OrphanedBlockSubmitRpc(FakeRpc):
     """qbitd accepts the submitted block, then loses it to a same-height rival.
 
-    Models page #284 (#413/#414): submitblock succeeds and the tip flips to
+    Models the #413/#414 orphan stall: submitblock succeeds and the tip flips to
     the pool's hash (blockwait reports it), then the node reorgs to an
     equal-work competitor at the same height. From then on getblockheader
     still knows the pool's block but reports it off the active chain

@@ -7690,7 +7690,7 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
         tempdir: str,
         age_retained_acceptance: bool = False,
     ) -> tuple[PrismCoordinator, OrphanedBlockSubmitRpc, list[str], list[str], list[str]]:
-        """Run the page-#284 first pass and pin its release-without-reject contract.
+        """Run the #414 orphan first pass and pin its release-without-reject contract.
 
         submitblock accepts the pool's block, blockwait reports its hash as
         the tip, and moments later qbitd reorgs to an equal-work competitor
@@ -7871,7 +7871,7 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
     def test_proven_orphan_releases_barrier_first_pass_and_holds_prepared_rows(
         self,
     ) -> None:
-        # Page #284 (#413/#414), end to end, as revised by the #414 review:
+        # The #413/#414 orphan stall, end to end, as revised by the #414 review:
         # the first pass releases the landed barrier and wakes delivery but
         # does not reject the prepared payout rows. While the competitor is
         # the bare tip (one confirmation, below the default bar of two) and

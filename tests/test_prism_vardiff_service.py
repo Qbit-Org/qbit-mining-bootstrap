@@ -98,7 +98,7 @@ class VardiffServiceTests(unittest.TestCase):
         self.assertEqual(state.vardiff_window_submitted, 1)
 
     def test_payout_publication_block_skips_retarget_without_raising(self) -> None:
-        # #414 (page #284): a share-driven retarget builds a paired job, and
+        # #414: a share-driven retarget builds a paired job, and
         # that build can be fenced behind a pending payout publication (a
         # landed accepted-block transition). The fence must not escape
         # note_accepted -- it would propagate out of handle_submit and kill

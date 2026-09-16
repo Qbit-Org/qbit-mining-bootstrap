@@ -1230,7 +1230,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertTrue(sent["clean"])
 
     def test_payout_publication_block_in_retarget_keeps_client_connected(self) -> None:
-        # #414 (page #284): the share-driven retarget's paired job build
+        # #414: the share-driven retarget's paired job build
         # reaches reorg reconciliation while a landed accepted-block
         # transition fences payout publication, so maybe_send_job raises
         # PayoutStatePublicationBlocked. That must not escape the accepted
