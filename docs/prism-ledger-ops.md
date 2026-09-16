@@ -1249,16 +1249,19 @@ Container evidence (PostgreSQL 16.15) is lock-semantics and phase-shape
 evidence on a synthetic ledger, not a production absolute. It belongs here so
 the production numbers above have something to be read against.
 
+Taken on 2026-09-16 in Docker on an Apple M-series laptop: a synthetic
+ledger of 1,000,000 production-shaped rows (1,000 MB with its indexes, 500
+miners), `VACUUM (ANALYZE)` before each read, insert latency from 2,000
+single-row inserts timed in PL/pgSQL with `clock_timestamp()`.
+
 | Measurement | Before 016 | After 016 | Notes |
 | --- | --- | --- | --- |
-| Swap duration | | | |
-| Insert latency | | | |
-| `VACUUM (VERBOSE, ANALYZE)` duration | | | |
-| Page-walk plan, buffers and heap fetches | | | |
-| Bounded `share_id` probe, buffers and `Subplans Removed` | | | |
-| Unbounded `share_id` probe, buffers | | | |
-
-<!-- coordinator: fill from the integration run -->
+| Prepare, validate, swap | | 2.3 ms, 47 ms, 16.7 ms | the validation scan is the only term that grows with the table (about 300 MB of heap here); the swap renamed, created the parent, adopted five indexes, attached and created two lead partitions |
+| Insert latency p50 / p95 / p99 | 0.031 / 0.048 / 0.066 ms | 0.032 / 0.047 / 0.069 ms into the release partition; 0.025 / 0.038 / 0.061 ms into a fresh lead partition | a hot leaf's indexes are small and cache-resident |
+| `VACUUM (ANALYZE)` duration | 0.32 s | 0.44 s for every partition; 0.02 s for one lead partition | retention bounds the set vacuum visits |
+| Page-walk plan, `qbit_prism_window` over about 200k shares | 15,809 shared buffers | 17,353 shared buffers | the same recursive page walk through the partitioned parent |
+| Bounded `share_id` probe | | 8 shared buffers over the three attached leaves | `Subplans Removed` appears once the floor clears a partition; at 1 M rows the floor is still 0 |
+| Unbounded `share_id` probe | | 6 shared buffers | one index descent per attached leaf; grows with the attached count, which is the cost the bound removes |
 
 ## Offline pool-fee and CTV fee-rate changes
 

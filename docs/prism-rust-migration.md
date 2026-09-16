@@ -716,10 +716,10 @@ validated before the swap, not just the bound.
 
 **Re-bounding.** A run that is interrupted and resumed later may find the
 sequence has eaten the headroom. `prepare` is therefore called again at the
-start of the pending stage: it returns the existing bound while at least one
-partition width of headroom is left, and otherwise drops the pending
-constraint, bounds further out and records the new bound, which then has to be
-validated again. That is the one case where a validation scan has to start
+start of the pending stage and of the validated stage: it returns the existing
+bound while at least one partition width of headroom is left, and otherwise
+drops the constraint, pending or validated, bounds further out and records the
+new bound, which then has to be validated again. That is the one case where a validation scan has to start
 over, and it is why an interrupted conversion is better resumed promptly than
 left for a week.
 
@@ -750,7 +750,7 @@ state of `qbit_share_ledger_p0_bound` and `converted_at` in the catalog:
 | --- | --- | --- |
 | plain | an ordinary table with no bound | refuses the reserved names, prepares the bound, then validates and swaps |
 | pending | the bound is on the table and enforced on new rows, not yet validated | prepares again (which re-bounds only if the headroom is gone), validates every pending `CHECK`, then swaps |
-| validated | the bound is validated | swaps |
+| validated | the bound is validated | prepares again (which re-bounds and validates again only if the headroom is gone), then swaps |
 | converted | the parent is partitioned and the catalog records the conversion | ensures the lead partitions and records 16 |
 
 Every name the run would take is checked while the ledger is still plain,
