@@ -79,6 +79,107 @@ accounting after it, and the row records where the block is between them:
 | `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. |
 | `abandoned` | Reachable from `pending` only. |
 
+### Candidate commands
+
+Two operator commands read and finish the rows above. Both take
+`PRISM_DATABASE_URL` and nothing else: neither builds a node client, reads a
+signing key, loads the server configuration or starts a listener, so neither
+can offer a block.
+
+```sh
+qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
+qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>"
+```
+
+`list` prints every unfinished row — `pending`, `offer_reserved`, `offered`
+and `reconciliation` — oldest due first. That is the oldest-due claim lane's
+own ordering, so the row a server works next is the first line and parked
+rows sort last. It is not ordered by height, which is read out of the
+candidate document and may be unknown.
+
+```
+block_hash                                                        state           height  attempts  next_attempt                      claim                                                    sv  last_error
+7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a  pending         184021  0         2026-09-16T15:03:10.792447+00:00  -                                                        1   -
+5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f  offered         184020  2         2026-09-16T15:03:28.793326+00:00  expired                                                  1   -
+3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c  offer_reserved  184022  1         2026-09-16T15:03:43.793265+00:00  prism-frontend-b until 2026-09-16T15:03:50.793265+00:00  1   -
+9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e  reconciliation  184018  7         2026-09-16T15:04:08.793284+00:00  -                                                        1   submitblock reply was lost with the offering frontend; awaiting an autho…(truncated)
+d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4  pending         184019  3         parked                            -                                                        1   block digest did not authenticate against candidate_sha256
+b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1  pending         -       1         parked                            -                                                        3   candidate storage_version 3 is not supported by this server; only versio…(truncated)
+```
+
+| Column | Meaning |
+| --- | --- |
+| `block_hash` | The whole 64-character hash, so it can be pasted straight into `candidates abandon --block-hash`. |
+| `state` | The lifecycle state from the table above. Terminal rows are finished work and never appear. |
+| `height` | `candidate->'found_block'->>'block_height'`, extracted server-side. `-` (text) or `null` (`--json`) when the document holds no readable height — an unknown-`storage_version` row, for example. Never `0`. |
+| `attempts` | `attempt_count`: how many claims the row has taken, not how many offers were made. |
+| `next_attempt` | `next_attempt_at`, or `parked` when it is `infinity`. |
+| `claim` | `<claim_instance_id> until <claim_expires_at>` for a live claim, `expired` for a claim past its expiry (the row is workable again), `-` for none. `--json` keeps the stale holder and expiry. |
+| `sv` | `storage_version`. Anything other than `1` is a row this server cannot decode. |
+| `last_error` | Why the last attempt stopped. Truncated in text mode only, and marked `…(truncated)` when it is; `--json` prints it whole. |
+
+**Parked is not abandoned.** A parked row has `next_attempt_at = 'infinity'`
+and a `last_error`, which is exactly what the `parked` cell means. It is still
+unfinished: the claim lane moved it out of the retry schedule because this
+server could not decode or validate it, and it keeps its state, its document,
+its block bytes and its window reference. It is operator work, not a retry
+loop, and it is not terminal until something finishes it.
+
+`list` never loads a payload. `candidate` and `block_bytes` are not in its
+projection, so the command stays usable on a production-sized row. It opens a
+`default_transaction_read_only=on` pool with one connection, a 15 s statement
+timeout and a 5 s lock timeout, which is why it takes no claim and why it
+keeps working while the cluster is halted — precisely when it is needed. An
+empty list is a **success**: the command prints `no unfinished candidates` (or
+an empty `candidates` array) and exits zero, so a `set -e` runbook can wait for
+exactly that. `--json` prints one
+`{"schema":"qbit.prism.candidates.list.v1","candidates":[...]}` document with
+every field untruncated and every unknown value as `null`.
+
+`abandon` finishes one `pending` row. `pending` is the only state it touches,
+because it is the only unfinished state from which no `submitblock` can yet
+have been made: a row in `offer_reserved`, `offered` or `reconciliation` is the
+record that a call may already have happened, and discarding it would discard
+that record. The rule is the statement's `WHERE` clause, not a check the
+command makes first, so a row that moves between reading and writing is still
+refused. A successful abandon releases the document, the block bytes and the
+six window columns, clears the claim, sets `completed_at`, and writes the
+operator's `--reason` into `last_error` — exactly the columns the offline
+epoch supersession writes. `next_attempt_at` is deliberately left as it is: no
+lane selects a terminal row, so its value is inert, and an `infinity` left
+there stays as evidence that the row had been parked.
+
+| Exit | Outcome | Message |
+| --- | --- | --- |
+| 0 | Abandoned. | `abandoned <hash>: <reason>` |
+| 1 | Configuration or database failure, including the two fences below. | The underlying error, as for every other command. |
+| 2 | No such row. | `no candidate row for <hash>` |
+| 3 | Offered to the node; never abandonable. | `candidate <hash> is in state <state>; it was offered to the node and is never abandoned. Its block may already have been submitted. Leave it to reconciliation` |
+| 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned>; nothing to do` |
+| 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
+
+Codes 3 and 6 are the two refusals that protect the invariant. Code 4 is kept
+distinct from code 2 so that re-running a successful abandon reads as
+"nothing to do" rather than as a lost row. An **expired** claim is not a live
+claim, so a row whose owner died is abandonable without waiting for anything;
+code 5 applies only while the claim is still live. A pending row that has both
+a live claim and a landed block reports code 6, because the claim expires on
+its own and the accounting does not.
+
+`abandon` writes through the ordinary ledger write transaction and so inherits
+its two fences, both reported as exit 1:
+
+- **A halted cluster.** While `qbit_prism_cluster.fatal_error` is set, every
+  ledger write fails with `cluster halted: ...`. Use
+  [fatal-state recovery](#fatal-state-recovery) first. `list` is unaffected and
+  stays available throughout.
+- **A live legacy Python writer lease.** While a `qbit_ledger_writer_lease` row
+  has not expired, the write fails with `live legacy Python writer lease`. This
+  is what stops an operator abandon racing the `2.x.x` writer during a cutover.
+
+Neither command takes a batch or an allowlist, and neither offers a block.
+
 **Offer phase.** The minimum before the one `submitblock` call: the proof was
 validated at Stratum admission and the row authenticated at claim (document
 digest, block digest, window reference); an ordinary candidate passes the
