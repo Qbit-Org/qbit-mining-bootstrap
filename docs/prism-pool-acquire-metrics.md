@@ -35,7 +35,15 @@ acquisitions, the shared ledger helper covers these direct statements:
 - `pool_blocks_for_reconcile`;
 - `migration_source`, the one-row pages of `import_legacy_audits` (including
   the final empty read), and `backfill_ctv`'s initial audit list;
-- `job`, `compact_prepared`, and `prune_expired_jobs`.
+- `job`, `compact_prepared`, and `prune_expired_jobs`;
+- `apply_online_migration`'s startup checkout, before the connection is detached.
+
+Each pending online migration records one checkout when metrics are attached.
+Timing ends before detach: the runner's session settings, advisory-lock waits, concurrent
+index builds and drops, and the detached connection's lifetime are excluded.
+An error or cancellation after checkout does not add another observation or
+change that checkout's success. The transaction that records the migration
+uses the detached connection and is not another pool checkout.
 
 The job readers and expiry statement each record one checkout. The compact
 reader releases it before waiting for blocking decoding and hashing. Expiry
