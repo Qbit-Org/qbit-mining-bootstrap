@@ -57,5 +57,6 @@ while old prepared work remains alive.
 The unchanged frozen money/window corpus and compact runtime tests remain the
 compatibility gates. No sub-second one-share-delta result, production timing,
 24-hour memory soak, or measured per-frontend RSS is claimed by this change.
-The old incremental/differential and 24-hour criteria remain conditional work;
-the bounded cache ownership above is a structural property, not a soak result.
+The original incremental/differential criteria depend on the conditional engine
+work. The 24-hour memory criterion remains unmeasured; bounded cache ownership
+is a structural property, not a soak result.
