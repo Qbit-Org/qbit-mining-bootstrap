@@ -22,6 +22,16 @@ const _: () = assert!(PROOF_WINDOW_SHARES as usize > 2 * PROOF_PAGE_ROWS);
 /// is not the proof at work.
 const DIFFERS_FROM_HISTORY: &str = "audit share snapshot differs from canonical database history";
 
+// Return failures through the fixture's Result path so db.close still runs.
+fn check_counts(metrics: &Metrics, expected: (f64, f64)) -> Result<()> {
+    let actual = counts(metrics);
+    ensure!(
+        actual == expected,
+        "pool checkout counts: expected {expected:?}, got {actual:?}"
+    );
+    Ok(())
+}
+
 /// A signed candidate over `window` for `snapshot`'s anchor, balances and
 /// revision. The bundle is built and signed over exactly this window, so it
 /// is internally consistent whatever the window holds: the audit signature
@@ -245,7 +255,7 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
         // Probe + three pages + newest; partial history also checks oldest.
         // A proof refusal follows successful checkouts and never starts BEGIN.
         let acquired = if newest { 5. } else { 6. };
-        assert_eq!(counts(&metrics), (before.0 + acquired, before.1));
+        check_counts(&metrics, (before.0 + acquired, before.1))?;
         ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
         let snapshots: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_audit_snapshots")
             .fetch_one(&ledger.pool)
@@ -261,7 +271,7 @@ async fn refuses_truncated_window(newest: bool) -> Result<()> {
         let before = counts(&metrics);
         let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
         // The full crossing window skips oldest: probe + three pages + newest + BEGIN.
-        assert_eq!(counts(&metrics), (before.0 + 6., before.1));
+        check_counts(&metrics, (before.0 + 6., before.1))?;
         ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
         let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
         ensure!(served.as_deref() == Some(canonical.as_slice()));
@@ -292,7 +302,7 @@ async fn lands_identically(
     let before = checkout_counts.map(|(metrics, _)| counts(metrics));
     let report = ledger.land_candidate(&claim, &ledger_public_key()).await?;
     if let Some(((metrics, acquired), before)) = checkout_counts.zip(before) {
-        assert_eq!(counts(metrics), (before.0 + acquired, before.1));
+        check_counts(metrics, (before.0 + acquired, before.1))?;
     }
     ensure!(report.audit_bundle_sha256_hex == sha256_hex(&canonical));
     let served = audit_canonical_bytes(&ledger.pool, &claim.candidate.block_hash).await?;
@@ -422,16 +432,18 @@ async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> R
         let error = ledger
             .land_candidate(&claim, &ledger_public_key())
             .await
-            .unwrap_err();
-        assert_eq!(
+            .err()
+            .context("bootstrap query accepted a missing eligibility column")?;
+        ensure!(
             error
                 .downcast_ref::<sqlx::Error>()
                 .and_then(sqlx::Error::as_database_error)
                 .and_then(|error| error.code())
-                .as_deref(),
-            Some("42703")
+                .as_deref()
+                == Some("42703"),
+            "wrong bootstrap SQL error: {error:#}"
         );
-        assert_eq!(counts(&metrics), (before.0 + 2., before.1));
+        check_counts(&metrics, (before.0 + 2., before.1))?;
         sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN acquire_test_hidden TO accepted")
             .execute(&ledger.pool)
             .await?;
@@ -445,7 +457,7 @@ async fn durable_range_proof_checks_bootstrap_against_the_anchored_ledger() -> R
             format!("{error:#}").contains("bootstrap audit window omits canonical shares"),
             "wrong refusal: {error:#}"
         );
-        assert_eq!(counts(&metrics), (before.0 + 2., before.1));
+        check_counts(&metrics, (before.0 + 2., before.1))?;
         ensure!(!wrote_block_or_audit_row(&ledger.pool, &claim.candidate.block_hash).await?);
         Ok(())
     }
