@@ -529,7 +529,50 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     let hash:Option<String>=sqlx::query_scalar("SELECT a.block_hash FROM qbit_pool_audit_bundles a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1").fetch_optional(&state.pool).await?;
     let hash = hash.ok_or_else(|| ApiError::missing("no PRISM evidence has been produced"))?;
     let body = bundle(state, &hash, false).await?;
-    let counts:Value=sqlx::query_scalar("SELECT jsonb_build_object('accepted_share_count',count(*),'distinct_miner_count',count(DISTINCT miner_id)) FROM qbit_share_ledger WHERE accepted").fetch_one(&state.pool).await?;
+    // Both counts are lifetime-scoped, and the share ledger is partitioned
+    // with a retention path since #144: a `count(*)` over the online rows
+    // would start falling the first time a partition is detached. The
+    // permanent daily rollups hold every share the sweep has folded, and the
+    // rollup watermark is one of the conditions a partition must clear before
+    // it may leave, so "rollups up to the watermark plus the raw rows above
+    // it" is exact and stays exact after a detach. A database whose rollups
+    // have never run has no `qbit_hashrate_rollup_progress` row; it reads the
+    // raw lifetime counts as before, which is also correct because nothing
+    // can have been detached yet.
+    let counts: Value = sqlx::query_scalar(
+        "WITH progress AS (
+             SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton
+         ), watermark AS (
+             SELECT COALESCE((SELECT last_share_seq FROM progress),0) AS last_share_seq,
+                    EXISTS(SELECT 1 FROM progress) AS ready
+         ), rolled AS (
+             SELECT COALESCE(sum(rollup.accepted_share_count),0)::bigint AS accepted_share_count
+             FROM qbit_hashrate_rollup_pool rollup, watermark
+             WHERE watermark.ready AND rollup.grain_seconds=86400
+         ), tail AS (
+             SELECT count(*) AS accepted_share_count
+             FROM qbit_share_ledger ledger, watermark
+             WHERE ledger.accepted
+               AND (NOT watermark.ready OR ledger.share_seq>watermark.last_share_seq)
+         ), miners AS (
+             SELECT count(*) AS distinct_miner_count FROM (
+                 SELECT rollup.miner_id
+                 FROM qbit_hashrate_rollup_miner rollup, watermark
+                 WHERE watermark.ready AND rollup.grain_seconds=86400
+                 UNION
+                 SELECT ledger.miner_id
+                 FROM qbit_share_ledger ledger, watermark
+                 WHERE ledger.accepted
+                   AND (NOT watermark.ready OR ledger.share_seq>watermark.last_share_seq)
+             ) distinct_miners
+         )
+         SELECT jsonb_build_object(
+             'accepted_share_count',
+             (SELECT accepted_share_count FROM rolled)+(SELECT accepted_share_count FROM tail),
+             'distinct_miner_count',(SELECT distinct_miner_count FROM miners))",
+    )
+    .fetch_one(&state.pool)
+    .await?;
     let payout_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM qbit_pool_payout_entries WHERE block_hash=$1")
             .bind(&hash)

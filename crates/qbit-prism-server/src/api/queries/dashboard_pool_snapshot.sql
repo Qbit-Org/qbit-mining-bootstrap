@@ -8,7 +8,9 @@ latest_block_row AS (
         block.block_hash,
         block.block_height,
         block.found_at,
-        block.payout_manifest_sha256
+        block.payout_manifest_sha256,
+        block.solver_miner_id,
+        block.solver_share_id
     FROM qbit_pool_blocks block
     WHERE block.chain_state = 'confirmed'
     ORDER BY block.block_height DESC, block.found_at DESC
@@ -21,15 +23,27 @@ latest_block AS (
         block.found_at,
         block.payout_manifest_sha256,
         bundle.audit_bundle_sha256,
-        solver.miner_id AS solver_recipient_id,
-        solver.share_id AS solver_share_id
+        -- Solver attribution is a column of the block row since #144: written
+        -- at landing and backfilled by migration 015, so the latest block
+        -- keeps its solver after the partition holding the solving share is
+        -- detached. The LATERAL is the compatibility path for a row whose
+        -- columns are still unset; after 015's backfill no such row exists.
+        COALESCE(block.solver_miner_id, solver.miner_id) AS solver_recipient_id,
+        COALESCE(block.solver_share_id, solver.share_id) AS solver_share_id
     FROM latest_block_row block
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = block.block_hash
     LEFT JOIN LATERAL (
+        -- The guard is inside the subquery, not on the join: PostgreSQL
+        -- evaluates a LEFT JOIN's ON clause per inner row, so a
+        -- `ON block.solver_share_id IS NULL` still runs the lookup for every
+        -- block (measured: 202 buffers against 2 over 50 blocks), while the
+        -- same predicate here becomes a One-Time Filter and the index scan
+        -- reads "never executed".
         SELECT share.miner_id, share.share_id
         FROM qbit_share_ledger share
-        WHERE share.accepted
+        WHERE block.solver_share_id IS NULL
+          AND share.accepted
           AND length(share.share_id) >= 65
           AND lower(right(share.share_id, 64)) = block.block_hash
         ORDER BY share.accepted_at DESC, share.share_seq DESC

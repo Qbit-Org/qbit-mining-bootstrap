@@ -611,10 +611,18 @@ impl Coordinator {
         };
         // Nothing is written before the enqueue, so every failure up to it is
         // definite.
+        //
+        // The ledger is partitioned by `share_seq` (migration 016) and holds
+        // no global `share_id` index, so an unbounded probe descends one
+        // per-leaf index per attached partition. This share was submitted by
+        // the connection that is still waiting for its acknowledgement, so it
+        // can only be in the newest leaves: `qbit_prism_share_probe_floor()`
+        // is two partition widths below the next `share_seq`, which prunes
+        // the probe to at most three leaves at executor start.
         let exists = tokio::time::timeout_at(
             bound,
             sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1)",
+                "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
             )
             .bind(&share.share_id)
             .fetch_one(&self.ledger.pool),
@@ -680,11 +688,16 @@ impl Coordinator {
         // work, and only after active-chain confirmation.
         loop {
             // Observe credit and disposition in one MVCC snapshot so
-            // finalization cannot fall between two separate reads.
+            // finalization cannot fall between two separate reads. The credit
+            // this polls for is written by the reconciliation of the block
+            // this call is still acknowledging, so it lands in the newest
+            // leaves and carries the same probe floor as the probe above:
+            // without it, every poll of this loop would descend one per-leaf
+            // `share_id` index per attached partition.
             let poll = tokio::time::timeout_at(
                 bound,
                 sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)

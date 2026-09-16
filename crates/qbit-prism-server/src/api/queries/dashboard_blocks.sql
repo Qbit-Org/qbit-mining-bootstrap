@@ -15,7 +15,11 @@ page_blocks AS (
         block.found_at,
         block.public_chain_state AS chain_state,
         COALESCE(block.disconnected_at,block.inactive_since) AS disconnected_at,
-        block.payout_manifest_sha256
+        block.payout_manifest_sha256,
+        block.solver_miner_id,
+        block.solver_share_id,
+        block.solver_share_difficulty,
+        block.solver_network_difficulty
     FROM public_blocks block
     WHERE ($3 = 'all' OR ($3 = 'active' AND block.public_chain_state = 'confirmed') OR ($3 = 'reversed' AND block.public_chain_state = 'reversed'))
     ORDER BY block.block_height DESC, block.found_at DESC
@@ -33,17 +37,31 @@ rows AS (
         COALESCE(bundle.found_block_bits, bundle.audit_bundle#>>'{found_block,bits}') AS audit_bits,
         COALESCE(bundle.found_block_coinbase_value_sats::text, bundle.audit_bundle#>>'{found_block,coinbase_value_sats}') AS audit_coinbase_value_sats,
         bundle.audit_bundle_sha256,
-        solver.miner_id AS solver_recipient_id,
-        solver.share_difficulty::text AS solver_share_difficulty,
-        solver.network_difficulty::text AS solver_network_difficulty,
-        solver.share_id AS solver_share_id
+        -- Solver attribution is a column of the block row since #144: written
+        -- at landing and backfilled by migration 015, so it survives the
+        -- detach of the partition that held the solving share. The LATERAL is
+        -- the compatibility path for a row whose columns are still unset (a
+        -- block inserted around the landing path); after 015's backfill no
+        -- such row exists, and the join is not executed for any row that
+        -- carries `solver_share_id`.
+        COALESCE(block.solver_miner_id, solver.miner_id) AS solver_recipient_id,
+        COALESCE(block.solver_share_difficulty, solver.share_difficulty)::text AS solver_share_difficulty,
+        COALESCE(block.solver_network_difficulty, solver.network_difficulty)::text AS solver_network_difficulty,
+        COALESCE(block.solver_share_id, solver.share_id) AS solver_share_id
     FROM page_blocks block
     LEFT JOIN qbit_pool_audit_bundles bundle
       ON bundle.block_hash = block.block_hash
     LEFT JOIN LATERAL (
+        -- The guard is inside the subquery, not on the join: PostgreSQL
+        -- evaluates a LEFT JOIN's ON clause per inner row, so a
+        -- `ON block.solver_share_id IS NULL` still runs the lookup for every
+        -- block (measured: 202 buffers against 2 over 50 blocks), while the
+        -- same predicate here becomes a One-Time Filter and the index scan
+        -- reads "never executed".
         SELECT share.miner_id, share.share_difficulty, share.network_difficulty, share.share_id
         FROM qbit_share_ledger share
-        WHERE share.accepted
+        WHERE block.solver_share_id IS NULL
+          AND share.accepted
           AND length(share.share_id) >= 65
           AND lower(right(share.share_id, 64)) = block.block_hash
         ORDER BY share.accepted_at DESC, share.share_seq DESC

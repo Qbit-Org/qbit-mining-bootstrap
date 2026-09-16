@@ -86,8 +86,27 @@ impl Ledger {
         Ok(changed)
     }
 
+    /// When the ledger accepted `share_id`, or `None` if it holds no such
+    /// accepted row.
+    ///
+    /// The ledger is partitioned by `share_seq` (migration 016) and has no
+    /// global `share_id` index, so an unbounded probe descends one per-leaf
+    /// index per attached partition. Vardiff evidence is a share the session
+    /// submitted moments ago, so the bounded probe
+    /// (`qbit_prism_share_probe_floor()`, two partition widths below the next
+    /// `share_seq`) answers it from at most three leaves. A miss is not an
+    /// answer: the caller uses this timestamp to decide whether a retained
+    /// difficulty may be resumed, so an older but still online row must be
+    /// found rather than silently reported as absent. The second probe runs
+    /// unbounded, and is reached only when the cheap one found nothing.
     pub async fn share_accepted_at_ms(&self, share_id: &str) -> Result<Option<i64>> {
+        let mut connection = self.acquire().await?;
+        let accepted_at: Option<i64> = sqlx::query_scalar("SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint FROM qbit_share_ledger WHERE share_id=$1 AND accepted AND share_seq>=qbit_prism_share_probe_floor()")
+            .bind(share_id).fetch_optional(&mut *connection).await?;
+        if accepted_at.is_some() {
+            return Ok(accepted_at);
+        }
         Ok(sqlx::query_scalar("SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint FROM qbit_share_ledger WHERE share_id=$1 AND accepted")
-            .bind(share_id).fetch_optional(&mut *self.acquire().await?).await?)
+            .bind(share_id).fetch_optional(&mut *connection).await?)
     }
 }

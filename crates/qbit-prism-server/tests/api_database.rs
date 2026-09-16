@@ -80,6 +80,25 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     ] {
         sqlx::query("INSERT INTO qbit_share_ledger (share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) VALUES ($1,$2,$2,decode(repeat($3,64),'hex'),$4::bigint,1000000,10,$1,clock_timestamp()-make_interval(secs=>$5),0,clock_timestamp()-make_interval(secs=>$5),$6,1)").bind(format!("{miner}.{worker}:{id}")).bind(miner).bind(id).bind(difficulty).bind(seconds as f64).bind(writer).execute(&pool).await.unwrap();
     }
+    // The hand-applied schema above stops at migration 003, recorded as the
+    // migrator records it. A start without initialize refuses anything below
+    // the required version, so this connect brings the schema forward on the
+    // native path. It runs before the router is built because the public read
+    // models require the native schema: block solver attribution is columns of
+    // `qbit_pool_blocks` since migration 015 (#144), which the dashboard
+    // blocks, leaderboard and pool snapshot queries read.
+    let mut scoped_url = url::Url::parse(&url).unwrap();
+    scoped_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let ledger = qbit_prism_server::ledger::Ledger::connect(
+        scoped_url.as_str(),
+        "api-hydration".into(),
+        4,
+        true,
+    )
+    .await
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -274,22 +293,6 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     assert_eq!(empty["rows"], json!([]));
     // Native range-backed audit bodies and legacy filesystem bodies expose
     // identical logical JSON, and neither can claim an incorrect canonical SHA.
-    let mut scoped_url = url::Url::parse(&url).unwrap();
-    scoped_url
-        .query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    // The hand-applied schema above stops at migration 003, recorded as the
-    // migrator records it. A start without initialize refuses anything
-    // below the required version, so this connect brings the schema
-    // forward, applying 004 to 009 on the native path.
-    let ledger = qbit_prism_server::ledger::Ledger::connect(
-        scoped_url.as_str(),
-        "api-hydration".into(),
-        4,
-        true,
-    )
-    .await
-    .unwrap();
     let snapshot = ledger.snapshot(1_000_000).await.unwrap();
     let manifest_key =
         qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"42".repeat(32)).unwrap();
@@ -418,6 +421,29 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
         .execute(&pool)
         .await
         .unwrap();
+    // What the migrator records for 002 and 003, then the native path forward
+    // from there. The chain-state read models require the native schema:
+    // block solver attribution is columns of `qbit_pool_blocks` since
+    // migration 015 (#144), which the dashboard blocks query reads. Every
+    // block row below is inserted afterwards and around the landing path, so
+    // its solver columns stay unset and the query serves them through the
+    // ledger fallback the columns replaced.
+    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut scoped_url = url::Url::parse(&url).unwrap();
+    scoped_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let ledger = qbit_prism_server::ledger::Ledger::connect(
+        scoped_url.as_str(),
+        "api-chain-states".into(),
+        4,
+        true,
+    )
+    .await
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -593,6 +619,7 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
         }
     }
     server.abort();
+    ledger.pool.close().await;
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
