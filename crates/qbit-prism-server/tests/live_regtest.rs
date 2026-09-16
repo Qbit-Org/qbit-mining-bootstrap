@@ -991,24 +991,28 @@ mod diagnostics {
         let mut output = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(separator) = rest.find("://") {
-            // The scheme starts after the last non-scheme character, which
-            // may be several bytes long.
-            let scheme_start = rest[..separator]
-                .char_indices()
-                .rev()
-                .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
-                .map_or(0, |(index, c)| index + c.len_utf8());
+            let scheme_start = scheme_start_before(rest, separator);
             let after = &rest[separator + 3..];
-            let end = after
+            let span = after
                 .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
                 .unwrap_or(after.len());
-            let authority = after[..end]
+            let authority = after[..span]
                 .split(['/', '?', '#'])
                 .next()
                 .unwrap_or_default();
             let scheme = rest[scheme_start..separator].to_ascii_lowercase();
+            let redacted = scheme.starts_with("postgres") || authority.contains('@');
+            // Another URL can follow this one with only punctuation between
+            // them. The authority stops at the second URL's slash without ever
+            // seeing its `@`, so hand the second one back and scan it on its
+            // own. A span already being redacted is consumed whole.
+            let end = if redacted {
+                span
+            } else {
+                next_scheme_start(&after[..span]).unwrap_or(span)
+            };
             output.push_str(&rest[..scheme_start]);
-            if scheme.starts_with("postgres") || authority.contains('@') {
+            if redacted {
                 output.push_str("[redacted-url]");
             } else {
                 output.push_str(&rest[scheme_start..separator + 3 + end]);
@@ -1017,6 +1021,22 @@ mod diagnostics {
         }
         output.push_str(rest);
         output
+    }
+
+    /// Where the scheme of the URL whose `://` sits at `separator` begins. The
+    /// character before it may be several bytes long.
+    fn scheme_start_before(text: &str, separator: usize) -> usize {
+        text[..separator]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+            .map_or(0, |(index, c)| index + c.len_utf8())
+    }
+
+    /// Where a second URL's scheme starts inside `text`, if one is embedded.
+    fn next_scheme_start(text: &str) -> Option<usize> {
+        let separator = text.find("://")?;
+        Some(scheme_start_before(text, separator))
     }
 
     /// Withholds the rest of the line after a credential-named setting's
@@ -1753,6 +1773,14 @@ mod startup_diagnostics_tests {
                 "postgres://prism:tab%09pw7%01z@db/prism",
                 vec![format!("raw {control} end")],
                 strings(&["raw [redacted] end"]),
+            ),
+            (
+                // Two URLs with only punctuation between them: the safe one
+                // must not swallow the credential-bearing one.
+                "credential URL directly after a safe URL".into(),
+                plain,
+                strings(&["retry http://health,https://user:tok3n@example.test now"]),
+                strings(&["retry http://health,[redacted-url] now"]),
             ),
             (
                 "malformed percent escape in a query password".into(),
