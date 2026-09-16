@@ -1254,6 +1254,34 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
         sqlx::raw_sql(&format!("DROP TABLE {P0}"))
             .execute(&ledger.pool)
             .await?;
+        // A self-consistent archive with matching bounds is not sufficient:
+        // only the catalog's copy of record may return a departed partition.
+        sqlx::query("UPDATE qbit_prism_share_partitions SET archive_manifest_sha256=$2 WHERE partition_name=$1")
+            .bind(P0)
+            .bind("ab".repeat(32))
+            .execute(&ledger.pool)
+            .await?;
+        let error = archive::restore(&ledger, &manifest_path, root.path(), true)
+            .await
+            .expect_err("re-attached an archive other than the catalog's copy of record")
+            .to_string();
+        ensure!(error.contains("catalog records another archive as the copy of record"), "{error}");
+        let absent: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
+            .bind(P0)
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(absent, "a refused re-attach did not roll back the restored table");
+        let row = catalog(&ledger.pool, P0).await?;
+        ensure!(
+            row.try_get::<String, _>("state")? == "dropped"
+                && row.try_get::<String, _>("archive_manifest_sha256")? == "ab".repeat(32),
+            "a refused re-attach changed the catalog"
+        );
+        sqlx::query("UPDATE qbit_prism_share_partitions SET archive_manifest_sha256=$2 WHERE partition_name=$1")
+            .bind(P0)
+            .bind(&disk.manifest_sha256)
+            .execute(&ledger.pool)
+            .await?;
         let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
         ensure!(restored["attached"] == true, "{restored}");
         let online: i64 =

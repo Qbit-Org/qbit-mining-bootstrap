@@ -2140,7 +2140,7 @@ pub async fn restore(
             .await
             .with_context(|| format!("running: {statement}"))?;
         rename_leaf_indexes(&mut tx, &partition_name).await?;
-        let existing = sqlx::query("SELECT lower_seq,upper_seq FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
+        let existing = sqlx::query("SELECT lower_seq,upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
             .bind(&partition_name)
             .fetch_optional(&mut *tx)
             .await?;
@@ -2151,6 +2151,14 @@ pub async fn restore(
                 recorded_lower == lower && recorded_upper == upper,
                 "refusing to re-attach {partition_name}: the catalog records bounds [{recorded_lower:?}, {recorded_upper}) but the archive records [{lower:?}, {upper})"
             );
+            if let Some(recorded) =
+                existing.try_get::<Option<String>, _>("archive_manifest_sha256")?
+            {
+                ensure!(
+                    recorded == manifest_sha256,
+                    "refusing to re-attach {partition_name}: the catalog records another archive as the copy of record ({recorded}); only that archive can return the partition, but the restored manifest hashes to {manifest_sha256}"
+                );
+            }
             sqlx::query("UPDATE qbit_prism_share_partitions SET state='attached',detached_at=NULL,dropped_at=NULL WHERE partition_name=$1")
                 .bind(&partition_name)
                 .execute(&mut *tx)
