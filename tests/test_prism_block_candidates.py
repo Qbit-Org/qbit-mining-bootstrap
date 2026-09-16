@@ -29,6 +29,7 @@ from lab.prism.block_candidates import (
 from tests.prism_coordinator_test_support import durable_candidate_row
 from lab.prism.bundle_compiler import BundleCompiler
 from lab.prism.prism_coordinator import PrismCoordinator
+from lab.prism.payout_state import PayoutStatePublicationBlocked
 
 
 _compat_verified_audit_report = verified_audit_report
@@ -7635,6 +7636,290 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
                 server.metrics_payload(),
             )
 
+    def test_proven_orphan_abandons_first_pass_and_releases_landed_barrier(self) -> None:
+        # Page #284 (#413/#414), end to end: submitblock accepts the pool's
+        # block, blockwait reports its hash as the tip, and moments later
+        # qbitd reorgs to an equal-work competitor at the same height. The
+        # active-height check then sees the competitor and the abandon
+        # path's chain probe must read the node's definitive orphan verdict
+        # (header held off the active chain, a different block active at
+        # the height) and abandon on THIS pass: no accepted-pending defer,
+        # no 300 s observed-tip hold. The landed barrier is released so
+        # reconciliation, payout publication, and job delivery resume at
+        # once, and the dropped acceptance evidence cannot re-arm the defer.
+        parent = "00" * 32
+        block_hash = "b2" * 32
+        competitor = "c2" * 32
+        server, state, _ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        refresh_retries: list[str] = []
+        real_schedule = server._schedule_tip_refresh_retry
+
+        def recording_schedule() -> None:
+            refresh_retries.append("scheduled")
+            real_schedule()
+
+        server._schedule_tip_refresh_retry = recording_schedule  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+
+            def blockwait_then_reorg(accepted_hash: str) -> None:
+                # blockwait sees the pool's own hash as the new tip (the
+                # only channel every tip observation funnels through) ...
+                server._note_tip_observation_for_candidates(accepted_hash)
+                self.assertIn(
+                    accepted_hash, server._tip_observed_accepted_block_hashes
+                )
+                # ... and the node immediately loses it to the competitor.
+                rpc.orphan(accepted_hash)
+
+            rpc = OrphanedBlockSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+                competitor=competitor,
+                on_accept=blockwait_then_reorg,
+            )
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+
+            # Terminal on the first pass, with no deferral.
+            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertEqual(abandoned, [block_hash])
+            self.assertEqual(submitted, [])
+            self.assertEqual(
+                server._block_candidate_outcome.reason,
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+            )
+            self.assertEqual(
+                server.block_candidate_abandoned_counts[
+                    PRISM_REJECTION_SUBMITBLOCK_REJECTED
+                ],
+                1,
+            )
+            self.assertEqual(
+                getattr(server, "block_candidate_accept_pending_defer_count", 0),
+                0,
+            )
+            self.assertEqual(server.block_candidate_orphan_verdict_count, 1)
+            self.assertIsNone(server._retry_block_candidate)
+            # The landed barrier is released: the transition is withdrawn
+            # and its tombstone popped once the outbox row is terminal, so
+            # neither reconciliation nor payout publication raises and a
+            # child build on the competitor finds no fence.
+            self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+            self.assertNotIn(
+                block_hash,
+                server._invalidated_accepted_block_payout_previews,
+            )
+            self.assertFalse(server._payout_state_publication_blocked)
+            self.assertFalse(
+                any(
+                    transition.landed
+                    for transition in server._accepted_block_payout_previews.values()
+                )
+            )
+            with server._payout_balance_mutation():
+                pass
+            self.assertIsNone(
+                server._accepted_block_payout_transition_for_parent(
+                    competitor,
+                    parent_height=10,
+                )
+            )
+            # The pending external-tip refresh was woken, not left to its
+            # next wave.
+            self.assertGreaterEqual(len(refresh_retries), 1)
+            # Acceptance evidence is dropped and cannot come back: the hash
+            # is no longer outstanding, so a late blockwait report of it
+            # (the observation arriving after the verdict) registers nothing.
+            self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+            self.assertNotIn(block_hash, server._outstanding_block_candidate_hashes)
+            self.assertFalse(server._block_candidate_acceptance_retained(block_hash))
+            self.assertFalse(server._block_candidate_acceptance_observed(block_hash))
+            server.observe_tip_for_refresh(block_hash)
+            self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+            self.assertFalse(server._block_candidate_acceptance_observed(block_hash))
+            payload = server.metrics_payload()
+            self.assertIn("qbit_prism_block_candidate_orphan_verdicts_total 1", payload)
+            self.assertIn(
+                "qbit_prism_block_candidate_accept_pending_defers_total 0",
+                payload,
+            )
+            self.assertIn(
+                "qbit_prism_block_candidates_abandoned_total"
+                f'{{reason_id="{PRISM_REJECTION_SUBMITBLOCK_REJECTED}"}} 1',
+                payload,
+            )
+
+    def test_unknown_probe_inside_window_keeps_deferring_orphan_suspect(self) -> None:
+        # Regression guard for the lost-ack protection (#414 must not weaken
+        # it): the same reorg, but the abandon path's header probe fails. An
+        # unknown view is never an orphan verdict, so inside the observed-tip
+        # window the candidate keeps deferring with its landed barrier
+        # intact -- exactly as today -- and only a healthy probe that proves
+        # the orphan ends the hold. (The active-header lookup failing inside
+        # the probe is pinned at the probe level in
+        # test_block_candidate_chain_probe_orphan_verdict_semantics.)
+        parent = "00" * 32
+        block_hash = "b3" * 32
+        competitor = "c3" * 32
+        server, state, _ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+
+            def blockwait_then_reorg(accepted_hash: str) -> None:
+                server._note_tip_observation_for_candidates(accepted_hash)
+                rpc.orphan(accepted_hash)
+
+            rpc = OrphanedBlockSubmitRpc(
+                start_tip=parent,
+                hash_by_hex={"00": block_hash},
+                competitor=competitor,
+                on_accept=blockwait_then_reorg,
+            )
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+
+            # Pass 1: the header probe times out. Unknown + fresh observation
+            # defers; nothing terminal, barrier preserved, no orphan verdict.
+            rpc.header_failure = RuntimeError("qbit RPC getblockheader timed out")
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertEqual(abandoned, [])
+            self.assertEqual(submitted, [])
+            self.assertNotIn(
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+                getattr(server, "block_candidate_abandoned_counts", {}),
+            )
+            self.assertEqual(server.block_candidate_accept_pending_defer_count, 1)
+            self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+            self.assertIn(block_hash, server._accepted_block_payout_previews)
+            self.assertTrue(
+                server._accepted_block_payout_previews[block_hash].landed
+            )
+            self.assertNotIn(
+                block_hash,
+                server._invalidated_accepted_block_payout_previews,
+            )
+            self.assertIn(block_hash, server._tip_observed_accepted_block_hashes)
+            self.assertTrue(server._block_candidate_acceptance_retained(block_hash))
+            with self.assertRaises(PayoutStatePublicationBlocked):
+                with server._payout_balance_mutation():
+                    pass
+            candidate = self._retained_candidate(server)
+
+            # Pass 2: the node answers; the orphan is proven and the hold ends
+            # without another node offer (the retained definitive acceptance
+            # is reused, then dropped by the verdict).
+            rpc.header_failure = None
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(rpc.submitblock_calls, 1)
+            self.assertEqual(abandoned, [block_hash])
+            self.assertEqual(submitted, [])
+            self.assertEqual(
+                server._block_candidate_outcome.reason,
+                PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+            )
+            self.assertEqual(server.block_candidate_accept_pending_defer_count, 1)
+            self.assertEqual(server.block_candidate_orphan_verdict_count, 1)
+            self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+            self.assertNotIn(
+                block_hash,
+                server._invalidated_accepted_block_payout_previews,
+            )
+            self.assertFalse(server._payout_state_publication_blocked)
+            with server._payout_balance_mutation():
+                pass
+            self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+            self.assertFalse(server._block_candidate_acceptance_retained(block_hash))
+            self.assertIsNone(server._retry_block_candidate)
+            # Distinct series: one defer, one verdict, one abandonment.
+            payload = server.metrics_payload()
+            self.assertIn(
+                "qbit_prism_block_candidate_accept_pending_defers_total 1",
+                payload,
+            )
+            self.assertIn("qbit_prism_block_candidate_orphan_verdicts_total 1", payload)
+            self.assertIn(
+                "qbit_prism_block_candidates_abandoned_total"
+                f'{{reason_id="{PRISM_REJECTION_SUBMITBLOCK_REJECTED}"}} 1',
+                payload,
+            )
+
+    def test_window_expiry_abandonment_is_not_an_orphan_verdict(self) -> None:
+        # EP-OBSERVABILITY: the verdict counter attributes only proven
+        # orphans. A candidate the node no longer knows at all abandons
+        # only once its observation window expires, and that expiry path
+        # increments the abandonment series alone -- the verdict series
+        # stays a real zero.
+        parent = "00" * 32
+        block_hash = "b4" * 32
+        racing_tip = "77" * 32
+        server, state, _ledger = submit_coordinator(tip=parent)
+        server.max_blocks = 2
+        server.stop_after_block = False
+        with tempfile.TemporaryDirectory() as tempdir:
+            submitted, abandoned = self._accepted_tail_scaffolding(server, tempdir)
+            self._age_retained_acceptance_past_window(server)
+            rpc = LostAckSubmitRpc(start_tip=parent, hash_by_hex={"00": block_hash})
+            server.rpc = rpc
+            candidate = block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    coinbase_tx_hex="c0ffee",
+                    block_hash_hex=block_hash,
+                    block_hex="00",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+            )
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            candidate = self._retained_candidate(server)
+            # The tip moves on and the node reports the hash unknown; the
+            # observation has already aged out of the window.
+            rpc.racing_tip = racing_tip
+            with server.lock:
+                server._tip_observed_accepted_block_hashes[block_hash] = (
+                    time.monotonic() - 400.0
+                )
+            self.assertTrue(server._submit_next_block_candidate_writer(candidate))
+            self.assertEqual(abandoned, [block_hash])
+            self.assertEqual(submitted, [])
+            self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+            payload = server.metrics_payload()
+            self.assertIn("qbit_prism_block_candidate_orphan_verdicts_total 0", payload)
+            self.assertIn(
+                "qbit_prism_block_candidates_abandoned_total"
+                f'{{reason_id="{PRISM_REJECTION_STALE_JOB}"}} 1',
+                payload,
+            )
+
     def test_three_blocks_quick_succession_lost_acks_finalize_all(self) -> None:
         # Three pool blocks land back to back (the 20:58 / 21:06:58 /
         # 21:07:20 pattern), every submitblock ack is lost, and one retry
@@ -7889,6 +8174,114 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             )
         )
 
+    def test_block_candidate_chain_probe_orphan_verdict_semantics(self) -> None:
+        # #414: the probe answers False for a proven orphan -- the node
+        # holds the header off the active chain (confirmations -1) AND
+        # names a different block at the candidate's height -- and drops
+        # the acceptance evidence that would otherwise re-arm the defer.
+        # Every weaker view stays unknown (None), so the observed-tip
+        # window keeps deferring exactly as before.
+        block_hash = "e6" * 32
+        competitor = "f6" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.observed_tip_accept_window_seconds = 60.0
+
+        def arm_evidence() -> None:
+            server._register_outstanding_block_candidate(block_hash)
+            with server.lock:
+                server._tip_observed_accepted_block_hashes[block_hash] = (
+                    time.monotonic() - 1.0
+                )
+            server._stash_retained_block_candidate_node_submission(
+                block_hash,
+                _BlockCandidateNodeSubmission(attempted=True, result=None),
+            )
+            self.assertTrue(server._block_candidate_acceptance_observed(block_hash))
+            self.assertTrue(server._block_candidate_acceptance_retained(block_hash))
+
+        # Header off the active chain, but the node still names the
+        # candidate at its height (a racing snapshot): unknown, evidence kept.
+        arm_evidence()
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": -1},
+            active_hash=block_hash,
+        )
+        self.assertIsNone(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertTrue(server._block_candidate_acceptance_pending(block_hash, expected_height=10))
+        self.assertTrue(server._block_candidate_acceptance_observed(block_hash))
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+
+        # Header off the active chain and the active-header lookup fails:
+        # an RPC failure is never an orphan verdict.
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": -1},
+            fail_active_hash=True,
+        )
+        self.assertIsNone(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertTrue(server._block_candidate_acceptance_pending(block_hash, expected_height=10))
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+
+        # A header without a usable confirmations field proves nothing.
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10},
+            active_hash=competitor,
+        )
+        self.assertIsNone(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+
+        # Both node statements agree: proven orphan. False overrides fresh
+        # observation and retained-offer evidence, and drops both.
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": -1},
+            active_hash=competitor,
+        )
+        self.assertFalse(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertFalse(server._block_candidate_acceptance_observed(block_hash))
+        self.assertFalse(server._block_candidate_acceptance_retained(block_hash))
+        self.assertNotIn(block_hash, server._outstanding_block_candidate_hashes)
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 1)
+        self.assertEqual(server._block_candidate_orphan_verdicts, {block_hash: 10})
+        # A late observation through the real channel is refused now.
+        server._note_tip_observation_for_candidates(block_hash)
+        self.assertFalse(server._block_candidate_acceptance_observed(block_hash))
+        self.assertFalse(server._block_candidate_acceptance_pending(block_hash, expected_height=10))
+        # Counted once per candidate, not per probe.
+        self.assertFalse(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 1)
+
+        # Without an expected height the header's own height is checked.
+        arm_evidence()
+        self.assertFalse(server._block_candidate_chain_probe(block_hash))
+        self.assertFalse(server._block_candidate_acceptance_observed(block_hash))
+
+        # The chain flips back: a True verdict retires the standing orphan
+        # verdict and re-registers the observation.
+        server._register_outstanding_block_candidate(block_hash)
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": 1},
+        )
+        self.assertTrue(
+            server._block_candidate_chain_probe(block_hash, expected_height=10)
+        )
+        self.assertNotIn(block_hash, server._block_candidate_orphan_verdicts)
+        self.assertTrue(server._block_candidate_acceptance_observed(block_hash))
+
     def test_post_persist_stale_view_defers_before_rejecting_prepared_rows(self) -> None:
         # Codex P1 / Bugbot: the post-persistence active-hash check could
         # reject the prepared payout rows and only then reach the abandon,
@@ -8070,6 +8463,91 @@ class PrismCoordinatorAcceptedBlockGapTests(unittest.TestCase):
             block_hash,
             server._invalidated_accepted_block_payout_previews,
         )
+
+    def test_late_observation_during_orphan_withdrawal_cannot_resurrect_transition(
+        self,
+    ) -> None:
+        # EP-STATE (#414): complete the two operations out of order. The
+        # orphan verdict seals first (under coordinator.lock, dropping the
+        # evidence and the outstanding registration); a blockwait
+        # observation then lands through the real channel while the
+        # preview withdrawal blocks. The earlier verdict must win: the
+        # observation registers nothing, the terminal seal commits the
+        # abandonment, and the landed barrier is not restored.
+        block_hash = "a7" * 32
+        competitor = "b7" * 32
+        server, _state, _ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server._register_outstanding_block_candidate(block_hash)
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server._stash_retained_block_candidate_node_submission(
+            block_hash,
+            _BlockCandidateNodeSubmission(attempted=True, result=None),
+        )
+        server.rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": -1},
+            active_hash=competitor,
+        )
+        real_clear = server._clear_accepted_block_payout_preview
+        late_observations: list[bool] = []
+
+        def observing_clear(
+            hash_arg: str,
+            *,
+            invalidate_published: bool = False,
+        ) -> None:
+            if invalidate_published:
+                # The verdict has already sealed; a blockwait observation
+                # now arrives while the withdrawal blocks.
+                server._note_tip_observation_for_candidates(block_hash)
+                late_observations.append(
+                    block_hash in server._tip_observed_accepted_block_hashes
+                )
+            return real_clear(
+                hash_arg,
+                invalidate_published=invalidate_published,
+            )
+
+        server._clear_accepted_block_payout_preview = observing_clear  # type: ignore[method-assign]
+
+        accepted_race_won = server._abandon_block_candidate(
+            PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+            "submitted block is not active at height 10",
+            block_hash=block_hash,
+            worker=None,
+            preserve_if_accepted=True,
+            expected_height=10,
+        )
+
+        self.assertFalse(accepted_race_won)
+        self.assertEqual(late_observations, [False])
+        outcome = getattr(server, "_block_candidate_outcome", None)
+        self.assertEqual(
+            getattr(outcome, "reason", None),
+            PRISM_REJECTION_SUBMITBLOCK_REJECTED,
+        )
+        self.assertEqual(
+            getattr(server, "block_candidate_accept_pending_defer_count", 0),
+            0,
+        )
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 1)
+        # The transition is withdrawn and NOT restored; the tombstone stands
+        # only until the outbox row is terminal (the writer pops it).
+        self.assertNotIn(block_hash, server._accepted_block_payout_previews)
+        self.assertIn(block_hash, server._invalidated_accepted_block_payout_previews)
+        self.assertFalse(
+            any(
+                transition.landed
+                for transition in server._accepted_block_payout_previews.values()
+            )
+        )
+        with server._payout_balance_mutation():
+            pass
+        self.assertNotIn(block_hash, server._tip_observed_accepted_block_hashes)
+        self.assertNotIn(block_hash, server._outstanding_block_candidate_hashes)
+        self.assertFalse(server._block_candidate_acceptance_retained(block_hash))
 
     def test_replay_restores_acceptance_evidence_from_durable_block_state(self) -> None:
         # Codex round 5: the observation registry dies with the process. A

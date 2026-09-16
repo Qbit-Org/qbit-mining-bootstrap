@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from lab.prism.payout_state import PayoutStatePublicationBlocked
 from lab.prism.vardiff_service import VardiffService
 from tests.prism_vardiff_test_support import *
 
@@ -1225,6 +1228,50 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.pending_share_difficulty, Decimal("4"))
         self.assertEqual(sent["jobs"], 1)
         self.assertTrue(sent["clean"])
+
+    def test_payout_publication_block_in_retarget_keeps_client_connected(self) -> None:
+        # #414 (page #284): the share-driven retarget's paired job build
+        # reaches reorg reconciliation while a landed accepted-block
+        # transition fences payout publication, so maybe_send_job raises
+        # PayoutStatePublicationBlocked. That must not escape the accepted
+        # share path: the client keeps its connection and its current
+        # difficulty (the speculative pending difficulty is rolled back),
+        # the skip is counted, and the log line is emitted once per client.
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        attempts: dict[str, int] = {"jobs": 0}
+
+        def fenced_send_job(client: object, clean_jobs: bool) -> bool:
+            attempts["jobs"] += 1
+            raise PayoutStatePublicationBlocked(
+                "accepted block payout confirmation is still pending"
+            )
+
+        server.maybe_send_job = fenced_send_job  # type: ignore[method-assign]
+
+        with redirect_stdout(StringIO()) as captured:
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+            state.vardiff_window_started_monotonic = time.monotonic() - 2
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+
+        self.assertEqual(attempts["jobs"], 2)
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertFalse(getattr(state, "closing", False))
+        self.assertEqual(
+            captured.getvalue().count(
+                "vardiff retarget skipped reason=payout_publication_blocked"
+            ),
+            1,
+        )
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 2',
+            server.metrics_payload(),
+        )
 
     def test_step_up_retarget_keeps_old_job_submittable_at_old_difficulty(self) -> None:
         tip = "00" * 32

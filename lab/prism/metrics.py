@@ -174,6 +174,7 @@ class MetricsPort(Protocol):
     accept_resource_exhaustion_count: Any
     block_candidate_abandoned_counts: Any
     block_candidate_accept_pending_defer_count: Any
+    block_candidate_orphan_verdict_count: Any
     block_candidate_poisoned_count: Any
     block_candidate_retry_count: Any
     block_candidate_wakeups_coalesced: Any
@@ -578,6 +579,9 @@ class MetricsRenderer:
             "# HELP qbit_prism_block_candidate_accept_pending_defers_total Terminal abandonments refused because the candidate is (or was recently observed as) an active chain block; the candidate retries until its accepted success tail finalizes it as submitted.",
             "# TYPE qbit_prism_block_candidate_accept_pending_defers_total counter",
             f"qbit_prism_block_candidate_accept_pending_defers_total {int(getattr(self.port, 'block_candidate_accept_pending_defer_count', 0))}",
+            "# HELP qbit_prism_block_candidate_orphan_verdicts_total Block candidates the node proved off the active chain (getblockheader confirmations -1 with a different block active at the candidate's height), counted once per candidate at the verdict. Such candidates abandon on that pass instead of deferring until the observed-tip acceptance window expires, so this separates proven orphans from window-expiry abandonments in qbit_prism_block_candidates_abandoned_total.",
+            "# TYPE qbit_prism_block_candidate_orphan_verdicts_total counter",
+            f"qbit_prism_block_candidate_orphan_verdicts_total {int(getattr(self.port, 'block_candidate_orphan_verdict_count', 0))}",
             "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
             "# TYPE qbit_prism_block_candidate_poisoned_total counter",
             f"qbit_prism_block_candidate_poisoned_total {int(getattr(self.port, 'block_candidate_poisoned_count', 0))}",

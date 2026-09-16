@@ -207,6 +207,7 @@ from lab.prism.block_candidates import (
     _BlockSubmitterLedgerCall,  # noqa: F401 - compatibility re-export
     _BlockSubmitterRpcCall,  # noqa: F401 - compatibility re-export
     _STATE_FIELD_MAP as _BLOCK_CANDIDATE_STATE_FIELD_MAP,
+    _active_chain_header_height,
     block_candidate_from_intent as decode_block_candidate_intent,
     block_candidate_intent as encode_block_candidate_intent,
     compatibility_default as candidate_compatibility_default,
@@ -1987,6 +1988,12 @@ class PrismCoordinator:
     block_candidate_accept_pending_defer_count = BlockCandidateStateField(
         "block_candidate_accept_pending_defer_count"
     )
+    block_candidate_orphan_verdict_count = BlockCandidateStateField(
+        "block_candidate_orphan_verdict_count"
+    )
+    _block_candidate_orphan_verdicts = BlockCandidateStateField(
+        "_block_candidate_orphan_verdicts"
+    )
     accepted_parent_redrive_attempt_count = BlockCandidateStateField(
         "accepted_parent_redrive_attempt_count"
     )
@@ -2650,6 +2657,7 @@ class PrismCoordinator:
         self.block_candidate_retry_count = 0
         self.block_candidate_poisoned_count = 0
         self.block_candidate_accept_pending_defer_count = 0
+        self.block_candidate_orphan_verdict_count = 0
         # Hashes of block candidates this process may still land (durable
         # outbox pending, queued, retained for retry, or mid-disposition).
         # Membership lets every tip-observation channel recognize the pool's
@@ -2698,6 +2706,7 @@ class PrismCoordinator:
         # same hash through that decision again; abandonment metrics count
         # candidates, not cleanup attempts.
         self._counted_block_candidate_abandonments: set[str] = set()
+        self._block_candidate_orphan_verdicts: dict[str, int] = {}
         self.stale_job_abandon_counts = {
             abandon_class: 0
             for abandon_class in PRISM_STALE_JOB_ABANDON_CLASSES
@@ -9329,8 +9338,16 @@ class PrismCoordinator:
             stale_job_class=stale_job_class,
         )
 
-    def active_block_candidate_height(self, block_hash: str) -> int | None:
-        """Return the active-chain height for a previously submitted candidate."""
+    def block_candidate_chain_header(self, block_hash: str) -> dict[str, Any] | None:
+        """Return the node's header view for a submitted candidate.
+
+        None means the node does not know the hash (a tip race in flight,
+        or the block never reached it); any other RPC failure propagates so
+        callers keep an unknown view unknown. A known header carries the
+        node's chain-membership statement in ``confirmations`` (positive on
+        the active chain, ``-1`` off it), which is what the candidate chain
+        probe reads for both the active-height and the orphan verdicts.
+        """
         try:
             header = self.rpc.call("getblockheader", [block_hash])
         except Exception as exc:
@@ -9338,14 +9355,13 @@ class PrismCoordinator:
             if "block not found" in detail or "not found" in detail or "-5" in detail:
                 return None
             raise
-        if not isinstance(header, dict):
-            return None
-        try:
-            confirmations = int(header.get("confirmations", 0))
-            height = int(header["height"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        return height if confirmations > 0 else None
+        return header if isinstance(header, dict) else None
+
+    def active_block_candidate_height(self, block_hash: str) -> int | None:
+        """Return the active-chain height for a previously submitted candidate."""
+        return _active_chain_header_height(
+            self.block_candidate_chain_header(block_hash)
+        )
 
     def _defer_for_pending_parent_payout_transition(
         self,

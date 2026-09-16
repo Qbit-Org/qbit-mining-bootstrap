@@ -20,6 +20,7 @@ from lab.prism.coordinator_config import (
 )
 from lab.prism.job_bundle import CachedJobBundle, JobBuildSuperseded
 from lab.prism.job_delivery import PrismJobContext
+from lab.prism.payout_state import PayoutStatePublicationBlocked
 from lab.prism.stratum_session import (
     ClientState,
     WorkerIdentity,
@@ -69,6 +70,17 @@ PRISM_VARDIFF_IDLE_SKIP_REASONS = (
     "cache_miss",
     "queue_full",
     "superseded",
+)
+# Bounded reasons a share-driven retarget was skipped after the share was
+# already accepted and durably appended; also the metric label order for
+# qbit_prism_vardiff_retargets_skipped_total. A skip is not a failure of the
+# share path: the client keeps its connection and its current difficulty,
+# and the scheduled tip refresh delivers its next job.
+PRISM_VARDIFF_RETARGET_SKIP_REASONS = (
+    # Job construction is fenced behind a pending payout publication (a
+    # landed accepted-block transition or an accepted-parent preview wait),
+    # so the paired difficulty/job send cannot be built right now (#414).
+    "payout_publication_blocked",
 )
 # Bounded outcomes for one retarget taken under the fast-arrival initial
 # convergence policy; also the metric label order for
@@ -744,6 +756,9 @@ class VardiffService:
         self.vardiff_initial_retarget_outcome_counts = {
             outcome: 0 for outcome in PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES
         }
+        self.vardiff_retarget_skip_counts = {
+            reason: 0 for reason in PRISM_VARDIFF_RETARGET_SKIP_REASONS
+        }
         self.vardiff_high_diff_arrival_seconds_histogram = _new_bucket_histogram(
             PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS
         )
@@ -980,6 +995,23 @@ class VardiffService:
                     initial_convergence=initial_convergence,
                 )
             )
+        except PayoutStatePublicationBlocked as exc:
+            # The retarget's paired job build reached reorg reconciliation
+            # while a landed accepted-block transition (or an accepted-parent
+            # preview wait) fences payout publication. That is a coordination
+            # state of the pool, not a fault of this share: the share is
+            # already accepted and durably appended, and retarget_locked
+            # restored every speculative client mutation before re-raising.
+            # Skip the retarget -- the client keeps its connection, its
+            # current difficulty, and gets its next job from the scheduled
+            # refresh once the fence lifts -- instead of letting the
+            # exception escape handle_submit and kill the client thread
+            # before the share's own acknowledgement is written (#414).
+            self._note_retarget_skipped(
+                client,
+                "payout_publication_blocked",
+                exc,
+            )
         finally:
             if initial_convergence and not applied:
                 with client_vardiff_lock(client):
@@ -989,6 +1021,39 @@ class VardiffService:
                         True,
                     ):
                         client.vardiff_initial_convergence_evaluated = False
+
+    def _note_retarget_skipped(
+        self,
+        client: ClientState,
+        reason: str,
+        exc: BaseException,
+    ) -> None:
+        """Count a skipped share-driven retarget; log it once per connection.
+
+        The fence that causes a skip persists for the whole coordination
+        hold, and a rental-scale miner submits many shares inside it, so the
+        log line is emitted once per client connection while the counter
+        records every skip.
+        """
+        if reason not in PRISM_VARDIFF_RETARGET_SKIP_REASONS:
+            raise ValueError(f"unknown vardiff retarget skip reason: {reason}")
+        with self._vardiff_convergence_lock:
+            self.vardiff_retarget_skip_counts[reason] += 1
+        with client_vardiff_lock(client):
+            already_logged = bool(
+                getattr(client, "vardiff_retarget_skip_logged", False)
+            )
+            client.vardiff_retarget_skip_logged = True
+        if already_logged:
+            return
+        print(
+            "prism coordinator: vardiff retarget skipped "
+            f"reason={reason} connection={getattr(client, 'connection_id', None)} "
+            f"username={getattr(client, 'username', None)}: {exc}; the share "
+            "stays accepted and the client keeps its current difficulty "
+            "until the scheduled refresh delivers its next job",
+            flush=True,
+        )
 
     def _count_resume_outcome(self, outcome: str) -> None:
         if outcome not in PRISM_VARDIFF_RESUME_OUTCOMES:
@@ -2413,6 +2478,7 @@ class VardiffService:
         with self._vardiff_convergence_lock:
             initial_attempts = self.vardiff_initial_retarget_attempts
             initial_outcomes = dict(self.vardiff_initial_retarget_outcome_counts)
+            retarget_skips = dict(self.vardiff_retarget_skip_counts)
             durable_writes = dict(self.vardiff_durable_write_outcome_counts)
             durable_pruned = int(self.vardiff_durable_pruned_records)
             durable_prune_failures = int(self.vardiff_durable_prune_failures)
@@ -2459,6 +2525,12 @@ class VardiffService:
             "# HELP qbit_prism_vardiff_idle_task_failures_total Idle retarget tasks that failed during cached delivery.",
             "# TYPE qbit_prism_vardiff_idle_task_failures_total counter",
             f"qbit_prism_vardiff_idle_task_failures_total {failures}",
+            "# HELP qbit_prism_vardiff_retargets_skipped_total Share-driven vardiff retargets skipped by bounded reason after the share was accepted; the client keeps its connection and current difficulty, and the scheduled refresh delivers its next job. payout_publication_blocked: the paired job build was fenced behind a pending payout publication (a landed accepted-block transition).",
+            "# TYPE qbit_prism_vardiff_retargets_skipped_total counter",
+            *[
+                f'qbit_prism_vardiff_retargets_skipped_total{{reason="{reason}"}} {int(retarget_skips.get(reason, 0))}'
+                for reason in PRISM_VARDIFF_RETARGET_SKIP_REASONS
+            ],
             "# HELP qbit_prism_vardiff_initial_retarget_attempts_total Retargets attempted under the fast-arrival initial convergence policy: a connection whose first retarget has not yet committed produced enough accepted shares, over enough elapsed time, to show an observed difficulty far above the one it is stamped at. Equals the sum of qbit_prism_vardiff_initial_retargets_total.",
             "# TYPE qbit_prism_vardiff_initial_retarget_attempts_total counter",
             f"qbit_prism_vardiff_initial_retarget_attempts_total {int(initial_attempts)}",

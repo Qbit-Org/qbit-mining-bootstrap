@@ -1598,6 +1598,9 @@ def reference_render_metrics_payload(server) -> str:
         "# HELP qbit_prism_block_candidate_accept_pending_defers_total Terminal abandonments refused because the candidate is (or was recently observed as) an active chain block; the candidate retries until its accepted success tail finalizes it as submitted.",
         "# TYPE qbit_prism_block_candidate_accept_pending_defers_total counter",
         f"qbit_prism_block_candidate_accept_pending_defers_total {int(getattr(server, 'block_candidate_accept_pending_defer_count', 0))}",
+        "# HELP qbit_prism_block_candidate_orphan_verdicts_total Block candidates the node proved off the active chain (getblockheader confirmations -1 with a different block active at the candidate's height), counted once per candidate at the verdict. Such candidates abandon on that pass instead of deferring until the observed-tip acceptance window expires, so this separates proven orphans from window-expiry abandonments in qbit_prism_block_candidates_abandoned_total.",
+        "# TYPE qbit_prism_block_candidate_orphan_verdicts_total counter",
+        f"qbit_prism_block_candidate_orphan_verdicts_total {int(getattr(server, 'block_candidate_orphan_verdict_count', 0))}",
         "# HELP qbit_prism_block_candidate_poisoned_total Invalid durable candidate intents quarantined from replay.",
         "# TYPE qbit_prism_block_candidate_poisoned_total counter",
         f"qbit_prism_block_candidate_poisoned_total {int(getattr(server, 'block_candidate_poisoned_count', 0))}",
@@ -1873,6 +1876,7 @@ class MetricsRenderParityTests(unittest.TestCase):
         # Block-candidate producer state (routed to the B1 owner).
         server.block_candidate_retry_count = 2
         server.block_candidate_accept_pending_defer_count = 1
+        server.block_candidate_orphan_verdict_count = 1
         server.block_candidate_poisoned_count = 1
         server.block_candidate_wakeups_coalesced = 3
         server.block_candidate_abandoned_counts = {"stale-job": 2}
@@ -2043,6 +2047,8 @@ class MetricsRenderParityTests(unittest.TestCase):
         # checklist names; an accidentally empty fixture would prove nothing.
         for needle in (
             "qbit_prism_block_candidate_accept_pending_defers_total 1",
+            "qbit_prism_block_candidate_orphan_verdicts_total 1",
+            'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 0',
             'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
             "qbit_prism_block_submit_seconds_count 1",
             'qbit_prism_accepted_block_preview_publication_seconds_count{result="published"} 1',
