@@ -248,6 +248,16 @@ impl TipState {
                 .is_some_and(|at| at.elapsed() <= build_budget)
     }
 
+    /// Whether a tip recorded after `since` differs from `hash`. Only evidence
+    /// newer than a pass's own chain view can supersede that view. An older
+    /// observation is stale, not a newer tip: yielding to it would hold
+    /// settlement until a blocked or absent refresh caught up, with no budget.
+    pub(crate) fn superseded_since(&self, hash: &str, since: MonotonicInstant) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|tip| tip.hash != hash && tip.observed_at > since)
+    }
+
     pub(super) fn reserve(&mut self) -> u64 {
         self.requested = self
             .requested

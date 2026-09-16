@@ -20,6 +20,8 @@ pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bo
 }
 
 pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
+    // Tip observations recorded from here on can supersede this chain view.
+    let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.
     let chain = crate::readiness::chain_info(
         &coordinator.rpc,
@@ -48,11 +50,14 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
         // A native chunk is one claimed fanout. Never interrupt its durable
         // completion, but leave subsequent rows claimable by a later pass.
         // Compare hashes, not poll sequence numbers: same-tip polls must not
-        // starve settlement. Also yield if the replacement already published.
+        // starve settlement. Also yield to a tip observed after this pass
+        // began that differs from the pass tip, such as a replacement that
+        // already published. An observation older than the pass never yields:
+        // waiting for a blocked or absent refresh to catch up has no budget.
         // A replacement that keeps failing to publish holds settlement only
-        // for its build budget; the pass-tip check stays bounded by the pass.
+        // for its build budget; the pass-tip check ends with the pass.
         let tip = coordinator.observed_tip.read().await;
-        let superseded = tip.as_deref().is_some_and(|hash| hash != pass_tip);
+        let superseded = tip.superseded_since(pass_tip, pass_started);
         if tip.refresh_pending(coordinator.config.template_refresh_failure_exit) || superseded {
             coordinator.metrics.record_ctv_tip_refresh_yield();
             break;

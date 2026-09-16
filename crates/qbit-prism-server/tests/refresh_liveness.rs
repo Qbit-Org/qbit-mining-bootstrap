@@ -714,6 +714,41 @@ async fn ctv_settles_after_the_replacement_build_budget_when_publication_keeps_f
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctv_settles_when_the_observed_tip_predates_the_pass() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f).await?;
+            let published = "ab".repeat(32);
+            // The node advances before any refresh or block notification
+            // observes it, so the pass reads the newer tip while the last
+            // observation still names the published one. No observer moves
+            // it during the pass: a yield here has no budget and would last
+            // until a blocked or absent refresh caught up with the node.
+            f.node.set_tip(&"ef".repeat(32), &published, 1102, "03");
+            ensure!(
+                f.a.observed_tip.read().await.as_deref() == Some(published.as_str()),
+                "fixture observed the newer tip before the pass"
+            );
+            let processed = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
+            ensure!(
+                processed == count,
+                "an observation older than the pass stranded settlement ({processed} of {count} rows)"
+            );
+            ensure!(metric(&f.a.metrics.render(), "tip_refresh_yields_total")? == 0.);
+            ensure!(
+                f.a.observed_tip.read().await.as_deref() == Some(published.as_str()),
+                "the CTV pass moved the tip observation"
+            );
+            let claimed: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE claim_token IS NOT NULL OR next_broadcast_attempt_at IS NULL").fetch_one(f.pool()).await?;
+            ensure!(claimed == 0, "CTV left claims or unprocessed rows behind");
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_claim_leaves_socket_share_appends_live_and_then_makes_progress() -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| Box::pin(async move {
         f.refresh(true).await?;
