@@ -1001,6 +1001,11 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *connection)
         .await?;
+    // These deliberate full-partition scans may take longer than a request.
+    // LOCAL restores the pool's ordinary timeout when the transaction ends.
+    sqlx::query("SET LOCAL statement_timeout=0")
+        .execute(&mut *connection)
+        .await?;
     let records = catalog_rows(&mut connection).await?;
     let attached = attached_partitions(&mut connection).await?;
     let mut unknowns = Vec::new();
@@ -1799,6 +1804,9 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
 /// halfway through catalog work.
 async fn ddl_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConnection<Postgres>> {
     let mut connection = ledger.acquire().await?;
+    // Session settings for maintenance must never escape into pooled reads,
+    // including when a DDL future is cancelled before it can reset them.
+    connection.close_on_drop();
     sqlx::query(
         "SELECT set_config('statement_timeout','0',false),set_config('lock_timeout','0',false)",
     )
@@ -1982,9 +1990,10 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
         // The last check before the one irreversible step: the standalone
         // relation holds exactly the rows the verified archive recorded.
         // Ledger rows are immutable, so a count is the whole comparison.
+        let mut ddl = ddl_connection(ledger).await?;
         let held: i64 =
             sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {partition_name}"))
-                .fetch_one(&mut *ledger.acquire().await?)
+                .fetch_one(&mut *ddl)
                 .await
                 .with_context(|| {
                     format!("counting the rows of {partition_name} before dropping it")
@@ -1994,7 +2003,6 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
             "refusing to drop {partition_name}: it holds {held} rows but its verified archive records {}; the archive is not a copy of every row. Read the relation by name and reconcile it with the archive before it leaves",
             number_or(record.archive_rows, "no")
         );
-        let mut ddl = ddl_connection(ledger).await?;
         sqlx::raw_sql(&format!("DROP TABLE {partition_name}"))
             .execute(&mut *ddl)
             .await

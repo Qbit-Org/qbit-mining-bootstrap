@@ -1178,6 +1178,62 @@ async fn archive_requires_durable_parent_directories_before_recording() -> Resul
     }
 }
 
+#[tokio::test]
+async fn plan_allows_long_maintenance_reads_without_changing_pool_timeouts() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("plan-timeout-a").await?;
+        insert_shares(&ledger.pool, 1, 120, 7, "server-a", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        let planner =
+            Ledger::connect_tool(&db.url, "plan-timeout-b".into(), 2, false, None).await?;
+        let mut first = planner.pool.acquire().await?;
+        let mut second = planner.pool.acquire().await?;
+        for connection in [&mut *first, &mut *second] {
+            sqlx::query("SET statement_timeout='100ms'")
+                .execute(connection)
+                .await?;
+        }
+        drop(first);
+        drop(second);
+        let returns: String = sqlx::query_scalar("SELECT pg_get_function_result('qbit_prism_window(timestamptz,numeric)'::regprocedure)")
+            .fetch_one(&ledger.pool)
+            .await?;
+        // Keep the real window calculation, with a deterministic delay that
+        // models a maintenance read exceeding the request statement budget.
+        sqlx::raw_sql(&format!(
+            "ALTER FUNCTION qbit_prism_window(timestamptz,numeric) RENAME TO archive_test_window;
+             CREATE FUNCTION qbit_prism_window(timestamptz,numeric) RETURNS {returns} LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_sleep(0.3); RETURN QUERY SELECT * FROM archive_test_window($1,$2); END $$"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let report = archive::plan(&planner, &retention(0)).await?;
+        ensure!(
+            entry(&report, P0).eligible,
+            "maintenance plan did not finish"
+        );
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&planner.pool)
+            .await?;
+        ensure!(
+            timeout == "100ms",
+            "plan leaked its maintenance timeout into the pool: {timeout}"
+        );
+        Ok(vec![ledger, planner])
+    }
+    .await;
+    match result {
+        Ok(ledgers) => db.close(ledgers).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Acceptance criterion 5 of #144: a block whose payout window lay inside a
 /// partition keeps serving its advertised artifact after that partition has
 /// been sealed, archived, verified, detached and dropped. Nothing can rebuild
