@@ -19,15 +19,18 @@ compact references rather than accepted-share arrays. The cache is owned only
 by the serialized refresh loop. Its steady retained memory is one snapshot:
 O(window shares + prior-balance recipients), including each share's owned
 strings. Builders still need their existing transient counted-share and
-artifact allocations. Old cache rows are released on the blocking executor
-under build admission before reading a replacement; keeping old issued jobs
-does not keep those rows alive. No idle build permit is retained.
+artifact allocations. Old cache ownership is released on the blocking executor under build admission
+before reading a replacement; an active blocking build retains its own admitted
+inputs until cleanup ends. Keeping old issued jobs does not retain those rows.
+No idle build permit is retained.
 
-The unpublished snapshot keeps its build admission through reservation and
-publication, including cancellation cleanup. Publication still uses the existing
-reservation and publication authority
-boundary, with fresh tip, readiness, revision, and balance checks. The cache
-becomes reusable only after successful publication. Original issued balances,
+The serialized refresh loop owns cached inputs even if a later reservation is
+cancelled. Build admission covers actual build cleanup, then ends before database
+reservation waits so existing work can still resume. Cached inputs never confer
+publication authority. Publication still uses the existing reservation and
+publication authority
+boundary, with fresh tip, readiness, revision, and balance checks. A failed publication may leave reusable cached inputs, but fast reuse of published
+work requires its exact window reference to match the cache. Original issued balances,
 references, and absolute expirations are unchanged. Native share-array hashes
 and canonical audit hashes continue to use their existing serializers; the
 Python-compatible `PayoutWindow` digest is not substituted for either.

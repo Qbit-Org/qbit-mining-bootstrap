@@ -104,3 +104,33 @@ async fn empty_window_is_cached_until_the_first_accepted_share() {
         .shares
         .is_some());
 }
+
+#[tokio::test]
+async fn failed_reanchor_retries_publication_from_cached_inputs() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let first = f.coordinator.prepared.read().await.clone().unwrap();
+    // Force a fresh anchor with otherwise identical economics and template.
+    f.coordinator.refresh_lock.lock().await.take();
+    f.store.snapshot.lock().unwrap().as_mut().unwrap().anchor_ms += 1;
+    f.store.fail_save.store(true, Ordering::SeqCst);
+    assert!(f.coordinator.refresh_once().await.is_err());
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &first
+    ));
+    let reads = f.store.snapshots.lock().unwrap().len();
+    f.store.fail_save.store(false, Ordering::SeqCst);
+    f.coordinator.refresh_once().await.unwrap();
+    let current = f.coordinator.prepared.read().await.clone().unwrap();
+    assert_ne!(
+        current.storage_key, first.storage_key,
+        "unpublished cached inputs were mistaken for the published reservation"
+    );
+    assert_eq!(current.window.anchor_ms, first.window.anchor_ms + 1);
+    assert_eq!(
+        f.store.snapshots.lock().unwrap().len(),
+        reads,
+        "retry discarded valid captured inputs"
+    );
+}

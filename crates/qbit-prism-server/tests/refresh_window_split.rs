@@ -248,8 +248,8 @@ async fn older_refresh_cannot_publish_after_newer_tip_observation() -> Result<()
                 .await
                 .context("refresh did not reach COMMIT barrier")?;
             ensure!(
-                f.a.build_slots.available_permits() + 1 == f.a.config.build_workers,
-                "unpublished snapshot released admission during the reservation wait"
+                f.a.build_slots.available_permits() == f.a.config.build_workers,
+                "reservation wait held admission needed by existing work"
             );
             f.node.set_template(None);
             f.node
@@ -277,7 +277,8 @@ async fn older_refresh_cannot_publish_after_newer_tip_observation() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_refresh_keeps_unpublished_window_under_admission() -> Result<()> {
+async fn cancelled_reservation_retains_bounded_cache_without_holding_build_admission() -> Result<()>
+{
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {
             f.refresh(true).await?;
@@ -294,8 +295,8 @@ async fn cancelled_refresh_keeps_unpublished_window_under_admission() -> Result<
                 .await
                 .context("refresh did not reach reservation wait")?;
             ensure!(
-                f.a.build_slots.available_permits() + 1 == f.a.config.build_workers,
-                "unpublished replacement window outlived build admission"
+                f.a.build_slots.available_permits() == f.a.config.build_workers,
+                "completed build kept admission while reservation waited"
             );
             pending.abort();
             ensure!(
@@ -315,7 +316,12 @@ async fn cancelled_refresh_keeps_unpublished_window_under_admission() -> Result<
                 "cancelled refresh published its replacement"
             );
             drop(all);
+            let mark = f.proxy.mark();
             f.a.refresh_once().await?;
+            ensure!(
+                f.returned_share_rows(mark)? == 0,
+                "cancelled reservation discarded reusable cached inputs"
+            );
             ensure!(
                 prepared(&f.a).await?.snapshot.payout_revision
                     == first.snapshot.payout_revision + 1,

@@ -938,6 +938,11 @@ impl Coordinator {
         let fee = self.fee_policy().await?;
         if let Some(current) = self.prepared.read().await.as_ref() {
             if reuse_window
+                && current.window
+                    == cached_window
+                        .as_ref()
+                        .expect("validated refresh window")
+                        .reference
                 && current.fee == fee
                 && current.fingerprint == fingerprint
                 && current.snapshot.payout_revision == state.payout_revision
@@ -997,29 +1002,25 @@ impl Coordinator {
             )
             .context("prepared expiry overflow")?;
         let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
-        let window = if reuse_window {
-            prepared_storage::compact::CompactOwner::new(Arc::clone(
-                cached_window.as_ref().expect("validated refresh window"),
-            ))
-        } else {
-            // Retire the prior cache under admission before allocating its
-            // replacement. Prepared/issued work carries only its WindowRef.
+        if !reuse_window {
+            // Retire cache ownership under admission before reading its
+            // replacement. Any active blocking build keeps its own admission.
             let retired = cached_window.take();
             let cleanup = prepared_storage::compact::CompactOwner::new((retired, permit.clone()));
             cleanup
                 .spawn_blocking(|(retired, permit)| {
                     let _admission = permit;
-                    // Unwrap the async cleanup owner while already blocking, so
-                    // its destructor cannot defer cleanup beyond this admission.
                     drop(retired.map(|window| window.into_inner()));
                 })
                 .await?;
-            self.capture_refresh_window(network, permit.clone()).await?
-        };
-        // Keep this window and admission together through reservation and
-        // publication. A cancelled/failed refresh must finish dropping its
-        // unpublished rows before another build can acquire that capacity.
-        let admitted = prepared_storage::compact::CompactOwner::new((window.into_inner(), permit));
+            *cached_window = Some(self.capture_refresh_window(network, permit.clone()).await?);
+        }
+        // Cached inputs are not publication authority. Keep exactly one owner
+        // in the serialized refresh loop even if a later build/save is cancelled.
+        // This lets build admission end after actual build cleanup, so existing
+        // lease holders can resume while a replacement reservation waits.
+        let window = Arc::clone(cached_window.as_ref().expect("captured refresh window"));
+        let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
@@ -1039,11 +1040,12 @@ impl Coordinator {
             self.config.instance_id,
             uuid::Uuid::new_v4().simple()
         );
+        let (window, permit) = admitted.into_inner();
         let source = prepared_storage::compact::RefreshBuild {
             proof,
             key: storage_key,
             template,
-            window: admitted.0.clone(),
+            window,
             inputs,
             fee,
             fingerprint,
@@ -1058,15 +1060,11 @@ impl Coordinator {
         };
         let captured = self
             .capture_refresh(prepared_storage::compact::CompactOwner::new((
-                source,
-                admitted.1.clone(),
+                source, permit,
             )))
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
         self.lock_compact_publication(reserved).await?.publish()?;
-        let (window, permit) = admitted.into_inner();
-        *cached_window = Some(prepared_storage::compact::CompactOwner::new(window));
-        drop(permit);
         Ok(())
     }
 
