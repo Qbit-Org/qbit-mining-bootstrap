@@ -488,11 +488,8 @@ impl Config {
             "share commit grace must be positive"
         );
         let block_only_ack_timeout = share_commit_timeout.max(Duration::from_secs(60));
-        let candidate_orphan_confirmations = positive("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6)?;
-        ensure!(
-            candidate_orphan_confirmations <= 1000,
-            "PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS must be between 1 and 1000"
-        );
+        let candidate_orphan_confirmations =
+            bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
         Ok(Self {
             database_url,
             instance_id,
