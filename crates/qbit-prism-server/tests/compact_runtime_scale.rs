@@ -123,6 +123,11 @@ async fn run(
 }
 
 async fn qualify(n: u64) -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("qbit_prism_server::coordinator::compact_resume=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     run(|db| { async move {
         let node = fake_qbitd::FakeNode::open().await?;
         let mut frontends = Vec::new();
@@ -177,14 +182,18 @@ async fn qualify(n: u64) -> Result<()> {
             let child: Value = sqlx::query_scalar("SELECT payload FROM qbit_prism_jobs WHERE job_id=$1")
                 .bind(&issued.wire.job_id).fetch_one(&db.direct).await?;
             assertions::assert_no_materialized_shares(&child)?;
-            b.refresh_once().await?;
+            let b_refresh_clock = Instant::now();
+            b.refresh_once().await.context("frontend B refresh failed")?;
+            eprintln!("compact scale phase: shares={n}, phase=frontend_b_refresh, seconds={:.3}", b_refresh_clock.elapsed().as_secs_f64());
             let resume_mark = db.proxy.mark();
             let resume_clock = Instant::now();
             // Every waiter has its own outer budget; common work contains no
             // worker, issued expiry, or first-waiter timeout.
             let resume = || async {
                 tokio::time::timeout(Duration::from_secs(25), b.resume_job(&worker,&issued.wire.job_id))
-                    .await??.context("cross-frontend resume missed")
+                    .await.context("cross-frontend resume exceeded its original 25-second budget")?
+                    .context("cross-frontend resume returned a backend error")?
+                    .context("cross-frontend resume missed")
             };
             let (r1,r2,r3,r4) = tokio::try_join!(resume(),resume(),resume(),resume())?;
             let resume_elapsed = resume_clock.elapsed();

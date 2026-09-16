@@ -157,7 +157,13 @@ async fn reconstruct(
     metadata: Arc<BlockingDrop<StoredCompactPrepared>>,
     extra_size: usize,
 ) -> Result<Arc<Prepared>> {
+    let started = Instant::now();
     let permit = build_slots.acquire_owned().await?;
+    tracing::debug!(
+        phase = "build_admission",
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "compact reconstruction progress"
+    );
     let owned = CompactOwner::new((metadata, permit));
     let window = if owned.0.record.window.shares.is_some() {
         let reader = window_reads.acquire_owned().await?;
@@ -169,12 +175,22 @@ async fn reconstruct(
     } else {
         None
     };
+    tracing::debug!(
+        phase = "window_read",
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "compact reconstruction progress"
+    );
     let (metadata, permit) = owned.into_inner();
     let owned = CompactOwner::new((metadata, window, permit));
     #[cfg(test)]
     let drop_probe = ledger.compact_drop_probe();
     let result = owned
         .spawn_blocking(move |(source_metadata, source_window, permit)| {
+            tracing::debug!(
+                phase = "blocking_start",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             let admission = permit;
             #[cfg(test)]
             let _cleanup = drop_probe;
@@ -203,6 +219,11 @@ async fn reconstruct(
             } else {
                 None
             };
+            tracing::debug!(
+                phase = "bundle_build",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             if let Some(body) = &body {
                 let expected = metadata
                     .record
@@ -219,6 +240,11 @@ async fn reconstruct(
                     "reconstructed prepared coinbase hash mismatch"
                 );
             }
+            tracing::debug!(
+                phase = "hash_verification",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             let wire = body
                 .as_ref()
                 .map(|body| {
@@ -249,6 +275,11 @@ async fn reconstruct(
             )?;
             drop(body);
             drop(snapshot);
+            tracing::debug!(
+                phase = "cleanup",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             Ok::<_, anyhow::Error>(CompactOwner::new((captured.original, admission)))
         })
         .await??;
