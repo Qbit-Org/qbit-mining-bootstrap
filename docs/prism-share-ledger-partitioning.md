@@ -309,12 +309,23 @@ public artifact digests already commit to every share a block paid on.
 
 ## Measurements
 
-Container evidence (PostgreSQL 16.15, this machine) is in the pull
-request and in [prism-ledger-ops.md](prism-ledger-ops.md#share-ledger-partitions-and-retention):
-the swap duration, insert latency and `VACUUM` duration before and after
-the conversion on a synthetic ledger, and the plans of the bounded probe
-and of the page walk. They are lock-semantics and phase-shape evidence,
-not production absolutes. The production run of the same measurements
+Container evidence (PostgreSQL 16.15 in Docker on an Apple M-series
+laptop, a synthetic ledger of 1,000,000 production-shaped rows, 1,000 MB
+with its indexes, `VACUUM (ANALYZE)` before each read; 2,000 single-row
+inserts timed from PL/pgSQL with `clock_timestamp()`):
+
+| Measurement | Before 016 | After 016 | Notes |
+| --- | ---: | ---: | --- |
+| prepare (bound `NOT VALID`) | | 2.3 ms | catalog only |
+| validate (one scan) | | 47 ms | SHARE UPDATE EXCLUSIVE; scales with heap size, about 300 MB here |
+| swap | | 16.7 ms | rename, parent, five indexes adopted, attach, lead partitions; none of its terms is a function of the row count |
+| insert latency p50 / p95 / p99 | 0.031 / 0.048 / 0.066 ms | 0.032 / 0.047 / 0.069 ms into the release partition; 0.025 / 0.038 / 0.061 ms into a fresh lead partition | a hot leaf's indexes are small and cache-resident |
+| `VACUUM (ANALYZE)` of the ledger | 0.32 s | 0.44 s for all partitions; 0.02 s for one lead partition | retention keeps the set vacuum has to visit bounded |
+| page walk, `qbit_prism_window` over 200k shares | 15,809 shared buffers | 17,353 shared buffers | same plan shape through the partitioned parent |
+| bounded `share_id` probe | | 8 shared buffers over three leaves | `Subplans Removed` appears once the floor clears a partition (shown in the prototype at 100 M) |
+
+They are lock-semantics and phase-shape evidence, not production
+absolutes. The production run of the same measurements
 (insert latency percentiles from `/metrics`, `VACUUM (VERBOSE)` duration,
 `pg_stat_user_indexes` sizes, the page-walk `EXPLAIN`) before and after
 016 on a production-sized copy is acceptance criterion 4 of #144 and is
