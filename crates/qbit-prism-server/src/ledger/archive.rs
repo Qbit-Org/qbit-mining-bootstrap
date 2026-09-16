@@ -1327,18 +1327,23 @@ async fn partition_plan(
 /// beside this one, stores nothing and loses nothing. `sealed_at` is recorded
 /// only once nothing is left, so an interrupted seal never claims the
 /// partition is sealed.
+///
+/// A production artifact is hundreds of megabytes. Rebuilding it is one
+/// unpaged read of its whole window and storing it one TOASTed write, and
+/// neither fits the pool's 15 s statement timeout, so both run on a
+/// [`maintenance_connection`] and not through the pool: a seal that timed
+/// out on every attempt would leave `sealed_at` unset and the partition
+/// impossible to detach.
 pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
     check_partition_name(partition_name)?;
     let record = catalog_row(&mut *ledger.acquire().await?, partition_name).await?;
     let mut sealed = 0i64;
     let mut sealed_bytes = 0i64;
     let mut cursor = String::new();
+    let mut connection = maintenance_connection(ledger).await?;
     loop {
         // One artifact at a time: a production window is hundreds of
-        // megabytes, and nothing here may hold two of them. Each statement
-        // takes its own checkout and gives it back, so the rebuild below is
-        // never waiting on a connection this loop is sitting on: the operator
-        // pool has two.
+        // megabytes, and nothing here may hold two of them.
         let row = sqlx::query(
             "SELECT a.block_hash,a.audit_bundle_sha256 FROM qbit_pool_audit_bundles a \
              JOIN qbit_prism_audit_snapshots s ON s.snapshot_sha256=a.share_snapshot_sha256 \
@@ -1349,13 +1354,13 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
         .bind(record.upper_seq)
         .bind(record.lower_seq)
         .bind(&cursor)
-        .fetch_optional(&mut *ledger.acquire().await?)
+        .fetch_optional(&mut *connection)
         .await?;
         let Some(row) = row else { break };
         let block_hash: String = row.try_get("block_hash")?;
         let digest: String = row.try_get("audit_bundle_sha256")?;
         cursor = block_hash.clone();
-        let bytes = audit_canonical_bytes(&ledger.pool, &block_hash)
+        let bytes = audit_canonical_bytes(&mut *connection, &block_hash)
             .await
             .with_context(|| {
                 format!("rebuilding the canonical audit of block {block_hash} to seal {partition_name}; its shares must still be online to seal it")
@@ -1370,7 +1375,7 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
         .bind(&block_hash)
         .bind(&digest)
         .bind(bytes)
-        .execute(&mut *ledger.acquire().await?)
+        .execute(&mut *connection)
         .await?
         .rows_affected();
         if updated == 1 {
@@ -1378,6 +1383,7 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
             sealed_bytes += length;
         }
     }
+    drop(connection);
     let (intersecting, unsealed) =
         intersecting_audits(&mut *ledger.acquire().await?, &record).await?;
     let mut recorded = record.sealed_at;
@@ -1828,18 +1834,20 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
 // detach and drop
 // ---------------------------------------------------------------------------
 
-/// Take a connection for DDL that must not be cut short.
+/// Take a connection for maintenance work that must not be cut short.
 ///
 /// `DETACH PARTITION ... CONCURRENTLY` waits for the transactions that can
 /// still see the partition, and `DROP TABLE` waits for its ACCESS EXCLUSIVE
 /// lock. Both are deliberate operator actions on a partition the plan has
 /// already cleared, and neither blocks an append or a read of the parent, so
 /// they run without the pool's 15 s statement timeout rather than failing
-/// halfway through catalog work.
-async fn ddl_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConnection<Postgres>> {
+/// halfway through catalog work. The seal's window-sized artifact rebuild and
+/// write take the same connection for the same reason.
+async fn maintenance_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConnection<Postgres>> {
     let mut connection = ledger.acquire().await?;
     // Session settings for maintenance must never escape into pooled reads,
-    // including when a DDL future is cancelled before it can reset them.
+    // including when a maintenance future is cancelled before it can reset
+    // them.
     connection.close_on_drop();
     sqlx::query(
         "SELECT set_config('statement_timeout','0',false),set_config('lock_timeout','0',false)",
@@ -1943,7 +1951,7 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
         entry.refusal("detach")
     );
 
-    let mut ddl = ddl_connection(ledger).await?;
+    let mut ddl = maintenance_connection(ledger).await?;
     let statement = if attachment.detach_pending {
         format!("ALTER TABLE {PARENT} DETACH PARTITION {partition_name} FINALIZE")
     } else {
@@ -2026,7 +2034,7 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
         // The last check before the one irreversible step: the standalone
         // relation holds exactly the rows the verified archive recorded.
         // Ledger rows are immutable, so a count is the whole comparison.
-        let mut ddl = ddl_connection(ledger).await?;
+        let mut ddl = maintenance_connection(ledger).await?;
         let held: i64 =
             sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {partition_name}"))
                 .fetch_one(&mut *ddl)

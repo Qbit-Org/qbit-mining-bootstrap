@@ -23,7 +23,7 @@ pub mod archive;
 mod audit;
 pub use audit::{
     audit_canonical_bytes, audit_completeness, decode_canonical_audit_body, materialize_audit_row,
-    AuditCompleteness,
+    AuditCompleteness, AuditReader,
 };
 mod candidates;
 use candidates::prepare_candidate_observed;

@@ -1309,6 +1309,78 @@ async fn plan_allows_long_maintenance_reads_without_changing_pool_timeouts() -> 
     }
 }
 
+/// The seal's rebuild and write are window-sized, hundreds of megabytes for a
+/// production block, far past the request statement budget the pool sets.
+/// Both run on a maintenance connection the pool never sees again, so a seal
+/// the pool's timeout would cut short still stores the artifact, and the
+/// pool keeps its own timeout afterwards.
+#[tokio::test]
+async fn seal_stores_a_slow_artifact_without_changing_pool_timeouts() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("seal-timeout-a").await?;
+        let landed = land_block(&ledger, 1449).await?;
+        let sealer = Ledger::connect_tool(&db.url, "seal-timeout-b".into(), 2, false, None).await?;
+        let mut first = sealer.pool.acquire().await?;
+        let mut second = sealer.pool.acquire().await?;
+        for connection in [&mut *first, &mut *second] {
+            sqlx::query("SET statement_timeout='300ms'")
+                .execute(connection)
+                .await?;
+        }
+        drop(first);
+        drop(second);
+        // A deterministic delay on the artifact's write that models a
+        // production-sized TOAST write exceeding the request statement budget.
+        sqlx::raw_sql(
+            "CREATE FUNCTION archive_test_slow_seal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_sleep(0.6); RETURN NEW; END $$;
+             CREATE TRIGGER archive_test_slow_seal BEFORE UPDATE OF canonical_audit_bytes
+             ON qbit_pool_audit_bundles FOR EACH ROW EXECUTE FUNCTION archive_test_slow_seal()",
+        )
+        .execute(&ledger.pool)
+        .await?;
+        let sealed = archive::seal(&sealer, P0).await?;
+        ensure!(
+            sealed["sealed_now"] == 1
+                && sealed["unsealed_remaining"] == 0
+                && sealed["sealed_at"].is_string(),
+            "the seal did not store the artifact: {sealed}"
+        );
+        let served = audit_canonical_bytes(&ledger.pool, &landed.block_hash)
+            .await?
+            .context("the sealed block serves no canonical bytes")?;
+        ensure!(
+            served == landed.canonical,
+            "the stored canonical bytes differ from the artifact the block committed to"
+        );
+        let mut first = sealer.pool.acquire().await?;
+        let mut second = sealer.pool.acquire().await?;
+        for connection in [&mut *first, &mut *second] {
+            let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(connection)
+                .await?;
+            ensure!(
+                timeout != "0",
+                "the seal leaked its maintenance timeout into the pool: {timeout}"
+            );
+        }
+        drop(first);
+        drop(second);
+        Ok(vec![ledger, sealer])
+    }
+    .await;
+    match result {
+        Ok(ledgers) => db.close(ledgers).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Acceptance criterion 5 of #144: a block whose payout window lay inside a
 /// partition keeps serving its advertised artifact after that partition has
 /// been sealed, archived, verified, detached and dropped. Nothing can rebuild
