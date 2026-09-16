@@ -88,6 +88,128 @@ async fn frozen_2x_cli_import_restores_all_body_layouts_and_serves_exact_artifac
     result
 }
 
+/// Every session setting `pg_restore` emits, other than `search_path`, is
+/// one PostgreSQL defaults to `0`, so the fixture would not notice a leak on
+/// its own. This target carries the ledger's own operator values instead,
+/// exactly as `Ledger::connect` pins them on every pooled connection.
+const RESTORE_TARGET_SESSION: [(&str, &str); 3] = [
+    ("lock_timeout", "5s"),
+    ("statement_timeout", "15s"),
+    ("idle_in_transaction_session_timeout", "30s"),
+];
+
+/// The session `pg_restore` uses must not come back to the fixture pool: its
+/// script opens with `SET` statements that survive `COMMIT`. #391 restored
+/// `search_path` on that pooled session; the timeouts it also zeroed were
+/// still returned. sqlx hands a connection back through a spawned task, so
+/// the probe waits for every connection to be idle and then reads all of
+/// them, which finds a leaked session without depending on scheduling.
+#[tokio::test]
+async fn frozen_2x_backup_restore_session_settings_stay_off_the_fixture_pool() -> Result<()> {
+    let Some(inputs) = gate::inputs(
+        gate::site!(),
+        &[gate::Input::DatabaseUrl, gate::Input::PgBinDir],
+    )?
+    else {
+        return Ok(());
+    };
+    let raw = &inputs[0];
+    let pg_bin = std::path::Path::new(&inputs[1]);
+    let mut target_url = url::Url::parse(raw)?;
+    target_url.query_pairs_mut().append_pair(
+        "options",
+        &RESTORE_TARGET_SESSION
+            .iter()
+            .map(|(name, value)| format!("-c{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let source = recovery::Database::open(raw).await?;
+    let restored = recovery::Database::open(target_url.as_str()).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        let before = recovery::accounting_state(&source.pool).await?;
+        let archive = recovery::backup(&source, pg_bin).await?;
+        assert_pooled_session(&restored, "before restore").await?;
+
+        recovery::restore(&archive, &source, &restored, pg_bin).await?;
+        assert_pooled_session(&restored, "after restore").await?;
+        ensure!(recovery::accounting_state(&restored.pool).await? == before);
+        let restored_schema: Option<String> =
+            sqlx::query_scalar("SELECT schemaname::text FROM pg_catalog.pg_tables WHERE tablename='qbit_share_ledger' AND schemaname=$1")
+                .bind(&restored.schema)
+                .fetch_optional(&restored.pool)
+                .await?;
+        ensure!(
+            restored_schema.as_deref() == Some(restored.schema.as_str()),
+            "restore landed outside the target fixture schema"
+        );
+
+        // A restore that fails inside its transaction reports that failure
+        // and leaves the pool exactly as it was.
+        let failed = recovery::restore(&archive, &source, &restored, pg_bin)
+            .await
+            .expect_err("restoring over an existing schema must fail");
+        ensure!(
+            format!("{failed:#}").contains("already exists"),
+            "unexpected restore error: {failed:#}"
+        );
+        ensure!(recovery::accounting_state(&restored.pool).await? == before);
+        assert_pooled_session(&restored, "after a failed restore").await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    source.close().await?;
+    restored.close().await?;
+    result
+}
+
+/// Reads the session settings of every connection in the fixture pool, once
+/// each in-flight release has finished so none of them can be missed.
+async fn assert_pooled_session(db: &recovery::Database, when: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.pool.size() == 0 || db.pool.num_idle() != db.pool.size() as usize {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "{when}: the fixture pool never got all of its connections back"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut connections = Vec::new();
+    for _ in 0..db.pool.size() {
+        connections.push(db.pool.acquire().await?);
+    }
+    for connection in &mut connections {
+        assert_session(connection, when, &db.schema).await?;
+    }
+    Ok(())
+}
+
+async fn assert_session(
+    connection: &mut sqlx::PgConnection,
+    when: &str,
+    schema: &str,
+) -> Result<()> {
+    let search_path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&mut *connection)
+        .await?;
+    ensure!(
+        search_path == schema,
+        "{when}: pooled search_path is {search_path:?}, expected {schema:?}"
+    );
+    for (name, expected) in RESTORE_TARGET_SESSION {
+        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            .fetch_one(&mut *connection)
+            .await?;
+        ensure!(
+            value == expected,
+            "{when}: pooled {name} is {value:?}, expected {expected:?}: the pg_restore session reached the fixture pool"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_loss() -> Result<()> {
     let Some(inputs) = gate::inputs(

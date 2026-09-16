@@ -3,7 +3,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy};
 use qbit_prism_server::api::{self, ApiConfig, ApiState};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::{io::Write, path::Path, process::Stdio, sync::Arc};
 use tokio::process::Command;
 use tower::ServiceExt;
@@ -343,16 +343,31 @@ pub async fn restore(
         .join("\n")
         .replace(&format!("CREATE SCHEMA {};", source.schema), "")
         .replace(&source.schema, &target.schema);
-    let mut transaction = target.pool.begin().await?;
-    sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
-    // pg_restore's SQL clears search_path. Return this pooled connection to
-    // the fixture's schema before reusing it: qualifying an outer DELETE is
-    // insufficient when its trigger body resolves unqualified ledger tables.
-    sqlx::query("SELECT pg_catalog.set_config('search_path',$1,false)")
-        .bind(&target.schema)
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
+    // The SQL opens with session SET statements (search_path, lock_timeout,
+    // statement_timeout, ...) that survive COMMIT, so it runs on a session of
+    // its own that is closed afterwards, never on one that would carry those
+    // settings back into `target.pool`. Only the URL, which pins search_path
+    // to the fixture schema, is shared with the pool.
+    let mut connection = PgConnection::connect(&target.url).await?;
+    let restored = async {
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&mut connection)
+            .await?;
+        ensure!(
+            schema == target.schema,
+            "restore session resolves {schema:?}, not the target schema {:?}",
+            target.schema
+        );
+        let mut transaction = connection.begin().await?;
+        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    // A failed close must not hide why the restore itself failed.
+    let closed = connection.close().await;
+    restored?;
+    closed?;
     Ok(())
 }
 
