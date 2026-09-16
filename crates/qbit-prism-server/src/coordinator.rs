@@ -1016,11 +1016,16 @@ impl Coordinator {
                 .await?;
             self.capture_refresh_window(network, permit.clone()).await?
         };
-        let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
+        // Keep this window and admission together through reservation and
+        // publication. A cancelled/failed refresh must finish dropping its
+        // unpublished rows before another build can acquire that capacity.
+        let admitted = prepared_storage::compact::CompactOwner::new((window.into_inner(), permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
+                && current.window.prior_balances_digest
+                    == admitted.0.reference.prior_balances_digest
                 && current.fee == fee
         });
         let generation = self
@@ -1034,12 +1039,11 @@ impl Coordinator {
             self.config.instance_id,
             uuid::Uuid::new_v4().simple()
         );
-        let (window, permit) = admitted.into_inner();
         let source = prepared_storage::compact::RefreshBuild {
             proof,
             key: storage_key,
             template,
-            window: (*window).clone(),
+            window: admitted.0.clone(),
             inputs,
             fee,
             fingerprint,
@@ -1054,12 +1058,15 @@ impl Coordinator {
         };
         let captured = self
             .capture_refresh(prepared_storage::compact::CompactOwner::new((
-                source, permit,
+                source,
+                admitted.1.clone(),
             )))
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
         self.lock_compact_publication(reserved).await?.publish()?;
-        *cached_window = Some(window);
+        let (window, permit) = admitted.into_inner();
+        *cached_window = Some(prepared_storage::compact::CompactOwner::new(window));
+        drop(permit);
         Ok(())
     }
 

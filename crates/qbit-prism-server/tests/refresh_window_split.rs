@@ -247,6 +247,10 @@ async fn older_refresh_cannot_publish_after_newer_tip_observation() -> Result<()
             timeout(Duration::from_secs(5), pause.entered())
                 .await
                 .context("refresh did not reach COMMIT barrier")?;
+            ensure!(
+                f.a.build_slots.available_permits() + 1 == f.a.config.build_workers,
+                "unpublished snapshot released admission during the reservation wait"
+            );
             f.node.set_template(None);
             f.node
                 .set_tip(&"ef".repeat(32), &"ab".repeat(32), 101, "02");
@@ -265,6 +269,57 @@ async fn older_refresh_cannot_publish_after_newer_tip_observation() -> Result<()
             ensure!(
                 prepared(&f.a).await?.template["previousblockhash"] == "ef".repeat(32),
                 "fresh tip could not publish after stale refusal"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_refresh_keeps_unpublished_window_under_admission() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let first = prepared(&f.a).await?;
+            sqlx::query(
+                "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton",
+            )
+            .execute(f.pool())
+            .await?;
+            let pause = f.proxy.pause_after_commit("qbit_prism_jobs", "INSERT")?;
+            let c = f.a.clone();
+            let pending = tokio::spawn(async move { c.refresh_once().await });
+            timeout(Duration::from_secs(5), pause.entered())
+                .await
+                .context("refresh did not reach reservation wait")?;
+            ensure!(
+                f.a.build_slots.available_permits() + 1 == f.a.config.build_workers,
+                "unpublished replacement window outlived build admission"
+            );
+            pending.abort();
+            ensure!(
+                pending.await.unwrap_err().is_cancelled(),
+                "refresh did not cancel"
+            );
+            pause.release();
+            let all = timeout(
+                Duration::from_secs(5),
+                f.a.build_slots
+                    .clone()
+                    .acquire_many_owned(u32::try_from(f.a.config.build_workers)?),
+            )
+            .await??;
+            ensure!(
+                prepared(&f.a).await?.storage_key == first.storage_key,
+                "cancelled refresh published its replacement"
+            );
+            drop(all);
+            f.a.refresh_once().await?;
+            ensure!(
+                prepared(&f.a).await?.snapshot.payout_revision
+                    == first.snapshot.payout_revision + 1,
+                "refresh did not recover after cancellation cleanup"
             );
             Ok(())
         })

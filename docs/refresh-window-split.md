@@ -23,7 +23,9 @@ artifact allocations. Old cache rows are released on the blocking executor
 under build admission before reading a replacement; keeping old issued jobs
 does not keep those rows alive. No idle build permit is retained.
 
-Publication still uses the existing reservation and publication authority
+The unpublished snapshot keeps its build admission through reservation and
+publication, including cancellation cleanup. Publication still uses the existing
+reservation and publication authority
 boundary, with fresh tip, readiness, revision, and balance checks. The cache
 becomes reusable only after successful publication. Original issued balances,
 references, and absolute expirations are unchanged. Native share-array hashes
@@ -43,8 +45,9 @@ budget to determine whether the conditional incremental-engine work is needed.
 existing execution proxy: three transaction changes two seconds apart return
 zero additional accepted-share rows; new shares, revisions, interval expiry,
 and difficulty changes trigger fresh reads. It also verifies as-issued resume,
-compact storage and canonical audit reconstruction, and rejection of a delayed
-refresh after a newer tip observation. Unit regressions cover same-revision
+compact storage and canonical audit reconstruction, rejection of a delayed
+refresh after a newer tip observation, and cancellation during a completed
+COMMIT response wait. Unit regressions cover same-revision
 balance changes, the empty-to-nonempty transition, and release of retired rows
 while old prepared work remains alive.
 

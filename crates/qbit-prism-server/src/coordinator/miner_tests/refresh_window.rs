@@ -31,6 +31,10 @@ async fn balance_identity_invalidates_window_even_at_the_same_revision() {
     );
     assert_eq!(f.store.snapshots.lock().unwrap().len(), reads + 1);
     assert!(
+        current.generation > first.generation,
+        "changed balances reused the old generation"
+    );
+    assert!(
         first.reservation.balances.is_empty(),
         "old prepared balances changed"
     );
