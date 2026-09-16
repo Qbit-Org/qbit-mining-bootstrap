@@ -9,7 +9,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from scripts.run_rust_test_shard import IGNORED, main, shard_commands, workspace_targets
+from scripts.run_rust_test_shard import COMPACT_SCALE, IGNORED, main, shard_commands, workspace_targets
 
 
 NATIVE_SCRIPT = Path(__file__).resolve().parents[1] / "test" / "prism-native-tests.sh"
@@ -24,6 +24,7 @@ def fixture_metadata():
                 ("test", "stratum_admission_postgres"),
                 ("test", "observability_database"), ("test", "issued_job_dependency"),
                 ("test", "new_contract"),
+                ("test", "compact_runtime_scale"),
                 ("custom-build", "build-script-build"),
             ]
         ]},
@@ -44,14 +45,23 @@ class RustTestShardTests(unittest.TestCase):
         shards = [shard_commands(metadata, i, 4) for i in range(4)]
         self.assertCountEqual([cmd for shard in shards for cmd in shard], expected)
         ordinary = [cmd for cmd in expected if "--ignored" not in cmd]
-        self.assertEqual(len(ordinary), 11)
-        self.assertEqual(len({tuple(cmd) for cmd in ordinary}), 11)
+        self.assertEqual(len(ordinary), 12)
+        self.assertEqual(len({tuple(cmd) for cmd in ordinary}), 12)
         self.assertEqual(len(expected) - len(ordinary), len(IGNORED))
         for shard in shards:
             for command in shard:
                 if "--ignored" in command:
-                    prefix = command[:command.index("--")]
+                    # The optimized scale invocation belongs to the same target
+                    # as its ordinary debug run; profile is not target identity.
+                    prefix = [arg for arg in command[:command.index("--")] if arg != "--release"]
                     self.assertIn(prefix + ["--", "--nocapture"], shard)
+        scale = [cmd for cmd in expected if COMPACT_SCALE[2] in cmd]
+        self.assertEqual(len(scale), 2)
+        self.assertNotIn("--release", scale[0])
+        self.assertNotIn("--ignored", scale[0])
+        self.assertEqual(scale[1], scale[0][:-2] + [
+            "--release", "--", "--ignored", "--nocapture", "--test-threads=1",
+        ])
         admission = next(cmd for cmd in expected if "--exact" in cmd)
         self.assertEqual(admission[-1], next(iter(IGNORED.values()))[-1])
         metadata["packages"].reverse()
@@ -68,7 +78,7 @@ class RustTestShardTests(unittest.TestCase):
         self.assertCountEqual(local, ci)
 
     def test_bad_coordinates_empty_and_unknown_targets_fail_closed(self):
-        for index, count in [(-1, 4), (4, 4), (0, 0), (0, -1), (11, 12)]:
+        for index, count in [(-1, 4), (4, 4), (0, 0), (0, -1), (12, 13)]:
             with self.subTest(index=index, count=count), self.assertRaises(ValueError):
                 shard_commands(fixture_metadata(), index, count)
         with self.assertRaises(ValueError):

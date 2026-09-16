@@ -359,7 +359,37 @@ impl Fixture {
             .build_job(solver, EXTRANONCE1, 1.0, 0.0)
             .await
             .map_err(|error| anyhow!("build_job refused the solver: {error:?}"))?;
-        Ok(job.context.bundle.clone())
+        if let Some(published) = &job.context.prepared.bundle {
+            ensure!(
+                Arc::ptr_eq(published, &job.context.bundle),
+                "job did not share published metadata"
+            );
+        }
+        let bootstrap = job
+            .context
+            .prepared
+            .window
+            .shares
+            .is_none()
+            .then(|| solver.clone());
+        let bundle =
+            d2_test_support::original_audit(&self.coordinator, &job.context.prepared, bootstrap)
+                .await?;
+        let wire = codec::Job::from_manifest(
+            "comparison".into(),
+            &job.context.prepared.template,
+            &bundle.signed_coinbase_manifest.manifest,
+            "00000000",
+            EXTRANONCE2_SIZE,
+            1.0,
+            0.0,
+            true,
+        )?;
+        ensure!(
+            wire.coinb1 == job.wire.coinb1 && wire.coinb2 == job.wire.coinb2,
+            "reconstructed audit does not describe the issued coinbase"
+        );
+        Ok(Arc::new(bundle))
     }
 
     async fn close(self) -> Result<()> {
@@ -436,8 +466,9 @@ async fn accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window() -> 
             .context("the ledger window was not published as prepared work")?;
         let carried = fixture.solver_bundle(&scenario.solver).await?;
         ensure!(
-            Arc::ptr_eq(&published, &carried),
-            "the solver's job carried a different bundle than refresh_once published"
+            published.found_block == carried.found_block
+                && published.coinbase_script_sig_suffix_hex == carried.coinbase_script_sig_suffix_hex,
+            "the reconstructed solver audit differs from published metadata"
         );
 
         let projection = bundle_payout(&carried)?;
@@ -508,8 +539,10 @@ async fn a_single_share_from_another_miner_takes_the_whole_coinbase() -> Result<
             .context("one accepted share did not select the ledger window")?;
         let carried = fixture.solver_bundle(&solver).await?;
         ensure!(
-            Arc::ptr_eq(&published, &carried),
-            "the solver's job carried a different bundle than refresh_once published"
+            published.found_block == carried.found_block
+                && published.coinbase_script_sig_suffix_hex
+                    == carried.coinbase_script_sig_suffix_hex,
+            "the reconstructed solver audit differs from published metadata"
         );
 
         let accounts = &carried.payout_policy_manifest.accounts;

@@ -156,6 +156,8 @@ impl Ledger {
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
             metrics: None,
             config_fingerprint: std::sync::Arc::default(),
+            compact_decode_hook: Default::default(),
+            snapshot_decode_hook: Default::default(),
         }
     }
 
@@ -318,6 +320,10 @@ impl Ledger {
             }),
             metrics,
             config_fingerprint: std::sync::Arc::default(),
+            #[cfg(test)]
+            compact_decode_hook: Default::default(),
+            #[cfg(test)]
+            snapshot_decode_hook: Default::default(),
         };
         let source = migration::require_migration_source(&ledger.pool).await?;
         tracing::info!(
