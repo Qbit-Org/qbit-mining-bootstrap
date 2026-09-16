@@ -245,6 +245,85 @@ async fn transaction_churn_does_not_extend_original_reanchor_interval() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_snapshot_read_does_not_restart_reanchor_age() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let mut config = (*f.a.config).clone();
+            config.instance_id = "refresh-delayed-anchor".into();
+            config.snapshot_interval = Duration::from_millis(200);
+            let c = Coordinator::new(config, Arc::new(Metrics::default())).await?;
+            let result = async {
+                sqlx::raw_sql("CREATE FUNCTION refresh_observe_anchor() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_prism_cluster UPDATE'; RETURN NULL; END $$; CREATE TRIGGER refresh_observe_anchor AFTER UPDATE OF ledger_clock_ms ON qbit_prism_cluster FOR EACH STATEMENT EXECUTE FUNCTION refresh_observe_anchor();")
+                    .execute(f.pool()).await?;
+                let pause = f.proxy.pause_after_commit("qbit_prism_cluster", "UPDATE")?;
+                let coordinator = c.clone();
+                let pending = tokio::spawn(async move { coordinator.refresh_once().await });
+                timeout(Duration::from_secs(5), pause.entered()).await
+                    .context("snapshot did not reach COMMIT barrier")?;
+                sleep(Duration::from_millis(250)).await;
+                pause.release();
+                timeout(Duration::from_secs(5), pending).await???;
+                let first = prepared(&c).await?;
+                let mark = f.proxy.mark();
+                c.refresh_once().await?;
+                one_read(f, mark, support::SHARES).await?;
+                ensure!(prepared(&c).await?.window.anchor_ms > first.window.anchor_ms,
+                    "snapshot response wait renewed the original reanchor interval");
+                Ok(())
+            }.await;
+            c.ledger.pool.close().await;
+            result
+        })
+    }).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shares_after_capture_enter_the_next_window_without_rewriting_the_selected_one(
+) -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let first = prepared(&f.a).await?;
+            let mut share =
+                f.a.ledger
+                    .read_window(&first.window, BalanceSource::AsIssued)
+                    .await?
+                    .shares
+                    .pop()
+                    .context("fixture share missing")?;
+            share.share_id = "accepted-during-reservation".into();
+            f.node.set_template(Some(churn(first.template.clone(), 1)));
+            let pause = f.proxy.pause_after_commit("qbit_prism_jobs", "INSERT")?;
+            let c = f.a.clone();
+            let pending = tokio::spawn(async move { c.refresh_once().await });
+            timeout(Duration::from_secs(5), pause.entered())
+                .await
+                .context("refresh did not reach reservation barrier")?;
+            let appended = f.a.ledger.append(share, None).await?;
+            pause.release();
+            timeout(Duration::from_secs(5), pending).await???;
+            let selected = prepared(&f.a).await?;
+            ensure!(
+                selected.window == first.window
+                    && selected.snapshot.share_seq == first.snapshot.share_seq,
+                "publication rewrote the already-selected anchored window"
+            );
+            f.node.set_template(Some(churn(first.template.clone(), 2)));
+            let mark = f.proxy.mark();
+            f.a.refresh_once().await?;
+            one_read(f, mark, support::SHARES + 1).await?;
+            ensure!(
+                prepared(&f.a).await?.snapshot.share_seq == appended.share.share_seq,
+                "the next build did not capture the share committed during reservation"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn difficulty_change_invalidates_the_retained_window_weight() -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {

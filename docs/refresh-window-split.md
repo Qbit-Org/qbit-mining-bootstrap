@@ -9,7 +9,8 @@ The window is invalidated by a changed accepted-share cutoff, payout revision,
 prior-balance digest, network difficulty, or the existing
 `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` interval. The interval starts before the
 snapshot read; rebuilding templates does not renew it. The accepted-cutoff
-probe uses the existing partial sequence index. Production appends serialize
+probe reads the latest accepted sequence without selecting share payloads;
+it shares its exact SQL with the snapshot cutoff. Production appends serialize
 under the ordering barrier, assign the acceptance timestamp from the ledger
 clock, and reject future job timestamps, so a newly committed accepted row is
 eligible at the next snapshot barrier. Rejected rows do not invalidate it.
@@ -22,6 +23,13 @@ publication cadence under a busy share stream instead of adding a full read,
 generation change, and miner update on every poll. The first accepted share
 still immediately replaces an empty window. Revision, balance, and tip changes
 continue through their existing refresh and publication checks.
+
+Build inputs are selected after waiting for build admission, with a fresh
+cutoff, payout state, and reanchor-age check. Shares committed after that
+selection belong to the next window, as they did after the baseline snapshot
+read. The reanchor interval triggers another read; it is not a replacement for
+the existing absolute work deadline. Tip, readiness, revision, and balance
+identity are still revalidated before publication.
 
 `Prepared`, issued jobs, persisted records, and resumed jobs still contain
 compact references rather than accepted-share arrays. The cache is owned only
@@ -63,7 +71,11 @@ compact storage and canonical audit reconstruction, rejection of a delayed
 refresh after a newer tip observation, and cancellation during a completed
 COMMIT response wait. Unit regressions cover same-revision
 balance changes, the empty-to-nonempty transition, and release of retired rows
-while old prepared work remains alive.
+while old prepared work remains alive. Admission regressions hold the sole
+build slot while the cutoff changes or the original interval expires. A delayed
+snapshot COMMIT response checks that read latency does not renew the interval;
+a share committed during reservation enters the next build without rewriting
+the already-selected window.
 
 The unchanged frozen money/window corpus and compact runtime tests remain the
 compatibility gates. No sub-second one-share-delta result, production timing,

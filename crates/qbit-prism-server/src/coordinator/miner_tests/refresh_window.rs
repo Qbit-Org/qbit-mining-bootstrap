@@ -1,5 +1,90 @@
 use super::*;
 
+async fn cached_inputs_change_during_build_wait(expire: bool) {
+    let interval = Duration::from_secs(2);
+    let f = Fixture::build(
+        Duration::from_secs(10),
+        |c| c.snapshot_interval = interval,
+        None,
+    )
+    .await;
+    let started = Instant::now();
+    f.coordinator.refresh_once().await.unwrap();
+    let first = f.coordinator.prepared.read().await.clone().unwrap();
+    let reads = f.store.snapshots.lock().unwrap().len();
+    let permit = f
+        .coordinator
+        .build_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let gate = Arc::new(Gate::default());
+    *f.store.compact.clock_gate.lock().unwrap() = Some(gate.clone());
+    let mut template = first.template.clone();
+    template["coinbasevalue"] = json!(500_000_001);
+    f.node.lock().unwrap().template = Some(template);
+    let c = f.coordinator.clone();
+    let mut pending = tokio::spawn(async move { c.refresh_once().await });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < interval,
+        "fixture did not reach admission before reanchor"
+    );
+    gate.release.notify_one();
+    // The last clock probe has completed. The sole build permit is still
+    // held here, so this refresh cannot select or build its next window yet.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut pending)
+            .await
+            .is_err()
+    );
+    if expire {
+        tokio::time::sleep(interval).await;
+    }
+    {
+        let mut slot = f.store.snapshot.lock().unwrap();
+        let snapshot = slot.as_mut().unwrap();
+        snapshot.anchor_ms += 1;
+        if !expire {
+            snapshot.share_seq += 1;
+            let mut share = snapshot.shares.last().unwrap().clone();
+            share.share_seq = snapshot.share_seq;
+            share.share_id = "arrived-during-build-admission".into();
+            snapshot.shares.push(share);
+        }
+    }
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let current = f.coordinator.prepared.read().await.clone().unwrap();
+    assert_eq!(
+        f.store.snapshots.lock().unwrap().len(),
+        reads + 1,
+        "build admission reused inputs invalidated while waiting"
+    );
+    assert_eq!(current.snapshot.anchor_ms, first.snapshot.anchor_ms + 1);
+    assert_eq!(
+        current.snapshot.share_seq,
+        first.snapshot.share_seq + u64::from(!expire)
+    );
+}
+
+#[tokio::test]
+async fn build_wait_rechecks_new_share_cutoff() {
+    cached_inputs_change_during_build_wait(false).await;
+}
+
+#[tokio::test]
+async fn build_wait_rechecks_original_reanchor_age() {
+    cached_inputs_change_during_build_wait(true).await;
+}
+
 #[tokio::test]
 async fn balance_identity_invalidates_window_even_at_the_same_revision() {
     let f = Fixture::new(Duration::from_secs(10)).await;

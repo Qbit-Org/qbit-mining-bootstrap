@@ -930,9 +930,6 @@ impl Coordinator {
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
         let state = self.work_ledger.payout_state().await?;
         let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
-        let reuse_window = cached_window.as_ref().is_some_and(|window| {
-            window.reusable(network, share_seq, state, self.config.snapshot_interval)
-        });
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
@@ -1004,6 +1001,17 @@ impl Coordinator {
             )
             .context("prepared expiry overflow")?;
         let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
+        // Admission can wait across new shares, settlement, or reanchor expiry.
+        // Select valid inputs after that wait, at the same boundary where a
+        // fresh snapshot would be read. Later shares belong to the next window;
+        // the selected WindowRef remains immutable through build/publication.
+        let reuse_window = if let Some(window) = cached_window.as_ref() {
+            let state = self.work_ledger.payout_state().await?;
+            let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
+            window.reusable(network, share_seq, state, self.config.snapshot_interval)
+        } else {
+            false
+        };
         if !reuse_window {
             // Retire cache ownership under admission before reading its
             // replacement. Any active blocking build keeps its own admission.
