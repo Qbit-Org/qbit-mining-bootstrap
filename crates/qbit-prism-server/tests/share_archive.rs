@@ -1438,3 +1438,73 @@ async fn json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
 }
+
+/// Sequences are nontransactional: an append can hold a `share_seq` below the
+/// partition's bound in a transaction that has not committed when the
+/// sequence reports the bound passed. The archive waits for it under the
+/// ledger's ordering lock and then holds every row, rather than writing a copy
+/// that misses the row the detach would take with the partition.
+#[tokio::test]
+async fn archive_waits_for_an_append_that_drew_its_share_seq_before_the_bound() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("drain-a").await?;
+        let archiver = db.ledger("drain-b").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 1, 250, 7, "server-a", 7200.0).await?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        // The sequence has handed out the partition's last value and stands
+        // past the bound, while the append that drew it is still open: the
+        // ordering lock held, the row written, nothing committed.
+        set_sequence(&ledger.pool, p0_upper).await?;
+        let mut writer = ledger.pool.begin().await?;
+        // `ORDER_LOCK` in `ledger.rs`, the advisory key every append holds
+        // from before its insert until its transaction ends.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(0x505249534d000002_i64)
+            .execute(&mut *writer)
+            .await?;
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,\
+             share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,\
+             accepted,writer_id,writer_epoch) VALUES($1,'late:0001','m1','k',decode(repeat('aa',32),'hex'),7,1000,100,'job-a',\
+             clock_timestamp(),1700000000,clock_timestamp(),true,'server-a',0)",
+        )
+        .bind(p0_upper - 1)
+        .execute(&mut *writer)
+        .await?;
+        let archive = tokio::spawn({
+            let root = root.path().to_path_buf();
+            async move { archive::archive(&archiver, P0, &root, false, "operator-a").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        ensure!(
+            !archive.is_finished(),
+            "the archive finished while an append below the bound was still open"
+        );
+        writer.commit().await?;
+        let written = archive.await??;
+        ensure!(
+            written["manifest"]["row_count"] == 251
+                && written["manifest"]["last_share_seq"] == p0_upper - 1,
+            "the archive does not hold the late append: {}",
+            written["manifest"]
+        );
+        let verified = archive::verify(&ledger, P0, root.path()).await?;
+        ensure!(
+            verified["live_rows_compared"] == true && verified["row_count"] == 251,
+            "the archive did not verify against the live rows: {verified}"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}

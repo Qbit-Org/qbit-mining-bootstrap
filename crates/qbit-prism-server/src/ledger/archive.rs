@@ -785,6 +785,25 @@ fn check_sequence_passed(record: &PartitionRecord, next_share_seq: i64, what: &s
     Ok(())
 }
 
+/// Wait for every append that drew its `share_seq` before the bound was
+/// passed. Sequences are nontransactional: an append takes its value inside
+/// its transaction (`INSERT ... RETURNING share_seq`) and holds `ORDER_LOCK`
+/// from before that insert until the transaction ends, so the sequence can
+/// report the bound passed while a row below it is still uncommitted and
+/// invisible. Taking the lock, outside any transaction so it lasts for the
+/// statement only, returns once every such transaction has committed or
+/// rolled back; an append that starts afterwards draws a value at or above
+/// what the sequence reported, outside the partition. Only after this is a
+/// stream of the live rows complete.
+async fn drain_appends(connection: &mut PgConnection) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(super::ORDER_LOCK)
+        .execute(&mut *connection)
+        .await
+        .context("waiting for in-flight appends under the ledger's ordering lock")?;
+    Ok(())
+}
+
 /// Every audit row whose snapshot intersects the partition, split by whether
 /// its canonical bytes are stored. Snapshots with `inline_shares` are the
 /// bootstrap window's synthetic share, which is not in the ledger and so does
@@ -1377,6 +1396,7 @@ pub async fn archive(
     );
     let next_share_seq = next_share_seq(&mut connection).await?;
     check_sequence_passed(&record, next_share_seq, "archive")?;
+    drain_appends(&mut connection).await?;
     ensure!(
         record.archived_at.is_none() || force,
         "refusing to archive {partition_name}: it was already archived at {} into {}. Pass --force to write it again, which also clears the recorded verification, its own and that of every later archive",
@@ -1662,6 +1682,7 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         // append can reach it, and the immutability trigger holds the rest.
         let next_share_seq = next_share_seq(&mut connection).await?;
         check_sequence_passed(&record, next_share_seq, "verify")?;
+        drain_appends(&mut connection).await?;
         let stream = RowStream::new(partition_name, record.lower_seq, record.upper_seq, None);
         let stream = stream_partition(&mut connection, partition_name, stream).await?;
         let (summary, _) = stream.finish()?;
