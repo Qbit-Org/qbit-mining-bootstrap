@@ -530,6 +530,7 @@ qbit-prism-server::share_archive::plan_allows_long_maintenance_reads_without_cha
 qbit-prism-server::share_archive::plan_keeps_candidate_and_audit_blockers_in_one_snapshot
 qbit-prism-server::share_archive::plan_names_each_blocker_and_separates_unknown_from_clear
 qbit-prism-server::share_archive::restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent
+qbit-prism-server::share_archive::rollup_gate_measures_the_newest_committed_row_not_the_bound
 qbit-prism-server::share_archive::seal_is_idempotent_and_safe_to_run_concurrently
 qbit-prism-server::share_archive::seal_stores_a_slow_artifact_without_changing_pool_timeouts
 qbit-prism-server::share_archive::unfinished_candidate_window_pins_an_earlier_partition

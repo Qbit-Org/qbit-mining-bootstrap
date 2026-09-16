@@ -1452,9 +1452,13 @@ and a partition leaves only when all five clear.
 2. **It is younger than the retention age**, 30 days by default. The longest
    dashboard read of raw rows is 24 hours, so this covers every one of them
    with margin.
-3. **The hashrate rollup watermark has not passed it.** While
-   `qbit_hashrate_rollup_progress` is behind the partition, the permanent
-   rollup tables do not yet hold its contribution.
+3. **The hashrate rollup watermark has not reached its newest row.** While
+   `qbit_hashrate_rollup_progress` is behind the partition's newest committed
+   `share_seq`, or the share sequence has not yet passed the partition's upper
+   bound, the permanent rollup tables do not yet hold its whole contribution.
+   The mark is the newest row, not the bound: the sweep advances only to rows
+   that committed, and a `share_seq` an append drew and rolled back is never
+   folded.
 4. **A landed block's audit still depends on it**, that is, an audit row whose
    share snapshot intersects the partition and that has no stored
    `canonical_audit_bytes`. Sealing clears this condition.

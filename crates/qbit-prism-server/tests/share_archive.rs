@@ -2398,3 +2398,93 @@ async fn archive_waits_for_an_append_that_drew_its_share_seq_before_the_bound() 
         }
     }
 }
+
+/// The rollup sweep advances to the newest row it folded, never to a
+/// `share_seq` the sequence handed to an append that rolled back. When such
+/// an append drew a partition's last value, the sequence has passed the bound
+/// but no row will ever carry it, so a gate on the bound would hold the
+/// partition for a sweep that cannot happen: the gate measures the newest
+/// committed row instead. An empty partition the sequence has not passed is
+/// not folded either; it is not yet anything.
+#[tokio::test]
+async fn rollup_gate_measures_the_newest_committed_row_not_the_bound() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("tail-a").await?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+
+        // A fresh ledger whose sweep has run: nothing is folded because
+        // nothing exists yet, and no partition reads as eligible.
+        let watermark = advance_rollups(&ledger.pool).await?;
+        ensure!(watermark == 0, "the sweep of an empty ledger advanced to {watermark}");
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        let rollup = condition(entry(&report, P0), "rollup_watermark");
+        ensure!(
+            rollup.status == "blocked" && rollup.detail.contains("appends can still land in it"),
+            "an empty partition the sequence has not passed was not blocked: {rollup:?}"
+        );
+        ensure!(
+            report.eligible.is_empty(),
+            "an empty ledger lists eligible partitions: {:?}",
+            report.eligible
+        );
+
+        insert_shares(&ledger.pool, 1, 250, 7, "server-a", 7200.0).await?;
+        // An append draws the partition's last value and rolls back: the
+        // sequence stands past the bound while no row carries p0_upper - 1.
+        set_sequence(&ledger.pool, p0_upper - 2).await?;
+        let mut writer = ledger.pool.begin().await?;
+        // `ORDER_LOCK` in `ledger.rs`, as the append path holds it.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(0x505249534d000002_i64)
+            .execute(&mut *writer)
+            .await?;
+        let drawn: i64 = sqlx::query_scalar(
+            "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,\
+             share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,\
+             accepted,writer_id,writer_epoch) VALUES('gone:0001','m1','k',decode(repeat('aa',32),'hex'),7,1000,100,'job-a',\
+             clock_timestamp(),1700000000,clock_timestamp(),true,'server-a',0) RETURNING share_seq",
+        )
+        .fetch_one(&mut *writer)
+        .await?;
+        ensure!(drawn == p0_upper - 1, "the append drew {drawn}, not the bound's last value");
+        writer.rollback().await?;
+
+        let watermark = advance_rollups(&ledger.pool).await?;
+        ensure!(watermark == 250, "the sweep did not stop at the newest committed row: {watermark}");
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        ensure!(
+            report.next_share_seq == p0_upper,
+            "the sequence does not stand at the bound: {}",
+            report.next_share_seq
+        );
+        let p0 = entry(&report, P0);
+        ensure!(p0.newest_share_seq == Some(250), "{p0:?}");
+        let rollup = condition(p0, "rollup_watermark");
+        ensure!(
+            rollup.status == "clear" && rollup.detail.contains("newest row 250"),
+            "a watermark at the newest committed row did not clear the gate: {rollup:?}"
+        );
+        // The lead partition above it has no row and the sequence has not
+        // reached it: still not folded, with the sequence position named.
+        let p1 = entry(&report, P1);
+        let rollup = condition(p1, "rollup_watermark");
+        ensure!(
+            p1.newest_share_seq.is_none()
+                && rollup.status == "blocked"
+                && rollup.detail.contains(&format!("stands at {p0_upper}")),
+            "the empty lead partition was not blocked on the sequence: {rollup:?}"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}

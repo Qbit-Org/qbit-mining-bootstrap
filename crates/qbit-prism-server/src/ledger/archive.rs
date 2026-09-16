@@ -959,6 +959,11 @@ pub struct PartitionPlan {
     pub attachment: AttachmentState,
     pub live_rows: Option<i64>,
     pub newest_accepted_at: Option<DateTime<Utc>>,
+    /// The highest `share_seq` a committed row of the partition carries: what
+    /// the rollup watermark has to reach. It is below `upper_seq - 1` when the
+    /// sequence handed the partition's last values to appends that rolled
+    /// back, so the bound itself is not a value the sweep can ever report.
+    pub newest_share_seq: Option<i64>,
     pub conditions: Vec<Condition>,
     pub blockers: Vec<String>,
     pub unknowns: Vec<String>,
@@ -1095,6 +1100,7 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
                 options,
                 window_floor,
                 any_accepted,
+                next_share_seq,
                 watermark,
             )
             .await?,
@@ -1136,6 +1142,7 @@ async fn partition_plan(
     options: &PlanOptions,
     window_floor: Option<i64>,
     any_accepted: bool,
+    next_share_seq: i64,
     watermark: Option<i64>,
 ) -> Result<PartitionPlan> {
     check_partition_name(&record.partition_name)?;
@@ -1143,6 +1150,7 @@ async fn partition_plan(
     let mut conditions = Vec::new();
     let mut live_rows = None;
     let mut newest_accepted_at = None;
+    let mut newest_share_seq = None;
     let mut unknowns = Vec::new();
     if record.state == "attached" && !attachment.attached {
         unknowns.push(format!(
@@ -1181,7 +1189,7 @@ async fn partition_plan(
         }
     } else {
         let stats = sqlx::query(&format!(
-            "SELECT count(*)::bigint AS rows,max(accepted_at) AS newest FROM {}",
+            "SELECT count(*)::bigint AS rows,max(accepted_at) AS newest,max(share_seq) AS newest_seq FROM {}",
             record.partition_name
         ))
         .fetch_one(&mut *connection)
@@ -1189,8 +1197,10 @@ async fn partition_plan(
         .with_context(|| format!("counting the live rows of {}", record.partition_name))?;
         let rows: i64 = stats.try_get("rows")?;
         let newest: Option<DateTime<Utc>> = stats.try_get("newest")?;
+        let newest_seq: Option<i64> = stats.try_get("newest_seq")?;
         live_rows = Some(rows);
         newest_accepted_at = newest;
+        newest_share_seq = newest_seq;
 
         conditions.push(match window_floor {
             _ if !any_accepted => Condition::clear(
@@ -1242,24 +1252,42 @@ async fn partition_plan(
             ),
         });
 
-        conditions.push(match watermark {
-            None => Condition::unknown(
+        // The sweep advances to the newest committed row it folded, never to
+        // a share_seq the sequence handed to an append that rolled back. So
+        // the mark to reach is the partition's newest row, not its bound:
+        // when a rolled-back append drew the bound's last value, no later
+        // sweep of this partition can report it. Appends commit in share_seq
+        // order under ORDER_LOCK, so a watermark at or past the newest row
+        // covers every committed row below it too. The rows are only all
+        // known once the sequence has passed the bound; before that an empty
+        // partition has nothing folded because it has nothing yet.
+        conditions.push(match (watermark, newest_share_seq) {
+            (None, _) => Condition::unknown(
                 "rollup_watermark",
                 "qbit_hashrate_rollup_progress holds no row: the rollups have never run, so this partition's contribution is not in the permanent rollup tables",
             ),
-            Some(last) if last >= record.upper_seq - 1 => Condition::clear(
+            (Some(last), Some(newest)) if last < newest => Condition::blocked(
                 "rollup_watermark",
                 format!(
-                    "the rollup sweep has folded share_seq up to {last}, at or past this partition's last possible row {}",
-                    record.upper_seq - 1
+                    "the rollup sweep has folded share_seq up to {last} only; this partition's newest row is share_seq {newest}"
                 ),
             ),
-            Some(last) => Condition::blocked(
+            _ if next_share_seq < record.upper_seq => Condition::blocked(
                 "rollup_watermark",
                 format!(
-                    "the rollup sweep has folded share_seq up to {last} only; this partition needs {}",
-                    record.upper_seq - 1
+                    "the share sequence stands at {next_share_seq}, below this partition's upper bound {}, so appends can still land in it and its rows are not all folded yet",
+                    record.upper_seq
                 ),
+            ),
+            (Some(last), Some(newest)) => Condition::clear(
+                "rollup_watermark",
+                format!(
+                    "the rollup sweep has folded share_seq up to {last}, at or past this partition's newest row {newest}"
+                ),
+            ),
+            (Some(_), None) => Condition::clear(
+                "rollup_watermark",
+                "the partition holds no row to fold, and the share sequence has passed it",
             ),
         });
 
@@ -1306,6 +1334,7 @@ async fn partition_plan(
         attachment,
         live_rows,
         newest_accepted_at,
+        newest_share_seq,
         conditions,
         blockers,
         unknowns,
