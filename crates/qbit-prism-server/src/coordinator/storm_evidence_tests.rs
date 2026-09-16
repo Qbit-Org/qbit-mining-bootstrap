@@ -14,3 +14,10 @@
 //! sets `state='offered'` by hand asserts its own setup and proves nothing,
 //! so the offer record is produced by the coordinator, observed at the fake
 //! node, and only then read back.
+//!
+//! **Held pending #415.** That issue may add a terminal disposition for a
+//! proven orphan, which changes what a `Reconciliation` row can become. Today
+//! the documented rule is that such a row is retried with read-only chain
+//! observations only and never abandoned. Until #415's disposition is decided,
+//! assertions written here would be written against a rule that is about to
+//! change, so this module stays empty by decision rather than by omission.

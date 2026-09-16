@@ -18,6 +18,18 @@
 //! the one `submitblock` call, and provably short of terminalization, because
 //! the child never learned the outcome.
 //!
+//! The fixture takes its own PostgreSQL database through
+//! `support/ledger_database.rs` (#410): the drain holds database-scoped
+//! advisory locks, and a killed child leaves its claim behind, so sharing a
+//! database would leak this test's contention into every other fixture.
+//!
+//! Which constructor the child uses matters. #412 added `Ledger::connect_tool`
+//! and `Coordinator::new_tool`, a third registration mode that runs every
+//! startup gate but writes **no** `starting` heartbeat. A restarted frontend
+//! registers a heartbeat; a one-shot tool does not. Be deliberate about which
+//! one the test relaunches, and assert what `qbit_prism_instances` is expected
+//! to hold afterwards rather than leaving it unstated.
+//!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
 //!   cargo test --locked -p qbit-prism-server --test candidate_storm_restart -- --nocapture

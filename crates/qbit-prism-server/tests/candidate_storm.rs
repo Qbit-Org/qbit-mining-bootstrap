@@ -17,6 +17,17 @@
 //! asserted *equal* at two cardinalities measured in the same process, so the
 //! reduced-N CI path proves the same property as a local run at 3,120.
 //!
+//! The fixture takes **its own PostgreSQL database** through
+//! `support/ledger_database.rs` (#410), and that choice is load-bearing rather
+//! than incidental. PostgreSQL scopes advisory locks to a database, not a
+//! schema, so a drain of N siblings — N claims, each touching the ordering and
+//! settlement keys — would both queue behind other fixtures' locks and inflict
+//! its own on them, at the largest scale in the test tree. A per-row cost
+//! measured in a shared database is measuring other fixtures' lock waits, not
+//! this drain. With the database isolated, claims issued and statements
+//! executed per drained row are clean numbers; wall clock still carries the
+//! runner's noise, which is the second reason it is recorded and not asserted.
+//!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
 //!   cargo test --locked -p qbit-prism-server --test candidate_storm -- --nocapture
