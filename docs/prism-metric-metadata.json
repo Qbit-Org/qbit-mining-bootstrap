@@ -83,6 +83,9 @@
       ],
       "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
     },
+    "share_ledger_partition_lead_rows": {
+      "status": "max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it."
+    },
     "process_resident_memory_bytes": {
       "replaces": [
         "qbit_prism_process_resident_memory_bytes"

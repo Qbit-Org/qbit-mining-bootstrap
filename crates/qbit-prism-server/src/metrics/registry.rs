@@ -66,6 +66,7 @@ families! {
     FirstOffer: Histogram, "block_submit_seconds", "Locally validated block proof to first node offer; requires the offer owner's timestamp boundary.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
+    PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
     PoolAcquire: Histogram, "database_pool_acquire_seconds", "Actual database pool acquisition wait by outcome.";
     LockWait: Histogram, "database_advisory_lock_wait_seconds", "Database advisory transaction lock wait by lock and outcome.";
     CollectorAvailable: Gauge, "collector_available", "Whether a collector has a complete successful observation.";
@@ -116,6 +117,7 @@ impl Family {
             self,
             Self::Candidates
                 | Self::CandidateAge
+                | Self::PartitionLead
                 | Self::Rss
                 | Self::CollectorAvailable
                 | Self::CollectorSuccess

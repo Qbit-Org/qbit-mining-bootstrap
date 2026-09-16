@@ -30,8 +30,11 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:
 /// every row the offer lifecycle (migration 011) has not finished, pending
-/// and offered-but-not-landed alike. No share-table scan, candidate JSON
-/// decode, or accounting lock.
+/// and offered-but-not-landed alike, and the attached share ledger partition
+/// headroom the maintenance task keeps ahead of the sequence (#144). Both are
+/// catalog-sized reads: no share-table scan, candidate JSON decode, or
+/// accounting lock. They share one snapshot, so a failure of either leaves
+/// every sample of this collector unknown rather than half fresh.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
@@ -43,7 +46,10 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
             "SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered','reconciliation')"
         ).fetch_one(&mut *tx).await?;
-        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)? };
+        let partition_lead_rows: Option<i64> = sqlx::query_scalar(
+            "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"
+        ).fetch_one(&mut *tx).await?;
+        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, partition_lead_rows };
         tx.commit().await?;
         Ok::<_, anyhow::Error>(snapshot)
     }).await.context("metrics database collection deadline exceeded")?

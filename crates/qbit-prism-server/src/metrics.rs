@@ -68,6 +68,7 @@ impl Metrics {
             Family::Coverage,
             Family::Candidates,
             Family::CandidateAge,
+            Family::PartitionLead,
             Family::Rss,
             Family::ConnectionLimit,
         ] {

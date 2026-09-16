@@ -453,6 +453,64 @@ impl Ledger {
             }
             None => None,
         };
+        // The copy the retry below would need: `append_in` takes the share by
+        // value, and six short string allocations against a round trip to
+        // PostgreSQL is the whole price of keeping a refused append
+        // recoverable.
+        let retry_share = share.clone();
+        let attempt = self
+            .append_prepared(share, prepared.as_ref(), expected_revision, pre_commit)
+            .await;
+        // The ledger is partitioned on `share_seq` with no DEFAULT partition
+        // (migration 016): once the sequence runs past the last attached
+        // bound, the INSERT is refused with SQLSTATE 23514, "no partition of
+        // relation ... found for row". That refusal is definite and total. It
+        // is raised by the ledger INSERT itself, inside the transaction
+        // `append_prepared` opened, and that transaction is rolled back with
+        // the share, the clock update, the hash row and any prepared
+        // candidate bytes undone together, so nothing of the attempt
+        // survives it. [`crate::partitions::run`] should have kept the lead
+        // attached; where it has not, a miner's share is not the place to
+        // lose the work. Attach the lead on a fresh pool connection and run
+        // the whole attempt again, exactly once. Any other error, and a
+        // second failure of any kind, is returned unchanged: reconcile,
+        // never repeat.
+        //
+        // `pre_commit` is still called at most once. It runs only after every
+        // statement of an attempt has succeeded, which an attempt refused by
+        // 23514 never reaches.
+        let Err(error) = attempt else { return attempt };
+        if !refused_for_want_of_a_partition(&error) {
+            return Err(error);
+        }
+        let created = crate::partitions::ensure(&self.pool).await.context(
+            "the share ledger has no partition for the next share_seq and attaching the partition lead failed; run qbit_prism_share_partition_ensure() against the primary",
+        )?;
+        tracing::warn!(
+            created,
+            %error,
+            "share append found no partition for its sequence; attached the partition lead and retried"
+        );
+        self.append_prepared(
+            retry_share,
+            prepared.as_ref(),
+            expected_revision,
+            pre_commit,
+        )
+        .await
+    }
+
+    /// One complete attempt of [`Ledger::append_checked`], from BEGIN to
+    /// COMMIT. Runs the share append, the prepared candidate persistence and
+    /// the pre-commit gate under one `ORDER_LOCK`; every path out of it has
+    /// either committed or rolled the transaction back.
+    async fn append_prepared(
+        &self,
+        share: AcceptedShare,
+        prepared: Option<&super::candidates::PreparedCandidate>,
+        expected_revision: Option<i64>,
+        pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<AppendResult> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
@@ -464,7 +522,7 @@ impl Ledger {
             );
         }
         let result = self.append_in(&mut tx, share).await?;
-        if let Some(prepared) = &prepared {
+        if let Some(prepared) = prepared {
             self.persist_prepared_candidate(&mut tx, prepared, Some(&result.share.share_id))
                 .await?;
         }
@@ -1053,6 +1111,25 @@ impl WindowRead {
 #[cfg(test)]
 #[path = "window/reference_tests.rs"]
 mod reference_tests;
+
+/// Whether `error` is PostgreSQL refusing a row because the partitioned share
+/// ledger has no partition for its `share_seq`.
+///
+/// SQLSTATE 23514 is `check_violation`, which the ledger also raises for its
+/// own CHECK constraints (a bad `credit_policy`, a leaf's bound), so the
+/// message is part of the identification: only the routing failure names the
+/// missing partition, and only it is repaired by attaching the lead.
+fn refused_for_want_of_a_partition(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(|database| {
+                database.code().as_deref() == Some("23514")
+                    && database.message().contains("no partition of relation")
+            })
+    })
+}
 
 fn share_header_hash(share_id: &str) -> String {
     if let Some(suffix) = share_id.get(share_id.len().saturating_sub(64)..) {

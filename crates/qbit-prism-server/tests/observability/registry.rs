@@ -455,6 +455,7 @@ fn pending_candidate_count_and_age_move_together_without_database_prerequisites(
     metrics.publish_database(Some(metrics::DatabaseMetrics {
         candidates: 2,
         candidate_oldest: Duration::from_secs(5),
+        partition_lead_rows: Some(67_108_864),
     }));
     let body = metrics.render();
     assert_eq!(sample(&body, "qbit_prism_block_candidates_pending"), 2.);
@@ -462,11 +463,21 @@ fn pending_candidate_count_and_age_move_together_without_database_prerequisites(
         sample(&body, "qbit_prism_block_candidate_oldest_pending_seconds"),
         5.
     );
+    assert_eq!(
+        sample(&body, "qbit_prism_share_ledger_partition_lead_rows"),
+        67_108_864.
+    );
     metrics.publish_database(Some(metrics::DatabaseMetrics::default()));
     let body = metrics.render();
     assert_eq!(sample(&body, "qbit_prism_block_candidates_pending"), 0.);
     assert_eq!(
         sample(&body, "qbit_prism_block_candidate_oldest_pending_seconds"),
         0.
+    );
+    // An unpartitioned ledger has no lead to report, and a successful
+    // collection must not turn that into exhausted headroom.
+    assert_eq!(
+        sample(&body, "qbit_prism_share_ledger_partition_lead_rows"),
+        -1.
     );
 }

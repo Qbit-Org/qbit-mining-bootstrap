@@ -14,6 +14,11 @@ pub struct ProcessMetrics {
 pub struct DatabaseMetrics {
     pub candidates: u64,
     pub candidate_oldest: Duration,
+    /// Rows of attached share ledger partition headroom above the next
+    /// `share_seq`, or `None` where the ledger is not partitioned yet. An
+    /// absent lead is not a zero lead: the sample is left at its unknown
+    /// value rather than reported as exhausted headroom.
+    pub partition_lead_rows: Option<i64>,
 }
 
 impl Metrics {
@@ -163,6 +168,11 @@ impl Collection<'_> {
                         vec![],
                         snapshot.candidate_oldest.as_secs_f64(),
                     );
+                    registry.set(
+                        Family::PartitionLead,
+                        vec![],
+                        snapshot.partition_lead_rows.map_or(-1., |rows| rows as f64),
+                    );
                 }
             },
         );
@@ -217,7 +227,11 @@ pub(super) fn invalidate(registry: &mut Registry, collector: Collector) {
         0.,
     );
     let families: &[Family] = match collector {
-        Collector::Database => &[Family::Candidates, Family::CandidateAge],
+        Collector::Database => &[
+            Family::Candidates,
+            Family::CandidateAge,
+            Family::PartitionLead,
+        ],
         Collector::Process => &[Family::Rss],
     };
     for family in families {
@@ -297,6 +311,7 @@ mod tests {
         newer.publish_database(Some(DatabaseMetrics {
             candidates: 2,
             candidate_oldest: Duration::from_secs(7),
+            partition_lead_rows: Some(64),
         }));
         old.publish_database(Some(DatabaseMetrics::default()));
         assert_eq!(

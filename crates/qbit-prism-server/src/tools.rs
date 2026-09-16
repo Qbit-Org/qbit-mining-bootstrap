@@ -127,6 +127,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             config::check_environment()?;
             let config = Config::from_env()?;
             crate::rollups::settings_from_env()?;
+            crate::partitions::settings_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
             crate::api::ApiConfig::from_env()?;
             crate::api::public_service::ServiceConfig::from_env()?;
