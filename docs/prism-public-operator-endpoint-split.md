@@ -30,6 +30,7 @@ database names, hostnames, addresses, or server-provided SQL identifiers:
 | Configuration | `database connection configuration is invalid` | Public-reader connection configuration |
 | Schema | `native public read schema is incomplete` | Schema migrations and public-reader `search_path` |
 | Timeout | `database probe timed out` | Database load, pool availability, probe query latency |
+| Cancellation | `database readiness query was canceled` | Database statement deadlines and operator query cancellations |
 | Other query/driver failure | `database readiness query failed` | Database service logs and readiness query compatibility |
 
 The public process emits a `public readiness probe failed` warning for failed
@@ -37,8 +38,12 @@ database probes, with fixed `category`, `phase` (`schema`, `replica`, or `probe`
 for the whole-probe timeout), and `action` fields. Enable warnings for
 `qbit_prism_server::api::public_service` in `RUST_LOG` to collect these operator
 diagnostics. Classification uses SQLx variants and recognized SQLSTATE values;
-unknown errors remain failures without guessing their cause. Cancellation is
-not automatically labeled a timeout. The warning does not format the raw error,
+unknown errors remain failures without guessing their cause. PostgreSQL reports
+both an expired `statement_timeout` and an operator cancellation as SQLSTATE
+`57014`; both use the cancellation category with deadline/cancellation guidance.
+If the whole-probe timer wins instead, the category is timeout. These labels
+describe the observed failure, not a guess based on localized driver text.
+The warning does not format the raw error,
 its source chain, or even an unrecognized SQLSTATE. Consult access-controlled
 database logs and deployment configuration for detailed investigation; do not
 publish those sources or enable verbose driver logging on a public diagnostics

@@ -112,6 +112,7 @@ enum ProbeFailure {
     Configuration,
     Schema,
     Timeout,
+    Canceled,
     Readiness,
 }
 impl ProbeFailure {
@@ -125,7 +126,10 @@ impl ProbeFailure {
                     "08000" | "08001" | "08003" | "08004" | "08006" | "08007" | "08P01" | "53300"
                     | "57P01" | "57P02" | "57P03" | "3D000",
                 ) => Self::Connection,
-                // Cancellation need not be a timeout (an operator may cancel).
+                // PostgreSQL uses the same code for statement_timeout and an
+                // operator cancellation; neither the code nor the probe phase
+                // proves which happened. Do not inspect localized driver text.
+                Some("57014") => Self::Canceled,
                 _ => Self::Readiness,
             },
             sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed => Self::Connection,
@@ -143,6 +147,7 @@ impl ProbeFailure {
             Self::Configuration => "configuration",
             Self::Schema => "schema",
             Self::Timeout => "timeout",
+            Self::Canceled => "cancellation",
             Self::Readiness => "readiness",
         }
     }
@@ -155,6 +160,7 @@ impl ProbeFailure {
             Self::Configuration => "database connection configuration is invalid",
             Self::Schema => "native public read schema is incomplete",
             Self::Timeout => "database probe timed out",
+            Self::Canceled => "database readiness query was canceled",
             Self::Readiness => "database readiness query failed",
         }
     }
@@ -171,6 +177,7 @@ impl ProbeFailure {
             Self::Configuration => "check public-reader connection configuration",
             Self::Schema => "check schema migrations and public-reader search_path",
             Self::Timeout => "check database load, pool availability, and probe query latency",
+            Self::Canceled => "check database statement deadlines and operator query cancellations",
             Self::Readiness => "check database service logs and readiness query compatibility",
         }
     }
@@ -651,6 +658,7 @@ mod tests {
             error.as_database_error().and_then(|e| e.code()).as_deref(),
             Some("57014")
         );
+        assert_eq!(ProbeFailure::from_sqlx(&error), ProbeFailure::Canceled);
         assert!(
             started.elapsed() < Duration::from_millis(850),
             "second query received a fresh budget"

@@ -114,7 +114,11 @@ async fn database_failures_are_categorized_without_public_or_operator_secrets() 
         ("42P01", "schema", "native public read schema is incomplete"),
         ("42703", "schema", "native public read schema is incomplete"),
         ("3F000", "schema", "native public read schema is incomplete"),
-        ("57014", "readiness", "database readiness query failed"),
+        (
+            "57014",
+            "cancellation",
+            "database readiness query was canceled",
+        ),
         ("XX000", "readiness", "database readiness query failed"),
         // Even an unrecognized SQLSTATE must never be copied into diagnostics.
         (
@@ -148,6 +152,9 @@ async fn database_failures_are_categorized_without_public_or_operator_secrets() 
         assert!(logs.contains(&format!("category=\"{category}\"")), "{logs}");
         assert!(logs.contains("phase=\"schema\""), "{logs}");
         assert!(logs.contains("action=\"check "), "{logs}");
+        if code == "57014" {
+            assert!(logs.contains("statement deadlines and operator query cancellations"));
+        }
         assert_private_absent(&logs);
         service.pool.close().await;
     }
