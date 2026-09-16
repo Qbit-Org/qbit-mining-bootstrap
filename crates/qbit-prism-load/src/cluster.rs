@@ -16,8 +16,48 @@ use std::{
 
 pub const STANDBY_NAME: &str = "prism_standby_1";
 pub const STANDBY_SLOT: &str = "prism_standby_1_slot";
-/// The primary-side synchronous setting D3 flips on.
+/// The primary-side synchronous setting D3 flips on: the managed cluster's
+/// default, priority-based, under which the standby reports `sync`.
 pub const SYNCHRONOUS_NAMES: &str = "FIRST 1 (prism_standby_1)";
+/// The quorum-based form of the same setting, under which the standby
+/// reports `quorum`. Only a test that needs the second topology asks for it.
+pub const QUORUM_SYNCHRONOUS_NAMES: &str = "ANY 1 (prism_standby_1)";
+
+/// How the primary names its synchronous standby.
+///
+/// PostgreSQL reports a standby differently under the two forms of
+/// `synchronous_standby_names`: a member of a `FIRST n` set is `sync`, and a
+/// candidate of an `ANY n` set is `quorum`. Both are synchronous, and
+/// [`classify_replication`] reads them the same way. The managed cluster
+/// uses `FIRST` unless told otherwise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynchronousMethod {
+    /// `FIRST 1 (prism_standby_1)`: priority-based, the standby reports `sync`.
+    #[default]
+    First,
+    /// `ANY 1 (prism_standby_1)`: quorum-based, the standby reports `quorum`.
+    Any,
+}
+
+impl SynchronousMethod {
+    /// The `synchronous_standby_names` value the primary is given.
+    pub const fn standby_names(self) -> &'static str {
+        match self {
+            Self::First => SYNCHRONOUS_NAMES,
+            Self::Any => QUORUM_SYNCHRONOUS_NAMES,
+        }
+    }
+
+    /// The `sync_state` PostgreSQL reports for the standby once the setting
+    /// has applied, which is what the managed cluster waits for.
+    pub const fn standby_sync_state(self) -> &'static str {
+        match self {
+            Self::First => "sync",
+            Self::Any => "quorum",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +205,8 @@ impl ObservedReplication {
 /// flag, and never guessed: a `pg_stat_replication` that cannot be read, or
 /// whose rows hide `sync_state` from this role, is `Unknown` with the
 /// reason rather than `none` in one direction or `async` in the other.
+///
+/// The read is here; what the rows mean is [`classify_replication`].
 pub async fn detect_replication(pool: &PgPool) -> ObservedReplication {
     let states: std::result::Result<Vec<Option<String>>, sqlx::Error> =
         sqlx::query_scalar("SELECT sync_state FROM pg_stat_replication")
@@ -174,28 +216,75 @@ pub async fn detect_replication(pool: &PgPool) -> ObservedReplication {
         Err(error) => ObservedReplication::Unknown {
             reason: format!("pg_stat_replication could not be read: {error}"),
         },
-        Ok(states) if states.is_empty() => ObservedReplication::Observed {
+        Ok(states) => classify_replication(&states),
+    }
+}
+
+/// The `sync_state` values PostgreSQL 16 reports for a synchronous standby:
+/// `sync` for a member of a `FIRST n` set and `quorum` for a candidate of an
+/// `ANY n` set. A commit waits on either.
+pub const SYNCHRONOUS_SYNC_STATES: [&str; 2] = ["sync", "quorum"];
+
+/// What one `sync_state` column per `pg_stat_replication` row says about the
+/// cluster, as [`detect_replication`] reads it. Pure, so every shape of the
+/// view is testable without a database.
+///
+/// PostgreSQL 16's `sync_state` takes four values: `async`, `potential`,
+/// `quorum` and `sync`. The arms, in order:
+///
+/// 1. No rows: no standby, `Observed(None)`.
+/// 2. Any row whose state is null: `Unknown`. PostgreSQL shows a role
+///    without `pg_read_all_stats` the rows but not their state columns, so a
+///    standby exists and whether it is synchronous cannot be told. This arm
+///    has to stay above the next one: a hidden state beside a visible one
+///    could be anything, and letting a visible `sync` decide would report a
+///    mode the harness has not observed.
+/// 3. Any row `sync` or `quorum` ([`SYNCHRONOUS_SYNC_STATES`]):
+///    `Observed(Sync)`. A commit waits on the synchronous set, and an
+///    additional asynchronous standby beside it does not make the cluster
+///    asynchronous, so one synchronous row is enough (`any` semantics, as
+///    PostgreSQL itself applies them). `quorum` is what an external cluster
+///    with `synchronous_standby_names = 'ANY n (...)'` reports; before it was
+///    recognized, a correct `--replication sync` run against such a cluster
+///    was refused as a contradicted premise, and a `--replication async` run
+///    was accepted for a cluster that is synchronous.
+/// 4. Otherwise `Observed(Async)`.
+///
+/// `potential` is deliberately not synchronous. Under `FIRST n`, a
+/// `potential` standby is one that would be promoted into the synchronous
+/// set if a current member left, but is not in it now: no commit is waiting
+/// on it. Accepting it would refuse a correctly configured
+/// `--replication async` run at the premise check (exit 8), and would let a
+/// `--replication sync` claim pass on a cluster where nothing is actually
+/// synchronous. A value outside the four-value domain falls through to
+/// `Async` as it always has (EP-VALIDATION).
+pub fn classify_replication(states: &[Option<String>]) -> ObservedReplication {
+    if states.is_empty() {
+        return ObservedReplication::Observed {
             mode: Replication::None,
-        },
-        // PostgreSQL shows a role without pg_read_all_stats the rows but not
-        // their state columns: a standby exists, and whether it is
-        // synchronous cannot be told.
-        Ok(states) if states.iter().any(Option::is_none) => ObservedReplication::Unknown {
+        };
+    }
+    if states.iter().any(Option::is_none) {
+        return ObservedReplication::Unknown {
             reason: format!(
                 "{} pg_stat_replication row(s) are visible but their sync_state is null, \
                  which PostgreSQL shows a role without pg_read_all_stats: a standby exists \
                  and whether it is synchronous cannot be told",
                 states.len()
             ),
-        },
-        Ok(states) if states.iter().any(|state| state.as_deref() == Some("sync")) => {
-            ObservedReplication::Observed {
-                mode: Replication::Sync,
-            }
-        }
-        Ok(_) => ObservedReplication::Observed {
-            mode: Replication::Async,
-        },
+        };
+    }
+    if states.iter().any(|state| {
+        state
+            .as_deref()
+            .is_some_and(|state| SYNCHRONOUS_SYNC_STATES.contains(&state))
+    }) {
+        return ObservedReplication::Observed {
+            mode: Replication::Sync,
+        };
+    }
+    ObservedReplication::Observed {
+        mode: Replication::Async,
     }
 }
 
@@ -292,6 +381,8 @@ pub struct ManagedPostgres {
     pub standby_url: Option<String>,
     pub standby_port: Option<u16>,
     pub replication: Replication,
+    /// How the primary names the standby when the mode is synchronous.
+    pub synchronous_method: SynchronousMethod,
     pub pg_stat_statements: Option<String>,
     pub bin_dir: PathBuf,
     /// Dropped after `stop`, which is what removes the directory.
@@ -378,12 +469,33 @@ fn pkglibdir(bin: &Path) -> Option<PathBuf> {
 }
 
 impl ManagedPostgres {
-    /// Start the primary, then the standby the mode asks for.
+    /// Start the primary, then the standby the mode asks for. A synchronous
+    /// standby is named with `FIRST 1`, the managed cluster's default.
     pub async fn start(
         bin_dir: PathBuf,
         replication: Replication,
         max_connections: u32,
         keep_artifacts: bool,
+    ) -> Result<Self> {
+        Self::start_with_method(
+            bin_dir,
+            replication,
+            max_connections,
+            keep_artifacts,
+            SynchronousMethod::First,
+        )
+        .await
+    }
+
+    /// [`start`](Self::start), naming a synchronous standby with the given
+    /// method. `ANY 1` exists so a test can verify the quorum topology an
+    /// external cluster may use; the harness itself runs `FIRST 1`.
+    pub async fn start_with_method(
+        bin_dir: PathBuf,
+        replication: Replication,
+        max_connections: u32,
+        keep_artifacts: bool,
+        synchronous_method: SynchronousMethod,
     ) -> Result<Self> {
         let root = TempRoot::create(keep_artifacts)?;
         let user = current_user()?;
@@ -429,6 +541,7 @@ impl ManagedPostgres {
             standby_url: None,
             standby_port: None,
             replication,
+            synchronous_method,
             pg_stat_statements: preload.clone().map(|_| "loaded".to_owned()),
             bin_dir: bin_dir.clone(),
             root,
@@ -521,26 +634,37 @@ impl ManagedPostgres {
         .await
         .context("standby never reached state='streaming'")?;
         if self.replication == Replication::Sync {
+            let method = self.synchronous_method;
             sqlx::query(&format!(
-                "ALTER SYSTEM SET synchronous_standby_names = '{SYNCHRONOUS_NAMES}'"
+                "ALTER SYSTEM SET synchronous_standby_names = '{}'",
+                method.standby_names()
             ))
             .execute(&admin)
             .await?;
             sqlx::query("SELECT pg_reload_conf()")
                 .execute(&admin)
                 .await?;
+            // The wait is for the one state the method produces, `sync`
+            // under `FIRST` and `quorum` under `ANY`, not for either: a
+            // cluster that reached the other would be misconfigured.
             wait_for(Duration::from_secs(60), || async {
                 sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM pg_stat_replication \
-                     WHERE application_name=$1 AND sync_state='sync')",
+                     WHERE application_name=$1 AND sync_state=$2)",
                 )
                 .bind(STANDBY_NAME)
+                .bind(method.standby_sync_state())
                 .fetch_one(&admin)
                 .await
                 .unwrap_or(false)
             })
             .await
-            .context("standby never reached sync_state='sync'")?;
+            .with_context(|| {
+                format!(
+                    "standby never reached sync_state='{}'",
+                    method.standby_sync_state()
+                )
+            })?;
         }
         admin.close().await;
         Ok(())
