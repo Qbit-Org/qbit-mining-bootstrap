@@ -318,9 +318,9 @@ async fn land_block(ledger: &Ledger, nonce: u32) -> Result<Landed> {
         .claim_candidate(60)
         .await?
         .context("no pending candidate to claim")?;
-    ledger
-        .land_candidate(&claim.with_bundle(bundle), &ledger_public_key())
-        .await?;
+    let claim = claim.with_bundle(bundle);
+    ledger.land_candidate(&claim, &ledger_public_key()).await?;
+    ledger.finish_candidate(&claim, true, None).await?;
     ledger.append(share(2), None).await?;
     Ok(Landed {
         block_hash,
@@ -834,6 +834,82 @@ async fn plan_names_each_blocker_and_separates_unknown_from_clear() -> Result<()
         ensure!(
             landed.audit_bundle_sha256.len() == 64,
             "the landed artifact has no digest"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+#[tokio::test]
+async fn unfinished_candidate_window_pins_an_earlier_partition() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("window-pin-a").await?;
+        insert_shares(&ledger.pool, 1, 120, 7, "server-a", 7200.0).await?;
+        set_sequence(&ledger.pool, 120).await?;
+        let snapshot = ledger.snapshot(100).await?;
+        let (coinbase_key, ledger_key) = keys();
+        let bundle = build_audit_bundle(
+            snapshot.shares.clone(),
+            FoundBlock {
+                block_height: 102,
+                coinbase_value_sats: 500_000_000,
+                network_difficulty: 100,
+                anchor_job_issued_at_ms: snapshot.anchor_ms,
+            },
+            snapshot.prior_balances.clone(),
+            PayoutPolicy::day_one_default(),
+            &coinbase_key,
+            &ledger_key,
+        )?;
+        let pending = candidate_with_bundle(
+            &bundle,
+            WindowRef::from_snapshot(&snapshot)?,
+            snapshot.payout_revision,
+            1443,
+        )?;
+        let pending_hash = pending.block_hash.clone();
+        ledger.enqueue_candidate(pending).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        // The solving share belongs to p1, but recovery still reads the
+        // persisted payout window from p0 after the online horizon moves on.
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET share_id=(SELECT share_id FROM qbit_share_ledger WHERE share_seq=$2) WHERE block_hash=$1")
+            .bind(&pending_hash)
+            .bind(p0_upper)
+            .execute(&ledger.pool)
+            .await?;
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        let p0 = entry(&report, P0);
+        let references = condition(p0, "pending_references");
+        ensure!(
+            references.status == "blocked"
+                && references.detail.contains("1 unfinished block candidate")
+                && p0.blockers.len() == 1,
+            "the candidate's earlier payout window did not pin p0: {p0:?}"
+        );
+
+        // Move the whole window without changing its count. With neither
+        // the solving share nor the window in p0, this candidate releases it.
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET window_first_share_seq=window_first_share_seq+$2,window_last_share_seq=window_last_share_seq+$2 WHERE block_hash=$1")
+            .bind(&pending_hash)
+            .bind(p0_upper)
+            .execute(&ledger.pool)
+            .await?;
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        let p0 = entry(&report, P0);
+        ensure!(
+            condition(p0, "pending_references").status == "clear" && p0.eligible,
+            "a non-overlapping candidate window still pinned p0: {p0:?}"
         );
         Ok(ledger)
     }

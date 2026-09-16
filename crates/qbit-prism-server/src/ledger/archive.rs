@@ -832,16 +832,22 @@ async fn intersecting_audits(
 /// index, one descent per referencing row.
 async fn pending_references(
     connection: &mut PgConnection,
-    partition_name: &str,
+    record: &PartitionRecord,
 ) -> Result<(i64, i64)> {
     let row = sqlx::query(&format!(
         "SELECT (SELECT count(*)::bigint FROM qbit_block_candidate_outbox o \
-           WHERE o.state IN {states} AND o.share_id IS NOT NULL \
-             AND EXISTS(SELECT 1 FROM {partition_name} p WHERE p.share_id=o.share_id)) AS outbox,\
+           WHERE o.state IN {states} \
+             AND (EXISTS(SELECT 1 FROM {partition_name} p WHERE p.share_id=o.share_id) \
+               OR (o.window_first_share_seq IS NOT NULL AND o.window_last_share_seq IS NOT NULL \
+                 AND o.window_first_share_seq<$1 \
+                 AND o.window_last_share_seq>=COALESCE($2,o.window_first_share_seq)))) AS outbox,\
          (SELECT count(*)::bigint FROM qbit_prism_deferred_shares d \
            WHERE EXISTS(SELECT 1 FROM {partition_name} p WHERE p.share_id=d.share->>'share_id')) AS deferred",
+        partition_name = record.partition_name,
         states = crate::ledger::CandidateState::UNFINISHED_SQL,
     ))
+    .bind(record.upper_seq)
+    .bind(record.lower_seq)
     .fetch_one(&mut *connection)
     .await?;
     Ok((row.try_get("outbox")?, row.try_get("deferred")?))
@@ -1230,18 +1236,17 @@ async fn partition_plan(
             )
         });
 
-        let (outbox, deferred) =
-            pending_references(&mut *connection, &record.partition_name).await?;
+        let (outbox, deferred) = pending_references(connection, &record).await?;
         conditions.push(if outbox == 0 && deferred == 0 {
             Condition::clear(
                 "pending_references",
-                "no unfinished block candidate and no deferred share names a share_id in this partition",
+                "no unfinished block candidates name a share_id in this partition or read their payout window from it, and no deferred shares name a share_id in it",
             )
         } else {
             Condition::blocked(
                 "pending_references",
                 format!(
-                    "{outbox} unfinished block candidate(s) and {deferred} deferred share(s) name a share_id in this partition; let the outbox finish or reconcile it first"
+                    "{outbox} unfinished block candidate(s) name a share_id in this partition or read their payout window from it, and {deferred} deferred share(s) name a share_id in it; let the outbox finish or reconcile it first"
                 ),
             )
         });
