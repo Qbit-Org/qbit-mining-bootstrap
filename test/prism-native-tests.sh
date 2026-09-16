@@ -71,6 +71,17 @@ if [[ -z "${PRISM_TEST_DATABASE_URL:-}" ]]; then
     exit 1
   }
   "${prism_pg_bin}/initdb" -D "${prism_test_tmp}/data" -A trust --no-locale -E UTF8 > "${prism_test_tmp}/initdb.log"
+  # `initdb -A trust` admits any reader credential over TCP, valid or not, so a
+  # test whose subject is authentication fails. Keep trust for the bootstrap
+  # role that creates the fixtures; require SCRAM of every other TCP role.
+  prism_test_user="$(id -un)"
+  cat > "${prism_test_tmp}/data/pg_hba.conf" <<EOF
+local   all             all                                     trust
+host    all             "${prism_test_user}"    127.0.0.1/32    trust
+host    all             "${prism_test_user}"    ::1/128         trust
+host    all             all                     127.0.0.1/32    scram-sha-256
+host    all             all                     ::1/128         scram-sha-256
+EOF
   # A private socket directory and random loopback port avoid production DBs.
   started=0
   for _ in 1 2 3 4 5; do
@@ -83,7 +94,6 @@ if [[ -z "${PRISM_TEST_DATABASE_URL:-}" ]]; then
     fi
   done
   [[ "${started}" == 1 ]] || { cat "${prism_test_tmp}/postgres.log" >&2; exit 1; }
-  prism_test_user="$(id -un)"
   export PRISM_TEST_DATABASE_URL="postgresql://${prism_test_user}@127.0.0.1:${prism_test_port}/postgres"
 fi
 

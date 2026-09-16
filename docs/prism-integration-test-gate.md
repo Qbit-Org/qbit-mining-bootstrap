@@ -147,6 +147,13 @@ why both the native matrix and its combined proof are in the required
 
 ## Running locally
 
+The public-reader credential tests require PostgreSQL to reject missing or
+incorrect passwords for their temporary reader roles. A supplied
+`PRISM_TEST_DATABASE_URL` must point to a disposable cluster that enforces
+password authentication for those roles; an unrestricted TCP `trust` rule
+invalidates these tests. The runner configures this for clusters it creates,
+while allowing its bootstrap role to connect without a password for setup.
+
 `test/prism-native-tests.sh` provisions a private PostgreSQL cluster (or uses
 `PRISM_TEST_DATABASE_URL`), resolves `PRISM_TEST_PG_BIN_DIR` and `QBITD_BIN`,
 and exports the switch once every input a mode needs is present, so a local
