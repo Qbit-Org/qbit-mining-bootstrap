@@ -160,16 +160,18 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
     """Run the actual merged public service, image entrypoint and HTTP probe."""
 
     @classmethod
-    def command(cls, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(args, cwd=ROOT, env=fixture_env(), text=True,
-                              capture_output=True, check=check, timeout=180)
+    def command(cls, *args: str, check: bool = True, input: str | None = None,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(args, cwd=ROOT, env=fixture_env(**(env or {})), text=True,
+                              input=input, capture_output=True, check=check, timeout=180)
 
     @classmethod
     def sql(cls, query: str, *, reader: bool = False, check: bool = True) -> subprocess.CompletedProcess:
         return cls.command(
-            "docker", "exec", "--env", f"PGPASSWORD={READER_PASSWORD if reader else BOOTSTRAP_PASSWORD}",
+            "docker", "exec", "-i", "--env", "PGPASSWORD",
             cls.primary, "psql", "-h", "127.0.0.1", "-U", "prism_reader" if reader else "prism_bootstrap",
-            "-d", "prism_fixture", "-v", "ON_ERROR_STOP=1", "-Atc", query, check=check,
+            "-d", "prism_fixture", "-v", "ON_ERROR_STOP=1", "-Atf", "-", input=query, check=check,
+            env={"PGPASSWORD": READER_PASSWORD if reader else BOOTSTRAP_PASSWORD},
         )
 
     @classmethod
@@ -186,8 +188,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         cls.command(
             "docker", "run", "-d", "--name", cls.primary, "--network", cls.network,
             "--network-alias", "prism-postgres", "--env", "POSTGRES_USER=prism_bootstrap",
-            "--env", f"POSTGRES_PASSWORD={BOOTSTRAP_PASSWORD}", "--env", "POSTGRES_DB=prism_fixture",
+            "--env", "POSTGRES_PASSWORD", "--env", "POSTGRES_DB=prism_fixture",
             "--env", "POSTGRES_HOST_AUTH_METHOD=scram-sha-256", "postgres:16",
+            env={"POSTGRES_PASSWORD": BOOTSTRAP_PASSWORD},
         )
         for _ in range(60):
             if cls.sql("SELECT 1", check=False).returncode == 0:
@@ -196,7 +199,8 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         else:
             raise AssertionError("disposable PostgreSQL did not become ready")
         cls.command("docker", "run", "--rm", "--network", cls.network, "--no-healthcheck",
-                    "--env", f"PRISM_DATABASE_URL={WRITER_URL}", cls.image, "qbit-prism-server", "migrate")
+                    "--env", "PRISM_DATABASE_URL", cls.image, "qbit-prism-server", "migrate",
+                    env={"PRISM_DATABASE_URL": WRITER_URL})
         cls.sql(f"""
             CREATE ROLE prism_reader LOGIN PASSWORD '{READER_PASSWORD}'
                 NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -207,6 +211,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             CREATE ROLE prism_literal_reader LOGIN PASSWORD '{LITERAL_PASSWORD.replace("'", "''")}'
                 NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
             GRANT prism_reader TO prism_literal_reader;
+            CREATE ROLE qbit LOGIN PASSWORD 'change-this'
+                NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+            GRANT prism_reader TO qbit;
         """)
         # Use the shipped standby entrypoint against a disposable primary only.
         cls.command("docker", "exec", cls.primary, "sh", "-c",
@@ -215,7 +222,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         cls.command(
             "docker", "run", "-d", "--name", cls.replica, "--network", cls.network,
             "--network-alias", "prism-postgres-replica", "--env", "PRISM_POSTGRES_USER=prism_bootstrap",
-            "--env", f"PRISM_POSTGRES_PASSWORD={BOOTSTRAP_PASSWORD}", "--env", "PRISM_POSTGRES_DB=prism_fixture",
+            "--env", "PRISM_POSTGRES_PASSWORD", "--env", "PRISM_POSTGRES_DB=prism_fixture",
             "--volume", f"{ROOT / 'config/prism-postgres/replica-entrypoint.sh'}:/replica-entrypoint.sh:ro",
             "--entrypoint", "bash", "postgres:16", "/replica-entrypoint.sh",
         )
@@ -260,6 +267,58 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("PGPASSWORD=") for item in json.loads(config)["Env"]))
         return json.loads(config)
 
+    def preflight(self, stack: tuple[str, ...], *, env_file: Path | None = None,
+                  **overrides: str) -> subprocess.CompletedProcess:
+        # The actual shell preflight runs the public image with the same merged
+        # service environment. Place its one-shot container on our disposable
+        # network; no production services, volumes or ports are started.
+        with tempfile.TemporaryDirectory(prefix="prism-reader-preflight-") as directory:
+            fixture_root = Path(directory)
+            (fixture_root / "scripts").mkdir()
+            (fixture_root / "config").mkdir()
+            for source, destination in (
+                (ROOT / "scripts/check-env.sh", fixture_root / "scripts/check-env.sh"),
+                (ROOT / ".env.example", fixture_root / ".env.example"),
+                (ROOT / "config/upstream.env.example", fixture_root / "config/upstream.env.example"),
+                (ROOT / "compose.yaml", fixture_root / "compose.yaml"),
+            ):
+                shutil.copyfile(source, destination)
+            overlay = fixture_root / "placement.yaml"
+            overlay.write_text(
+                "services:\n  prism-public-api:\n    networks: !override [fixture]\n"
+                "networks:\n  fixture:\n    external: true\n"
+                f"    name: {self.network}\n", encoding="utf-8")
+            args = ["bash", str(fixture_root / "scripts/check-env.sh"), "--public-reader-only"]
+            for name in (*stack, str(overlay)):
+                args.extend(("--compose-file", str(ROOT / name)))
+            if env_file:
+                overrides["DEPLOY_ENV_FILE"] = str(env_file)
+            result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, timeout=60,
+                                    env=fixture_env(production="compose.production.yaml" in stack,
+                                                    **{"PRISM_COORDINATOR_IMAGE": self.image,
+                                                       "COMPOSE_PROJECT_NAME": self.project, **overrides}))
+        diagnostics = result.stdout + result.stderr
+        for credential in (BOOTSTRAP_PASSWORD, READER_PASSWORD, LITERAL_PASSWORD, "fixture-bad-reader",
+                           "change-this", "ch%61nge-this"):
+            self.assertFalse(credential in diagnostics, "preflight exposed a credential")
+        return result
+
+    def assert_config_exit(self, expected: str) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = json.loads(self.command("docker", "inspect", "--format", "{{json .State}}", self.public).stdout)
+            if not state["Running"]:
+                self.assertNotEqual(state["ExitCode"], 0)
+                logs = self.command("docker", "logs", self.public)
+                diagnostics = logs.stdout + logs.stderr
+                for credential in (BOOTSTRAP_PASSWORD, READER_PASSWORD, LITERAL_PASSWORD, "change-this",
+                                   "ch%61nge-this", "fixture-secret"):
+                    self.assertFalse(credential in diagnostics, "startup exposed a credential")
+                self.assertTrue(expected in diagnostics, "missing configuration diagnostic")
+                return
+            time.sleep(0.1)
+        self.fail("invalid configuration reached service startup instead of exiting")
+
     def response(self, path: str) -> tuple[int, dict]:
         result = self.command("docker", "exec", self.public, "curl", "--silent", "--show-error",
                               "--max-time", "2", "--write-out", "\n%{http_code}",
@@ -277,14 +336,15 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             except subprocess.CalledProcessError:
                 pass
             if time.monotonic() >= deadline:
-                logs = self.command("docker", "logs", "--tail", "40", self.public, check=False)
-                self.fail(f"synthetic public listener did not report readiness within 30 seconds:\n"
-                          f"{logs.stdout}{logs.stderr}")
+                self.fail("synthetic public listener did not report readiness within 30 seconds")
             time.sleep(0.25)
         self.assertEqual(status, 200 if healthy else 503, body)
         self.assertIs(body["ok"], healthy, body)
         self.assertIs(body["database_ready"], healthy, body)
-        if not healthy:
+        # In require mode the existing replica guard may report warming up
+        # after authentication prevented its first snapshot. Keep those public
+        # failure-message semantics with the readiness/redaction owner.
+        if not healthy and "replica" not in body:
             self.assertIn("password authentication failed", body.get("error", ""), body)
         self.assertNotIn(BOOTSTRAP_PASSWORD, json.dumps(body))
         self.assertNotIn(READER_PASSWORD, json.dumps(body))
@@ -298,14 +358,24 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
     def test_reader_dsn_and_http_health_in_every_stack(self) -> None:
         for stack in STACKS:
             with self.subTest(stack=stack):
+                self.assertEqual(self.preflight(stack, PRISM_PUBLIC_DATABASE_URL=READER_URL).returncode, 0)
                 self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=READER_URL)
                 self.assert_health(True)
 
     def test_supported_default_dsns_still_connect(self) -> None:
-        for stack in ((), ("compose.prism-external-db.yaml",)):
-            with self.subTest(stack=stack):
-                self.start_public(stack, lab_default=True)
+        for stack, dsn in itertools.product(STACKS, (None, "")):
+            with self.subTest(stack=stack, dsn_absent=dsn is None):
+                overrides = {} if dsn is None else {"PRISM_PUBLIC_DATABASE_URL": dsn}
+                self.assertEqual(self.preflight(stack, **overrides).returncode, 0)
+                self.start_public(stack, lab_default=True, **overrides)
                 self.assert_health(True)
+
+    def test_shipped_lab_password_remains_supported(self) -> None:
+        overrides = {"PRISM_PUBLIC_DATABASE_URL": "", "PRISM_POSTGRES_USER": "qbit",
+                     "PRISM_POSTGRES_PASSWORD": "change-this"}
+        self.assertEqual(self.preflight((), **overrides).returncode, 0)
+        self.start_public((), lab_default=True, **overrides)
+        self.assert_health(True)
 
     def test_literal_env_file_password_and_encoded_dsn_authenticate(self) -> None:
         stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
@@ -313,30 +383,71 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
             env_file = Path(directory) / "reader.env"
             env_file.write_text(f"PRISM_PUBLIC_DATABASE_URL={LITERAL_PASSWORDLESS_URL}\n"
                                 f"PRISM_PUBLIC_POSTGRES_PASSWORD='{LITERAL_PASSWORD}'\n", encoding="utf-8")
+            self.assertEqual(self.preflight(stack, env_file=env_file).returncode, 0)
             config = self.start_public(stack, env_file=env_file)
             self.assertIn(f"PGPASSWORD={LITERAL_PASSWORD}", config["Env"])
             self.assert_health(True)
+        self.assertEqual(self.preflight(stack, PRISM_PUBLIC_DATABASE_URL=LITERAL_URL).returncode, 0)
         config = self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=LITERAL_URL)
         self.assertIn("PGPASSWORD=", config["Env"])
         self.assert_health(True)
 
-    def test_passwordless_dsn_authentication_and_dsn_precedence(self) -> None:
+    def test_interpolated_carrier_preserves_original_caller_precedence(self) -> None:
         stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
-        for password in (None, "", "fixture-bad-reader", READER_PASSWORD):
-            with self.subTest(password=password):
+        with tempfile.TemporaryDirectory(prefix="prism-reader-interpolation-") as directory:
+            env_file = Path(directory) / "reader.env"
+            env_file.write_text(f"PRISM_PUBLIC_DATABASE_URL={PASSWORDLESS_URL}\n"
+                                "READER_SECRET=change-this\n"
+                                "PRISM_PUBLIC_POSTGRES_PASSWORD=${READER_SECRET}\n", encoding="utf-8")
+            self.assertEqual(self.preflight(stack, env_file=env_file, READER_SECRET=READER_PASSWORD).returncode, 0)
+            self.start_public(stack, env_file=env_file, READER_SECRET=READER_PASSWORD)
+            self.assert_health(True)
+
+    def test_passwordless_dsn_authentication_and_dsn_precedence(self) -> None:
+        for stack, password in itertools.product(STACKS, (None, "", "fixture-bad-reader", READER_PASSWORD)):
+            with self.subTest(stack=stack, absent=password is None, empty=password == "", valid=password == READER_PASSWORD):
                 overrides = {"PRISM_PUBLIC_DATABASE_URL": PASSWORDLESS_URL}
                 if password is not None:
                     overrides["PRISM_PUBLIC_POSTGRES_PASSWORD"] = password
+                self.assertEqual(self.preflight(stack, **overrides).returncode, 0)
                 self.start_public(stack, **overrides)
                 self.assert_health(password == READER_PASSWORD)
         # An explicitly incorrect DSN password must not be repaired by even a
         # valid reader carrier; the DSN is authoritative. An empty query
         # password likewise wins over the carrier in SQLx.
+        stack = ("compose.production.yaml", "compose.prism-external-db.yaml", "compose.prism-ha.yaml")
         for password in ("fixture-bad-reader", ""):
             with self.subTest(dsn_password=password):
+                self.assertEqual(self.preflight(stack, PRISM_PUBLIC_DATABASE_URL=f"{PASSWORDLESS_URL}?password={password}",
+                                               PRISM_PUBLIC_POSTGRES_PASSWORD=READER_PASSWORD).returncode, 0)
                 self.start_public(stack, PRISM_PUBLIC_DATABASE_URL=f"{PASSWORDLESS_URL}?password={password}",
                                   PRISM_PUBLIC_POSTGRES_PASSWORD=READER_PASSWORD)
                 self.assert_health(False)
+
+    def test_malformed_and_production_default_credentials_fail_preflight_and_startup(self) -> None:
+        cases = (
+            ("malformed", "fixture-secret", "", "invalid public PRISM_DATABASE_URL"),
+            ("invalid-option", PASSWORDLESS_URL + "?sslmode=fixture-secret", "", "invalid public PRISM_DATABASE_URL"),
+            ("uri-default", PASSWORDLESS_URL.replace("prism_reader@", "prism_reader:change-this@"), "", "non-default database credentials"),
+            ("encoded-default", PASSWORDLESS_URL.replace("prism_reader@", "prism_reader:ch%61nge-this@"), "", "non-default database credentials"),
+            ("carrier-default", PASSWORDLESS_URL, "change-this", "non-default database credentials"),
+            ("query-default", PASSWORDLESS_URL + "?password=ch%61nge-this", READER_PASSWORD, "non-default database credentials"),
+        )
+        for stack in STACKS:
+            for label, dsn, carrier, message in cases:
+                if "default" in label and "compose.production.yaml" not in stack:
+                    continue
+                with self.subTest(stack=stack, case=label):
+                    overrides = {"PRISM_PUBLIC_DATABASE_URL": dsn, "PRISM_PUBLIC_POSTGRES_PASSWORD": carrier}
+                    self.assertNotEqual(self.preflight(stack, **overrides).returncode, 0)
+                    self.start_public(stack, **overrides)
+                    self.assert_config_exit(message)
+
+    def test_missing_image_is_a_failed_preflight_without_building(self) -> None:
+        absent_image = f"prism-credential-missing-{uuid.uuid4().hex}:local"
+        self.assertNotEqual(self.preflight((), PRISM_COORDINATOR_IMAGE=absent_image).returncode, 0)
+        result = self.command("docker", "image", "inspect", absent_image, check=False)
+        self.assertNotEqual(result.returncode, 0, "preflight implicitly built an image")
 
     def test_reader_cannot_write_even_without_session_read_only_guard(self) -> None:
         self.assertEqual(self.sql("SELECT count(*) FROM qbit_pool_blocks", reader=True).returncode, 0)

@@ -3,6 +3,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Compose must see the caller's environment, not the shell-only example defaults
+# loaded below. Preserve even explicit empty overrides without putting values in
+# external command arguments, files, or diagnostics.
+COMPOSE_INPUT_NAMES=()
+COMPOSE_INPUT_VALUES=()
+COMPOSE_INPUT_COUNT=0
+COMPOSE_INPUT_KEYS='|'
+while IFS= read -r name; do
+  COMPOSE_INPUT_KEYS+="${name}|"
+  # Readonly shell internals cannot be changed by sourced configuration and
+  # must not be assigned during restoration (some also vary in subshells).
+  declaration="$(declare -p "${name}")"
+  declaration="${declaration#declare -}"
+  [[ "${declaration%% *}" != *r* ]] || continue
+  COMPOSE_INPUT_NAMES+=("${name}")
+  COMPOSE_INPUT_VALUES+=("${!name}")
+  COMPOSE_INPUT_COUNT=$((COMPOSE_INPUT_COUNT + 1))
+done < <(compgen -e)
+PUBLIC_COMPOSE_FILES=()
 ENV_DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-}"
 ENV_QBIT_PROVIDER="${QBIT_PROVIDER:-}"
 ENV_MINING_LANES="${MINING_LANES:-}"
@@ -926,15 +945,78 @@ check_bitcoin_peer_bootstrap() {
   fi
 }
 
-case "${1:-}" in
-  "") ;;
+check_public_reader_credentials() (
+  local name index output
+  local -a compose_args
+  # Restore precisely the environment Compose would receive from the caller.
+  while IFS= read -r name; do
+    [[ "${COMPOSE_INPUT_KEYS}" == *"|${name}|"* ]] || export -n "${name?}"
+  done < <(compgen -e)
+  for ((index=0; index<COMPOSE_INPUT_COUNT; index++)); do
+    export "${COMPOSE_INPUT_NAMES[index]}=${COMPOSE_INPUT_VALUES[index]}"
+  done
+  compose_args=(compose --env-file "${ROOT_DIR}/config/upstream.env.example")
+  if [[ -f "${ROOT_DIR}/config/upstream.env" ]]; then
+    compose_args=(compose --env-file "${ROOT_DIR}/config/upstream.env")
+  fi
+  if [[ -n "${ENV_DEPLOY_ENV_FILE}" ]]; then
+    local deploy_file="${ENV_DEPLOY_ENV_FILE}"
+    [[ "${deploy_file}" == /* ]] || deploy_file="${ROOT_DIR}/${deploy_file}"
+    compose_args+=(--env-file "${deploy_file}")
+  elif [[ -f "${ROOT_DIR}/.env" ]]; then
+    compose_args+=(--env-file "${ROOT_DIR}/.env")
+  fi
+  compose_args+=(-f "${ROOT_DIR}/compose.yaml")
+  for name in "${PUBLIC_COMPOSE_FILES[@]-}"; do
+    [[ -n "${name}" ]] || continue
+    compose_args+=(-f "${name}")
+  done
+  # Run the same public image/environment as deployment, without starting its
+  # database dependencies or publishing ports. The validator does no network IO.
+  # Capture Docker/Compose output: even a launcher error may contain env values.
+  # Compose run otherwise builds an absent image implicitly, even with --pull
+  # never. Remove only the build recipe in this final, credential-free overlay.
+  if output="$(printf 'services:\n  prism-public-api:\n    build: !reset null\n' | \
+      docker "${compose_args[@]}" -f - --profile prism run --rm --no-deps --pull never -T \
+      prism-public-api qbit-prism-server check-public-database-config 2>&1)"; then
+    [[ "${output}" == *"PRISM public database configuration valid; authentication is checked by readiness"* ]] || \
+      fail "public reader validation returned no result; use an image supporting check-public-database-config"
+    printf 'doctor: public reader configuration valid; database authentication remains a readiness check\n'
+  else
+    # Emit only known, value-free configuration errors, never raw launcher logs.
+    for name in \
+      'PRISM_DATABASE_URL is required by the public service' \
+      'public PRISM_DATABASE_URL must use postgres or postgresql' \
+      'invalid public PRISM_DATABASE_URL' \
+      'production requires non-default database credentials'; do
+      [[ "${output}" != *"${name}"* ]] || fail "public reader: ${name}"
+    done
+    fail "public reader validation failed; ensure Docker and the selected PRISM image support check-public-database-config"
+  fi
+)
+
+public_reader_only=0
+while [[ $# -gt 0 ]]; do
+case "$1" in
   --require-lab)
     validate_mining_lanes
     require_lab_mode
     exit 0
     ;;
+  --public-reader-only) public_reader_only=1 ;;
+  --compose-file)
+    [[ $# -ge 2 && -n "$2" ]] || fail "--compose-file requires a file"
+    PUBLIC_COMPOSE_FILES+=("$2")
+    shift
+    ;;
   *) fail "unknown argument: ${1}" ;;
 esac
+shift
+done
+if [[ "${public_reader_only}" == 1 ]]; then
+  check_public_reader_credentials
+  exit 0
+fi
 
 export QBIT_PRODUCTION QBIT_TOOLS_PRODUCTION QBIT_CHAIN CKPOOL_NON_TEST_READINESS_GATE
 export QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED
@@ -966,6 +1048,9 @@ fi
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not reachable"
+if mining_lane_enabled prism; then
+  check_public_reader_credentials
+fi
 
 case "${QBIT_PROVIDER}" in
   source)
