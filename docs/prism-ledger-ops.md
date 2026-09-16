@@ -1499,7 +1499,7 @@ primary, with the frontends running. Nothing here needs a maintenance window.
 | --- | --- |
 | `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written again in order, and is refused once a later archived partition has left the ledger |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written again in order, and is refused once a later archived partition has left the ledger |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
 | `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
 | `drop <partition>` | requires `detached` and verified, and counts the rows against the archive again; `DROP TABLE`; the archive is the copy of record |
@@ -1561,10 +1561,22 @@ chain, not from a database export.
 The layout under the root:
 
 ```
-<root>/qbit_share_ledger/<partition_name>/
+<root>/qbit_share_ledger/<partition_name>/<manifest-sha256>/
     rows.ndjson.gz     gzip; one JSON object per line, share_seq ascending
     manifest.json      UTF-8, no trailing newline
 ```
+
+Every `archive` run writes into a new version directory named after the
+SHA-256 of the manifest it holds, and the catalog points at that version only
+once both files and their directory entries are durable: `archive_uri` is the
+full path of the recorded `manifest.json` and `archive_manifest_sha256` is the
+directory's name. A partition directory can hold more than one version after
+`--force` or an interrupted run; the earlier ones stay on disk so that a failed
+catalog update cannot destroy the copy of record, but only the version the
+catalog records is that copy, and `verify` reads that one. An archive written
+before this version scheme, with both files directly under the partition
+directory, is still read by `verify`, which checks its digest against the
+catalog as for any other.
 
 A row is the whole ledger row with a fixed key order: difficulties are decimal
 strings (`numeric(78,0)`), timestamps are microseconds since the epoch (exact
@@ -1603,14 +1615,18 @@ the archive root instead.
 
 **Verifying an archive by hand.** `rows_sha256` is the SHA-256 of the
 uncompressed byte stream, so a verifier streams the file without materializing
-it:
+it. Start from the version directory the catalog records, which is the
+`archive_manifest_sha256` from the catalog read above (the `archive` command
+prints the same value); the off-host copy has no catalog to ask, so carry the
+digest along with it:
 
 ```sh
-cd "$ARCHIVE_ROOT/qbit_share_ledger/qbit_share_ledger_p0"
+MANIFEST_SHA256=…                        # archive_manifest_sha256 for qbit_share_ledger_p0
+cd "$ARCHIVE_ROOT/qbit_share_ledger/qbit_share_ledger_p0/$MANIFEST_SHA256"
 gzip -dc rows.ndjson.gz | sha256sum      # must equal the manifest's rows_sha256
 sha256sum rows.ndjson.gz                 # must equal the manifest's rows_gz_sha256
 gzip -dc rows.ndjson.gz | wc -l          # must equal the manifest's row_count
-sha256sum manifest.json                  # must equal the catalog's archive_manifest_sha256
+sha256sum manifest.json                  # must equal $MANIFEST_SHA256, the directory's name,
                                          # and the next manifest's previous_manifest_sha256
 gzip -dc rows.ndjson.gz | head -1        # the first row; its share_seq is first_share_seq
 gzip -dc rows.ndjson.gz | tail -1        # the last row; its share_seq is last_share_seq

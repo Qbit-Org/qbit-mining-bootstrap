@@ -147,15 +147,17 @@ enum ShareArchiveCommand {
         partition: String,
     },
     /// Write the partition's rows and manifest under
-    /// <root>/qbit_share_ledger/<partition>/ and record them in the catalog.
+    /// <root>/qbit_share_ledger/<partition>/<manifest-sha256>/ and record
+    /// them in the catalog.
     Archive {
         partition: String,
         /// Archive root the layout is written under.
         #[arg(long)]
         dir: PathBuf,
-        /// Overwrite an archive this partition already has, clearing its
-        /// verification and that of every later archive, which must then be
-        /// written again in order.
+        /// Write an archive again for a partition that already has one, into
+        /// a new version directory that replaces the recorded one, clearing
+        /// its verification and that of every later archive, which must then
+        /// be written again in order.
         #[arg(long)]
         force: bool,
     },
