@@ -100,10 +100,19 @@ async fn active_cancellation_keeps_live_peers_and_reconciles_all_gone() -> Resul
                     ensure!(peer.await.unwrap_err().is_cancelled());
                 }
                 settled(&batcher).await;
-                if !live_peer && !committing {
+                if !live_peer {
                     let (count, retention): (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM qbit_prism_jobs WHERE job_id LIKE 'pg-%'), floor(extract(epoch FROM expires_at)*1000)::bigint FROM qbit_prism_jobs WHERE job_id='prepared'")
                         .fetch_one(&ledger.pool).await?;
-                    ensure!(count == 0 && retention == original_expiry, "canceled precommit attempt persisted a child or renewal");
+                    if committing {
+                        // Observe uncertainty before any explicit reconciliation:
+                        // the complete commit retains both original children and
+                        // their dependency, or rollback leaves no effects.
+                        ensure!((count == 2 && retention == expiry + 60_001)
+                            || (count == 0 && retention == original_expiry),
+                            "canceled COMMIT left partial children or retention");
+                    } else {
+                        ensure!(count == 0 && retention == original_expiry, "canceled precommit attempt persisted a child or renewal");
+                    }
                 }
                 if !live_peer {
                     // All-gone during COMMIT is uncertain. Reconcile only the

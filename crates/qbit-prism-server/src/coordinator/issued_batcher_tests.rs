@@ -322,6 +322,10 @@ async fn all_members_canceled_during_commit_leave_exact_identity_for_reconciliat
     let count = f.store.jobs.lock().unwrap().len();
     // This fake COMMIT became durable but its acknowledgement was never
     // received. All-gone cancellation must not remove or remint these rows.
+    assert_eq!(
+        f.store.jobs.lock().unwrap()[&prepared.storage_key].expires_at_ms,
+        370_000
+    );
     for (id, expiry) in [
         ("all-gone-commit-1", 300_000),
         ("all-gone-commit-2", 310_000),

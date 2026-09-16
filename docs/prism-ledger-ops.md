@@ -87,7 +87,11 @@ cleanup is bounded at 16 seconds and discards an unresponsive connection.
 Dropping the Coordinator closes admissions and resolves pending waiters.
 COMMIT already started means an uncertain outcome after cancellation or lost
 acknowledgement, never proof of rollback. Reconciliation must use the exact
-original IDs, payloads and expiries. A durable row may remain undelivered after
+original IDs, payloads and expiries. Committed, undelivered children retain their
+dependency through their original expiries with the existing renewal headroom,
+including when every caller cancels during COMMIT. Cancellation does not delete
+committed metadata, undo its retention, or restart its expiry; normal pruning
+still applies. A durable row may remain undelivered after
 authority revocation: the original caller still revalidates after persistence,
 and Stratum never sends work before successful durable commit and revalidation.
 
