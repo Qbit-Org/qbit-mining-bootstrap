@@ -102,6 +102,29 @@ ALTER TABLE qbit_pool_blocks
         CHECK (solver_share_difficulty IS NULL OR solver_share_difficulty > 0),
     ADD COLUMN IF NOT EXISTS solver_network_difficulty numeric(78, 0)
         CHECK (solver_network_difficulty IS NULL OR solver_network_difficulty > 0);
+-- Old frontends can keep landing blocks during online conversion without
+-- naming the new columns. Capture their solver at insertion as well as in
+-- the initial backfill, before retention can remove the supporting shares.
+CREATE FUNCTION qbit_prism_capture_block_solver()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.solver_share_id IS NULL THEN
+        SELECT share.miner_id, share.share_id, share.share_difficulty, share.network_difficulty
+        INTO NEW.solver_miner_id, NEW.solver_share_id, NEW.solver_share_difficulty, NEW.solver_network_difficulty
+        FROM qbit_share_ledger share
+        WHERE share.accepted
+          AND length(share.share_id) >= 65
+          AND lower(right(share.share_id, 64)) = NEW.block_hash
+        ORDER BY share.accepted_at DESC, share.share_seq DESC
+        LIMIT 1;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER qbit_pool_blocks_capture_solver
+BEFORE INSERT ON qbit_pool_blocks
+FOR EACH ROW EXECUTE FUNCTION qbit_prism_capture_block_solver();
+
 -- Backfill from the ledger, one suffix-index probe per block, exactly the
 -- lookup the dashboard queries performed on every request.
 UPDATE qbit_pool_blocks block

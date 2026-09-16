@@ -271,6 +271,8 @@ pub(super) async fn undo_015(pool: &PgPool) -> Result<()> {
          DROP FUNCTION qbit_prism_share_next_seq();
          DROP TABLE qbit_prism_share_partitions;
          DROP TABLE qbit_prism_share_partitioning;
+         DROP TRIGGER qbit_pool_blocks_capture_solver ON qbit_pool_blocks;
+         DROP FUNCTION qbit_prism_capture_block_solver();
          ALTER TABLE qbit_pool_blocks DROP COLUMN solver_miner_id, DROP COLUMN solver_share_id, DROP COLUMN solver_share_difficulty, DROP COLUMN solver_network_difficulty;
          ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id);
          ALTER TABLE qbit_prism_share_hashes ADD CONSTRAINT qbit_prism_share_hashes_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)",
@@ -382,6 +384,58 @@ async fn migration_016_converts_empty_2x_ledgers_at_sequence_boundaries() -> Res
         }
     }
     Ok(())
+}
+
+/// Older frontends omit the new solver columns while conversion is pending.
+#[tokio::test]
+async fn migration_015_captures_old_frontend_solvers_during_online_conversion() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("old-landing").await?;
+    let result = async {
+        let hash = "ab".repeat(32);
+        let share_id = format!("legacy.rig:{hash}");
+        let mut solving = share(1);
+        solving.share_id = share_id.clone();
+        ledger.append(solving, None).await?;
+        // 015 and its backfill have committed. Keep 016 pending, as during
+        // the online validation phase while old frontends remain active.
+        undo_016(&ledger.pool).await?;
+        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,100,'parent','coinbase','manifest')")
+            .bind(&hash)
+            .execute(&ledger.pool)
+            .await?;
+        let solver: (Option<String>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT solver_miner_id,solver_share_id,solver_share_difficulty::text,solver_network_difficulty::text FROM qbit_pool_blocks WHERE block_hash=$1")
+                .bind(&hash)
+                .fetch_one(&ledger.pool)
+                .await?;
+        ensure!(
+            solver.0.is_some() && solver.1.as_deref() == Some(share_id.as_str())
+                && solver.2.is_some() && solver.3.is_some(),
+            "an old frontend landing after the backfill lost its solver: {solver:?}"
+        );
+        let converted = db.ledger("converted").await?;
+        assert_converted(&ledger.pool).await?;
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger DETACH PARTITION qbit_share_ledger_p0")
+            .execute(&ledger.pool)
+            .await?;
+        let stored: Option<String> = sqlx::query_scalar("SELECT solver_share_id FROM qbit_pool_blocks WHERE block_hash=$1")
+            .bind(&hash)
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(stored.as_deref() == Some(share_id.as_str()), "detach lost solver attribution");
+        Ok(converted)
+    }
+    .await;
+    match result {
+        Ok(converted) => db.close(vec![ledger, converted]).await,
+        Err(error) => {
+            db.close(vec![ledger]).await?;
+            Err(error)
+        }
+    }
 }
 
 /// A ledger with rows is converted after the commit by the online runner,
