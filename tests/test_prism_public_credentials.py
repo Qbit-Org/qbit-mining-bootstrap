@@ -505,6 +505,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
                                    encoding="utf-8")
                 stack = ("compose.prism-external-db.yaml", "compose.prism-ha.yaml")
                 overrides = {"PRISM_COORDINATOR_IMAGE": image, "PRISM_PUBLIC_DATABASE_URL": "",
+                             # The fixture's FROM image lives in the local
+                             # engine, not in CI's separate remote BuildKit.
+                             "BUILDX_BUILDER": "default",
                              # Only the external overlay selects this reader DSN.
                              "PRISM_DATABASE_URL": READER_URL, "PRISM_POSTGRES_PASSWORD": "change-this"}
                 result = self.preflight(stack, make_deployment=True, extra_files=(str(overlay),), **overrides)
