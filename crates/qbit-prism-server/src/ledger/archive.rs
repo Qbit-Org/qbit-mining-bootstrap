@@ -1711,19 +1711,34 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
     let live_rows_compared = attachment.attached && attachment.relation_present;
     let mut tx = ledger.begin().await?;
     if live_rows_compared {
+        // Fence the evidence checked above against archive rewrites. Lock
+        // predecessor before successor, in the same order archive updates
+        // its own digest and invalidates later verifications.
+        let previous: Option<(i64, String)> = sqlx::query_as(
+            "SELECT upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq<$1 ORDER BY upper_seq DESC LIMIT 1 FOR SHARE",
+        )
+        .bind(record.upper_seq)
+        .fetch_optional(&mut *tx)
+        .await?;
+        ensure!(
+            previous.as_ref().map(|(upper, _)| *upper) == expected_upper
+                && previous.as_ref().map(|(_, digest)| digest) == expected_link.as_ref(),
+            "{partition_name}'s predecessor archive was rewritten during verification; verify the current archive chain again"
+        );
         // The timestamp is the proof detach and drop require: the archive
         // was compared with the live rows. A verify after the detach checks
         // the archive against itself and the catalog only, and reports
         // that without recording it, so it can never stand in for the
         // comparison the detach needed.
-        let updated = sqlx::query("UPDATE qbit_prism_share_partitions SET archive_verified_at=clock_timestamp() WHERE partition_name=$1 AND archived_at IS NOT NULL")
+        let updated = sqlx::query("UPDATE qbit_prism_share_partitions SET archive_verified_at=clock_timestamp() WHERE partition_name=$1 AND archive_manifest_sha256=$2 AND archived_at IS NOT NULL")
             .bind(partition_name)
+            .bind(&manifest_sha256)
             .execute(&mut *tx)
             .await?
             .rows_affected();
         ensure!(
             updated == 1,
-            "{partition_name} has no archived_at in qbit_prism_share_partitions, so the verification cannot be recorded. Run share-archive archive {partition_name} --dir <root> first"
+            "{partition_name}'s archive was rewritten during verification or has no archived_at in qbit_prism_share_partitions, so the verification cannot be recorded. Run share-archive archive and verify for {partition_name} again"
         );
     }
     let verified_at: Option<DateTime<Utc>> = sqlx::query_scalar(

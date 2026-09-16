@@ -923,6 +923,95 @@ async fn unfinished_candidate_window_pins_an_earlier_partition() -> Result<()> {
     }
 }
 
+#[tokio::test]
+async fn verification_refuses_a_concurrent_archive_rewrite() -> Result<()> {
+    // Replacing either the predecessor or the archive being verified must
+    // keep the stale verifier from restoring the invalidated timestamp.
+    for rewritten in [P0, P1] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("verify-race-a").await?;
+            let verifier = db.ledger("verify-race-b").await?;
+            let root = tempfile::tempdir()?;
+            insert_shares(&ledger.pool, 1, 250, 7, "server-a", 7200.0).await?;
+            let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+            let (_, p1_upper) = bounds(&ledger.pool, P1).await?;
+            insert_shares(&ledger.pool, p0_upper, p0_upper + 4, 7, "server-a", 7200.0)
+                .await?;
+            set_sequence(&ledger.pool, p1_upper).await?;
+            for partition in [P0, P1] {
+                archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+                archive::verify(&ledger, partition, root.path()).await?;
+            }
+
+            // Hold the catalog changes an archive rewrite makes uncommitted,
+            // so the verifier first reads the old manifest and chain link.
+            let mut writer = ledger.pool.begin().await?;
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await?;
+            sqlx::query("UPDATE qbit_prism_share_partitions SET archive_manifest_sha256=$2 WHERE partition_name=$1")
+                .bind(rewritten)
+                .bind("ab".repeat(32))
+                .execute(&mut *writer)
+                .await?;
+            sqlx::query("UPDATE qbit_prism_share_partitions SET archive_verified_at=NULL WHERE partition_name=$1")
+                .bind(P1)
+                .execute(&mut *writer)
+                .await?;
+            let verification = tokio::spawn({
+                let root = root.path().to_path_buf();
+                async move {
+                    let result = archive::verify(&verifier, P1, &root).await;
+                    (verifier, result)
+                }
+            });
+            // Observe the actual lock wait instead of relying on scheduling
+            // the verifier within an arbitrary sleep.
+            let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                        .bind(writer_pid)
+                        .fetch_one(&db.admin)
+                        .await?;
+                    if blocked {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    ensure!(!verification.is_finished(), "verification did not wait for the rewrite of {rewritten}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            writer.commit().await?;
+            let (verifier, verified) = verification.await?;
+            waiting.context("verification never waited for the catalog rewrite")??;
+            let error = verified
+                .expect_err("a stale verification survived an archive rewrite")
+                .to_string();
+            ensure!(error.contains("rewritten during verification"), "{error}");
+            ensure!(
+                catalog(&ledger.pool, P1)
+                    .await?
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archive_verified_at")?
+                    .is_none(),
+                "verification restored the timestamp invalidated by rewriting {rewritten}"
+            );
+            Ok(vec![ledger, verifier])
+        }
+        .await;
+        match result {
+            Ok(ledgers) => db.close(ledgers).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Acceptance criterion 5 of #144: a block whose payout window lay inside a
 /// partition keeps serving its advertised artifact after that partition has
 /// been sealed, archived, verified, detached and dropped. Nothing can rebuild
