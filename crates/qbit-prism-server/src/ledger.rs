@@ -8,7 +8,7 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Utc};
 use qbit_prism::{AcceptedShare, AuditBundle, CarryForwardBalance};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{
     postgres::{PgPoolOptions, PgRow},
@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
+/// Share ledger retention: the operator commands behind `share-archive`.
+pub mod archive;
 mod audit;
 pub use audit::{
     audit_canonical_bytes, audit_completeness, decode_canonical_audit_body, materialize_audit_row,

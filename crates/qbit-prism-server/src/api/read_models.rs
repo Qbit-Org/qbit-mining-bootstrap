@@ -168,40 +168,13 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
             "unknown PRISM block"
         }));
     }
-    if !value["share_snapshot_sha256"].is_null() {
-        // A native body is rebuilt from its share snapshot and its canonical
-        // digest is recomputed, both proportional to the window. That work
-        // runs after the read connections are released, so it shares the
-        // read concurrency through the same limit as an imported decode. The
-        // permit is taken here, before `materialize_audit_row`, so it also
-        // spans that call's snapshot lookup and window read, the two database
-        // round trips that precede the blocking job: the limit bounds a
-        // native row's database work as well as its CPU work. The permit
-        // moves into the blocking job: a dropped request cannot free it
-        // before the rebuild ends. Waiting for it spends the request's own
-        // deadline.
-        let permit = state
-            .audit_decodes
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal())?;
-        crate::ledger::materialize_audit_row(&state.pool, &mut value, Some(permit))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error,"audit snapshot reconstruction failed");
-                audit_read_error(error)
-            })?;
-        // The digest was checked against `audit_bundle_sha256` by the rebuild;
-        // the query above always projects that column, so a native row that
-        // reached here has proven its canonical bytes.
-        if value["audit_bundle_sha256"].as_str().is_none() {
-            return Err(ApiError::internal());
-        }
-    } else if value["has_canonical_audit_bytes"] == true {
-        // Imported canonical bytes are authoritative over any inline or
-        // filesystem copy, so the query above projected no inline body for
-        // them. A corrupt value refuses the row; it never falls back to
+    if value["has_canonical_audit_bytes"] == true {
+        // Stored canonical bytes are authoritative over any inline or
+        // filesystem copy and over a reconstruction, whatever the row's
+        // shape, so the query above projected no inline body for them. A
+        // native row is sealed before its shares are archived (#144), and
+        // after the detach only these bytes can still serve its advertised
+        // digest. A corrupt value refuses the row; it never falls back to
         // body_uri, even when that file still exists.
         //
         // The bytes and their decode outlive the read connection, so the
@@ -234,9 +207,39 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
                 crate::ledger::decode_canonical_audit_body(bytes, expected, Some(permit))
                     .await
                     .map_err(|error| {
-                        tracing::warn!(%error,"imported canonical audit decode failed");
+                        tracing::warn!(%error,"stored canonical audit decode failed");
                         audit_read_error(error)
                     })?;
+        }
+    } else if !value["share_snapshot_sha256"].is_null() {
+        // An unsealed native body is rebuilt from its share snapshot and its
+        // canonical digest is recomputed, both proportional to the window.
+        // That work runs after the read connections are released, so it
+        // shares the read concurrency through the same limit as a stored
+        // decode. The permit is taken here, before `materialize_audit_row`,
+        // so it also spans that call's snapshot lookup and window read, the
+        // two database round trips that precede the blocking job: the limit
+        // bounds a native row's database work as well as its CPU work. The
+        // permit moves into the blocking job: a dropped request cannot free
+        // it before the rebuild ends. Waiting for it spends the request's own
+        // deadline.
+        let permit = state
+            .audit_decodes
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        crate::ledger::materialize_audit_row(&state.pool, &mut value, Some(permit))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error,"audit snapshot reconstruction failed");
+                audit_read_error(error)
+            })?;
+        // The digest was checked against `audit_bundle_sha256` by the rebuild;
+        // the query above always projects that column, so a native row that
+        // reached here has proven its canonical bytes.
+        if value["audit_bundle_sha256"].as_str().is_none() {
+            return Err(ApiError::internal());
         }
     }
     if value["audit_bundle"].is_null() {

@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use anyhow::{ensure, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
@@ -53,6 +53,11 @@ enum Command {
         #[command(subcommand)]
         command: FatalStateCommand,
     },
+    /// Seal, archive, verify, detach, drop and restore share ledger partitions.
+    ShareArchive {
+        #[command(subcommand)]
+        command: ShareArchiveCommand,
+    },
     /// Validate compact target bits and print Prism's exact scaled difficulty.
     HeaderDifficulty {
         #[arg(long)]
@@ -82,6 +87,93 @@ enum Command {
         iterations: usize,
         #[arg(long)]
         output_json: Option<PathBuf>,
+    },
+}
+
+/// The retention rules shared by every command that evaluates eligibility.
+/// The defaults are the design record's: the payout window floor is taken at four
+/// times the requested weight, so a difficulty rise of up to 4x between two
+/// retention runs cannot reach into archived history, and a share stays online
+/// for thirty days, which covers every dashboard read of raw rows with margin.
+#[derive(Args)]
+struct RetentionArgs {
+    /// Network difficulty the payout window floor is taken at, as a whole number.
+    #[arg(long)]
+    network_difficulty: String,
+    /// Days a share stays online after it was accepted.
+    #[arg(long, default_value_t = 30)]
+    retention_days: i64,
+    /// Multiple of the requested window weight the floor allows for.
+    #[arg(long, default_value_t = 4)]
+    window_multiple: i64,
+    /// Also scan the attached leaves for a share_id held by more than one of
+    /// them. One pass over every attached partition, so it is not the default.
+    #[arg(long)]
+    check_duplicates: bool,
+}
+
+impl RetentionArgs {
+    fn options(self) -> crate::ledger::archive::PlanOptions {
+        crate::ledger::archive::PlanOptions {
+            network_difficulty: self.network_difficulty,
+            retention_days: self.retention_days,
+            window_multiple: self.window_multiple,
+            check_duplicates: self.check_duplicates,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ShareArchiveCommand {
+    /// Print every partition with its bounds, rows and the five retention
+    /// conditions, each with its blocker named. Nothing is changed.
+    Plan {
+        #[command(flatten)]
+        retention: RetentionArgs,
+    },
+    /// Store the canonical bytes of every audit whose share window intersects
+    /// the partition, so its blocks keep serving once its shares are gone.
+    Seal {
+        /// Partition name, as printed by share-archive plan.
+        partition: String,
+    },
+    /// Write the partition's rows and manifest under
+    /// <root>/qbit_share_ledger/<partition>/ and record them in the catalog.
+    Archive {
+        partition: String,
+        /// Archive root the layout is written under.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Overwrite an archive this partition already has.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Re-read the archive, recompute both digests, check the manifest against
+    /// the catalog and the chain, and compare the live rows while they are there.
+    Verify {
+        partition: String,
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Detach a sealed, archived and verified partition once every retention
+    /// condition is clear. The table stays as a standalone relation.
+    Detach {
+        partition: String,
+        #[command(flatten)]
+        retention: RetentionArgs,
+    },
+    /// Drop a detached, verified partition. The archive is the copy of record.
+    Drop { partition: String },
+    /// Recreate a partition table from its archive and verify it row for row.
+    Restore {
+        /// Path to the archive's manifest.json, absolute or under --dir.
+        manifest: PathBuf,
+        /// Archive root a relative manifest path is resolved against.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Attach the restored table back under its recorded bounds.
+        #[arg(long)]
+        attach: bool,
     },
 }
 
@@ -150,6 +242,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             Ok(())
         }
         Command::FatalState { command } => fatal_state(command).await,
+        Command::ShareArchive { command } => share_archive(command).await,
         Command::HeaderDifficulty { bits } => {
             let compact = crate::codec::parse_u32_hex(&bits)?;
             let target = crate::codec::target_from_compact(compact)?;
@@ -283,6 +376,48 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Every share-archive command runs as the operator against the primary, with
+/// the frontends running, and closes its pool whichever way it ends. The
+/// result is printed as JSON so a retention run is scriptable.
+async fn share_archive(command: ShareArchiveCommand) -> Result<()> {
+    use crate::ledger::archive;
+
+    let config = config::DatabaseConfig::from_env()?;
+    let ledger = crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+    let result = async {
+        match command {
+            ShareArchiveCommand::Plan { retention } => Ok(serde_json::to_value(
+                archive::plan(&ledger, &retention.options()).await?,
+            )?),
+            ShareArchiveCommand::Seal { partition } => archive::seal(&ledger, &partition).await,
+            ShareArchiveCommand::Archive {
+                partition,
+                dir,
+                force,
+            } => archive::archive(&ledger, &partition, &dir, force, &config.instance_id).await,
+            ShareArchiveCommand::Verify { partition, dir } => {
+                archive::verify(&ledger, &partition, &dir).await
+            }
+            ShareArchiveCommand::Detach {
+                partition,
+                retention,
+            } => archive::detach(&ledger, &partition, &retention.options()).await,
+            ShareArchiveCommand::Drop { partition } => {
+                archive::drop_partition(&ledger, &partition).await
+            }
+            ShareArchiveCommand::Restore {
+                manifest,
+                dir,
+                attach,
+            } => archive::restore(&ledger, &manifest, &dir, attach).await,
+        }
+    }
+    .await;
+    ledger.pool.close().await;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
 }
 
 fn diagnostic_host(bind: &str) -> String {

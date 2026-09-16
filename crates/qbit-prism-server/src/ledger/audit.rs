@@ -219,13 +219,20 @@ pub async fn materialize_audit_row(
 }
 
 impl Ledger {
-    /// New range-backed bodies, imported canonical bytes, then old inline
+    /// Stored canonical bytes, then range-backed bodies, then old inline
     /// bodies. Legacy filesystem bodies are imported by the migration command
-    /// or resolved by the public API reader. Imported bytes that fail their
+    /// or resolved by the public API reader. Stored bytes that fail their
     /// digest or parse are an error, never a fallback to another source.
+    ///
+    /// Stored bytes win whatever the row's shape (#144). A native row is
+    /// sealed before its shares are archived, and after the detach the
+    /// reconstruction it used to serve has nothing to read: the block keeps
+    /// its advertised `audit_bundle_sha256` only because the bytes proved
+    /// against that digest at seal time are preferred here.
     pub async fn audit_bundle(&self, block_hash: &str) -> Result<Option<Value>> {
-        // Load only the representation that will be served.
-        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,CASE WHEN share_snapshot_sha256 IS NULL THEN canonical_audit_bytes END AS canonical_audit_bytes,CASE WHEN share_snapshot_sha256 IS NOT NULL OR canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        // Load only the representation that will be served: the inline body is
+        // needed for a reconstruction, which only happens without bytes.
+        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes,CASE WHEN canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
             .bind(block_hash)
             .fetch_optional(&mut *self.acquire().await?)
             .await?;
@@ -239,15 +246,15 @@ impl Ledger {
         // The row still holds its own copy of the bytes; free it before the
         // decode instead of keeping two copies alive across the await.
         drop(row);
-        if snapshot.is_some() {
-            let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
-            materialize_audit_row(&self.pool, &mut logical, None).await?;
-            return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
-        }
         if let Some(bytes) = canonical {
             return Ok(Some(
                 decode_canonical_audit_body(bytes, expected, None).await?,
             ));
+        }
+        if snapshot.is_some() {
+            let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
+            materialize_audit_row(&self.pool, &mut logical, None).await?;
+            return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
         }
         Ok(body.filter(|body| !body.is_null()))
     }
