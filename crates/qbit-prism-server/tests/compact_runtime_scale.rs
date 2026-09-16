@@ -146,6 +146,10 @@ async fn qualify(n: u64) -> Result<()> {
             let (a,b) = (&frontends[0], &frontends[1]);
             let plan = window_fixture::WindowPlan::new(n)?;
             let loaded = plan.load(&db.direct, "compact-runtime-scale").await?;
+            // Bulk loading a fresh primary leaves no share distribution stats.
+            // Prepare them before measurement so page plans do not depend on
+            // whether the background auto-analyze interval has elapsed.
+            sqlx::query("ANALYZE qbit_share_ledger").execute(&db.direct).await?;
             plan.verify_round_trip(&db.direct, &[1,n/2,n]).await?;
             // Observer installation, fixture writes and checkpoint are outside
             // the insert-LSN bracket. This disposable primary has no workers.
