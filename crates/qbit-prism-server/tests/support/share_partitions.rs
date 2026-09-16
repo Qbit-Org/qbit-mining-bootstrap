@@ -265,6 +265,7 @@ pub(super) async fn undo_015(pool: &PgPool) -> Result<()> {
          DROP FUNCTION qbit_prism_share_ledger_convert_validate();
          DROP FUNCTION qbit_prism_share_ledger_convert_prepare(bigint);
          DROP FUNCTION qbit_prism_share_partition_ensure();
+         DROP FUNCTION qbit_prism_share_partition_next_number();
          DROP FUNCTION qbit_prism_share_partition_create(text,bigint,bigint);
          DROP FUNCTION qbit_prism_share_probe_floor();
          DROP FUNCTION qbit_prism_share_next_seq();
@@ -398,7 +399,7 @@ async fn migration_016_converts_a_populated_ledger_online_and_resumes_from_every
                 "attached".to_owned()
             )
         );
-        assert_eq!(rows[1].0, "qbit_share_ledger_p3");
+        assert_eq!(rows[1].0, "qbit_share_ledger_p1");
         assert_eq!((rows[1].1, rows[1].2), (Some(3 * WIDTH), 4 * WIDTH));
         assert_eq!(conversion_bound(&pool).await?, Some(3 * WIDTH));
         let next = resumed
