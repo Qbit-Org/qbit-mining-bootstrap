@@ -74,6 +74,49 @@ async fn refresh_issue_resume_preserves_original_work_and_compact_storage() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_requires_the_frontends_published_revision_before_reconstruction() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = f.a.authorize("alice.rig").await?;
+            let previous = f.b.prepared.read().await.clone().context("B publication")?;
+            // Advance the real ledger fence without changing the node's tip.
+            // A publishes that revision while B still retains its older work.
+            sqlx::query(
+                "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton",
+            )
+            .execute(f.pool())
+            .await?;
+            f.a.refresh_once().await?;
+            let issued = f.issue(&worker, Duration::from_secs(30)).await?;
+            ensure!(issued.wire.payout_revision > previous.snapshot.payout_revision);
+            ensure!(issued.wire.previousblockhash == previous.template["previousblockhash"]);
+            let original = f.payload(&issued.wire.job_id).await?;
+            let mark = f.proxy.mark();
+            ensure!(
+                f.b.resume_job(&worker, &issued.wire.job_id)
+                    .await?
+                    .is_none(),
+                "resume adopted a revision B has not published"
+            );
+            ensure!(
+                f.returned_share_rows(mark)? == 0,
+                "ineligible work was reconstructed"
+            );
+            f.b.refresh_once().await?;
+            let resumed =
+                f.b.resume_job(&worker, &issued.wire.job_id)
+                    .await?
+                    .context("matching published revision must resume")?;
+            same_job(&issued, &resumed)?;
+            ensure!(f.payload(&issued.wire.job_id).await? == original);
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_old_refresh_cannot_replace_new_tip_publication_or_resume_retired_work(
 ) -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| {

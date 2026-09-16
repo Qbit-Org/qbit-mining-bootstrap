@@ -25,7 +25,9 @@ mod socket;
 #[path = "../window_fixture.rs"]
 mod window_fixture;
 
-const BASELINE: &str = "1b0d409344c1b99f5f4bd04970890b9b034a9eeb";
+// This identifies the historical report, not the runtime used by a new run.
+// Record the tested revision separately in that run's build/gate manifest.
+const HISTORICAL_BASELINE: &str = "1b0d409344c1b99f5f4bd04970890b9b034a9eeb";
 const SHARES: u64 = 16;
 const SETTLEMENT_LOCK: i64 = 0x5052_4953_4d00_0003;
 // Advisory locks are database-wide, so smoke cases in this binary serialize.
@@ -322,7 +324,7 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
     let complete = seconds.len() == sessions && refresh_errors.is_empty() && failure_free;
     let max = seconds.last().copied();
     let report = json!({
-        "schema":"b275.delivery.v2", "baseline_sha":BASELINE,
+        "schema":"b275.delivery.v3", "historical_baseline_sha":HISTORICAL_BASELINE,
         "frontends":frontends,"sessions_total":sessions,"sessions_per_frontend":sessions/frontends,
         "fixture_shares":SHARES,"database":fixture.settings,
         "runtime_threads":tokio::runtime::Handle::current().metrics().num_workers(),
@@ -337,7 +339,7 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         "refresh_errors":refresh_errors,"delivery_errors":delivery_errors,
         "database_metric_deltas_per_frontend":metrics,
         "metric_scope":"all instrumented frontend checkout/lock calls during refresh plus fanout; sums overlap across concurrent sessions",
-        "commit_seconds":null,"commit_timing":"not exposed by baseline",
+        "commit_seconds":null,"commit_timing":"not exposed by runtime instrumentation",
         "performance_acceptance":"not established by this harness result alone"
     });
     println!("B275_MEASUREMENT {report}");
@@ -452,7 +454,7 @@ pub async fn landing_lock(fixture: &Fixture) -> Result<()> {
     );
     println!(
         "B275_LOCK {}",
-        json!({"baseline_sha":BASELINE,"stub_hold_target_seconds":3,"release_observed_seconds":released,"persist_seconds":elapsed,"settlement_waiter_observed":true,"waiter_pid":waiter_pid,"database_metric_deltas":delta,"commit_seconds":null,"lock_free_acceptance_met":false})
+        json!({"historical_baseline_sha":HISTORICAL_BASELINE,"stub_hold_target_seconds":3,"release_observed_seconds":released,"persist_seconds":elapsed,"settlement_waiter_observed":true,"waiter_pid":waiter_pid,"database_metric_deltas":delta,"commit_seconds":null,"lock_free_acceptance_met":false})
     );
     Ok(())
 }

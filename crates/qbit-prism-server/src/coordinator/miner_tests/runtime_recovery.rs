@@ -182,6 +182,77 @@ async fn shared_runtime_reconstruction_survives_one_waiter_and_cleans_up_the_las
 }
 
 #[tokio::test]
+async fn metadata_failure_is_shared_only_until_the_last_flight_waiter_leaves() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f, Duration::from_secs(30)).await;
+    f.store
+        .compact
+        .reads
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("transient metadata lookup failure")));
+    let first = f
+        .coordinator
+        .resume_flights
+        .join(
+            &f.coordinator,
+            &job.context.prepared.storage_key,
+            job.wire.extranonce2_size,
+        )
+        .await;
+    let second = f
+        .coordinator
+        .resume_flights
+        .join(
+            &f.coordinator,
+            &job.context.prepared.storage_key,
+            job.wire.extranonce2_size,
+        )
+        .await;
+    assert!(Arc::ptr_eq(&first, &second));
+    for waiter in [&first, &second] {
+        let result = waiter.metadata.clone().await;
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("transient metadata lookup failure"))
+        );
+    }
+    assert_eq!(f.store.compact.read_keys.lock().unwrap().len(), 1);
+    assert!(f.store.compact.window_calls.lock().unwrap().is_empty());
+    drop(first);
+    let overlapping = f
+        .coordinator
+        .resume_flights
+        .join(
+            &f.coordinator,
+            &job.context.prepared.storage_key,
+            job.wire.extranonce2_size,
+        )
+        .await;
+    assert!(Arc::ptr_eq(&second, &overlapping));
+    assert!(overlapping.metadata.clone().await.is_err());
+    assert_eq!(f.store.compact.read_keys.lock().unwrap().len(), 1);
+    drop(second);
+    drop(overlapping);
+    let resumed = timeout(
+        Duration::from_secs(5),
+        f.coordinator
+            .resume_job(&job.context.worker, &job.wire.job_id),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("a later request retries the metadata read");
+    assert_eq!(f.store.compact.read_keys.lock().unwrap().len(), 2);
+    assert_eq!(resumed.wire.coinb1, job.wire.coinb1);
+    assert_eq!(resumed.wire.coinb2, job.wire.coinb2);
+    assert_eq!(
+        resumed.context.prepared.reservation.record,
+        job.context.prepared.reservation.record
+    );
+}
+
+#[tokio::test]
 async fn original_resume_expiry_includes_coalescer_build_and_reader_admission() {
     for phase in ["coalescer", "build", "reader"] {
         let f = Fixture::new(Duration::from_secs(10)).await;

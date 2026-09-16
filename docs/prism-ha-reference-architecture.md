@@ -387,8 +387,11 @@ bound and re-entry after two successes. This is the #186 carry-over to #291.
 `qbit-prism-server self-check` adds `live_instances` to its existing JSON report.
 It snapshots `qbit_prism_instances` through a **read-only connection using the
 same resolved writer DSN**, before the existing self-check initializes its own
-coordinator (which writes a `starting` heartbeat). No new configuration reader,
-ledger method, migration or HA election is introduced.
+coordinator. That coordinator writes no heartbeat: the diagnostic is not a
+frontend, so it never appears in its own sample, leaves no row behind when it
+exits, and does not touch the row of a running frontend that shares its
+`PRISM_INSTANCE_ID`. No new configuration reader, migration or HA election is
+introduced.
 
 The server attempts to publish a heartbeat every **2 seconds**. `observed_at` is
 one PostgreSQL `clock_timestamp()` sample through `PRISM_DATABASE_URL`; counts
@@ -429,15 +432,31 @@ frontend with its configured ID; its legacy initialization still briefly writes
 `starting` for that ID after the snapshot. Concurrent diagnostics may therefore
 temporarily undercount; wait for the next server heartbeat before rechecking.
 
-The tools unit tests exercise empty/stale/fresh/boundary/future/startup rows and
-a failed connection. This SQL test creates a connection-local temporary table
-and verifies an empty result, an old heartbeat and a missing-table error without
-modifying deployment rows:
+The `ledger::instances::live_instance_tests` unit tests exercise
+empty/stale/fresh/boundary/future/startup rows and a failed connection. The SQL
+test `ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table`
+creates a connection-local temporary table and verifies an empty result, an old
+heartbeat and a missing-table error without modifying deployment rows. Export
+`PRISM_TEST_DATABASE_URL` for a **disposable** database, then run:
 
 ```sh
-PRISM_TEST_DATABASE_URL='postgresql://fixture:fixture@127.0.0.1:5432/fixture' \
-  cargo test -p qbit-prism-server tools::live_instance_tests -- --nocapture
+(
+  set -eu
+  name=ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
+  cargo test --locked -p qbit-prism-server --lib -- --list --exact "${name}" |
+    grep -Fqx "${name}: test"
+  out="$(PRISM_TEST_REQUIRE_INTEGRATION=1 cargo test --locked -p qbit-prism-server \
+    --lib -- --exact "${name}" --nocapture 2>&1)" || { printf '%s\n' "${out}"; exit 1; }
+  printf '%s\n' "${out}"
+  printf '%s\n' "${out}" | grep -Fq 'test result: ok. 1 passed; 0 failed;'
+)
 ```
+
+Record the step as passed only when the subshell exits zero. It fails when the
+name does not enumerate exactly that test, when the run does not report one
+pass (a `0 passed` result is a failure), and, because
+`PRISM_TEST_REQUIRE_INTEGRATION=1` turns the gate's skip into a failure, when
+`PRISM_TEST_DATABASE_URL` is unset, empty or unreachable.
 
 For a full-command SQL failure probe, use a **disposable** database
 and a DSN whose `options=-csearch_path=missing_ha_probe` hides the heartbeat

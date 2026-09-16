@@ -18,6 +18,11 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 #[derive(Default)]
 struct NetworkReplyGate {
     paused: Notify,
@@ -245,17 +250,10 @@ async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let admin = sqlx::PgPool::connect(&raw).await?;
-    let schema = format!("prism_allocation_error_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-    let mut url = url::Url::parse(&raw)?;
-    url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
+    let fixture = FixtureDatabase::open(&raw, "prism_allocation_error_").await?;
     let node = Node::open().await?;
     let coordinator = Coordinator::new(
-        coordinator_config(url.into(), &node)?,
+        coordinator_config(fixture.url.clone(), &node)?,
         Arc::new(qbit_prism_server::metrics::Metrics::default()),
     )
     .await?;
@@ -282,11 +280,7 @@ async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
     assert!(error.message.contains("1024 allocation attempts"));
     held.release().await?;
     coordinator.ledger.pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin)
-        .await?;
-    admin.close().await;
-    Ok(())
+    fixture.close(Ok(())).await
 }
 
 /// The candidate is not settled by an attempt whose node observation
@@ -349,17 +343,10 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let admin = sqlx::PgPool::connect(&raw).await?;
-    let schema = format!("prism_readiness_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-    let mut url = url::Url::parse(&raw)?;
-    url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
+    let fixture = FixtureDatabase::open(&raw, "prism_readiness_").await?;
     let node = Node::open().await?;
     let coordinator = Coordinator::new(
-        coordinator_config(url.into(), &node)?,
+        coordinator_config(fixture.url.clone(), &node)?,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     )
     .await?;
@@ -621,11 +608,7 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
     }
     .await;
     coordinator.ledger.pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin)
-        .await?;
-    admin.close().await;
-    result
+    fixture.close(result).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -634,21 +617,14 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let admin = sqlx::PgPool::connect(&raw).await?;
-    let schema = format!("prism_job_revision_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-    let mut url = url::Url::parse(&raw)?;
-    url.query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
+    let fixture = FixtureDatabase::open(&raw, "prism_job_revision_").await?;
     let node = Node::open().await?;
     let first = Coordinator::new(
-        coordinator_config(url.to_string(), &node)?,
+        coordinator_config(fixture.url.clone(), &node)?,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     )
     .await?;
-    let mut config = coordinator_config(url.into(), &node)?;
+    let mut config = coordinator_config(fixture.url.clone(), &node)?;
     config.instance_id = "readiness-second".into();
     let second = Coordinator::new(
         config,
@@ -742,11 +718,7 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
     }.await;
     first.ledger.pool.close().await;
     second.ledger.pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin)
-        .await?;
-    admin.close().await;
-    result
+    fixture.close(result).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -754,17 +726,10 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let admin = sqlx::PgPool::connect(&raw).await?;
     for explicit in [true, false] {
-        let schema = format!("prism_fee_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        let fixture = FixtureDatabase::open(&raw, "prism_fee_").await?;
         let node = Node::open().await?;
-        let mut config = coordinator_config(url.into(), &node)?;
+        let mut config = coordinator_config(fixture.url.clone(), &node)?;
         config.ctv_enabled = true;
         config.ctv_config.max_direct_coinbase_outputs = 0;
         config.ctv_fee = explicit.then(|| qbit_prism::FanoutFeeRatePolicy::new(1000, 12000));
@@ -953,11 +918,7 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
         }
         .await;
         coordinator.ledger.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&admin)
-            .await?;
-        result?;
+        fixture.close(result).await?;
     }
-    admin.close().await;
     Ok(())
 }

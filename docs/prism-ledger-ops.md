@@ -147,6 +147,77 @@ therefore impossible across crashes and takeovers. The price is that a crash
 between the reservation commit and the call loses that delivery; the row
 reports it as unknown and reconciles rather than retrying.
 
+**Parked candidates.** A claim parks a row it must not use instead of
+retrying it. Two cases park: an unsupported `storage_version`, or a version-1
+row without its JSONB body (#285); and, since #387, a supported row whose
+persisted input fails the claim's validation. That covers a missing window
+reference or an inline pre-007 document, and JSON that is not a supported
+candidate. It covers a `candidate_sha256` or document block hash that
+disagrees with the row, and window columns that disagree with the document
+or cannot hold its range. It also covers missing, truncated or mis-hashed
+block bytes, an empty or non-hex coinbase suffix, stored inputs that
+contradict the window reference, and an offer outcome this binary does not
+know, persisted on a claimed unfinished row. (A claim selects only the four
+unfinished states, so a row in an unknown state is never claimed and never
+reaches this path.) The decode runs after the claim commits, and parking is
+one `UPDATE` in a follow-up transaction behind the writer fence. That update
+matches the row's database block hash, the claim's token and the state the
+claim selected, so a replacement owner's claim, or a row that has since moved
+to another state, is never parked. It clears `claim_token`,
+`claim_instance_id` and `claim_expires_at`, records the reason in
+`last_error` and sets `next_attempt_at` to `infinity`. The state, document,
+digest, block bytes, window columns and offer record stay unchanged, and
+`attempt_count` keeps the claim's increment. A validation reason reads
+`candidate <block_hash>: validation <kind>: <diagnosis>`, at most 1024 bytes,
+where `<kind>` is one of `lifecycle`, `window_reference`, `document`,
+`document_digest`, `document_identity`, `window_columns`, `block`,
+`coinbase_suffix` or `reference_invariants`. The claim still fails, so the
+submit loop logs `candidate polling failed`. The ledger logs the full
+diagnosis with one of three messages, and only the first means the row is
+parked:
+
+| Log message | Meaning |
+| --- | --- |
+| `parked a candidate that failed validation; operator action required` | The update matched exactly one row and its commit succeeded. |
+| `a candidate failed validation and was not parked` | Nothing was committed: the transaction could not begin, the writer fence refused, the claim was no longer this attempt's, or the transaction failed before its commit. A row still held by that claim is claimed again after its lease and parking is retried. |
+| `a candidate failed validation and whether it was parked is unknown; inspect the row` | The commit returned an error, so the outcome is unknown. |
+
+Nothing else parks a row. A claim or decode failure that is not one of these
+validation failures is not evidence about the stored candidate: a database or
+connection error while claiming, an executor or join failure, a column that
+cannot be read, or an error serializing the parsed document. Such a claim
+parks nothing and is left to expire and be retried. A failure of the parking
+transaction itself is reported as in the table above; in particular, a
+parking commit error can leave the row durably parked with an unknown
+outcome.
+
+Find parked rows and their reasons with:
+
+```sql
+SELECT block_hash, state, storage_version, attempt_count, last_error, updated_at
+FROM qbit_block_candidate_outbox
+WHERE state IN ('pending', 'offer_reserved', 'offered', 'reconciliation')
+  AND next_attempt_at = 'infinity'
+ORDER BY updated_at;
+```
+
+Nothing unparks a row automatically. No binary resets `next_attempt_at`,
+whether it is the one that parked the row or an earlier release. Reverting
+the binary therefore leaves every parked row parked, because a claim selects
+only due rows. Recovery is explicit operator work, and there is no recovery
+command for it yet (#268 tracks listing and abandonment). First preserve the
+row, from a backup or with `SELECT to_jsonb(o) FROM
+qbit_block_candidate_outbox o WHERE block_hash = '<hash>'`. Then establish
+why the stored evidence disagrees. Never edit the document, its digest, the
+block bytes or the window columns to make a row pass: they are what the
+claim authenticates. Once the cause is resolved, an operator may return the
+row to the claim lanes with `UPDATE qbit_block_candidate_outbox SET
+next_attempt_at = clock_timestamp() WHERE block_hash = '<hash>' AND
+next_attempt_at = 'infinity'`. A row that still fails validation is parked
+again with a fresh reason. Resetting the schedule of an `offer_reserved`,
+`offered` or `reconciliation` row never grants another offer (see
+**Recovery** above).
+
 **Timing.** `proof_observed_at_ms` is the enqueuing frontend's wall clock as
 the locally validated block proof entered the coordinator; `offered_at_ms` is
 the offering frontend's wall clock immediately before its `submitblock` call.
@@ -166,8 +237,16 @@ most once per block, not exactly once across crashes.
 through its whole attempt and offers it after landing, or before landing for
 a leased candidate; a post-011 frontend would reserve and offer such a row
 again. The two must never share an outbox. Stop every pre-011 frontend and
-let their claims expire (at most the 120 s lease) before migrating. 011
-refuses to run while any pending row holds a live claim, refuses an attempted
+let their claims expire (at most the 120 s lease) before migrating. Keep
+supervisors and automatic restarts disabled throughout the cutover. Every
+`qbit_prism_instances` row must explicitly report `stopped` or `drained`;
+011 names and refuses any other instance, even with an empty outbox or a
+stale heartbeat. Heartbeat age proves only that reporting stopped, not that
+an idle or paused frontend cannot resume. Resolve blockers through graceful
+shutdown; do not edit or delete instance evidence to bypass the check.
+The scan holds a table lock through migration commit to serialize heartbeat
+registration and updates. 011 also refuses any pending row with a live claim,
+refuses an attempted
 pending row that lacks its block bytes or window reference, quarantines every
 pending row a pre-011 frontend attempted as `reconciliation` with an unknown
 outcome (recovered without any offer, confirmed if the chain holds the block,
@@ -191,6 +270,20 @@ writes, and a kept CHECK that rejects the quarantine or a lifecycle write
 fails that write's transaction as any CHECK would. Signer rotation is
 refused while any unfinished row stores other keys, in every unfinished
 state.
+
+**Startup fence (012).** The instance-table lock alone cannot reject an old
+startup queued behind migration. Migration 012 adds a database CHECK that
+requires `candidate_offer_lifecycle: 1` in every `starting` heartbeat. This
+binary writes that marker; a pre-011 binary cannot finish registering even
+if it checked capabilities before the cutover. The constraint is checked
+after the lock wait, including an upsert that would reuse a stopped instance
+ID. Shutdown and historical health evidence are retained. Migration 012 and
+011 commit together on a pre-011 database. A database already at 011 must
+also stop all frontends gracefully before applying 012; it uses the same
+explicit shutdown check. Restart with this binary after cutover. The new
+`instance_offer_startup = 1` capability rejects earlier binaries at their
+ordinary startup gate, and this binary refuses a missing or changed
+012 declaration. Recovery exports require the same schema and declaration.
 
 PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
@@ -292,7 +385,11 @@ qbit-prism-server broadcast-ctv
 The integrated periodic worker uses `PRISM_CTV_BROADCASTER_ENABLED=1`. An optional
 CPFP wallet and fee configuration must be consistent with the intended operating
 policy. Durable claims coordinate work across instances; node RPCs may still
-receive an identical transaction more than once after a lost reply.
+receive an identical transaction more than once after a lost reply. The one-shot
+`broadcast-ctv` verifies the node, the schema and the cluster fingerprint like a
+frontend but registers no heartbeat: its claims are fenced by their own claim
+tokens, so it never competes with a frontend's broadcaster for the same fanout
+and leaves no `qbit_prism_instances` row for fatal-state recovery to refuse.
 
 Confirmed fanouts are observed every five seconds until 1,000 confirmations;
 afterward the latest deep checkpoint is checked every 60 seconds. A shallow
@@ -585,6 +682,174 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    on production-sized history and retains the exact data-loss boundary when
    completing the 3.0.0 release notes before approving rollout.
 
+## Share ledger indexes
+
+`qbit_share_ledger` is append-only and every insert maintains every index,
+so an index nobody scans, or INCLUDE payload nobody reads, is write
+amplification without a reader. Migration 013 (#153) trimmed the secondary
+indexes to the native query set below. The table is what to check against
+before adding an index or a query that reads the ledger.
+
+| Index | Definition | Native readers | Plan |
+| --- | --- | --- | --- |
+| `qbit_share_ledger_pkey` | `(share_seq)` | every `share_seq` walk that projects share rows: the payout page walk of `snapshot`, the audit range reads, `qbit_prism_window`'s ranking pass, the rollup batch in `rollups.sql`, the latest-share probe | index scan, then the heap for the projected columns |
+| `qbit_share_ledger_share_id_key` | `(share_id)`, unique | the duplicate-share probes on submit, `share_accepted_at_ms` | index scan |
+| `qbit_share_ledger_accepted_seq_walk_idx` (013) | `(share_seq DESC) INCLUDE (job_issued_at, accepted_at, share_difficulty) WHERE accepted` | `qbit_prism_window`'s newest-first page walk (pool snapshot, reward leaderboard), the landing durable-range count under the settlement lock, `max(share_seq)`, the rollup boundary and tail passes | index-only |
+| `qbit_share_ledger_accepted_recent_idx` | `(accepted_at DESC) INCLUDE (share_difficulty, miner_id, share_seq) WHERE accepted` | pool hashrate series, leaderboard window, pool snapshot rollups, the miner summary's pool figure, evidence counts | index-only |
+| `qbit_share_ledger_accepted_miner_history_idx` (013) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
+| `qbit_share_ledger_accepted_block_suffix_idx` | `((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC) INCLUDE (miner_id, share_difficulty, network_difficulty) WHERE accepted AND length(share_id) >= 65` | the block-solver lookup in blocks, leaderboard, reward leaderboard and pool snapshot | index scan, one row per block |
+
+Dropped by 013, with no native reader:
+
+- `qbit_share_ledger_accepted_seq_window_idx`, `share_seq DESC` with seven
+  INCLUDE columns. Every `share_seq` walk was planned on the primary key, so
+  the payload never earned an index-only read; the narrow replacement is the
+  one the planner takes.
+- `qbit_share_ledger_accepted_miner_recent_idx`: its `payout_order_key`
+  INCLUDE had no reader.
+- `qbit_share_ledger_accepted_window_idx`, `(job_issued_at, share_seq DESC)`:
+  `job_issued_at` is only ever a filter on a `share_seq` walk.
+- `qbit_share_ledger_template_height_idx`: no native query filters on
+  `template_height`. `qbit_shares_since_template_height`, the 001 operator
+  replay function, is its only caller and now reads the primary key with a
+  filter; if a native consumer appears, restoring it is one
+  `CREATE INDEX CONCURRENTLY ... ON qbit_share_ledger (template_height, share_seq) WHERE accepted`.
+
+`WHERE accepted` stays on every partial index. The native writers only
+insert accepted rows, but every reader excludes rejected rows by contract
+(the window and rollup tests write `accepted = false` rows to prove it), and
+the predicate is what lets the frozen `qbit_prism_window` walk stay
+index-only without carrying the column.
+
+Known full scan: the boundary and tail passes of
+`dashboard_hashrate_rollups.sql` bound `accepted_at` through CTE values the
+planner cannot estimate, so each is a full index-only scan (of
+`accepted_seq_walk_idx` after 013, of `accepted_recent_idx` before it). That
+predates 013 and is a query change, not an index change.
+
+### Measuring the trim on production
+
+Run these on the production database after 013 and before scheduling #144,
+in this order. The `ANALYZE` comes first: the statistics captured for #144
+were hundreds of times below the row count, and every plan is provisional
+until they are current.
+
+```sql
+ANALYZE qbit_share_ledger;
+
+-- Statistics after the ANALYZE, against the real row count.
+SELECT c.reltuples::bigint, s.n_live_tup, (SELECT count(*) FROM qbit_share_ledger) AS rows
+FROM pg_class c JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE c.relname = 'qbit_share_ledger';
+
+-- Whether vacuum has run, so the visibility map is set and index-only scans
+-- do not fall back to the heap; stats_reset bounds the scan counts below.
+SELECT s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze,
+       s.n_tup_ins, s.n_dead_tup, age(c.relfrozenxid) AS frozen_age,
+       pg_postmaster_start_time(), d.stats_reset
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+JOIN pg_stat_database d ON d.datname = current_database()
+WHERE s.relname = 'qbit_share_ledger';
+
+-- Every index with its size and scan count; a zero-scan index has had no
+-- reader since stats_reset.
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes WHERE relname = 'qbit_share_ledger'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- The gate: the payout page walk as the pool snapshot runs it, with the
+-- network difficulty of the moment. "Heap Fetches" near zero on
+-- qbit_share_ledger_accepted_seq_walk_idx means the covering index earns
+-- index-only reads; large Heap Fetches mean the visibility map is cold
+-- (VACUUM qbit_share_ledger, then run it again).
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*), sum(counted_difficulty)
+FROM qbit_prism_window(clock_timestamp(), (<network difficulty> * 8)::numeric);
+```
+
+Record the index sizes before and after 013, the scan counts, the
+`Heap Fetches` lines of the page walk, and the share acknowledgement latency
+histogram from `/metrics` before and after, in #153 and #144.
+
+## Offline pool-fee and CTV fee-rate changes
+
+`qbit-prism-server policy-transition --to /protected/next.env` changes the
+cluster's pinned fee policy after **every frontend has stopped**. It supports
+pool-fee enablement, recipient and basis-point changes, and explicit/automatic
+CTV fee rates and premiums. Signing keys, genesis, username fallback, output
+ordering, payout thresholds, CTV enablement and settlement layout must stay
+unchanged. Signing-key rotation and multi-epoch verification are deferred.
+
+1. Preserve the current configuration, signing material and database backup.
+   Prepare a protected env file containing the target overrides. For example,
+   for an already-enabled pool fee and CTV settlement:
+
+   ```dotenv
+   PRISM_POOL_FEE_BPS=200
+   PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT=2000
+   PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
+   ```
+
+   These are examples, not market-rate recommendations. The command validates
+   the target CTV fee against the node's current relay and mempool floors; it
+   can replace an old rate that is already below those floors. Mainnet still
+   requires an explicit rate. Rates can change again before restart.
+
+2. Disable automatic restarts and stop every frontend and standalone candidate
+   or CTV worker. Graceful SIGTERM closes miner admission and drains workers;
+   in the bundled stack use
+   `docker compose stop --timeout 45 prism-coordinator prism-coordinator-2`.
+   Confirm every `qbit_prism_instances.status.state` is `stopped`. A stale,
+   `starting`, `draining`, `drained`, unknown or live heartbeat is refused by
+   instance name. There is no force flag. If a crashed instance cannot record
+   its own stopped marker, escalate for reviewed recovery; do not manufacture
+   markers with SQL. Keep the qbit node and database available.
+
+3. With the **current** configuration in the command's environment, run:
+
+   ```sh
+   qbit-prism-server migrate
+   qbit-prism-server policy-transition --to /protected/next.env
+   ```
+
+   Migration `014` adds the immutable transition journal (`013` is used for
+   the share ledger index trim). The command creates no frontend heartbeat.
+   The target file overlays current `PRISM_*` and `QBIT_*` variables; omitted
+   values retain their current values, and an empty value clears an optional
+   setting. It supports dotenv quoting and `export`, never shell execution.
+   Other stack variables are ignored. The target database URL must be unchanged.
+   Both effective policies are checked with the normal configuration parser
+   and pool-fee address resolution. The current fingerprint must match the
+   database, and the target must actually change the policy.
+
+4. Save the returned JSON. Under the settlement and ordering locks, with
+   concurrent frontend registrations excluded, one transaction updates the
+   fingerprint, increments `payout_revision` once, and journals the old/new
+   public policies, revisions, database login, instance snapshot and candidate
+   counts. It abandons unoffered pending candidates with `epoch-superseded` and
+   releases their retained window/block payloads. A pending candidate with an
+   already-landed block is refused until reconciled. Offered, offer-reserved
+   and reconciliation candidates retain their original bytes, policy and keys;
+   their old claims are fenced and they can resume immediately on restart
+   without another offer. Parked rows stay parked for operator recovery.
+   Existing audit and CTV manifest bytes are unchanged. Recovery evidence
+   exports include the transition journal and its allocation sequence.
+
+   A failure before commit leaves the policy and candidate dispositions intact.
+   A timeout or lost commit response can mean success: inspect
+   `qbit_prism_policy_transitions` and the cluster fingerprint/revision before
+   retrying. Repeating a committed transition with the old environment fails
+   the current-fingerprint check and does not increment the revision again.
+   The journal contains public keys, never signing seeds or credentials.
+
+5. Apply the effective target configuration to **all** frontends, run the normal
+   `check-config`, then restart and verify health before restoring miner traffic.
+   Restarting with the old policy is rejected and names the active payout
+   revision. Miners disconnect during the stop and receive fresh work after
+   reconnecting; revision-bound jobs prepared before the transition cannot be
+   issued. Historical verification continues to use the unchanged public keys.
+
 ## Fatal-state recovery
 
 A disconnected mature pool block or deep confirmed CTV fanout records a shared
@@ -727,7 +992,15 @@ LIMIT 200;
 
 Every row must show `stopped` or `drained`. A running frontend's row holds its
 health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
-never became ready. Stale does not mean stopped: a heartbeat older than the
+never became ready. Only `run` frontends write rows: the one-shot commands
+`self-check`, `import-audits`, `backfill-ctv` and `broadcast-ctv` pass the same
+startup gates (schema and capabilities, the halt guard, the cluster
+fingerprint) without registering, so a normal or failed exit leaves nothing
+behind, and a run under a live frontend's `PRISM_INSTANCE_ID` leaves that row,
+including its session-owner token, untouched. A `starting` row under a
+generated UUID that an earlier 3.x.x build's one-shot command left behind is
+still refused and still needs the investigation below; nothing removes it
+automatically. Stale does not mean stopped: a heartbeat older than the
 `self-check` window (`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds) shows
 only that reporting stopped. The process may be hung, paused, cut off from
 PostgreSQL, or on an unreachable host, and
@@ -892,7 +1165,7 @@ QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
 
 The database test wrapper starts a private local cluster unless
 `PRISM_TEST_DATABASE_URL` is supplied. Its default mode runs the whole workspace
-and the two explicit `--ignored` database runs, as CI does, and checks the
+and the three explicit `--ignored` database targets, as CI does, and checks the
 integration gate's manifest so no gated test passes without running (see
 [the integration test gate](prism-integration-test-gate.md)). Live tests add
 actual qbitd regtest and bounded CPU mining. Use an isolated database for tests. The native builder

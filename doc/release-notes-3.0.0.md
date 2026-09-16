@@ -29,3 +29,11 @@ digest, trusted ledger key and recorded coinbase. Rehearse it on an isolated
 source restore before migrating the source. Production `self-check` fails when
 audits lack shared stored bodies or canonical availability; native immutable
 snapshots provide canonical reconstruction without a duplicate full byte copy.
+
+The one-shot commands `self-check`, `import-audits`, `backfill-ctv` and
+`broadcast-ctv` no longer register a frontend heartbeat (#381). Earlier 3.x.x
+builds left a `starting` row under a generated instance ID after every
+invocation, which `fatal-state clear` then refused, and overwrote the live
+frontend's status when the ID was configured. Rows those builds left behind are
+not removed automatically; the fatal-state runbook's investigation still applies
+to them.

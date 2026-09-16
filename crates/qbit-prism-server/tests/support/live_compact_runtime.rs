@@ -17,6 +17,8 @@ mod jsonb_inventory;
 mod observer;
 #[path = "ledger_execution_proxy.rs"]
 mod proxy;
+#[path = "wal_primary.rs"]
+mod wal_primary;
 #[path = "window_fixture.rs"]
 #[allow(dead_code)]
 mod window_fixture;
@@ -97,7 +99,11 @@ async fn large_wallet_template(f: &Fixture) -> Result<Value> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_large_template_first_insertion_resumes_and_mines_with_bounded_jsonb_and_wal(
 ) -> Result<()> {
-    let Some(fixture) = Fixture::open_with_servers(false, false).await? else {
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let primary = wal_primary::Primary::start(bin).await?;
+    let Some(fixture) = Fixture::open_on_database(false, false, Some(&primary.url)).await? else {
         return Ok(());
     };
     let mut frontends = Vec::new();
@@ -143,6 +149,7 @@ async fn real_large_template_first_insertion_resumes_and_mines_with_bounded_json
         let after = observer::insert_lsn(&fixture.pool).await?;
         let wal = observer::wal_bytes(&fixture.pool, &before, &after).await?;
         let measured = probe.measure(proxy, mark)?;
+        eprintln!("real-node refresh observation: max_jsonb={}, insert_wal_bytes={wal}, refresh_seconds={:.3}", measured.max_uncompressed_bytes, elapsed.as_secs_f64());
         let prepared = a.prepared.read().await.clone().context("refresh did not publish")?;
         assertions::assert_refresh_measurements(5000, prepared.window.shares.context("window missing")?.share_count,
             Some(measured.max_uncompressed_bytes), Some(wal))?;
@@ -189,5 +196,6 @@ async fn real_large_template_first_insertion_resumes_and_mines_with_bounded_json
         eprintln!("{}", fixture.diagnostics());
     }
     let cleanup = fixture.cleanup().await;
-    result.and(proxy_result).and(cleanup)
+    let primary = primary.close().await;
+    result.and(proxy_result).and(cleanup).and(primary)
 }

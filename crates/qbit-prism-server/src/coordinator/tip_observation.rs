@@ -122,6 +122,7 @@ impl PreparedIdentity {
             && self.revision == prepared.snapshot.payout_revision
             && self.parent.as_deref() == prepared.template["previousblockhash"].as_str()
     }
+    #[cfg(test)]
     pub(super) fn from_stored(key: &str, prepared: &StoredPrepared, window: WindowRef) -> Self {
         Self {
             key: key.into(),
@@ -148,9 +149,8 @@ impl PreparedIdentity {
         }
     }
 
-    /// Activation can construct the same slim authority view without retaining
-    /// a Prepared, Snapshot or AuditBundle. Expiry stays a separate fixed input.
-    #[allow(dead_code)]
+    /// Construct original resume authority without retaining a Prepared,
+    /// Snapshot or AuditBundle. Expiry stays a separate fixed input.
     pub(super) fn from_compact(key: &str, record: &crate::ledger::CompactPrepared) -> Self {
         Self {
             key: key.into(),
@@ -440,6 +440,7 @@ impl Coordinator {
     /// Current publication may issue/recover miner work during its bounded
     /// replacement lease. Persistence still locks the *current* DB revision;
     /// as-issued payloads retain their original economic snapshot.
+    #[cfg(test)]
     pub(super) async fn issued_work_revision(&self, prepared: &Prepared) -> Result<Option<i64>> {
         self.work_authority_revision(&PreparedIdentity::of(prepared), None)
             .await
@@ -447,6 +448,7 @@ impl Coordinator {
 
     /// A slim original authority view plus an optional absolute issued expiry.
     /// The caller owns its original deadline; no stage creates a new budget.
+    #[cfg(test)]
     pub(super) async fn work_authority_revision(
         &self,
         identity: &PreparedIdentity,
@@ -457,6 +459,7 @@ impl Coordinator {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn work_authority_revision_in_epoch(
         &self,
         identity: &PreparedIdentity,

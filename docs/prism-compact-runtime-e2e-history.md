@@ -1,4 +1,8 @@
-# Compact runtime end-to-end evidence
+# Compact runtime end-to-end qualification history
+
+This records the independent test slice and its integration at the named
+historical commits. Current review and qualification status is maintained in
+[PR #397](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/397).
 
 ## Independent baseline, 2026-09-15
 

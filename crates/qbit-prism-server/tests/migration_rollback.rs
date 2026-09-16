@@ -146,7 +146,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         for kind in [
             "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
-            "fatal_state", "fatal_state_events", "cluster_config", "payout_revision",
+            "fatal_state", "fatal_state_events", "policy_transitions", "cluster_config", "payout_revision",
             "ledger_clock",
         ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
@@ -488,6 +488,20 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(cleared["records"]["sequences"] != before_halt["records"]["sequences"]);
         unchanged["records"]["sequences"] = before_halt["records"]["sequences"].clone();
         ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
+
+        // The policy journal is evidence independently of the active fingerprint
+        // and revision. Its complete row and allocator must survive the native
+        // backup roundtrip below, even if every other accounting row is identical.
+        sqlx::query("INSERT INTO qbit_prism_policy_transitions(previous_fingerprint,config_fingerprint,previous_policy,policy,previous_revision,payout_revision,instances,abandoned_candidates,retained_candidates) SELECT 'prior-recovery-fingerprint',config_fingerprint,'{\"fee_bps\":100}','{\"fee_bps\":200}',payout_revision-1,payout_revision,'[]',2,3 FROM qbit_prism_cluster")
+            .execute(&source.pool).await?;
+        let transitioned = recovery::evidence(&source, pg_bin).await?;
+        ensure!(transitioned["records"]["policy_transitions"]["count"] == 1);
+        ensure!(transitioned["records"]["policy_transitions"] != cleared["records"]["policy_transitions"]);
+        ensure!(transitioned["records"]["sequences"] != cleared["records"]["sequences"]);
+        let mut unchanged = transitioned;
+        unchanged["records"]["policy_transitions"] = cleared["records"]["policy_transitions"].clone();
+        unchanged["records"]["sequences"] = cleared["records"]["sequences"].clone();
+        ensure!(unchanged == cleared, "policy journal must change only its own evidence");
 
         assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
         assert_candidate_payload_fingerprints(raw, pg_bin, &artifacts[0]).await?;
@@ -864,6 +878,7 @@ async fn assert_allocator_sequence_fingerprints(
             .await?;
     if native {
         sequences.push("qbit_prism_fatal_state_events_event_id_seq");
+        sequences.push("qbit_prism_policy_transitions_transition_id_seq");
     }
     for sequence in sequences {
         let original: (i64, bool) =
@@ -1173,6 +1188,7 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
                 "qbit_prism_audit_snapshots",
                 "qbit_prism_cluster",
                 "qbit_prism_fatal_state_events",
+                "qbit_prism_policy_transitions",
                 "qbit_prism_balance_snapshots",
                 "qbit_share_ledger",
                 "qbit_pool_blocks",
@@ -1331,12 +1347,12 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=2".into(),
-            "UPDATE qbit_prism_schema_capabilities SET capability_value=1".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_storage_version'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_storage_version'".into(),
             "declares candidate_storage_version = 2",
         ),
         (
@@ -1353,6 +1369,16 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_offer_lifecycle'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_offer_lifecycle'".into(),
             "declares candidate_offer_lifecycle = 2",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='instance_offer_startup'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('instance_offer_startup',1)".into(),
+            "instance_offer_startup",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='instance_offer_startup'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='instance_offer_startup'".into(),
+            "instance_offer_startup",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),

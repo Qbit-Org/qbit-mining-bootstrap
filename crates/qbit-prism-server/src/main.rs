@@ -2,6 +2,7 @@ mod process_security;
 
 fn main() -> anyhow::Result<()> {
     process_security::disable_core_dumps()?;
+    let command = qbit_prism_server::tools::prepare()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -20,5 +21,5 @@ fn main() -> anyhow::Result<()> {
         .thread_name("prism")
         .enable_all()
         .build()?;
-    runtime.block_on(qbit_prism_server::tools::run())
+    runtime.block_on(command)
 }

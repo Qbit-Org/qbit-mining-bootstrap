@@ -25,6 +25,8 @@ mod jsonb_inventory;
 mod observer;
 #[path = "support/ledger_execution_proxy.rs"]
 mod proxy;
+#[path = "support/wal_primary.rs"]
+mod wal_primary;
 #[path = "support/window_fixture.rs"]
 #[allow(dead_code)]
 mod window_fixture;
@@ -36,13 +38,16 @@ struct Database {
     proxy: proxy::ExecutionProxy,
     schema: String,
     url: String,
+    primary: wal_primary::Primary,
 }
 
 impl Database {
     async fn open() -> Result<Option<Self>> {
-        let Some(raw) = gate::database_url(gate::site!())? else {
+        let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
             return Ok(None);
         };
+        let primary = wal_primary::Primary::start(bin).await?;
+        let raw = primary.url.clone();
         let admin = PgPool::connect(&raw).await?;
         let (version, fsync): (String, String) =
             sqlx::query_as("SELECT current_setting('server_version_num'),current_setting('fsync')")
@@ -78,6 +83,7 @@ impl Database {
             proxy,
             schema,
             url,
+            primary,
         }))
     }
 
@@ -89,9 +95,10 @@ impl Database {
             .execute(&self.admin)
             .await;
         self.admin.close().await;
+        let primary = self.primary.close().await;
         proxy?;
         schema?;
-        Ok(())
+        primary
     }
 }
 
@@ -116,6 +123,11 @@ async fn run(
 }
 
 async fn qualify(n: u64) -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("qbit_prism_server::coordinator::compact_resume=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     run(|db| { async move {
         let node = fake_qbitd::FakeNode::open().await?;
         let mut frontends = Vec::new();
@@ -134,6 +146,10 @@ async fn qualify(n: u64) -> Result<()> {
             let (a,b) = (&frontends[0], &frontends[1]);
             let plan = window_fixture::WindowPlan::new(n)?;
             let loaded = plan.load(&db.direct, "compact-runtime-scale").await?;
+            // Bulk loading a fresh primary leaves no share distribution stats.
+            // Prepare them before measurement so page plans do not depend on
+            // whether the background auto-analyze interval has elapsed.
+            sqlx::query("ANALYZE qbit_share_ledger").execute(&db.direct).await?;
             plan.verify_round_trip(&db.direct, &[1,n/2,n]).await?;
             // Observer installation, fixture writes and checkpoint are outside
             // the insert-LSN bracket. This disposable primary has no workers.
@@ -149,6 +165,7 @@ async fn qualify(n: u64) -> Result<()> {
             let wal = observer::wal_bytes(&db.direct, &before, &after).await?;
             let prepared = a.prepared.read().await.clone().context("A published no work")?;
             let count = prepared.window.shares.context("nonempty reference absent")?.share_count;
+            eprintln!("compact refresh observation: shares={n}, published_shares={count}, max_jsonb={}, insert_wal_bytes={wal}, refresh_seconds={:.3}", measured.max_uncompressed_bytes, elapsed.as_secs_f64());
             assertions::assert_refresh_measurements(n,count,Some(measured.max_uncompressed_bytes),Some(wal))?;
             let payload: Value = sqlx::query_scalar("SELECT payload FROM qbit_prism_jobs WHERE job_id=$1")
                 .bind(&prepared.storage_key).fetch_one(&db.direct).await?;
@@ -169,14 +186,18 @@ async fn qualify(n: u64) -> Result<()> {
             let child: Value = sqlx::query_scalar("SELECT payload FROM qbit_prism_jobs WHERE job_id=$1")
                 .bind(&issued.wire.job_id).fetch_one(&db.direct).await?;
             assertions::assert_no_materialized_shares(&child)?;
-            b.refresh_once().await?;
+            let b_refresh_clock = Instant::now();
+            b.refresh_once().await.context("frontend B refresh failed")?;
+            eprintln!("compact scale phase: shares={n}, phase=frontend_b_refresh, seconds={:.3}", b_refresh_clock.elapsed().as_secs_f64());
             let resume_mark = db.proxy.mark();
             let resume_clock = Instant::now();
             // Every waiter has its own outer budget; common work contains no
             // worker, issued expiry, or first-waiter timeout.
             let resume = || async {
                 tokio::time::timeout(Duration::from_secs(25), b.resume_job(&worker,&issued.wire.job_id))
-                    .await??.context("cross-frontend resume missed")
+                    .await.context("cross-frontend resume exceeded its original 25-second budget")?
+                    .context("cross-frontend resume returned a backend error")?
+                    .context("cross-frontend resume missed")
             };
             let (r1,r2,r3,r4) = tokio::try_join!(resume(),resume(),resume(),resume())?;
             let resume_elapsed = resume_clock.elapsed();

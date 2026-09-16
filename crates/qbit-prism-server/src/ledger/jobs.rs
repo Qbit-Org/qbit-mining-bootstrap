@@ -163,7 +163,7 @@ impl Ledger {
             "SELECT payload FROM qbit_prism_jobs WHERE job_id=$1 AND expires_at>clock_timestamp()",
         )
         .bind(job_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *self.acquire().await?)
         .await?)
     }
 
@@ -171,7 +171,7 @@ impl Ledger {
         // A candidate ID may have been selected before renewal committed. The
         // outer predicate is rechecked after DELETE waits for its row lock.
         Ok(sqlx::query(cleanup::EXPIRED_JOBS)
-            .execute(&self.pool)
+            .execute(&mut *self.acquire().await?)
             .await?
             .rows_affected())
     }

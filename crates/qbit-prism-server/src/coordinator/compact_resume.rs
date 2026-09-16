@@ -1,6 +1,6 @@
 //! Bounded, waiter-owned reconstruction. No detached task gets a new deadline.
 use super::*;
-use crate::ledger::{PreparedTemplate, StoredCompactPrepared};
+use crate::ledger::{BlockingDrop, PreparedTemplate, ReadAdmission, StoredCompactPrepared};
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
 use prepared_storage::compact::{
@@ -21,25 +21,28 @@ impl std::error::Error for SharedFailure {
     }
 }
 type Metadata = Shared<
-    BoxFuture<'static, Result<Option<Arc<CompactOwner<StoredCompactPrepared>>>, SharedFailure>>,
+    BoxFuture<'static, Result<Option<Arc<BlockingDrop<StoredCompactPrepared>>>, SharedFailure>>,
 >;
 type Rebuild = Shared<BoxFuture<'static, Result<Arc<Prepared>, SharedFailure>>>;
 
 pub(super) struct ResumeFlight {
     pub metadata: Metadata,
     rebuild: StdMutex<Option<Rebuild>>,
-    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    _admission: ReadAdmission,
     changed: Arc<Notify>,
 }
 impl Drop for ResumeFlight {
     fn drop(&mut self) {
-        drop(self.slot.take());
         self.changed.notify_waiters();
     }
 }
 
 pub(super) struct ResumeFlights {
     entries: StdMutex<HashMap<(String, usize), Weak<ResumeFlight>>>,
+    // Unlike build_slots, this bounds distinct metadata reads and their
+    // retained template/balance decoders, including while awaiting authority
+    // or build admission. Keep the flight until its last waiter finishes;
+    // dropping it early would let overlapping resumes repeat the same work.
     slots: Arc<Semaphore>,
     changed: Arc<Notify>,
 }
@@ -72,15 +75,23 @@ impl ResumeFlights {
                     return flight;
                 }
                 if let Ok(slot) = self.slots.clone().try_acquire_owned() {
+                    let admission = ReadAdmission::notifying(slot, self.changed.clone());
+                    let decoder_admission = admission.clone();
                     let ledger = coordinator.work_ledger.clone();
                     let config = coordinator.config.clone();
                     let lookup = key.0.clone();
+                    // An overlapping cohort observes one read outcome,
+                    // including a failure. The weak map owns no result: once
+                    // the last waiter/decoder leaves, a later request retries
+                    // under its own original deadline and admission.
                     let metadata = async move {
                         let result = async {
-                            let Some(stored) = ledger.compact_prepared(&lookup).await? else {
+                            let Some(stored) = ledger
+                                .compact_prepared_with_admission(&lookup, decoder_admission)
+                                .await?
+                            else {
                                 return Ok(None);
                             };
-                            let stored = CompactOwner::new(stored);
                             if stored.record.audit_builder_version
                                 != qbit_prism::AUDIT_BUILDER_VERSION
                                 || stored.record.signer_keys != local_signer_keys(&config)?
@@ -97,7 +108,7 @@ impl ResumeFlights {
                     let flight = Arc::new(ResumeFlight {
                         metadata,
                         rebuild: StdMutex::new(None),
-                        slot: Some(slot),
+                        _admission: admission,
                         changed: self.changed.clone(),
                     });
                     entries.insert(key.clone(), Arc::downgrade(&flight));
@@ -115,7 +126,7 @@ impl ResumeFlight {
         &self,
         coordinator: &Coordinator,
         key: String,
-        metadata: Arc<CompactOwner<StoredCompactPrepared>>,
+        metadata: Arc<BlockingDrop<StoredCompactPrepared>>,
         extra_size: usize,
     ) -> Rebuild {
         let mut shared = self.rebuild.lock().unwrap();
@@ -151,10 +162,16 @@ async fn reconstruct(
     window_reads: Arc<Semaphore>,
     config: Arc<Config>,
     key: String,
-    metadata: Arc<CompactOwner<StoredCompactPrepared>>,
+    metadata: Arc<BlockingDrop<StoredCompactPrepared>>,
     extra_size: usize,
 ) -> Result<Arc<Prepared>> {
+    let started = Instant::now();
     let permit = build_slots.acquire_owned().await?;
+    tracing::debug!(
+        phase = "build_admission",
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "compact reconstruction progress"
+    );
     let owned = CompactOwner::new((metadata, permit));
     let window = if owned.0.record.window.shares.is_some() {
         let reader = window_reads.acquire_owned().await?;
@@ -166,12 +183,23 @@ async fn reconstruct(
     } else {
         None
     };
+    tracing::debug!(
+        phase = "window_read",
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "compact reconstruction progress"
+    );
     let (metadata, permit) = owned.into_inner();
     let owned = CompactOwner::new((metadata, window, permit));
     #[cfg(test)]
     let drop_probe = ledger.compact_drop_probe();
     let result = owned
         .spawn_blocking(move |(source_metadata, source_window, permit)| {
+            tracing::debug!(
+                phase = "blocking_start",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
+            // Bind admission first so later locals drop before it on error.
             let admission = permit;
             #[cfg(test)]
             let _cleanup = drop_probe;
@@ -200,6 +228,11 @@ async fn reconstruct(
             } else {
                 None
             };
+            tracing::debug!(
+                phase = "bundle_build",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             if let Some(body) = &body {
                 let expected = metadata
                     .record
@@ -216,18 +249,18 @@ async fn reconstruct(
                     "reconstructed prepared coinbase hash mismatch"
                 );
             }
+            tracing::debug!(
+                phase = "hash_verification",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             let wire = body
                 .as_ref()
                 .map(|body| {
-                    codec::Job::from_manifest(
-                        "shared".into(),
+                    bundle_build::shared_base_wire(
                         &metadata.template,
                         &body.signed_coinbase_manifest.manifest,
-                        "00000000",
                         extra_size,
-                        1.0,
-                        0.0,
-                        true,
                     )
                 })
                 .transpose()?;
@@ -246,6 +279,11 @@ async fn reconstruct(
             )?;
             drop(body);
             drop(snapshot);
+            tracing::debug!(
+                phase = "cleanup",
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "compact reconstruction progress"
+            );
             Ok::<_, anyhow::Error>(CompactOwner::new((captured.original, admission)))
         })
         .await??;

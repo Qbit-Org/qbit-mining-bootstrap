@@ -132,3 +132,7 @@ if docker exec "${PUBLIC_CONTAINER}" qbit-prism-server healthcheck >/dev/null 2>
 fi
 
 printf 'prism image smoke: public API healthy as uid %s with core dumps disabled\n' "${uid}"
+
+# Exercise dedicated-reader authentication through the real Compose merges,
+# image entrypoint and HTTP healthcheck, using disposable synthetic databases.
+PRISM_CREDENTIAL_TEST_IMAGE="${PRISM_IMAGE}" python3 -m unittest -v tests.test_prism_public_credentials

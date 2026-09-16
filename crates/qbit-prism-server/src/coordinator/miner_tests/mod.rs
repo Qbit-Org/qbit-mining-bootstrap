@@ -308,6 +308,7 @@ impl Fixture {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let store = Arc::new(MemoryLedger::default());
         let mut config = config::test_config();
+        config.rpc_url = url.clone();
         config.submit_tip_max_age = max_age;
         tune(&mut config);
         let ledger = Arc::new(Ledger::offline_for_tests(

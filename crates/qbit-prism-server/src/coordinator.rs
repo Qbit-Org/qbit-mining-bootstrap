@@ -14,7 +14,9 @@ use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use qbit_pool_builder::ManifestSigningKey;
-use qbit_prism::{AcceptedShare, AuditBundle, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy};
+#[cfg(test)]
+use qbit_prism::AuditBundle;
+use qbit_prism::{AcceptedShare, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -37,7 +39,6 @@ mod publication_authority;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
-#[cfg_attr(not(test), allow(dead_code))]
 mod tip_observation;
 mod work_ledger;
 pub use compact_runtime::{PreparedBundle, PreparedSnapshot};
@@ -144,7 +145,7 @@ pub struct Prepared {
     pub parent_of_tip: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct StoredPrepared {
     template: Value,
@@ -165,7 +166,7 @@ struct StoredPrepared {
     coinbase_suffix: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl StoredPrepared {
     /// Legacy rows cannot prove their CTV inputs or builder version. A resumed
     /// candidate (including bootstrap work) must use the exact issued inputs,
@@ -502,12 +503,12 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 }
 
 #[derive(Debug)]
-struct ValidatedFeePolicy {
+pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
 }
 
-async fn validated_ctv_fee_policy(
+pub(crate) async fn validated_ctv_fee_policy(
     rpc: &Rpc,
     configured: Option<FanoutFeeRatePolicy>,
     premium_bps: u64,
@@ -554,9 +555,32 @@ fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result
 }
 
 impl Coordinator {
-    pub async fn new(
+    /// Start a `run` frontend's coordinator: validate the node and the
+    /// configuration, register the frontend with a `starting` heartbeat and
+    /// pin or verify the cluster fingerprint.
+    pub async fn new(config: Config, metrics: Arc<crate::metrics::Metrics>) -> Result<Arc<Self>> {
+        Self::connect(config, metrics, true).await
+    }
+
+    /// Start a one-shot command's coordinator (`self-check`, `broadcast-ctv`).
+    /// Every gate of [`Coordinator::new`] still applies: the node's genesis
+    /// and chain, the schema and capability checks, the halt guard and the
+    /// cluster fingerprint. The difference is [`Ledger::connect_tool`] in
+    /// place of the registering connection: the command writes no heartbeat,
+    /// so its exit leaves no frontend row behind and a live frontend sharing
+    /// its instance ID is not touched. Claims it takes remain fenced by their
+    /// own tokens.
+    pub async fn new_tool(
+        config: Config,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Arc<Self>> {
+        Self::connect(config, metrics, false).await
+    }
+
+    async fn connect(
         mut config: Config,
         metrics: Arc<crate::metrics::Metrics>,
+        register_frontend: bool,
     ) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
             config.rpc_url.clone(),
@@ -598,7 +622,7 @@ impl Coordinator {
                 || (configured_chain == "testnet3" && actual_chain == "test"),
             "configured QBIT_CHAIN differs from connected node"
         );
-        let ledger = Arc::new(
+        let ledger = Arc::new(if register_frontend {
             Ledger::connect_with_metrics(
                 &config.database_url,
                 config.instance_id.clone(),
@@ -606,8 +630,17 @@ impl Coordinator {
                 config.initialize_schema,
                 Some(metrics.clone()),
             )
-            .await?,
-        );
+            .await?
+        } else {
+            Ledger::connect_tool(
+                &config.database_url,
+                config.instance_id.clone(),
+                config.database_connections,
+                config.initialize_schema,
+                Some(metrics.clone()),
+            )
+            .await?
+        });
         if !config.initialize_schema {
             let ready: bool = sqlx::query_scalar(
                 "SELECT count(*)=2 FROM qbit_prism_schema_migrations WHERE version IN (7,9)",
@@ -620,6 +653,10 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
+        // Keep a frontend's initial heartbeat non-quiescent if configuration
+        // fails. Another live incarnation may share this instance ID, so this
+        // rejected startup cannot safely publish `stopped` for the shared row.
+        // A one-shot command wrote no heartbeat and has nothing to retract.
         ledger
             .configure(
                 &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,
@@ -953,8 +990,14 @@ impl Coordinator {
                     .context("prepared TTL overflow")?,
             )
             .context("prepared expiry overflow")?;
-        let permit = self.build_slots.clone().acquire_owned().await?;
-        let snapshot = self.work_ledger.snapshot(network).await?;
+        let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
+        let snapshot = self
+            .work_ledger
+            .snapshot_with_admission(
+                network,
+                crate::ledger::ReadAdmission::shared(permit.clone()),
+            )
+            .await?;
         let admitted = prepared_storage::compact::CompactOwner::new((snapshot, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
@@ -978,7 +1021,7 @@ impl Coordinator {
             proof,
             key: storage_key,
             template,
-            snapshot,
+            snapshot: snapshot.into_inner(),
             inputs,
             fee,
             fingerprint,
@@ -2050,6 +2093,12 @@ impl MiningBackend for Coordinator {
             let initial = self.authority_view().await;
             let readiness_epoch = initial.readiness.generation;
             let published_tip = initial.tip.publication_stamp();
+            let published_payout = initial.prepared.as_ref().map(|prepared| {
+                (
+                    prepared.template["previousblockhash"].clone(),
+                    prepared.snapshot.payout_revision,
+                )
+            });
             drop(initial);
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
@@ -2089,6 +2138,8 @@ impl MiningBackend for Coordinator {
                 let Some(metadata) = flight.metadata.clone().await? else {
                     return Ok(None);
                 };
+                let (published_parent, published_revision) =
+                    published_payout.as_ref().context("no current template")?;
                 let identity = tip_observation::PreparedIdentity::from_compact(
                     &stored.prepared_key,
                     &metadata.record,
@@ -2099,6 +2150,15 @@ impl MiningBackend for Coordinator {
                 else {
                     return Ok(None);
                 };
+                // Preserve ordinary resume's publication compatibility. A
+                // current database revision alone does not prove this frontend
+                // has published that payout. Exact identity remains the
+                // separate, stricter requirement for a replacement lease.
+                if published_parent.as_str() != Some(metadata.record.parent_hash.as_str())
+                    || *published_revision != metadata.record.payout_revision
+                {
+                    return Ok(None);
+                }
                 // Coalescer/metadata waits precede the identity-specific
                 // proof. They cannot borrow a publication that superseded the
                 // operation's original admission while those waits ran.
@@ -2316,6 +2376,9 @@ mod candidate_lease_tests;
 
 #[cfg(test)]
 pub(crate) mod miner_tests;
+
+#[cfg(test)]
+mod compact_decode_tests;
 
 #[cfg(test)]
 mod d2_below_target_tests;

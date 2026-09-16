@@ -83,8 +83,7 @@ lock-free persistence or simulate actual landing work.
 
 ## Reproduction
 
-Use a clean checkout of the measured harness SHA and its existing test-profile
-binary for exact reproduction. Set `PRISM_TEST_DATABASE_URL` to a dedicated
+Use a clean checkout of the measured harness SHA. Set `PRISM_TEST_DATABASE_URL` to a dedicated
 disposable PG16 primary with the three durability settings above; coordinate
 other builds/tests and inspect resource limits first. For each of three
 repetitions, set `manifest` to a fresh output file, then run:
@@ -93,16 +92,41 @@ repetitions, set `manifest` to a fresh output file, then run:
 ulimit -n 16384
 PRISM_TEST_REQUIRE_INTEGRATION=1 \
 PRISM_TEST_GATE_MANIFEST="$manifest" \
-target/debug/deps/b275_persistence_measure-696abc204732aa70 \
+cargo test --locked -p qbit-prism-server --test b275_persistence_measure \
   measure_2000_sessions_one_and_two_frontends \
-  --ignored --exact --test-threads=2 --nocapture
+  -- --ignored --exact --test-threads=2 --nocapture
 ```
 
-The original runner used this exact binary/test argument list and inherited the
-disposable database URL; it set the same descriptor limit before invocation.
+The original runner directly invoked the existing test-profile binary
+`target/debug/deps/b275_persistence_measure-696abc204732aa70` with the same test
+arguments and inherited disposable database URL and descriptor limit. That
+hash-suffixed path is evidence of the original invocation, not a portable path.
 Preserve stdout JSON, exit status, manifests, tested SHA and host/configuration
-for any new measurement. Original evidence remains recoverable in historical
-commit `32f13fe766542155aa4ae7722d6f7ce34ddff4b8`.
+for any new measurement. Original evidence is in
+[PR #402's commit history](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/402/commits),
+at `32f13fe766542155aa4ae7722d6f7ce34ddff4b8`; the current tree contains this
+standalone report and reusable tests.
+
+## Integration after the historical run
+
+The branch incorporates PR #397 through
+`67e24b0dc26e8982b6d8d0b4925d8b82436701bd`, including explicit `ANALYZE` after
+bulk fixture loading for the separate 500k qualification. Its 25 s resume budget
+and correctness assertions remain unchanged. The six measurements above still
+belong only to `3d4775c`; they were not rerun or reattributed to this integration.
+New delivery output uses schema `b275.delivery.v3` and names the old reference
+`historical_baseline_sha`, so it cannot be mistaken for the tested runtime.
+Record the actual build revision in each new run's manifest. Timing boundaries,
+session counts, deadlines and acceptance checks are unchanged.
+
+On 2026-09-16 the integrated source passed 23 reconciliation tests (all 11
+database gates executed) and seven harness tests (all four gates executed) on
+disposable PG16. The retry control recovered eight clients after two failed
+attempts and reported `complete=false`. The release-profile 500k qualification
+also passed: refresh 5.251 s, shared resume 4.848 s, four waiters reading exactly
+500,000 rows across 123 pages, against the unchanged 25 s resume budget.
+These are separate integration checks, not new 2,000-session measurements or
+production qualification.
 
 ## Revised-harness validation
 
@@ -113,7 +137,8 @@ issued rows, exercise the compact-issued revision fence during its own lock wait
 scope waiter attribution, share the case deadline and unify fixture cleanup.
 These are separate from the frozen v1 scale results above.
 
-The revised disposable-PG16 suite passed **7 tests, 0 failures, 1 intentionally
+Before that upstream integration, the revised disposable-PG16 suite passed
+**7 tests, 0 failures, 1 intentionally
 ignored scale test**, including **4/4 required integration gates**. A transient
 issued-row rejection regression recovered all eight clients after eight failed
 attempts and correctly emitted `complete=false`. Ordinary small deliveries had
@@ -126,5 +151,8 @@ same late-confirmation count failure (zero instead of one). Anchoring the same
 350 ms hold after observed append entry passed all **12 reconciliation tests**,
 with the 200 ms share bound, 1,000 ms candidate bound, late-ACK and candidate
 retention assertions unchanged. This is a test-only correction; payout/runtime
-behavior is unchanged. Current CI and sanitized review dispositions are tracked
+behavior is unchanged. Independent delta review also passed all 23 tests matching
+`commit_reconcile`, reproduced the failing old-clock control, and verified that
+the six historical rows and unknown outcomes survived report pruning.
+Current CI and sanitized review dispositions are tracked
 on [PR #402](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/402).
