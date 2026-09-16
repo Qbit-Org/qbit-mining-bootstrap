@@ -5,6 +5,9 @@ pub use payout_state::PayoutState;
 pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 
+const ACCEPTED_CUTOFF_SQL: &str =
+    "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";
+
 #[derive(Clone, Debug)]
 pub struct AppendResult {
     pub share: AcceptedShare,
@@ -552,6 +555,16 @@ impl Ledger {
         })
     }
 
+    /// Probe the accepted cutoff without selecting share payloads. Appends
+    /// serialize under ORDER_LOCK and reject future job times, so a committed
+    /// accepted row is eligible at the next snapshot's ledger-clock barrier.
+    pub(crate) async fn latest_accepted_share_seq(&self) -> Result<u64> {
+        let cutoff: i64 = sqlx::query_scalar(ACCEPTED_CUTOFF_SQL)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(cutoff)?)
+    }
+
     /// Captures all three inputs under the same database boundary: ordered
     /// shares, prior balances and their revision. Timestamp barriers preserve
     /// the existing public audit format without relying on host clock sync.
@@ -580,11 +593,9 @@ impl Ledger {
         let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
         let payout_revision: i64 = row.try_get("payout_revision")?;
-        let cutoff: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let cutoff: i64 = sqlx::query_scalar(ACCEPTED_CUTOFF_SQL)
+            .fetch_one(&mut *tx)
+            .await?;
         let rows = prior_balance_rows(&mut tx).await?;
         #[cfg(test)]
         let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();

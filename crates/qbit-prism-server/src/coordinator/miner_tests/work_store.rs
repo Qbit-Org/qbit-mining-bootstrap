@@ -70,6 +70,9 @@ impl MemoryLedger {
 }
 
 impl work_ledger::WorkLedger for MemoryLedger {
+    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(self.snapshot.lock().unwrap().as_ref().unwrap().share_seq) })
+    }
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         self.compact.drop_probe.lock().unwrap().take()
     }
