@@ -113,6 +113,7 @@ qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_live_starting_sta
 qbit-prism-server::ledger_postgres::fatal_state::clear_rolls_back_reconciliation_if_mature_block_remains_disconnected
 qbit-prism-server::ledger_postgres::fatal_state::deep_fanout_halt_names_recovery_and_refuses_unresolved_confirmation
 qbit-prism-server::ledger_postgres::fatal_state::migration_and_show_preserve_unknown_legacy_set_time_without_registration
+qbit-prism-server::ledger_postgres::fatal_state::one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard
 qbit-prism-server::ledger_postgres::fatal_state::recovery_rejects_wrong_cluster_and_unsuitable_node
 qbit-prism-server::ledger_postgres::fatal_state::recovery_resolves_fee_address_before_verifying_cluster_fingerprint
 qbit-prism-server::ledger_postgres::fatal_state::recovery_serializes_new_heartbeats_and_concurrent_clear
