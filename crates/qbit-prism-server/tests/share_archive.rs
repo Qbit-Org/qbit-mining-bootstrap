@@ -1012,6 +1012,114 @@ async fn verification_refuses_a_concurrent_archive_rewrite() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn plan_keeps_candidate_and_audit_blockers_in_one_snapshot() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("plan-race-a").await?;
+        land_block(&ledger, 1447).await?;
+        archive::seal(&ledger, P0).await?;
+        let snapshot = ledger.snapshot(100).await?;
+        let (coinbase_key, ledger_key) = keys();
+        let bundle = build_audit_bundle(
+            snapshot.shares.clone(),
+            FoundBlock {
+                block_height: 102,
+                coinbase_value_sats: 500_000_000,
+                network_difficulty: 100,
+                anchor_job_issued_at_ms: snapshot.anchor_ms,
+            },
+            snapshot.prior_balances.clone(),
+            PayoutPolicy::day_one_default(),
+            &coinbase_key,
+            &ledger_key,
+        )?;
+        let pending = candidate_with_bundle(
+            &bundle,
+            WindowRef::from_snapshot(&snapshot)?,
+            snapshot.payout_revision,
+            1448,
+        )?;
+        ledger.enqueue_candidate(pending).await?;
+        let claim = ledger.claim_candidate(60).await?.context("no candidate")?.with_bundle(bundle);
+        // The horizon helper dates its new rows one second ago. Keep them
+        // after this candidate's anchor so its old snapshot remains valid.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        move_horizon_past_p0(&ledger.pool).await?;
+        let mut url = url::Url::parse(&db.url)?;
+        url.query_pairs_mut().append_pair("application_name", "archive-plan-race");
+        let planner = Ledger::connect_tool(url.as_str(), "plan-race-b".into(), 2, false, None).await?;
+        // An updatable view pauses only the planner's audit read after that
+        // statement has taken its snapshot. The real landing/finishing APIs
+        // can still publish a new audit and finish the pending candidate.
+        sqlx::raw_sql(
+            "CREATE FUNCTION archive_test_gate() RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
+               BEGIN
+                 IF current_setting('application_name')='archive-plan-race' THEN
+                   PERFORM pg_advisory_xact_lock(430419);
+                 END IF;
+                 RETURN true;
+               END $$;
+             ALTER TABLE qbit_pool_audit_bundles RENAME TO archive_test_audits;
+             CREATE VIEW qbit_pool_audit_bundles AS SELECT * FROM archive_test_audits WHERE archive_test_gate()",
+        )
+        .execute(&ledger.pool)
+        .await?;
+        let mut blocker = db.admin.begin().await?;
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(430419)")
+            .execute(&mut *blocker)
+            .await?;
+        let planning = tokio::spawn(async move {
+            let result = archive::plan(&planner, &retention(0)).await;
+            (planner, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                    .bind(blocker_pid)
+                    .fetch_one(&db.admin)
+                    .await?;
+                if blocked {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                ensure!(!planning.is_finished(), "plan never paused in its audit read");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("plan did not reach its audit read")??;
+        ledger.land_candidate(&claim, &ledger_public_key()).await?;
+        ledger.finish_candidate(&claim, true, None).await?;
+        blocker.commit().await?;
+        let (planner, report) = planning.await?;
+        let report = report?;
+        let p0 = entry(&report, P0);
+        ensure!(
+            !p0.eligible && condition(p0, "pending_references").status == "blocked",
+            "plan missed both the unfinished candidate and its new unsealed audit: {p0:?}"
+        );
+        let after = archive::plan(&ledger, &retention(0)).await?;
+        ensure!(
+            condition(entry(&after, P0), "audits_sealed").status == "blocked",
+            "a subsequent snapshot did not see the new unsealed audit"
+        );
+        Ok(vec![ledger, planner])
+    }
+    .await;
+    match result {
+        Ok(ledgers) => db.close(ledgers).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn archive_requires_durable_parent_directories_before_recording() -> Result<()> {

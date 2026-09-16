@@ -994,7 +994,13 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
         (1..=1024).contains(&options.window_multiple),
         "--window-multiple must be between 1 and 1024"
     );
-    let mut connection = ledger.acquire().await?;
+    // Landing publishes an audit before finishing its candidate. A single
+    // snapshot must see at least one of those references even if the two
+    // transitions commit between the audit and outbox checks below.
+    let mut connection = ledger.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *connection)
+        .await?;
     let records = catalog_rows(&mut connection).await?;
     let attached = attached_partitions(&mut connection).await?;
     let mut unknowns = Vec::new();
@@ -1098,6 +1104,7 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
             .collect(),
         partitions,
     };
+    connection.commit().await?;
     Ok(report)
 }
 
