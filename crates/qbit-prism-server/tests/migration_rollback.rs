@@ -1347,7 +1347,7 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
@@ -1379,6 +1379,16 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='instance_offer_startup'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='instance_offer_startup'".into(),
             "instance_offer_startup",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_orphan_disposition'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_orphan_disposition',1)".into(),
+            "candidate_orphan_disposition",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_orphan_disposition'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_orphan_disposition'".into(),
+            "candidate_orphan_disposition",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),
@@ -1705,18 +1715,26 @@ async fn assert_candidate_payload_fingerprints(
 }
 
 /// A reservation's authority and every unfinished state's balance evidence
-/// survive recovery. Claim ownership remains ephemeral; offer ownership does
-/// not. The test restores its original pending row only to leave the parent
-/// fixture unchanged, never as a production recovery operation.
+/// survive recovery, and so does the offer record of the terminal `orphaned`
+/// disposition migration 015 added (#415): the row is cleared like every
+/// terminal row, so it no longer counts as unfinished and no longer holds a
+/// balance snapshot, but its reservation, outcome, call time and reason are
+/// evidence a restore must not lose. Claim ownership remains ephemeral;
+/// offer ownership does not. The test restores its original pending row only
+/// to leave the parent fixture unchanged, never as a production recovery
+/// operation.
 async fn assert_offer_recovery_fingerprints(
     source: &recovery::Database,
     ledger: &Ledger,
     pg_bin: &std::path::Path,
     candidate: &qbit_prism_server::ledger::Candidate,
 ) -> Result<()> {
-    use qbit_prism_server::ledger::OfferOutcome;
+    use qbit_prism_server::ledger::{OfferOutcome, ORPHANED_STATE};
 
-    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
+    // `completed_at` and the payload are restored with the rest: an orphaned
+    // row is terminal and cleared, and the lifecycle CHECK refuses a pending
+    // row that kept a completion or lost its document.
+    const COLUMNS: &str = "state,attempt_count,proof_observed_at_ms,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,offer_reply,last_error,completed_at,candidate,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,claim_token,claim_instance_id,claim_expires_at,next_attempt_at,updated_at";
     let restore = format!("UPDATE qbit_block_candidate_outbox SET ({COLUMNS})=(SELECT {COLUMNS} FROM jsonb_populate_record(NULL::qbit_block_candidate_outbox,$2)) WHERE block_hash=$1");
     let original: serde_json::Value = sqlx::query_scalar(
         "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
@@ -1730,7 +1748,12 @@ async fn assert_offer_recovery_fingerprints(
         .await?
         .expect("pending recovery fixture");
     ledger.reserve_offer(&claim).await?;
-    for state in ["offer_reserved", "offered", "reconciliation"] {
+    for state in [
+        "offer_reserved",
+        "offered",
+        "reconciliation",
+        ORPHANED_STATE,
+    ] {
         match state {
             "offered" => {
                 ledger
@@ -1747,6 +1770,27 @@ async fn assert_offer_recovery_fingerprints(
                     .reconcile_candidate(&claim, "delivery unknown")
                     .await?
             }
+            ORPHANED_STATE => {
+                // Reconciliation released the claim with its backoff; the
+                // recovery lane re-claims the row before it writes the
+                // proven-orphan verdict, at the revision it observed.
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+                    .bind(&candidate.block_hash)
+                    .execute(&source.pool)
+                    .await?;
+                let reclaimed = ledger
+                    .claim_candidate(600)
+                    .await?
+                    .expect("the reconciliation row must be claimable again");
+                let revision = ledger.payout_revision().await?;
+                ledger
+                    .orphan_candidate_at_revision(
+                        &reclaimed,
+                        "proven orphan: a different block is active at this height",
+                        revision,
+                    )
+                    .await?
+            }
             _ => {}
         }
         let row: serde_json::Value = sqlx::query_scalar(
@@ -1758,15 +1802,35 @@ async fn assert_offer_recovery_fingerprints(
         ensure!(row["state"] == state);
         let baseline = recovery::evidence(source, pg_bin).await?;
         ensure!(baseline["pending_candidates"] == 0);
+        // An orphaned row is terminal, so it is out of the unfinished set
+        // (and out of the pending gauges), and its cleared window reference
+        // no longer holds its balance snapshot; its offer record is checked
+        // below like every other state's.
+        let orphaned = state == ORPHANED_STATE;
         ensure!(
-            baseline["unfinished_candidates"] == 1,
-            "{state} looked drained"
+            baseline["unfinished_candidates"] == i32::from(!orphaned),
+            "{state} counted as unfinished: {}",
+            baseline["unfinished_candidates"]
         );
-        ensure!(
-            baseline["records"]["candidate_balances"]["count"] == 1,
-            "{state} lost retained balance evidence"
-        );
-        assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        if orphaned {
+            ensure!(
+                row["candidate"].is_null()
+                    && row["block_bytes"].is_null()
+                    && row["window_anchor_ms"].is_null()
+                    && row["window_prior_balances_sha256"].is_null(),
+                "{state} kept a payload: {row}"
+            );
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 0,
+                "{state} still exported a balance snapshot it no longer references"
+            );
+        } else {
+            ensure!(
+                baseline["records"]["candidate_balances"]["count"] == 1,
+                "{state} lost retained balance evidence"
+            );
+            assert_candidate_balance_fingerprints(source, ledger, pg_bin, candidate).await?;
+        }
         let mut mutations = vec![
             "proof_observed_at_ms=1800000002122",
             "offer_reserved_at=offer_reserved_at-interval '1 second'",

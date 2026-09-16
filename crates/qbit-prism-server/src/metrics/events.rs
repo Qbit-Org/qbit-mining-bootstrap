@@ -66,6 +66,15 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .increment(Family::LateConfirmed, vec![]);
     }
+    /// Record one offered candidate settled as a proven orphan (#415), once
+    /// the ledger committed the terminal disposition. Attributed to the
+    /// settlement event, never to an observation that failed to settle.
+    pub fn record_candidate_orphaned(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::CandidatesOrphaned, vec![]);
+    }
     pub fn record_rejection(&self, reason: RejectReason) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.increment(

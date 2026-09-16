@@ -12,7 +12,6 @@
 //! Run through test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test offer_latency -- --nocapture.
 use anyhow::{ensure, Context, Result};
-use axum::{extract::State, routing::post, Json, Router};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, FoundBlock, PayoutPolicy};
 use qbit_prism_server::{
@@ -23,14 +22,21 @@ use qbit_prism_server::{
     metrics::Metrics,
 };
 use qbit_prism_test_gate as gate;
-use serde_json::{json, Value};
+use serde_json::json;
 use sqlx::PgPool;
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+#[path = "support/scripted_node.rs"]
+#[allow(dead_code)]
+mod scripted_node;
+use ledger_database::FixtureDatabase;
+use scripted_node::{ChainState, ScriptedNode};
 
 /// How many blocks are measured, one after another on one chain.
 const SAMPLES: usize = 8;
@@ -41,73 +47,21 @@ const OFFER_BOUND: Duration = Duration::from_millis(250);
 /// the settlement lock, which the post-offer observation and the landing
 /// transaction both need.
 const LANDING_HOLD: Duration = Duration::from_secs(3);
-/// The ledger's settlement advisory lock, a cluster-wide constant, taken by
-/// `observe_chain_view` and by the landing transaction and never by the offer
-/// phase. Held here from a plain connection, as a long `save_job` or another
-/// candidate's landing would hold it.
+/// The ledger's settlement advisory lock, a constant within the fixture's own
+/// database, taken by `observe_chain_view` and by the landing transaction and
+/// never by the offer phase. Held here from a plain connection, as a long
+/// `save_job` or another candidate's landing would hold it.
 const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
 const PARENT: &str = "aa";
 
-struct NodeState {
-    tip: String,
-    height: u64,
-    chainwork: u64,
-    /// The active chain by height, for `getblockhash`.
-    blocks: HashMap<u64, String>,
-    /// When each `submitblock` arrived, by block hash, read before the
-    /// request is even decoded: the node-entry boundary of a sample.
-    submissions: HashMap<String, Vec<Instant>>,
-}
-
-async fn node_reply(
-    State(node): State<Arc<Mutex<NodeState>>>,
-    Json(request): Json<Value>,
-) -> Json<Value> {
-    let arrived = Instant::now();
-    let mut node = node.lock().await;
-    let result = match request["method"].as_str().unwrap_or("") {
-        "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
-        "getblockhash" => {
-            let height = request["params"][0].as_u64().unwrap_or(0);
-            json!(node
-                .blocks
-                .get(&height)
-                .cloned()
-                .unwrap_or_else(|| node.tip.clone()))
-        }
-        "getblockchaininfo" => json!({"chain":"test","initialblockdownload":false,
-            "blocks":node.height,"headers":node.height,"bestblockhash":node.tip,
-            "chainwork":format!("{:x}",node.chainwork)}),
-        "getbestblockhash" => json!(node.tip),
-        "getnetworkinfo" => json!({"connections":2}),
-        "submitblock" => {
-            let block = hex::decode(request["params"][0].as_str().unwrap_or("")).unwrap();
-            let hash = codec::hash_display(&codec::double_sha256(&block[..80]));
-            node.submissions
-                .entry(hash.clone())
-                .or_default()
-                .push(arrived);
-            // Accepted: the block is the new tip, with more cumulative work.
-            let height = node.height + 1;
-            node.tip = hash.clone();
-            node.height = height;
-            node.chainwork += 1;
-            node.blocks.insert(height, hash);
-            Value::Null
-        }
-        method => panic!("unexpected offer-latency RPC {method}"),
-    };
-    Json(json!({"id":request["id"],"result":result,"error":null}))
-}
-
 struct Fixture {
-    admin: PgPool,
-    /// A plain connection pool on the fixture's schema, for the hold.
+    /// The fixture's own database: advisory locks are per database, so the
+    /// hold below can never queue another test binary's ledger.
+    database: FixtureDatabase,
+    /// A plain connection pool on the fixture's database, for the hold.
     pool: PgPool,
-    schema: String,
     coordinator: Arc<Coordinator>,
-    node: Arc<Mutex<NodeState>>,
-    server: tokio::task::JoinHandle<()>,
+    node: ScriptedNode,
 }
 
 impl Fixture {
@@ -115,30 +69,23 @@ impl Fixture {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_offer_latency_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let pool = PgPool::connect(url.as_str()).await?;
-        let node = Arc::new(Mutex::new(NodeState {
-            tip: PARENT.repeat(32),
-            height: 100,
-            chainwork: 1,
-            blocks: HashMap::from([(100, PARENT.repeat(32))]),
-            submissions: HashMap::new(),
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let rpc_url = format!("http://{}/", listener.local_addr()?);
-        let app = Router::new()
-            .route("/", post(node_reply))
-            .with_state(node.clone());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let database = FixtureDatabase::open(&raw, "prism_offer_latency_").await?;
+        match Self::build(&database).await {
+            Ok((pool, coordinator, node)) => Ok(Some(Self {
+                database,
+                pool,
+                coordinator,
+                node,
+            })),
+            Err(error) => Err(database.abandon(error).await),
+        }
+    }
+
+    async fn build(database: &FixtureDatabase) -> Result<(PgPool, Arc<Coordinator>, ScriptedNode)> {
+        let pool = PgPool::connect(&database.url).await?;
+        let node = ScriptedNode::open(ChainState::new(&PARENT.repeat(32), 100)).await?;
         let config = Config {
-            database_url: url.to_string(),
+            database_url: database.url.clone(),
             instance_id: "offer-latency".into(),
             database_connections: 6,
             initialize_schema: true,
@@ -148,7 +95,7 @@ impl Fixture {
             template_max_age: Duration::from_secs(120),
             submit_tip_max_age: Duration::from_secs(10),
             template_refresh_failure_exit: Duration::from_secs(120),
-            rpc_url,
+            rpc_url: node.url.clone(),
             rpc_user: "test".into(),
             rpc_password: "test".into(),
             rpc_timeout: Duration::from_secs(5),
@@ -163,6 +110,7 @@ impl Fixture {
             share_commit_timeout: Duration::from_secs(15),
             share_commit_grace: Duration::from_secs(5),
             block_only_ack_timeout: Duration::from_secs(60),
+            candidate_orphan_confirmations: 6,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),
@@ -211,14 +159,7 @@ impl Fixture {
                 )
                 .await?;
         }
-        Ok(Some(Self {
-            admin,
-            pool,
-            schema,
-            coordinator,
-            node,
-            server,
-        }))
+        Ok((pool, coordinator, node))
     }
 
     fn ledger(&self) -> &Ledger {
@@ -314,6 +255,7 @@ impl Fixture {
     /// The arrival times of every `submitblock` for the block.
     async fn arrivals(&self, block_hash: &str) -> Vec<Instant> {
         self.node
+            .state
             .lock()
             .await
             .submissions
@@ -322,15 +264,13 @@ impl Fixture {
             .unwrap_or_default()
     }
 
-    async fn close(self) -> Result<()> {
-        self.server.abort();
+    /// Stops the node, closes the pools and drops the fixture database; a
+    /// test error wins over a cleanup error.
+    async fn close(self, result: Result<()>) -> Result<()> {
+        self.node.stop();
         self.coordinator.ledger.pool.close().await;
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.database.close(result).await
     }
 }
 
@@ -360,8 +300,7 @@ async fn offer_reaches_the_node_within_the_bound_while_builders_and_landing_are_
         return Ok(());
     };
     let result = measure(&fixture).await;
-    fixture.close().await?;
-    result
+    fixture.close(result).await
 }
 
 async fn measure(fixture: &Fixture) -> Result<()> {

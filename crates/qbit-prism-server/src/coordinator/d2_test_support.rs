@@ -155,6 +155,7 @@ pub(super) fn test_config(
         // Block-only acknowledgements keep the bound these harnesses were
         // written against.
         block_only_ack_timeout: share_commit_timeout,
+        candidate_orphan_confirmations: 6,
         extranonce2_size: EXTRANONCE2_SIZE,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),

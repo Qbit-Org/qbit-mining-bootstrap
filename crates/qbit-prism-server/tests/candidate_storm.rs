@@ -638,6 +638,7 @@ fn config(database_url: String, rpc_url: String, instance: &str) -> Result<Confi
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(10),
         block_submit_timeout: Duration::from_secs(10),
+        candidate_orphan_confirmations: 6,
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,

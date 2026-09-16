@@ -83,6 +83,7 @@ families! {
     ConnectionRefusals: Counter, "stratum_connection_refusals_total", "Stratum connections refused by an existing admission limit, by closed reason.";
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
+    CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.

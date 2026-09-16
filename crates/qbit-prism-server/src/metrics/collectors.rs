@@ -30,8 +30,12 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:
 /// every row the offer lifecycle (migration 011) has not finished, pending
-/// and offered-but-not-landed alike. No share-table scan, candidate JSON
-/// decode, or accounting lock.
+/// and offered-but-not-landed alike. The predicate is
+/// `CandidateState::UNFINISHED_SQL` itself, so the gauges and the claim
+/// lanes can never disagree about what "unfinished" means: a row settled
+/// `submitted`, `abandoned` or, since migration 015, `orphaned` is terminal
+/// and counted by neither. No share-table scan, candidate JSON decode, or
+/// accounting lock.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
@@ -41,7 +45,7 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")
             .execute(&mut *tx).await?;
         let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
-            "SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered','reconciliation')"
+            &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {}", crate::ledger::CandidateState::UNFINISHED_SQL)
         ).fetch_one(&mut *tx).await?;
         let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)? };
         tx.commit().await?;

@@ -1,5 +1,5 @@
 use super::audit::{persist_audit_snapshot, verify_durable_range, AuditSnapshotWrite};
-use super::candidates::{header_bits_hex, CandidateState, ClaimParts};
+use super::candidates::{header_bits_hex, CandidateState, ClaimParts, ORPHANED_STATE};
 use super::*;
 use qbit_prism::{verify_audit_parts, AuditVerificationReport};
 use std::sync::Arc;
@@ -216,7 +216,8 @@ impl Ledger {
     /// errors use retry_candidate and retain every recovery artifact.
     /// `abandoned` is reachable from `pending` only: a row the node was
     /// offered is never abandoned, it stays in reconciliation with its
-    /// evidence (`Ledger::reconcile_candidate`).
+    /// evidence (`Ledger::reconcile_candidate`) until the chain proves it an
+    /// orphan (`Ledger::orphan_candidate_at_revision`).
     pub async fn finish_candidate(
         &self,
         claim: &CandidateClaim,
@@ -235,20 +236,35 @@ impl Ledger {
         error: Option<&str>,
         expected_revision: i64,
     ) -> Result<()> {
+        self.finish_candidate_counted_at_revision(claim, submitted, error, expected_revision)
+            .await
+            .map(|_| ())
+    }
+
+    /// Reports whether this committed settlement confirmed the block for the
+    /// first time. Reconciliation uses the same durable publication marker.
+    pub(crate) async fn finish_candidate_counted_at_revision(
+        &self,
+        claim: &CandidateClaim,
+        submitted: bool,
+        error: Option<&str>,
+        expected_revision: i64,
+    ) -> Result<bool> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
-        let revision: i64 =
-            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
-                .fetch_one(&mut *tx)
-                .await?;
-        ensure!(
-            revision == expected_revision,
-            "payout revision changed while observing candidate disposition"
-        );
+        require_revision(&mut tx, expected_revision).await?;
         let state = require_claim(&mut tx, claim).await?;
+        let mut first_confirmation = false;
         if submitted {
+            first_confirmation = sqlx::query_scalar::<_, bool>(
+                "SELECT audit_publication_sequence IS NULL FROM qbit_pool_blocks WHERE block_hash=$1 FOR UPDATE",
+            )
+            .bind(&claim.candidate.block_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false);
             let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
             let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND chain_state='confirmed')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(
@@ -268,20 +284,105 @@ impl Ledger {
             );
             let mature:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND maturity_state='mature')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(!mature, "cannot abandon a mature candidate");
-            let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=CASE WHEN chain_state='confirmed' THEN clock_timestamp() ELSE inactive_since END WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
-            if changed > 0 {
-                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1").bind(&claim.candidate.block_hash).execute(&mut *tx).await?;
+            if deactivate_pool_block(&mut tx, &claim.candidate.block_hash).await? {
                 bump_revision(&mut tx).await?;
             }
         }
         // The terminal row is "no window": the six window columns, the block
         // and the document go NULL in one statement, so retention's
         // `window_anchor_ms IS NOT NULL` predicate is exactly the live set and
-        // the outbox does not keep every submitted or abandoned block forever.
-        // The offer record (reservation, call time, outcome) is small and
-        // stays on a submitted row as the evidence of its one offer.
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET state=$3,candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2")
+        // the outbox does not keep every submitted, abandoned or orphaned
+        // block forever. The offer record (reservation, call time, outcome)
+        // is small and stays on a submitted row as the evidence of its one
+        // offer.
+        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2"))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(first_confirmation)
+    }
+
+    /// The terminal orphan disposition (#415): settle an offered row this
+    /// claim holds as [`ORPHANED_STATE`], with the chain's evidence as its
+    /// reason, at the revision the evidence was observed at.
+    ///
+    /// The caller has observed, on one coherent tip, that a DIFFERENT block
+    /// is active at the candidate's height with at least the configured
+    /// confirmations, after the row's audit landed. This settlement is
+    /// written from that asynchronous observation, so it revalidates before
+    /// it writes, with the fences every other settlement uses and no new
+    /// lock: the settlement and order locks, the payout revision the
+    /// observation was taken at (a reorg reconciler that confirmed the block
+    /// meanwhile bumped it, so a stale "not active" verdict cannot overwrite
+    /// a newer "active" one, exactly as `finish_candidate_at_revision`), the
+    /// strictly-live claim token, and the block's own `qbit_pool_blocks`
+    /// row, which must not be `confirmed`. The state, the reason, the
+    /// terminal `completed_at` (what takes the row out of the pending
+    /// gauges) and the block's `inactive` chain state are one transaction.
+    ///
+    /// Reachable from the three offer states only, like
+    /// `reconcile_candidate`, and never from `pending`, whose one terminal
+    /// refusal is `abandoned`. `orphaned` is a processing disposition, not a
+    /// chain fact: like `submitted` and `abandoned` the row releases its
+    /// document, its block bytes and its window reference (so retention and
+    /// the balance-snapshot collector stop holding them), and it keeps its
+    /// offer record and its reason. A recovered reservation whose call was
+    /// lost records the `unknown` outcome with no call time and no reply, as
+    /// reconciliation does; nothing here invents a submission. The block's
+    /// landed audit and pool block are its durable evidence: the pool block,
+    /// if the landing wrote one, moves to `inactive` the way an abandoned
+    /// block does (a block that never connected gets no disconnection time),
+    /// and the ordinary reorg reconciler moves it back to `confirmed` and
+    /// credits its deferred share if the chain ever reactivates it; the
+    /// outbox row stays terminal either way. Never abandons.
+    pub async fn orphan_candidate_at_revision(
+        &self,
+        claim: &CandidateClaim,
+        reason: &str,
+        expected_revision: i64,
+    ) -> Result<()> {
+        ensure!(
+            !reason.trim().is_empty(),
+            "an orphaned row needs the chain's evidence as its reason"
+        );
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
+        writable(&mut tx).await?;
+        require_revision(&mut tx, expected_revision).await?;
+        let state = require_claim(&mut tx, claim).await?;
+        ensure!(
+            state != CandidateState::Pending,
+            "cannot settle a pending candidate as orphaned: a block that was never offered is abandoned, not orphaned"
+        );
+        // The block's own chain state, as the ledger holds it now: a block
+        // the reconciler has confirmed is active, whatever an older
+        // observation said, and a mature block is settled history.
+        let block: Option<(String, String)> = sqlx::query_as(
+            "SELECT chain_state,maturity_state FROM qbit_pool_blocks WHERE block_hash=$1 FOR UPDATE",
+        )
+        .bind(&claim.candidate.block_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((chain_state, maturity_state)) = &block {
+            ensure!(
+                chain_state != "confirmed" && maturity_state == "immature",
+                "cannot settle candidate {} as orphaned: its block is {chain_state} and {maturity_state} in the ledger",
+                claim.candidate.block_hash
+            );
+        }
+        // Confirmed was refused above under the row lock, so only a
+        // `prepared` block changes here.
+        if deactivate_pool_block(&mut tx, &claim.candidate.block_hash).await? {
+            bump_revision(&mut tx).await?;
+        }
+        // Terminal: the payload is released exactly as a submitted or
+        // abandoned row releases it, and the offer record stays as the offer
+        // lifecycle left it, with an `unknown` outcome for a reservation
+        // whose call was lost. An offer-state row has no `body_id` under
+        // 011's payload rule, so there is no body to release.
+        let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(ORPHANED_STATE).bind(reason).execute(&mut *tx).await?.rows_affected();
+        ensure!(settled == 1, CandidateState::OFFERED_CLAIM_LOST);
         tx.commit().await?;
         Ok(())
     }
@@ -297,42 +398,45 @@ impl Ledger {
     /// Observations must all come from one stable RPC tip. Missing observations
     /// leave blocks untouched. A temporary fork is reversible; mature history
     /// never silently becomes a debit or a new payout.
+    ///
+    /// Returns how many blocks this call confirmed for the first time; see [`Self::reconcile_blocks_at_revision`].
     pub async fn reconcile_blocks(
         &self,
         observations: &[BlockObservation],
         tip_height: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let revision = self.payout_revision().await?;
         self.reconcile_blocks_at_revision(observations, tip_height, revision)
             .await
     }
 
+    /// [`Self::reconcile_blocks`] at the revision the observations were
+    /// collected at.
+    ///
+    /// Returns first confirmations observed by this committed transaction,
+    /// including confirmations while an outbox row is still unfinished. The
+    /// publication ordinal is assigned on first confirmation and never cleared;
+    /// settlement and reconciliation therefore share one durable counting rule.
+    /// Later disconnect/reconnect cycles do not count again.
     pub async fn reconcile_blocks_at_revision(
         &self,
         observations: &[BlockObservation],
         tip_height: u64,
         expected_revision: i64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
-        let revision: i64 =
-            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
-                .fetch_one(&mut *tx)
-                .await?;
-        ensure!(
-            revision == expected_revision,
-            "payout revision changed while collecting chain observations"
-        );
-        let fatal = self
+        require_revision(&mut tx, expected_revision).await?;
+        let (fatal, first_confirmations) = self
             .reconcile_blocks_in(&mut tx, observations, tip_height)
             .await?;
         tx.commit().await?;
         if let Some(message) = fatal {
             bail!(message);
         }
-        Ok(())
+        Ok(first_confirmations)
     }
 
     // The caller owns settlement/order locks and decides whether a fatal result
@@ -342,8 +446,9 @@ impl Ledger {
         tx: &mut Transaction<'_, Postgres>,
         observations: &[BlockObservation],
         tip_height: u64,
-    ) -> Result<Option<String>> {
+    ) -> Result<(Option<String>, u64)> {
         let mut changed = false;
+        let mut first_confirmations = 0;
         let observed: std::collections::HashMap<&str, bool> = observations
             .iter()
             .map(|o| (o.block_hash.as_str(), o.active))
@@ -353,7 +458,7 @@ impl Ledger {
             "duplicate block observations"
         );
         let hashes: Vec<&str> = observed.keys().copied().collect();
-        let rows = sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE").bind(&hashes).fetch_all(&mut **tx).await?;
+        let rows = sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state,audit_publication_sequence FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE").bind(&hashes).fetch_all(&mut **tx).await?;
         for row in rows {
             let hash: String = row.try_get("block_hash")?;
             let Some(&active) = observed.get(hash.as_str()) else {
@@ -366,9 +471,15 @@ impl Ledger {
                     "mature pool block disconnected: {hash}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>"
                 );
                 sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut **tx).await?;
-                return Ok(Some(message));
+                return Ok((Some(message), first_confirmations));
             }
             if active && state != "confirmed" {
+                if row
+                    .try_get::<Option<i64>, _>("audit_publication_sequence")?
+                    .is_none()
+                {
+                    first_confirmations += 1;
+                }
                 sqlx::query(
                     "UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1",
                 )
@@ -382,14 +493,8 @@ impl Ledger {
                 sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='awaiting_maturity',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1 AND settlement_status='reorged'").bind(&hash).execute(&mut **tx).await?;
                 changed = true;
             } else if !active && state == "confirmed" {
-                sqlx::query(
-                    "UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=clock_timestamp() WHERE block_hash=$1",
-                )
-                .bind(&hash)
-                .execute(&mut **tx)
-                .await?;
-                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1").bind(&hash).execute(&mut **tx).await?;
-                changed = true;
+                // Immature here: a mature block returned the fatal above.
+                changed |= deactivate_pool_block(tx, &hash).await?;
             }
         }
         if changed {
@@ -402,7 +507,7 @@ impl Ledger {
         if matured > 0 {
             bump_revision(tx).await?;
         }
-        Ok(None)
+        Ok((None, first_confirmations))
     }
 
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
@@ -650,6 +755,31 @@ async fn require_claim(
         Some((true, state)) => CandidateState::parse(&state),
         _ => bail!("candidate claim was lost or expired"),
     }
+}
+
+/// The assignments that release a terminal outbox row's payload: the
+/// document, the block bytes and the six window columns, so retention's
+/// `window_anchor_ms IS NOT NULL` predicate is exactly the live set.
+const RELEASE_PAYLOAD_SQL: &str = "candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL";
+
+/// Take an immature `prepared` or `confirmed` pool block off the active
+/// chain, the one deactivation every settlement and the reorg reconciler
+/// share: the block becomes `inactive`, `inactive_since` records a
+/// disconnection only for a block that was `confirmed` (a block that never
+/// connected keeps NULL, which is how consumers tell the two apart), and its
+/// fanout artifacts are released as `reorged`. Returns whether the block
+/// changed; the caller bumps the payout revision once for its transaction.
+async fn deactivate_pool_block(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+) -> Result<bool> {
+    let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=CASE WHEN chain_state='confirmed' THEN clock_timestamp() ELSE inactive_since END WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'")
+        .bind(block_hash).execute(&mut **tx).await?.rows_affected();
+    if changed > 0 {
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1")
+            .bind(block_hash).execute(&mut **tx).await?;
+    }
+    Ok(changed > 0)
 }
 
 async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {

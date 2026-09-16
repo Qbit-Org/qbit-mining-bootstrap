@@ -5,7 +5,7 @@ use crate::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
         BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
         HeartbeatHealth, Ledger, OfferOutcome, SignerKeys, Snapshot, Window, WindowError,
-        WindowRef,
+        WindowRef, ORPHANED_STATE,
     },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
@@ -297,6 +297,21 @@ struct ChainCache {
     tip: String,
     height: u64,
     observations: HashMap<String, bool>,
+}
+
+/// One coherent observation of a candidate against the chain, see
+/// [`Coordinator::observe_candidate`].
+struct CandidateObservation {
+    /// The candidate's own block is the active block at its height.
+    active: bool,
+    /// The payout revision the ledger recorded for this tip view; the fence
+    /// every settlement written from this observation revalidates.
+    revision: i64,
+    tip: String,
+    tip_height: u64,
+    /// The active block at the candidate's height, `None` while the tip is
+    /// below it.
+    at_height: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -844,9 +859,14 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
-        self.work_ledger
+        // Reconciliation and settlement both count the block's durable first
+        // confirmation, regardless of the outbox state at that moment.
+        let first_confirmations = self
+            .work_ledger
             .reconcile(&observations, tip_height, revision)
             .await?;
+        self.blocks
+            .fetch_add(first_confirmations, Ordering::Relaxed);
         *cache = Some(ChainCache {
             tip: tip.into(),
             height: tip_height,
@@ -1330,7 +1350,14 @@ impl Coordinator {
         }
     }
 
-    async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<(bool, i64, String)> {
+    /// One coherent read-only observation of a candidate's block against the
+    /// chain: the tip before and after is the same hash, the node is ready
+    /// on it, and the payout revision is the one the ledger recorded for
+    /// that tip view. `at_height` is the active block at the candidate's
+    /// height, `None` while the tip is below it; the block is `active`
+    /// exactly when that is the candidate's own hash. Any failure leaves the
+    /// candidate unobserved: the caller settles nothing on an error.
+    async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<CandidateObservation> {
         let height = claim.candidate.found_block.block_height;
         let info = self.ready_chain_info().await?;
         let tip_height = info["blocks"].as_u64().context("invalid tip height")?;
@@ -1349,19 +1376,28 @@ impl Coordinator {
             )
             .await?;
         // ready_chain_info already published this sequenced observation.
-        let active = tip_height >= height
-            && self
-                .rpc
-                .call("getblockhash", json!([height]))
-                .await?
-                .as_str()
-                == Some(&claim.candidate.block_hash);
+        let at_height = if tip_height >= height {
+            Some(
+                tip_observation::tip_hash(&self.rpc.call("getblockhash", json!([height])).await?)
+                    .context("qbit did not report a valid block hash at the candidate's height")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         ensure!(
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(&tip),
             "tip changed while observing candidate"
         );
         self.ready_tip(&tip).await?;
-        Ok((active, revision, tip))
+        let active = at_height.as_deref() == Some(claim.candidate.block_hash.as_str());
+        Ok(CandidateObservation {
+            active,
+            revision,
+            tip,
+            tip_height,
+            at_height,
+        })
     }
 
     pub async fn process_candidate(&self, claim: &CandidateClaim) -> Result<()> {
@@ -1469,8 +1505,12 @@ impl Coordinator {
                 // Finishing can commit its terminal state just before the
                 // processing future receives COMMIT's reply. The canceled
                 // work needs no retry when durable completion already won.
+                // Every state that is not unfinished is terminal. A proven
+                // orphan that committed here was not counted by
+                // `record_candidate_orphaned`: that counter reports completions
+                // this process observed, not every committed settlement.
                 let terminal = tokio::time::timeout(lease.timeout, sqlx::query_scalar::<_, bool>(
-                    "SELECT state IN ('submitted','abandoned') FROM qbit_block_candidate_outbox WHERE block_hash=$1"
+                    &format!("SELECT state NOT IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL)
                 ).bind(&claim.candidate.block_hash).fetch_optional(&self.ledger.pool)).await;
                 if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
             },
@@ -1660,7 +1700,7 @@ impl Coordinator {
         // The rebuilt window is released off the runtime once the landing
         // returns, whichever way it went.
         let rebuilt = OffRuntime::new(claim.clone().with_parts(parts));
-        let (_, revision, _) = self.observe_candidate(claim).await?;
+        let revision = self.observe_candidate(claim).await?.revision;
         match self
             .ledger
             .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
@@ -1728,7 +1768,12 @@ impl Coordinator {
             // that is already active needs no offer, only its audit and its
             // confirmation; a superseded one is the one proven pre-offer
             // rejection that may abandon.
-            let (active, revision, tip) = self.observe_candidate(claim).await?;
+            let CandidateObservation {
+                active,
+                revision,
+                tip,
+                ..
+            } = self.observe_candidate(claim).await?;
             if active {
                 return self.adopt_active_candidate(claim, lease, &tip).await;
             }
@@ -1862,13 +1907,33 @@ impl Coordinator {
         // A null reply can still describe a known side-chain block, and the
         // landing may have taken long: only active-chain evidence observed
         // now, at a revision proven now, advances the shared payout state.
-        let (active, revision, _) = self.observe_candidate(claim).await?;
-        if active {
-            self.ledger
-                .finish_candidate_at_revision(claim, true, None, revision)
+        let observation = self.observe_candidate(claim).await?;
+        if observation.active {
+            let first_confirmation = self
+                .ledger
+                .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
                 .await?;
-            self.blocks.fetch_add(1, Ordering::Relaxed);
+            self.blocks
+                .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
             self.wake.notify_one();
+            return Ok(());
+        }
+        // The proven orphan (#415): the audit above is durable, and this one
+        // coherent observation shows a DIFFERENT block active at the
+        // candidate's height with the configured confirmations. The row is
+        // settled terminal at the observed revision, with the evidence as its
+        // reason; a reorg reconciler that confirmed the block meanwhile has
+        // bumped that revision, and the settlement then fails and falls to
+        // the ordinary reconciliation retry below. An observation that
+        // failed never reaches here, so a failed observation never settles.
+        // The log line and the counter follow the committed settlement only;
+        // a refused one reports nothing terminal.
+        if let Some(reason) = self.orphan_evidence(claim, &observation) {
+            self.ledger
+                .orphan_candidate_at_revision(claim, &reason, observation.revision)
+                .await?;
+            self.metrics.record_candidate_orphaned();
+            tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
             return Ok(());
         }
         let reason = format!(
@@ -1876,6 +1941,42 @@ impl Coordinator {
         );
         tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
         self.ledger.reconcile_candidate(claim, &reason).await
+    }
+
+    /// The evidence that settles an offered candidate as a proven orphan, or
+    /// `None` while the chain has not proven it: the candidate's own block
+    /// is active, no block is active at its height yet (the tip is below
+    /// it), or the competitor has fewer than
+    /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations. Confirmations
+    /// are counted from the tip the observation proved coherent
+    /// (`tip_height - height + 1` for a block at `height`), so the verdict
+    /// and the revision it is written at come from the same observation.
+    fn orphan_evidence(
+        &self,
+        claim: &CandidateClaim,
+        observation: &CandidateObservation,
+    ) -> Option<String> {
+        let height = claim.candidate.found_block.block_height;
+        // The candidate's own hash at its height is exactly
+        // `observation.active`. The tip height is the node's report: the
+        // subtraction stays checked rather than trusting that `at_height` is
+        // only ever read at or below it, and the count saturates.
+        let competitor = observation.at_height.as_deref()?;
+        if competitor == claim.candidate.block_hash {
+            return None;
+        }
+        let confirmations = observation
+            .tip_height
+            .checked_sub(height)?
+            .saturating_add(1);
+        let required = self.config.candidate_orphan_confirmations;
+        if confirmations < required {
+            return None;
+        }
+        Some(format!(
+            "proven orphan: block {competitor} is active at height {height} with {confirmations} confirmations (tip {} at height {}, {required} required) and block {} is not on the active chain; settled terminal with its landed audit kept for a reorg back, never offered again",
+            observation.tip, observation.tip_height, claim.candidate.block_hash
+        ))
     }
 
     /// The one proof-to-first-offer sample for a block, emitted by the
