@@ -385,7 +385,11 @@ qbit-prism-server broadcast-ctv
 The integrated periodic worker uses `PRISM_CTV_BROADCASTER_ENABLED=1`. An optional
 CPFP wallet and fee configuration must be consistent with the intended operating
 policy. Durable claims coordinate work across instances; node RPCs may still
-receive an identical transaction more than once after a lost reply.
+receive an identical transaction more than once after a lost reply. The one-shot
+`broadcast-ctv` verifies the node, the schema and the cluster fingerprint like a
+frontend but registers no heartbeat: its claims are fenced by their own claim
+tokens, so it never competes with a frontend's broadcaster for the same fanout
+and leaves no `qbit_prism_instances` row for fatal-state recovery to refuse.
 
 Confirmed fanouts are observed every five seconds until 1,000 confirmations;
 afterward the latest deep checkpoint is checked every 60 seconds. A shallow
@@ -988,7 +992,15 @@ LIMIT 200;
 
 Every row must show `stopped` or `drained`. A running frontend's row holds its
 health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
-never became ready. Stale does not mean stopped: a heartbeat older than the
+never became ready. Only `run` frontends write rows: the one-shot commands
+`self-check`, `import-audits`, `backfill-ctv` and `broadcast-ctv` pass the same
+startup gates (schema and capabilities, the halt guard, the cluster
+fingerprint) without registering, so a normal or failed exit leaves nothing
+behind, and a run under a live frontend's `PRISM_INSTANCE_ID` leaves that row,
+including its session-owner token, untouched. A `starting` row under a
+generated UUID that an earlier 3.x.x build's one-shot command left behind is
+still refused and still needs the investigation below; nothing removes it
+automatically. Stale does not mean stopped: a heartbeat older than the
 `self-check` window (`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds) shows
 only that reporting stopped. The process may be hung, paused, cut off from
 PostgreSQL, or on an unreachable host, and
