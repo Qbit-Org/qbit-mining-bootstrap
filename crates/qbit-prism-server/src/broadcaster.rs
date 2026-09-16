@@ -49,9 +49,11 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
         // completion, but leave subsequent rows claimable by a later pass.
         // Compare hashes, not poll sequence numbers: same-tip polls must not
         // starve settlement. Also yield if the replacement already published.
+        // A replacement that keeps failing to publish holds settlement only
+        // for its build budget; the pass-tip check stays bounded by the pass.
         let tip = coordinator.observed_tip.read().await;
         let superseded = tip.as_deref().is_some_and(|hash| hash != pass_tip);
-        if tip.refresh_pending() || superseded {
+        if tip.refresh_pending(coordinator.config.template_refresh_failure_exit) || superseded {
             coordinator.metrics.record_ctv_tip_refresh_yield();
             break;
         }

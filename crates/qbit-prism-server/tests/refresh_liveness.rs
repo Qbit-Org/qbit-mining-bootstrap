@@ -5,7 +5,9 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AuditBundle, FoundBlock, PayoutPolicy};
 use qbit_prism_server::{
     broadcaster, codec,
+    coordinator::Coordinator,
     ledger::{BlockObservation, Candidate, CandidateCtv, SignerKeys, WindowRef},
+    metrics::Metrics,
     stratum::MiningBackend,
 };
 use serde_json::{json, Value};
@@ -598,6 +600,54 @@ async fn ctv_yield_case(f: &Fixture, publish_before_completion: bool) -> Result<
             == series
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctv_settles_after_the_replacement_build_budget_when_publication_keeps_failing(
+) -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f).await?;
+            // A third frontend whose replacement-build budget elapses inside
+            // the test bound; the fixture frontends keep the 120-second default.
+            let budget = Duration::from_secs(1);
+            let mut config = (*f.a.config).clone();
+            config.instance_id = "runtime-c".into();
+            config.template_refresh_failure_exit = budget;
+            let c = Coordinator::new(config, Arc::new(Metrics::default())).await?;
+            c.refresh_once().await?;
+            // Every refresh detects the newer tip, then fails before publishing.
+            f.node.set_tip(&"ef".repeat(32), &"ab".repeat(32), 1102, "03");
+            f.node
+                .set_reply("getblocktemplate", json!([{"rules":["segwit"]}]), json!({}));
+            for frontend in [&f.a, &c] {
+                ensure!(
+                    frontend.refresh_once().await.is_err(),
+                    "a broken template fetch published work"
+                );
+            }
+            ensure!(
+                broadcaster::run_once(&f.a).await? == 0,
+                "CTV claimed rows inside the replacement-build budget"
+            );
+            ensure!(metric(&f.a.metrics.render(), "tip_refresh_yields_total")? == 1.);
+            // Retries never renew the first departure. This wait is not a race
+            // injection: it only lets the configured budget elapse.
+            ensure!(c.refresh_once().await.is_err());
+            tokio::time::sleep(budget).await;
+            ensure!(
+                broadcaster::run_once(&c).await? == count,
+                "settlement stayed stranded after the replacement-build budget"
+            );
+            ensure!(metric(&c.metrics.render(), "tip_refresh_yields_total")? == 0.);
+            let claimed: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE claim_token IS NOT NULL OR next_broadcast_attempt_at IS NULL").fetch_one(f.pool()).await?;
+            ensure!(claimed == 0, "CTV left claims or unprocessed rows behind");
+            c.ledger.pool.close().await;
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
