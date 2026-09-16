@@ -267,7 +267,7 @@ cargo run --locked --release -p qbit-prism-server -- benchmark \
 
 The native test wrapper uses a supplied `PRISM_TEST_DATABASE_URL` or starts an
 isolated local PostgreSQL cluster. Its default mode runs the whole workspace and
-the two explicit `--ignored` database runs, matching the CI job, and once
+the three explicit `--ignored` database targets, matching the CI job, and once
 `qbitd` and the PostgreSQL server tools are present it requires every gated
 test to execute and checks the gate's manifest against
 `test/prism-gated-tests.txt`; see

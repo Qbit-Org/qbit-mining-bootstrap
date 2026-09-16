@@ -3,11 +3,16 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+from pathlib import Path
+import shlex
 import subprocess
 import unittest
 from unittest import mock
 
 from scripts.run_rust_test_shard import COMPACT_SCALE, IGNORED, main, shard_commands, workspace_targets
+
+
+NATIVE_SCRIPT = Path(__file__).resolve().parents[1] / "test" / "prism-native-tests.sh"
 
 
 def fixture_metadata():
@@ -17,7 +22,8 @@ def fixture_metadata():
             for kind, name in [
                 ("lib", "qbit_prism_server"), ("bin", "qbit-prism-server"),
                 ("test", "stratum_admission_postgres"),
-                ("test", "observability_database"), ("test", "new_contract"),
+                ("test", "observability_database"), ("test", "issued_job_dependency"),
+                ("test", "new_contract"),
                 ("test", "compact_runtime_scale"),
                 ("custom-build", "build-script-build"),
             ]
@@ -39,8 +45,8 @@ class RustTestShardTests(unittest.TestCase):
         shards = [shard_commands(metadata, i, 4) for i in range(4)]
         self.assertCountEqual([cmd for shard in shards for cmd in shard], expected)
         ordinary = [cmd for cmd in expected if "--ignored" not in cmd]
-        self.assertEqual(len(ordinary), 11)
-        self.assertEqual(len({tuple(cmd) for cmd in ordinary}), 11)
+        self.assertEqual(len(ordinary), 12)
+        self.assertEqual(len({tuple(cmd) for cmd in ordinary}), 12)
         self.assertEqual(len(expected) - len(ordinary), len(IGNORED))
         for shard in shards:
             for command in shard:
@@ -63,8 +69,16 @@ class RustTestShardTests(unittest.TestCase):
             package["targets"].reverse()
         self.assertEqual(shards, [shard_commands(metadata, i, 4) for i in range(4)])
 
+    def test_local_database_mode_selects_the_same_ignored_contracts(self):
+        script = NATIVE_SCRIPT.read_text(encoding="utf-8").replace("\\\n", " ")
+        database = script.split("\n  database)\n", 1)[1].split("\n    ;;", 1)[0]
+        local = [shlex.split(line)[1:] for line in database.splitlines() if "--ignored" in line]
+        ci = [cmd for cmd in shard_commands(fixture_metadata(), 0, 1) if "--ignored" in cmd]
+        self.assertEqual(len(ci), len(IGNORED))
+        self.assertCountEqual(local, ci)
+
     def test_bad_coordinates_empty_and_unknown_targets_fail_closed(self):
-        for index, count in [(-1, 4), (4, 4), (0, 0), (0, -1), (11, 12)]:
+        for index, count in [(-1, 4), (4, 4), (0, 0), (0, -1), (12, 13)]:
             with self.subTest(index=index, count=count), self.assertRaises(ValueError):
                 shard_commands(fixture_metadata(), index, count)
         with self.assertRaises(ValueError):
