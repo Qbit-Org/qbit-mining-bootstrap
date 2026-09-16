@@ -12,6 +12,10 @@ pub(super) struct RefreshWindow {
 }
 
 impl RefreshWindow {
+    pub fn within_reanchor_interval(&self, interval: Duration) -> bool {
+        self.anchored.elapsed() < interval
+    }
+
     pub fn reusable(
         &self,
         network: u128,
@@ -23,7 +27,7 @@ impl RefreshWindow {
             && self.snapshot.share_seq == share_seq
             && self.snapshot.payout_revision == state.payout_revision
             && self.reference.prior_balances_digest == state.prior_balances_digest
-            && self.anchored.elapsed() < interval
+            && self.within_reanchor_interval(interval)
     }
 }
 

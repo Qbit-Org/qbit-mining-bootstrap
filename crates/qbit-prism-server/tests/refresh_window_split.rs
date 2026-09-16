@@ -110,16 +110,49 @@ async fn new_share_and_payout_revision_each_invalidate_once() -> Result<()> {
                     .shares
                     .pop()
                     .context("fixture share missing")?;
-            share.share_id = "refresh-new-share".into();
-            let appended = f.a.ledger.append(share, None).await?;
+            let mut changes = f.a.refresh.subscribe();
+            let mut latest_share_seq = first.snapshot.share_seq;
+            // With a share on every poll and an unchanged template, baseline
+            // work stays issued until a real rebuild trigger. Dirty inputs
+            // must not cause full-window reads or generation fanout per poll.
+            for n in 1..=3 {
+                share.share_id = format!("refresh-new-share-{n}");
+                latest_share_seq =
+                    f.a.ledger
+                        .append(share.clone(), None)
+                        .await?
+                        .share
+                        .share_seq;
+                let mark = f.proxy.mark();
+                f.a.refresh_once().await?;
+                let current = prepared(&f.a).await?;
+                ensure!(
+                    f.returned_share_rows(mark)? == 0,
+                    "shares alone reread the window"
+                );
+                ensure!(
+                    Arc::ptr_eq(&first, &current),
+                    "shares alone replaced published work"
+                );
+                ensure!(
+                    current.generation == first.generation && !changes.has_changed()?,
+                    "shares alone notified miners of a new generation"
+                );
+            }
+            f.node.set_template(Some(churn(first.template.clone(), 1)));
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
-            one_read(f, mark, support::SHARES + 1).await?;
+            one_read(f, mark, support::SHARES + 3).await?;
             let next = prepared(&f.a).await?;
             ensure!(
-                next.snapshot.share_seq == appended.share.share_seq && next.window != first.window,
-                "new share did not enter the window"
+                next.snapshot.share_seq == latest_share_seq && next.window != first.window,
+                "next template did not capture all newly eligible shares"
             );
+            ensure!(
+                next.generation > first.generation && changes.has_changed()?,
+                "changed template did not notify miners"
+            );
+            changes.borrow_and_update();
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
             ensure!(
@@ -133,7 +166,7 @@ async fn new_share_and_payout_revision_each_invalidate_once() -> Result<()> {
             .await?;
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
-            one_read(f, mark, support::SHARES + 1).await?;
+            one_read(f, mark, support::SHARES + 3).await?;
             ensure!(
                 prepared(&f.a).await?.snapshot.payout_revision == next.snapshot.payout_revision + 1,
                 "revision was not refreshed"
@@ -169,14 +202,30 @@ async fn transaction_churn_does_not_extend_original_reanchor_interval() -> Resul
                     f.returned_share_rows(mark)? == 0,
                     "early template churn reread the window"
                 );
+                let mut share = c
+                    .ledger
+                    .read_window(&first.window, BalanceSource::AsIssued)
+                    .await?
+                    .shares
+                    .pop()
+                    .context("fixture share missing")?;
+                share.share_id = "refresh-before-reanchor".into();
+                let latest_share_seq = c.ledger.append(share, None).await?.share.share_seq;
+                let before = prepared(&c).await?;
+                let mark = f.proxy.mark();
+                c.refresh_once().await?;
+                ensure!(
+                    f.returned_share_rows(mark)? == 0 && Arc::ptr_eq(&before, &prepared(&c).await?),
+                    "share alone rebuilt before the original reanchor"
+                );
                 sleep(Duration::from_millis(850)).await;
                 let mark = f.proxy.mark();
-                f.node.set_template(Some(churn(first.template.clone(), 2)));
                 c.refresh_once().await?;
-                one_read(f, mark, support::SHARES).await?;
+                one_read(f, mark, support::SHARES + 1).await?;
                 ensure!(
-                    prepared(&c).await?.window.anchor_ms > first.window.anchor_ms,
-                    "window never reanchored"
+                    prepared(&c).await?.window.anchor_ms > first.window.anchor_ms
+                        && prepared(&c).await?.snapshot.share_seq == latest_share_seq,
+                    "original reanchor did not capture the latest shares"
                 );
                 let mark = f.proxy.mark();
                 f.node.set_template(Some(churn(first.template.clone(), 3)));

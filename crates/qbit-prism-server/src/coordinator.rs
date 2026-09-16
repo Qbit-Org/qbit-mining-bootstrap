@@ -937,16 +937,18 @@ impl Coordinator {
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         if let Some(current) = self.prepared.read().await.as_ref() {
-            if reuse_window
-                && current.window
-                    == cached_window
-                        .as_ref()
-                        .expect("validated refresh window")
-                        .reference
-                && current.fee == fee
+            // A new share invalidates build inputs, but does not itself replace
+            // usable published work. Preserve the existing same-template
+            // cadence; the next template/economic change or original reanchor
+            // reads the latest shares. Empty-to-first-share remains immediate.
+            if cached_window.as_ref().is_some_and(|window| {
+                window.reference == current.window
+                    && window.within_reanchor_interval(self.config.snapshot_interval)
+            }) && current.fee == fee
                 && current.fingerprint == fingerprint
                 && current.snapshot.payout_revision == state.payout_revision
-                && current.snapshot.share_seq == share_seq
+                && current.window.prior_balances_digest == state.prior_balances_digest
+                && (current.bundle.is_some() || current.snapshot.share_seq == share_seq)
                 && crate::readiness::validate_template_age(
                     &current.template,
                     self.config.template_max_age,

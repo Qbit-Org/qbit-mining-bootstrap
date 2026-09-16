@@ -14,6 +14,15 @@ under the ordering barrier, assign the acceptance timestamp from the ledger
 clock, and reject future job timestamps, so a newly committed accepted row is
 eligible at the next snapshot barrier. Rejected rows do not invalidate it.
 
+Invalidating cached inputs does not by itself replace usable published work.
+As before this split, accepted shares with an unchanged template wait for the
+next template or economic change, or the original reanchor deadline; that
+build captures the latest eligible shares. This preserves the existing
+publication cadence under a busy share stream instead of adding a full read,
+generation change, and miner update on every poll. The first accepted share
+still immediately replaces an empty window. Revision, balance, and tip changes
+continue through their existing refresh and publication checks.
+
 `Prepared`, issued jobs, persisted records, and resumed jobs still contain
 compact references rather than accepted-share arrays. The cache is owned only
 by the serialized refresh loop. Its steady retained memory is one snapshot:
@@ -46,8 +55,10 @@ budget to determine whether the conditional incremental-engine work is needed.
 
 `refresh_window_split` exercises the real Coordinator and PostgreSQL through the
 existing execution proxy: three transaction changes two seconds apart return
-zero additional accepted-share rows; new shares, revisions, interval expiry,
-and difficulty changes trigger fresh reads. It also verifies as-issued resume,
+zero additional accepted-share rows; a share on every unchanged-template poll
+does not replace published work, and the next template or original reanchor
+captures all latest eligible shares in one read. Revisions and difficulty
+changes trigger fresh reads immediately. It also verifies as-issued resume,
 compact storage and canonical audit reconstruction, rejection of a delayed
 refresh after a newer tip observation, and cancellation during a completed
 COMMIT response wait. Unit regressions cover same-revision
