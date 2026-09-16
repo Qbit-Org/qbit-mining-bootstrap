@@ -105,7 +105,7 @@ enum FatalStateCommand {
 
 #[derive(Subcommand)]
 enum CandidatesCommand {
-    /// Print every unfinished candidate, oldest due first; zero when none.
+    /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
     List {
         /// Print the versioned JSON document instead of the operator table.
         #[arg(long)]
@@ -329,11 +329,13 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
         CandidatesCommand::List { json, limit } => {
             let url =
                 config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
-            let rows = crate::ledger::Ledger::list_candidates(&url, limit).await?;
+            let (rows, truncated) = crate::ledger::Ledger::list_candidates(&url, limit).await?;
             if json {
                 let document = json!({
                     "schema": "qbit.prism.candidates.list.v1",
                     "candidates": rows,
+                    "limit": limit,
+                    "truncated": truncated,
                 });
                 println!("{}", serde_json::to_string_pretty(&document)?);
             } else if rows.is_empty() {
@@ -342,6 +344,9 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
                 println!("no unfinished candidates");
             } else {
                 print!("{}", candidate_table(&rows));
+                if truncated {
+                    eprintln!("candidate inventory truncated at {limit} rows; more unfinished candidates exist (parked rows sort last). Increase --limit up to 10000; larger inventories require a read-only database query.");
+                }
             }
             Ok(())
         }
