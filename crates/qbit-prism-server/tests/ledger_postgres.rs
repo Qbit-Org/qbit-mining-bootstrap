@@ -1,6 +1,6 @@
 //! Real PostgreSQL transaction, failover and accounting tests.
 //! PRISM_TEST_DATABASE_URL=postgres://ubuntu@127.0.0.1:55483/postgres cargo test -p qbit-prism-server --test ledger_postgres
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, AuditBundle,
@@ -13,7 +13,8 @@ use qbit_prism_server::ledger::{
 use qbit_prism_test_gate as gate;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[path = "support/ledger_2x.rs"]
@@ -35,7 +36,16 @@ mod index_trim;
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
+/// A fixture database with one schema on `search_path`. `admin`, `schema` and
+/// `url` copy the fixture's, for the included modules that read them; `admin`
+/// is a handle to the fixture's one admin connection.
 struct Database {
+    fixture: FixtureDatabase,
     admin: PgPool,
     schema: String,
     url: String,
@@ -45,18 +55,12 @@ impl Database {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("prism_test_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        let fixture = FixtureDatabase::open(&raw, "prism_test_").await?;
         Ok(Some(Self {
-            admin,
-            schema,
-            url: url.to_string(),
+            admin: fixture.admin.clone(),
+            schema: fixture.schema.clone(),
+            url: fixture.url.clone(),
+            fixture,
         }))
     }
     async fn ledger(&self, id: &str) -> Result<Ledger> {
@@ -66,11 +70,111 @@ impl Database {
         for ledger in ledgers {
             ledger.pool.close().await;
         }
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.fixture.close(Ok(())).await
+    }
+}
+
+#[test]
+fn fixture_url_keeps_credentials_and_connection_options_and_sets_search_path_last() -> Result<()> {
+    let raw = "postgresql://prism%40ci:p%2Fss%3Aw%40rd@db.internal:6543/postgres?sslmode=require&host=/var/run/postgresql&application_name=ci&options=-cstatement_timeout%3D0";
+    let url = ledger_database::fixture_url(raw, "prism_fixture_0a", "prism_test_0a")?;
+    assert_eq!(
+        url::Url::parse(&url)?.password(),
+        Some("p%2Fss%3Aw%40rd"),
+        "the encoded password changed"
+    );
+    // Read back through the parser the ledger itself uses.
+    let options: sqlx::postgres::PgConnectOptions = url.parse()?;
+    assert_eq!(options.get_username(), "prism@ci");
+    assert_eq!(options.get_host(), "db.internal");
+    assert_eq!(options.get_port(), 6543);
+    assert_eq!(
+        options.get_socket().map(|socket| socket.as_path()),
+        Some(std::path::Path::new("/var/run/postgresql"))
+    );
+    assert!(matches!(
+        options.get_ssl_mode(),
+        sqlx::postgres::PgSslMode::Require
+    ));
+    assert_eq!(options.get_application_name(), Some("ci"));
+    assert_eq!(options.get_database(), Some("prism_fixture_0a"));
+    assert_eq!(
+        options.get_options(),
+        Some("-cstatement_timeout=0 -csearch_path=prism_test_0a")
+    );
+    // A URL without a database still gets the fixture's.
+    let bare: sqlx::postgres::PgConnectOptions = ledger_database::fixture_url(
+        "postgres://prism@localhost",
+        "prism_fixture_0a",
+        "prism_test_0a",
+    )?
+    .parse()?;
+    assert_eq!(bare.get_database(), Some("prism_fixture_0a"));
+    Ok(())
+}
+
+#[test]
+fn fixture_url_refuses_urls_and_names_that_would_break_isolation() {
+    use ledger_database::{fixture_url, generated_names};
+    for (raw, expected) in [
+        (
+            "postgres://prism:hunter2@localhost/postgres?dbname=postgres",
+            "dbname=",
+        ),
+        ("postgres://prism:hunter2@localhost/template1", "template1"),
+        ("postgres://prism:hunter2@localhost/template0", "template0"),
+        (
+            "postgres://prism:hunter2@localhost/templat%651",
+            "template1",
+        ),
+        ("mysql://prism:hunter2@localhost/postgres", "postgres://"),
+        ("postgres:prism:hunter2", "postgres://"),
+        (
+            "postgres://prism:hunter2@localhost:port/postgres",
+            "not a valid URL",
+        ),
+        ("postgres://prism:hunter2@localhost/%FF", "not UTF-8"),
+        ("", "not a valid URL"),
+    ] {
+        let error = format!(
+            "{:#}",
+            fixture_url(raw, "prism_fixture_0a", "prism_test_0a").unwrap_err()
+        );
+        assert!(error.contains(expected), "{raw}: {error}");
+        assert!(
+            !error.contains("hunter2"),
+            "{raw} leaked its password: {error}"
+        );
+    }
+    let raw = "postgres://prism@localhost/postgres";
+    let longest = format!("p{}", "_".repeat(62));
+    let too_long = format!("{longest}x");
+    for bad in [
+        "",
+        "Prism",
+        "1prism",
+        "_prism",
+        "prism-fixture",
+        "prism\"x",
+        "prism fixture",
+        too_long.as_str(),
+    ] {
+        assert!(
+            fixture_url(raw, bad, "prism_test_0a").is_err(),
+            "database {bad:?}"
+        );
+        assert!(
+            fixture_url(raw, "prism_fixture_0a", bad).is_err(),
+            "schema {bad:?}"
+        );
+    }
+    assert!(fixture_url(raw, &longest, &longest).is_ok());
+    for prefix in ["prism_test_", "prism_atomicity_"] {
+        let (database, schema) = generated_names(prefix);
+        assert!(
+            fixture_url(raw, &database, &schema).is_ok(),
+            "{database} {schema}"
+        );
     }
 }
 
@@ -1530,4 +1634,154 @@ async fn concurrent_cpfp_allocations_exclude_active_and_retired_outpoints() -> R
     assert_eq!(active, 2);
     assert_eq!(archived, 1, "replacement lost durable cleanup history");
     db.close(vec![a, b]).await
+}
+
+/// PostgreSQL scopes advisory locks to a database, not a schema. Each fixture
+/// owns a database, so a key one fixture holds never queues another fixture's
+/// migration, while two clients of the same fixture still contend for it.
+/// The database goes however the fixture ends: closed, unwound, or failed
+/// during setup. A multi-thread runtime covers Drop's blocking path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixture_databases_isolate_advisory_keys_while_one_fixture_still_contends() -> Result<()> {
+    // The ledger's private migration key, spelled as `window_reference` does.
+    const MIGRATION_LOCK: i64 = 0x505249534d000001;
+    // Only a watchdog. The ledger's unchanged 5 s lock_timeout is what fails a
+    // migration queued behind the key, so load cannot make this a DDL timing
+    // assertion.
+    const WATCHDOG: Duration = Duration::from_secs(30);
+    const TRY_LOCK: &str = "SELECT pg_try_advisory_xact_lock($1)";
+    let Some(first) = Database::open().await? else {
+        return Ok(());
+    };
+    let Some(second) = Database::open().await? else {
+        return Ok(());
+    };
+    let mut holder = PgConnection::connect(&first.url).await?;
+    let mut held = holder.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *held)
+        .await?;
+
+    let mut elsewhere = PgConnection::connect(&second.url).await?;
+    let free: bool = sqlx::query_scalar(TRY_LOCK)
+        .bind(MIGRATION_LOCK)
+        .fetch_one(&mut elsewhere)
+        .await?;
+    assert!(free, "a key held by one fixture was unavailable to another");
+    let independent = tokio::time::timeout(WATCHDOG, second.ledger("b"))
+        .await
+        .context("another fixture's migration never finished")??;
+
+    let mut rival = PgConnection::connect(&first.url).await?;
+    let taken: bool = sqlx::query_scalar(TRY_LOCK)
+        .bind(MIGRATION_LOCK)
+        .fetch_one(&mut rival)
+        .await?;
+    assert!(
+        !taken,
+        "a second client of the same fixture took a held key"
+    );
+    let first_url = first.url.clone();
+    let contender = Ledger::connect(&first_url, "a".into(), 8, true);
+    tokio::pin!(contender);
+    let queued = async {
+        let since = tokio::time::Instant::now();
+        while !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid::bigint=($1>>32) AND objid::bigint=($1&4294967295) AND objsubid=1)",
+        )
+        .bind(MIGRATION_LOCK)
+        .fetch_one(&mut rival)
+        .await?
+        {
+            ensure!(
+                since.elapsed() < WATCHDOG,
+                "the same fixture's migration never queued behind the held key"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        connected = &mut contender => bail!(
+            "the same fixture's migration ended while the key was held: {:?}",
+            connected.map(|_| ())
+        ),
+        queued = queued => queued?,
+    }
+    held.commit().await?;
+    let contended = tokio::time::timeout(WATCHDOG, contender)
+        .await
+        .context("the queued migration did not finish once the key was released")??;
+    holder.close().await?;
+    rival.close().await?;
+
+    // `pg_database` is shared, so the second fixture's session sees every row.
+    const EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)";
+    let closed = first.fixture.name().to_owned();
+    first.close(vec![contended]).await?;
+    let exists: bool = sqlx::query_scalar(EXISTS)
+        .bind(&closed)
+        .fetch_one(&mut elsewhere)
+        .await?;
+    assert!(!exists, "close left its database behind");
+
+    // A panic unwinds past a fixture that still has a session inside it.
+    let Some(abandoned) = Database::open().await? else {
+        return Ok(());
+    };
+    let unwound = abandoned.fixture.name().to_owned();
+    let lingering = PgConnection::connect(&abandoned.url).await?;
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _abandoned = abandoned;
+        panic!("a test failed with its fixture open");
+    }));
+    assert!(panicked.is_err());
+    drop(lingering);
+    let exists: bool = sqlx::query_scalar(EXISTS)
+        .bind(&unwound)
+        .fetch_one(&mut elsewhere)
+        .await?;
+    assert!(!exists, "an unwound fixture left its database behind");
+
+    // Setup that fails once the database exists: its copy of template1
+    // already has a `public` schema.
+    let raw = gate::database_url(gate::site!())?.context("the gate withdrew its database URL")?;
+    let sqlstate = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|error| error.as_database_error())
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned())
+    };
+    let (failed, _) = ledger_database::generated_names("prism_test_");
+    let error = FixtureDatabase::open_named(&raw, &failed, "public")
+        .await
+        .err()
+        .context("setup created a schema that already existed")?;
+    assert_eq!(sqlstate(&error).as_deref(), Some("42P06"), "{error:#}");
+    let exists: bool = sqlx::query_scalar(EXISTS)
+        .bind(&failed)
+        .fetch_one(&mut elsewhere)
+        .await?;
+    assert!(!exists, "failed setup left its database behind");
+
+    // A CREATE that collides with a live fixture's database leaves it, and
+    // the session inside it, untouched.
+    let error = FixtureDatabase::open_named(&raw, second.fixture.name(), "public")
+        .await
+        .err()
+        .context("setup reused an existing database")?;
+    assert_eq!(sqlstate(&error).as_deref(), Some("42P04"), "{error:#}");
+    let exists: bool = sqlx::query_scalar(EXISTS)
+        .bind(second.fixture.name())
+        .fetch_one(&mut elsewhere)
+        .await
+        .context("a colliding CREATE ended a session it did not own")?;
+    assert!(
+        exists,
+        "a colliding CREATE dropped a database it did not own"
+    );
+    elsewhere.close().await?;
+    second.close(vec![independent]).await
 }

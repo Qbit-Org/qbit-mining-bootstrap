@@ -118,6 +118,7 @@ qbit-prism-server::ledger_postgres::fatal_state::recovery_rejects_wrong_cluster_
 qbit-prism-server::ledger_postgres::fatal_state::recovery_resolves_fee_address_before_verifying_cluster_fingerprint
 qbit-prism-server::ledger_postgres::fatal_state::recovery_serializes_new_heartbeats_and_concurrent_clear
 qbit-prism-server::ledger_postgres::fatal_state::show_and_clear_cli_resume_appends_and_record_operator_decision
+qbit-prism-server::ledger_postgres::fixture_databases_isolate_advisory_keys_while_one_fixture_still_contends
 qbit-prism-server::ledger_postgres::global_duplicates_idempotence_and_config_fencing
 qbit-prism-server::ledger_postgres::index_trim::migration_013_builds_its_indexes_without_blocking_appends
 qbit-prism-server::ledger_postgres::index_trim::migration_013_refuses_a_drop_target_swapped_while_it_built
