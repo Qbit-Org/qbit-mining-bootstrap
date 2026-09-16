@@ -378,6 +378,72 @@ async fn assert_no_new_instances(pool: &PgPool) -> Result<()> {
 }
 
 #[tokio::test]
+async fn list_reports_truncation_without_hiding_it_in_either_output_mode() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    let empty = cli(&db, &node, &["candidates", "list", "--json"]).await?;
+    assert_eq!(code(&empty), 0, "{}", stderr(&empty));
+    let document: Value = serde_json::from_slice(&empty.stdout)?;
+    assert_eq!(document["truncated"], false);
+    assert_eq!(document["limit"], 100);
+    assert!(listed(&empty).is_empty());
+
+    for n in 0..101 {
+        let mut row = Row::new("00", "pending");
+        row.hash = format!("{n:064x}");
+        row.parked = n == 100;
+        seed(&ledger.pool, &row).await?;
+    }
+    // Terminal rows must not make an otherwise complete inventory truncated.
+    seed(&ledger.pool, &Row::new("ff", "abandoned")).await?;
+    let before: Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(o) ORDER BY o.block_hash) FROM qbit_block_candidate_outbox o",
+    )
+    .fetch_one(&ledger.pool)
+    .await?;
+    for (limit, expected_count, truncated) in [
+        (None, 100, true),
+        (Some("1"), 1, true),
+        (Some("101"), 101, false),
+        (Some("102"), 101, false),
+        (Some("10000"), 101, false),
+    ] {
+        let mut args = vec!["candidates", "list", "--json"];
+        if let Some(limit) = limit {
+            args.extend(["--limit", limit]);
+        }
+        let output = cli(&db, &node, &args).await?;
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let document: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(document["truncated"], truncated);
+        assert_eq!(document["limit"], limit.unwrap_or("100").parse::<u64>()?);
+        let rows = listed(&output);
+        assert_eq!(rows.len(), expected_count);
+        assert_eq!(rows.iter().any(|row| row["parked"] == true), !truncated);
+    }
+    for (limit, truncated) in [("100", true), ("101", false)] {
+        let output = cli(&db, &node, &["candidates", "list", "--limit", limit]).await?;
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        assert_eq!(stderr(&output).contains("inventory truncated"), truncated);
+        if truncated {
+            assert!(stderr(&output).contains("parked rows sort last"));
+        }
+    }
+    let after: Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(o) ORDER BY o.block_hash) FROM qbit_block_candidate_outbox o",
+    )
+    .fetch_one(&ledger.pool)
+    .await?;
+    assert_eq!(after, before);
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
 async fn list_shows_every_unfinished_state_without_claiming_or_loading_payloads() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());

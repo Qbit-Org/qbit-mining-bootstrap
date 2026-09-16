@@ -1454,8 +1454,8 @@ impl Ledger {
         )
     }
 
-    /// Every unfinished candidate, oldest due first: the oldest-due claim
-    /// lane's own ordering, so the row a server works next prints first and
+    /// Up to `limit` unfinished candidates and whether more exist, oldest due
+    /// first: the oldest-due claim lane's own ordering, so the row a server works next prints first and
     /// parked (`infinity`) rows sort last.
     ///
     /// The pool is the read-only shape [`Ledger::inspect_fatal_state`] uses.
@@ -1463,7 +1463,7 @@ impl Ledger {
     /// property PostgreSQL enforces rather than one a reviewer checks, and
     /// no write guard runs, so the inventory keeps working while the cluster
     /// is halted: precisely when an operator needs it.
-    pub async fn list_candidates(url: &str, limit: i64) -> Result<Vec<Value>> {
+    pub async fn list_candidates(url: &str, limit: i64) -> Result<(Vec<Value>, bool)> {
         ensure!(
             (1..=10_000).contains(&limit),
             "--limit must be between 1 and 10000"
@@ -1481,13 +1481,20 @@ impl Ledger {
             .connect(url)
             .await?;
         let rows = sqlx::query(&Self::candidate_list_sql())
-            .bind(limit)
+            .bind(limit + 1)
             .fetch_all(&pool)
             .await;
         // Released on the failure path too: an inventory that cannot finish
         // must not leave a connection behind for the next command.
         pool.close().await;
-        rows?.iter().map(candidate_summary).collect()
+        let rows = rows?;
+        let truncated = rows.len() > limit as usize;
+        let candidates = rows
+            .iter()
+            .take(limit as usize)
+            .map(candidate_summary)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((candidates, truncated))
     }
 
     /// Abandon one candidate, as the single statement whose `WHERE` *is* the

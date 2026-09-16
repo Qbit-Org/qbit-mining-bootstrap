@@ -94,7 +94,7 @@ qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
 qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>"
 ```
 
-`list` prints every unfinished row — `pending`, `offer_reserved`, `offered`
+`list` prints unfinished rows up to the selected limit — `pending`, `offer_reserved`, `offered`
 and `reconciliation` — oldest due first. That is the oldest-due claim lane's
 own ordering, so the row a server works next is the first line and parked
 rows sort last. It is not ordered by height, which is read out of the
@@ -136,8 +136,14 @@ keeps working while the cluster is halted — precisely when it is needed. An
 empty list is a **success**: the command prints `no unfinished candidates` (or
 an empty `candidates` array) and exits zero, so a `set -e` runbook can wait for
 exactly that. `--json` prints one
-`{"schema":"qbit.prism.candidates.list.v1","candidates":[...]}` document with
-every field untruncated and every unknown value as `null`.
+`{"schema":"qbit.prism.candidates.list.v1","candidates":[...],"limit":100,"truncated":false}` document with
+every field untruncated and every unknown value as `null`. The inventory is limited
+to `--limit` rows (default 100, maximum 10000). Both modes fetch one extra row to
+detect omitted candidates: JSON sets `truncated: true`, while text mode writes a
+warning to stderr. Parked rows sort last and may be among the omitted rows. Raise
+`--limit` to inspect more; inventories larger than 10000 require a read-only
+database query. A full page is complete only when `truncated` is false. These
+fields describe the query's snapshot, not rows arriving after it.
 
 `abandon` finishes one `pending` row with `storage_version = 1` **whose
 document this release could replay**. Other storage versions are refused
