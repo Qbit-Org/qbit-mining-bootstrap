@@ -1036,27 +1036,35 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
     // can still reach at four times the requested weight. An empty window is
     // only clear when the ledger holds no accepted share at all; otherwise the
     // floor is unknown and blocks every partition.
+    // The window's counted weight adds up to the requested weight exactly
+    // when the walk reached it, and to less when the parent ran out of rows
+    // first; a partition PostgreSQL hides from the parent is judged by that.
     let floor_row = sqlx::query(
-        "SELECT (SELECT min(share_seq) FROM qbit_prism_window(clock_timestamp(),$1::text::numeric*8*$2::bigint)) AS floor,\
+        "SELECT w.floor,w.weight<$1::text::numeric*8*$2::bigint AS short,\
          EXISTS(SELECT 1 FROM qbit_share_ledger WHERE accepted) AS any_accepted,\
          qbit_prism_share_next_seq() AS next_seq,\
-         (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton) AS watermark",
+         (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton) AS watermark \
+         FROM (SELECT min(share_seq) AS floor,COALESCE(sum(counted_difficulty),0)::numeric AS weight \
+           FROM qbit_prism_window(clock_timestamp(),$1::text::numeric*8*$2::bigint)) w",
     )
     .bind(&options.network_difficulty)
     .bind(options.window_multiple)
     .fetch_one(&mut *connection)
     .await
     .context("reading the payout window floor, the share sequence and the rollup watermark")?;
-    let window_floor: Option<i64> = floor_row.try_get("floor")?;
-    let any_accepted: bool = floor_row.try_get("any_accepted")?;
-    let next_share_seq: i64 = floor_row.try_get("next_seq")?;
-    let watermark: Option<i64> = floor_row.try_get("watermark")?;
-    if window_floor.is_none() && any_accepted {
+    let horizon = Horizon {
+        window_floor: floor_row.try_get("floor")?,
+        window_short: floor_row.try_get("short")?,
+        any_accepted: floor_row.try_get("any_accepted")?,
+        next_share_seq: floor_row.try_get("next_seq")?,
+        watermark: floor_row.try_get("watermark")?,
+    };
+    if horizon.window_floor.is_none() && horizon.any_accepted {
         unknowns.push(
             "the payout window returned no rows while the ledger holds accepted shares; the window floor is unknown".into(),
         );
     }
-    if watermark.is_none() {
+    if horizon.watermark.is_none() {
         unknowns.push(
             "qbit_hashrate_rollup_progress holds no row, so the rollup sweep has never run and no partition's contribution is known to be folded; start a frontend with PRISM_HASHRATE_ROLLUP_ENABLED and let it catch up".into(),
         );
@@ -1093,18 +1101,7 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
 
     let mut partitions = Vec::new();
     for record in records {
-        partitions.push(
-            partition_plan(
-                &mut connection,
-                record,
-                options,
-                window_floor,
-                any_accepted,
-                next_share_seq,
-                watermark,
-            )
-            .await?,
-        );
+        partitions.push(partition_plan(&mut connection, record, options, &horizon).await?);
     }
     let attached_upper_seq = partitions
         .iter()
@@ -1117,12 +1114,12 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
         network_difficulty: options.network_difficulty.clone(),
         window_multiple: options.window_multiple,
         retention_days: options.retention_days,
-        window_floor_share_seq: window_floor,
-        next_share_seq,
-        rollup_last_share_seq: watermark,
+        window_floor_share_seq: horizon.window_floor,
+        next_share_seq: horizon.next_share_seq,
+        rollup_last_share_seq: horizon.watermark,
         attached_count: i64::try_from(attached.len())?,
         attached_upper_seq,
-        lead_rows_ahead: attached_upper_seq.map(|upper| upper - next_share_seq),
+        lead_rows_ahead: attached_upper_seq.map(|upper| upper - horizon.next_share_seq),
         duplicate_share_ids,
         unknowns,
         eligible: partitions
@@ -1136,14 +1133,26 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
     Ok(report)
 }
 
+/// What the parent reports about the online horizon, read once per plan on
+/// the same snapshot as every partition.
+struct Horizon {
+    /// The oldest `share_seq` the payout window reaches; `None` when the
+    /// parent showed it no accepted row.
+    window_floor: Option<i64>,
+    /// The window ran out of rows the parent shows before reaching its
+    /// weight, so it holds that whole history and would reach on into any
+    /// rows the parent hides.
+    window_short: bool,
+    any_accepted: bool,
+    next_share_seq: i64,
+    watermark: Option<i64>,
+}
+
 async fn partition_plan(
     connection: &mut PgConnection,
     record: PartitionRecord,
     options: &PlanOptions,
-    window_floor: Option<i64>,
-    any_accepted: bool,
-    next_share_seq: i64,
-    watermark: Option<i64>,
+    horizon: &Horizon,
 ) -> Result<PartitionPlan> {
     check_partition_name(&record.partition_name)?;
     let attachment = attachment(connection, &record.partition_name).await?;
@@ -1172,7 +1181,7 @@ async fn partition_plan(
     }
     if attachment.detach_pending {
         unknowns.push(format!(
-            "{} carries pg_inherits.inhdetachpending: an earlier DETACH PARTITION ... CONCURRENTLY was interrupted. Run share-archive detach {} to finalize it",
+            "{} carries pg_inherits.inhdetachpending: an earlier DETACH PARTITION ... CONCURRENTLY was interrupted, and {PARENT} hides its rows from every new query until it is finalized. Run share-archive detach {} to finalize it under every condition",
             record.partition_name, record.partition_name
         ));
     }
@@ -1189,21 +1198,37 @@ async fn partition_plan(
         }
     } else {
         let stats = sqlx::query(&format!(
-            "SELECT count(*)::bigint AS rows,max(accepted_at) AS newest,max(share_seq) AS newest_seq FROM {}",
+            "SELECT count(*)::bigint AS rows,count(*) FILTER (WHERE accepted)::bigint AS accepted_rows,max(accepted_at) AS newest,max(share_seq) AS newest_seq FROM {}",
             record.partition_name
         ))
         .fetch_one(&mut *connection)
         .await
         .with_context(|| format!("counting the live rows of {}", record.partition_name))?;
         let rows: i64 = stats.try_get("rows")?;
+        let accepted_rows: i64 = stats.try_get("accepted_rows")?;
         let newest: Option<DateTime<Utc>> = stats.try_get("newest")?;
         let newest_seq: Option<i64> = stats.try_get("newest_seq")?;
         live_rows = Some(rows);
         newest_accepted_at = newest;
         newest_share_seq = newest_seq;
 
-        conditions.push(match window_floor {
-            _ if !any_accepted => Condition::clear(
+        // PostgreSQL hides a detach-pending partition from every new snapshot
+        // of the parent, so the window just walked could not count this
+        // partition's rows. A floor the window reached at its full weight
+        // above the partition is exact, since nothing hidden lies in what it
+        // counted; a window that ran out of visible rows first would have
+        // gone on into these.
+        let hidden_rows = attachment.detach_pending && accepted_rows > 0;
+        conditions.push(match horizon.window_floor {
+            _ if hidden_rows && horizon.window_short => Condition::blocked(
+                "payout_window",
+                format!(
+                    "the payout window at {}x ran out of rows before reaching its weight, and {PARENT} hides this detach-pending partition's {accepted_rows} accepted row(s) from it, so the window reaches into this partition's bounds {}",
+                    options.window_multiple,
+                    record.bounds()
+                ),
+            ),
+            _ if !horizon.any_accepted => Condition::clear(
                 "payout_window",
                 "the ledger holds no accepted share, so no payout window reaches this partition",
             ),
@@ -1261,7 +1286,7 @@ async fn partition_plan(
         // covers every committed row below it too. The rows are only all
         // known once the sequence has passed the bound; before that an empty
         // partition has nothing folded because it has nothing yet.
-        conditions.push(match (watermark, newest_share_seq) {
+        conditions.push(match (horizon.watermark, newest_share_seq) {
             (None, _) => Condition::unknown(
                 "rollup_watermark",
                 "qbit_hashrate_rollup_progress holds no row: the rollups have never run, so this partition's contribution is not in the permanent rollup tables",
@@ -1272,11 +1297,11 @@ async fn partition_plan(
                     "the rollup sweep has folded share_seq up to {last} only; this partition's newest row is share_seq {newest}"
                 ),
             ),
-            _ if next_share_seq < record.upper_seq => Condition::blocked(
+            _ if horizon.next_share_seq < record.upper_seq => Condition::blocked(
                 "rollup_watermark",
                 format!(
-                    "the share sequence stands at {next_share_seq}, below this partition's upper bound {}, so appends can still land in it and its rows are not all folded yet",
-                    record.upper_seq
+                    "the share sequence stands at {}, below this partition's upper bound {}, so appends can still land in it and its rows are not all folded yet",
+                    horizon.next_share_seq, record.upper_seq
                 ),
             ),
             (Some(last), Some(newest)) => Condition::clear(
@@ -1958,9 +1983,10 @@ async fn maintenance_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConne
 /// EP-STATE and EP-ERRORS: the DDL runs outside any transaction (PostgreSQL
 /// refuses `DETACH ... CONCURRENTLY` in a transaction block), so the catalog
 /// update cannot be atomic with it. `pg_inherits` is therefore read as the
-/// truth on every run: a partition already detached, or one left with
-/// `inhdetachpending` by an interrupted attempt, is finalized or simply
-/// reconciled into the catalog instead of being detached again.
+/// truth on every run: a partition already detached is reconciled into the
+/// catalog instead of being detached again, and one left with
+/// `inhdetachpending` by an interrupted attempt is finalized, under every
+/// condition again, since the mark says nothing about who started the DDL.
 pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions) -> Result<Value> {
     check_partition_name(partition_name)?;
     let _lifecycle = lifecycle_guard(ledger).await?;
@@ -2018,6 +2044,25 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
             "detached_at": reconciled,
         }));
     }
+    // An interrupted `DETACH ... CONCURRENTLY` left the partition marked
+    // detach-pending: PostgreSQL has already excluded it from the parent for
+    // every new snapshot, and only FINALIZE can move it forward. The mark
+    // proves only that a detach was started, by share-archive detach or by
+    // hand, not that any condition held, so every condition is required
+    // again before the statement that resolves it. The mark keeps the
+    // relation attached and present, so the blockers are the whole of that
+    // gate, and a partition that fails it is brought back first: its rows
+    // are hidden from the parent for as long as the mark stands, the window
+    // and the dashboards cannot see them, and a seal cannot rebuild from
+    // them.
+    if attachment.detach_pending {
+        ensure!(
+            entry.blockers.is_empty(),
+            "refusing to finalize the interrupted detach of {partition_name}: {}. {PARENT} hides a detach-pending partition from every new query and the mark can only go forward, so bring its rows back first: run ALTER TABLE {PARENT} DETACH PARTITION {partition_name} FINALIZE, then {}; clear each condition with share-archive plan and start again from share-archive detach {partition_name}",
+            entry.blockers.join("; "),
+            reattach_statement(record)
+        );
+    }
     ensure!(
         record.sealed_at.is_some(),
         "refusing to detach {partition_name}: no sealed_at is recorded. Run share-archive seal {partition_name}"
@@ -2040,12 +2085,9 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
         number_or(entry.live_rows, "an unknown number of"),
         number_or(record.archive_rows, "no")
     );
-    // An interrupted `DETACH ... CONCURRENTLY` left the partition marked
-    // detach-pending: PostgreSQL has already excluded it from the parent for
-    // every new snapshot, and only FINALIZE can move it forward. Its
-    // eligibility was proved by the run that started the detach, and `plan`
-    // reports the pending mark itself as an unknown, so the eligibility gate
-    // below would refuse the one statement that resolves it.
+    // `plan` reports the detach-pending mark itself as an unknown, the one
+    // thing FINALIZE may not be refused for; every blocker of a pending
+    // partition was required above, and the mark leaves it no other unknown.
     ensure!(
         attachment.detach_pending || entry.eligible,
         "{}",
@@ -2105,6 +2147,19 @@ async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option
     Ok(detached_at)
 }
 
+/// The statement that returns a relation to the parent under its recorded
+/// bounds: the way back for one that left, or is leaving, too early.
+fn reattach_statement(record: &PartitionRecord) -> String {
+    format!(
+        "ALTER TABLE {PARENT} ATTACH PARTITION {} FOR VALUES FROM ({}) TO ({})",
+        record.partition_name,
+        record
+            .lower_seq
+            .map_or_else(|| "MINVALUE".into(), |lower| lower.to_string()),
+        record.upper_seq
+    )
+}
+
 /// The seal, held to for a relation that is no longer an attached partition:
 /// once it is recorded detached the drop is one command away, and a canonical
 /// artifact can only be rebuilt while the shares it paid on are still online
@@ -2119,13 +2174,7 @@ async fn check_seal_off_parent(
     what: &str,
 ) -> Result<()> {
     let name = &record.partition_name;
-    let reattach = format!(
-        "ALTER TABLE {PARENT} ATTACH PARTITION {name} FOR VALUES FROM ({}) TO ({})",
-        record
-            .lower_seq
-            .map_or_else(|| "MINVALUE".into(), |lower| lower.to_string()),
-        record.upper_seq
-    );
+    let reattach = reattach_statement(record);
     ensure!(
         record.sealed_at.is_some(),
         "refusing to {what} {name}: no sealed_at is recorded, so audit rows whose snapshot intersects it may still depend on its rows, and a seal needs them online in {PARENT}. Run {reattach}, then share-archive seal {name}, and start again from share-archive detach {name}"

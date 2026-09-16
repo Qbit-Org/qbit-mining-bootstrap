@@ -278,7 +278,7 @@ the primary, with the frontends running:
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
 | `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous, and refused over a predecessor whose archive is not verified, so every link is to a certified manifest; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written and verified again in order, each over its verified predecessor, and is refused once a later archived partition has left the ledger |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, whose own archive has to be verified, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` only for that full comparison, and only once the share sequence has passed the partition, so a verify after the detach reports but never counts as the proof the detach required |
-| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY` (finalized if an earlier attempt was interrupted); the table stays as a standalone relation |
+| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, or FINALIZE for an attempt interrupted after PostgreSQL marked the partition detach-pending, held to every condition again because the mark does not tell a `share-archive detach` from a statement run by hand; the table stays as a standalone relation |
 | `drop <partition> --dir <root>` | requires `detached` and verified; reads the recorded archive back from disk, checking both digests against the catalog, and counts the rows against it again; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
 
@@ -294,6 +294,17 @@ loads the rows, re-streams the digest and, with `--attach`, attaches and
 records the catalog in one transaction, so a failed restore leaves nothing
 behind; `detach`, `drop` and the restore run their DDL without statement or
 lock timeouts, as the migration runner does.
+
+While a partition carries the detach-pending mark, PostgreSQL hides its rows
+from every new query of the parent. The payout window is read from the
+parent, so `plan` counts the hidden partition's accepted rows into that
+condition itself: a window that ran out of visible rows before reaching its
+weight still reaches into the partition and blocks it. A pending partition
+that fails a condition is brought back first; the refusal prints the
+`FINALIZE` and `ATTACH PARTITION` statements that do it. The rollup sweep
+reads the parent too and cannot fold rows it does not see, so a partition
+whose rows are not yet folded must never be detached by hand: the watermark
+passes them while they are hidden and nothing can show it afterwards.
 
 ## Archive format v1
 

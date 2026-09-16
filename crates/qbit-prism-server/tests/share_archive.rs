@@ -169,6 +169,17 @@ async fn set_sequence(pool: &PgPool, value: i64) -> Result<()> {
     Ok(())
 }
 
+/// Whether `pg_inherits` holds the partition with the mark an interrupted
+/// `DETACH PARTITION ... CONCURRENTLY` leaves behind.
+async fn detach_pending(pool: &PgPool, partition: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE((SELECT i.inhdetachpending FROM pg_inherits i WHERE i.inhrelid=to_regclass($1) AND i.inhparent=to_regclass('qbit_share_ledger')),false)",
+    )
+    .bind(partition)
+    .fetch_one(pool)
+    .await?)
+}
+
 async fn bounds(pool: &PgPool, partition: &str) -> Result<(Option<i64>, i64)> {
     let row = sqlx::query(
         "SELECT lower_seq,upper_seq FROM qbit_prism_share_partitions WHERE partition_name=$1",
@@ -2330,6 +2341,133 @@ async fn an_interrupted_concurrent_detach_is_finalized() -> Result<()> {
         .fetch_optional(&ledger.pool)
         .await?;
         ensure!(still.is_none(), "{P0} is still a partition after the finalize");
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// A detach-pending mark proves that a `DETACH PARTITION ... CONCURRENTLY`
+/// was started, by share-archive detach or by hand, not that any condition
+/// held, so FINALIZE is held to every condition again. PostgreSQL hides the
+/// marked partition from the parent meanwhile, which is where the payout
+/// window is read from, so the window gate has to see through that.
+#[tokio::test]
+async fn an_interrupted_detach_is_held_to_every_condition_before_finalize() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("finalize-b").await?;
+        let root = tempfile::tempdir()?;
+        // The whole accepted history is in p0, so the payout window at 4x
+        // reaches into it; nothing else holds the partition back.
+        insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+        let (p0_lower, p0_upper) = bounds(&ledger.pool, P0).await?;
+        set_sequence(&ledger.pool, p0_upper - 1).await?;
+        advance_rollups(&ledger.pool).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        archive::seal(&ledger, P0).await?;
+        let before = archive::plan(&ledger, &retention(0)).await?;
+        ensure!(
+            entry(&before, P0).blockers.len() == 1
+                && condition(entry(&before, P0), "payout_window").status == "blocked",
+            "the fixture does not isolate the payout window: {:?}",
+            entry(&before, P0).blockers
+        );
+
+        // An operator starts the detach by hand, and a reader's snapshot
+        // interrupts its second phase, as in the test above.
+        let mut reader = ledger.pool.begin().await?;
+        sqlx::query("SELECT count(*) FROM qbit_share_ledger")
+            .fetch_one(&mut *reader)
+            .await?;
+        let mut ddl = ledger.pool.acquire().await?;
+        sqlx::query("SELECT set_config('statement_timeout','2000',false)")
+            .execute(&mut *ddl)
+            .await?;
+        let interrupted = sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0} CONCURRENTLY"
+        ))
+        .execute(&mut *ddl)
+        .await;
+        ensure!(
+            interrupted.is_err(),
+            "the concurrent detach was not interrupted by the open reader"
+        );
+        drop(ddl);
+        reader.rollback().await?;
+        ensure!(
+            detach_pending(&ledger.pool, P0).await?,
+            "the interrupted detach did not leave {P0} detach-pending"
+        );
+
+        // The parent now hides p0's rows: the window walked over it holds no
+        // row at all, which read as clear before the hidden rows were counted.
+        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(
+            visible == 0,
+            "the parent still shows {visible} row(s) of a detach-pending partition"
+        );
+        let accepted: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {P0} WHERE accepted"))
+                .fetch_one(&ledger.pool)
+                .await?;
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        let window = condition(entry(&report, P0), "payout_window");
+        ensure!(
+            window.status == "blocked"
+                && window.detail.contains(&format!(
+                    "hides this detach-pending partition's {accepted} accepted row(s)"
+                )),
+            "the payout window did not account for the hidden partition: {window:?}"
+        );
+        let error = archive::detach(&ledger, P0, &retention(0))
+            .await
+            .expect_err("finalized a partition the payout window still reaches")
+            .to_string();
+        let reattach = format!(
+            "ALTER TABLE qbit_share_ledger ATTACH PARTITION {P0} FOR VALUES FROM ({}) TO ({p0_upper})",
+            p0_lower.map_or_else(|| "MINVALUE".to_owned(), |lower| lower.to_string())
+        );
+        ensure!(
+            error.starts_with(&format!(
+                "refusing to finalize the interrupted detach of {P0}: payout_window:"
+            )) && error.contains(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0} FINALIZE, then {reattach};"
+            )),
+            "{error}"
+        );
+        ensure!(
+            detach_pending(&ledger.pool, P0).await?,
+            "a refused finalize moved {P0}"
+        );
+        ensure!(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "attached",
+            "a refused finalize changed the catalog"
+        );
+
+        // Once the window has moved on past p0, the same mark is finalized.
+        move_horizon_past_p0(&ledger.pool).await?;
+        let finalized = archive::detach(&ledger, P0, &retention(0)).await?;
+        ensure!(
+            finalized["action"] == "finalized",
+            "the detach was not finalized once every condition held: {finalized}"
+        );
+        ensure!(
+            !detach_pending(&ledger.pool, P0).await?
+                && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "detached",
+            "the catalog was not updated after the finalize"
+        );
         Ok(ledger)
     }
     .await;
