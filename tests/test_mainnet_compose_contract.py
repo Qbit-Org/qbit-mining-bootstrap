@@ -253,6 +253,7 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(writer["PRISM_SHARE_COMMIT_TIMEOUT_SECONDS"], "19")
         self.assertEqual(writer["PRISM_RPC_TIMEOUT_SECONDS"], "21")
         self.assertEqual(writer["PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS"], "2")
+        self.assertEqual(writer["PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS"], "17")
         for service in ("prism-coordinator", "prism-public-api"):
             with self.subTest(service=service):
                 env = self._environment(service)
