@@ -22,6 +22,7 @@ from dataclasses import replace as dataclass_replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import patch
 
 from lab.auxpow import vardiff
@@ -1017,6 +1018,9 @@ class LostAckSubmitRpc(FakeRpc):
         return super().call(method, params)
 
 
+_UNSET_REPLY = object()
+
+
 class AcceptanceProbeRpc(FakeRpc):
     def __init__(
         self,
@@ -1025,11 +1029,27 @@ class AcceptanceProbeRpc(FakeRpc):
         header: dict[str, object] | None = None,
         fail: bool = False,
         fail_tip: bool = False,
+        active_hash: str | None = None,
+        fail_active_hash: bool = False,
+        headers_by_hash: dict[str, dict[str, object] | None] | None = None,
+        getblockhash_reply: object = _UNSET_REPLY,
     ) -> None:
         self.tip = tip
         self.header = header
         self.fail = fail
         self.fail_tip = fail_tip
+        # The node's active block at any requested height (the orphan
+        # verdict's second statement); None keeps getblockhash unavailable.
+        self.active_hash = active_hash
+        self.fail_active_hash = fail_active_hash
+        # Per-hash header views (the competitor's confirmations for the
+        # orphan confirmation wait); a hash absent here falls back to
+        # ``header``, and an explicit None entry is "block not found".
+        self.headers_by_hash = dict(headers_by_hash or {})
+        # A verbatim getblockhash reply (a null, a number, an empty string)
+        # for pinning that only a well-formed hash is "a different block".
+        self.getblockhash_reply = getblockhash_reply
+        self.getblockheader_calls: list[str] = []
 
     def call(self, method: str, params: list[object] | None = None) -> object:
         if self.fail:
@@ -1039,9 +1059,164 @@ class AcceptanceProbeRpc(FakeRpc):
                 raise RuntimeError("qbit RPC getbestblockhash unavailable")
             return self.tip
         if method == "getblockheader":
-            if self.header is None:
+            requested = str((params or [""])[0]).lower()
+            self.getblockheader_calls.append(requested)
+            if requested in self.headers_by_hash:
+                header = self.headers_by_hash[requested]
+            else:
+                header = self.header
+            if header is None:
                 raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
-            return self.header
+            return header
+        if method == "getblockhash":
+            if self.fail_active_hash:
+                raise RuntimeError("qbit RPC getblockhash timed out")
+            if self.getblockhash_reply is not _UNSET_REPLY:
+                return self.getblockhash_reply
+            if self.active_hash is not None:
+                return self.active_hash
+        return super().call(method, params)
+
+
+class OrphanedBlockSubmitRpc(FakeRpc):
+    """qbitd accepts the submitted block, then loses it to a same-height rival.
+
+    Models the #413/#414 orphan stall: submitblock succeeds and the tip flips to
+    the pool's hash (blockwait reports it), then the node reorgs to an
+    equal-work competitor at the same height. From then on getblockheader
+    still knows the pool's block but reports it off the active chain
+    (``confirmations == -1``) and getblockhash at that height names the
+    competitor. ``on_accept`` runs inside the accepting submitblock call,
+    after the tip flipped to the pool's hash, so a test can register the
+    blockwait observation and trigger the reorg exactly where the incident
+    did: between the node's acceptance and the coordinator's active-height
+    check. ``header_failure`` / ``active_hash_failure`` inject probe RPC
+    failures to pin that an unknown view never becomes an orphan verdict.
+
+    The competitor is a real block to this node: its header reports its
+    confirmations (one while it is the tip), ``extend_competitor`` lands a
+    child on it (one more confirmation -- the default terminal bar), and
+    ``reactivate`` flips the tie back to the pool's block. That is the
+    state machine the orphan confirmation wait (#414 review) runs against.
+    """
+
+    def __init__(
+        self,
+        *,
+        start_tip: str,
+        hash_by_hex: dict[str, str],
+        competitor: str,
+        on_accept: Callable[[str], None] | None = None,
+        lose_acks: bool = False,
+    ) -> None:
+        self.tip = start_tip
+        self.height = 9
+        self.hash_by_hex = dict(hash_by_hex)
+        self.competitor = competitor.lower()
+        self.on_accept = on_accept
+        self.lose_acks = lose_acks
+        self.known: dict[str, int] = {}
+        self.orphaned: set[str] = set()
+        self.submitblock_calls = 0
+        self.header_failure: Exception | None = None
+        self.active_hash_failure: Exception | None = None
+        self.competitor_header_failure: Exception | None = None
+        self.getblockhash_calls = 0
+        # Blocks mined on top of the competitor (hash -> height).
+        self.competitor_children: dict[str, int] = {}
+
+    def orphan(self, block_hash: str) -> None:
+        """Reorg the node to the competitor at the pool block's height."""
+        self.orphaned.add(block_hash.lower())
+        self.tip = self.competitor
+
+    def reactivate(self, block_hash: str) -> None:
+        """The tie flips back: the pool's block is the active tip again."""
+        key = block_hash.lower()
+        self.orphaned.discard(key)
+        self.tip = key
+        self.height = self.known[key]
+        self.competitor_children.clear()
+
+    def extend_competitor(self) -> str:
+        """A child lands on the competitor: one more confirmation for it."""
+        self.height += 1
+        child = f"{len(self.competitor_children) + 1:02x}" * 32
+        self.competitor_children[child] = self.height
+        self.tip = child
+        return child
+
+    def _competitor_height(self) -> int | None:
+        heights = [
+            block_height
+            for block_hash, block_height in self.known.items()
+            if block_hash in self.orphaned
+        ]
+        return heights[0] if heights else None
+
+    def call(self, method: str, params: list[object] | None = None) -> object:
+        if method == "getbestblockhash":
+            return self.tip
+        if method == "getblockcount":
+            return self.height
+        if method == "submitblock":
+            self.submitblock_calls += 1
+            block_hash = self.hash_by_hex[str((params or [""])[0])].lower()
+            if block_hash in self.known:
+                return "duplicate"
+            self.height += 1
+            self.known[block_hash] = self.height
+            self.tip = block_hash
+            if self.on_accept is not None:
+                self.on_accept(block_hash)
+            if self.lose_acks:
+                raise OSError("connection reset by peer before submitblock ack")
+            return None
+        if method == "getblockheader":
+            requested = str((params or [""])[0]).lower()
+            if requested == self.competitor:
+                if self.competitor_header_failure is not None:
+                    raise self.competitor_header_failure
+                competitor_height = self._competitor_height()
+                if competitor_height is None:
+                    raise RuntimeError(
+                        "qbit RPC getblockheader failed: -5 Block not found"
+                    )
+                return {
+                    "height": competitor_height,
+                    "confirmations": self.height - competitor_height + 1,
+                }
+            if self.header_failure is not None:
+                raise self.header_failure
+            if requested in self.known:
+                block_height = self.known[requested]
+                if requested in self.orphaned:
+                    return {"height": block_height, "confirmations": -1}
+                return {
+                    "height": block_height,
+                    "confirmations": self.height - block_height + 1,
+                }
+            if requested in self.competitor_children:
+                block_height = self.competitor_children[requested]
+                return {
+                    "height": block_height,
+                    "confirmations": self.height - block_height + 1,
+                }
+            raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
+        if method == "getblockhash":
+            self.getblockhash_calls += 1
+            if self.active_hash_failure is not None:
+                raise self.active_hash_failure
+            requested_height = int((params or [0])[0])
+            for block_hash, block_height in self.known.items():
+                if block_height == requested_height:
+                    if block_hash in self.orphaned:
+                        return self.competitor
+                    return block_hash
+            for block_hash, block_height in self.competitor_children.items():
+                if block_height == requested_height:
+                    return block_hash
+            raise RuntimeError(f"unknown height {requested_height}")
         return super().call(method, params)
 
 

@@ -42,7 +42,11 @@ from lab.prism.share_ledger import PendingShare, SingleWriterShareLedger
 from tests.prism_coordinator_test_support import (
     coordinator as light_coordinator,
 )
-from tests.prism_vardiff_test_support import block_candidate, submit_coordinator
+from tests.prism_vardiff_test_support import (
+    AcceptanceProbeRpc,
+    block_candidate,
+    submit_coordinator,
+)
 
 
 ANCESTOR_HASH = "aa" * 32
@@ -474,6 +478,61 @@ class AncestorRedriveSweepTests(unittest.TestCase):
                 self.assertEqual(
                     int(server.accepted_parent_redrive_resolved_count), 0
                 )
+
+    def test_reorged_ancestor_probe_leaves_no_orphan_verdict_behind(self) -> None:
+        """The sweep's chain probe is a read (#414 review finding 3).
+
+        A durably confirmed ancestor the node has since reorged out answers
+        the real probe with the orphan view: its header held off the active
+        chain and a different block active at its height. The sweep stands
+        down exactly as for any non-True probe, and the read leaves no
+        orphan bookkeeping behind -- no verdict entry that nothing would
+        retire, no verdict count -- because that bookkeeping belongs to the
+        abandon path of a candidate this process still owns.
+        """
+        competitor = "bb" * 32
+        server, _state, _recording = submit_coordinator()
+        ledger = SweepLedger(
+            {
+                "block_hash": ANCESTOR_HASH,
+                "block_height": 10,
+                "parent_hash": PARENT_TIP,
+                "chain_state": "confirmed",
+                "maturity_state": "immature",
+            }
+        )
+        server.ledger = ledger
+        server.accepted_parent_redrive_defer_threshold = 1
+        rpc = AcceptanceProbeRpc(
+            tip=competitor,
+            header={"height": 10, "confirmations": -1},
+            active_hash=competitor,
+        )
+        server.rpc = rpc
+        server._begin_accepted_block_payout_preview(
+            ANCESTOR_HASH, block_height=10
+        )
+        server._mark_accepted_block_payout_landed(ANCESTOR_HASH, block_height=10)
+
+        self._defer_once(server)
+        with patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 0)
+
+        self.assertEqual(ledger.pool_block_state_calls, [ANCESTOR_HASH])
+        # The real probe ran against the node and read the orphan view ...
+        self.assertEqual(rpc.getblockheader_calls, [ANCESTOR_HASH])
+        # ... the sweep stood down ...
+        with server._accepted_block_payout_preview_condition:
+            self.assertIn(ANCESTOR_HASH, server._accepted_block_payout_previews)
+        self.assertEqual(int(server.accepted_parent_redrive_resolved_count), 0)
+        # ... and the read mutated no candidate state.
+        self.assertEqual(server._block_candidate_orphan_verdicts, {})
+        self.assertEqual(server.block_candidate_orphan_verdict_count, 0)
+        self.assertEqual(server.block_candidate_orphan_wait_defer_count, 0)
+        self.assertEqual(
+            dict(server.block_candidate_orphan_terminal_counts),
+            {"competitor_confirmed": 0, "window_expired": 0},
+        )
 
     def test_retry_held_ancestor_is_left_to_its_owner(self) -> None:
         """The in-process-ownership guard itself, reached with nothing adopted.

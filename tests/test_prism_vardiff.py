@@ -5,6 +5,12 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked,
+    TemplateRefreshSuperseded,
+)
 from lab.prism.vardiff_service import VardiffService
 from tests.prism_vardiff_test_support import *
 
@@ -1225,6 +1231,217 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(state.pending_share_difficulty, Decimal("4"))
         self.assertEqual(sent["jobs"], 1)
         self.assertTrue(sent["clean"])
+
+    def test_payout_publication_block_in_retarget_keeps_client_connected(self) -> None:
+        # #414: the share-driven retarget's paired job build
+        # reaches reorg reconciliation while a landed accepted-block
+        # transition fences payout publication, so maybe_send_job raises
+        # PayoutStatePublicationBlocked. That must not escape the accepted
+        # share path: the client keeps its connection and its current
+        # difficulty (the speculative pending difficulty is rolled back),
+        # the skip is counted, and the log line is emitted once per client.
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        attempts: dict[str, int] = {"jobs": 0}
+
+        def fenced_send_job(client: object, clean_jobs: bool) -> bool:
+            attempts["jobs"] += 1
+            raise PayoutStatePublicationBlocked(
+                "accepted block payout confirmation is still pending"
+            )
+
+        server.maybe_send_job = fenced_send_job  # type: ignore[method-assign]
+
+        with redirect_stdout(StringIO()) as captured:
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+            state.vardiff_window_started_monotonic = time.monotonic() - 2
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+
+        self.assertEqual(attempts["jobs"], 2)
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertFalse(getattr(state, "closing", False))
+        self.assertEqual(
+            captured.getvalue().count(
+                "vardiff retarget skipped reason=payout_publication_blocked"
+            ),
+            1,
+        )
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 2',
+            server.metrics_payload(),
+        )
+
+    def test_template_refresh_superseded_in_retarget_keeps_client_connected(
+        self,
+    ) -> None:
+        # #414 review finding 2: the sibling fence from the same reconcile
+        # pass -- a superseded template refresh -- takes the same skip path
+        # as the payout fence instead of escaping handle_submit and killing
+        # the client thread: connection kept, speculative difficulty rolled
+        # back, the skip counted under its own bounded reason, the log line
+        # emitted once per hold.
+        server = coordinator()
+        state = client()
+        state.share_difficulty = Decimal("1")
+        state.vardiff_window_started_monotonic = time.monotonic() - 2
+        attempts: dict[str, int] = {"jobs": 0}
+
+        def fenced_send_job(client: object, clean_jobs: bool) -> bool:
+            attempts["jobs"] += 1
+            raise TemplateRefreshSuperseded(
+                "tip refresh snapshot was superseded before client job build"
+            )
+
+        server.maybe_send_job = fenced_send_job  # type: ignore[method-assign]
+
+        with redirect_stdout(StringIO()) as captured:
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+            state.vardiff_window_started_monotonic = time.monotonic() - 2
+            server.note_vardiff_submitted_share(state)
+            server.note_vardiff_accepted_share(state, FakeJob(Decimal("1")))  # type: ignore[arg-type]
+
+        self.assertEqual(attempts["jobs"], 2)
+        self.assertIsNone(state.pending_share_difficulty)
+        self.assertEqual(state.share_difficulty, Decimal("1"))
+        self.assertFalse(getattr(state, "closing", False))
+        self.assertEqual(
+            captured.getvalue().count(
+                "vardiff retarget skipped reason=template_refresh_blocked"
+            ),
+            1,
+        )
+        payload = server.metrics_payload()
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="template_refresh_blocked"} 2',
+            payload,
+        )
+        self.assertIn(
+            'qbit_prism_vardiff_retargets_skipped_total{reason="payout_publication_blocked"} 0',
+            payload,
+        )
+
+    def test_fenced_retarget_still_acks_the_share_and_keeps_the_connection(
+        self,
+    ) -> None:
+        # #414 review finding 2, end to end through the Stratum dispatcher:
+        # the accepted share's own acknowledgement is written after the
+        # retarget's paired build is fenced -- for either fence class -- and
+        # the connection stays open at its current difficulty.
+        tip = "00" * 32
+        fences = (
+            (
+                PayoutStatePublicationBlocked(
+                    "accepted block payout confirmation is still pending"
+                ),
+                "payout_publication_blocked",
+            ),
+            (
+                TemplateRefreshSuperseded(
+                    "tip refresh snapshot was superseded before client job build"
+                ),
+                "template_refresh_blocked",
+            ),
+        )
+        for fence, reason in fences:
+            with self.subTest(reason=reason):
+                server = coordinator()
+                server.accepted_block_count = 0
+                server.max_blocks = 1
+                server.stop_after_block = True
+                server.jobs = {}
+                server.recent_share_keys = set()
+                server.share_weights_by_username = {}
+                ledger = RecordingLedger()
+                server.ledger = ledger
+                worker = worker_identity()
+                state = client()
+                state.username = worker.username
+                state.worker = worker
+                state.share_difficulty = Decimal("1")
+                state.vardiff_window_started_monotonic = time.monotonic() - 2
+                sent: list[dict[str, object]] = []
+                state.send = lambda payload: sent.append(payload)  # type: ignore[method-assign]
+                server.clients = {state}
+                server.rpc = TipTemplateRpc(tip=tip, template=gbt_template(tip))
+                context = prism_context(
+                    "job-1", tip, worker=worker, difficulty=Decimal("1")
+                )
+                state.active_job = context
+                state.active_job_ids = {"job-1"}
+                server.jobs["job-1"] = context
+                attempts: dict[str, int] = {"jobs": 0}
+
+                def fenced_send_job(
+                    client: object,
+                    clean_jobs: bool,
+                    *,
+                    fence: BaseException = fence,
+                ) -> bool:
+                    attempts["jobs"] += 1
+                    raise fence
+
+                server.maybe_send_job = fenced_send_job  # type: ignore[method-assign]
+                # Outside the behaviour under test: the dispatcher's
+                # post-submit refresh hook has no pending accepted block.
+                server.refresh_jobs_after_pending_accepted_block = (  # type: ignore[method-assign]
+                    lambda client, **_kwargs: 0
+                )
+
+                def assemble_accepted(job: object, **_kwargs: object) -> SimpleNamespace:
+                    return SimpleNamespace(
+                        header_hex="aa" * 80,
+                        block_hash_hex="bb" * 32,
+                        share_pass=True,
+                        block_pass=False,
+                    )
+
+                server.note_vardiff_submitted_share(state)
+                with (
+                    patch(
+                        "lab.prism.prism_coordinator.direct_stratum.assemble_submission",
+                        side_effect=assemble_accepted,
+                    ),
+                    redirect_stdout(StringIO()) as captured,
+                ):
+                    server.handle_request(
+                        state,
+                        {
+                            "id": 7,
+                            "method": "mining.submit",
+                            "params": [
+                                "miner-a",
+                                "job-1",
+                                "00" * 8,
+                                "00000001",
+                                "00000002",
+                            ],
+                        },
+                    )
+
+                # The paired build was attempted and fenced ...
+                self.assertEqual(attempts["jobs"], 1)
+                self.assertIn(
+                    f"vardiff retarget skipped reason={reason}",
+                    captured.getvalue(),
+                )
+                # ... the share was credited and acknowledged regardless ...
+                self.assertEqual(len(ledger.pending), 1)
+                self.assertEqual(ledger.pending[0].job_id, "job-1")
+                self.assertIn({"id": 7, "result": True, "error": None}, sent)
+                # ... and the client keeps its connection and difficulty.
+                self.assertFalse(getattr(state, "closing", False))
+                self.assertIsNone(state.pending_share_difficulty)
+                self.assertEqual(state.share_difficulty, Decimal("1"))
+                self.assertIn(
+                    f'qbit_prism_vardiff_retargets_skipped_total{{reason="{reason}"}} 1',
+                    server.metrics_payload(),
+                )
 
     def test_step_up_retarget_keeps_old_job_submittable_at_old_difficulty(self) -> None:
         tip = "00" * 32
