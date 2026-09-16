@@ -761,6 +761,30 @@ async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> 
     assert_eq!(after["claim_instance_id"], Value::Null);
     assert_eq!(after["claim_token"], Value::Null);
 
+    // The state predicate is the version guard: a second abandon completing
+    // after the first cannot overwrite the reason the first recorded, and
+    // says so rather than reporting a success or a lost row.
+    let again = cli(
+        &db,
+        &node,
+        &[
+            "candidates",
+            "abandon",
+            "--block-hash",
+            &held.hash,
+            "--reason",
+            "INC-311: a second operator, later, with another reason",
+        ],
+    )
+    .await?;
+    assert_eq!(code(&again), 4, "{}", stderr(&again));
+    assert!(
+        stderr(&again).contains("is already abandoned; nothing to do"),
+        "{}",
+        stderr(&again)
+    );
+    assert_eq!(whole_row(&ledger.pool, &held.hash).await?, after);
+
     node.assert_never_reached();
     assert_no_new_instances(&ledger.pool).await?;
     db.close(vec![ledger]).await
