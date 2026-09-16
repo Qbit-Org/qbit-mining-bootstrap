@@ -7,7 +7,7 @@ observations, with the pool-acquisition histogram, collector measurements,
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **43 coordinator
+The generated table below is the sole inventory for both roles: **46 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -23,11 +23,13 @@ its existing untyped exposition; the inventory records the counter/gauge intent
 from its producer. Public response/cache label sets are lazy and appear after a
 request; replica gauges appear only with `PRISM_PUBLIC_REPLICA_MODE=require`.
 Default histogram boundaries in seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-1, 2.5, 5, 10, 30, and +Inf. Only `qbit_prism_share_ack_seconds` adds 15 and 20.
-Histograms also export `_sum` and `_count`. See the
+1, 2.5, 5, 10, 30, and +Inf. `qbit_prism_share_ack_seconds` adds 15 and 20.
+`qbit_prism_ctv_fanout_broadcaster_chunk_rows` counts rows, not seconds, and
+exports the single finite bound 1; every other histogram uses the default
+ladder. Histograms also export `_sum` and `_count`. See the
 [histogram consumer guide](prism-metrics-histogram-consumers.md) for the five
-added series per process, elapsed-time attribution, quantile changes and
-mixed-version queries.
+added series per process, elapsed-time attribution, quantile changes,
+mixed-version queries and the chunk-row histogram.
 Bucket samples add `le`; the table lists producer labels. `job`, `instance` and
 `network` are deployment scrape labels, not native metric dimensions. See the
 [deployed-alert migration and draft diff](prism-alert-migration.md) for the
@@ -59,8 +61,8 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_collector_available` | gauge | `collector=database,process` | run | Whether a collector has a complete successful observation. | none |
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
-| `qbit_prism_ctv_fanout_broadcaster_chunk_rows` | histogram | none | run | Fanouts attempted per native broadcaster chunk; each chunk contains one row. | `qbit_prism_ctv_fanout_broadcaster_chunk_rows` |
-| `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` | histogram | none | run | Claimed fanout attempt duration including status persistence, in seconds. | `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` |
+| `qbit_prism_ctv_fanout_broadcaster_chunk_rows` | histogram | none | run | Fanouts attempted per native broadcaster chunk; each chunk contains one row. Values are rows, not seconds: instead of the default time ladder this histogram exports the single finite bound `le="1"` plus `+Inf`, so `_count` is the number of claimed fanout attempts and `_sum` equals `_count`. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported; a query for a higher `le` matches no series. | `qbit_prism_ctv_fanout_broadcaster_chunk_rows` |
+| `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` | histogram | none | run | Claimed fanout attempt duration including status persistence, in seconds. Default histogram ladder in seconds; one observation per claimed attempt, recorded even when persisting the attempt's completion fails. | `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` |
 | `qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total` | counter | none | run | CTV passes deferred at a fanout boundary for a newer or unpublished tip. | `qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total` |
 | `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`. | none |
 | `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and by instrumented coordinator ledger transactions and selected direct ledger queries, including payout-revision reads and heartbeats. Non-transactional coverage remains partial under #352; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness. | none |

@@ -1,6 +1,8 @@
 # Reading native event histograms
 
-Event histogram values are elapsed **seconds** supplied by the event producer.
+Event histogram values are elapsed **seconds** supplied by the event producer,
+except `qbit_prism_ctv_fanout_broadcaster_chunk_rows`, which counts rows (see
+[Reading the CTV chunk-row histogram](#reading-the-ctv-chunk-row-histogram)).
 The registry converts `Duration` to seconds and records it once per hook call;
 it does not infer a wait from a configured timeout. The producer owns the timing
 boundary, outcome, and whether cancellation produces an observation. Pool
@@ -9,7 +11,8 @@ share acknowledgement or database operation duration.
 
 The default finite bucket upper bounds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
 2.5, 5, 10, and 30 seconds, followed by `+Inf`. Only
-`qbit_prism_share_ack_seconds` adds 15 and 20 seconds. Buckets are cumulative and include
+`qbit_prism_share_ack_seconds` adds 15 and 20 seconds, and only the chunk-row
+histogram replaces the ladder. Buckets are cumulative and include
 their upper bound: an observation of exactly 5 seconds increments `le="5"` and
 every larger bucket; an observation greater than 5 and at most 10 seconds first
 appears in `le="10"`. An ACK of exactly 15 seconds first appears in `le="15"`,
@@ -66,9 +69,24 @@ first rate window following a restart into the new version.
 The registry's family selector is shared by observation and rendering. Consumers
 of `metrics::BUCKETS`, including live pool-snapshot tests and pool-alert fixtures,
 continue to use the default ladder. The rendered event fixture pins all existing
-samples plus the five additive series; HTTP inventory tests retain all 42
+samples plus the five additive series; HTTP inventory tests retain all 46
 coordinator and 14 public families. See the [native inventory](prism-native-metrics.md)
 for reason-label compatibility.
+
+## Reading the CTV chunk-row histogram
+
+`qbit_prism_ctv_fanout_broadcaster_chunk_rows` keeps its 2.x.x name and type
+but counts **rows**, not seconds. A native broadcaster chunk is one claimed
+fanout, so every observation is exactly 1 and the ladder is the single finite
+bound `le="1"` followed by `+Inf`: `_count` is the number of claimed attempts
+and `_sum` equals `_count`. Read attempt throughput from `rate(..._count[5m])`;
+`histogram_quantile` over this family is an interpolation artifact, not a
+measurement. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported, so a
+query for `le="10"` matches no native series, and a mixed-version aggregation
+must use only `le="1"`, `+Inf`, `_sum` and `_count`. The companion
+`qbit_prism_ctv_fanout_broadcaster_chunk_seconds` histogram uses the default
+time ladder and records one observation per attempt, including an attempt
+whose completion persistence failed.
 
 ## Reading small waits
 

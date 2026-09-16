@@ -106,6 +106,8 @@ const _: () = {
 impl Family {
     fn buckets(self) -> &'static [f64] {
         match self {
+            // Rows, not seconds: a native chunk is one claimed fanout. See
+            // docs/prism-metrics-histogram-consumers.md before changing this.
             Self::CtvChunkRows => &[1.],
             Self::ShareAck => SHARE_ACK_BUCKETS,
             _ => BUCKETS,
