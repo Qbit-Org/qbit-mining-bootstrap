@@ -39,7 +39,7 @@ acquisitions, the shared ledger helper covers these direct statements:
 - `apply_online_migration`'s startup checkout, before the connection is detached.
 
 Each pending online migration records one checkout when metrics are attached.
-Timing ends before detach: session settings, advisory-lock waits, concurrent
+Timing ends before detach: the runner's session settings, advisory-lock waits, concurrent
 index builds and drops, and the detached connection's lifetime are excluded.
 An error or cancellation after checkout does not add another observation or
 change that checkout's success. The transaction that records the migration
@@ -57,7 +57,7 @@ on one checkout. Acquiring through an existing connection or transaction is
 not another pool checkout. Import reads release before filesystem and audit
 verification work, then acquire separately for each write transaction.
 
-Recording requires an attached metrics handle. Separate operator-only connections and
+Recording requires an attached metrics handle. Operator-only connections and
 ledgers created without telemetry continue to work without observations.
 
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).

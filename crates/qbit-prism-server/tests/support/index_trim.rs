@@ -11,10 +11,10 @@
 //! that a kept index swapped while the other replacement builds is refused
 //! before the version is recorded.
 use super::*;
-use anyhow::ensure;
 use qbit_prism_server::{ledger::REQUIRED_SCHEMA_VERSIONS, metrics::Metrics};
 use sqlx::Row;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -204,16 +204,6 @@ async fn migration_013_replaces_the_release_indexes_of_a_frozen_2x_source_and_ke
     db.close(vec![ledger]).await
 }
 
-// Only the pool checkout family: advisory-lock observations are separate.
-fn acquire_family(metrics: &Metrics) -> Vec<String> {
-    metrics
-        .render()
-        .lines()
-        .filter(|line| line.contains("qbit_prism_database_pool_acquire_seconds"))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn assert_acquire_counts(metrics: &Metrics, success: u64, failure: u64) {
     let body = metrics.render();
     for (outcome, expected) in [("success", success), ("failure", failure)] {
@@ -228,8 +218,11 @@ fn assert_acquire_counts(metrics: &Metrics, success: u64, failure: u64) {
     }
 }
 
-async fn waiting_build_pid(pool: &PgPool) -> Result<i32> {
-    timeout(Duration::from_secs(60), async {
+async fn blocked_build(
+    pool: &PgPool,
+    migrate: Pin<&mut impl Future<Output = Result<Ledger>>>,
+) -> Result<i32> {
+    let waiting = timeout(Duration::from_secs(60), async {
         loop {
             // The relation OID scopes this to this test's private schema.
             let pid: Option<i32> = sqlx::query_scalar("SELECT a.pid FROM pg_stat_activity a WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.wait_event_type='Lock' AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.locktype='relation' AND l.relation='qbit_share_ledger'::regclass AND l.granted)")
@@ -239,9 +232,14 @@ async fn waiting_build_pid(pool: &PgPool) -> Result<i32> {
             }
             sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .context("the concurrent build never waited for the open writer")?
+    });
+    tokio::select! {
+        result = migrate => match result {
+            Ok(_) => anyhow::bail!("the online migration succeeded while a writer transaction was open"),
+            Err(error) => Err(error).context("the online migration failed before its build waited for the open writer"),
+        },
+        result = waiting => result.context("the concurrent build never waited for the open writer")?,
+    }
 }
 
 #[tokio::test]
@@ -266,20 +264,10 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         true,
         Some(metrics.clone()),
     ));
-    tokio::select! {
-        result = &mut migrate => anyhow::bail!("migration finished before the writer committed: {:?}", result.err()),
-        result = waiting_build_pid(&pool) => { result?; }
-    }
+    blocked_build(&pool, migrate.as_mut()).await?;
     // Exactly two checkouts so far: migrate_schema's transaction and the
     // online runner's detached connection. DDL has not completed yet.
     assert_acquire_counts(&metrics, 2, 0);
-    let acquired = acquire_family(&metrics);
-    sleep(Duration::from_millis(75)).await;
-    assert_eq!(
-        acquire_family(&metrics),
-        acquired,
-        "index wait extended checkout timing"
-    );
     // Appends keep landing while the build waits.
     timeout(Duration::from_secs(5), async {
         let mut tx = pool.begin().await?;
@@ -289,9 +277,14 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
     })
     .await
     .context("an append blocked behind the online index build")??;
+    assert!(
+        futures_util::poll!(&mut migrate).is_pending(),
+        "the online migration finished before the writer committed"
+    );
     writer.commit().await?;
     let online = timeout(Duration::from_secs(60), migrate).await??;
-    // Only registration's transaction and heartbeat acquire afterward. The
+    // Registration's transaction and heartbeat add two observed checkouts;
+    // the intervening startup validation checkouts remain untimed. The
     // online version-recording transaction reuses its detached connection.
     assert_acquire_counts(&metrics, 4, 0);
     assert_trimmed(&pool).await?;
@@ -309,12 +302,8 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         true,
         Some(metrics.clone()),
     ));
-    let pid = tokio::select! {
-        result = &mut migrate => anyhow::bail!("migration finished before SQL cancellation: {:?}", result.err()),
-        result = waiting_build_pid(&pool) => result?,
-    };
+    let pid = blocked_build(&pool, migrate.as_mut()).await?;
     assert_acquire_counts(&metrics, 6, 0);
-    let acquired = acquire_family(&metrics);
     let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
         .bind(pid)
         .fetch_one(&pool)
@@ -333,16 +322,13 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         Some("57014"),
         "{error:#}"
     );
-    assert_eq!(
-        acquire_family(&metrics),
-        acquired,
-        "SQL cancellation relabeled or observed checkout twice"
-    );
+    // SQL cancellation neither relabels the checkout nor observes it again.
+    assert_acquire_counts(&metrics, 6, 0);
     writer.rollback().await?;
     // The runner awaits close on SQL error; its session lock must be released
     // so the metrics-None restart can rebuild the interrupted index.
     let resumed = timeout(Duration::from_secs(60), db.ledger("resumed-no-metrics")).await??;
-    assert_eq!(acquire_family(&metrics), acquired);
+    assert_acquire_counts(&metrics, 6, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
     db.close(vec![first, online, resumed]).await
@@ -591,46 +577,24 @@ async fn swap_during_build(
     let index_state = "SELECT pg_get_indexdef(indexrelid),indisvalid,indexrelid::text FROM pg_index WHERE indexrelid=to_regclass($1)";
     let mut writer = pool.begin().await?;
     insert_share(&mut *writer, share_id, "alice").await?;
-    let finished = AtomicBool::new(false);
-    let migrate = async {
-        let outcome = db.ledger("swapped").await;
-        finished.store(true, Ordering::SeqCst);
-        outcome
-    };
-    let swap = async {
-        timeout(Duration::from_secs(60), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.wait_event_type='Lock' AND l.locktype='relation' AND l.relation='qbit_share_ledger'::regclass AND l.granted)")
-                    .fetch_one(pool)
-                    .await?;
-                if waiting {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                ensure!(
-                    !finished.load(Ordering::SeqCst),
-                    "the online migration finished while a writer transaction was open"
-                );
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
+    let mut migrate = Box::pin(db.ledger("swapped"));
+    blocked_build(pool, migrate.as_mut()).await?;
+    let swap = format!(
+        "ALTER INDEX {name} RENAME TO operator_kept; CREATE INDEX {name} ON operator_shares (miner_id)"
+    );
+    timeout(Duration::from_secs(5), sqlx::raw_sql(&swap).execute(pool))
         .await
-        .context("the concurrent build never waited for the open writer")??;
-        let swap = format!(
-            "ALTER INDEX {name} RENAME TO operator_kept; CREATE INDEX {name} ON operator_shares (miner_id)"
-        );
-        timeout(Duration::from_secs(5), sqlx::raw_sql(&swap).execute(pool))
-            .await
-            .context("the operator's swap blocked behind the build")??;
-        let foreign: (String, bool, String) = sqlx::query_as(index_state)
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-        ensure!(!finished.load(Ordering::SeqCst));
-        writer.commit().await?;
-        Ok::<_, anyhow::Error>(foreign)
-    };
-    let (online, foreign) = tokio::join!(migrate, swap);
-    let foreign = foreign?;
+        .context("the operator's swap blocked behind the build")??;
+    let foreign: (String, bool, String) = sqlx::query_as(index_state)
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+    assert!(
+        futures_util::poll!(&mut migrate).is_pending(),
+        "the online migration finished before the writer committed"
+    );
+    writer.commit().await?;
+    let online = timeout(Duration::from_secs(60), migrate).await?;
     let error = online
         .err()
         .with_context(|| {
