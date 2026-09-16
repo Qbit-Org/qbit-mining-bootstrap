@@ -10,8 +10,9 @@
 //! more can land in it, and because ledger rows are immutable the detach and
 //! the drop each count the rows against the archive again before they act.
 //! Only then is the partition detached, and only a detached, verified
-//! partition is dropped. The archive is the copy of record from that point,
-//! and `restore` builds the partition table back from it.
+//! partition is dropped, after its archive has been read back from disk once
+//! more. The archive is the copy of record from that point, and `restore`
+//! builds the partition table back from it.
 //!
 //! Every step is idempotent and every step is resumable, because each is a
 //! piece of DDL or a bounded write followed by one catalog transaction, and
@@ -1157,7 +1158,7 @@ async fn partition_plan(
     }
     if record.state == "detached" && !attachment.relation_present {
         unknowns.push(format!(
-            "the catalog records {} as detached but no relation of that name exists; it was dropped outside share-archive, so its archive is now the only copy. Run share-archive drop {} to record that",
+            "the catalog records {} as detached but no relation of that name exists; it was dropped outside share-archive, so its archive is now the only copy. Run share-archive drop {} --dir <root> to record that",
             record.partition_name, record.partition_name
         ));
     }
@@ -1649,20 +1650,16 @@ fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
     Ok(recorded)
 }
 
-/// Re-read the archive, recompute both digests, check the manifest against the
-/// catalog row and the chain, including that the chain has no gap, and, while
-/// the partition is still attached, stream the live rows again and compare the
-/// stream digest and the count. Records `archive_verified_at` only when
-/// everything agreed and the live rows were compared, and only once the share
-/// sequence has passed the partition; after a detach the verification is
-/// reported only.
-pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
-    check_partition_name(partition_name)?;
-    let _lifecycle = lifecycle_guard(ledger).await?;
-    let mut connection = ledger.acquire().await?;
-    let record = catalog_row(&mut connection, partition_name).await?;
-    let attachment = attachment(&mut connection, partition_name).await?;
-    let path = manifest_location(root, &record)?;
+/// The archive the catalog recorded for `record`, read back from disk: the
+/// manifest parsed and re-canonicalized, and its partition name, bounds,
+/// digest, row count and rows digest checked against the catalog row. Returns
+/// the manifest path, the rows path beside it, the manifest and its digest.
+async fn read_recorded_manifest(
+    root: &Path,
+    record: &PartitionRecord,
+) -> Result<(PathBuf, PathBuf, ArchiveManifest, String)> {
+    let partition_name = record.partition_name.as_str();
+    let path = manifest_location(root, record)?;
     let rows_path = path
         .parent()
         .context("the manifest path has no directory")?
@@ -1712,6 +1709,32 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
             manifest.rows_sha256
         );
     }
+    Ok((path, rows_path, manifest, manifest_sha256))
+}
+
+/// Stream the archived rows through every digest and count check of
+/// [`read_rows_file`] on a blocking thread, keeping none of them.
+async fn check_recorded_rows(rows_path: &Path, manifest: &ArchiveManifest) -> Result<()> {
+    let rows_path = rows_path.to_path_buf();
+    let manifest = manifest.clone();
+    tokio::task::spawn_blocking(move || read_rows_file(&rows_path, &manifest, |_| Ok(()))).await?
+}
+
+/// Re-read the archive, recompute both digests, check the manifest against the
+/// catalog row and the chain, including that the chain has no gap, and, while
+/// the partition is still attached, stream the live rows again and compare the
+/// stream digest and the count. Records `archive_verified_at` only when
+/// everything agreed and the live rows were compared, and only once the share
+/// sequence has passed the partition; after a detach the verification is
+/// reported only.
+pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
+    check_partition_name(partition_name)?;
+    let _lifecycle = lifecycle_guard(ledger).await?;
+    let mut connection = ledger.acquire().await?;
+    let record = catalog_row(&mut connection, partition_name).await?;
+    let attachment = attachment(&mut connection, partition_name).await?;
+    let (path, rows_path, manifest, manifest_sha256) =
+        read_recorded_manifest(root, &record).await?;
 
     // The chain: the archived partition with the next-lower upper_seq.
     let previous = archived_predecessor(&mut connection, record.upper_seq).await?;
@@ -1740,12 +1763,7 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         number_or(manifest.lower_seq, "MINVALUE")
     );
 
-    let rows_path_for_read = rows_path.clone();
-    let manifest_for_read = manifest.clone();
-    tokio::task::spawn_blocking(move || {
-        read_rows_file(&rows_path_for_read, &manifest_for_read, |_| Ok(()))
-    })
-    .await??;
+    check_recorded_rows(&rows_path, &manifest).await?;
 
     let mut live = Value::Null;
     if attachment.attached && attachment.relation_present {
@@ -2005,10 +2023,15 @@ async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option
 }
 
 /// Drop a detached, verified partition whose rows still number what the
-/// archive recorded. The archive is the copy of record from here on. The
-/// immutability trigger guards UPDATE, DELETE and TRUNCATE, not DROP, so no
-/// share row is ever rewritten by this.
-pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Value> {
+/// archive recorded, once that archive has been read back from disk. The
+/// archive is the copy of record from here on, and `archive_verified_at` only
+/// proves it was complete when the comparison was taken, not that its files
+/// are still there and intact now; so the manifest and rows the catalog
+/// recorded are re-read under `root`, and checked against the catalog and each
+/// other, right before the one irreversible statement. The immutability
+/// trigger guards UPDATE, DELETE and TRUNCATE, not DROP, so no share row is
+/// ever rewritten by this.
+pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
     let _lifecycle = lifecycle_guard(ledger).await?;
     let (record, attachment) = {
@@ -2030,10 +2053,25 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
         record.archive_verified_at.is_some(),
         "refusing to drop {partition_name}: no archive_verified_at is recorded, so no copy of its rows is known to exist. Run share-archive verify {partition_name} --dir <root>"
     );
+    let mut archive_checked = None;
     if attachment.relation_present {
-        // The last check before the one irreversible step: the standalone
-        // relation holds exactly the rows the verified archive recorded.
-        // Ledger rows are immutable, so a count is the whole comparison.
+        // The archive first: what the catalog recorded has to be readable,
+        // canonical and whole now, not only when verify recorded it. The
+        // lifecycle lock keeps every rewrite off until the drop is done, so
+        // what is read here is what remains after the relation is gone.
+        let path = async {
+            let (path, rows_path, manifest, _) = read_recorded_manifest(root, &record).await?;
+            check_recorded_rows(&rows_path, &manifest).await?;
+            Ok::<_, anyhow::Error>(path)
+        }
+        .await
+        .with_context(|| {
+            format!("refusing to drop {partition_name}: its recorded archive did not read back cleanly, so no copy of its rows is known to exist. Nothing was changed")
+        })?;
+        archive_checked = Some(path.display().to_string());
+        // Then the standalone relation: it holds exactly the rows the
+        // verified archive recorded. Ledger rows are immutable, so a count is
+        // the whole comparison.
         let mut ddl = maintenance_connection(ledger).await?;
         let held: i64 =
             sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {partition_name}"))
@@ -2069,6 +2107,7 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
         "partition_name": partition_name,
         "relation_dropped": attachment.relation_present,
         "archive_uri": record.archive_uri,
+        "archive_checked": archive_checked,
         "dropped_at": dropped_at,
     }))
 }

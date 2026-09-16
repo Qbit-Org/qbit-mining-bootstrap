@@ -1240,7 +1240,7 @@ async fn failed_forced_archive_preserves_the_recorded_files() -> Result<()> {
         std::fs::copy(replacement.parent().unwrap().join("rows.ndjson.gz"), directory.join("rows.ndjson.gz"))?;
         archive::verify(&ledger, P0, legacy.path()).await?;
         archive::detach(&ledger, P0, &retention(0)).await?;
-        archive::drop_partition(&ledger, P0).await?;
+        archive::drop_partition(&ledger, P0, root.path()).await?;
         archive::restore(&ledger, &replacement, root.path(), true).await?;
         Ok(ledger)
     }.await;
@@ -1437,7 +1437,7 @@ async fn an_archived_blocks_audit_is_served_from_its_sealed_bytes() -> Result<()
         .fetch_all(&ledger.pool)
         .await?;
         ensure!(!attached.contains(&P0.to_owned()), "{P0} is still attached");
-        let dropped = archive::drop_partition(&ledger, P0).await?;
+        let dropped = archive::drop_partition(&ledger, P0, root.path()).await?;
         ensure!(dropped["relation_dropped"] == true, "{dropped}");
         let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(P0)
@@ -1559,7 +1559,7 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
             catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "detached",
             "the catalog was not brought in line with pg_inherits"
         );
-        archive::drop_partition(&ledger, P0).await?;
+        archive::drop_partition(&ledger, P0, root.path()).await?;
         let disk = read_archive(&ledger, P0).await?;
         let manifest_path = PathBuf::from(catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?);
 
@@ -1752,7 +1752,7 @@ async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() 
         // A row written into the standalone relation by name, between the
         // detach and the drop, is the last thing the drop checks for.
         insert_shares_into(&ledger.pool, P0, 42, 42, 7, "server-a", 7200.0).await?;
-        let error = archive::drop_partition(&ledger, P0)
+        let error = archive::drop_partition(&ledger, P0, root.path())
             .await
             .expect_err("dropped a relation holding a row its archive does not")
             .to_string();
@@ -1768,6 +1768,120 @@ async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() 
             present && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "detached",
             "the refused drop changed something"
         );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// `archive_verified_at` proves the archive was whole when it was compared,
+/// not that it still is. The drop reads the recorded archive back right before
+/// `DROP TABLE`, so a copy of record that went missing, was truncated or was
+/// altered between verify and drop is refused, and the relation stays.
+#[tokio::test]
+async fn drop_refuses_when_the_recorded_archive_no_longer_reads_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("drop-reread-a").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::seal(&ledger, P0).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        let detached = archive::detach(&ledger, P0, &retention(0)).await?;
+        ensure!(detached["action"] == "detached", "{detached}");
+        let manifest_path = PathBuf::from(
+            catalog(&ledger.pool, P0)
+                .await?
+                .try_get::<String, _>("archive_uri")?,
+        );
+        let rows_path = manifest_path.parent().unwrap().join("rows.ndjson.gz");
+        let manifest_bytes = std::fs::read(&manifest_path)?;
+        let rows_bytes = std::fs::read(&rows_path)?;
+
+        let refused = |what: &'static str| {
+            let ledger = &ledger;
+            let root = root.path();
+            async move {
+                let error = archive::drop_partition(ledger, P0, root)
+                    .await
+                    .expect_err(what);
+                let error = format!("{error:#}");
+                ensure!(
+                    error.contains("refusing to drop") && error.contains("Nothing was changed"),
+                    "{what}: {error}"
+                );
+                let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(P0)
+                    .fetch_one(&ledger.pool)
+                    .await?;
+                ensure!(
+                    present
+                        && catalog(&ledger.pool, P0)
+                            .await?
+                            .try_get::<String, _>("state")?
+                            == "detached",
+                    "{what}: the refused drop changed something"
+                );
+                Ok::<_, anyhow::Error>(error)
+            }
+        };
+
+        // The rows file is gone.
+        std::fs::remove_file(&rows_path)?;
+        let error = refused("dropped a relation whose archived rows are missing").await?;
+        ensure!(error.contains("rows.ndjson.gz"), "{error}");
+
+        // The rows file is back but truncated.
+        std::fs::write(&rows_path, &rows_bytes[..rows_bytes.len() / 2])?;
+        let error = refused("dropped a relation whose archived rows are truncated").await?;
+        ensure!(error.contains("rows_gz_sha256"), "{error}");
+
+        // The rows file is whole and one byte of it was altered.
+        let mut altered = rows_bytes.clone();
+        let middle = altered.len() / 2;
+        altered[middle] ^= 0x40;
+        std::fs::write(&rows_path, &altered)?;
+        let error = refused("dropped a relation whose archived rows were altered").await?;
+        ensure!(error.contains("altered"), "{error}");
+        std::fs::write(&rows_path, &rows_bytes)?;
+
+        // The manifest is not the one the catalog recorded.
+        let mut reformatted = manifest_bytes.clone();
+        reformatted.push(b'\n');
+        std::fs::write(&manifest_path, &reformatted)?;
+        let error = refused("dropped a relation whose manifest was rewritten").await?;
+        ensure!(error.contains("canonical"), "{error}");
+
+        // The manifest is gone, and so is the version directory the catalog
+        // points at.
+        std::fs::remove_file(&manifest_path)?;
+        let error = refused("dropped a relation whose manifest is missing").await?;
+        ensure!(error.contains("neither that path nor"), "{error}");
+        std::fs::write(&manifest_path, &manifest_bytes)?;
+
+        // Whole again: the drop goes through and names what it read back.
+        let dropped = archive::drop_partition(&ledger, P0, root.path()).await?;
+        ensure!(
+            dropped["relation_dropped"] == true
+                && dropped["archive_checked"]
+                    == serde_json::json!(manifest_path.display().to_string()),
+            "{dropped}"
+        );
+        let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(P0)
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(!present, "{P0} still exists after the drop");
         Ok(ledger)
     }
     .await;

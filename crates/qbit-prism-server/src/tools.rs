@@ -175,8 +175,14 @@ enum ShareArchiveCommand {
         #[command(flatten)]
         retention: RetentionArgs,
     },
-    /// Drop a detached, verified partition. The archive is the copy of record.
-    Drop { partition: String },
+    /// Drop a detached, verified partition once its archive has been read back
+    /// from disk and checked. The archive is the copy of record.
+    Drop {
+        partition: String,
+        /// Archive root the recorded archive is read back from.
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Recreate a partition table from its archive and verify it row for row.
     Restore {
         /// Path to the archive's manifest.json, absolute or under --dir.
@@ -472,8 +478,8 @@ async fn share_archive(command: ShareArchiveCommand) -> Result<()> {
                 partition,
                 retention,
             } => archive::detach(&ledger, &partition, &retention.options()).await,
-            ShareArchiveCommand::Drop { partition } => {
-                archive::drop_partition(&ledger, &partition).await
+            ShareArchiveCommand::Drop { partition, dir } => {
+                archive::drop_partition(&ledger, &partition, &dir).await
             }
             ShareArchiveCommand::Restore {
                 manifest,

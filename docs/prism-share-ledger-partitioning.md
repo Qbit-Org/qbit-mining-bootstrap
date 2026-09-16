@@ -74,7 +74,8 @@ inspection or service.
 ledger; the immutability triggers stay on the parent and on every leaf.
 Space is reclaimed by `DETACH PARTITION ... CONCURRENTLY` followed, after
 the archive has been re-read and verified against the live rows, by
-`DROP TABLE` of the detached table. The archive is the copy of record from
+`DROP TABLE` of the detached table, which reads the archive back once more
+first. The archive is the copy of record from
 then on, and the catalog row (`qbit_prism_share_partitions`) keeps the
 bounds, the archive location, the digests and the timestamps of each step.
 
@@ -273,7 +274,7 @@ the primary, with the frontends running:
 | `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written again in order, and is refused once a later archived partition has left the ledger |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` only for that full comparison, and only once the share sequence has passed the partition, so a verify after the detach reports but never counts as the proof the detach required |
 | `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY` (finalized if an earlier attempt was interrupted); the table stays as a standalone relation |
-| `drop <partition>` | requires `detached` and verified, and counts the rows against the archive again; `DROP TABLE`; the archive is the copy of record |
+| `drop <partition> --dir <root>` | requires `detached` and verified; reads the recorded archive back from disk, checking both digests against the catalog, and counts the rows against it again; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
 
 `plan` also reports the attached partition count, the lead ahead of the
