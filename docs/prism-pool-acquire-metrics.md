@@ -32,6 +32,8 @@ acquisitions, the shared ledger helper covers these direct statements:
 - `audit_bundle`'s initial representation read;
 - the existing-audit probe before candidate landing and each page of its
   durable-range proof, released before the page's blocking comparison;
+- the durable-range proof's inline/bootstrap existence probe, newest eligible
+  boundary query, and oldest eligible boundary query for partial history;
 - `pool_blocks_for_reconcile`;
 - `migration_source`, the one-row pages of `import_legacy_audits` (including
   the final empty read), and `backfill_ctv`'s initial audit list;
@@ -60,13 +62,18 @@ verification work, then acquire separately for each write transaction.
 Recording requires an attached metrics handle. Operator-only connections and
 ledgers created without telemetry continue to work without observations.
 
+Each durable-range boundary statement records one checkout and releases it
+before any proof refusal, blocking fold or subsequent query. Bootstrap uses
+only its existence probe; a non-inline range uses its existing page checkouts
+and the newest boundary query, plus the oldest query only for partial history.
+SQL failures and boundary refusals after checkout retain a success observation.
+These probes add no transaction and do not time the SQL or the proof itself.
+
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
 Other direct coordinator, candidate, startup and session-reservation
 cleanup queries still acquire without this helper. Audit reconstruction
 (`audit_canonical_bytes`, the snapshot lookup in `materialize_audit_row`, and
 its range read) remains untimed, including when `audit_bundle` invokes it.
-The independent bootstrap/newest/older boundary probes added by #379 also
-remain untimed; only the durable-range page checkouts are observed here.
 The separate rollup transaction also remains untimed. Public API read pools and the public role's export
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
@@ -78,8 +85,8 @@ Remaining startup/session and ledger-owned sites include:
   already uses `Ledger::begin`; releasing an owner's reservations already
   uses `Ledger::acquire`.
 - `ledger/candidates.rs`: `landed_audit` and `record_landed_audit_bits`.
-- `ledger/audit.rs`: the reconstruction and independent boundary probes
-  described above; startup/migration validation helpers keep their existing
+- `ledger/audit.rs`: the reconstruction reads described above;
+  startup/migration validation helpers keep their existing
   connection ownership.
 
 Coordinator startup checks, candidate lease/terminal reconciliation,
