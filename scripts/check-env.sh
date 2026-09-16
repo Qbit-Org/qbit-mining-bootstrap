@@ -952,7 +952,9 @@ check_public_reader_credentials() (
     if production_mode_enabled || [[ "${QBIT_CHAIN:-regtest}" == main || "${QBIT_CHAIN:-regtest}" == mainnet ]]; then
       production=1
     else
-      require_lab_mode
+      # Reader image preparation follows the qbit production selector. The
+      # full preflight validates other chains only for their enabled lanes.
+      check_qbit_chain_selection
       # Pinned artifacts are prepared explicitly, including in a lab. Tagged
       # lab images are rebuilt so an older image cannot omit the validator.
       [[ "${PRISM_COORDINATOR_IMAGE:-}" == *@sha256:* ]] || prepare_lab_image=1

@@ -1,5 +1,6 @@
 """Shell launcher boundary; real SQLx/Compose checks live in the image suite."""
 import json
+import itertools
 import os
 from pathlib import Path
 import subprocess
@@ -147,9 +148,16 @@ class CheckEnvPublicCredentialLauncherTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_lab_preparation_still_rejects_invalid_qbit_chain_selection(self):
+        result = self.run_preflight('raise AssertionError("Docker must not run")',
+                                    settings={"QBIT_CHAIN": "regtest", "QBIT_CHAIN_FLAG": "-chain=main"},
+                                    args=("--make-deployment",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QBIT_CHAIN=regtest requires QBIT_CHAIN_FLAG=-regtest", result.stderr)
+
     def test_real_make_doctor_and_launch_share_overlays_and_prepare_fresh_image(self):
-        for target in ("doctor", "up-prism-pool"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory(prefix="public-reader-make-") as directory:
+        for target, bitcoin_chain in itertools.product(("doctor", "up-prism-pool"), ("regtest", "mainnet", "testnet4")):
+            with self.subTest(target=target, bitcoin_chain=bitcoin_chain), tempfile.TemporaryDirectory(prefix="public-reader-make-") as directory:
                 root = Path(directory)
                 for name in ("Makefile", "scripts/check-env.sh", ".env.example", "config/upstream.env.example",
                              "docker/qbit/qbit-entrypoint.sh"):
@@ -180,7 +188,9 @@ class CheckEnvPublicCredentialLauncherTests(unittest.TestCase):
                 result = subprocess.run(
                     ["make", "--no-print-directory", target, "MINING_LANES=prism", "QBIT_PROVIDER=source",
                      f"COMPOSE_OVERLAY_FILES={' '.join(overlays)}"], cwd=root,
-                    env={"PATH": f"{root / 'bin'}:{os.environ['PATH']}"},
+                    # Disabled Bitcoin-lane settings must not gate a PRISM lab.
+                    env={"PATH": f"{root / 'bin'}:{os.environ['PATH']}", "BITCOIN_CHAIN": bitcoin_chain,
+                         "BITCOIN_CHAIN_FLAG": "-regtest"},
                     text=True, capture_output=True, timeout=15,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
