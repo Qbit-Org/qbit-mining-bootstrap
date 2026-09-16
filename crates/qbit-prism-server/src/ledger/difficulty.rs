@@ -89,7 +89,7 @@ impl Ledger {
     /// When the ledger accepted `share_id`, or `None` if it holds no such
     /// accepted row.
     ///
-    /// The ledger is partitioned by `share_seq` (migration 016) and has no
+    /// The ledger is partitioned by `share_seq` (migration 017) and has no
     /// global `share_id` index, so an unbounded probe descends one per-leaf
     /// index per attached partition. Vardiff evidence is a share the session
     /// submitted moments ago, so the bounded probe

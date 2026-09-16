@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 pub(crate) enum OnlineMigration {
     /// Index creates and drops, applied with `CONCURRENTLY` (013).
     Indexes(IndexMigration),
-    /// The share ledger partition conversion (016, `partition.rs`).
+    /// The share ledger partition conversion (017, `partition.rs`).
     Partitions(super::partition::PartitionMigration),
 }
 

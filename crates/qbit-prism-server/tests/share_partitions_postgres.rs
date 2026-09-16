@@ -144,7 +144,7 @@ fn share(id: u64, miner: &str) -> AcceptedShare {
 
 /// A share whose header hash is `block_hash`, which is what makes it the
 /// block's solving share: the suffix of `share_id` is the expression both the
-/// landing and migration 015's backfill attribute a block by.
+/// landing and migration 016's backfill attribute a block by.
 fn solving_share(block_hash: &str, miner: &str) -> AcceptedShare {
     share_with_id(format!("{miner}.rig:{block_hash}"), miner)
 }
@@ -388,7 +388,7 @@ async fn landing_attributes_the_solver_on_the_block_row_and_readers_survive_a_de
         );
 
         // EP-COMPAT: a block row whose columns were never written, which is
-        // what a pre-015 landing missed by the backfill would look like, is
+        // what a pre-016 landing missed by the backfill would look like, is
         // still served by the ledger fallback the columns replaced.
         clear_solver_columns(db.pool(), &hash).await?;
         let fallback = solver_view(db.pool(), &hash).await?;

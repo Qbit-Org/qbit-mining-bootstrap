@@ -1,4 +1,4 @@
-//! Migration 016, the share ledger partition conversion, applied outside
+//! Migration 017, the share ledger partition conversion, applied outside
 //! the migration transaction on a ledger that has rows (#144).
 //!
 //! The conversion attaches the release table as the first partition of a
@@ -8,7 +8,7 @@
 //! so the swap is catalog work, milliseconds whatever the table holds. The
 //! validation is the only pass over the data, and it runs under SHARE
 //! UPDATE EXCLUSIVE, which blocks neither appends nor reads. The three
-//! steps are the SQL functions migration 015 installs; this runner orders
+//! steps are the SQL functions migration 016 installs; this runner orders
 //! them on a dedicated connection, each in its own transaction, because the
 //! validation can take hours on a large ledger and the migration
 //! transaction's statement timeout and lock hold would not survive it, and
@@ -25,14 +25,14 @@
 //! it (and validated again); a pending bound is validated; a validated
 //! bound is swapped; a converted ledger is recorded. Every
 //! name the swap creates is checked before the first step, so a refusal
-//! changes nothing. Until 16 is recorded every start refuses the database,
+//! changes nothing. Until 17 is recorded every start refuses the database,
 //! as for every other required migration.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
 
-/// The conversion migration 016 declares. Nothing is derived from the
+/// The conversion migration 017 declares. Nothing is derived from the
 /// scratch apply beyond the proof that the file converts the table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartitionMigration {
@@ -325,14 +325,14 @@ mod tests {
             table(&["qbit_share_ledger_p0", "qbit_share_ledger_p1"]),
         );
         assert_eq!(
-            derive(16, &before, &after).unwrap(),
-            PartitionMigration { version: 16 }
+            derive(17, &before, &after).unwrap(),
+            PartitionMigration { version: 17 }
         );
-        let error = derive(16, &before, &before).unwrap_err().to_string();
+        let error = derive(17, &before, &before).unwrap_err().to_string();
         assert!(error.contains("is not a partition"), "{error}");
-        let error = derive(16, &after, &after).unwrap_err().to_string();
+        let error = derive(17, &after, &after).unwrap_err().to_string();
         assert!(error.contains("already has partitions"), "{error}");
-        let error = derive(16, &SchemaFingerprint::default(), &after)
+        let error = derive(17, &SchemaFingerprint::default(), &after)
             .unwrap_err()
             .to_string();
         assert!(error.contains("missing before"), "{error}");

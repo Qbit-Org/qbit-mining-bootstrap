@@ -4,8 +4,8 @@ use crate::{
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
         BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
-        HeartbeatHealth, Ledger, OfferOutcome, SignerKeys, Snapshot, Window, WindowError,
-        WindowRef,
+        HeartbeatHealth, Ledger, OfferOutcome, RecoveryClaim, SignerKeys, Snapshot, Window,
+        WindowError, WindowRef, ORPHANED_STATE,
     },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
@@ -31,11 +31,14 @@ use std::{
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod bundle_build;
+mod chain_observation;
 mod compact_resume;
 mod compact_runtime;
+mod issued_batcher;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
+mod refresh_window;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
@@ -206,6 +209,12 @@ struct StoredJob {
     expires_at_ms: i64,
 }
 
+#[derive(Default)]
+struct RefreshState {
+    observation: chain_observation::ChainObservation,
+    cached_window: Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>,
+}
+
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
@@ -221,6 +230,7 @@ pub struct Coordinator {
     pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
+    issued_batcher: issued_batcher::IssuedBatcher,
     pub last_error: RwLock<Option<String>>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
@@ -232,7 +242,9 @@ pub struct Coordinator {
     /// share appends and the candidate-lease heartbeat, which must not wait out
     /// the 15 s acquire timeout behind a multi-page read.
     window_reads: Arc<Semaphore>,
-    refresh_lock: Mutex<()>,
+    // Both states survive cancelled refreshes under the same serialization:
+    // retiring cached inputs must not reset a consumed node transition.
+    refresh_lock: Mutex<RefreshState>,
     resume_flights: compact_resume::ResumeFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -309,6 +321,21 @@ struct ChainCache {
     observations: HashMap<String, bool>,
 }
 
+/// One coherent observation of a candidate against the chain, see
+/// [`Coordinator::observe_candidate`].
+struct CandidateObservation {
+    /// The candidate's own block is the active block at its height.
+    active: bool,
+    /// The payout revision the ledger recorded for this tip view; the fence
+    /// every settlement written from this observation revalidates.
+    revision: i64,
+    tip: String,
+    tip_height: u64,
+    /// The active block at the candidate's height, `None` while the tip is
+    /// below it.
+    at_height: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 struct CandidateLease {
     seconds: i64,
@@ -343,6 +370,26 @@ enum RebuildFailure {
     /// The caller may fall back to a `Current` read, which proves the digest
     /// itself before it returns any balances.
     BalanceSnapshotMissing,
+}
+
+/// Why an operator recovery (#418) stopped short of finishing its row. Each
+/// variant is a stop the operator reads, not a failure of the machinery.
+/// After confirmed cleanup the row is left recoverable with the reason in
+/// `last_error`, and the command maps the variant to its exit status. Node,
+/// database and unconfirmed cleanup errors propagate as failures instead.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryStop {
+    /// The node does not hold the block on its active chain. Nothing is
+    /// offered: a block the node never accepted stays the coordinator's, and
+    /// a block a reorg removed stays in reconciliation.
+    #[error("not on the active chain: {0}")]
+    NotActive(String),
+    /// The identity check or the landing refused the row, for the reason.
+    #[error("{0}")]
+    Refused(String),
+    /// The operator's one deadline expired.
+    #[error("the recovery deadline expired")]
+    Deadline,
 }
 
 /// Map a window read error to the claim's action. A database error is not
@@ -687,6 +734,7 @@ impl Coordinator {
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
             ledger,
             rpc,
             refresh,
@@ -698,7 +746,7 @@ impl Coordinator {
             readiness: Arc::new(RwLock::new(ReadinessState::default())),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(RefreshState::default()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -855,9 +903,14 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
-        self.work_ledger
+        // Reconciliation and settlement both count the block's durable first
+        // confirmation, regardless of the outbox state at that moment.
+        let first_confirmations = self
+            .work_ledger
             .reconcile(&observations, tip_height, revision)
             .await?;
+        self.blocks
+            .fetch_add(first_confirmations, Ordering::Relaxed);
         *cache = Some(ChainCache {
             tip: tip.into(),
             height: tip_height,
@@ -870,12 +923,19 @@ impl Coordinator {
     }
 
     pub async fn refresh_once(&self) -> Result<()> {
-        let _flight = self.refresh_lock.lock().await;
+        let mut refresh = self.refresh_lock.lock().await;
+        let RefreshState {
+            observation,
+            cached_window,
+        } = &mut *refresh;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
         let proof = self.begin_compact_build().await;
         let readiness_generation = proof.readiness_epoch();
+        // Capture before node I/O, so a delayed equal-work observation cannot
+        // overwrite a replacement accepted while its proof was in flight.
+        let chain_observation = self.work_ledger.chain_observation_state().await?;
         let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
@@ -909,9 +969,14 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = self
-            .work_ledger
-            .observe_chain_view(parent, height - 1, chainwork)
+        let observed_revision = observation
+            .observe(
+                &*self.work_ledger,
+                parent,
+                height - 1,
+                chainwork,
+                &chain_observation,
+            )
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
@@ -926,16 +991,28 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let revision = self.work_ledger.payout_revision().await?;
+        let probe = self
+            .work_ledger
+            .refresh_probe(crate::ledger::ReadAdmission::default())
+            .await?;
+        let state = probe.payout_state;
+        let share_seq = probe.accepted_share_seq;
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         if let Some(current) = self.prepared.read().await.as_ref() {
-            if current.bundle.is_some()
-                && current.fee == fee
+            // A new share invalidates build inputs, but does not itself replace
+            // usable published work. Preserve the existing same-template
+            // cadence; the next template/economic change or original reanchor
+            // reads the latest shares. Empty-to-first-share remains immediate.
+            if cached_window.as_ref().is_some_and(|window| {
+                window.reference == current.window
+                    && window.within_reanchor_interval(self.config.snapshot_interval)
+            }) && current.fee == fee
                 && current.fingerprint == fingerprint
-                && current.snapshot.payout_revision == revision
-                && current.created.elapsed() < self.config.snapshot_interval
+                && current.snapshot.payout_revision == state.payout_revision
+                && current.window.prior_balances_digest == state.prior_balances_digest
+                && (current.bundle.is_some() || current.snapshot.share_seq == share_seq)
                 && crate::readiness::validate_template_age(
                     &current.template,
                     self.config.template_max_age,
@@ -945,8 +1022,8 @@ impl Coordinator {
                 self.ready_tip(parent).await?;
                 self.ensure_template_fresh(&template).await?;
                 ensure!(
-                    self.work_ledger.payout_revision().await? == current.snapshot.payout_revision,
-                    "payout revision changed during work reuse"
+                    self.work_ledger.payout_state().await? == state,
+                    "payout state changed during work reuse"
                 );
                 let mut readiness = self.readiness.write().await;
                 ensure!(
@@ -991,18 +1068,49 @@ impl Coordinator {
             )
             .context("prepared expiry overflow")?;
         let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
-        let snapshot = self
-            .work_ledger
-            .snapshot_with_admission(
+        // Admission can wait across new shares, settlement, or reanchor expiry.
+        // Select valid inputs after that wait, at the same boundary where a
+        // fresh snapshot would be read. Later shares belong to the next window;
+        // the selected WindowRef remains immutable through build/publication.
+        let reuse_window = if let Some(window) = cached_window.as_ref() {
+            let probe = self
+                .work_ledger
+                .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
+                .await?;
+            window.reusable(
                 network,
-                crate::ledger::ReadAdmission::shared(permit.clone()),
+                probe.accepted_share_seq,
+                probe.payout_state,
+                self.config.snapshot_interval,
             )
-            .await?;
-        let admitted = prepared_storage::compact::CompactOwner::new((snapshot, permit));
+        } else {
+            false
+        };
+        if !reuse_window {
+            // Retire cache ownership under admission before reading its
+            // replacement. Any active blocking build keeps its own admission.
+            let retired = cached_window.take();
+            let cleanup = prepared_storage::compact::CompactOwner::new((retired, permit.clone()));
+            cleanup
+                .spawn_blocking(|(retired, permit)| {
+                    let _admission = permit;
+                    drop(retired.map(|window| window.into_inner()));
+                })
+                .await?;
+            *cached_window = Some(self.capture_refresh_window(network, permit.clone()).await?);
+        }
+        // Cached inputs are not publication authority. Keep exactly one owner
+        // in the serialized refresh loop even if a later build/save is cancelled.
+        // This lets build admission end after actual build cleanup, so existing
+        // lease holders can resume while a replacement reservation waits.
+        let window = Arc::clone(cached_window.as_ref().expect("captured refresh window"));
+        let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
-                && current.snapshot.share_seq == admitted.0.share_seq
-                && current.snapshot.payout_revision == admitted.0.payout_revision
+                && current.snapshot.share_seq == admitted.0.snapshot.share_seq
+                && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
+                && current.window.prior_balances_digest
+                    == admitted.0.reference.prior_balances_digest
                 && current.fee == fee
         });
         let generation = self
@@ -1016,12 +1124,12 @@ impl Coordinator {
             self.config.instance_id,
             uuid::Uuid::new_v4().simple()
         );
-        let (snapshot, permit) = admitted.into_inner();
+        let (window, permit) = admitted.into_inner();
         let source = prepared_storage::compact::RefreshBuild {
             proof,
             key: storage_key,
             template,
-            snapshot: snapshot.into_inner(),
+            window,
             inputs,
             fee,
             fingerprint,
@@ -1117,13 +1225,27 @@ impl Coordinator {
         let mut last_hint_prune = Instant::now();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
-            match self.refresh_once().await {
-                Ok(()) => {
-                    *self.last_error.write().await = None;
+            // One definite accounting-only refusal may retry immediately with
+            // a fresh proof. The allowance belongs to this external trigger:
+            // another refusal must return to tick/wake cadence, not replenish
+            // it. refresh_once retains the original witness epoch itself.
+            for attempt in 0..2 {
+                if attempt > 0 && shutdown.has_changed().unwrap_or(true) {
+                    return;
                 }
-                Err(error) => {
-                    tracing::warn!(%error,"template refresh deferred");
-                    *self.last_error.write().await = Some(error.to_string());
+                match self.refresh_once().await {
+                    Ok(()) => {
+                        *self.last_error.write().await = None;
+                        break;
+                    }
+                    Err(error) => {
+                        let retry = error.is::<crate::ledger::ChainObservationRetry>();
+                        tracing::warn!(%error,"template refresh deferred");
+                        *self.last_error.write().await = Some(error.to_string());
+                        if !retry {
+                            break;
+                        }
+                    }
                 }
             }
             if last_hint_prune.elapsed() >= Duration::from_secs(300) {
@@ -1186,7 +1308,14 @@ impl Coordinator {
         }
     }
 
-    async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<(bool, i64, String)> {
+    /// One coherent read-only observation of a candidate's block against the
+    /// chain: the tip before and after is the same hash, the node is ready
+    /// on it, and the payout revision is the one the ledger recorded for
+    /// that tip view. `at_height` is the active block at the candidate's
+    /// height, `None` while the tip is below it; the block is `active`
+    /// exactly when that is the candidate's own hash. Any failure leaves the
+    /// candidate unobserved: the caller settles nothing on an error.
+    async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<CandidateObservation> {
         let height = claim.candidate.found_block.block_height;
         let info = self.ready_chain_info().await?;
         let tip_height = info["blocks"].as_u64().context("invalid tip height")?;
@@ -1205,19 +1334,28 @@ impl Coordinator {
             )
             .await?;
         // ready_chain_info already published this sequenced observation.
-        let active = tip_height >= height
-            && self
-                .rpc
-                .call("getblockhash", json!([height]))
-                .await?
-                .as_str()
-                == Some(&claim.candidate.block_hash);
+        let at_height = if tip_height >= height {
+            Some(
+                tip_observation::tip_hash(&self.rpc.call("getblockhash", json!([height])).await?)
+                    .context("qbit did not report a valid block hash at the candidate's height")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         ensure!(
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(&tip),
             "tip changed while observing candidate"
         );
         self.ready_tip(&tip).await?;
-        Ok((active, revision, tip))
+        let active = at_height.as_deref() == Some(claim.candidate.block_hash.as_str());
+        Ok(CandidateObservation {
+            active,
+            revision,
+            tip,
+            tip_height,
+            at_height,
+        })
     }
 
     pub async fn process_candidate(&self, claim: &CandidateClaim) -> Result<()> {
@@ -1239,6 +1377,19 @@ impl Coordinator {
         &self,
         claim: &CandidateClaim,
         lease: CandidateLease,
+    ) -> Result<()> {
+        self.with_candidate_heartbeat(claim, lease, self.process_candidate_inner(claim, lease))
+            .await
+    }
+
+    /// Run `work` on a claimed row while the ordinary heartbeat renews its
+    /// lease: the one owner of a claim's lifetime, for the submit loop's
+    /// processing and for the operator recovery alike.
+    async fn with_candidate_heartbeat(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        work: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
         // Establish ownership before even waiting for build capacity. Keep
         // renewal and processing independently polled: processing may hold a
@@ -1316,7 +1467,7 @@ impl Coordinator {
         };
         // Neither future is spawned. Completion, cancellation and lease loss
         // all drop the other future; no orphan task can keep a lease alive.
-        let mut work = Box::pin(self.process_candidate_inner(claim, lease));
+        let mut work = Box::pin(work);
         tokio::select! {
             biased;
             result = &mut work => result,
@@ -1325,12 +1476,202 @@ impl Coordinator {
                 // Finishing can commit its terminal state just before the
                 // processing future receives COMMIT's reply. The canceled
                 // work needs no retry when durable completion already won.
+                // Every state that is not unfinished is terminal. A proven
+                // orphan that committed here was not counted by
+                // `record_candidate_orphaned`: that counter reports completions
+                // this process observed, not every committed settlement.
                 let terminal = tokio::time::timeout(lease.timeout, sqlx::query_scalar::<_, bool>(
-                    "SELECT state IN ('submitted','abandoned') FROM qbit_block_candidate_outbox WHERE block_hash=$1"
+                    &format!("SELECT state NOT IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL)
                 ).bind(&claim.candidate.block_hash).fetch_optional(&self.ledger.pool)).await;
                 if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
             },
         }
+    }
+
+    /// Claim one row by hash for the operator recovery command (#418), with
+    /// the lease every claim takes, so [`Coordinator::recover_candidate`]'s
+    /// heartbeat renews it exactly as the submit loop's does. Keep the token
+    /// outside the deadline: COMMIT can succeed before its reply arrives or
+    /// before decoding finishes, so cancellation does not prove no claim.
+    pub async fn claim_candidate_for_recovery(
+        &self,
+        block_hash: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<RecoveryClaim> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let result = match tokio::time::timeout_at(
+            deadline,
+            self.ledger
+                .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds, &token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RecoveryStop::Deadline.into()),
+        };
+        if let Err(error) = &result {
+            let reason = format!("operator recovery claim stopped: {error:#}");
+            // The token fence preserves any later owner's claim. Taking
+            // the row lock also orders release after an in-flight COMMIT.
+            // Cleanup has its own bound even when the operation expired.
+            tokio::time::timeout(
+                CANDIDATE_LEASE.timeout,
+                self.ledger.release_recovery_token(block_hash, &token, &reason),
+            )
+            .await
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} timed out after {error:#}; the claim may remain until its lease expires"
+            ))?
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} failed after {error:#}; the claim may remain until its lease expires"
+            ))?;
+        }
+        result
+    }
+
+    /// Land an already-accepted block for the operator recovery command
+    /// (#418), under the operator's one `deadline`, and never offer it.
+    ///
+    /// This is the post-offer phase, driven for a row the operator named
+    /// instead of one a lane claimed: the chain must hold the block now, the
+    /// node's header must be the candidate's identity, a `pending` row is
+    /// adopted first so no claim on any frontend can offer it whatever
+    /// happens next, and then the landing, the second observation and the
+    /// finish are the coordinator's own. The only difference from a lane's
+    /// attempt is the rebuild deadline, which is the operator's rather than
+    /// the lane's 60 s.
+    ///
+    /// Every stop, the deadline included, attempts a bounded claim release.
+    /// A confirmed release leaves the row recoverable with its reason: its
+    /// state (a row adopted into `reconciliation` stays there), evidence and
+    /// schedule are untouched, and an audit that landed is reused by the next
+    /// attempt. A [`RecoveryStop`] names why; node and database errors
+    /// propagate as themselves. Unconfirmed cleanup is a failure that names
+    /// the original stop without asserting the row's current disposition.
+    pub async fn recover_candidate(
+        &self,
+        claim: &CandidateClaim,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let block = &claim.candidate.block_hash;
+        let lease = CandidateLease {
+            // The operator's deadline bounds the window read and rebuild
+            // too; the lane's own bound is what this command exists to
+            // exceed. The deadline around the whole work fires first.
+            rebuild_deadline: deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .max(Duration::from_secs(1)),
+            ..CANDIDATE_LEASE
+        };
+        let work =
+            self.with_candidate_heartbeat(claim, lease, self.recover_candidate_inner(claim, lease));
+        let result = match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            Err(_) => Err(RecoveryStop::Deadline.into()),
+        };
+        let Err(error) = &result else {
+            return result;
+        };
+        // Only a confirmed release proves this attempt left the row
+        // recoverable. Cleanup is separately bounded; if it fails, the
+        // claim may remain until its lease expires.
+        let reason = format!("operator recovery stopped: {error:#}");
+        let released = tokio::time::timeout(
+            lease.timeout,
+            self.ledger.release_recovery_claim(claim, &reason),
+        )
+        .await
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} timed out after {error:#}; the claim may remain until its lease expires"
+        ))?
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} failed after {error:#}; the claim may remain until its lease expires"
+        ))?;
+        if !released {
+            anyhow::bail!(
+                "recovery claim cleanup for {block} did not release this attempt's claim after {error:#}; the candidate may have completed or changed owners; inspect the row before retrying"
+            );
+        }
+        result
+    }
+
+    async fn recover_candidate_inner(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+    ) -> Result<()> {
+        let candidate = &claim.candidate;
+        let block = &candidate.block_hash;
+        let height = candidate.found_block.block_height;
+        // The chain must hold the block now. There is no offer here, for any
+        // state: a block the node does not hold is not this command's.
+        let CandidateObservation { active, tip, .. } = self.observe_candidate(claim).await?;
+        if !active {
+            return Err(RecoveryStop::NotActive(format!(
+                "the node's active chain (tip {tip}) does not hold {block} at height {height}"
+            ))
+            .into());
+        }
+        // The node's header is the block's identity: its height must be the
+        // one the candidate records, and its parent the one in the
+        // candidate's block bytes.
+        let header = self.rpc.call("getblockheader", json!([block])).await?;
+        let node_height = header["height"]
+            .as_u64()
+            .context("qbit block header has no height")?;
+        if node_height != height {
+            return Err(RecoveryStop::Refused(format!(
+                "the candidate records height {height} but the node holds the block at height {node_height}"
+            ))
+            .into());
+        }
+        let node_parent = header["previousblockhash"]
+            .as_str()
+            .context("qbit block header has no previousblockhash")?;
+        let parent = header_parent(&candidate.block_bytes)?;
+        if !parent.eq_ignore_ascii_case(node_parent) {
+            return Err(RecoveryStop::Refused(format!(
+                "the candidate's block names parent {parent} but the node's header names {node_parent}"
+            ))
+            .into());
+        }
+        // A pending row is adopted before anything lands, exactly as the
+        // pre-offer probe adopts an active pending block: from this commit
+        // on, no claim on any frontend offers it, whatever happens next.
+        if claim.lifecycle.state == CandidateState::Pending {
+            let evidence =
+                format!("node reports block {block} active at height {height} with tip {tip}");
+            let reason = format!(
+                "adopted by operator recovery before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
+            );
+            tracing::warn!(%block, %reason, "operator recovery is adopting an active pending block");
+            self.ledger
+                .adopt_active_candidate(claim, &evidence, &reason)
+                .await?;
+        }
+        // The normal post-offer landing, refusals and all.
+        if let Err(reason) = self.land_offered(claim, lease).await? {
+            return Err(RecoveryStop::Refused(reason).into());
+        }
+        // Finished only on active-chain evidence observed now, at a revision
+        // proven now, exactly as the post-offer phase finishes.
+        let CandidateObservation {
+            active,
+            revision,
+            tip,
+            ..
+        } = self.observe_candidate(claim).await?;
+        if !active {
+            return Err(RecoveryStop::NotActive(format!(
+                "after the landing the node's active chain (tip {tip}) no longer holds {block} at height {height}; the audit is durable and the row awaits reconciliation"
+            ))
+            .into());
+        }
+        self.ledger
+            .finish_candidate_at_revision(claim, true, None, revision)
+            .await?;
+        self.blocks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Whether the block's audit has already landed and, if so, whether the
@@ -1516,7 +1857,7 @@ impl Coordinator {
         // The rebuilt window is released off the runtime once the landing
         // returns, whichever way it went.
         let rebuilt = OffRuntime::new(claim.clone().with_parts(parts));
-        let (_, revision, _) = self.observe_candidate(claim).await?;
+        let revision = self.observe_candidate(claim).await?.revision;
         match self
             .ledger
             .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
@@ -1584,7 +1925,12 @@ impl Coordinator {
             // that is already active needs no offer, only its audit and its
             // confirmation; a superseded one is the one proven pre-offer
             // rejection that may abandon.
-            let (active, revision, tip) = self.observe_candidate(claim).await?;
+            let CandidateObservation {
+                active,
+                revision,
+                tip,
+                ..
+            } = self.observe_candidate(claim).await?;
             if active {
                 return self.adopt_active_candidate(claim, lease, &tip).await;
             }
@@ -1718,13 +2064,33 @@ impl Coordinator {
         // A null reply can still describe a known side-chain block, and the
         // landing may have taken long: only active-chain evidence observed
         // now, at a revision proven now, advances the shared payout state.
-        let (active, revision, _) = self.observe_candidate(claim).await?;
-        if active {
-            self.ledger
-                .finish_candidate_at_revision(claim, true, None, revision)
+        let observation = self.observe_candidate(claim).await?;
+        if observation.active {
+            let first_confirmation = self
+                .ledger
+                .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
                 .await?;
-            self.blocks.fetch_add(1, Ordering::Relaxed);
+            self.blocks
+                .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
             self.wake.notify_one();
+            return Ok(());
+        }
+        // The proven orphan (#415): the audit above is durable, and this one
+        // coherent observation shows a DIFFERENT block active at the
+        // candidate's height with the configured confirmations. The row is
+        // settled terminal at the observed revision, with the evidence as its
+        // reason; a reorg reconciler that confirmed the block meanwhile has
+        // bumped that revision, and the settlement then fails and falls to
+        // the ordinary reconciliation retry below. An observation that
+        // failed never reaches here, so a failed observation never settles.
+        // The log line and the counter follow the committed settlement only;
+        // a refused one reports nothing terminal.
+        if let Some(reason) = self.orphan_evidence(claim, &observation) {
+            self.ledger
+                .orphan_candidate_at_revision(claim, &reason, observation.revision)
+                .await?;
+            self.metrics.record_candidate_orphaned();
+            tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
             return Ok(());
         }
         let reason = format!(
@@ -1732,6 +2098,42 @@ impl Coordinator {
         );
         tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
         self.ledger.reconcile_candidate(claim, &reason).await
+    }
+
+    /// The evidence that settles an offered candidate as a proven orphan, or
+    /// `None` while the chain has not proven it: the candidate's own block
+    /// is active, no block is active at its height yet (the tip is below
+    /// it), or the competitor has fewer than
+    /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations. Confirmations
+    /// are counted from the tip the observation proved coherent
+    /// (`tip_height - height + 1` for a block at `height`), so the verdict
+    /// and the revision it is written at come from the same observation.
+    fn orphan_evidence(
+        &self,
+        claim: &CandidateClaim,
+        observation: &CandidateObservation,
+    ) -> Option<String> {
+        let height = claim.candidate.found_block.block_height;
+        // The candidate's own hash at its height is exactly
+        // `observation.active`. The tip height is the node's report: the
+        // subtraction stays checked rather than trusting that `at_height` is
+        // only ever read at or below it, and the count saturates.
+        let competitor = observation.at_height.as_deref()?;
+        if competitor == claim.candidate.block_hash {
+            return None;
+        }
+        let confirmations = observation
+            .tip_height
+            .checked_sub(height)?
+            .saturating_add(1);
+        let required = self.config.candidate_orphan_confirmations;
+        if confirmations < required {
+            return None;
+        }
+        Some(format!(
+            "proven orphan: block {competitor} is active at height {height} with {confirmations} confirmations (tip {} at height {}, {required} required) and block {} is not on the active chain; settled terminal with its landed audit kept for a reorg back, never offered again",
+            observation.tip, observation.tip_height, claim.candidate.block_hash
+        ))
     }
 
     /// The one proof-to-first-offer sample for a block, emitted by the
@@ -2402,3 +2804,6 @@ mod window_switch_tests;
 
 #[cfg(test)]
 mod window_incident_tests;
+
+#[cfg(test)]
+mod storm_evidence_tests;

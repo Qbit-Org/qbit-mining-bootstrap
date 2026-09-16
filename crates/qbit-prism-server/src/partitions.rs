@@ -1,7 +1,7 @@
 //! Attached headroom for the partitioned share ledger.
 //!
 //! `qbit_share_ledger` is RANGE partitioned on `share_seq` with no DEFAULT
-//! partition (migration 016), so an append whose sequence value runs past the
+//! partition (migration 017), so an append whose sequence value runs past the
 //! last attached bound is refused outright: PostgreSQL raises SQLSTATE 23514,
 //! "no partition of relation ... found for row". The database keeps that from
 //! happening through `qbit_prism_share_partition_ensure()`, which attaches

@@ -7,7 +7,7 @@ observations, with the pool-acquisition histogram, collector measurements,
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **42 coordinator
+The generated table below is the sole inventory for both roles: **46 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -23,11 +23,13 @@ its existing untyped exposition; the inventory records the counter/gauge intent
 from its producer. Public response/cache label sets are lazy and appear after a
 request; replica gauges appear only with `PRISM_PUBLIC_REPLICA_MODE=require`.
 Default histogram boundaries in seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
-1, 2.5, 5, 10, 30, and +Inf. Only `qbit_prism_share_ack_seconds` adds 15 and 20.
-Histograms also export `_sum` and `_count`. See the
+1, 2.5, 5, 10, 30, and +Inf. `qbit_prism_share_ack_seconds` adds 15 and 20.
+`qbit_prism_ctv_fanout_broadcaster_chunk_rows` counts rows, not seconds, and
+exports the single finite bound 1; every other histogram uses the default
+ladder. Histograms also export `_sum` and `_count`. See the
 [histogram consumer guide](prism-metrics-histogram-consumers.md) for the five
-added series per process, elapsed-time attribution, quantile changes and
-mixed-version queries.
+added series per process, elapsed-time attribution, quantile changes,
+mixed-version queries and the chunk-row histogram.
 Bucket samples add `le`; the table lists producer labels. `job`, `instance` and
 `network` are deployment scrape labels, not native metric dimensions. See the
 [deployed-alert migration and draft diff](prism-alert-migration.md) for the
@@ -50,14 +52,18 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
 | `qbit_prism_authorized_with_current_work` | gauge | none | run | Authorized connections holding the current semantic work generation. | `qbit_prism_stratum_clients_with_current_tip_jobs` |
-| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidate_oldest_pending_seconds` |
-| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidates_pending` |
+| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidate_oldest_pending_seconds` |
+| `qbit_prism_block_candidates_orphaned_total` | counter | none | run | Offered block candidates this instance settled as proven orphans since process start. Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule. | none |
+| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidates_pending` |
 | `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule. | `qbit_prism_block_submit_seconds` |
 | `qbit_prism_blocks_total` | counter | none | run | Blocks confirmed by this instance since process start. Native confirmed-block process counter; not the legacy node-acceptance accounting boundary. | `qbit_prism_blocks_accepted_total` |
 | `qbit_prism_collector_age_seconds` | gauge | `collector=database,process` | run | Monotonic age of the last successful collector observation, or -1 before success. | none |
 | `qbit_prism_collector_available` | gauge | `collector=database,process` | run | Whether a collector has a complete successful observation. | none |
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
+| `qbit_prism_ctv_fanout_broadcaster_chunk_rows` | histogram | none | run | Fanouts attempted per native broadcaster chunk; each chunk contains one row. Values are rows, not seconds: instead of the default time ladder this histogram exports the single finite bound `le="1"` plus `+Inf`, so `_count` is the number of claimed fanout attempts and `_sum` equals `_count`. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported; a query for a higher `le` matches no series. | `qbit_prism_ctv_fanout_broadcaster_chunk_rows` |
+| `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` | histogram | none | run | Claimed fanout attempt duration including status persistence, in seconds. Default histogram ladder in seconds; one observation per claimed attempt, recorded even when persisting the attempt's completion fails. | `qbit_prism_ctv_fanout_broadcaster_chunk_seconds` |
+| `qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total` | counter | none | run | CTV passes deferred at a fanout boundary for a newer or unpublished tip. | `qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total` |
 | `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`. | none |
 | `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and by instrumented coordinator ledger transactions and selected direct ledger queries, including payout-revision reads and heartbeats. Non-transactional coverage remains partial under #352; rollup worker transactions, public API queries and other pool traffic outside these acquisition paths are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
@@ -207,6 +213,28 @@ task is not running or its calls are failing, which
 not lose a share: the append that finds no partition attaches the lead itself
 and retries once. A never-partitioned ledger and a failed read both read -1;
 neither is a report of exhausted headroom.
+
+The pending predicate is the four unfinished outbox states (`pending`,
+`offer_reserved`, `offered`, `reconciliation`). Since #415 (migration 015) a
+reconciliation row whose block lost a tip race does not stay in that set
+forever: once its audit has landed and one coherent tip observation shows a
+*different* block active at its height with at least
+`PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted from
+the observed tip as `tip_height - height + 1`), the post-offer settlement marks
+the row terminal as `orphaned`, in the same transaction as its reason and its
+block's `inactive` chain state. Both pending gauges then stop counting the row.
+The process increments `qbit_prism_block_candidates_orphaned_total` after it
+observes a successful commit; cancellation or restart between commit and
+recording can lose that increment. The row releases its document, block bytes
+and window reference while preserving offer metadata and the reason for the
+operator surface (#268); it is never claimed or offered again. A failed observation settles nothing, so
+unknown stays distinct from zero: the row waits in reconciliation and the
+gauges report -1 only when the collector itself fails. A later reorg that
+reactivates the block is credited by the ordinary reorg reconciler from the
+landed audit, deferred share included, without reopening the row or touching
+the counter. Rows a frontend cannot land (a rebuild refused for good, a missing
+balance snapshot) are not orphans and stay in the pending set with their reason
+in `last_error`; that backlog is operator work.
 
 The existing coordinator families retain their names and types; their complete
 contracts appear in the generated table above. The #277 `metrics_snapshot_available`,

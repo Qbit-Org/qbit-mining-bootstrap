@@ -85,7 +85,7 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     // the required version, so this connect brings the schema forward on the
     // native path. It runs before the router is built because the public read
     // models require the native schema: block solver attribution is columns of
-    // `qbit_pool_blocks` since migration 015 (#144), which the dashboard
+    // `qbit_pool_blocks` since migration 016 (#144), which the dashboard
     // blocks, leaderboard and pool snapshot queries read.
     let mut scoped_url = url::Url::parse(&url).unwrap();
     scoped_url
@@ -424,7 +424,7 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
     // What the migrator records for 002 and 003, then the native path forward
     // from there. The chain-state read models require the native schema:
     // block solver attribution is columns of `qbit_pool_blocks` since
-    // migration 015 (#144), which the dashboard blocks query reads. Every
+    // migration 016 (#144), which the dashboard blocks query reads. Every
     // block row below is inserted afterwards and around the landing path, so
     // its solver columns stay unset and the query serves them through the
     // ledger fallback the columns replaced.

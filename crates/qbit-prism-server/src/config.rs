@@ -10,7 +10,7 @@ use std::{env, time::Duration};
 mod database;
 mod environment;
 mod policy_transition;
-pub use database::DatabaseConfig;
+pub use database::{public_database_options_from_env, DatabaseConfig};
 pub use environment::check_environment;
 pub(crate) use policy_transition::transition_configs;
 
@@ -45,6 +45,19 @@ pub struct Config {
     /// The acknowledgement bound for block-only proofs, measured from the same
     /// instant as `share_commit_timeout`. Not an environment variable.
     pub block_only_ack_timeout: Duration,
+    /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (#415): how many confirmations
+    /// a DIFFERENT block active at an offered candidate's height needs, on
+    /// one coherent tip observation, before the post-offer settlement marks
+    /// the row `orphaned` instead of keeping it in reconciliation. Counted
+    /// from the tip the observation proved: a competitor at height `h` has
+    /// `tip_height - h + 1` confirmations. Default 6, the conventional
+    /// settlement depth, so a lost tip race (a same-height competitor, the
+    /// common case) leaves the pending gauges within a few block intervals
+    /// while a deeper reorg back is still ordinary rather than the
+    /// disposition being wrong; the disposition is reversible for credit
+    /// either way, because the reorg reconciler credits a reactivated block
+    /// from its landed audit. 1 to 1000.
+    pub candidate_orphan_confirmations: u64,
     pub extranonce2_size: usize,
     pub coinbase_tag: String,
     pub manifest_seed: String,
@@ -187,7 +200,7 @@ fn alias(primary: &str, legacy: &str, default: u64) -> Result<u64> {
         positive(legacy, default)
     }
 }
-fn seconds(name: &str, default: f64) -> Result<Duration> {
+pub(crate) fn seconds(name: &str, default: f64) -> Result<Duration> {
     let n = number(name, default)?;
     ensure!(
         n.is_finite() && n > 0.0 && n <= 86400.0,
@@ -475,6 +488,8 @@ impl Config {
             "share commit grace must be positive"
         );
         let block_only_ack_timeout = share_commit_timeout.max(Duration::from_secs(60));
+        let candidate_orphan_confirmations =
+            bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
         Ok(Self {
             database_url,
             instance_id,
@@ -500,6 +515,7 @@ impl Config {
             share_commit_timeout,
             share_commit_grace,
             block_only_ack_timeout,
+            candidate_orphan_confirmations,
             extranonce2_size,
             coinbase_tag,
             manifest_seed,
@@ -598,6 +614,7 @@ mod tests {
             share_commit_timeout: Duration::from_secs(15),
             share_commit_grace: Duration::from_secs(5),
             block_only_ack_timeout: Duration::from_secs(60),
+            candidate_orphan_confirmations: 6,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),

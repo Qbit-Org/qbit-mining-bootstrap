@@ -1,4 +1,4 @@
-//! Migration 016 (#144): the share ledger partition conversion.
+//! Migration 017 (#144): the share ledger partition conversion.
 //!
 //! The conversion attaches the release table as the first partition of a
 //! new partitioned parent after a validated bound, inside the migration
@@ -10,7 +10,7 @@
 //! every append behind it, that a bound whose headroom ran out is moved,
 //! and what per-leaf share_id uniqueness means for the append path.
 //!
-//! `undo_016` and `undo_015` put a migrated database back to what a build
+//! `undo_017` and `undo_016` put a migrated database back to what a build
 //! without those migrations left, for the older upgrade fixtures that
 //! simulate such builds.
 use super::*;
@@ -130,7 +130,7 @@ async fn insert_share<'e>(
 /// set (its own share_id uniqueness included), every attached partition in
 /// the catalog and the catalog's attached rows attached, the immutability
 /// trigger on the parent and every leaf, the release function returning
-/// the parent's row type, and 16 recorded after every other version.
+/// the parent's row type, and 17 recorded after every other version.
 pub(super) async fn assert_converted(pool: &PgPool) -> Result<()> {
     assert_eq!(
         relkind(pool, "qbit_share_ledger").await?.as_deref(),
@@ -184,26 +184,26 @@ pub(super) async fn assert_converted(pool: &PgPool) -> Result<()> {
     .await?;
     assert!(converted);
     assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
-    let recorded_last: bool = sqlx::query_scalar("SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=16) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version<16)")
+    let recorded_last: bool = sqlx::query_scalar("SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=17) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version<17)")
         .fetch_one(pool)
         .await?;
     assert!(recorded_last);
     Ok(())
 }
 
-/// Undo 016 on a converted ledger: detach and drop the empty lead
+/// Undo 017 on a converted ledger: detach and drop the empty lead
 /// partitions, detach the release table, give it the sequence back before
 /// the parent (which owns it) is dropped, drop the parent and the release
 /// function bound to its row type, rename the release table and its six
 /// indexes back, drop the bound, recreate the function on the plain table,
-/// clear the catalog and remove the version row. The 015 objects stay.
-pub(super) async fn undo_016(pool: &PgPool) -> Result<()> {
+/// clear the catalog and remove the version row. The 016 objects stay.
+pub(super) async fn undo_017(pool: &PgPool) -> Result<()> {
     ensure!(
         relkind(pool, "qbit_share_ledger").await?.as_deref() == Some("p"),
-        "undo_016 needs a converted ledger"
+        "undo_017 needs a converted ledger"
     );
     let versions = schema_versions(pool).await?;
-    ensure!(versions.contains(&16));
+    ensure!(versions.contains(&17));
     sqlx::raw_sql(
         "DO $$
          DECLARE part text;
@@ -231,7 +231,7 @@ pub(super) async fn undo_016(pool: &PgPool) -> Result<()> {
          $$;
          DELETE FROM qbit_prism_share_partitions;
          UPDATE qbit_prism_share_partitioning SET converted_at=NULL, conversion_bound=NULL, updated_at=clock_timestamp();
-         DELETE FROM qbit_prism_schema_migrations WHERE version=16",
+         DELETE FROM qbit_prism_schema_migrations WHERE version=17",
     )
     .execute(pool)
     .await?;
@@ -243,24 +243,24 @@ pub(super) async fn undo_016(pool: &PgPool) -> Result<()> {
         schema_versions(pool).await?,
         versions
             .into_iter()
-            .filter(|version| *version != 16)
+            .filter(|version| *version != 17)
             .collect::<Vec<_>>()
     );
     Ok(())
 }
 
-/// Undo 015 on a ledger 016 has been undone on: the catalog, the
+/// Undo 016 on a ledger 017 has been undone on: the catalog, the
 /// functions, the solver columns and the version row go, and the two
 /// release foreign keys onto share_id come back under their release names.
-pub(super) async fn undo_015(pool: &PgPool) -> Result<()> {
+pub(super) async fn undo_016(pool: &PgPool) -> Result<()> {
     ensure!(
         relkind(pool, "qbit_share_ledger").await?.as_deref() == Some("r"),
-        "undo 016 before 015"
+        "undo 017 before 016"
     );
     let versions = schema_versions(pool).await?;
-    ensure!(versions.contains(&15) && !versions.contains(&16));
+    ensure!(versions.contains(&16) && !versions.contains(&17));
     sqlx::raw_sql(
-        "DELETE FROM qbit_prism_schema_migrations WHERE version=15;
+        "DELETE FROM qbit_prism_schema_migrations WHERE version=16;
          DROP FUNCTION qbit_prism_share_ledger_convert_swap();
          DROP FUNCTION qbit_prism_share_ledger_convert_validate();
          DROP FUNCTION qbit_prism_share_ledger_convert_prepare(bigint);
@@ -283,7 +283,7 @@ pub(super) async fn undo_015(pool: &PgPool) -> Result<()> {
         schema_versions(pool).await?,
         versions
             .into_iter()
-            .filter(|version| *version != 15)
+            .filter(|version| *version != 16)
             .collect::<Vec<_>>()
     );
     Ok(())
@@ -304,7 +304,7 @@ async fn partition_of(pool: &PgPool, share_seq: i64) -> Result<String> {
 /// the lead is attached above it, appends route into the first cell, and
 /// a second start applies nothing.
 #[tokio::test]
-async fn migration_016_converts_an_empty_ledger_in_the_transaction_and_appends_route_to_the_first_cell(
+async fn migration_017_converts_an_empty_ledger_in_the_transaction_and_appends_route_to_the_first_cell(
 ) -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
@@ -347,7 +347,7 @@ async fn migration_016_converts_an_empty_ledger_in_the_transaction_and_appends_r
 }
 
 #[tokio::test]
-async fn migration_016_converts_empty_2x_ledgers_at_sequence_boundaries() -> Result<()> {
+async fn migration_017_converts_empty_2x_ledgers_at_sequence_boundaries() -> Result<()> {
     for state in [SourceState::Pre258, SourceState::Applied258] {
         for next_seq in [WIDTH - 1, WIDTH, WIDTH + 1] {
             let Some(db) = Database::open().await? else {
@@ -388,7 +388,7 @@ async fn migration_016_converts_empty_2x_ledgers_at_sequence_boundaries() -> Res
 
 /// Older frontends omit the new solver columns while conversion is pending.
 #[tokio::test]
-async fn migration_015_captures_old_frontend_solvers_during_online_conversion() -> Result<()> {
+async fn migration_016_captures_old_frontend_solvers_during_online_conversion() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
@@ -399,9 +399,9 @@ async fn migration_015_captures_old_frontend_solvers_during_online_conversion() 
         let mut solving = share(1);
         solving.share_id = share_id.clone();
         ledger.append(solving, None).await?;
-        // 015 and its backfill have committed. Keep 016 pending, as during
+        // 016 and its backfill have committed. Keep 017 pending, as during
         // the online validation phase while old frontends remain active.
-        undo_016(&ledger.pool).await?;
+        undo_017(&ledger.pool).await?;
         sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,100,'parent','coinbase','manifest')")
             .bind(&hash)
             .execute(&ledger.pool)
@@ -444,7 +444,7 @@ async fn migration_015_captures_old_frontend_solvers_during_online_conversion() 
 /// partition's bound is two widths above the sequence on the grid, and the
 /// lead partitions follow it.
 #[tokio::test]
-async fn migration_016_converts_a_populated_ledger_online_and_resumes_from_every_stage(
+async fn migration_017_converts_a_populated_ledger_online_and_resumes_from_every_stage(
 ) -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
@@ -458,7 +458,7 @@ async fn migration_016_converts_a_populated_ledger_online_and_resumes_from_every
     for prepared in ["nothing", "prepare", "prepare+validate"] {
         // Each round below appends one more share after its conversion.
         let rows = 4 + i64::try_from(ledgers.len())?;
-        undo_016(&pool).await?;
+        undo_017(&pool).await?;
         assert_eq!(share_count(&pool).await?, rows);
         if prepared != "nothing" {
             let bound: i64 = sqlx::query_scalar("SELECT qbit_prism_share_ledger_convert_prepare()")
@@ -477,9 +477,9 @@ async fn migration_016_converts_a_populated_ledger_online_and_resumes_from_every
         let error = Ledger::connect(&db.url, "cold".into(), 8, false)
             .await
             .err()
-            .context("a non-initializing start accepted a database missing 016")?
+            .context("a non-initializing start accepted a database missing 017")?
             .to_string();
-        assert!(error.contains("missing migration(s) 16"), "{error}");
+        assert!(error.contains("missing migration(s) 17"), "{error}");
         let resumed = db.ledger(&format!("resumed-{prepared}")).await?;
         assert_converted(&pool).await?;
         assert_eq!(share_count(&pool).await?, rows);
@@ -514,14 +514,14 @@ async fn migration_016_converts_a_populated_ledger_online_and_resumes_from_every
 /// bound is prepared: the table stays plain, no constraint is added and
 /// nothing is recorded; once the name is free the conversion goes through.
 #[tokio::test]
-async fn migration_016_refuses_a_reserved_partition_name_before_any_ddl() -> Result<()> {
+async fn migration_017_refuses_a_reserved_partition_name_before_any_ddl() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
     let first = db.ledger("first").await?;
     first.append(share(1), None).await?;
-    undo_016(&pool).await?;
+    undo_017(&pool).await?;
     let versions = schema_versions(&pool).await?;
     sqlx::raw_sql("CREATE VIEW qbit_share_ledger_p7 AS SELECT 1 AS one")
         .execute(&pool)
@@ -557,14 +557,14 @@ async fn migration_016_refuses_a_reserved_partition_name_before_any_ddl() -> Res
 /// appends queued behind an ACCESS EXCLUSIVE request; once the writer
 /// commits, the conversion completes with its row.
 #[tokio::test]
-async fn migration_016_waits_for_an_open_writer_without_blocking_appends() -> Result<()> {
+async fn migration_017_waits_for_an_open_writer_without_blocking_appends() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
     let first = db.ledger("first").await?;
     first.append(share(1), None).await?;
-    undo_016(&pool).await?;
+    undo_017(&pool).await?;
     let mut writer = pool.begin().await?;
     insert_share(&mut *writer, None, 2, "alice").await?;
     let finished = AtomicBool::new(false);
@@ -620,7 +620,7 @@ async fn migration_016_waits_for_an_open_writer_without_blocking_appends() -> Re
 /// width of it, then validated and swapped; the first partition's bound is
 /// the new one.
 #[tokio::test]
-async fn migration_016_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
+async fn migration_017_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
@@ -629,7 +629,7 @@ async fn migration_016_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
     first.append(share(1), None).await?;
     let mut ledgers = vec![first];
     for (round, validate) in [false, true].into_iter().enumerate() {
-        undo_016(&pool).await?;
+        undo_017(&pool).await?;
         // The bound is reprepared on the grid from the current sequence.
         let expected_bound = (round as i64 + 1) * WIDTH;
         let bound: i64 = sqlx::query_scalar("SELECT qbit_prism_share_ledger_convert_prepare(10)")

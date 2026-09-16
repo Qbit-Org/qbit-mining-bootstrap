@@ -8,6 +8,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     AuditBundleBody, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy, SettlementModeConfig,
 };
+use serde_json::json;
 use std::sync::Arc;
 
 /// The public keys the building frontend signed with. The seeds stay local;
@@ -124,8 +125,8 @@ pub struct ClaimParts {
 /// Where an outbox row is in the offer-before-landing lifecycle (migration
 /// 011). Every variant is unfinished: the row keeps its document, its block
 /// bytes and its window reference, and a claim can hold it. The terminal
-/// states, `submitted` and `abandoned`, are never claimed and have no
-/// variant here.
+/// states, `submitted`, `abandoned` and `orphaned` (migration 015), are
+/// never claimed and have no variant here; see [`ORPHANED_STATE`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CandidateState {
     /// Never offered. The only state a claim may offer from, and the only
@@ -145,10 +146,41 @@ pub enum CandidateState {
     Reconciliation,
 }
 
+/// The terminal processing disposition of a proven orphan (#415, migration
+/// 015): an offered row whose block the chain has proven not to be on the
+/// active chain, a DIFFERENT block being active at its height with at least
+/// `Config::candidate_orphan_confirmations` confirmations, observed on one
+/// coherent tip after the row's audit landed. It records why processing
+/// stopped, not a permanent chain fact: the block's chain state stays in
+/// `qbit_pool_blocks`, which a later reorg may still move to `confirmed`.
+/// Terminal like `submitted` and `abandoned`: never claimed again, never
+/// offered again, and no longer counted by the pending-candidate gauges. Like
+/// those two it releases its document, its block bytes and its window
+/// reference; it keeps its offer record and its reason, so an operator
+/// reading the outbox (#268) sees what was offered and why it was settled.
+/// The block itself keeps its landed audit and its `qbit_pool_blocks` row,
+/// marked `inactive`: a later reorg that reactivates the block is confirmed
+/// and credited by the ordinary reorg reconciler from that evidence, deferred
+/// share included, and this row never reopens. Written by
+/// [`Ledger::orphan_candidate_at_revision`] only.
+pub const ORPHANED_STATE: &str = "orphaned";
+
 impl CandidateState {
     /// The SQL list of every unfinished state, for `state IN` predicates.
+    /// Every other state is terminal, so `state NOT IN` this list is the
+    /// terminal test.
     pub const UNFINISHED_SQL: &'static str =
         "('pending','offer_reserved','offered','reconciliation')";
+
+    /// The SQL list of the three offer states, for `state IN` predicates:
+    /// the unfinished states a block may already have reached the node from,
+    /// which only reconciliation or a terminal chain verdict may settle.
+    pub const OFFERED_SQL: &'static str = "('offer_reserved','offered','reconciliation')";
+
+    /// Why a settlement that must hold a live claim on an offered row wrote
+    /// nothing.
+    pub(super) const OFFERED_CLAIM_LOST: &'static str =
+        "candidate claim was lost or expired, or the row was never offered";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -940,12 +972,9 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let moved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN ('offer_reserved','offered','reconciliation') AND claim_expires_at>clock_timestamp()")
+        let moved = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
-        ensure!(
-            moved == 1,
-            "candidate claim was lost or expired, or the row was never offered"
-        );
+        ensure!(moved == 1, CandidateState::OFFERED_CLAIM_LOST);
         tx.commit().await?;
         Ok(())
     }
@@ -1364,7 +1393,10 @@ impl Ledger {
     /// unclaimed, so empty polling never advances the sequence. Public so a
     /// test can EXPLAIN the statement the server runs rather than a copy.
     pub fn due_work_probe_sql() -> String {
-        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') WHERE EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))", CandidateState::UNFINISHED_SQL)
+        // An ordered LIMIT 1 derived query lets the existing unfinished index
+        // serve polls with large retained history. LIMIT 1 also bounds the
+        // outer nextval to one call; both advancing clock predicates remain.
+        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') FROM (SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) ORDER BY next_attempt_at,created_at,block_hash LIMIT 1) AS due", CandidateState::UNFINISHED_SQL)
     }
 
     /// The row selection of one claim lane, exactly as
@@ -1391,6 +1423,553 @@ impl Ledger {
     }
 }
 
+/// The operator candidate commands (#268). Both are deliberately narrow:
+/// `list` is an inventory that cannot write, and `abandon` applies to a
+/// `pending` row only, because `pending` is the one unfinished state from
+/// which no `submitblock` can yet have been made. Neither reads a node, a
+/// signing key or anything beyond the stored-data configuration.
+impl Ledger {
+    /// The statement [`Ledger::list_candidates`] issues, without its bind.
+    /// Public so a test can describe the statement the command runs rather
+    /// than a copy, and prove what it projects.
+    ///
+    /// Neither payload column is selected: the height is extracted to a
+    /// scalar server-side, so the row the operator sees costs eight bytes
+    /// instead of a block and a document. The extraction is guarded by a
+    /// digit pattern rather than a bare cast, so a row an unknown writer
+    /// left behind renders with an unknown height instead of failing the
+    /// whole inventory.
+    pub fn candidate_list_sql() -> String {
+        format!(
+            "SELECT o.block_hash,o.state,\
+             CASE WHEN o.candidate->'found_block'->>'block_height' ~ '^[0-9]{{1,18}}$' \
+             THEN (o.candidate->'found_block'->>'block_height')::bigint END AS block_height,\
+             o.attempt_count,o.storage_version,o.last_error,o.created_at,o.updated_at,\
+             o.next_attempt_at='infinity'::timestamptz AS parked,\
+             CASE WHEN o.next_attempt_at='infinity'::timestamptz THEN NULL \
+             ELSE o.next_attempt_at END AS next_attempt_at,\
+             o.claim_instance_id,o.claim_expires_at,\
+             o.claim_expires_at>clock_timestamp() AS claim_live,\
+             o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply \
+             FROM qbit_block_candidate_outbox o WHERE o.state IN {} \
+             ORDER BY o.next_attempt_at,o.created_at,o.block_hash LIMIT $1",
+            CandidateState::UNFINISHED_SQL
+        )
+    }
+
+    /// Up to `limit` unfinished candidates and whether more exist, oldest due
+    /// first: the oldest-due claim lane's own ordering, so the row a server works next prints first and
+    /// parked (`infinity`) rows sort last.
+    ///
+    /// The pool is the read-only shape [`Ledger::inspect_fatal_state`] uses.
+    /// `default_transaction_read_only=on` is what makes "takes no claim" a
+    /// property PostgreSQL enforces rather than one a reviewer checks, and
+    /// no write guard runs, so the inventory keeps working while the cluster
+    /// is halted: precisely when an operator needs it.
+    pub async fn list_candidates(url: &str, limit: i64) -> Result<(Vec<Value>, bool)> {
+        ensure!(
+            (1..=10_000).contains(&limit),
+            "--limit must be between 1 and 10000"
+        );
+        let pool = read_only_pool(url).await?;
+        let rows = sqlx::query(&Self::candidate_list_sql())
+            .bind(limit + 1)
+            .fetch_all(&pool)
+            .await;
+        // Released on the failure path too: an inventory that cannot finish
+        // must not leave a connection behind for the next command.
+        pool.close().await;
+        let rows = rows?;
+        let truncated = rows.len() > limit as usize;
+        let candidates = rows
+            .iter()
+            .take(limit as usize)
+            .map(candidate_summary)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((candidates, truncated))
+    }
+
+    /// Abandon one candidate, as the single statement whose `WHERE` *is* the
+    /// safety property: `pending` (never offered, so no `submitblock` can
+    /// have been made for it), supported storage version 1, a document this
+    /// release wrote itself, no live claim, and no landed block. The
+    /// column list is the supersession path's
+    /// (`policy_transition.rs`), with the operator's reason taking
+    /// `last_error`'s place; `next_attempt_at` is left untouched there and
+    /// here, because no lane selects a terminal row and an `infinity` left
+    /// in it is the evidence that the row had been parked.
+    ///
+    /// `storage_version = 1` alone does not mean native (#425). The native
+    /// claim lane parks a pre-migration 2.x.x v1 document at that version
+    /// rather than rewriting it, so the version guard by itself would let an
+    /// operator destroy the very evidence the legacy drain still needs. The
+    /// shape predicate here is the migrator's own, from
+    /// `migration::refuse_undrained_outbox`: a row this server wrote carries
+    /// `payout_revision` and `block_hash` beside either an inline `bundle`
+    /// (pre-007) or a `window` reference (007 and later). A `candidate` that
+    /// is not that shape — a legacy document, or a `NULL` an unknown writer
+    /// left on a pending row — keeps every column, and the diagnosis below
+    /// names the legacy drain as its remedy.
+    ///
+    /// The state is a predicate, never a preceding `SELECT`: a row can move
+    /// between a check and a write. When the predicate refuses, the
+    /// diagnosis below runs read-only in the same transaction, for the
+    /// operator's message and exit status alone.
+    pub async fn abandon_candidate(&self, block_hash: &str, reason: &str) -> Result<Value> {
+        let mut tx = self.begin().await?;
+        // Landing keeps FOR KEY SHARE so its owner can renew the lease. That
+        // row lock also permits this non-key UPDATE after the lease expires.
+        // Take landing's settlement lock first, in a separate statement: the
+        // UPDATE must see accounting committed while we waited for the lock.
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        // The write guard, kept even though the one-shot tool connection has
+        // already refused a halted cluster: it is what refuses a live legacy
+        // Python writer lease, so an operator abandon never races the 2.x.x
+        // writer during a cutover.
+        writable(&mut tx).await?;
+        // The claim decision and its later explanation must use the same
+        // instant, even if a lease expires between these statements. Capture
+        // database time after waiting for settlement, not transaction start.
+        let claim_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let abandoned: Option<String> = sqlx::query_scalar(
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=$3) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
+            .bind(block_hash).bind(reason).bind(claim_at).fetch_optional(&mut *tx).await?;
+        let outcome = match abandoned {
+            Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
+            None => diagnose_abandon_refusal(&mut tx, block_hash, claim_at).await?,
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
+/// One outbox row as the operator commands report it. Every unknown value
+/// stays JSON `null`: an absent height, an unrecorded proof observation and
+/// an offer record an older binary never wrote are all distinct from zero.
+fn candidate_summary(row: &PgRow) -> Result<Value> {
+    let time = |name: &str| -> Result<Value> {
+        Ok(row
+            .try_get::<Option<DateTime<Utc>>, _>(name)?
+            .map_or(Value::Null, |at| json!(at.to_rfc3339())))
+    };
+    Ok(json!({
+        "block_hash": row.try_get::<String, _>("block_hash")?,
+        "state": row.try_get::<String, _>("state")?,
+        "block_height": row.try_get::<Option<i64>, _>("block_height")?,
+        "attempt_count": row.try_get::<i32, _>("attempt_count")?,
+        "storage_version": row.try_get::<i32, _>("storage_version")?,
+        "last_error": row.try_get::<Option<String>, _>("last_error")?,
+        "created_at": time("created_at")?,
+        "updated_at": time("updated_at")?,
+        "parked": row.try_get::<bool, _>("parked")?,
+        "next_attempt_at": time("next_attempt_at")?,
+        "claim_instance_id": row.try_get::<Option<String>, _>("claim_instance_id")?,
+        "claim_expires_at": time("claim_expires_at")?,
+        "claim_live": row.try_get::<Option<bool>, _>("claim_live")?.unwrap_or(false),
+        "proof_observed_at_ms": row.try_get::<Option<i64>, _>("proof_observed_at_ms")?,
+        "offer_reserved_by": row.try_get::<Option<String>, _>("offer_reserved_by")?,
+        "offered_at_ms": row.try_get::<Option<i64>, _>("offered_at_ms")?,
+        "offer_outcome": row.try_get::<Option<String>, _>("offer_outcome")?,
+        "offer_reply": row.try_get::<Option<String>, _>("offer_reply")?,
+    }))
+}
+
+/// Why the abandon statement changed no row, read after it and never before
+/// it. This gates no write: the refusal is already decided.
+///
+/// `native` restates the statement's shape predicate rather than a copy of
+/// its reasoning, so a `storage_version = 1` row holding a pre-migration
+/// 2.x.x document is reported as the legacy row it is instead of falling
+/// through to the `bail!` below.
+async fn diagnose_abandon_refusal(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+    claim_at: DateTime<Utc>,
+) -> Result<Value> {
+    let Some(facts) = refusal_facts(tx, block_hash, claim_at).await? else {
+        return Ok(json!({"outcome":"missing"}));
+    };
+    let state = facts.state.as_str();
+    Ok(match state {
+        "submitted" | "abandoned" | "orphaned" => json!({"outcome":"terminal","state":state}),
+        "offer_reserved" | "offered" | "reconciliation" => {
+            json!({"outcome":"offered","state":state})
+        }
+        // A landed block is reported ahead of a live claim: the claim expires
+        // on its own, and the accounting does not.
+        "pending" if facts.landed => json!({"outcome":"landed"}),
+        "pending" if facts.storage_version != 1 => json!({
+            "outcome": "unsupported_storage_version",
+            "storage_version": facts.storage_version,
+        }),
+        // Reported ahead of a claim for the same reason as the version above:
+        // a claim expires by itself, and a document this release cannot
+        // replay never becomes replayable by waiting.
+        "pending" if !facts.native => json!({"outcome": "legacy_candidate"}),
+        "pending" if facts.claim_live => facts.claimed(),
+        // Unfinished business, never "nothing to do": the row is pending,
+        // unclaimed and unlanded, so the statement should have taken it, and
+        // something changed it under this transaction.
+        other => bail!(
+            "candidate {block_hash} is {other} and unclaimed but the abandon statement changed no row; re-read the row before retrying"
+        ),
+    })
+}
+
+/// What a refusal is explained with: the row's state, storage version and
+/// document shape, whether its block has landed, and its claim as of one
+/// database instant. Read after the refusing statement in the same
+/// transaction, never before it, by both operator commands that write.
+struct RefusalFacts {
+    state: String,
+    storage_version: i32,
+    landed: bool,
+    /// The same shape predicate the refusing statement tested, read back in
+    /// the same transaction.
+    native: bool,
+    claim_live: bool,
+    claim_instance_id: Option<String>,
+    claim_expires_at: Option<DateTime<Utc>>,
+}
+
+impl RefusalFacts {
+    /// The `claimed` outcome, naming the holder and its expiry.
+    fn claimed(&self) -> Value {
+        json!({
+            "outcome": "claimed",
+            "claim_instance_id": self.claim_instance_id,
+            "claim_expires_at": self
+                .claim_expires_at
+                .map_or(Value::Null, |at| json!(at.to_rfc3339())),
+        })
+    }
+}
+
+async fn refusal_facts(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+    claim_at: DateTime<Utc>,
+) -> Result<Option<RefusalFacts>> {
+    let Some(row) = sqlx::query(
+        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>$2 AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed,COALESCE((o.candidate ?& ARRAY['payout_revision','block_hash']) AND (o.candidate ? 'bundle' OR o.candidate ? 'window'),false) AS native FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
+        .bind(block_hash).bind(claim_at).fetch_optional(&mut **tx).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RefusalFacts {
+        state: row.try_get("state")?,
+        storage_version: row.try_get("storage_version")?,
+        landed: row.try_get("landed")?,
+        native: row.try_get("native")?,
+        claim_live: row
+            .try_get::<Option<bool>, _>("claim_live")?
+            .unwrap_or(false),
+        claim_instance_id: row.try_get("claim_instance_id")?,
+        claim_expires_at: row.try_get("claim_expires_at")?,
+    }))
+}
+
+/// A one-connection pool on which PostgreSQL itself refuses every write
+/// (`default_transaction_read_only=on`), in the shape
+/// [`Ledger::inspect_fatal_state`] uses: what makes "takes no claim" a
+/// property the database enforces for the inventory and the recovery plan,
+/// and what keeps both working while the cluster is halted.
+pub(super) async fn read_only_pool(url: &str) -> Result<PgPool> {
+    Ok(PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(15))
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('default_transaction_read_only','on',false),set_config('statement_timeout','15s',false),set_config('lock_timeout','5s',false)")
+                    .execute(&mut *connection).await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await?)
+}
+
+/// One listed hash as the recovery plan reads it (#418): the outbox row's
+/// lifecycle facts beside what has landed for its block. No payload column
+/// is in the projection; the stored height is extracted server-side exactly
+/// as the inventory does it, and stays `None` when the document holds none.
+#[derive(Clone, Debug)]
+pub struct RecoveryRow {
+    pub block_hash: String,
+    pub state: String,
+    pub stored_height: Option<i64>,
+    pub storage_version: i32,
+    pub claim_instance_id: Option<String>,
+    pub claim_expires_at: Option<DateTime<Utc>>,
+    pub claim_live: bool,
+    /// The migrator's shape test, as `abandon` applies it: a document this
+    /// release wrote. Always `false` for a terminal row, whose document was
+    /// released; the plan never asks it of one.
+    pub native: bool,
+    pub landed_height: Option<i64>,
+    pub landed_parent: Option<String>,
+    pub landed_chain_state: Option<String>,
+    pub has_audit: bool,
+}
+
+/// The read-only side of the recovery command: the plan's reads, on the
+/// pool [`read_only_pool`] opens. It cannot claim, and it loads no payload.
+pub struct RecoveryReader {
+    pool: PgPool,
+}
+
+impl RecoveryReader {
+    pub async fn open(url: &str) -> Result<Self> {
+        Ok(Self {
+            pool: read_only_pool(url).await?,
+        })
+    }
+
+    /// The statement [`RecoveryReader::rows`] issues, without its bind.
+    /// Public so a test can describe the statement the command runs rather
+    /// than a copy, and prove that neither `candidate` nor `block_bytes` is
+    /// a selected column.
+    pub fn sql() -> String {
+        "SELECT o.block_hash,o.state,\
+         CASE WHEN o.candidate->'found_block'->>'block_height' ~ '^[0-9]{1,18}$' \
+         THEN (o.candidate->'found_block'->>'block_height')::bigint END AS stored_height,\
+         o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,\
+         COALESCE((o.candidate ?& ARRAY['payout_revision','block_hash']) AND (o.candidate ? 'bundle' OR o.candidate ? 'window'),false) AS native,\
+         b.block_height AS landed_height,b.parent_hash AS landed_parent,b.chain_state AS landed_chain_state,\
+         EXISTS(SELECT 1 FROM qbit_pool_audit_bundles a WHERE a.block_hash=o.block_hash) AS has_audit \
+         FROM qbit_block_candidate_outbox o LEFT JOIN qbit_pool_blocks b ON b.block_hash=o.block_hash \
+         WHERE o.block_hash=ANY($1::text[])"
+            .to_owned()
+    }
+
+    /// The rows for `hashes`, in no particular order; a hash with no row is
+    /// simply absent, for the plan to refuse.
+    pub async fn rows(&self, hashes: &[String]) -> Result<Vec<RecoveryRow>> {
+        sqlx::query(&Self::sql())
+            .bind(hashes)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(RecoveryRow {
+                    block_hash: row.try_get("block_hash")?,
+                    state: row.try_get("state")?,
+                    stored_height: row.try_get("stored_height")?,
+                    storage_version: row.try_get("storage_version")?,
+                    claim_instance_id: row.try_get("claim_instance_id")?,
+                    claim_expires_at: row.try_get("claim_expires_at")?,
+                    claim_live: row
+                        .try_get::<Option<bool>, _>("claim_live")?
+                        .unwrap_or(false),
+                    native: row.try_get("native")?,
+                    landed_height: row.try_get("landed_height")?,
+                    landed_parent: row.try_get("landed_parent")?,
+                    landed_chain_state: row.try_get("landed_chain_state")?,
+                    has_audit: row.try_get("has_audit")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Which of `hashes` are unfinished outbox rows, with their states: the
+    /// parent rule's read. A parent that is terminal or unknown to the outbox
+    /// is no obstacle; an unfinished one must land first.
+    pub async fn unfinished_states(&self, hashes: &[String]) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT block_hash,state FROM qbit_block_candidate_outbox WHERE block_hash=ANY($1::text[]) AND state IN {}",
+            CandidateState::UNFINISHED_SQL
+        ))
+        .bind(hashes)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Released on every path, so a plan that cannot finish leaves no
+    /// connection behind for the next command.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+}
+
+/// How a by-hash recovery claim ended (#418).
+#[derive(Debug)]
+pub enum RecoveryClaim {
+    /// The row is held by this process's token, decoded and authenticated
+    /// exactly as the claim lane authenticates a row, with its lifecycle as
+    /// the claim found it. Boxed: the claim carries the block.
+    Claimed(Box<CandidateClaim>),
+    /// The claim statement changed no row, or the claimed row could not be
+    /// decoded and its claim was released again. The outcome document names
+    /// why, in the vocabulary the operator commands share (`missing`,
+    /// `terminal`, `claimed`, `unsupported_storage_version`,
+    /// `legacy_candidate`), plus `invalid` for a row this binary cannot
+    /// authenticate, whose reason is in `reason`.
+    Refused(Value),
+}
+
+/// The bound on the reason a recovery attempt records in `last_error`, in
+/// bytes: the same bound a parked row's reason has.
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= PARKING_REASON_MAX_BYTES {
+        return reason.to_owned();
+    }
+    let mut end = PARKING_REASON_MAX_BYTES - '…'.len_utf8();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &reason[..end])
+}
+
+/// The operator recovery command's writes (#418): a durable, token-fenced
+/// claim on one named row, and its release. Everything between the two is
+/// the coordinator's ordinary post-offer landing, driven by
+/// `Coordinator::recover_candidate`.
+impl Ledger {
+    /// Claim one unfinished row by hash, through the claim mechanism every
+    /// frontend uses: the same token, holder, expiry and attempt count the
+    /// lanes write, so a live frontend's claim lane skips the row while
+    /// this process holds it and the ordinary heartbeat renews it. The
+    /// statement's `WHERE` is the safety property: an unfinished state, no
+    /// live claim, `storage_version = 1` and a document this release wrote
+    /// (the shape test `abandon` applies). Unlike a lane it ignores
+    /// `next_attempt_at`: a parked row is exactly the operator work this
+    /// command exists for, and its schedule is left as it is.
+    ///
+    /// The claimed row is decoded and authenticated as the lane does it. A
+    /// row that fails is not parked: its claim is released with the reason,
+    /// and the refusal reports it, because the operator asked for this row
+    /// by name and decides what to do with it. The caller supplies a fresh
+    /// token and retains it to release a claim after cancellation, including
+    /// when COMMIT succeeded but its acknowledgement was not received.
+    pub async fn claim_candidate_for_recovery(
+        &self,
+        block_hash: &str,
+        lease_seconds: i64,
+        token: &str,
+    ) -> Result<RecoveryClaim> {
+        ensure!(
+            (1..=600).contains(&lease_seconds),
+            "invalid candidate lease duration"
+        );
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        // The claim decision and its explanation use one database instant,
+        // as the abandon statement's do.
+        let claim_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let row = sqlx::query(&format!(
+            "UPDATE qbit_block_candidate_outbox o SET claim_token=$2,claim_instance_id=$3,claim_expires_at=clock_timestamp()+$4*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() WHERE o.block_hash=$1 AND o.state IN {} AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=$5) AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') RETURNING {CLAIMED_COLUMNS}",
+            CandidateState::UNFINISHED_SQL
+        ))
+        .bind(block_hash)
+        .bind(token)
+        .bind(&self.instance_id)
+        .bind(lease_seconds)
+        .bind(claim_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            let refusal = diagnose_recovery_refusal(&mut tx, block_hash, claim_at).await?;
+            tx.commit().await?;
+            return Ok(RecoveryClaim::Refused(refusal));
+        };
+        tx.commit().await?;
+        // The document is O(1) but the block digest scales with the block:
+        // off the runtime, as the lane keeps it.
+        let decode_token = token.to_owned();
+        let decoded =
+            tokio::task::spawn_blocking(move || decode_claimed_row(&row, decode_token)).await?;
+        match decoded {
+            Ok(claim) => Ok(RecoveryClaim::Claimed(Box::new(claim))),
+            Err(error) => {
+                let reason = format!("operator recovery could not authenticate the row: {error:#}");
+                self.release_recovery_token(block_hash, token, &reason)
+                    .await
+                    .context("releasing the recovery claim of a row that failed validation")?;
+                Ok(RecoveryClaim::Refused(
+                    json!({"outcome": "invalid", "reason": format!("{error:#}")}),
+                ))
+            }
+        }
+    }
+
+    /// Release this process's claim on a row whose recovery stopped, with the
+    /// reason in `last_error`, leaving everything else as it is: the state
+    /// (a row adopted into `reconciliation` stays there), the document, the
+    /// block bytes, the window columns, the offer record and, unlike
+    /// `retry_candidate`, the schedule, so a parked row stays parked. Fenced
+    /// on the token: a claim that a terminal commit has already cleared, or
+    /// that a later owner replaced, is not touched, and `false` says so.
+    ///
+    /// The row lock is `NO KEY UPDATE`, compatible with the `KEY SHARE` a
+    /// landing transaction holds, so a release after a deadline never waits
+    /// behind the very transaction the deadline cut short.
+    pub async fn release_recovery_claim(
+        &self,
+        claim: &CandidateClaim,
+        reason: &str,
+    ) -> Result<bool> {
+        self.release_recovery_token(&claim.candidate.block_hash, &claim.claim_token, reason)
+            .await
+    }
+
+    pub(crate) async fn release_recovery_token(
+        &self,
+        block_hash: &str,
+        token: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let reason = bounded_reason(reason);
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
+            .bind(block_hash).fetch_optional(&mut *tx).await?;
+        let released = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
+            .bind(block_hash).bind(token).bind(&reason).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(released == 1)
+    }
+}
+
+/// Why the recovery claim changed no row, read after it and never before it.
+/// Every unfinished state is claimable here, so there is no `offered`
+/// refusal, and a landed block is no refusal either: an idempotent landing
+/// is exactly what reuses it.
+async fn diagnose_recovery_refusal(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+    claim_at: DateTime<Utc>,
+) -> Result<Value> {
+    let Some(facts) = refusal_facts(tx, block_hash, claim_at).await? else {
+        return Ok(json!({"outcome":"missing"}));
+    };
+    let state = facts.state.as_str();
+    Ok(match state {
+        "submitted" | "abandoned" | "orphaned" => json!({"outcome":"terminal","state":state}),
+        _ if facts.storage_version != 1 => json!({
+            "outcome": "unsupported_storage_version",
+            "storage_version": facts.storage_version,
+        }),
+        // Ahead of the claim, as for abandon: a claim expires by itself, and
+        // a document this release cannot replay never becomes replayable by
+        // waiting.
+        _ if !facts.native => json!({"outcome": "legacy_candidate"}),
+        _ if facts.claim_live => facts.claimed(),
+        other => bail!(
+            "candidate {block_hash} is {other} and unclaimed but the recovery claim changed no row; re-read the row before retrying"
+        ),
+    })
+}
+
+/// The columns a claiming statement returns, the ones [`decode_claimed_row`]
+/// reads: the row's identity, document, block and window columns, and its
+/// lifecycle and offer record. Shared by the two lanes and the by-hash
+/// recovery claim, so a decode never meets a projection it did not expect.
+const CLAIMED_COLUMNS: &str = "o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256,o.state,o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply";
+
 async fn claim_candidate_lane(
     tx: &mut Transaction<'_, Postgres>,
     fresh: bool,
@@ -1398,7 +1977,7 @@ async fn claim_candidate_lane(
     instance_id: &str,
     lease_seconds: i64,
 ) -> Result<Option<PgRow>> {
-    let query = format!("WITH next AS ({}) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256,o.state,o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply", Ledger::claim_lane_sql(fresh));
+    let query = format!("WITH next AS ({}) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING {CLAIMED_COLUMNS}", Ledger::claim_lane_sql(fresh));
     Ok(sqlx::query(&query)
         .bind(token)
         .bind(instance_id)
@@ -1510,3 +2089,7 @@ use faults::Fault;
 #[cfg(test)]
 #[path = "candidates/park_tests.rs"]
 mod park_tests;
+
+#[cfg(test)]
+#[path = "candidates/storm_fault_tests.rs"]
+mod storm_fault_tests;

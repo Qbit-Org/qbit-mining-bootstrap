@@ -30,6 +30,12 @@ mod fake_qbitd;
 #[path = "support/fatal_state.rs"]
 mod fatal_state;
 
+#[path = "support/candidates_cli.rs"]
+mod candidates_cli;
+
+#[path = "support/candidates_recover.rs"]
+mod candidates_recover;
+
 #[path = "support/index_trim.rs"]
 mod index_trim;
 

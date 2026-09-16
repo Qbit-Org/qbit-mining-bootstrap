@@ -28,10 +28,10 @@ grouped AS (
     GROUP BY miner_id
 ),
 -- Blocks found per miner, from the block row's own solver attribution
--- (written at landing and backfilled by migration 015, #144), so the count
+-- (written at landing and backfilled by migration 016, #144), so the count
 -- does not change when the partition holding the solving share is detached.
 -- The LATERAL is the compatibility path for a row whose columns are still
--- unset; after 015's backfill no such row exists. A block with neither is
+-- unset; after 016's backfill no such row exists. A block with neither is
 -- counted for no miner, as the inner join this replaced did.
 blocks AS (
     SELECT COALESCE(block.solver_miner_id, solver.miner_id) AS miner_id, count(*) AS blocks_found_total

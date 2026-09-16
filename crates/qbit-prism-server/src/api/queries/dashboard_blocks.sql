@@ -38,10 +38,10 @@ rows AS (
         COALESCE(bundle.found_block_coinbase_value_sats::text, bundle.audit_bundle#>>'{found_block,coinbase_value_sats}') AS audit_coinbase_value_sats,
         bundle.audit_bundle_sha256,
         -- Solver attribution is a column of the block row since #144: written
-        -- at landing and backfilled by migration 015, so it survives the
+        -- at landing and backfilled by migration 016, so it survives the
         -- detach of the partition that held the solving share. The LATERAL is
         -- the compatibility path for a row whose columns are still unset (a
-        -- block inserted around the landing path); after 015's backfill no
+        -- block inserted around the landing path); after 016's backfill no
         -- such row exists, and the join is not executed for any row that
         -- carries `solver_share_id`.
         COALESCE(block.solver_miner_id, solver.miner_id) AS solver_recipient_id,

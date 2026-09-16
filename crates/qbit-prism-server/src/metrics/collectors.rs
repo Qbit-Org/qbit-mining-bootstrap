@@ -30,11 +30,11 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:
 /// every row the offer lifecycle (migration 011) has not finished, pending
-/// and offered-but-not-landed alike, and the attached share ledger partition
-/// headroom the maintenance task keeps ahead of the sequence (#144). Both are
-/// catalog-sized reads: no share-table scan, candidate JSON decode, or
-/// accounting lock. They share one snapshot, so a failure of either leaves
-/// every sample of this collector unknown rather than half fresh.
+/// and offered-but-not-landed alike, using `CandidateState::UNFINISHED_SQL`
+/// so terminal submitted, abandoned and orphaned rows are excluded. The same
+/// snapshot reads attached share ledger partition headroom (#144). Both reads
+/// are catalog-sized: no share-table scan, candidate JSON decode, or accounting
+/// lock. A failure of either leaves every sample of this collector unknown.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
@@ -44,7 +44,7 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")
             .execute(&mut *tx).await?;
         let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
-            "SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered','reconciliation')"
+            &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {}", crate::ledger::CandidateState::UNFINISHED_SQL)
         ).fetch_one(&mut *tx).await?;
         let partition_lead_rows: Option<i64> = sqlx::query_scalar(
             "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"

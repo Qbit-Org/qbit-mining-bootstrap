@@ -1,9 +1,9 @@
--- Everything the share ledger partitioning (#144, migration 016) needs
+-- Everything the share ledger partitioning (#144, migration 017) needs
 -- before the table changes shape, applied inside the migration transaction.
 --
 -- 1. The two foreign keys onto qbit_share_ledger(share_id) go. A unique
 --    index on a partitioned table must include the partition key, so the
---    global share_id UNIQUE cannot survive 016, and no foreign key can
+--    global share_id UNIQUE cannot survive 017, and no foreign key can
 --    reference share_id afterwards. Both keys also pin every partition
 --    holding a referenced row: PostgreSQL re-validates inbound foreign keys
 --    at DETACH, and the outbox is never pruned, so one retained row would
@@ -29,7 +29,7 @@
 --    CHECK, a per-leaf UNIQUE (share_id) and the immutability trigger) and
 --    then attached, which takes only SHARE UPDATE EXCLUSIVE on the parent:
 --    appends and reads continue. qbit_prism_share_ledger_convert_prepare()
---    and qbit_prism_share_ledger_convert_swap() are the two halves of 016's
+--    and qbit_prism_share_ledger_convert_swap() are the two halves of 017's
 --    conversion, defined here so the online runner and the transactional
 --    path run the same code.
 --
@@ -249,7 +249,7 @@ $$;
 -- contiguous; with the width never changed they are the grid cells
 -- [k*rows, (k+1)*rows). Names are qbit_share_ledger_p<n> with n from
 -- qbit_prism_share_partition_next_number(); the release table converted by
--- 016 is qbit_share_ledger_p0 whatever its upper bound.
+-- 017 is qbit_share_ledger_p0 whatever its upper bound.
 CREATE FUNCTION qbit_prism_share_partition_ensure()
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE
@@ -282,7 +282,7 @@ BEGIN
 END;
 $$;
 
--- First half of the conversion (016). On the still-plain release table,
+-- First half of the conversion (017). On the still-plain release table,
 -- add CHECK (share_seq < bound) NOT VALID, where bound is the smallest
 -- partition grid boundary at least headroom rows above the next share_seq,
 -- and record it. Returns the bound. The constraint is enforced on new rows
@@ -372,7 +372,7 @@ BEGIN
 END;
 $$;
 
--- Second half of the conversion (016): one transaction of catalog work.
+-- Second half of the conversion (017): one transaction of catalog work.
 -- Requires the bound validated. Renames the release table and its indexes
 -- to their _p0 names, creates the partitioned parent LIKE it with the same
 -- constraint names, gives the parent the primary key and the four

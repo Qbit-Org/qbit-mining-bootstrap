@@ -1,6 +1,6 @@
 -- Convert qbit_share_ledger into a partitioned table, RANGE (share_seq),
 -- with the release table attached as its first partition (#144). The work
--- is the two functions migration 015 defined; this file is the order they
+-- is the two functions migration 016 defined; this file is the order they
 -- run in, and it is applied as written only where the ledger is empty (a
 -- fresh deployment, or an empty 2.x.x source under the cutover locks),
 -- inside the migration transaction. Existing native ledgers and populated

@@ -60,7 +60,8 @@ def summarize(lines):
             elif kind == "candidates":
                 pending += int(row["state"] == "pending")
                 # Unknown states must not make a drained-work check pass.
-                unfinished += int(row["state"] not in ("submitted", "abandoned"))
+                # `orphaned` (migration 015) is terminal and keeps its evidence.
+                unfinished += int(row["state"] not in ("submitted", "abandoned", "orphaned"))
         else:
             raise ValueError(f"unknown evidence kind: {kind}")
     if not complete:

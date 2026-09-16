@@ -64,6 +64,7 @@ impl Drop for ActiveSession {
 pub struct SessionId {
     id: u32,
     reservation: Option<(PgPool, String)>,
+    metrics: Option<std::sync::Arc<Metrics>>,
     _active: Option<ActiveSession>,
 }
 
@@ -77,7 +78,8 @@ impl SessionId {
     pub async fn release(mut self) -> Result<()> {
         if let Some((pool, token)) = &self.reservation {
             sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE extranonce1=$1 AND reservation_token=$2")
-                .bind(i64::from(self.id)).bind(token).execute(pool).await?;
+                .bind(i64::from(self.id)).bind(token)
+                .execute(&mut *time_pool_acquire(self.metrics.as_deref(), pool.acquire()).await?).await?;
             self.reservation = None;
         }
         Ok(())
@@ -90,6 +92,7 @@ impl From<u32> for SessionId {
         Self {
             id,
             reservation: None,
+            metrics: None,
             _active: None,
         }
     }
@@ -107,13 +110,18 @@ impl Drop for SessionId {
             return;
         };
         let id = self.id;
+        let metrics = self.metrics.take();
         // Shutdown/cancellation must not release somebody else's replacement.
         // A lost commit response or failed cleanup can retain a reservation;
         // this is safe, and stopped-owner reclamation handles normal shutdown.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE extranonce1=$1 AND reservation_token=$2")
-                    .bind(i64::from(id)).bind(token).execute(&pool).await {
+                let cleanup = async {
+                    sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE extranonce1=$1 AND reservation_token=$2")
+                        .bind(i64::from(id)).bind(token)
+                        .execute(&mut *time_pool_acquire(metrics.as_deref(), pool.acquire()).await?).await
+                }.await;
+                if let Err(error) = cleanup {
                     tracing::warn!(%error, "session reservation cleanup deferred");
                 }
             });
@@ -445,6 +453,7 @@ impl Ledger {
             let session = SessionId {
                 id,
                 reservation: Some((self.pool.clone(), token)),
+                metrics: self.metrics.clone(),
                 _active: Some(active),
             };
             tx.commit().await?;

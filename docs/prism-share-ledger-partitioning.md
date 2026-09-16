@@ -1,12 +1,12 @@
 # Share ledger partitioning and retention (design record, #144)
 
 This record resolves decision **D6** of #260 (retention and archival of
-shares and audit bodies) and specifies what migrations 015 and 016, the
+shares and audit bodies) and specifies what migrations 016 and 017, the
 `share-archive` operator command and the reader changes of #144 do. The
 first slice, the index trim (#153, migration 013), is recorded in
 [prism-ledger-ops.md](prism-ledger-ops.md#share-ledger-indexes). The
 migration mechanics are in
-[prism-rust-migration.md](prism-rust-migration.md#migration-016-the-share-ledger-partition-conversion-applied-online),
+[prism-rust-migration.md](prism-rust-migration.md#migration-017-the-share-ledger-partition-conversion-applied-online),
 the operator procedure in
 [prism-ledger-ops.md](prism-ledger-ops.md#share-ledger-partitions-and-retention).
 
@@ -166,13 +166,13 @@ duplicates across attached partitions; the native writers cannot create
 one.
 
 The two inbound foreign keys onto `share_id` (the 001 outbox key and the
-002 `qbit_prism_share_hashes` key) are dropped by 015: a foreign key onto a
+002 `qbit_prism_share_hashes` key) are dropped by 016: a foreign key onto a
 partitioned parent's non-key column cannot exist, and PostgreSQL
 re-validates inbound keys at DETACH, so a single retained outbox row would
 pin its block's partition forever. Rule from here on: **no object may
 carry a foreign key to `qbit_share_ledger`**.
 
-## The conversion (migration 016)
+## The conversion (migration 017)
 
 Shape 2 of the design spike, priced by prototype and measured again here:
 the release table is attached as the first partition, nothing is copied,
@@ -222,7 +222,7 @@ No revert script ships; recovery is the isolated-restore reconciliation of
 
 ## Every native reader, and the partition key
 
-| Reader | Predicate | After 016 |
+| Reader | Predicate | After 017 |
 | --- | --- | --- |
 | `Ledger::snapshot` cutoff, `max(share_seq)` | ordered walk | ordered append, newest leaf first, stops at the first row |
 | `Ledger::snapshot` page walk, `qbit_prism_window` pages, `qbit_audit_share_window` | `share_seq < cursor ORDER BY share_seq DESC LIMIT 4096` | pruned by the cursor; older leaves never executed |
@@ -231,7 +231,7 @@ No revert script ships; recovery is the isolated-restore reconciliation of
 | `dashboard_hashrate_rollups.sql` tail | `share_seq > watermark` | pruned; the boundary pass keeps its documented full index-only scan (a query change, not this one) |
 | replay comparison in `append_in`, block-only reconciliation probes, `share_accepted_at_ms` | `share_id = $1` | consult `qbit_prism_share_hashes` first, or carry `share_seq >= qbit_prism_share_probe_floor()`: at most three leaves |
 | `dashboard_leaderboard.sql`, `dashboard_pool_snapshot.sql`, `dashboard_miner_share_summary.sql`, `dashboard_miner_worker_rows.sql`, `dashboard_hashrate_series.sql` (raw fallback) | `accepted_at` range, 3 h to 24 h | one `accepted_recent_idx` / `miner_history_idx` descent per attached leaf, empty for every leaf outside the range: O(attached partitions) buffer reads per request, a few hundred at most with retention in place; shown not to need the key |
-| block solver lookups in blocks, leaderboard, reward leaderboard, pool snapshot | `lower(right(share_id, 64)) = block_hash` | no longer read the ledger: `qbit_pool_blocks.solver_*`, written at landing and backfilled by 015 |
+| block solver lookups in blocks, leaderboard, reward leaderboard, pool snapshot | `lower(right(share_id, 64)) = block_hash` | no longer read the ledger: `qbit_pool_blocks.solver_*`, written at landing and backfilled by 016 |
 | `latest_evidence` lifetime counts | none | served from the permanent rollup tables plus the raw tail above the watermark |
 | `tools.rs` latest miner | ordered walk | newest leaf |
 | `read_schema_ready.sql` | `to_regclass` | a partitioned parent resolves |
@@ -241,7 +241,7 @@ No revert script ships; recovery is the isolated-restore reconciliation of
 The design spike's nine Python consumers reconcile to these native ones:
 
 - **Block solver attribution** (four dashboard queries): moved onto
-  `qbit_pool_blocks` by 015 and written at landing. Unaffected by detach.
+  `qbit_pool_blocks` by 016 and written at landing. Unaffected by detach.
 - **`accepted_share_count` and `distinct_miner_count`** in
   `/audit/latest-evidence`: read from `qbit_hashrate_rollup_pool` and
   `qbit_hashrate_rollup_miner` at the daily grain plus the raw tail, which
@@ -345,7 +345,7 @@ laptop, a synthetic ledger of 1,000,000 production-shaped rows, 1,000 MB
 with its indexes, `VACUUM (ANALYZE)` before each read; 2,000 single-row
 inserts timed from PL/pgSQL with `clock_timestamp()`):
 
-| Measurement | Before 016 | After 016 | Notes |
+| Measurement | Before 017 | After 017 | Notes |
 | --- | ---: | ---: | --- |
 | prepare (bound `NOT VALID`) | | 2.3 ms | catalog only |
 | validate (one scan) | | 47 ms | SHARE UPDATE EXCLUSIVE; scales with heap size, about 300 MB here |
@@ -359,7 +359,7 @@ They are lock-semantics and phase-shape evidence, not production
 absolutes. The production run of the same measurements
 (insert latency percentiles from `/metrics`, `VACUUM (VERBOSE)` duration,
 `pg_stat_user_indexes` sizes, the page-walk `EXPLAIN`) before and after
-016 on a production-sized copy is acceptance criterion 4 of #144 and is
+017 on a production-sized copy is acceptance criterion 4 of #144 and is
 listed as a runbook in the operations guide; it needs production access
 and is left to the operator.
 
@@ -370,7 +370,7 @@ and is left to the operator.
   authority).
 - Dropping `accepted_block_suffix_idx` once production confirms every
   block carries its solver columns (its only readers were the four
-  queries 015 rewrote).
+  queries 016 rewrote).
 - An anchor-to-archive index for `/audit/share-window`.
 - Bounding the dashboard `accepted_at` scans by `share_seq` from the
   catalog (`accepted_at` is monotone in `share_seq` for native rows).

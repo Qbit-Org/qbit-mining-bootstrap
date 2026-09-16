@@ -138,3 +138,18 @@ async fn refresh_observation_rpc_count_is_independent_of_client_submit_count() {
         assert_eq!(fixture.store.records.lock().unwrap().len(), clients);
     }
 }
+
+#[tokio::test]
+async fn only_an_observation_newer_than_a_pass_supersedes_its_tip() {
+    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    fixture.detect(1).await;
+    let state = fixture.coordinator.observed_tip.read().await;
+    // A pass whose chain view postdates the observation is never superseded
+    // by it, whatever tip it read. One that predates the observation is,
+    // unless the observation names the pass tip.
+    let later = tokio::time::Instant::now() + Duration::from_secs(1);
+    let earlier = tokio::time::Instant::now() - Duration::from_secs(1);
+    assert!(!state.superseded_since(&hash(2), later));
+    assert!(state.superseded_since(&hash(2), earlier));
+    assert!(!state.superseded_since(&hash(1), earlier));
+}

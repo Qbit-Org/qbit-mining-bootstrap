@@ -55,11 +55,11 @@ carries a banner with the same statement.
   resolves for any workspace crate, and CI runs it in the Rust tests job that
   the merge gate requires.
 - #144: the share ledger is partitioned and has a retention path. Migration
-  015 drops the two foreign keys onto `qbit_share_ledger(share_id)`, adds the
+  016 drops the two foreign keys onto `qbit_share_ledger(share_id)`, adds the
   partition catalog (`qbit_prism_share_partitioning`,
   `qbit_prism_share_partitions`) and its maintenance functions, and moves
   block solver attribution onto `qbit_pool_blocks.solver_*`, backfilled for
-  existing blocks. Migration 016 converts `qbit_share_ledger` into a
+  existing blocks. Migration 017 converts `qbit_share_ledger` into a
   `RANGE (share_seq)` partitioned table by attaching the release table as its
   first partition behind a validated bound, so nothing is copied and no index
   is rebuilt; it is applied inside the migration transaction on an empty

@@ -24,10 +24,10 @@ latest_block AS (
         block.payout_manifest_sha256,
         bundle.audit_bundle_sha256,
         -- Solver attribution is a column of the block row since #144: written
-        -- at landing and backfilled by migration 015, so the latest block
+        -- at landing and backfilled by migration 016, so the latest block
         -- keeps its solver after the partition holding the solving share is
         -- detached. The LATERAL is the compatibility path for a row whose
-        -- columns are still unset; after 015's backfill no such row exists.
+        -- columns are still unset; after 016's backfill no such row exists.
         COALESCE(block.solver_miner_id, solver.miner_id) AS solver_recipient_id,
         COALESCE(block.solver_share_id, solver.share_id) AS solver_share_id
     FROM latest_block_row block

@@ -44,6 +44,22 @@ pub(crate) async fn time_pool_acquire<T>(
 mod tests;
 
 impl Metrics {
+    pub(crate) fn record_ctv_tip_refresh_yield(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::CtvTipRefreshYields, Labels::Empty);
+    }
+
+    pub(crate) fn observe_ctv_chunk(&self, elapsed: Duration) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.observe(Family::CtvChunkRows, Labels::Empty, 1.);
+        registry.observe(
+            Family::CtvChunkSeconds,
+            Labels::Empty,
+            elapsed.as_secs_f64(),
+        );
+    }
     pub fn observe_share_ack(&self, result: AckResult, elapsed: Duration) {
         self.observe(
             Family::ShareAck,
@@ -65,6 +81,15 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .increment(Family::LateConfirmed, vec![]);
+    }
+    /// Record one offered candidate settled as a proven orphan (#415), once
+    /// the ledger committed the terminal disposition. Attributed to the
+    /// settlement event, never to an observation that failed to settle.
+    pub fn record_candidate_orphaned(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::CandidatesOrphaned, vec![]);
     }
     pub fn record_rejection(&self, reason: RejectReason) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());

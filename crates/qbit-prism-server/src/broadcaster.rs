@@ -20,6 +20,8 @@ pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bo
 }
 
 pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
+    // Tip observations recorded from here on can supersede this chain view.
+    let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.
     let chain = crate::readiness::chain_info(
         &coordinator.rpc,
@@ -40,22 +42,42 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
         )
         .await?;
     let limit = config::number("PRISM_CTV_BROADCASTER_LIMIT", 100usize)?.min(1000);
+    let pass_tip = chain["bestblockhash"]
+        .as_str()
+        .context("chain tip missing")?;
     let mut count = 0;
     for _ in 0..limit {
+        // A native chunk is one claimed fanout. Never interrupt its durable
+        // completion, but leave subsequent rows claimable by a later pass.
+        // Compare hashes, not poll sequence numbers: same-tip polls must not
+        // starve settlement. Also yield to a tip observed after this pass
+        // began that differs from the pass tip, such as a replacement that
+        // already published. An observation older than the pass never yields:
+        // waiting for a blocked or absent refresh to catch up has no budget.
+        // A replacement that keeps failing to publish holds settlement only
+        // for its build budget; the pass-tip check ends with the pass.
+        let tip = coordinator.observed_tip.read().await;
+        let superseded = tip.superseded_since(pass_tip, pass_started);
+        if tip.refresh_pending(coordinator.config.template_refresh_failure_exit) || superseded {
+            coordinator.metrics.record_ctv_tip_refresh_yield();
+            break;
+        }
+        drop(tip);
         let Some(claim) = coordinator.ledger.claim_fanout(120).await? else {
             break;
         };
+        let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(90),
             process(coordinator, &claim),
         )
         .await;
-        match outcome {
+        let finished = match outcome {
             Ok(Ok((status, result))) => {
                 coordinator
                     .ledger
                     .finish_fanout(&claim, status, Some(result), None)
-                    .await?
+                    .await
             }
             result => {
                 let error = match result {
@@ -70,9 +92,13 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
                     tracing::warn!(%finish,"CTV claim completion deferred");
                 }
                 tracing::warn!(%error,fanout=%claim.fanout_txid,"CTV broadcast deferred");
+                Ok(())
             }
-        }
+        };
+        // The chunk was attempted whether or not its completion persisted.
         count += 1;
+        coordinator.metrics.observe_ctv_chunk(started.elapsed());
+        finished?;
         tokio::task::yield_now().await;
     }
     Ok(count)

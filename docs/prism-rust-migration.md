@@ -96,18 +96,59 @@ hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
 transaction, including carry-forward summary repair, except migrations 013 and
-016. Migration 013, the share ledger index trim, builds its indexes after the
+017. Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
 ([below](#migration-013-the-share-ledger-index-trim-applied-online)).
-Migration 016, the share ledger partition conversion, validates its bound and
+Migration 017, the share ledger partition conversion, validates its bound and
 swaps the table after the commit on a dedicated connection
-([below](#migration-016-the-share-ledger-partition-conversion-applied-online)).
+([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
 Both are applied inside the migration transaction where the ledger is empty,
 under the cutover locks that exclude writers, and each records its version only
 after its last change. The migration is
 idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
+
+### Two drains, one for each era
+
+**Legacy rows and native rows have different drains.** Every `2.x.x` candidate
+must be drained with the pinned legacy image *before* migrating, as in step 1
+above and in [the drain requirement](#supported-2xx-source-schemas); the
+migrator refuses while any remains. The native `qbit-prism-server candidates`
+commands act on native-era rows only — they cannot read a chunked v2 body or a
+pre-migration v1 document, and running them neither satisfies nor bypasses the
+migrator's drain check.
+
+Use them after the cutover, on rows this release wrote:
+
+```sh
+qbit-prism-server candidates list
+qbit-prism-server candidates abandon --block-hash <hash> --reason "<nonblank explanation>"
+qbit-prism-server candidates recover --block-hash <hash> [--block-hash <hash> ...] [--apply]
+```
+
+`candidates list` exits zero on an empty list, so it is the check a `set -e`
+runbook waits on before stopping native frontends; `candidates abandon` applies
+to a `pending` row only and refuses everything the node may already have been
+offered. `candidates recover` lands a native-era block the node has already
+accepted, under an explicit allowlist, and never offers one; like the other
+two it cannot read a chunked v2 body or a pre-migration v1 document (exit 7
+and exit 8, evidence preserved), so it neither satisfies nor bypasses the
+migrator's drain check. All three are documented in full under
+[Candidate commands](prism-ledger-ops.md#candidate-commands). A pre-migration
+row reaching a native frontend is parked by the claim lane with a `last_error`
+naming its `storage_version`; `candidates list` shows it, but the answer is
+still the legacy drain, with the pinned `2.x.x` image, never an operator
+abandon.
+
+That rule is enforced, not only documented. A `2.x.x` v1 document is parked at
+`storage_version = 1`, the same version the native writer uses, so `abandon`
+tests the document rather than the version: it changes a row only when the
+`candidate` carries `payout_revision` and `block_hash` beside an inline
+`bundle` or a `window` reference — the predicate
+`refuse_undrained_outbox` classifies native rows with, above. A legacy document
+is refused atomically with exit 8 and keeps every column, so an operator
+sweeping a stalled outbox cannot delete the evidence this drain still needs.
 
 ### Supported 2.x.x source schemas
 
@@ -129,7 +170,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
-| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `016_share_ledger_partitions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `017_share_ledger_partitions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 Migration requires visible `qbit_` relations and functions to resolve in
@@ -210,7 +251,7 @@ for instance, or the outbox's `storage_version` there (the release 002
 added it; on a pre-#258 source 006 adds it, so it is reserved), stays
 governed by the release checks.
 
-Migration 016 reserves a family of names rather than a list. The partitions of
+Migration 017 reserves a family of names rather than a list. The partitions of
 the share ledger are named `qbit_share_ledger_p<n>` in creation order, and their
 indexes take that name as a prefix, so any relation in the ledger's schema
 matching `qbit_share_ledger_p<n>` or `qbit_share_ledger_p<n>_<suffix>` is
@@ -487,19 +528,31 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 16,
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 18,
 each checked on its own rather than as a high-water mark: a later migration
 being present never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
 quarantines previously attempted candidates for reconciliation without
 another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
-for the quiesce and recovery steps. 013 is recorded only once its online
+for the quiesce and recovery steps. Stop all frontends again before applying
+015 and restart only upgraded binaries; its capability gate runs at connect
+and does not evict older processes already serving the database. Keep automatic
+restarts disabled throughout the cutover. 013 is recorded only once its online
 index builds have completed, so a start after an interrupted build is
-refused until `migrate` finishes them. 016 is recorded the same way and for
+refused until `migrate` finishes them. 017 is recorded the same way and for
 the same reason: it is recorded only after the swap has made the release table
 the first partition of the partitioned parent, so a start after an interrupted
 validation or an interrupted swap is refused until `migrate` has resumed and
-finished the conversion. A database missing any of them is refused
+finished the conversion. Migration 018 adds the durable chain epoch
+and declares `chain_observation_epoch = 1`. Apply 018 only after stopping every old frontend,
+one-shot writer and paused startup, with restarts disabled, then start only
+epoch-aware binaries. The registered-instance shutdown check does not evict a
+connected writer or discover an unregistered old tool. See the
+[offline epoch upgrade contract](prism-ledger-ops.md#chain-observation-epoch-upgrade-018).
+The capability refuses older binaries at subsequent connects; deleting it or
+resetting the epoch is not a supported downgrade. A preexisting undeclared
+epoch column or capability causes migration refusal and transaction rollback.
+A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
 capability or a runtime `candidate_storage_version` other than 1. A native
@@ -622,17 +675,17 @@ relying on a starting frontend, whose readiness stays down until the build
 completes. Then run `ANALYZE qbit_share_ledger` and take the measurements the
 inventory lists before scheduling #144.
 
-### Migration 015: the partition catalog and solver attribution
+### Migration 016: the partition catalog and solver attribution
 
-Migration 015 (#144) is everything the partition conversion needs before the
-table changes shape, and it is transactional: 016's SQL is the functions 015
-installs, so 015 must have committed before the online runner starts. It does
+Migration 016 (#144) is everything the partition conversion needs before the
+table changes shape, and it is transactional: 017's SQL is the functions 016
+installs, so 016 must have committed before the online runner starts. It does
 four things.
 
 It drops the two foreign keys onto `qbit_share_ledger(share_id)`, the 001
 outbox key and the 002 `qbit_prism_share_hashes` key. A unique index on a
 partitioned table must include the partition key, so the global
-`UNIQUE (share_id)` cannot survive 016 and nothing can reference `share_id`
+`UNIQUE (share_id)` cannot survive 017 and nothing can reference `share_id`
 afterwards. Both keys would also pin partitions: PostgreSQL re-validates
 inbound foreign keys at DETACH, and the outbox is never pruned, so a single
 retained outbox row would pin the partition holding its block's solving share
@@ -669,9 +722,9 @@ from now on, and read by the queries. The backfill is one
 the lookup those queries performed on every request, so its cost is
 proportional to the pool's block count and not to the share count.
 
-### Migration 016: the share ledger partition conversion, applied online
+### Migration 017: the share ledger partition conversion, applied online
 
-Migration 016 (#144) converts `qbit_share_ledger` into a partitioned table,
+Migration 017 (#144) converts `qbit_share_ledger` into a partitioned table,
 `RANGE (share_seq)`, with the release table attached as its first partition.
 Nothing is copied and no index is rebuilt: with a validated
 `CHECK (share_seq < bound)` on the release table, `ATTACH PARTITION` proves the

@@ -23,10 +23,11 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013 and 016 online (`ONLINE_MIGRATIONS`) and record each
+/// ledgers apply 013 and 017 online (`ONLINE_MIGRATIONS`) and record each
 /// after its last change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] =
+    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -54,6 +55,17 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     ("candidate_offer_lifecycle", 1),
     // 012: startup proves support again in its initial heartbeat.
     ("instance_offer_startup", 1),
+    // 015: the terminal `orphaned` disposition of a proven orphan (#415). A
+    // binary without this entry has no name for the state and refuses the
+    // migrated database in a capability check made after 015 committed.
+    // Nothing evicts one that is already running or already past that
+    // check, so 015 is applied only once every earlier instance has
+    // reported shutdown, and old frontends must stay stopped until it has
+    // committed.
+    ("candidate_orphan_disposition", 1),
+    // 018: every accepted chain update advances a durable epoch. Older
+    // writers must be stopped before migration, not just refused at restart.
+    ("chain_observation_epoch", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -580,7 +592,17 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}, then start or migrate again");
+        let orphan_remedy = if versions.contains(&15) {
+            " and restore the candidate_orphan_disposition = 1 declaration from migrations/015_candidate_orphan_disposition.sql after verifying its three lifecycle CHECK constraints on qbit_block_candidate_outbox are present"
+        } else {
+            ""
+        };
+        let epoch_remedy = if versions.contains(&18) {
+            " and restore chain_observation_epoch = 1 from migrations/018_chain_observation_epoch.sql only after restoring the original durable chain_epoch; never reset the epoch or resume an older writer"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -601,6 +623,18 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
             "database is at schema migration 12 but does not declare instance_offer_startup = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 012's startup constraint and capability; nothing was changed"
         );
     }
+    if versions.contains(&15) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "candidate_orphan_disposition" && *value == 1),
+            "database is at schema migration 15 but does not declare candidate_orphan_disposition = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 015's lifecycle constraints and capability; nothing was changed"
+        );
+    }
+    if versions.contains(&18) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "chain_observation_epoch" && *value == 1),
+            "database is at schema migration 18 but does not declare chain_observation_epoch = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup including its durable chain_epoch and migration 018 capability; never reset the epoch or resume an older writer; nothing was changed"
+        );
+    }
     Ok(())
 }
 
@@ -616,7 +650,12 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
     // restored selectively; it is not read as a pre-006 database, which
     // would let 006 declare a storage version above an outbox 011 already
     // owns without the lifecycle declaration being checked first.
-    if !versions.contains(&6) && !versions.contains(&11) && !versions.contains(&12) {
+    if !versions.contains(&6)
+        && !versions.contains(&11)
+        && !versions.contains(&12)
+        && !versions.contains(&15)
+        && !versions.contains(&18)
+    {
         return Ok(());
     }
     if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref(), versions)
@@ -1316,7 +1355,7 @@ async fn fingerprint_schema(
     // Every other relation that holds a name: the constraint-backed indexes
     // the index reading left out, and the kinds no map above models. A
     // partitioned table is a table and a partitioned index an index above,
-    // as their partitions are (016 partitions the share ledger). TOAST
+    // as their partitions are (017 partitions the share ledger). TOAST
     // tables live in pg_toast and never here.
     let rows = sqlx::query("SELECT c.relname::text AS name,c.relkind::text AS kind,(SELECT t.relname::text FROM pg_index x JOIN pg_class t ON t.oid=x.indrelid WHERE x.indexrelid=c.oid) AS table_name,(SELECT k.conname::text FROM pg_constraint k WHERE k.conindid=c.oid AND k.contype IN ('p','u','x') ORDER BY k.conname LIMIT 1) AS constraint_name FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('i','I','v','m','f','c') ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
@@ -2081,11 +2120,19 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
     ),
     (
         15,
-        include_str!("../../migrations/015_share_ledger_partition_catalog.sql"),
+        include_str!("../../migrations/015_candidate_orphan_disposition.sql"),
     ),
     (
         16,
-        include_str!("../../migrations/016_share_ledger_partitions.sql"),
+        include_str!("../../migrations/016_share_ledger_partition_catalog.sql"),
+    ),
+    (
+        17,
+        include_str!("../../migrations/017_share_ledger_partitions.sql"),
+    ),
+    (
+        18,
+        include_str!("../../migrations/018_chain_observation_epoch.sql"),
     ),
 ];
 
@@ -2095,7 +2142,7 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// nothing else, and reaches the source statement by statement with
 /// `CONCURRENTLY` (see `online.rs`): `CREATE INDEX CONCURRENTLY` cannot run
 /// in a transaction block, and a plain `CREATE INDEX` on the share ledger
-/// would hold every append for the whole build. 016 converts the share
+/// would hold every append for the whole build. 017 converts the share
 /// ledger into a partitioned table (see `partition.rs`): its validation
 /// scan runs for hours on a large ledger and its swap must take the table
 /// lock with a short timeout and retries, neither of which the migration
@@ -2103,10 +2150,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// the database until it has completed. Fresh and empty 2.x.x sources apply
 /// these inside the transaction while holding the cutover locks that
 /// exclude writers. A later transactional migration must not depend on an
-/// online one's objects: within one run it is applied first. 016 depends on
-/// 013's indexes and on 015's functions; 013 is applied before it by
-/// version order, and 015 is transactional.
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 16];
+/// online one's objects: within one run it is applied first. 017 depends on
+/// 013's indexes and on 016's functions; 013 is applied before it by
+/// version order, and 016 is transactional.
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17];
 
 /// The online migration a version declares, from the scratch apply's
 /// before and after readings.
@@ -2119,7 +2166,7 @@ fn derive_online(
         13 => Ok(OnlineMigration::Indexes(online::derive(
             version, before, after,
         )?)),
-        16 => Ok(OnlineMigration::Partitions(partition::derive(
+        17 => Ok(OnlineMigration::Partitions(partition::derive(
             version, before, after,
         )?)),
         _ => bail!("migration {version} is listed in ONLINE_MIGRATIONS but has no online runner"),
@@ -3018,14 +3065,46 @@ pub(super) async fn migrate_schema(
             .await?;
     }
     if !versions.contains(&15) {
-        // The partition catalog, the conversion functions 016 calls, the
-        // two inbound foreign keys onto share_id, and solver attribution on
-        // qbit_pool_blocks; 016 depends on all of it, so it comes before
-        // the online loop below whichever path 016 takes.
+        // 015 (#415) replaces 011's lifecycle rules under their own names to
+        // admit the terminal `orphaned` disposition, so it runs above 011
+        // and 012, which the blocks above have applied or found recorded.
+        // The capability it declares is read at connect only: it refuses a
+        // pre-015 binary whose check runs after the commit and does nothing
+        // to one already running, or to a startup already past its check,
+        // either of which could meet an orphaned row it has no name for. So
+        // 015 takes the same shutdown proof 011 and 012 take, before its SQL
+        // locks the outbox (bounded by the session's lock_timeout) and
+        // replaces the rules; old frontends must stay stopped until the
+        // commit. The instance lock is kept until the commit.
+        refuse_unquiesced_instances(tx, 15).await?;
         sqlx::raw_sql(native_migration(15))
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(15)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&16) {
+        // The partition catalog, the conversion functions 017 calls, the
+        // two inbound foreign keys onto share_id, and solver attribution on
+        // qbit_pool_blocks; 017 depends on all of it, so it comes before
+        // the online loop below whichever path 017 takes.
+        sqlx::raw_sql(native_migration(16))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(16)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&18) {
+        // A capability only refuses future connects. All old frontends,
+        // tools, paused startups and automatic restarts must already be
+        // stopped; the instance registration lock remains held until COMMIT.
+        refuse_unquiesced_instances(tx, 18).await?;
+        sqlx::raw_sql(native_migration(18))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(18)")
             .execute(&mut **tx)
             .await?;
     }
@@ -3197,7 +3276,17 @@ where
             .await?;
     let rows = read_capabilities(&mut *connection).await?;
     require_declared_capabilities(rows.as_deref(), &versions)?;
-    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)
+    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)?;
+    if versions.contains(&18) {
+        let epoch: i64 = sqlx::query_scalar("SELECT chain_epoch FROM qbit_prism_cluster WHERE singleton")
+            .fetch_one(&mut *connection).await
+            .context("migration 018 chain_epoch metadata is missing or unreadable; restore the full backup, never reset the epoch")?;
+        ensure!(
+            epoch >= 0,
+            "migration 018 chain_epoch is negative; restore the full backup"
+        );
+    }
+    Ok(())
 }
 
 async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSource>>
@@ -5104,6 +5193,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains("candidate_offer_lifecycle"), "{error}");
+    }
+
+    #[test]
+    fn a_database_at_15_names_the_orphan_disposition_in_its_capability_remedies() {
+        let at_15 = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let declared = [
+            ("candidate_storage_version", 1),
+            ("candidate_offer_lifecycle", 1),
+            ("instance_offer_startup", 1),
+        ];
+        let error = declared_at(&declared, at_15).unwrap_err().to_string();
+        assert!(
+            error.starts_with("database is at schema migration 15 but does not declare candidate_orphan_disposition = 1"),
+            "{error}"
+        );
+        let mut all = declared.to_vec();
+        all.push(("candidate_orphan_disposition", 1));
+        declared_at(&all, at_15).unwrap();
+        // A dropped table held 015's declaration too: the one refusal names
+        // it beside 006's, 011's and 012's, and names it only once 15 is
+        // recorded.
+        let error = require_declared_capabilities(None, at_15)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("006_source_schema.sql")
+                && error.contains("VALUES('candidate_offer_lifecycle',1)")
+                && error.contains("012_offer_startup_fence.sql")
+                && error.contains("candidate_orphan_disposition = 1")
+                && error.contains("015_candidate_orphan_disposition.sql")
+                && error.ends_with("then start or migrate again"),
+            "{error}"
+        );
+        let before_15: Vec<i32> = at_15.iter().copied().filter(|v| *v != 15).collect();
+        let error = require_declared_capabilities(None, &before_15)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("candidate_orphan_disposition"), "{error}");
+        // A record with 15 alone of the declaring migrations was restored
+        // selectively: the pre-DDL fence still checks it.
+        let inventory = SourceInventory {
+            share_ledger: true,
+            outbox: true,
+            present: vec![false; OBJECTS_002.len()],
+            capabilities: None,
+        };
+        let error = refuse_undeclared_native_database(&[2, 3, 4, 5, 15], &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("has no qbit_prism_schema_capabilities")
+                && error.contains("015_candidate_orphan_disposition.sql"),
+            "{error}"
+        );
     }
 
     #[test]

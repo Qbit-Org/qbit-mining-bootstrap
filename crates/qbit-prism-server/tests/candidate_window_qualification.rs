@@ -272,6 +272,7 @@ fn frontend_config(database_url: &str, node: &FakeNode, instance_id: &str) -> Re
         share_commit_timeout: SHARE_COMMIT_TIMEOUT,
         share_commit_grace: Duration::from_secs(5),
         block_only_ack_timeout: Duration::from_secs(60),
+        candidate_orphan_confirmations: 6,
         extranonce2_size: EXTRANONCE2_SIZE,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),

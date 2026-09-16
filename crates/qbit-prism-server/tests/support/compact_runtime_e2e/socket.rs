@@ -16,6 +16,8 @@ use tokio::{
 
 pub struct Listener {
     pub address: SocketAddr,
+    #[allow(dead_code)]
+    pub stats: Arc<qbit_prism_server::stratum::StratumStats>,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
 }
@@ -35,6 +37,7 @@ impl Listener {
             stale_grace_seconds: 0.0,
             ..Default::default()
         };
+        let stats = config.stats.clone();
         let task = tokio::spawn(run_listener(
             listener,
             config,
@@ -45,6 +48,7 @@ impl Listener {
         ));
         Ok(Self {
             address,
+            stats,
             shutdown,
             task,
         })
@@ -88,7 +92,7 @@ impl Client {
             .await?;
         Ok(())
     }
-    async fn read(&mut self) -> Result<Value> {
+    pub async fn read(&mut self) -> Result<Value> {
         let mut line = String::new();
         ensure!(
             timeout(Duration::from_secs(5), self.reader.read_line(&mut line)).await?? > 0,
