@@ -1410,15 +1410,16 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
 // archive
 // ---------------------------------------------------------------------------
 
-/// Write `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and
+/// Write `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and
 /// `manifest.json`, and record the location, the digests and the row count.
 ///
 /// Only a partition the share sequence has passed is archived: below that,
 /// appends can still land in it and the archive would be incomplete the moment
-/// one did. Both files are written to temp names and renamed into place, so a
-/// reader never sees a partial archive and a failed run leaves none. An existing
-/// archive is overwritten only with `--force`, and only after the replacement
-/// manifest exists on disk. The catalog is updated once, after both renames,
+/// one did. Both files are written to temp names and promoted into a new
+/// version directory. Previous versions are retained, so a failure before
+/// recording leaves the catalog's existing copy of record intact. Replacing
+/// the recorded version requires `--force`. The catalog is updated once,
+/// after both renames and their directory entries are durable,
 /// and the previous verification is cleared with it: a new archive has not
 /// been verified. Every later archive chains to the replaced manifest's digest,
 /// so their verifications are cleared too and each has to be written again in
@@ -1541,7 +1542,12 @@ pub async fn archive(
     manifest_file.write_all(&manifest_bytes)?;
     manifest_file.sync_all()?;
     drop(manifest_file);
-    // Both replacements exist before either destination is overwritten.
+    // A unique version directory keeps the prior copy of record untouched
+    // even if promotion, directory syncing, or the catalog commit fails.
+    // Refuse an existing directory rather than overwriting any of its files.
+    let directory = directory.join(&manifest_sha256);
+    std::fs::create_dir(&directory)
+        .with_context(|| format!("creating archive version {}", directory.display()))?;
     let rows_path = directory.join("rows.ndjson.gz");
     let manifest_path = directory.join("manifest.json");
     rows_temp.promote(&rows_path)?;
@@ -1604,6 +1610,16 @@ pub async fn archive(
 /// Where an archive is: the layout under `--dir`, or, when that is not there,
 /// the path the catalog recorded when it was written.
 fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
+    if let Some(digest) = &record.archive_manifest_sha256 {
+        let version = partition_dir(root, &record.partition_name)
+            .join(digest)
+            .join("manifest.json");
+        if version.exists() {
+            return Ok(version);
+        }
+    }
+    // Existing v1 archives and copies made in the original layout remain
+    // readable; verify still checks their digest against the catalog.
     let layout = partition_dir(root, &record.partition_name).join("manifest.json");
     if layout.exists() {
         return Ok(layout);

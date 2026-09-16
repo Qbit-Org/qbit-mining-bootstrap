@@ -30,7 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 const P0: &str = "qbit_share_ledger_p0";
@@ -342,8 +342,13 @@ struct ArchiveOnDisk {
     lines: Vec<String>,
 }
 
-fn read_archive(root: &Path, partition: &str) -> Result<ArchiveOnDisk> {
-    let directory = root.join("qbit_share_ledger").join(partition);
+async fn read_archive(ledger: &Ledger, partition: &str) -> Result<ArchiveOnDisk> {
+    let path = PathBuf::from(
+        catalog(&ledger.pool, partition)
+            .await?
+            .try_get::<String, _>("archive_uri")?,
+    );
+    let directory = path.parent().context("archive has no directory")?;
     let manifest_bytes = std::fs::read(directory.join("manifest.json"))?;
     let manifest: archive::ArchiveManifest = serde_json::from_slice(&manifest_bytes)?;
     let gz = std::fs::read(directory.join("rows.ndjson.gz"))?;
@@ -415,7 +420,7 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
 
         let written =
             archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
-        let disk = read_archive(root.path(), P0)?;
+        let disk = read_archive(&ledger, P0).await?;
         ensure!(
             disk.manifest.schema == archive::ARCHIVE_SCHEMA_V1,
             "unexpected archive schema {}",
@@ -555,7 +560,7 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         // The chain: the second archive links to the first by manifest digest
         // and starts exactly where it ended.
         archive::archive(&ledger, P1, root.path(), false, "operator-a").await?;
-        let next = read_archive(root.path(), P1)?;
+        let next = read_archive(&ledger, P1).await?;
         ensure!(
             next.manifest.previous_manifest_sha256 == Some(disk.manifest_sha256.clone())
                 && next.manifest.previous_upper_seq == Some(p0_upper)
@@ -622,8 +627,8 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         // Written again in order, the chain is whole again.
         archive::archive(&ledger, P1, root.path(), true, "operator-a").await?;
         ensure!(
-            read_archive(root.path(), P1)?.manifest.previous_manifest_sha256
-                == Some(read_archive(root.path(), P0)?.manifest_sha256),
+            read_archive(&ledger, P1).await?.manifest.previous_manifest_sha256
+                == Some(read_archive(&ledger, P0).await?.manifest_sha256),
             "the second archive was not relinked to the rewritten first"
         );
         archive::verify(&ledger, P1, root.path()).await?;
@@ -653,7 +658,8 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         );
 
         // Tamper: one byte of the compressed file.
-        let rows_path = root.path().join("qbit_share_ledger").join(P0).join("rows.ndjson.gz");
+        let manifest_path = PathBuf::from(catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?);
+        let rows_path = manifest_path.parent().unwrap().join("rows.ndjson.gz");
         let mut bytes = std::fs::read(&rows_path)?;
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0x40;
@@ -1150,7 +1156,12 @@ async fn archive_requires_durable_parent_directories_before_recording() -> Resul
         ensure!(error.contains("syncing archive directory"), "{error}");
         let directory = root.join("qbit_share_ledger").join(P0);
         ensure!(
-            directory.join("manifest.json").is_file() && directory.join("rows.ndjson.gz").is_file(),
+            std::fs::read_dir(&directory)?
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.path().join("manifest.json").is_file()
+                        && entry.path().join("rows.ndjson.gz").is_file()
+                }),
             "the failure did not follow both file promotions"
         );
         let row = catalog(&ledger.pool, P0).await?;
@@ -1169,6 +1180,70 @@ async fn archive_requires_durable_parent_directories_before_recording() -> Resul
         Ok(ledger)
     }
     .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_forced_archive_preserves_the_recorded_files() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("archive-version-a").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        archive::seal(&ledger, P0).await?;
+        let before = catalog(&ledger.pool, P0).await?;
+        let original = PathBuf::from(before.try_get::<String, _>("archive_uri")?);
+        let original_rows = original.parent().unwrap().join("rows.ndjson.gz");
+        let manifest_bytes = std::fs::read(&original)?;
+        let rows_bytes = std::fs::read(&original_rows)?;
+        sqlx::raw_sql("CREATE FUNCTION refuse_archive_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected archive catalog failure'; END $$; CREATE TRIGGER refuse_archive_record BEFORE UPDATE OF archive_uri ON qbit_prism_share_partitions FOR EACH ROW EXECUTE FUNCTION refuse_archive_record()")
+            .execute(&ledger.pool).await?;
+        let error = archive::archive(&ledger, P0, root.path(), true, "operator-b")
+            .await.expect_err("the catalog failure did not stop archive recording").to_string();
+        ensure!(error.contains("injected archive catalog failure"), "{error}");
+        ensure!(std::fs::read(&original)? == manifest_bytes
+            && std::fs::read(&original_rows)? == rows_bytes,
+            "a failed forced archive replaced the verified files");
+        let after = catalog(&ledger.pool, P0).await?;
+        for field in ["archive_uri", "archive_manifest_sha256"] {
+            ensure!(before.try_get::<String, _>(field)? == after.try_get::<String, _>(field)?,
+                "failed rewrite changed {field}");
+        }
+        ensure!(before.try_get::<chrono::DateTime<chrono::Utc>, _>("archive_verified_at")?
+            == after.try_get::<chrono::DateTime<chrono::Utc>, _>("archive_verified_at")?,
+            "failed rewrite changed verification");
+        archive::verify(&ledger, P0, root.path()).await?;
+        sqlx::raw_sql("DROP TRIGGER refuse_archive_record ON qbit_prism_share_partitions; DROP FUNCTION refuse_archive_record()")
+            .execute(&ledger.pool).await?;
+        let replacement = archive::archive(&ledger, P0, root.path(), true, "operator-b").await?;
+        let replacement = PathBuf::from(replacement["archive_uri"].as_str().unwrap());
+        ensure!(replacement != original && std::fs::read(&original)? == manifest_bytes
+            && std::fs::read(&original_rows)? == rows_bytes,
+            "a successful rewrite did not preserve the prior version");
+        archive::verify(&ledger, P0, root.path()).await?;
+        // A copied v1 archive in the original, unversioned layout remains readable.
+        let legacy = tempfile::tempdir()?;
+        let directory = legacy.path().join("qbit_share_ledger").join(P0);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::copy(&replacement, directory.join("manifest.json"))?;
+        std::fs::copy(replacement.parent().unwrap().join("rows.ndjson.gz"), directory.join("rows.ndjson.gz"))?;
+        archive::verify(&ledger, P0, legacy.path()).await?;
+        archive::detach(&ledger, P0, &retention(0)).await?;
+        archive::drop_partition(&ledger, P0).await?;
+        archive::restore(&ledger, &replacement, root.path(), true).await?;
+        Ok(ledger)
+    }.await;
     match result {
         Ok(ledger) => db.close(vec![ledger]).await,
         Err(error) => {
@@ -1413,12 +1488,8 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
             "the catalog was not brought in line with pg_inherits"
         );
         archive::drop_partition(&ledger, P0).await?;
-        let disk = read_archive(root.path(), P0)?;
-        let manifest_path: PathBuf = root
-            .path()
-            .join("qbit_share_ledger")
-            .join(P0)
-            .join("manifest.json");
+        let disk = read_archive(&ledger, P0).await?;
+        let manifest_path = PathBuf::from(catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?);
 
         // Restored, not attached: the same rows, the same digest, the shape
         // qbit_prism_share_partition_create builds.
