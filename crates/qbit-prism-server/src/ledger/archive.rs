@@ -5,10 +5,13 @@
 //! Retention never deletes a share. A partition leaves the online ledger only
 //! after every audit that depends on it holds its own canonical bytes, after
 //! its rows have been written to an archive outside PostgreSQL, and after that
-//! archive has been re-read and compared against the live rows. Only then is
-//! the partition detached, and only a detached, verified partition is dropped.
-//! The archive is the copy of record from that point, and `restore` builds the
-//! partition table back from it.
+//! archive has been re-read and compared against the live rows. That comparison
+//! counts only once the share sequence has passed the partition, so nothing
+//! more can land in it, and because ledger rows are immutable the detach and
+//! the drop each count the rows against the archive again before they act.
+//! Only then is the partition detached, and only a detached, verified
+//! partition is dropped. The archive is the copy of record from that point,
+//! and `restore` builds the partition table back from it.
 //!
 //! Every step is idempotent and every step is resumable, because each is a
 //! piece of DDL or a bounded write followed by one catalog transaction, and
@@ -726,6 +729,28 @@ async fn attached_partitions(connection: &mut PgConnection) -> Result<Vec<String
     .await?)
 }
 
+/// The next `share_seq` the sequence will hand out. A partition whose
+/// `upper_seq` is above it can still receive appends, so no archive of it can
+/// be complete, and no comparison with its live rows proves anything about the
+/// rows still to come.
+async fn next_share_seq(connection: &mut PgConnection) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT qbit_prism_share_next_seq()")
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
+/// Refuse to archive or verify a partition the sequence has not passed.
+fn check_sequence_passed(record: &PartitionRecord, next_share_seq: i64, what: &str) -> Result<()> {
+    ensure!(
+        next_share_seq >= record.upper_seq,
+        "refusing to {what} {}: the share sequence stands at {next_share_seq}, below the partition's upper bound {}, so appends can still land in it and no archive of it can be complete. Wait until the sequence has passed {}",
+        record.partition_name,
+        record.upper_seq,
+        record.upper_seq
+    );
+    Ok(())
+}
+
 /// Every audit row whose snapshot intersects the partition, split by whether
 /// its canonical bytes are stored. Snapshots with `inline_shares` are the
 /// bootstrap window's synthetic share, which is not in the ledger and so does
@@ -1288,8 +1313,10 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
 /// Write `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and
 /// `manifest.json`, and record the location, the digests and the row count.
 ///
-/// Both files are written to temp names and renamed into place, so a reader
-/// never sees a partial archive and a failed run leaves none. An existing
+/// Only a partition the share sequence has passed is archived: below that,
+/// appends can still land in it and the archive would be incomplete the moment
+/// one did. Both files are written to temp names and renamed into place, so a
+/// reader never sees a partial archive and a failed run leaves none. An existing
 /// archive is overwritten only with `--force`, and only after the replacement
 /// manifest exists on disk. The catalog is updated once, after both renames,
 /// and the previous verification is cleared with it: a new archive has not
@@ -1311,6 +1338,8 @@ pub async fn archive(
         record.state,
         if attachment.attached { "is" } else { "is not" }
     );
+    let next_share_seq = next_share_seq(&mut connection).await?;
+    check_sequence_passed(&record, next_share_seq, "archive")?;
     ensure!(
         record.archived_at.is_none() || force,
         "refusing to archive {partition_name}: it was already archived at {} into {}. Pass --force to write it again, which also clears the recorded verification",
@@ -1455,7 +1484,8 @@ fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
 /// catalog row and the chain, and, while the partition is still attached,
 /// stream the live rows again and compare the stream digest and the count.
 /// Records `archive_verified_at` only when everything agreed and the live
-/// rows were compared; after a detach the verification is reported only.
+/// rows were compared, and only once the share sequence has passed the
+/// partition; after a detach the verification is reported only.
 pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
     let mut connection = ledger.acquire().await?;
@@ -1547,6 +1577,11 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
 
     let mut live = Value::Null;
     if attachment.attached && attachment.relation_present {
+        // The comparison below is a proof only while nothing more can land in
+        // the partition: once the sequence has passed its upper bound no
+        // append can reach it, and the immutability trigger holds the rest.
+        let next_share_seq = next_share_seq(&mut connection).await?;
+        check_sequence_passed(&record, next_share_seq, "verify")?;
         let stream = RowStream::new(partition_name, record.lower_seq, record.upper_seq, None);
         let stream = stream_partition(&mut connection, partition_name, stream).await?;
         let (summary, _) = stream.finish()?;
@@ -1633,8 +1668,9 @@ async fn ddl_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConnection<Po
 /// Detach one partition, leaving the table as a standalone relation.
 ///
 /// Requires every condition `plan` evaluates, plus `sealed_at`, `archived_at`
-/// and `archive_verified_at`. There is no override: the conditions are what
-/// make the detach reversible from the archive and harmless to every reader.
+/// and `archive_verified_at`, and a live row count equal to the archive's.
+/// There is no override: the conditions are what make the detach reversible
+/// from the archive and harmless to every reader.
 ///
 /// EP-STATE and EP-ERRORS: the DDL runs outside any transaction (PostgreSQL
 /// refuses `DETACH ... CONCURRENTLY` in a transaction block), so the catalog
@@ -1700,6 +1736,16 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
         record.archive_verified_at.is_some(),
         "refusing to detach {partition_name}: no archive_verified_at is recorded. Run share-archive verify {partition_name} --dir <root>"
     );
+    // The verification is a proof at the instant it was taken. Ledger rows are
+    // immutable, so the only way the partition can have diverged from its
+    // archive since is an append that committed after the comparison, and
+    // that shows in the count `plan` just took.
+    ensure!(
+        entry.live_rows.is_some() && entry.live_rows == record.archive_rows,
+        "refusing to detach {partition_name}: it holds {} live rows but its verified archive records {}; rows landed in it after the archive was verified. Run share-archive archive {partition_name} --dir <root> --force and verify it again",
+        number_or(entry.live_rows, "an unknown number of"),
+        number_or(record.archive_rows, "no")
+    );
     // An interrupted `DETACH ... CONCURRENTLY` left the partition marked
     // detach-pending: PostgreSQL has already excluded it from the parent for
     // every new snapshot, and only FINALIZE can move it forward. Its
@@ -1744,6 +1790,11 @@ async fn attachment2(ledger: &Ledger, partition_name: &str) -> Result<Attachment
     attachment(&mut connection, partition_name).await
 }
 
+/// A number for an operator message, or what its absence means.
+fn number_or(number: Option<i64>, absent: &str) -> String {
+    number.map_or_else(|| absent.to_owned(), |number| number.to_string())
+}
+
 async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option<DateTime<Utc>>> {
     let mut tx = ledger.begin().await?;
     sqlx::query("UPDATE qbit_prism_share_partitions SET state='detached',detached_at=COALESCE(detached_at,clock_timestamp()) WHERE partition_name=$1 AND state='attached'")
@@ -1760,9 +1811,10 @@ async fn record_detached(ledger: &Ledger, partition_name: &str) -> Result<Option
     Ok(detached_at)
 }
 
-/// Drop a detached, verified partition. The archive is the copy of record from
-/// here on. The immutability trigger guards UPDATE, DELETE and TRUNCATE, not
-/// DROP, so no share row is ever rewritten by this.
+/// Drop a detached, verified partition whose rows still number what the
+/// archive recorded. The archive is the copy of record from here on. The
+/// immutability trigger guards UPDATE, DELETE and TRUNCATE, not DROP, so no
+/// share row is ever rewritten by this.
 pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Value> {
     check_partition_name(partition_name)?;
     let (record, attachment) = {
@@ -1785,6 +1837,21 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str) -> Result<Val
         "refusing to drop {partition_name}: no archive_verified_at is recorded, so no copy of its rows is known to exist. Run share-archive verify {partition_name} --dir <root>"
     );
     if attachment.relation_present {
+        // The last check before the one irreversible step: the standalone
+        // relation holds exactly the rows the verified archive recorded.
+        // Ledger rows are immutable, so a count is the whole comparison.
+        let held: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {partition_name}"))
+                .fetch_one(&mut *ledger.acquire().await?)
+                .await
+                .with_context(|| {
+                    format!("counting the rows of {partition_name} before dropping it")
+                })?;
+        ensure!(
+            Some(held) == record.archive_rows,
+            "refusing to drop {partition_name}: it holds {held} rows but its verified archive records {}; the archive is not a copy of every row. Read the relation by name and reconcile it with the archive before it leaves",
+            number_or(record.archive_rows, "no")
+        );
         let mut ddl = ddl_connection(ledger).await?;
         sqlx::raw_sql(&format!("DROP TABLE {partition_name}"))
             .execute(&mut *ddl)

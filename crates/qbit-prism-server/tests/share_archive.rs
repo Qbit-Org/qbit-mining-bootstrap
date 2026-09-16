@@ -110,8 +110,31 @@ async fn insert_shares(
     writer: &str,
     age_seconds: f64,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,\
+    insert_shares_into(
+        pool,
+        "qbit_share_ledger",
+        first,
+        last,
+        difficulty,
+        writer,
+        age_seconds,
+    )
+    .await
+}
+
+/// The same rows written into one relation by name: a detached partition,
+/// which the parent no longer routes to.
+async fn insert_shares_into(
+    pool: &PgPool,
+    table: &str,
+    first: i64,
+    last: i64,
+    difficulty: i64,
+    writer: &str,
+    age_seconds: f64,
+) -> Result<()> {
+    sqlx::query(&format!(
+        "INSERT INTO {table}(share_seq,share_id,miner_id,payout_order_key,p2mr_program,\
          share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,\
          accepted,reject_reason,credit_policy,writer_id,writer_epoch) \
          SELECT i,'miner-'||(i%5)::text||':é'||lpad(i::text,16,'0'),'m'||(i%5)::text,'k',\
@@ -122,8 +145,8 @@ async fn insert_shares(
          statement_timestamp()-make_interval(secs=>$5+($2-i)::double precision/1000),\
          i%11<>0,CASE WHEN i%11=0 THEN 'stale-job' END,\
          CASE WHEN i%7=0 THEN 'stale-grace' END,$4,0 \
-         FROM generate_series($1::bigint,$2::bigint) AS g(i)",
-    )
+         FROM generate_series($1::bigint,$2::bigint) AS g(i)"
+    ))
     .bind(first)
     .bind(last)
     .bind(difficulty.to_string())
@@ -500,6 +523,18 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             "the catalog did not record the verified archive"
         );
 
+        // A partition the sequence has not passed can still receive rows, so
+        // neither an archive nor a verification of it can be complete.
+        let error = archive::archive(&ledger, P1, root.path(), false, "operator-a")
+            .await
+            .expect_err("archived a partition the sequence is still inside")
+            .to_string();
+        ensure!(
+            error.contains("share sequence stands at") && error.contains("still land in it"),
+            "{error}"
+        );
+        set_sequence(&ledger.pool, p1_upper - 1).await?;
+
         // The chain: the second archive links to the first by manifest digest
         // and starts exactly where it ended.
         archive::archive(&ledger, P1, root.path(), false, "operator-a").await?;
@@ -519,6 +554,15 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         );
         let verified = archive::verify(&ledger, P1, root.path()).await?;
         ensure!(verified["chain_adjacent"] == true, "{verified}");
+        // A verification is refused the same way whenever the sequence is
+        // found below the partition, whatever put it there.
+        set_sequence(&ledger.pool, p0_upper + 9).await?;
+        let error = archive::verify(&ledger, P1, root.path())
+            .await
+            .expect_err("verified a partition the sequence is inside")
+            .to_string();
+        ensure!(error.contains("share sequence stands at"), "{error}");
+        set_sequence(&ledger.pool, p1_upper - 1).await?;
 
         // Re-archiving is refused without --force, and --force clears the
         // recorded verification: a new archive has not been verified.
@@ -1015,6 +1059,85 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
         ensure!(
             next == p0_upper + 5,
             "the restore moved the share sequence to {next}"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// The verification is a proof at the instant it was taken. A row that lands
+/// after it, whether an append that committed late or one written into the
+/// standalone relation by name, is caught by the count the detach and the
+/// drop each take against the archive, so no row leaves the ledger unarchived.
+#[tokio::test]
+async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("recount-a").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::seal(&ledger, P0).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        let report = archive::plan(&ledger, &retention(0)).await?;
+        ensure!(entry(&report, P0).eligible, "{:?}", entry(&report, P0));
+
+        // An append that drew its share_seq before the sequence passed the
+        // partition and committed only after the comparison.
+        insert_shares(&ledger.pool, 41, 41, 7, "server-a", 7200.0).await?;
+        let error = archive::detach(&ledger, P0, &retention(0))
+            .await
+            .expect_err("detached a partition holding a row its archive does not")
+            .to_string();
+        ensure!(
+            error.contains("41 live rows") && error.contains("records 40"),
+            "{error}"
+        );
+        let attached: Option<bool> = sqlx::query_scalar(
+            "SELECT true FROM pg_inherits i WHERE i.inhrelid=to_regclass($1) AND i.inhparent=to_regclass('qbit_share_ledger')",
+        )
+        .bind(P0)
+        .fetch_optional(&ledger.pool)
+        .await?;
+        ensure!(
+            attached == Some(true)
+                && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "attached",
+            "the refused detach changed something"
+        );
+        // Archiving again, and verifying again, is the recovery.
+        archive::archive(&ledger, P0, root.path(), true, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        let detached = archive::detach(&ledger, P0, &retention(0)).await?;
+        ensure!(detached["action"] == "detached", "{detached}");
+
+        // A row written into the standalone relation by name, between the
+        // detach and the drop, is the last thing the drop checks for.
+        insert_shares_into(&ledger.pool, P0, 42, 42, 7, "server-a", 7200.0).await?;
+        let error = archive::drop_partition(&ledger, P0)
+            .await
+            .expect_err("dropped a relation holding a row its archive does not")
+            .to_string();
+        ensure!(
+            error.contains("holds 42 rows") && error.contains("records 41"),
+            "{error}"
+        );
+        let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(P0)
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(
+            present && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "detached",
+            "the refused drop changed something"
         );
         Ok(ledger)
     }

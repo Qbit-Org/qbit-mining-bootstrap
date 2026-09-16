@@ -1029,10 +1029,10 @@ primary, with the frontends running. Nothing here needs a maintenance window.
 | --- | --- |
 | `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
-| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` |
-| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
-| `drop <partition>` | requires `detached` and verified; `DROP TABLE`; the archive is the copy of record |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it |
+| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
+| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
+| `drop <partition>` | requires `detached` and verified, and counts the rows against the archive again; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
 
 `plan` also reports the attached partition count, the lead ahead of the
@@ -1055,7 +1055,12 @@ qbit-prism-server share-archive drop qbit_share_ledger_p0
 Run `plan` again after `drop` and keep its output with the run. `verify`
 compares the archive against the live rows only while the partition is still
 attached, so the order above is the order that gets that comparison: archive,
-verify, then detach. Between `detach` and `drop` the rows are still on disk
+verify, then detach. Both refuse a partition the share sequence has not passed,
+because a comparison of a partition that can still receive rows proves nothing
+about the rows still to come; and since ledger rows are immutable, `detach` and
+`drop` each count the rows against the archive again before acting, so an
+append that committed after the comparison is refused rather than lost.
+Between `detach` and `drop` the rows are still on disk
 under the standalone relation and can be read directly by name, which is the
 last chance to look at them without a restore; do not collapse those two steps
 into one to save a command. Read the catalog back afterwards:
