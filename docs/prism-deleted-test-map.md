@@ -20,7 +20,7 @@ Status values:
 - **needs triage**: no native test and no issue that closes it, or the mapping is unclear.
 - **retired**: the subject no longer exists in 3.x.x (Python-runtime mechanics with no native counterpart); neither a gap nor a replacement.
 
-In the replacement column `path::name` is a Rust test function (`#[test]` or `#[tokio::test]`) or a remaining Python `def test_`, with `path` relative to the repository root. Issue links point at the readiness-review issues whose body names the gap: #268, #270, #271, #272, #280, #285, #287 and #288, plus #266, whose body names three deleted block-candidate tests by line. #278 is mentioned where its trimmed cutover-minimum set names a missing metric family, without a gap link. Each linked issue was read to confirm it covers the row.
+In the replacement column `path::name` is a Rust test function (`#[test]` or `#[tokio::test]`) or a remaining Python `def test_`, with `path` relative to the repository root. Issue links point at the readiness-review issues whose body names the gap: #270, #271, #272, #280, #285, #287, #288 and #418 (the P2 follow-up carrying #268's remaining recover work), plus #266, whose body names three deleted block-candidate tests by line. #278 is mentioned where its trimmed cutover-minimum set names a missing metric family, without a gap link. Each linked issue was read to confirm it covers the row.
 
 ## Summary
 
