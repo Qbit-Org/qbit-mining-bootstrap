@@ -605,6 +605,13 @@ mod diagnostics {
     const REDACTED: &str = "[redacted]";
     /// Stands in for a control character a child wrote raw.
     const REPLACEMENT: char = '\u{fffd}';
+    /// The shortest piece of a multiline secret registered on its own. The
+    /// tail window can clip such a secret's first line away, leaving a
+    /// continuation that matches nothing. Shorter pieces are ordinary words,
+    /// and redacting those would empty the diagnostics to protect a few
+    /// characters, so at most this many characters of a clipped secret can
+    /// survive.
+    const MIN_FRAGMENT: usize = 8;
     /// The shortest hex, base64 or base64url run withheld as possible key
     /// material (a 128-bit value in hex, or 24 bytes in base64).
     pub const ENCODED_RUN: usize = 32;
@@ -808,8 +815,8 @@ mod diagnostics {
     }
 
     /// A value as written, as the inside of the Rust `{:?}` and JSON string
-    /// literals a child might print it in, and each of those with CRLF line
-    /// breaks collapsed. The written value covers a decoded password that
+    /// literals a child might print it in, each of those with CRLF line breaks
+    /// collapsed, and the long pieces of any that span lines. The written value covers a decoded password that
     /// carries a line break or a control character, because `sanitize` matches
     /// secrets against the tail before anything splits or rewrites it — but
     /// `read_tail` strips a line's trailing carriage return before that, so a
@@ -826,7 +833,18 @@ mod diagnostics {
             let stripped = form.replace("\r\n", "\n");
             let mut forms = vec![form.to_owned()];
             if stripped != form {
-                forms.push(stripped);
+                forms.push(stripped.clone());
+            }
+            // The tail window can start inside a multiline secret, dropping
+            // its head with the partial line it cut and leaving a
+            // continuation that the whole value no longer matches.
+            if stripped.contains('\n') {
+                forms.extend(
+                    stripped
+                        .split('\n')
+                        .filter(|piece| piece.chars().count() >= MIN_FRAGMENT)
+                        .map(str::to_owned),
+                );
             }
             for form in forms {
                 if !secrets.contains(&form) {
@@ -1988,6 +2006,34 @@ mod startup_diagnostics_tests {
         };
         assert_eq!((tail.dropped, tail.size), (1, bytes.len() as u64));
         assert!(tail.lines.iter().all(|line| line == "filler-line-0000"));
+
+        // The window starts inside the first line of a password that spans
+        // two, so the head goes with the partial line and only the
+        // continuation survives to be matched.
+        let split = directory.path().join("split.log");
+        let url = "postgres://prism:clipped-head-9%0Acontinuation-secret-9@db/prism";
+        let head = "old\nnoise clipped-head-9\ncontinuation-secret-9 tail\n";
+        let bytes = format!("{head}{}", "filler-line-0000\n".repeat(962)).into_bytes();
+        let window_start = bytes.len() - TAIL_BYTES as usize;
+        let first = head.find("clipped-head-9").expect("head in log")
+            ..head.find("\ncontinuation").expect("continuation in log");
+        assert!(
+            first.contains(&window_start),
+            "window starts at {window_start}, outside {first:?}"
+        );
+        std::fs::write(&split, &bytes)?;
+        let Tail::Read(tail) = read_tail(&split, false) else {
+            panic!("split log unread");
+        };
+        assert_eq!(
+            tail.lines.first().map(String::as_str),
+            Some("continuation-secret-9 tail")
+        );
+        let mut command = Command::new("server");
+        command.env("PRISM_DATABASE_URL", url);
+        let shown = sanitize(&tail.lines, &command_secrets(&command));
+        assert_eq!(shown.first().map(String::as_str), Some("[redacted] tail"));
+        assert_absent(&shown.join("\n"), &["continuation-secret-9"]);
         Ok(())
     }
 
