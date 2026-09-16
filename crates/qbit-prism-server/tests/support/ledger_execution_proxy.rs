@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -601,6 +601,11 @@ async fn serve(
     }
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
+    // A frame's kind, length and body are decoded separately. Buffer socket
+    // reads so a large result does not pay three reads per DataRow; keep the
+    // existing frame-by-frame observation, forwarding and fault boundaries.
+    let client_read = BufReader::new(client_read);
+    let server_read = BufReader::new(server_read);
     let connection = Arc::new(Mutex::new(Connection::default()));
     // Whichever direction ends first (client EOF, server EOF, or a fault)
     // drops both sockets; the server then aborts any open transaction.
@@ -681,7 +686,7 @@ fn record(
 }
 
 async fn pump_client(
-    mut from: OwnedReadHalf,
+    mut from: BufReader<OwnedReadHalf>,
     mut to: OwnedWriteHalf,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
@@ -755,7 +760,7 @@ enum Action {
 }
 
 async fn pump_server(
-    mut from: OwnedReadHalf,
+    mut from: BufReader<OwnedReadHalf>,
     mut to: OwnedWriteHalf,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
