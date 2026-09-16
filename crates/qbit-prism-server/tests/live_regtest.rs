@@ -603,6 +603,8 @@ mod diagnostics {
     pub const MAX_LINES: usize = 40;
     pub const MAX_TEXT_BYTES: usize = 8 * 1024;
     const REDACTED: &str = "[redacted]";
+    /// Stands in for a control character a child wrote raw.
+    const REPLACEMENT: char = '\u{fffd}';
     /// The shortest hex, base64 or base64url run withheld as possible key
     /// material (a 128-bit value in hex, or 24 bytes in base64).
     pub const ENCODED_RUN: usize = 32;
@@ -805,8 +807,11 @@ mod diagnostics {
             .any(|flag| value.trim().eq_ignore_ascii_case(flag))
     }
 
-    /// A value as written and as the inside of the Rust `{:?}` and JSON
-    /// string literals a child might print it in.
+    /// A value as written, as the inside of the Rust `{:?}` and JSON string
+    /// literals a child might print it in, and each of those as `sanitize_line`
+    /// leaves it. A password may carry a control character once it is decoded,
+    /// and a child that writes the decoded value raw would otherwise survive
+    /// normalization unmatched.
     fn add(secrets: &mut Vec<String>, value: &str) {
         let value = value.trim();
         if value.is_empty() {
@@ -816,8 +821,17 @@ mod diagnostics {
         let json = serde_json::Value::from(value).to_string();
         // Both literals are quoted, so the inner slice is at ASCII boundaries.
         for form in [value, &debug[1..debug.len() - 1], &json[1..json.len() - 1]] {
-            if !secrets.iter().any(|known| known == form) {
-                secrets.push(form.into());
+            let mut forms = vec![form.to_owned()];
+            // A form that normalizes to replacement characters alone would
+            // match every normalized control byte, so it is not stored.
+            let normalized = normalize_controls(form);
+            if normalized != form && normalized.chars().any(|c| c != REPLACEMENT) {
+                forms.push(normalized);
+            }
+            for form in forms {
+                if !secrets.contains(&form) {
+                    secrets.push(form);
+                }
             }
         }
     }
@@ -935,20 +949,27 @@ mod diagnostics {
     }
 
     pub fn sanitize_line(line: &str, secrets: &[String]) -> String {
-        let mut text: String = line
-            .chars()
-            .map(|c| {
-                if c.is_control() && c != '\t' {
-                    '\u{fffd}'
-                } else {
-                    c
-                }
-            })
-            .collect();
+        let mut text = normalize_controls(line);
         for secret in secrets {
             text = replace_ignoring_ascii_case(&text, secret);
         }
         redact_encoded(&redact_assignment(&redact_urls(&text)))
+    }
+
+    /// Every control character but tab becomes the replacement character, so
+    /// a child's raw bytes never reach the output. `command_secrets` stores
+    /// the result of this for each secret as well, because it runs before the
+    /// secrets are replaced and would otherwise stop them matching.
+    fn normalize_controls(text: &str) -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_control() && c != '\t' {
+                    REPLACEMENT
+                } else {
+                    c
+                }
+            })
+            .collect()
     }
 
     fn replace_ignoring_ascii_case(text: &str, secret: &str) -> String {
@@ -1724,6 +1745,14 @@ mod startup_diagnostics_tests {
                     format!("json {}", serde_json::to_string(control)?),
                 ],
                 strings(&[r#"debug "[redacted]""#, r#"json "[redacted]""#]),
+            ),
+            (
+                // Normalization rewrites the raw control byte before secrets
+                // are replaced, so the stored forms must include the rewrite.
+                "control characters written raw".into(),
+                "postgres://prism:tab%09pw7%01z@db/prism",
+                vec![format!("raw {control} end")],
+                strings(&["raw [redacted] end"]),
             ),
             (
                 "malformed percent escape in a query password".into(),
