@@ -128,24 +128,31 @@ replace it:
    hash with `UNIQUE (share_id)`, in the same transaction as the ledger
    row. It is not partitioned, its rows are never removed, and it stays
    O(1) per share. The append now consults it *first*: a header hash it
-   holds under the same `share_id` is an exact replay (the ledger row is
-   fetched and compared, payload mismatch refused as before); under
-   another `share_id` it is the cross-identity duplicate refused as
-   before; a header hash it does not hold is a new share, inserted without
-   any ledger probe. A replay whose ledger row is no longer online (it was
-   archived) is refused as a duplicate: the coordinator's replays are
-   seconds old, so this is unreachable in practice and safe if reached.
+   holds under another `share_id` is the cross-identity duplicate, refused
+   as before. It then probes the ledger for the `share_id` with the bound
+   of tier 3 (at most three leaves), which finds an exact replay or a
+   payload mismatch of any recent row, including rows written around the
+   append path, which the hash table does not know. Only when the hash
+   table holds the header under this `share_id` and the bounded probe
+   misses is the probe repeated without the bound, so a replay of any
+   online row is still matched exactly; a replay whose row has left the
+   online ledger is refused as the duplicate it is. The coordinator's
+   replays are seconds old, so that last case is unreachable in practice
+   and safe if reached.
 2. **Per-leaf `UNIQUE (share_id)`** on every partition, created explicitly
    by the partition procedure (a `PARTITION OF` table would get none).
-3. **Bounded probes.** Every remaining `share_id` lookup on the ledger
-   (the replay comparison, the block-only reconciliation probes, the
-   vardiff evidence lookup) carries
+3. **Bounded probes.** Every `share_id` lookup on the ledger (the replay
+   comparison, the block-only reconciliation probes, the vardiff evidence
+   lookup) carries
    `share_seq >= qbit_prism_share_probe_floor()`: two partition widths
    below the next `share_seq`, so PostgreSQL prunes to at most three
    leaves at executor start (verified: "Subplans Removed" in the plan)
    instead of descending one `share_id` index per attached partition.
    A probe without the bound costs one index descent per partition per
-   share, which the design spike measured at 31 buffers against 8.
+   share, which the design spike measured at 31 buffers against 8; the two
+   lookups that fall back to an unbounded probe on a miss (the credited
+   replay above, and the vardiff evidence lookup) do so only for a row
+   older than two partition widths, off the share path.
 
 The invariant this leaves is stated plainly: a row inserted *around* the
 append path (a direct `INSERT` by an operator or a harness) with a
@@ -246,8 +253,8 @@ The design spike's nine Python consumers reconcile to these native ones:
   artifact whose window covers them. Documented change; an anchor-to-
   archive index is deferred.
 - **Pool readiness** never depended on a lifetime miner count on 3.x.x
-  (`PRISM_MIN_READY_MINERS` is retired), so the spike's collection-mode
-  regression has no native counterpart.
+  (`PRISM_MIN_READY_MINERS` is retired), <!-- retired-setting: PRISM_MIN_READY_MINERS -->
+  so the spike's collection-mode regression has no native counterpart.
 - **Audit reconstruction** of a landed block: sealed before detach (D6).
 
 ## Retention procedure
@@ -260,7 +267,7 @@ the primary, with the frontends running:
 | `plan --network-difficulty D [--retention-days N]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
 | `archive <partition> --dir <root>` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
-| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` |
+| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` only for that full comparison, so a verify after the detach reports but never counts as the proof the detach required |
 | `detach <partition>` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY` (finalized if an earlier attempt was interrupted); the table stays as a standalone relation |
 | `drop <partition>` | requires `detached` and verified; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |

@@ -520,9 +520,10 @@ async fn migration_016_waits_for_an_open_writer_without_blocking_appends() -> Re
     db.close(vec![first, online]).await
 }
 
-/// A bound prepared by an earlier, interrupted run is moved further out
-/// when the sequence has come within one width of it, then validated and
-/// swapped; the first partition's bound is the new one.
+/// A bound prepared by an earlier, interrupted run, pending or already
+/// validated, is moved further out when the sequence has come within one
+/// width of it, then validated and swapped; the first partition's bound is
+/// the new one.
 #[tokio::test]
 async fn migration_016_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -531,26 +532,42 @@ async fn migration_016_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
     let pool = PgPool::connect(&db.url).await?;
     let first = db.ledger("first").await?;
     first.append(share(1), None).await?;
-    undo_016(&pool).await?;
-    let bound: i64 = sqlx::query_scalar("SELECT qbit_prism_share_ledger_convert_prepare(10)")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(bound, WIDTH);
-    // The writers ran on: the sequence is now within one width of the bound.
-    sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
-        .bind(WIDTH - 5)
-        .execute(&pool)
-        .await?;
-    let resumed = db.ledger("resumed").await?;
-    assert_converted(&pool).await?;
-    assert_eq!(conversion_bound(&pool).await?, Some(3 * WIDTH));
-    assert_eq!(catalog(&pool).await?[0].2, 3 * WIDTH);
-    let validated: bool = sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conrelid='qbit_share_ledger_p0'::regclass AND conname='qbit_share_ledger_p0_bound'")
-        .fetch_one(&pool).await?;
-    assert!(validated);
-    let next = resumed.append(share(2), None).await?;
-    assert_eq!(next.share.share_seq, u64::try_from(WIDTH - 4)?);
-    db.close(vec![first, resumed]).await
+    let mut ledgers = vec![first];
+    for (round, validate) in [false, true].into_iter().enumerate() {
+        undo_016(&pool).await?;
+        // The bound is reprepared on the grid from the current sequence.
+        let expected_bound = (round as i64 + 1) * WIDTH;
+        let bound: i64 = sqlx::query_scalar("SELECT qbit_prism_share_ledger_convert_prepare(10)")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(bound, expected_bound);
+        if validate {
+            sqlx::query_scalar::<_, Vec<String>>(
+                "SELECT qbit_prism_share_ledger_convert_validate()",
+            )
+            .fetch_one(&pool)
+            .await?;
+        }
+        // The writers ran on: the sequence is now within one width of the bound.
+        sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
+            .bind(expected_bound - 5)
+            .execute(&pool)
+            .await?;
+        let resumed = db.ledger(&format!("resumed-{round}")).await?;
+        assert_converted(&pool).await?;
+        assert_eq!(
+            conversion_bound(&pool).await?,
+            Some(expected_bound + 2 * WIDTH)
+        );
+        assert_eq!(catalog(&pool).await?[0].2, expected_bound + 2 * WIDTH);
+        let validated: bool = sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conrelid='qbit_share_ledger_p0'::regclass AND conname='qbit_share_ledger_p0_bound'")
+            .fetch_one(&pool).await?;
+        assert!(validated);
+        let next = resumed.append(share(2 + round as u64), None).await?;
+        assert_eq!(next.share.share_seq, u64::try_from(expected_bound - 4)?);
+        ledgers.push(resumed);
+    }
+    db.close(ledgers).await
 }
 
 /// share_id uniqueness is per leaf after the conversion. The append path

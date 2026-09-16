@@ -20,9 +20,10 @@
 //! that exclude writers; the file runs the same functions.
 //!
 //! The runner is resumable from what the database holds: a plain table
-//! without the bound is prepared; a pending bound is validated (or bounded
+//! without the bound is prepared; a pending or validated bound is bounded
 //! again, further out, when the sequence has come within one partition of
-//! it); a validated bound is swapped; a converted ledger is recorded. Every
+//! it (and validated again); a pending bound is validated; a validated
+//! bound is swapped; a converted ledger is recorded. Every
 //! name the swap creates is checked before the first step, so a refusal
 //! changes nothing. Until 16 is recorded every start refuses the database,
 //! as for every other required migration.
@@ -238,6 +239,26 @@ pub(super) async fn apply(
                 );
             }
             Stage::Validated => {
+                // A validated bound can still have lost its headroom while
+                // this run was away, and the swap refuses a bound the
+                // sequence has reached. Prepare again first: it keeps a bound
+                // with headroom and otherwise replaces it with a pending one
+                // further out, which the next round validates.
+                with_lock_retries(
+                    connection,
+                    version,
+                    "checking the partition bound",
+                    "SELECT qbit_prism_share_ledger_convert_prepare()",
+                )
+                .await?;
+                if stage(connection).await? != Stage::Validated {
+                    tracing::warn!(
+                        version,
+                        "the validated bound lost its headroom while this run was away; bounded again further out, validating again"
+                    );
+                    current = Stage::Pending;
+                    continue;
+                }
                 let started = Instant::now();
                 with_lock_retries(
                     connection,

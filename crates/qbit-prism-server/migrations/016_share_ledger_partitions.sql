@@ -14,10 +14,10 @@
 --      bound, and the release's pending credit_policy_check where 001 left
 --      it so) under SHARE UPDATE EXCLUSIVE, appends and reads continue,
 --      hours on a large ledger;
---   3. swap: about fifty milliseconds of catalog work under ACCESS
---      EXCLUSIVE, taken with a short lock timeout and retried: rename,
---      parent, indexes adopted by ATTACH (nothing is copied or rebuilt),
---      lead partitions.
+--   3. swap: milliseconds of catalog work (17 ms measured, none of it a
+--      function of the row count) under ACCESS EXCLUSIVE, taken with a
+--      short lock timeout and retried: rename, parent, indexes adopted by
+--      ATTACH (nothing is copied or rebuilt), lead partitions.
 --
 -- The version is recorded after the swap. Until then every start refuses
 -- the database, as for every other required migration. The migration is
