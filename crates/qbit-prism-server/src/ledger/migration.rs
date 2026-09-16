@@ -25,7 +25,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// ledgers apply 013 online (`ONLINE_MIGRATIONS`) and record it after its
 /// last index change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -53,6 +53,10 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     ("candidate_offer_lifecycle", 1),
     // 012: startup proves support again in its initial heartbeat.
     ("instance_offer_startup", 1),
+    // 015: the terminal `orphaned` disposition of a proven orphan (#415). A
+    // binary without this entry has no name for the state and refuses the
+    // migrated database at connect, so no mixed-version frontend meets it.
+    ("candidate_orphan_disposition", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -598,6 +602,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         ensure!(
             rows.iter().any(|(name, value)| name == "instance_offer_startup" && *value == 1),
             "database is at schema migration 12 but does not declare instance_offer_startup = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 012's startup constraint and capability; nothing was changed"
+        );
+    }
+    if versions.contains(&15) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "candidate_orphan_disposition" && *value == 1),
+            "database is at schema migration 15 but does not declare candidate_orphan_disposition = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 015's lifecycle constraints and capability; nothing was changed"
         );
     }
     Ok(())
@@ -2077,6 +2087,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         14,
         include_str!("../../migrations/014_policy_transition.sql"),
     ),
+    (
+        15,
+        include_str!("../../migrations/015_candidate_orphan_disposition.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -2981,6 +2995,20 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(14)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&15) {
+        // 015 (#415) replaces 011's lifecycle rules under their own names to
+        // admit the terminal `orphaned` disposition, so it runs above 011
+        // and 012, which the blocks above have applied or found recorded.
+        // A pre-015 frontend never writes the state and never claims a row
+        // in it, so no shutdown proof is needed; the capability 015
+        // declares refuses such a frontend at its next connect instead.
+        sqlx::raw_sql(native_migration(15))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(15)")
             .execute(&mut **tx)
             .await?;
     }

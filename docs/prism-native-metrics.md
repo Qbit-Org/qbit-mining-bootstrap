@@ -7,7 +7,7 @@ observations, with the pool-acquisition histogram, collector measurements,
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **42 coordinator
+The generated table below is the sole inventory for both roles: **43 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -50,8 +50,9 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
 | `qbit_prism_authorized_with_current_work` | gauge | none | run | Authorized connections holding the current semantic work generation. | `qbit_prism_stratum_clients_with_current_tip_jobs` |
-| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidate_oldest_pending_seconds` |
-| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). | `qbit_prism_block_candidates_pending` |
+| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidate_oldest_pending_seconds` |
+| `qbit_prism_block_candidates_orphaned_total` | counter | none | run | Offered block candidates this instance settled as proven orphans since process start. Increments once per offered candidate this instance settled terminal as a proven orphan (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. Attributed to the committed settlement, never to a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule. | none |
+| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidates_pending` |
 | `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule. | `qbit_prism_block_submit_seconds` |
 | `qbit_prism_blocks_total` | counter | none | run | Blocks confirmed by this instance since process start. Native confirmed-block process counter; not the legacy node-acceptance accounting boundary. | `qbit_prism_blocks_accepted_total` |
 | `qbit_prism_collector_age_seconds` | gauge | `collector=database,process` | run | Monotonic age of the last successful collector observation, or -1 before success. | none |
@@ -192,6 +193,27 @@ acquisition completes or is cancelled; subsequent transaction work is excluded.
 Collector status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
+
+The pending predicate is the four unfinished outbox states (`pending`,
+`offer_reserved`, `offered`, `reconciliation`). Since #415 (migration 015) a
+reconciliation row whose block lost a tip race does not stay in that set
+forever: once its audit has landed and one coherent tip observation shows a
+*different* block active at its height with at least
+`PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted from
+the observed tip as `tip_height - height + 1`), the post-offer settlement marks
+the row terminal as `orphaned`, in the same transaction as its reason and its
+block's `inactive` chain state, and increments
+`qbit_prism_block_candidates_orphaned_total` once the commit returned. Both
+pending gauges then stop counting the row. The row keeps its document, block
+bytes, window reference and offer record for the operator surface (#268); it
+is never claimed or offered again. A failed observation settles nothing, so
+unknown stays distinct from zero: the row waits in reconciliation and the
+gauges report -1 only when the collector itself fails. A later reorg that
+reactivates the block is credited by the ordinary reorg reconciler from the
+landed audit, deferred share included, without reopening the row or touching
+the counter. Rows a frontend cannot land (a rebuild refused for good, a missing
+balance snapshot) are not orphans and stay in the pending set with their reason
+in `last_error`; that backlog is operator work.
 
 The existing coordinator families retain their names and types; their complete
 contracts appear in the generated table above. The #277 `metrics_snapshot_available`,

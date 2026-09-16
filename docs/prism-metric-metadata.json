@@ -75,13 +75,16 @@
       "replaces": [
         "qbit_prism_block_candidates_pending"
       ],
-      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height."
     },
     "block_candidate_oldest_pending_seconds": {
       "replaces": [
         "qbit_prism_block_candidate_oldest_pending_seconds"
       ],
-      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266)."
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height."
+    },
+    "block_candidates_orphaned_total": {
+      "status": "Increments once per offered candidate this instance settled terminal as a proven orphan (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. Attributed to the committed settlement, never to a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
     },
     "process_resident_memory_bytes": {
       "replaces": [
