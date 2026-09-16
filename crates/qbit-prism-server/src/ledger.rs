@@ -61,7 +61,7 @@ pub use window::{
     WindowRef,
 };
 use window::{read_prior_balances, share_from_row};
-pub(crate) use window::{ChainObservationBehind, ChainObservationRetry};
+pub(crate) use window::{ChainObservationBehind, ChainObservationRetry, RefreshProbe};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;

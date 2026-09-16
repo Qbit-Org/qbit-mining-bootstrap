@@ -81,7 +81,7 @@ async fn unchanged_empty_and_nonempty_refresh_probe_execution_counts() -> Result
             }
             let probe_sql: usize = probes.iter().map(Vec::len).sum();
             let balance_reads: Vec<_> = probes.iter().flatten().filter(|e| e.sql.contains("qbit_current_carry_forward_balances()")).collect();
-            ensure!(probes.len() == 2 && probe_sql == 10 && cutoff_queries == 1,
+            ensure!(probes.len() == 2 && probe_sql == 10 && cutoff_queries == 0,
                 "idle probe cost changed: {} probe transactions / {probe_sql} executions / {cutoff_queries} standalone cutoffs", probes.len());
             ensure!(balance_reads.len() == 2, "idle balance-read count differs");
             for read in balance_reads { ensure!(read.returned_rows()? == 1, "balance DataRows differ"); }
