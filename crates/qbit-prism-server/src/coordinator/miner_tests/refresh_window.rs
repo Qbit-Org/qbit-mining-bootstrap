@@ -74,7 +74,15 @@ async fn economic_drift_during_fee_probe_defers_until_next_refresh() {
     assert_eq!(current.reservation.balances[0].balance_sats, 123);
 }
 
-async fn cached_inputs_change_during_build_wait(expire: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildWaitChange {
+    Share,
+    AnchorAge,
+    Balance,
+    Revision,
+}
+
+async fn cached_inputs_change_during_build_wait(change: BuildWaitChange) {
     let interval = Duration::from_secs(2);
     let f = Fixture::build(
         Duration::from_secs(10),
@@ -115,19 +123,35 @@ async fn cached_inputs_change_during_build_wait(expire: bool) {
             .await
             .is_err()
     );
-    if expire {
+    if change == BuildWaitChange::AnchorAge {
         tokio::time::sleep(interval).await;
     }
     {
         let mut slot = f.store.snapshot.lock().unwrap();
         let snapshot = slot.as_mut().unwrap();
         snapshot.anchor_ms += 1;
-        if !expire {
+        if change == BuildWaitChange::Share {
             snapshot.share_seq += 1;
             let mut share = snapshot.shares.last().unwrap().clone();
             share.share_seq = snapshot.share_seq;
             share.share_id = "arrived-during-build-admission".into();
             snapshot.shares.push(share);
+        }
+        if change == BuildWaitChange::Balance {
+            snapshot
+                .prior_balances
+                .push(qbit_prism::CarryForwardBalance {
+                    recipient_id: "during-admission".into(),
+                    order_key: "during-admission".into(),
+                    p2mr_program_hex: "34".repeat(32),
+                    balance_sats: 123,
+                });
+        }
+        if change == BuildWaitChange::Revision {
+            snapshot.payout_revision += 1;
+            f.store
+                .revision
+                .store(snapshot.payout_revision, Ordering::SeqCst);
         }
     }
     drop(permit);
@@ -145,18 +169,46 @@ async fn cached_inputs_change_during_build_wait(expire: bool) {
     assert_eq!(current.snapshot.anchor_ms, first.snapshot.anchor_ms + 1);
     assert_eq!(
         current.snapshot.share_seq,
-        first.snapshot.share_seq + u64::from(!expire)
+        first.snapshot.share_seq + u64::from(change == BuildWaitChange::Share)
     );
+    if change == BuildWaitChange::Balance {
+        assert_eq!(
+            current.snapshot.payout_revision,
+            first.snapshot.payout_revision
+        );
+        assert_ne!(
+            current.window.prior_balances_digest,
+            first.window.prior_balances_digest
+        );
+        assert!(first.reservation.balances.is_empty());
+        assert_eq!(current.reservation.balances[0].balance_sats, 123);
+    }
+    if change == BuildWaitChange::Revision {
+        assert_eq!(
+            current.snapshot.payout_revision,
+            first.snapshot.payout_revision + 1
+        );
+    }
 }
 
 #[tokio::test]
 async fn build_wait_rechecks_new_share_cutoff() {
-    cached_inputs_change_during_build_wait(false).await;
+    cached_inputs_change_during_build_wait(BuildWaitChange::Share).await;
 }
 
 #[tokio::test]
 async fn build_wait_rechecks_original_reanchor_age() {
-    cached_inputs_change_during_build_wait(true).await;
+    cached_inputs_change_during_build_wait(BuildWaitChange::AnchorAge).await;
+}
+
+#[tokio::test]
+async fn build_wait_rechecks_same_revision_balance_drift() {
+    cached_inputs_change_during_build_wait(BuildWaitChange::Balance).await;
+}
+
+#[tokio::test]
+async fn build_wait_rechecks_payout_revision_drift() {
+    cached_inputs_change_during_build_wait(BuildWaitChange::Revision).await;
 }
 
 #[tokio::test]
