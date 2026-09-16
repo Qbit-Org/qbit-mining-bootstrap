@@ -200,11 +200,27 @@ proves authentication, grants, schema availability, or replication health.
 
 `scripts/check-env.sh` now runs this native validator for the Prism lane through
 the selected Compose public service, using the image and effective environment
-that deployment will use. Prepare the selected PRISM image before running
-preflight. The check starts no service dependencies and publishes no ports;
+that deployment will use. `make doctor` and `make up-prism-pool` prepare tagged
+lab images before validation, including rebuilding an older image that lacks
+the validator. Production and digest-pinned artifacts must be pulled explicitly
+before doctor, following the mainnet runbook. The standalone script likewise
+requires a prepared image. The check starts no service dependencies and publishes no ports;
 its one-shot container is removed on exit. A missing/old image or failed
 launcher is a failed preflight, never a passing or skipped credential check.
-Pass the same additional overlays in deployment order, for example:
+For Make entry points, use the same additional overlays in deployment order:
+
+```sh
+export COMPOSE_OVERLAY_FILES="compose.prism-external-db.yaml compose.prism-ha.yaml"
+MINING_LANES=prism make doctor
+make up-prism-pool
+```
+
+Make inserts `compose.production.yaml` before these overlays when either
+production flag or the main chain selects production. Set
+`PRISM_COMPOSE_SERVICES="qbitd prism-coordinator prism-coordinator-2 prism-public-api"`
+to start both HA frontends. Database dependencies follow the selected overlay.
+For standalone preflight, pass every overlay explicitly, for example from the
+repository root (relative `--compose-file` paths use the caller's directory):
 
 ```sh
 DEPLOY_ENV_FILE=/absolute/path/deployment.env bash scripts/check-env.sh \
@@ -221,6 +237,12 @@ uses only the public service's reader carrier and does not add a bootstrap or
 writer password. For direct binary execution, export the reader's
 `PRISM_DATABASE_URL` and, if needed, its `PGPASSWORD` or `PGPASSFILE`, then run
 `qbit-prism-server check-public-database-config` before `public-api`.
+Parser warnings are suppressed because they can contain configuration values.
+When a native password file does not authenticate, check its existence,
+ownership, restrictive permissions, and matching reader entry locally without
+printing its contents. Authentication tests require a disposable PostgreSQL
+fixture with password authentication enabled; a trust-auth fixture cannot
+exercise rejected passwords.
 
 ### What the bound actually bounds
 

@@ -77,11 +77,18 @@ $EDITOR .env
 make up
 ```
 
-To validate the environment without starting containers, run:
+To validate the environment before starting the operator services, run:
 
 ```bash
 make doctor
 ```
+
+For the PRISM lane, doctor prepares the tagged lab image and runs its one-shot
+reader-configuration validator, without starting database dependencies or
+publishing ports. Production and digest-pinned images must be pulled beforehand
+as described in the [mainnet runbook](docs/mainnet-deployment.md). Use the same
+ordered `COMPOSE_OVERLAY_FILES` with doctor and `make up-prism-pool`; see the
+[reader preflight examples](docs/prism-postgres-replica.md#public-reader-credentials).
 
 To validate a running PRISM operator stack, run:
 

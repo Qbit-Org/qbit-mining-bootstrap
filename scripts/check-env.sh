@@ -946,8 +946,18 @@ check_bitcoin_peer_bootstrap() {
 }
 
 check_public_reader_credentials() (
-  local name index output
+  local name index output production=0 prepare_lab_image=0
   local -a compose_args
+  if [[ "${make_deployment}" == 1 ]]; then
+    if production_mode_enabled || [[ "${QBIT_CHAIN:-regtest}" == main || "${QBIT_CHAIN:-regtest}" == mainnet ]]; then
+      production=1
+    else
+      require_lab_mode
+      # Pinned artifacts are prepared explicitly, including in a lab. Tagged
+      # lab images are rebuilt so an older image cannot omit the validator.
+      [[ "${PRISM_COORDINATOR_IMAGE:-}" == *@sha256:* ]] || prepare_lab_image=1
+    fi
+  fi
   # Restore precisely the environment Compose would receive from the caller.
   while IFS= read -r name; do
     [[ "${COMPOSE_INPUT_KEYS}" == *"|${name}|"* ]] || export -n "${name?}"
@@ -967,10 +977,19 @@ check_public_reader_credentials() (
     compose_args+=(--env-file "${ROOT_DIR}/.env")
   fi
   compose_args+=(-f "${ROOT_DIR}/compose.yaml")
+  if [[ "${production}" == 1 ]]; then
+    compose_args+=(-f "${ROOT_DIR}/compose.production.yaml")
+  fi
   for name in "${PUBLIC_COMPOSE_FILES[@]-}"; do
     [[ -n "${name}" ]] || continue
     compose_args+=(-f "${name}")
   done
+  if [[ "${prepare_lab_image}" == 1 ]]; then
+    printf 'doctor: preparing the selected PRISM lab image for reader validation\n'
+    if ! output="$(docker "${compose_args[@]}" --profile prism build --quiet prism-public-api 2>&1)"; then
+      fail "public reader image preparation failed; check the selected lab build configuration"
+    fi
+  fi
   # Run the same public image/environment as deployment, without starting its
   # database dependencies or publishing ports. The validator does no network IO.
   # Capture Docker/Compose output: even a launcher error may contain env values.
@@ -987,15 +1006,17 @@ check_public_reader_credentials() (
     for name in \
       'PRISM_DATABASE_URL is required by the public service' \
       'public PRISM_DATABASE_URL must use postgres or postgresql' \
+      'invalid public PRISM_DATABASE_URL connection options' \
       'invalid public PRISM_DATABASE_URL' \
       'production requires non-default database credentials'; do
       [[ "${output}" != *"${name}"* ]] || fail "public reader: ${name}"
     done
-    fail "public reader validation failed; ensure Docker and the selected PRISM image support check-public-database-config"
+    fail "public reader validation failed; prepare the selected PRISM image and ensure Docker Compose and the image support check-public-database-config"
   fi
 )
 
 public_reader_only=0
+make_deployment=0
 while [[ $# -gt 0 ]]; do
 case "$1" in
   --require-lab)
@@ -1004,6 +1025,7 @@ case "$1" in
     exit 0
     ;;
   --public-reader-only) public_reader_only=1 ;;
+  --make-deployment) make_deployment=1 ;;
   --compose-file)
     [[ $# -ge 2 && -n "$2" ]] || fail "--compose-file requires a file"
     PUBLIC_COMPOSE_FILES+=("$2")

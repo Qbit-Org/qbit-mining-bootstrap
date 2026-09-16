@@ -124,6 +124,14 @@ class PublicCredentialComposeTests(unittest.TestCase):
                     overrides["PRISM_PUBLIC_POSTGRES_PASSWORD"] = password
                 self.assert_reader_boundary(render_public(stack, **overrides), PASSWORDLESS_URL, password or "")
 
+    def test_tools_only_production_selector_reaches_every_public_stack(self) -> None:
+        for stack in STACKS:
+            with self.subTest(stack=stack):
+                public = render_public(stack, QBIT_PRODUCTION="0", QBIT_TOOLS_PRODUCTION="1",
+                                       QBIT_CHAIN="regtest", PRISM_PUBLIC_DATABASE_URL=READER_URL)
+                self.assertEqual(public["environment"]["QBIT_PRODUCTION"], "0")
+                self.assertEqual(public["environment"]["QBIT_TOOLS_PRODUCTION"], "1")
+
     def test_missing_and_empty_public_dsn_preserve_supported_defaults(self) -> None:
         for stack, url, password in itertools.product(STACKS, (None, ""), ("", READER_PASSWORD)):
             with self.subTest(stack=stack, url=url, carrier_set=bool(password)):
@@ -269,6 +277,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
         return json.loads(config)
 
     def preflight(self, stack: tuple[str, ...], *, env_file: Path | None = None,
+                  make_deployment: bool = False, extra_files: tuple[str, ...] = (),
                   **overrides: str) -> subprocess.CompletedProcess:
         # The actual shell preflight runs the public image with the same merged
         # service environment. Place its one-shot container on our disposable
@@ -282,6 +291,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
                 (ROOT / ".env.example", fixture_root / ".env.example"),
                 (ROOT / "config/upstream.env.example", fixture_root / "config/upstream.env.example"),
                 (ROOT / "compose.yaml", fixture_root / "compose.yaml"),
+                (ROOT / "compose.production.yaml", fixture_root / "compose.production.yaml"),
             ):
                 shutil.copyfile(source, destination)
             overlay = fixture_root / "placement.yaml"
@@ -290,7 +300,9 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
                 "networks:\n  fixture:\n    external: true\n"
                 f"    name: {self.network}\n", encoding="utf-8")
             args = ["bash", str(fixture_root / "scripts/check-env.sh"), "--public-reader-only"]
-            for name in (*stack, str(overlay)):
+            if make_deployment:
+                args.append("--make-deployment")
+            for name in (*stack, *extra_files, str(overlay)):
                 args.extend(("--compose-file", str(ROOT / name)))
             if env_file:
                 overrides["DEPLOY_ENV_FILE"] = str(env_file)
@@ -443,7 +455,7 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
     def test_malformed_and_production_default_credentials_fail_preflight_and_startup(self) -> None:
         cases = (
             ("malformed", "fixture-secret", "", "invalid public PRISM_DATABASE_URL"),
-            ("invalid-option", PASSWORDLESS_URL + "?sslmode=fixture-secret", "", "invalid public PRISM_DATABASE_URL"),
+            ("invalid-option", PASSWORDLESS_URL + "?sslmode=fixture-secret", "", "invalid public PRISM_DATABASE_URL connection options"),
             ("uri-default", PASSWORDLESS_URL.replace("prism_reader@", "prism_reader:change-this@"), "", "non-default database credentials"),
             ("encoded-default", PASSWORDLESS_URL.replace("prism_reader@", "prism_reader:ch%61nge-this@"), "", "non-default database credentials"),
             ("carrier-default", PASSWORDLESS_URL, "change-this", "non-default database credentials"),
@@ -458,6 +470,65 @@ class PublicCredentialRuntimeTests(unittest.TestCase):
                     self.assertNotEqual(self.preflight(stack, **overrides).returncode, 0)
                     self.start_public(stack, **overrides)
                     self.assert_config_exit(message)
+
+    def test_tools_only_production_policy_through_preflight_and_startup(self) -> None:
+        for stack, carrier in itertools.product(STACKS, (False, True)):
+            with self.subTest(stack=stack, carrier=carrier):
+                overrides = {"QBIT_PRODUCTION": "0", "QBIT_TOOLS_PRODUCTION": "1", "QBIT_CHAIN": "regtest",
+                             "PRISM_PUBLIC_DATABASE_URL": PASSWORDLESS_URL if carrier else PASSWORDLESS_URL.replace(
+                                 "prism_reader@", "prism_reader:ch%61nge-this@"),
+                             "PRISM_PUBLIC_POSTGRES_PASSWORD": "change-this" if carrier else ""}
+                result = self.preflight(stack, make_deployment=True, **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("production requires non-default database credentials", result.stderr)
+                self.start_public(stack, **overrides)
+                self.assert_config_exit("non-default database credentials")
+        for stack in STACKS:
+            with self.subTest(stack=stack, valid=True):
+                overrides = {"QBIT_PRODUCTION": "0", "QBIT_TOOLS_PRODUCTION": "1", "QBIT_CHAIN": "regtest",
+                             "PRISM_PUBLIC_DATABASE_URL": PASSWORDLESS_URL,
+                             "PRISM_PUBLIC_POSTGRES_PASSWORD": READER_PASSWORD}
+                self.assertEqual(self.preflight(stack, make_deployment=True, **overrides).returncode, 0)
+                self.start_public(stack, **overrides)
+                self.assert_health(True)
+
+    def test_make_preflight_builds_fresh_lab_image_and_uses_effective_external_overlay(self) -> None:
+        image = f"prism-credential-fresh-{uuid.uuid4().hex}:local"
+        self.assertNotEqual(self.command("docker", "image", "inspect", image, check=False).returncode, 0)
+        try:
+            with tempfile.TemporaryDirectory(prefix="prism-reader-build-") as directory:
+                root = Path(directory)
+                (root / "Dockerfile").write_text(f"FROM {self.image}\n", encoding="utf-8")
+                overlay = root / "build.yaml"
+                overlay.write_text("services:\n  prism-public-api:\n    build: !override\n"
+                                   f"      context: {json.dumps(str(root))}\n      dockerfile: Dockerfile\n",
+                                   encoding="utf-8")
+                stack = ("compose.prism-external-db.yaml", "compose.prism-ha.yaml")
+                overrides = {"PRISM_COORDINATOR_IMAGE": image, "PRISM_PUBLIC_DATABASE_URL": "",
+                             # Only the external overlay selects this reader DSN.
+                             "PRISM_DATABASE_URL": READER_URL, "PRISM_POSTGRES_PASSWORD": "change-this"}
+                result = self.preflight(stack, make_deployment=True, extra_files=(str(overlay),), **overrides)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.command("docker", "image", "inspect", image, check=False).returncode, 0)
+                # The same selected overlay DSN authenticates at real startup.
+                del overrides["PRISM_COORDINATOR_IMAGE"]
+                self.start_public(stack, **overrides)
+                self.assert_health(True)
+        finally:
+            self.command("docker", "image", "rm", "--force", image, check=False)
+
+    def test_make_production_preflight_requires_prepared_image_and_effective_overlay(self) -> None:
+        stack = ("compose.prism-external-db.yaml", "compose.prism-ha.yaml")
+        overrides = {"QBIT_PRODUCTION": "1", "QBIT_CHAIN": "mainnet", "PRISM_PUBLIC_DATABASE_URL": "",
+                     "PRISM_DATABASE_URL": READER_URL, "PRISM_POSTGRES_PASSWORD": "change-this"}
+        result = self.preflight(stack, make_deployment=True, **overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.start_public(("compose.production.yaml", *stack), **overrides)
+        self.assert_health(True)
+        absent_image = f"prism-credential-missing-{uuid.uuid4().hex}:local"
+        result = self.preflight(stack, make_deployment=True, PRISM_COORDINATOR_IMAGE=absent_image, **overrides)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(self.command("docker", "image", "inspect", absent_image, check=False).returncode, 0)
 
     def test_missing_image_is_a_failed_preflight_without_building(self) -> None:
         absent_image = f"prism-credential-missing-{uuid.uuid4().hex}:local"
