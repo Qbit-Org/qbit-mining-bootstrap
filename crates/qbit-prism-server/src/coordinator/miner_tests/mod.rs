@@ -24,6 +24,7 @@ mod observations;
 mod prepared_expiry;
 mod published_lease;
 mod refresh;
+mod refresh_window;
 mod resume_inputs;
 mod runtime_recovery;
 pub(crate) mod stale_causes;
@@ -217,6 +218,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
 
 pub(crate) struct Node {
     pub tip: String,
+    pub template: Option<Value>,
     pub parents: HashMap<String, String>,
     pub calls: Vec<String>,
     pub fail: Option<String>,
@@ -240,9 +242,11 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
         let result = match method {
             "waitfornewblock" => json!({"hash":node.tip,"height":100}),
             "getbestblockhash" | "getblockhash" => json!(node.tip),
-            "getblocktemplate" => json!({"version":0x20000000u32,"bits":"207fffff",
+            "getblocktemplate" => node.template.clone().unwrap_or_else(|| {
+                json!({"version":0x20000000u32,"bits":"207fffff",
                 "curtime":chrono::Utc::now().timestamp(),"previousblockhash":node.tip,
-                "transactions":[],"height":101,"coinbasevalue":500_000_000}),
+                "transactions":[],"height":101,"coinbasevalue":500_000_000})
+            }),
             "getblockheader" => {
                 json!({"previousblockhash":node.parents.get(request["params"][0].as_str().unwrap())})
             }
@@ -295,6 +299,7 @@ impl Fixture {
     ) -> Self {
         let node = Arc::new(StdMutex::new(Node {
             tip: hash(1),
+            template: None,
             parents: [(hash(1), hash(0)), (hash(2), hash(1)), (hash(3), hash(2))].into(),
             calls: vec![],
             fail: None,
@@ -339,7 +344,7 @@ impl Fixture {
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(None),
             resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
