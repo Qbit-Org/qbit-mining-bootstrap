@@ -390,6 +390,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postg
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
+qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace
 qbit-prism-server::readiness_rpc::cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
 qbit-prism-server::readiness_rpc::coordinator_reports_wrap_exhaustion_truthfully
