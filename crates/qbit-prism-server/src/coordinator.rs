@@ -2056,6 +2056,12 @@ impl MiningBackend for Coordinator {
             let initial = self.authority_view().await;
             let readiness_epoch = initial.readiness.generation;
             let published_tip = initial.tip.publication_stamp();
+            let published_payout = initial.prepared.as_ref().map(|prepared| {
+                (
+                    prepared.template["previousblockhash"].clone(),
+                    prepared.snapshot.payout_revision,
+                )
+            });
             drop(initial);
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
@@ -2095,6 +2101,8 @@ impl MiningBackend for Coordinator {
                 let Some(metadata) = flight.metadata.clone().await? else {
                     return Ok(None);
                 };
+                let (published_parent, published_revision) =
+                    published_payout.as_ref().context("no current template")?;
                 let identity = tip_observation::PreparedIdentity::from_compact(
                     &stored.prepared_key,
                     &metadata.record,
@@ -2105,6 +2113,15 @@ impl MiningBackend for Coordinator {
                 else {
                     return Ok(None);
                 };
+                // Preserve ordinary resume's publication compatibility. A
+                // current database revision alone does not prove this frontend
+                // has published that payout. Exact identity remains the
+                // separate, stricter requirement for a replacement lease.
+                if published_parent.as_str() != Some(metadata.record.parent_hash.as_str())
+                    || *published_revision != metadata.record.payout_revision
+                {
+                    return Ok(None);
+                }
                 // Coalescer/metadata waits precede the identity-specific
                 // proof. They cannot borrow a publication that superseded the
                 // operation's original admission while those waits ran.
