@@ -233,10 +233,10 @@ impl Ledger {
         );
         // Reuse precisely the normal accounting transitions in this same
         // transaction. A recurring fatal result is rolled back with the rest.
-        if let Some(error) = self
+        let (reconcile_error, _) = self
             .reconcile_blocks_in(&mut tx, &observations, height)
-            .await?
-        {
+            .await?;
+        if let Some(error) = reconcile_error {
             bail!("reconciliation refused recovery: {error}");
         }
         let integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")

@@ -97,6 +97,71 @@ fn configuration_keeps_general_and_submit_deadlines_independent() {
     }
 }
 
+#[test]
+fn configuration_bounds_orphan_confirmations() {
+    const EXPECTED: &str = "PRISM_TEST_EXPECTED_ORPHAN_CONFIRMATIONS";
+    if let Ok(expected) = std::env::var(EXPECTED) {
+        let result = Config::from_env();
+        if expected == "invalid" {
+            let error = result
+                .err()
+                .expect("invalid confirmation threshold accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().candidate_orphan_confirmations,
+                expected.parse::<u64>().unwrap()
+            );
+        }
+        return;
+    }
+    for (setting, expected) in [
+        (None, "6"),
+        (Some("1"), "1"),
+        (Some("1000"), "1000"),
+        (Some("17"), "17"),
+        (Some("0"), "invalid"),
+        (Some("1001"), "invalid"),
+        (Some("-1"), "invalid"),
+        (Some("abc"), "invalid"),
+        (Some("1.5"), "invalid"),
+        (Some(""), "6"),
+        (Some("  "), "6"),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "configuration_bounds_orphan_confirmations",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(
+                "PRISM_DATABASE_URL",
+                "postgresql://operator@127.0.0.1:1/offline",
+            )
+            .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1")
+            .env("PRISM_RUNTIME_WORKERS", "2")
+            .env("QBIT_CHAIN", "regtest")
+            .env(EXPECTED, expected);
+        if let Some(value) = setting {
+            command.env("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{setting:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[derive(Default)]
 struct Observed {
     calls: Mutex<BTreeMap<String, usize>>,

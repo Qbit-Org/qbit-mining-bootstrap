@@ -695,12 +695,16 @@ impl Coordinator {
                 Err(_) => break,
                 Ok(Ok((true, _, _))) => return SaveOutcome::Accepted,
                 // D2b's answer for a candidate the pre-offer probe abandoned
-                // as superseded, or one the node refused after the offer
-                // (kept in reconciliation with the rejected outcome). It is
-                // not a proof: reconciliation still credits the deferred
-                // share if the block later becomes active.
+                // as superseded, one the node refused after the offer (kept
+                // in reconciliation with the rejected outcome), or one the
+                // chain proved an orphan after the offer (#415, terminal with
+                // its evidence). It is not a proof: reconciliation still
+                // credits the deferred share if the block later becomes
+                // active, and so does the reorg reconciler for an orphaned
+                // block, from its landed audit.
                 Ok(Ok((false, Some(state), outcome)))
                     if state == "abandoned"
+                        || state == ORPHANED_STATE
                         || (state == CandidateState::Reconciliation.as_str()
                             && outcome.as_deref() == Some(OfferOutcome::Rejected.as_str())) =>
                 {

@@ -86,6 +86,7 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_BLOCKPOLL_SECONDS` | 2 | Template polling interval |
 | `PRISM_RPC_TIMEOUT_SECONDS` | 15 | General node and wallet RPC deadline |
 | `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` | 1 | `submitblock` deadline; ambiguous results retain the durable candidate for recovery |
+| `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` | 6 | Confirmations a different active block at an offered candidate's height needs, on one coherent tip observation after the candidate's audit landed, before the row is settled `orphaned` (terminal, evidence kept, out of the pending gauges) instead of staying in reconciliation; 1 to 1000. A reorg back is still credited from the landed audit |
 | `PRISM_MIN_PEERS` | 1 | Minimum connected peers for public-chain readiness |
 | `PRISM_TEMPLATE_MAX_AGE_SECONDS` | 120 | Maximum template age in integral seconds; 0..86400 |
 | `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` | 10 | Published-tip freshness budget in seconds; zero forces a live tip RPC per share and disables the replacement-build lease |

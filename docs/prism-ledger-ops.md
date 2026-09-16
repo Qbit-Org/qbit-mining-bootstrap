@@ -74,7 +74,8 @@ accounting after it, and the row records where the block is between them:
 | `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
 | `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. |
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
-| `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned. |
+| `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
+| `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
 | `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. |
 | `abandoned` | Reachable from `pending` only. |
 
@@ -284,6 +285,24 @@ explicit shutdown check. Restart with this binary after cutover. The new
 `instance_offer_startup = 1` capability rejects earlier binaries at their
 ordinary startup gate, and this binary refuses a missing or changed
 012 declaration. Recovery exports require the same schema and declaration.
+
+**Orphan disposition upgrade (015).** Stop all frontends gracefully before
+applying 015, including frontends already using the offer lifecycle. Keep
+supervisors and automatic restarts disabled until migration finishes, and
+restart only binaries that understand `candidate_orphan_disposition`. As with
+011/012, every recorded instance must explicitly report `stopped` or `drained`;
+an old heartbeat is not proof that a frontend cannot resume. The migration
+refuses active instances before replacing the outbox constraints, and uses the
+configured database lock timeout. Run it during a maintenance window: replacing
+and validating CHECK constraints requires an exclusive outbox lock.
+The capability gate runs at connect and does **not** evict an older frontend
+that is already connected. Migration 012's startup marker proves support for
+the offer lifecycle, not for the later orphan disposition; it cannot fence a
+pre-015 startup already waiting on the migration lock. The shutdown and restart
+procedure is therefore required, including disabling automatic restarts.
+Migration 015 refuses modified named lifecycle rules and additional CHECKs that
+reference `state` or `completed_at`, leaving the schema unchanged on refusal.
+Resolve those constraints explicitly before retrying; do not bypass the check.
 
 PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
