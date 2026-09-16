@@ -200,7 +200,7 @@ fn alias(primary: &str, legacy: &str, default: u64) -> Result<u64> {
         positive(legacy, default)
     }
 }
-fn seconds(name: &str, default: f64) -> Result<Duration> {
+pub(crate) fn seconds(name: &str, default: f64) -> Result<Duration> {
     let n = number(name, default)?;
     ensure!(
         n.is_finite() && n > 0.0 && n <= 86400.0,
