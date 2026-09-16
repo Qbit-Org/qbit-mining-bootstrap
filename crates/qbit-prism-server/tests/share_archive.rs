@@ -591,7 +591,7 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
             .expect_err("re-archived without --force")
             .to_string();
         ensure!(error.contains("--force"), "{error}");
-        archive::archive(&ledger, P0, root.path(), true, "operator-a").await?;
+        let rewritten = archive::archive(&ledger, P0, root.path(), true, "operator-a").await?;
         ensure!(
             catalog(&ledger.pool, P0)
                 .await?
@@ -599,7 +599,58 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
                 .is_none(),
             "--force kept the verification of the archive it replaced"
         );
+        // The second manifest links to the digest that was just replaced, so
+        // its verification goes with the first's, and it cannot be certified
+        // again until it is written again.
+        ensure!(
+            rewritten["verification_cleared"] == serde_json::json!([P1]),
+            "{rewritten}"
+        );
+        ensure!(
+            catalog(&ledger.pool, P1)
+                .await?
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archive_verified_at")?
+                .is_none(),
+            "--force kept the verification of an archive chained to the one it replaced"
+        );
+        let error = archive::verify(&ledger, P1, root.path())
+            .await
+            .expect_err("certified a manifest chained to a replaced one")
+            .to_string();
+        ensure!(error.contains("chains to"), "{error}");
         archive::verify(&ledger, P0, root.path()).await?;
+        // Written again in order, the chain is whole again.
+        archive::archive(&ledger, P1, root.path(), true, "operator-a").await?;
+        ensure!(
+            read_archive(root.path(), P1)?.manifest.previous_manifest_sha256
+                == Some(read_archive(root.path(), P0)?.manifest_sha256),
+            "the second archive was not relinked to the rewritten first"
+        );
+        archive::verify(&ledger, P1, root.path()).await?;
+        // Once a later archive has left the ledger it cannot be written again
+        // to follow a new manifest, so the manifest it chains to is fixed.
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P1} CONCURRENTLY"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let reconciled = archive::detach(&ledger, P1, &retention(0)).await?;
+        ensure!(reconciled["action"] == "reconciled", "{reconciled}");
+        let error = archive::archive(&ledger, P0, root.path(), true, "operator-a")
+            .await
+            .expect_err("rewrote a manifest a detached partition chains to")
+            .to_string();
+        ensure!(
+            error.contains("have left the ledger") && error.contains(P1),
+            "{error}"
+        );
+        ensure!(
+            catalog(&ledger.pool, P0)
+                .await?
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archive_verified_at")?
+                .is_some(),
+            "the refused rewrite cleared the verification it left in place"
+        );
 
         // Tamper: one byte of the compressed file.
         let rows_path = root.path().join("qbit_share_ledger").join(P0).join("rows.ndjson.gz");

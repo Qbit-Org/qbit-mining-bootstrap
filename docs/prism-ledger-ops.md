@@ -1029,7 +1029,7 @@ primary, with the frontends running. Nothing here needs a maintenance window.
 | --- | --- |
 | `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written again in order, and is refused once a later archived partition has left the ledger |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
 | `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
 | `drop <partition>` | requires `detached` and verified, and counts the rows against the archive again; `DROP TABLE`; the archive is the copy of record |
@@ -1124,7 +1124,12 @@ own `lower_seq` means a partition is missing from the chain; `archive` refuses
 to write such a manifest and `verify` refuses to certify one, so partitions are
 archived in `upper_seq` order. The manifest's own SHA-256 is what the catalog
 and the next manifest record, so a manifest cannot be rewritten without
-breaking both.
+breaking both: `archive --force` clears the verification of every later
+archive along with its own, and each has to be written again with `--force`,
+in `upper_seq` order, and verified again. It is refused once a later archived
+partition has been detached or dropped, because that partition can no longer
+be archived from its live rows; bring the missing files back from a copy of
+the archive root instead.
 
 **Verifying an archive by hand.** `rows_sha256` is the SHA-256 of the
 uncompressed byte stream, so a verifier streams the file without materializing

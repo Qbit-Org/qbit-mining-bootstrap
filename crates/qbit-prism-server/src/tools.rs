@@ -144,7 +144,9 @@ enum ShareArchiveCommand {
         /// Archive root the layout is written under.
         #[arg(long)]
         dir: PathBuf,
-        /// Overwrite an archive this partition already has.
+        /// Overwrite an archive this partition already has, clearing its
+        /// verification and that of every later archive, which must then be
+        /// written again in order.
         #[arg(long)]
         force: bool,
     },

@@ -746,6 +746,23 @@ async fn archived_predecessor(
     .transpose()
 }
 
+/// Every archived partition above `upper_seq`, in order: the ones whose chain
+/// passes through the manifest recorded at that position.
+async fn archived_successors(
+    connection: &mut PgConnection,
+    upper_seq: i64,
+) -> Result<Vec<PartitionRecord>> {
+    sqlx::query(&format!(
+        "{SELECT_PARTITION} WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq>$1 ORDER BY upper_seq"
+    ))
+    .bind(upper_seq)
+    .fetch_all(&mut *connection)
+    .await?
+    .iter()
+    .map(PartitionRecord::from_row)
+    .collect()
+}
+
 /// The next `share_seq` the sequence will hand out. A partition whose
 /// `upper_seq` is above it can still receive appends, so no archive of it can
 /// be complete, and no comparison with its live rows proves anything about the
@@ -1337,7 +1354,10 @@ pub async fn seal(ledger: &Ledger, partition_name: &str) -> Result<Value> {
 /// archive is overwritten only with `--force`, and only after the replacement
 /// manifest exists on disk. The catalog is updated once, after both renames,
 /// and the previous verification is cleared with it: a new archive has not
-/// been verified.
+/// been verified. Every later archive chains to the replaced manifest's digest,
+/// so their verifications are cleared too and each has to be written again in
+/// order; once one of them has left the ledger it cannot be, and the archive
+/// is refused instead.
 pub async fn archive(
     ledger: &Ledger,
     partition_name: &str,
@@ -1359,7 +1379,7 @@ pub async fn archive(
     check_sequence_passed(&record, next_share_seq, "archive")?;
     ensure!(
         record.archived_at.is_none() || force,
-        "refusing to archive {partition_name}: it was already archived at {} into {}. Pass --force to write it again, which also clears the recorded verification",
+        "refusing to archive {partition_name}: it was already archived at {} into {}. Pass --force to write it again, which also clears the recorded verification, its own and that of every later archive",
         record
             .archived_at
             .map(|at| at.to_rfc3339())
@@ -1385,6 +1405,22 @@ pub async fn archive(
             None => "No partition below it is archived".to_owned(),
         },
         number_or(record.lower_seq, "MINVALUE")
+    );
+    // Every later archive chains, directly or through the ones between, to
+    // this partition's manifest digest, and a new manifest has a new digest.
+    // Each of them has to be written again in order and verified again, so
+    // their verifications go with this one's; one that has already left the
+    // ledger cannot be written again, and then this manifest has to stay.
+    let successors = archived_successors(&mut connection, record.upper_seq).await?;
+    let departed: Vec<&str> = successors
+        .iter()
+        .filter(|row| row.state != "attached")
+        .map(|row| row.partition_name.as_str())
+        .collect();
+    ensure!(
+        departed.is_empty(),
+        "refusing to archive {partition_name} again: every later archive chains to its manifest and would have to be written again in order, but these have left the ledger and cannot be: {}. The recorded archive stays the copy of record; bring its files back from a copy of the archive root instead",
+        departed.join(", ")
     );
 
     let directory = partition_dir(root, partition_name);
@@ -1463,6 +1499,23 @@ pub async fn archive(
         updated == 1,
         "{partition_name} left the attached state while it was being archived; the files at {uri} are complete but nothing was recorded. Run share-archive plan and archive it again"
     );
+    let verification_cleared: Vec<&str> = successors
+        .iter()
+        .map(|row| row.partition_name.as_str())
+        .collect();
+    if !verification_cleared.is_empty() {
+        let cleared = sqlx::query(
+            "UPDATE qbit_prism_share_partitions SET archive_verified_at=NULL WHERE archive_manifest_sha256 IS NOT NULL AND upper_seq>$1 AND state='attached'",
+        )
+        .bind(record.upper_seq)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(
+            cleared == u64::try_from(verification_cleared.len())?,
+            "the set of later archived partitions changed while {partition_name} was being archived; the files at {uri} are complete but nothing was recorded. Run share-archive plan and archive it again"
+        );
+    }
     tx.commit().await?;
     Ok(json!({
         "schema": "qbit.prism.share-archive-archive.v1",
@@ -1470,6 +1523,7 @@ pub async fn archive(
         "archive_uri": uri,
         "rows_uri": rows_path.display().to_string(),
         "archive_manifest_sha256": manifest_sha256,
+        "verification_cleared": verification_cleared,
         "manifest": manifest,
     }))
 }
