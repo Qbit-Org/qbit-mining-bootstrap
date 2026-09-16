@@ -339,7 +339,7 @@ impl Fixture {
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(chain_observation::ChainObservation::default()),
             resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),

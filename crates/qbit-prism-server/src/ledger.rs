@@ -54,6 +54,7 @@ pub use migration::{
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
+pub(crate) use window::ChainObservationRetry;
 pub use window::CommitGateClosed;
 pub use window::{
     probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,

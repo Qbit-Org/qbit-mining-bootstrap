@@ -3,12 +3,17 @@ use crate::ledger::{
     CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
     PreparedTemplate, StoredCompactPrepared,
 };
+use anyhow::bail;
 use std::collections::VecDeque;
 
 // Script typed observations rather than duplicate the database's blob codec.
 // The fake records only public template identity, never private blob bytes.
 #[derive(Default)]
 pub(crate) struct CompactStore {
+    pub observation_before: StdMutex<Option<Arc<Gate>>>,
+    pub observation_after: StdMutex<Option<Arc<Gate>>>,
+    pub observation_unknown: StdMutex<Option<FailCommit>>,
+    pub transition_calls: AtomicUsize,
     pub reads: StdMutex<VecDeque<Result<Option<StoredCompactPrepared>>>>,
     pub read_keys: StdMutex<Vec<String>>,
     pub metadata: StdMutex<HashMap<String, StoredCompactPrepared>>,
@@ -287,32 +292,66 @@ impl work_ledger::WorkLedger for MemoryLedger {
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
             let mut previous = self.tip.lock().unwrap();
-            if previous.as_deref().is_some_and(|old| old != tip) {
-                self.revision.fetch_add(1, Ordering::SeqCst);
-            }
+            ensure!(
+                previous.as_deref().is_none_or(|old| old == tip),
+                "local node follows a conflicting equal-work chain tip"
+            );
             *previous = Some(tip.into());
             Ok(self.revision.load(Ordering::SeqCst))
         })
     }
-    fn observe_chain_view_at_revision<'a>(
+    fn observe_chain_transition<'a>(
         &'a self,
+        predecessor: &'a str,
         tip: &'a str,
         _height: u64,
         _work: &'a str,
         expected_revision: i64,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move {
-            let mut previous = self.tip.lock().unwrap();
-            ensure!(
-                previous.as_deref() == Some(tip)
-                    || self.revision.load(Ordering::SeqCst) == expected_revision,
-                "chain observation revision changed"
-            );
-            if previous.as_deref().is_some_and(|old| old != tip) {
-                self.revision.fetch_add(1, Ordering::SeqCst);
+            self.compact.transition_calls.fetch_add(1, Ordering::SeqCst);
+            let before = self.compact.observation_before.lock().unwrap().take();
+            if let Some(gate) = before {
+                gate.entered.notify_one();
+                gate.release.notified().await;
             }
-            *previous = Some(tip.into());
-            Ok(self.revision.load(Ordering::SeqCst))
+            let unknown = self.compact.observation_unknown.lock().unwrap().take();
+            if matches!(unknown, Some(FailCommit::NotRecorded)) {
+                bail!("simulated lost chain observation COMMIT reply");
+            }
+            let revision = {
+                let mut previous = self.tip.lock().unwrap();
+                if previous.as_deref() == Some(predecessor)
+                    && self.revision.load(Ordering::SeqCst) != expected_revision
+                {
+                    return Err(crate::ledger::ChainObservationRetry.into());
+                }
+                ensure!(
+                    previous.as_deref() == Some(tip)
+                        || self.revision.load(Ordering::SeqCst) == expected_revision,
+                    "chain observation revision changed"
+                );
+                ensure!(
+                    previous
+                        .as_deref()
+                        .is_none_or(|old| old == tip || old == predecessor),
+                    "chain transition predecessor changed"
+                );
+                if previous.as_deref().is_some_and(|old| old != tip) {
+                    self.revision.fetch_add(1, Ordering::SeqCst);
+                }
+                *previous = Some(tip.into());
+                self.revision.load(Ordering::SeqCst)
+            };
+            let after = self.compact.observation_after.lock().unwrap().take();
+            if let Some(gate) = after {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if matches!(unknown, Some(FailCommit::Recorded)) {
+                bail!("simulated lost chain observation COMMIT reply");
+            }
+            Ok(revision)
         })
     }
     fn snapshot_with_admission(

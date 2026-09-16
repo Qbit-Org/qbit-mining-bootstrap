@@ -47,7 +47,13 @@ async fn prepare_replacement_lease(f: &Fixture) -> i64 {
     let revision = f
         .coordinator
         .work_ledger
-        .observe_chain_view(&hash(2), 100, "01")
+        .observe_chain_transition(
+            &hash(1),
+            &hash(2),
+            100,
+            "01",
+            f.store.revision.load(Ordering::SeqCst),
+        )
         .await
         .unwrap();
     assert!(revision > original.snapshot.payout_revision);

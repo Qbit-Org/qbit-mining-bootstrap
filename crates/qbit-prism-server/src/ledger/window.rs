@@ -24,6 +24,19 @@ impl std::fmt::Display for CommitGateClosed {
 
 impl std::error::Error for CommitGateClosed {}
 
+/// A transition was refused before any write, with its predecessor still the
+/// accepted tip. Only a new coherent proof may retry the uncommitted transition.
+#[derive(Debug)]
+pub(crate) struct ChainObservationRetry;
+
+impl std::fmt::Display for ChainObservationRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chain observation revision changed")
+    }
+}
+
+impl std::error::Error for ChainObservationRetry {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchor_ms: i64,
@@ -319,25 +332,41 @@ impl Ledger {
             .await
     }
 
-    /// Follow the node's equal-work, same-height fork choice only when the
-    /// cluster still has the revision read *before* the coherent node proof.
-    /// A delayed observation must not reverse a replacement another observer
-    /// has already committed. Fresh observations of disagreeing nodes can still
-    /// change fork choice; every change revokes old payout authority atomically.
+    /// Follow an observed local node transition from the accepted predecessor,
+    /// with the revision read *before* its fresh coherent node proof. A delayed
+    /// observation must not reverse a replacement another observer committed.
+    /// Callers consume this transition before I/O: unchanged opposing polls,
+    /// cancellation, unknown COMMIT outcomes and failed later publication must
+    /// not create another transition. Only `ChainObservationRetry` establishes
+    /// that no write occurred and a fresh proof may retry the same transition.
     /// Greater-work observations and the already accepted tip retain their
     /// existing monotonic/no-op semantics, even if the revision has advanced.
     /// Callers must prove that tip, height and work describe the same active tip.
-    /// Candidate/settlement observers without that pre-observation revision use
-    /// the strict [`Self::observe_chain_view`] path instead.
-    pub async fn observe_chain_view_at_revision(
+    /// Candidate/settlement observers and cold observers without a coherent
+    /// local predecessor use the strict [`Self::observe_chain_view`] path.
+    /// A cold conflicting equal-work node waits for convergence or more work;
+    /// this is not an authoritative-node election or a failover policy.
+    pub async fn observe_chain_transition(
         &self,
+        predecessor: &str,
         tip: &str,
         height: u64,
         chainwork_hex: &str,
         expected_revision: i64,
     ) -> Result<i64> {
-        self.observe_chain_view_checked(tip, height, chainwork_hex, Some(expected_revision))
-            .await
+        ensure!(
+            predecessor.len() == 64
+                && predecessor.bytes().all(|c| c.is_ascii_hexdigit())
+                && !predecessor.eq_ignore_ascii_case(tip),
+            "invalid chain transition predecessor"
+        );
+        self.observe_chain_view_checked(
+            tip,
+            height,
+            chainwork_hex,
+            Some((&predecessor.to_ascii_lowercase(), expected_revision)),
+        )
+        .await
     }
 
     async fn observe_chain_view_checked(
@@ -345,7 +374,7 @@ impl Ledger {
         tip: &str,
         height: u64,
         chainwork_hex: &str,
-        expected_revision: Option<i64>,
+        transition: Option<(&str, i64)>,
     ) -> Result<i64> {
         ensure!(
             tip.len() == 64 && tip.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -378,19 +407,28 @@ impl Ledger {
             "local node is behind the cluster's cumulative chainwork"
         );
         let mut revision: i64 = row.try_get("payout_revision")?;
-        let same_tip = row
-            .try_get::<Option<String>, _>("best_tip_hash")?
-            .as_deref()
-            == Some(&tip);
+        let accepted_tip: Option<String> = row.try_get("best_tip_hash")?;
+        let same_tip = accepted_tip.as_deref() == Some(&tip);
         if same {
+            let same_height = row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height);
             if !same_tip {
-                if let Some(expected) = expected_revision {
-                    ensure!(revision == expected, "chain observation revision changed");
+                if let Some((from, expected)) = transition {
+                    if revision != expected {
+                        if accepted_tip.as_deref() == Some(from) && same_height {
+                            // No UPDATE or COMMIT has been attempted. Preserve
+                            // this distinction from an indeterminate SQL error.
+                            return Err(ChainObservationRetry.into());
+                        }
+                        bail!("chain observation revision changed");
+                    }
+                    ensure!(
+                        accepted_tip.as_deref() == Some(from),
+                        "chain transition predecessor changed"
+                    );
                 }
             }
             ensure!(
-                (same_tip || expected_revision.is_some())
-                    && row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height),
+                (same_tip || transition.is_some()) && same_height,
                 "local node follows a conflicting equal-work chain tip"
             );
         }

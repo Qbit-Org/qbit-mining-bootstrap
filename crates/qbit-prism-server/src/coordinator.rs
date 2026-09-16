@@ -31,6 +31,7 @@ use std::{
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod bundle_build;
+mod chain_observation;
 mod compact_resume;
 mod compact_runtime;
 mod miner_submit;
@@ -232,7 +233,7 @@ pub struct Coordinator {
     /// share appends and the candidate-lease heartbeat, which must not wait out
     /// the 15 s acquire timeout behind a multi-page read.
     window_reads: Arc<Semaphore>,
-    refresh_lock: Mutex<()>,
+    refresh_lock: Mutex<chain_observation::ChainObservation>,
     resume_flights: compact_resume::ResumeFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -698,7 +699,7 @@ impl Coordinator {
             readiness: Arc::new(RwLock::new(ReadinessState::default())),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(chain_observation::ChainObservation::default()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -870,7 +871,7 @@ impl Coordinator {
     }
 
     pub async fn refresh_once(&self) -> Result<()> {
-        let _flight = self.refresh_lock.lock().await;
+        let mut observation = self.refresh_lock.lock().await;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
@@ -912,9 +913,14 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = self
-            .work_ledger
-            .observe_chain_view_at_revision(parent, height - 1, chainwork, chain_revision)
+        let observed_revision = observation
+            .observe(
+                &*self.work_ledger,
+                parent,
+                height - 1,
+                chainwork,
+                chain_revision,
+            )
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;

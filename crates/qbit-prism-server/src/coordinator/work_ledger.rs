@@ -47,8 +47,9 @@ pub(super) trait WorkLedger: Send + Sync {
         height: u64,
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>>;
-    fn observe_chain_view_at_revision<'a>(
+    fn observe_chain_transition<'a>(
         &'a self,
+        predecessor: &'a str,
         tip: &'a str,
         height: u64,
         chainwork: &'a str,
@@ -150,15 +151,17 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(Ledger::observe_chain_view(self, tip, height, chainwork))
     }
-    fn observe_chain_view_at_revision<'a>(
+    fn observe_chain_transition<'a>(
         &'a self,
+        predecessor: &'a str,
         tip: &'a str,
         height: u64,
         chainwork: &'a str,
         expected_revision: i64,
     ) -> BoxFuture<'a, Result<i64>> {
-        Box::pin(Ledger::observe_chain_view_at_revision(
+        Box::pin(Ledger::observe_chain_transition(
             self,
+            predecessor,
             tip,
             height,
             chainwork,
