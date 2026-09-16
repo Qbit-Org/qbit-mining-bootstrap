@@ -5940,6 +5940,204 @@ async fn the_kill_interrupts_pending_submits_and_records_the_count_at_the_kill_b
     Ok(())
 }
 
+/// The census fence is published at the kill itself, not when the driver is
+/// constructed. `KillDriver::start` runs when the phase *decides* to kill;
+/// `poll` then waits up to `WORK_WAIT` for the target to actually hold
+/// work. A fence published at construction would stamp every record any
+/// session built during that wait with the post-kill value, sweeping up to
+/// twenty seconds of ordinary mid-run no-responses into the kill's census
+/// and exempting them from the ordinary check -- the mirror image of the
+/// defect the fence was introduced to fix, and it can suppress exit 5 on a
+/// share that committed. The fence is the operation identity of one event,
+/// the SIGKILL, so it must be published there and nowhere earlier
+/// (EP-STATE, EP-OBSERVABILITY).
+///
+/// The nanosecond between the bump and `kill()` is not observable, but the
+/// publication point is: the counter is unchanged across construction and
+/// across every poll that finds no work, and it advances exactly once, on
+/// the poll that kills. A record built during the wait carries the pre-kill
+/// value and stays out of the census; one built after the kill is in it.
+/// That membership also pins the value the driver used: with the two
+/// records at 0 and 1, only a boundary of exactly 1 keeps one and drops the
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_census_fence_is_published_at_the_kill_not_when_the_driver_is_constructed() -> Result<()>
+{
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::kill::KillDriver;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const DURING_THE_WAIT: &str = "pload1abc.s00000:disconnected-during-the-wait";
+    const KILLED: &str = "pload1abc.s00000:lost-to-the-kill";
+
+    let dir = ScratchDir::new("kill-fence-point");
+    let server = stand_in_server(dir.path(), "PRISM listening (stand-in)");
+    let (audit_port, _audit) = stand_in_audit_port().await;
+    let mut frontends = vec![stand_in_frontend(&server, dir.path(), 0, audit_port)];
+    let first_pid = frontends[0].pid().expect("the stand-in is running");
+    // The target holds no work yet: the driver must wait for some.
+    let (victim, mut victim_control) = detached_session(0, 0, 0);
+    let sessions = vec![victim];
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let kill_fence = Arc::new(AtomicU64::new(0));
+    let no_response = |share_id: &str, reason: &str| client::SubmitRecord {
+        share_id: share_id.into(),
+        session: 0,
+        frontend: 0,
+        // As the session thread reads it while building the record.
+        fence: kill_fence.load(Ordering::SeqCst),
+        ..submit_record(
+            "mid_flight_kill",
+            Outcome::NoResponse {
+                reason: reason.into(),
+            },
+        )
+    };
+
+    let mut driver = KillDriver::start(
+        0,
+        Duration::from_secs(20),
+        Duration::from_secs(10),
+        kill_fence.clone(),
+    );
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        0,
+        "constructing the driver decides nothing about the census: the fence is unchanged"
+    );
+
+    // The wait for work. Every poll finds nothing outstanding, returns
+    // without killing, and leaves the fence alone.
+    for _ in 0..25 {
+        assert!(
+            driver
+                .poll(&sessions, &mut frontends, &[], &collected)?
+                .is_none(),
+            "a driver still waiting for work is not done"
+        );
+        assert_eq!(
+            kill_fence.load(Ordering::SeqCst),
+            0,
+            "a poll that found no work published no fence"
+        );
+        assert_eq!(frontends[0].pid(), Some(first_pid), "and killed nothing");
+        assert!(
+            !sessions[0].paused.load(Ordering::Relaxed),
+            "and paused nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "the session was sent nothing while the driver waited for work"
+    );
+    // An ordinary mid-run disconnect on the target, emitted while the
+    // driver is waiting: not the kill's, whatever happens next.
+    let during_the_wait = no_response(DURING_THE_WAIT, "socket closed: end of stream");
+    assert_eq!(
+        during_the_wait.fence, 0,
+        "a record built while the driver waits for work carries the pre-kill fence"
+    );
+    collected
+        .lock()
+        .unwrap()
+        .apply(client::Event::Submit(Box::new(during_the_wait)));
+
+    // Work arrives. The next poll kills on it, and that poll -- no earlier
+    // one -- publishes the fence.
+    sessions[0].outstanding.store(1, Ordering::Relaxed);
+    assert!(driver
+        .poll(&sessions, &mut frontends, &[], &collected)?
+        .is_none());
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the poll that found work published the fence, once"
+    );
+    assert!(
+        frontends[0].pid().is_none(),
+        "and killed the process on that same poll"
+    );
+    assert!(matches!(
+        victim_control.try_recv(),
+        Ok(client::Control::Pause)
+    ));
+    // The no-response the kill destroyed the answer to, as the session's
+    // reader reports it on end of stream.
+    let killed = no_response(KILLED, "socket closed: end of stream");
+    assert_eq!(
+        killed.fence, 1,
+        "a record built after the kill carries the published fence"
+    );
+    collected
+        .lock()
+        .unwrap()
+        .apply(client::Event::Submit(Box::new(killed)));
+    sessions[0].outstanding.store(0, Ordering::Relaxed);
+
+    let started = Instant::now();
+    let record = loop {
+        if let Some(record) = driver.poll(&sessions, &mut frontends, &[], &collected)? {
+            break record;
+        }
+        while let Ok(message) = victim_control.try_recv() {
+            match message {
+                client::Control::CensusBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+                other => panic!("resumed or re-offered before the census finished: {other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the kill did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        kill_fence.load(Ordering::SeqCst),
+        1,
+        "the whole kill advanced the fence exactly once"
+    );
+    assert_eq!(
+        record.outstanding_at_kill, 1,
+        "the victim held the work the driver waited for when it was killed"
+    );
+    assert_eq!(
+        record
+            .indeterminate
+            .iter()
+            .map(|r| r.share_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![KILLED],
+        "the census is the record built after the kill and not the one built while the \
+         driver waited for work: the boundary the driver used is the value it published \
+         at the kill"
+    );
+    match victim_control.try_recv() {
+        Ok(client::Control::Retarget {
+            frontend: 0,
+            reconnect: false,
+            ..
+        }) => {}
+        other => panic!("the victim's session is retargeted once the relaunch answers: {other:?}"),
+    }
+    match victim_control.try_recv() {
+        Ok(client::Control::Reoffer { share_id, .. }) => assert_eq!(share_id, KILLED),
+        other => panic!("only the kill's own share is re-offered: {other:?}"),
+    }
+    assert!(
+        victim_control.try_recv().is_err(),
+        "the disconnect during the wait is not re-offered as one of the kill's"
+    );
+    for child in frontends.iter_mut() {
+        child.kill();
+    }
+    Ok(())
+}
+
 /// Neither an unfinished victim nor a stalled collector may turn a partial
 /// census into a successful run. Both waits share the configured deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
