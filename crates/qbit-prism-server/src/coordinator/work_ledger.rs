@@ -13,6 +13,7 @@ pub(super) trait WorkLedger: Send + Sync {
         None
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
     fn read_window_with_permit<'a>(
@@ -86,6 +87,9 @@ pub(super) trait WorkLedger: Send + Sync {
 }
 
 impl WorkLedger for Ledger {
+    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(Ledger::latest_accepted_share_seq(self))
+    }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(Ledger::payout_revision(self))
     }

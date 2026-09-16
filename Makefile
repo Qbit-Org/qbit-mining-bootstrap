@@ -18,7 +18,12 @@ export COMPOSE_PROJECT_NAME
 export DEPLOY_ENV_FILE
 
 COMPOSE := docker compose $(COMPOSE_ENV_FILES) -f compose.yaml --project-name $(COMPOSE_PROJECT_NAME)
-PRODUCTION_COMPOSE ?= $(COMPOSE) -f compose.production.yaml
+# Ordered additional overlays shared by doctor and the PRISM deployment.
+COMPOSE_OVERLAY_FILES ?=
+COMPOSE_OVERLAY_ARGS = $(foreach file,$(COMPOSE_OVERLAY_FILES),-f "$(file)")
+PRODUCTION_COMPOSE ?= $(COMPOSE) -f compose.production.yaml $(COMPOSE_OVERLAY_ARGS)
+# Dependencies select bundled databases only when the overlay retains them.
+PRISM_COMPOSE_SERVICES ?= qbitd prism-coordinator prism-public-api
 # Shared profile set for disposable test cleanup; ordinary down adds PRISM but preserves volumes.
 COMPOSE_ALL_PROFILES := $(COMPOSE) --profile permissionless --profile real-miner-smoke --profile auxpow
 # Destructive integration cleanup is confined to a fresh, invocation-specific
@@ -31,14 +36,14 @@ set -euo pipefail; \
 QBIT_SRC_RESOLVED="$$(bash scripts/prepare-qbit-source.sh)"; \
 export QBIT_SRC_DIR="$$QBIT_SRC_RESOLVED"; \
 export QBIT_SRC_DIR_OVERRIDE="$$QBIT_SRC_RESOLVED"; \
-bash scripts/check-env.sh; \
+bash scripts/check-env.sh --make-deployment $(foreach file,$(COMPOSE_OVERLAY_FILES),--compose-file "$(file)"); \
 printf 'doctor: staged qbit source=%s\n' "$$QBIT_SRC_RESOLVED";
 endef
 
 define COMPOSE_ENV_HELPERS
 compose_env="$$(mktemp)"; \
 trap 'rm -f "$$compose_env"' EXIT; \
-$(COMPOSE) config --environment > "$$compose_env"; \
+$(COMPOSE) $(COMPOSE_OVERLAY_ARGS) config --environment > "$$compose_env"; \
 compose_env_value() { \
 	awk -F= -v key="$$1" -v dflt="$${2:-}" '$$1 == key { print substr($$0, index($$0, "=") + 1); found=1 } END { if (!found) print dflt }' "$$compose_env"; \
 }; \
@@ -296,9 +301,9 @@ up-prism-pool:
 	fi; \
 	printf 'audit HTTP stays inside the coordinator namespace at %s:%s\n' "$$(compose_env_value PRISM_AUDIT_BIND 127.0.0.1)" "$$(compose_env_value PRISM_AUDIT_PORT 3341)"; \
 	if [[ "$$(operator_build_mode)" == no-build ]]; then \
-		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator prism-public-api; \
+		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never $(PRISM_COMPOSE_SERVICES); \
 	else \
-		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator prism-public-api; \
+		$(COMPOSE) $(COMPOSE_OVERLAY_ARGS) --profile prism up --build $(PRISM_COMPOSE_SERVICES); \
 	fi
 
 up-dual-pools: export MINING_LANES=ckpool,auxpow
