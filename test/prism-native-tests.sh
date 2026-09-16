@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the native PRISM test suites against a disposable PostgreSQL.
 #
-#   test/prism-native-tests.sh              every workspace test, the two
-#                                           explicit #[ignore] database runs,
+#   test/prism-native-tests.sh              every workspace test, the three
+#                                           explicit #[ignore] database targets,
 #                                           and the gate manifest check: the
 #                                           prism-native-postgres CI job
 #   test/prism-native-tests.sh live         the real qbitd regtest suite
@@ -136,6 +136,7 @@ case "${mode}" in
     run_tests cargo test --locked -p qbit-prism-server --test stratum_admission_postgres \
       -- --ignored --nocapture --exact ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
     run_tests cargo test --locked -p qbit-prism-server --test observability_database -- --ignored --nocapture
+    run_tests cargo test --locked -p qbit-prism-server --test issued_job_dependency -- --ignored --nocapture --test-threads=2
     ;;
 esac
 

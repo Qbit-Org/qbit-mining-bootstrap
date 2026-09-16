@@ -182,6 +182,8 @@ class CheckGateManifestTests(unittest.TestCase):
         )
         oracle = [i for i in ids if i.startswith("qbit-prism-server::window_read_oracle::")]
         self.assertEqual(len(oracle), 8, oracle)
+        dependency = [i for i in ids if i.startswith("qbit-prism-server::issued_job_dependency::")]
+        self.assertEqual(len(dependency), 7, dependency)
 
     def test_ci_requires_shards_and_combined_proof_and_uploads_the_manifest(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
