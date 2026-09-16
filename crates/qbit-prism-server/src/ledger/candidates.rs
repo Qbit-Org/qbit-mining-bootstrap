@@ -8,6 +8,7 @@ use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     AuditBundleBody, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy, SettlementModeConfig,
 };
+use serde_json::json;
 use std::sync::Arc;
 
 /// The public keys the building frontend signed with. The seeds stay local;
@@ -1417,6 +1418,179 @@ impl Ledger {
         };
         format!("SELECT block_hash FROM qbit_block_candidate_outbox WHERE state IN {states} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1")
     }
+}
+
+/// The operator candidate commands (#268). Both are deliberately narrow:
+/// `list` is an inventory that cannot write, and `abandon` applies to a
+/// `pending` row only, because `pending` is the one unfinished state from
+/// which no `submitblock` can yet have been made. Neither reads a node, a
+/// signing key or any configuration beyond the database URL.
+impl Ledger {
+    /// The statement [`Ledger::list_candidates`] issues, without its bind.
+    /// Public so a test can describe the statement the command runs rather
+    /// than a copy, and prove what it projects.
+    ///
+    /// Neither payload column is selected: the height is extracted to a
+    /// scalar server-side, so the row the operator sees costs eight bytes
+    /// instead of a block and a document. The extraction is guarded by a
+    /// digit pattern rather than a bare cast, so a row an unknown writer
+    /// left behind renders with an unknown height instead of failing the
+    /// whole inventory.
+    pub fn candidate_list_sql() -> String {
+        format!(
+            "SELECT o.block_hash,o.state,\
+             CASE WHEN o.candidate->'found_block'->>'block_height' ~ '^[0-9]{{1,18}}$' \
+             THEN (o.candidate->'found_block'->>'block_height')::bigint END AS block_height,\
+             o.attempt_count,o.storage_version,o.last_error,o.created_at,o.updated_at,\
+             o.next_attempt_at='infinity'::timestamptz AS parked,\
+             CASE WHEN o.next_attempt_at='infinity'::timestamptz THEN NULL \
+             ELSE o.next_attempt_at END AS next_attempt_at,\
+             o.claim_instance_id,o.claim_expires_at,\
+             o.claim_expires_at>clock_timestamp() AS claim_live,\
+             o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply \
+             FROM qbit_block_candidate_outbox o WHERE o.state IN {} \
+             ORDER BY o.next_attempt_at,o.created_at,o.block_hash LIMIT $1",
+            CandidateState::UNFINISHED_SQL
+        )
+    }
+
+    /// Every unfinished candidate, oldest due first: the oldest-due claim
+    /// lane's own ordering, so the row a server works next prints first and
+    /// parked (`infinity`) rows sort last.
+    ///
+    /// The pool is the read-only shape [`Ledger::inspect_fatal_state`] uses.
+    /// `default_transaction_read_only=on` is what makes "takes no claim" a
+    /// property PostgreSQL enforces rather than one a reviewer checks, and
+    /// no write guard runs, so the inventory keeps working while the cluster
+    /// is halted: precisely when an operator needs it.
+    pub async fn list_candidates(url: &str, limit: i64) -> Result<Vec<Value>> {
+        ensure!(
+            (1..=10_000).contains(&limit),
+            "--limit must be between 1 and 10000"
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(15))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('default_transaction_read_only','on',false),set_config('statement_timeout','15s',false),set_config('lock_timeout','5s',false)")
+                        .execute(&mut *connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
+        let rows = sqlx::query(&Self::candidate_list_sql())
+            .bind(limit)
+            .fetch_all(&pool)
+            .await;
+        // Released on the failure path too: an inventory that cannot finish
+        // must not leave a connection behind for the next command.
+        pool.close().await;
+        rows?.iter().map(candidate_summary).collect()
+    }
+
+    /// Abandon one candidate, as the single statement whose `WHERE` *is* the
+    /// safety property: `pending` (never offered, so no `submitblock` can
+    /// have been made for it), no live claim, and no landed block. The
+    /// column list is the supersession path's
+    /// (`policy_transition.rs`), with the operator's reason taking
+    /// `last_error`'s place; `next_attempt_at` is left untouched there and
+    /// here, because no lane selects a terminal row and an `infinity` left
+    /// in it is the evidence that the row had been parked.
+    ///
+    /// The state is a predicate, never a preceding `SELECT`: a row can move
+    /// between a check and a write. When the predicate refuses, the
+    /// diagnosis below runs read-only in the same transaction, for the
+    /// operator's message and exit status alone.
+    pub async fn abandon_candidate(&self, block_hash: &str, reason: &str) -> Result<Value> {
+        let mut tx = self.begin().await?;
+        // A cluster halt and a live legacy Python writer lease both refuse
+        // here, before the statement: an operator abandon never races the
+        // 2.x.x writer during a cutover.
+        writable(&mut tx).await?;
+        let abandoned: Option<String> = sqlx::query_scalar(
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
+            .bind(block_hash).bind(reason).fetch_optional(&mut *tx).await?;
+        let outcome = match abandoned {
+            Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
+            None => diagnose_abandon_refusal(&mut tx, block_hash).await?,
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
+/// One outbox row as the operator commands report it. Every unknown value
+/// stays JSON `null`: an absent height, an unrecorded proof observation and
+/// an offer record an older binary never wrote are all distinct from zero.
+fn candidate_summary(row: &PgRow) -> Result<Value> {
+    let time = |name: &str| -> Result<Value> {
+        Ok(row
+            .try_get::<Option<DateTime<Utc>>, _>(name)?
+            .map_or(Value::Null, |at| json!(at.to_rfc3339())))
+    };
+    Ok(json!({
+        "block_hash": row.try_get::<String, _>("block_hash")?,
+        "state": row.try_get::<String, _>("state")?,
+        "block_height": row.try_get::<Option<i64>, _>("block_height")?,
+        "attempt_count": row.try_get::<i32, _>("attempt_count")?,
+        "storage_version": row.try_get::<i32, _>("storage_version")?,
+        "last_error": row.try_get::<Option<String>, _>("last_error")?,
+        "created_at": time("created_at")?,
+        "updated_at": time("updated_at")?,
+        "parked": row.try_get::<bool, _>("parked")?,
+        "next_attempt_at": time("next_attempt_at")?,
+        "claim_instance_id": row.try_get::<Option<String>, _>("claim_instance_id")?,
+        "claim_expires_at": time("claim_expires_at")?,
+        "claim_live": row.try_get::<Option<bool>, _>("claim_live")?.unwrap_or(false),
+        "proof_observed_at_ms": row.try_get::<Option<i64>, _>("proof_observed_at_ms")?,
+        "offer_reserved_by": row.try_get::<Option<String>, _>("offer_reserved_by")?,
+        "offered_at_ms": row.try_get::<Option<i64>, _>("offered_at_ms")?,
+        "offer_outcome": row.try_get::<Option<String>, _>("offer_outcome")?,
+        "offer_reply": row.try_get::<Option<String>, _>("offer_reply")?,
+    }))
+}
+
+/// Why the abandon statement changed no row, read after it and never before
+/// it. This gates no write: the refusal is already decided.
+async fn diagnose_abandon_refusal(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+) -> Result<Value> {
+    let Some(row) = sqlx::query(
+        "SELECT o.state,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
+        .bind(block_hash).fetch_optional(&mut **tx).await?
+    else {
+        return Ok(json!({"outcome":"missing"}));
+    };
+    let state: String = row.try_get("state")?;
+    let landed: bool = row.try_get("landed")?;
+    let claim_live: bool = row
+        .try_get::<Option<bool>, _>("claim_live")?
+        .unwrap_or(false);
+    Ok(match state.as_str() {
+        "submitted" | "abandoned" => json!({"outcome":"terminal","state":state}),
+        "offer_reserved" | "offered" | "reconciliation" => {
+            json!({"outcome":"offered","state":state})
+        }
+        // A landed block is reported ahead of a live claim: the claim expires
+        // on its own, and the accounting does not.
+        "pending" if landed => json!({"outcome":"landed"}),
+        "pending" if claim_live => json!({
+            "outcome": "claimed",
+            "claim_instance_id": row.try_get::<Option<String>, _>("claim_instance_id")?,
+            "claim_expires_at": row
+                .try_get::<Option<DateTime<Utc>>, _>("claim_expires_at")?
+                .map_or(Value::Null, |at| json!(at.to_rfc3339())),
+        }),
+        // Unfinished business, never "nothing to do": the row is pending,
+        // unclaimed and unlanded, so the statement should have taken it, and
+        // something changed it under this transaction.
+        other => bail!(
+            "candidate {block_hash} is {other} and unclaimed but the abandon statement changed no row; re-read the row before retrying"
+        ),
+    })
 }
 
 async fn claim_candidate_lane(
