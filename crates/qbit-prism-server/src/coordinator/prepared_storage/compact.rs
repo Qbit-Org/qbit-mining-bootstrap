@@ -277,7 +277,7 @@ pub(in crate::coordinator) struct RefreshBuild {
     pub proof: CompactBuildProof,
     pub key: String,
     pub template: Value,
-    pub snapshot: Snapshot,
+    pub window: refresh_window::CachedWindow,
     pub inputs: BundleInputs,
     pub fee: Option<FanoutFeeRatePolicy>,
     pub fingerprint: String,
@@ -303,18 +303,14 @@ impl Coordinator {
                 let admission = permit;
                 #[cfg(test)]
                 let _cleanup = drop_probe;
-                let mut source = source;
-                source.snapshot.prior_balances = CanonicalCompactBalances::prepare(
-                    std::mem::take(&mut source.snapshot.prior_balances),
-                    &admission,
-                )
-                .into_original_build();
-                let window = WindowRef::from_snapshot(&source.snapshot)?;
+                let source = source;
+                let snapshot = &source.window.snapshot;
+                let window = source.window.reference;
                 let body = if window.shares.is_some() {
                     Some(
                         bundle_build::build_body(
                             &config,
-                            &source.snapshot,
+                            snapshot,
                             &source.template,
                             None,
                             source.suffix.clone(),
@@ -329,7 +325,7 @@ impl Coordinator {
                     .as_ref()
                     .map(|body| {
                         Ok::<_, anyhow::Error>(PreparedAuditHashes {
-                            audit_bundle_sha256: audit_parts_sha256(body, &source.snapshot.shares)?,
+                            audit_bundle_sha256: audit_parts_sha256(body, &snapshot.shares)?,
                             coinbase_manifest_sha256: canonical_json_sha256(
                                 &body.signed_coinbase_manifest.manifest,
                             )?,
@@ -350,8 +346,8 @@ impl Coordinator {
                 let record = CompactPrepared {
                     format_version: CompactPrepared::FORMAT_VERSION,
                     window,
-                    share_seq: source.snapshot.share_seq,
-                    payout_revision: source.snapshot.payout_revision,
+                    share_seq: snapshot.share_seq,
+                    payout_revision: snapshot.payout_revision,
                     template_sha256: template.sha256().into(),
                     parent_hash: source.template["previousblockhash"]
                         .as_str()
@@ -373,17 +369,17 @@ impl Coordinator {
                     record,
                     template,
                     source.template,
-                    source.snapshot.prior_balances,
+                    snapshot.prior_balances.clone(),
                     body.as_ref().map(PreparedBundle::from),
                     base_wire,
                     source.original_expires_at_ms,
                     Instant::now(),
                     Some(source.proof),
                 )?;
-                // Body/counts and the original accepted rows drop here, before
-                // admission can be released by the synchronous output handoff.
+                // Counted shares drop under admission; the refresh loop alone
+                // retains the original accepted rows until invalidation.
                 drop(body);
-                drop(source.snapshot.shares);
+                drop(source.window);
                 Ok::<_, anyhow::Error>(CompactOwner::new((captured, admission)))
             })
             .await??;

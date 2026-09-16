@@ -552,6 +552,18 @@ impl Ledger {
         })
     }
 
+    /// Cheap invalidation probe using the accepted sequence index. Appends
+    /// serialize under ORDER_LOCK and reject future job times, so a committed
+    /// accepted row is eligible at the next snapshot's ledger-clock barrier.
+    pub(crate) async fn latest_accepted_share_seq(&self) -> Result<u64> {
+        let cutoff: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(cutoff)?)
+    }
+
     /// Captures all three inputs under the same database boundary: ordered
     /// shares, prior balances and their revision. Timestamp barriers preserve
     /// the existing public audit format without relying on host clock sync.

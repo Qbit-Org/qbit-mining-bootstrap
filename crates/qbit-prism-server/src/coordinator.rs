@@ -36,6 +36,7 @@ mod compact_runtime;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
+mod refresh_window;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
@@ -232,7 +233,8 @@ pub struct Coordinator {
     /// share appends and the candidate-lease heartbeat, which must not wait out
     /// the 15 s acquire timeout behind a multi-page read.
     window_reads: Arc<Semaphore>,
-    refresh_lock: Mutex<()>,
+    refresh_lock:
+        Mutex<Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>>,
     resume_flights: compact_resume::ResumeFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -698,7 +700,7 @@ impl Coordinator {
             readiness: Arc::new(RwLock::new(ReadinessState::default())),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(None),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -870,7 +872,7 @@ impl Coordinator {
     }
 
     pub async fn refresh_once(&self) -> Result<()> {
-        let _flight = self.refresh_lock.lock().await;
+        let mut cached_window = self.refresh_lock.lock().await;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
@@ -926,16 +928,20 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let revision = self.work_ledger.payout_revision().await?;
+        let state = self.work_ledger.payout_state().await?;
+        let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
+        let reuse_window = cached_window.as_ref().is_some_and(|window| {
+            window.reusable(network, share_seq, state, self.config.snapshot_interval)
+        });
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         if let Some(current) = self.prepared.read().await.as_ref() {
-            if current.bundle.is_some()
+            if reuse_window
                 && current.fee == fee
                 && current.fingerprint == fingerprint
-                && current.snapshot.payout_revision == revision
-                && current.created.elapsed() < self.config.snapshot_interval
+                && current.snapshot.payout_revision == state.payout_revision
+                && current.snapshot.share_seq == share_seq
                 && crate::readiness::validate_template_age(
                     &current.template,
                     self.config.template_max_age,
@@ -945,8 +951,8 @@ impl Coordinator {
                 self.ready_tip(parent).await?;
                 self.ensure_template_fresh(&template).await?;
                 ensure!(
-                    self.work_ledger.payout_revision().await? == current.snapshot.payout_revision,
-                    "payout revision changed during work reuse"
+                    self.work_ledger.payout_state().await? == state,
+                    "payout state changed during work reuse"
                 );
                 let mut readiness = self.readiness.write().await;
                 ensure!(
@@ -991,18 +997,30 @@ impl Coordinator {
             )
             .context("prepared expiry overflow")?;
         let permit = Arc::new(self.build_slots.clone().acquire_owned().await?);
-        let snapshot = self
-            .work_ledger
-            .snapshot_with_admission(
-                network,
-                crate::ledger::ReadAdmission::shared(permit.clone()),
-            )
-            .await?;
-        let admitted = prepared_storage::compact::CompactOwner::new((snapshot, permit));
+        let window = if reuse_window {
+            prepared_storage::compact::CompactOwner::new(Arc::clone(
+                cached_window.as_ref().expect("validated refresh window"),
+            ))
+        } else {
+            // Retire the prior cache under admission before allocating its
+            // replacement. Prepared/issued work carries only its WindowRef.
+            let retired = cached_window.take();
+            let cleanup = prepared_storage::compact::CompactOwner::new((retired, permit.clone()));
+            cleanup
+                .spawn_blocking(|(retired, permit)| {
+                    let _admission = permit;
+                    // Unwrap the async cleanup owner while already blocking, so
+                    // its destructor cannot defer cleanup beyond this admission.
+                    drop(retired.map(|window| window.into_inner()));
+                })
+                .await?;
+            self.capture_refresh_window(network, permit.clone()).await?
+        };
+        let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
-                && current.snapshot.share_seq == admitted.0.share_seq
-                && current.snapshot.payout_revision == admitted.0.payout_revision
+                && current.snapshot.share_seq == admitted.0.snapshot.share_seq
+                && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
                 && current.fee == fee
         });
         let generation = self
@@ -1016,12 +1034,12 @@ impl Coordinator {
             self.config.instance_id,
             uuid::Uuid::new_v4().simple()
         );
-        let (snapshot, permit) = admitted.into_inner();
+        let (window, permit) = admitted.into_inner();
         let source = prepared_storage::compact::RefreshBuild {
             proof,
             key: storage_key,
             template,
-            snapshot: snapshot.into_inner(),
+            window: (*window).clone(),
             inputs,
             fee,
             fingerprint,
@@ -1041,6 +1059,7 @@ impl Coordinator {
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
         self.lock_compact_publication(reserved).await?.publish()?;
+        *cached_window = Some(window);
         Ok(())
     }
 
