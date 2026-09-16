@@ -155,15 +155,29 @@ RETURNS bigint LANGUAGE sql STABLE AS $$
     FROM qbit_share_ledger_share_seq_seq;
 $$;
 
--- The share_seq floor a share_id probe may carry: two partition widths
--- below the sequence, so a probe on the partitioned ledger descends at most
--- three per-leaf indexes instead of one per attached partition. A replay
--- the native coordinator retries is seconds old; a share older than this
--- floor is answered by qbit_prism_share_hashes, the global authority.
+-- The share_seq floor a share_id probe may carry: the lower bound of the
+-- attached partition two below the one the next share_seq lands in, read
+-- from the catalog. A probe on the partitioned ledger then descends the
+-- per-leaf indexes of at most three partitions that hold rows (plus the
+-- empty lead) instead of one per attached partition, whatever
+-- partition_rows was when each partition was created. Subtracting two
+-- current widths from the sequence would not do: raise partition_rows
+-- after narrower partitions were attached and that floor spans every one
+-- of them still attached. The floor is always at least two full
+-- partitions of rows below the sequence; a replay the native coordinator
+-- retries is seconds old, and a share older than the floor is answered by
+-- qbit_prism_share_hashes, the global authority. Before the conversion no
+-- partition is cataloged and there is no floor.
 CREATE FUNCTION qbit_prism_share_probe_floor()
 RETURNS bigint LANGUAGE sql STABLE AS $$
-    SELECT GREATEST(0, qbit_prism_share_next_seq()
-        - 2 * (SELECT partition_rows FROM qbit_prism_share_partitioning WHERE singleton));
+    SELECT COALESCE((
+        SELECT COALESCE(lower_seq, 0)
+        FROM qbit_prism_share_partitions
+        WHERE state = 'attached'
+          AND (lower_seq IS NULL OR lower_seq <= qbit_prism_share_next_seq())
+        ORDER BY upper_seq DESC
+        OFFSET 2 LIMIT 1
+    ), 0);
 $$;
 
 -- Create one standalone table shaped like the ledger for [lower, upper),

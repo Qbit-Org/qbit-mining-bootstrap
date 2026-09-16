@@ -681,8 +681,8 @@ async fn share_id_uniqueness_is_per_leaf_and_the_append_path_keeps_it_global() -
     let ledger = db.ledger("a").await?;
     let original = ledger.append(share(1), None).await?;
     assert_eq!(original.share.share_seq, 1);
-    // Move the sequence into the second cell, well past the probe floor of
-    // the first row.
+    // Move the sequence into the fourth cell, p3: the probe floor becomes
+    // the lower bound of p1, two cells below, past the first row.
     sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
         .bind(3 * WIDTH + 10)
         .execute(&pool)
@@ -694,9 +694,9 @@ async fn share_id_uniqueness_is_per_leaf_and_the_append_path_keeps_it_global() -
     let floor: i64 = sqlx::query_scalar("SELECT qbit_prism_share_probe_floor()")
         .fetch_one(&pool)
         .await?;
-    assert!(
-        floor > 1,
-        "the first row is below the probe floor ({floor})"
+    assert_eq!(
+        floor, WIDTH,
+        "the probe floor is not the lower bound of p1, past the first row"
     );
     let later = ledger.append(share(2), None).await?;
     assert_eq!(later.share.share_seq, u64::try_from(3 * WIDTH + 11)?);

@@ -1240,9 +1240,11 @@ partition, because uniqueness is per leaf and the executor cannot prune on a
 column that is not the partition key. Every native `share_id` read of the
 ledger therefore carries
 `share_seq >= qbit_prism_share_probe_floor()`, a `STABLE` function that
-returns two partition widths below the next `share_seq`, so PostgreSQL prunes
-to at most three leaves at executor start. The proof is `Subplans Removed` in
-the plan of the query. Carry the same bound in any new query that looks a
+returns the lower bound of the attached partition two below the one the next
+`share_seq` lands in, read from `qbit_prism_share_partitions`, so PostgreSQL
+prunes to at most three leaves holding rows (plus the empty lead) at executor
+start, whatever width each partition was created with. The proof is
+`Subplans Removed` in the plan of the query. Carry the same bound in any new query that looks a
 share up by `share_id`; if the question is only whether a header was ever
 credited, read `qbit_prism_share_hashes` instead and do not touch the ledger
 at all. An unbounded probe stays correct and gets slower with every partition:
@@ -1357,6 +1359,9 @@ recorded in any state (`qbit_prism_share_partition_next_number()`): a name is
 never reused, and never derived from the width. Changing the width affects
 partitions created afterwards only; bounds already attached stay as they are,
 and the next partition starts at the last bound with the new width. The
+probe floor (`qbit_prism_share_probe_floor()`, below) is read from the
+attached bounds, not from the width, so raising the width does not widen the
+probes over the narrower partitions still attached. The
 release table becomes `qbit_share_ledger_p0`, `[MINVALUE, bound)`, and spans
 as many cells as it needs.
 

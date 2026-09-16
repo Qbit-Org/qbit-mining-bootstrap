@@ -617,8 +617,10 @@ impl Coordinator {
         // per-leaf index per attached partition. This share was submitted by
         // the connection that is still waiting for its acknowledgement, so it
         // can only be in the newest leaves: `qbit_prism_share_probe_floor()`
-        // is two partition widths below the next `share_seq`, which prunes
-        // the probe to at most three leaves at executor start.
+        // is the lower bound of the partition two below the one the next
+        // `share_seq` lands in, which prunes the probe to at most three
+        // leaves holding rows at executor start, whatever width each
+        // partition was created with.
         let exists = tokio::time::timeout_at(
             bound,
             sqlx::query_scalar::<_, bool>(

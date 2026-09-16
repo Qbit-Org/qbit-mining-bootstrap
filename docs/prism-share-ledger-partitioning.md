@@ -149,15 +149,20 @@ replace it:
 3. **Bounded probes.** Every `share_id` lookup on the ledger (the replay
    comparison, the block-only reconciliation probes, the vardiff evidence
    lookup) carries
-   `share_seq >= qbit_prism_share_probe_floor()`: two partition widths
-   below the next `share_seq`, so PostgreSQL prunes to at most three
-   leaves at executor start (verified: "Subplans Removed" in the plan)
-   instead of descending one `share_id` index per attached partition.
-   A probe without the bound costs one index descent per partition per
-   share, which the design spike measured at 31 buffers against 8; the two
-   lookups that fall back to an unbounded probe on a miss (the credited
-   replay above, and the vardiff evidence lookup) do so only for a row
-   older than two partition widths, off the share path.
+   `share_seq >= qbit_prism_share_probe_floor()`: the lower bound of the
+   attached partition two below the one the next `share_seq` lands in,
+   read from the catalog, so PostgreSQL prunes to at most three leaves
+   holding rows (plus the empty lead) at executor start (verified:
+   "Subplans Removed" in the plan) instead of descending one `share_id`
+   index per attached partition. The floor follows the bounds actually
+   attached, not `partition_rows`: subtracting two current widths from
+   the sequence would span every narrower partition still attached once
+   the width was raised. A probe without the bound costs one index
+   descent per partition per share, which the design spike measured at
+   31 buffers against 8; the two lookups that fall back to an unbounded
+   probe on a miss (the credited replay above, and the vardiff evidence
+   lookup) do so only for a row older than the floor, at least two full
+   partitions of rows, off the share path.
 
 The invariant this leaves is stated plainly: a row inserted *around* the
 append path (a direct `INSERT` by an operator or a harness) with a

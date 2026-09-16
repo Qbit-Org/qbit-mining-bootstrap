@@ -569,10 +569,11 @@ async fn share_id_probes_are_bounded_and_the_vardiff_lookup_is_still_exact() -> 
             "the vardiff lookup missed a share appended moments ago"
         );
 
-        // Move the sequence two partition widths past that share so the floor
-        // rises above it, and attach the lead the moved sequence needs.
+        // Move the sequence into the fourth cell, p3, and attach the lead the
+        // moved sequence needs: the floor is the lower bound of the cell two
+        // below the sequence's, p1, which is above that share.
         let width = db.partition_rows().await?;
-        db.set_next_seq(2 * width + 10).await?;
+        db.set_next_seq(3 * width + 10).await?;
         ensure!(
             partitions::ensure(db.pool()).await? > 0,
             "no lead was attached for the moved sequence"
@@ -581,8 +582,8 @@ async fn share_id_probes_are_bounded_and_the_vardiff_lookup_is_still_exact() -> 
             .fetch_one(db.pool())
             .await?;
         ensure!(
-            floor > i64::try_from(fresh.share_seq)?,
-            "the probe floor {floor} did not rise above share_seq {}",
+            floor == width && floor > i64::try_from(fresh.share_seq)?,
+            "the probe floor {floor} is not the lower bound of p1, two cells below the sequence, above share_seq {}",
             fresh.share_seq
         );
         ensure!(
@@ -601,6 +602,117 @@ async fn share_id_probes_are_bounded_and_the_vardiff_lookup_is_still_exact() -> 
                 .await?
                 .is_none(),
             "the vardiff lookup invented evidence for an absent share"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    db.close().await?;
+    result
+}
+
+/// The leaves the bounded probe descends, by name, and how many attached
+/// partitions executor-startup pruning removed before it ran.
+async fn bounded_probe_plan(pool: &PgPool, share_id: &str) -> Result<(Vec<String>, i64)> {
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()",
+    )
+    .bind(share_id)
+    .fetch_all(pool)
+    .await?;
+    let mut leaves = Vec::new();
+    let mut removed = 0;
+    for line in &plan {
+        if let Some(rest) = line.trim().strip_prefix("Subplans Removed: ") {
+            removed = rest.parse()?;
+        }
+        if let Some(rest) = line.split(" on qbit_share_ledger_p").nth(1) {
+            let number: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            leaves.push(format!("qbit_share_ledger_p{number}"));
+        }
+    }
+    ensure!(
+        !leaves.is_empty(),
+        "the probe plan names no partition: {plan:?}"
+    );
+    // A bitmap scan names a leaf twice, once per node.
+    leaves.sort();
+    leaves.dedup();
+    Ok((leaves, removed))
+}
+
+/// The probe floor is the lower bound of the attached partition two below
+/// the one the sequence is in, read from the catalog, so a probe descends
+/// at most three leaves holding rows plus the empty lead whatever
+/// `partition_rows` was when each partition was created. Two current widths
+/// below the sequence would not do: after the width grows, that floor spans
+/// every narrower partition still attached below the sequence.
+#[tokio::test]
+async fn the_probe_floor_tracks_the_attached_bounds_after_the_width_grows() -> Result<()> {
+    let Some(db) = Database::open("floor").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let width = db.partition_rows().await?;
+        let start = db.attached().await?;
+        ensure!(start.len() == 5, "unexpected attached set: {start:?}");
+        // Nothing to prune while the sequence is in the release partition:
+        // every leaf is in range, the lead included.
+        let early = db.ledger.append(share(1, "alice"), None).await?.share;
+        let (leaves, removed) = bounded_probe_plan(db.pool(), &early.share_id).await?;
+        ensure!(
+            leaves == start && removed == 0,
+            "a probe with the sequence in p0 pruned {removed} of {start:?}: {leaves:?}"
+        );
+
+        // Quadruple the width, then move the sequence into the first cell of
+        // the new grid, p5 = [5W, 9W), and attach its lead.
+        sqlx::query(
+            "UPDATE qbit_prism_share_partitioning SET partition_rows=partition_rows*4,updated_at=clock_timestamp() WHERE singleton",
+        )
+        .execute(db.pool())
+        .await?;
+        db.set_next_seq(5 * width + 10).await?;
+        ensure!(
+            partitions::ensure(db.pool()).await? > 0,
+            "no lead was attached above the widened grid"
+        );
+        let attached = db.attached().await?;
+        ensure!(
+            attached.len() > 6 && attached[5] == "qbit_share_ledger_p5",
+            "the widened lead is not attached above p0..p4: {attached:?}"
+        );
+        let landed = db.ledger.append(share(2, "alice"), None).await?.share;
+        let seq = i64::try_from(landed.share_seq)?;
+        ensure!(seq == 5 * width + 10, "the share landed at {seq}");
+
+        // The floor is the lower bound of p3, two cells below p5. Two
+        // current widths below the sequence, 5W + 11 - 8W, is below every
+        // bound: that floor would have left the probe descending p0, p1
+        // and p2 as well, and more with every narrower partition retained.
+        let floor: i64 = sqlx::query_scalar("SELECT qbit_prism_share_probe_floor()")
+            .fetch_one(db.pool())
+            .await?;
+        ensure!(
+            floor == 3 * width,
+            "the probe floor {floor} is not the lower bound of p3, {}",
+            3 * width
+        );
+        ensure!(
+            bounded_probe_finds(db.pool(), &landed.share_id).await?,
+            "the share just appended is below the probe floor"
+        );
+        ensure!(
+            !bounded_probe_finds(db.pool(), &early.share_id).await?
+                && db.ledger.share_accepted_at_ms(&early.share_id).await?
+                    == Some(early.accepted_at_ms),
+            "the row in p0 is inside the floor, or the unbounded fallback lost it"
+        );
+        // Executor-startup pruning removes exactly the three leaves below
+        // the floor; the probe descends p3, p4, p5 and the empty lead.
+        let (leaves, removed) = bounded_probe_plan(db.pool(), &landed.share_id).await?;
+        ensure!(
+            removed == 3 && leaves == attached[3..],
+            "the probe over {attached:?} pruned {removed} leaves and descends {leaves:?}"
         );
         Ok::<_, anyhow::Error>(())
     }

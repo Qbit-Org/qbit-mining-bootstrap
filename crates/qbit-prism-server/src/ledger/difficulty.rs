@@ -93,8 +93,9 @@ impl Ledger {
     /// global `share_id` index, so an unbounded probe descends one per-leaf
     /// index per attached partition. Vardiff evidence is a share the session
     /// submitted moments ago, so the bounded probe
-    /// (`qbit_prism_share_probe_floor()`, two partition widths below the next
-    /// `share_seq`) answers it from at most three leaves. A miss is not an
+    /// (`qbit_prism_share_probe_floor()`, the lower bound of the partition
+    /// two below the one the next `share_seq` lands in) answers it from at
+    /// most three leaves holding rows. A miss is not an
     /// answer: the caller uses this timestamp to decide whether a retained
     /// difficulty may be resumed, so an older but still online row must be
     /// found rather than silently reported as absent. The second probe runs
