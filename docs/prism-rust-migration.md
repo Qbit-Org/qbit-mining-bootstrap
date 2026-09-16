@@ -129,6 +129,15 @@ naming its `storage_version`; `candidates list` shows it, but the answer is
 still the legacy drain, with the pinned `2.x.x` image, never an operator
 abandon.
 
+That rule is enforced, not only documented. A `2.x.x` v1 document is parked at
+`storage_version = 1`, the same version the native writer uses, so `abandon`
+tests the document rather than the version: it changes a row only when the
+`candidate` carries `payout_revision` and `block_hash` beside an inline
+`bundle` or a `window` reference — the predicate
+`refuse_undrained_outbox` classifies native rows with, above. A legacy document
+is refused atomically with exit 8 and keeps every column, so an operator
+sweeping a stalled outbox cannot delete the evidence this drain still needs.
+
 ### Supported 2.x.x source schemas
 
 The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0

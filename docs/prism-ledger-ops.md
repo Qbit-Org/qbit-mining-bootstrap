@@ -139,8 +139,17 @@ exactly that. `--json` prints one
 `{"schema":"qbit.prism.candidates.list.v1","candidates":[...]}` document with
 every field untruncated and every unknown value as `null`.
 
-`abandon` finishes one `pending` row with `storage_version = 1`. Other storage
-versions are refused atomically and their evidence is preserved. `pending` is
+`abandon` finishes one `pending` row with `storage_version = 1` **whose
+document this release could replay**. Other storage versions are refused
+atomically and their evidence is preserved, and so is a version-1 row holding a
+pre-migration `2.x.x` document: the native claim lane parks one of those at
+version 1 rather than rewriting it, so the version alone does not say who wrote
+the row. The statement's shape test is the migrator's own — a native document
+carries `payout_revision` and `block_hash` beside either an inline `bundle`
+(pre-007) or a `window` reference (007 and later) — and anything else is
+refused with exit 8 and every column left as it is. That block is still owed to
+[the legacy drain](prism-rust-migration.md#two-drains-one-for-each-era), which
+is the only thing that can finish it. `pending` is
 the only state it touches, because it is the only unfinished state from which
 no `submitblock` can yet
 have been made: a row in `offer_reserved`, `offered` or `reconciliation` is the
@@ -167,13 +176,17 @@ there stays as evidence that the row had been parked.
 | 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version and directs legacy rows to the pinned `2.x.x` drain, newer formats to a compatible release. |
+| 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | `candidate <hash> holds a pre-migration 2.x.x document at storage_version 1; evidence preserved. This release cannot replay it, and abandoning it would discard the block the legacy drain still owes: drain it with the pinned 2.x.x image, never an operator abandon` |
 
-Codes 3, 6 and 7 protect offer, accounting and storage-format evidence. Code 4
+Codes 3, 6, 7 and 8 protect offer, accounting, storage-format and legacy-era
+evidence. Code 4
 is kept distinct from code 2 so that re-running a successful abandon reads as
 "nothing to do" rather than as a lost row. An **expired** claim is not a live
 claim, so a supported row whose owner died is abandonable without waiting;
 code 5 applies only while the claim is still live. Unsupported versions report
-code 7 ahead of claim status. A pending row whose block has landed always
+code 7, and an unreplayable version-1 document code 8, both ahead of claim
+status: a claim expires on its own, and neither a storage format nor a document
+shape becomes replayable by waiting. A pending row whose block has landed always
 reports code 6, because the accounting must be reconciled.
 
 `abandon` connects as a one-shot tool and writes through the ordinary ledger
