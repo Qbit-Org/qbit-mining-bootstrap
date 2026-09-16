@@ -24,6 +24,8 @@
 -- one-way (decision D5): the revert is a second cutover that has to rebuild
 -- a global share_id index over the whole table, and it fails on the first
 -- duplicate share_id accepted across two partitions, so none is shipped.
-SELECT qbit_prism_share_ledger_convert_prepare(0);
+-- Empty rows do not imply an unused sequence. One row of headroom keeps the
+-- bound strictly above the next value, even when it is already on the grid.
+SELECT qbit_prism_share_ledger_convert_prepare(1);
 SELECT qbit_prism_share_ledger_convert_validate();
 SELECT qbit_prism_share_ledger_convert_swap();

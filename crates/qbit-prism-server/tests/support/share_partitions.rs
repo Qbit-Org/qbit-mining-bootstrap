@@ -344,6 +344,46 @@ async fn migration_016_converts_an_empty_ledger_in_the_transaction_and_appends_r
     db.close(vec![a, b]).await
 }
 
+#[tokio::test]
+async fn migration_016_converts_empty_2x_ledgers_at_sequence_boundaries() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for next_seq in [WIDTH - 1, WIDTH, WIDTH + 1] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            let result = async {
+                super::two_x::apply_frozen_2x_schema(&pool, state).await?;
+                // An empty ledger may have consumed sequence values through
+                // rolled-back writes, independently of its row count.
+                sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1,false)")
+                    .bind(next_seq)
+                    .execute(&pool)
+                    .await?;
+                assert_eq!(share_count(&pool).await?, 0);
+                let ledger = db.ledger("empty-boundary").await?;
+                assert_converted(&pool).await?;
+                let expected_bound = if next_seq < WIDTH { WIDTH } else { 2 * WIDTH };
+                assert_eq!(conversion_bound(&pool).await?, Some(expected_bound));
+                let appended = ledger.append(share(1), None).await?;
+                assert_eq!(appended.share.share_seq, next_seq as u64);
+                assert_eq!(partition_of(&pool, next_seq).await?, "qbit_share_ledger_p0");
+                Ok(ledger)
+            }
+            .await;
+            pool.close().await;
+            match result {
+                Ok(ledger) => db.close(vec![ledger]).await?,
+                Err(error) => {
+                    db.close(Vec::new()).await?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A ledger with rows is converted after the commit by the online runner,
 /// resumable from every stage: nothing prepared, the bound pending, the
 /// bound validated. The rows and the sequence survive each time, the first
