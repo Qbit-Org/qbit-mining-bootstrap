@@ -135,6 +135,31 @@ fn code(output: &Output) -> i32 {
     output.status.code().expect("the command was signalled")
 }
 
+/// Which candidate document a seeded row carries. `storage_version = 1`
+/// spans all three: the native claim lane parks a pre-migration 2.x.x
+/// document at version 1 rather than rewriting it, which is exactly why
+/// `abandon` cannot read the version alone (#425).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// What this release writes since 007: the `window` reference beside
+    /// `payout_revision` and `block_hash`, with the block out in
+    /// `block_bytes`. The field names are `ledger::Candidate`'s.
+    NativeWindow,
+    /// What native 3.x.x wrote before 007: the same identity fields with the
+    /// audit bundle still inline. Migration 007 refuses a pending row in this
+    /// shape, so it reaches `abandon` only on a database that never migrated;
+    /// the migrator counts it as native, and so must this guard.
+    NativeBundle,
+    /// The 2.x.x Python writer's `qbit.prism.block-candidate-intent.v1`
+    /// document (`lab/prism/block_candidates.py` at v2.0.2). It names the
+    /// block `block_hash_hex`, carries no `payout_revision`, and has neither
+    /// a `bundle` nor a `window`: the shape the migrator refuses as undrained
+    /// legacy work. Only ever seeded `pending`, which is where the claim lane
+    /// parks one; 011 requires the four 007 payload columns on an offered row,
+    /// and a 2.x.x writer never wrote them.
+    Legacy,
+}
+
 /// One seeded outbox row. The defaults are an ordinary retrying `pending`
 /// row; each test changes only the fields its case is about.
 #[derive(Clone)]
@@ -142,6 +167,7 @@ struct Row {
     hash: String,
     state: &'static str,
     height: Option<i64>,
+    shape: Shape,
     storage_version: i32,
     attempt_count: i32,
     last_error: Option<String>,
@@ -157,6 +183,7 @@ impl Row {
             hash: byte.repeat(32),
             state,
             height: Some(101),
+            shape: Shape::NativeWindow,
             storage_version: 1,
             attempt_count: 0,
             last_error: None,
@@ -168,17 +195,103 @@ impl Row {
     }
 }
 
+/// The `candidate` document a seeded row carries, in the shape its writer
+/// really produced. `abandon` reads the document itself — the identity fields
+/// beside a `bundle` or a `window` are what tell a row this release wrote
+/// from a parked legacy one — so a fixture that carried only `found_block`
+/// could not tell the guard's two cases apart.
+fn candidate_document(row: &Row) -> Value {
+    // `found_block` is `qbit_prism::FoundBlock`; the height is the one field
+    // `candidates list` projects, and `None` is the unreadable-height case.
+    let found_block = match row.height {
+        Some(height) => json!({
+            "block_height": height,
+            "coinbase_value_sats": 5_000_000_000i64,
+            "network_difficulty": 1_048_576i64,
+            "anchor_job_issued_at_ms": 1_800_000_000_000i64,
+        }),
+        // A document an unknown writer left behind: no readable height.
+        None => json!({"coinbase_value_sats": 5_000_000_000i64}),
+    };
+    match row.shape {
+        Shape::NativeWindow | Shape::NativeBundle => {
+            let mut document = json!({
+                "block_hash": row.hash,
+                "block_sha256": "cc".repeat(32),
+                "job_id": "job",
+                "payout_revision": 7,
+                "found_block": found_block,
+                "payout_policy": {
+                    "p2mr_spend_input_bytes": 68,
+                    "target_feerate_sats_per_byte": 2,
+                    "safety_multiplier": 2,
+                },
+                "audit_builder_version": 1,
+                "signer_keys": {
+                    "manifest_key_hex": "02".to_owned() + &"11".repeat(32),
+                    "ledger_key_hex": "03".to_owned() + &"22".repeat(32),
+                },
+                "leased": false,
+                "coinbase_suffix_hex": "00".repeat(12),
+            });
+            match row.shape {
+                // The window columns this row is seeded with, restated in the
+                // document the way an enqueue writes them: an empty window
+                // carries no share range, so `shares` is null here and the
+                // four share columns stay NULL on the row.
+                Shape::NativeWindow => {
+                    document["window"] = json!({
+                        "anchor_ms": 1_800_000_000_000i64,
+                        "prior_balances_digest": "aa".repeat(32),
+                        "shares": null,
+                    });
+                }
+                _ => document["bundle"] = json!({"schema": "qbit.prism.audit-bundle.v1"}),
+            }
+            document
+        }
+        // Verbatim key set of `block_candidate_intent` at v2.0.2 (#258),
+        // trimmed to the fixed-metadata fields: no share list is needed to
+        // prove the shape, and none of the omitted keys is an identity field.
+        Shape::Legacy => json!({
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": row.hash,
+            "block_hex": "00".repeat(80),
+            "coinbase_tx_hex": "01".repeat(32),
+            "parent_hash": "dd".repeat(32),
+            "expected_height": row.height,
+            "template": {
+                "previousblockhash": "dd".repeat(32),
+                "height": row.height,
+                "coinbasevalue": 5_000_000_000i64,
+            },
+            "shares_json": [],
+            "prior_balances": [],
+            "found_block": found_block,
+            "witness_merkle_leaves_hex": [],
+            "extranonce1_hex": "deadbeef",
+            "extranonce2_hex": "00000000",
+            "username": "qbit1legacyminer",
+            "pending_share": {"job_id": "job", "share_id": "share-1"},
+            "credit_share_on_accept": true,
+            "collection_only": false,
+        }),
+    }
+}
+
 /// Seed `row` exactly as migration 011's lifecycle, payload and offer rules
 /// require for its state, so all four unfinished states and both terminal
 /// states can be held at once without driving six claims.
 async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
     let terminal = matches!(row.state, "submitted" | "abandoned");
     let offered = matches!(row.state, "offer_reserved" | "offered" | "reconciliation");
-    let candidate = (!terminal).then(|| match row.height {
-        Some(height) => json!({"found_block":{"block_height":height},"job_id":"job"}),
-        // A document an unknown writer left behind: no readable height.
-        None => json!({"job_id":"job"}),
-    });
+    // `block_bytes` and the six window columns arrived with 007. A parked
+    // 2.x.x row and a pre-007 native row both predate them and keep their
+    // block inside their own document, so seeding either with those columns
+    // would not be the row an operator meets. 011 requires all four on an
+    // offered row, which is why only `pending` rows take the older shapes.
+    let window_payload = !terminal && row.shape == Shape::NativeWindow;
+    let candidate = (!terminal).then(|| candidate_document(row));
     let last_error = match (row.state, &row.last_error) {
         // 011 requires a nonblank reason on a reconciliation row.
         ("reconciliation", None) => Some("node answer was lost in transport".to_owned()),
@@ -194,15 +307,15 @@ async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
          CASE WHEN $16::text IS NOT NULL THEN clock_timestamp()+make_interval(secs=>$17) END)")
         .bind(&row.hash)
         .bind(candidate)
-        .bind((!terminal).then(|| vec![0u8; 80]))
+        .bind(window_payload.then(|| vec![0u8; 80]))
         .bind(row.state)
         .bind(row.storage_version)
         .bind(row.attempt_count)
         .bind(last_error)
         .bind(row.parked)
         .bind(row.due_in_seconds)
-        .bind((!terminal).then_some(1_800_000_000_000i64))
-        .bind((!terminal).then(|| "aa".repeat(32)))
+        .bind(window_payload.then_some(1_800_000_000_000i64))
+        .bind(window_payload.then(|| "aa".repeat(32)))
         .bind(offered.then(|| "frontend-b".to_owned()))
         .bind((row.state == "offered").then_some(1_800_000_001_000i64))
         .bind(match row.state {
@@ -863,6 +976,99 @@ async fn abandon_refuses_unsupported_storage_versions_without_changing_evidence(
         );
         assert!(message.contains("evidence preserved"), "{message}");
         assert_eq!(whole_row(&ledger.pool, &row.hash).await?, before);
+    }
+    node.assert_never_reached();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+/// #425. `storage_version = 1` is not a synonym for "native": the claim lane
+/// parks a pre-migration 2.x.x document at that version rather than rewriting
+/// it, and the migrator's drain check still owes that block to the pinned
+/// 2.x.x image. With the version predicate alone, this command NULLed the
+/// document and terminalized the row, destroying the only copy of evidence no
+/// native release can rebuild. The guard is the migrator's own shape test, so
+/// both native shapes in the same database stay abandonable.
+#[tokio::test]
+async fn abandon_refuses_a_parked_legacy_document_and_leaves_its_evidence_whole() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = CountingNode::open().await?;
+    // Parked and retrying, with and without a dead claim: every way the
+    // version guard alone would have let an operator through.
+    for (byte, parked, claim) in [
+        ("11", true, None),
+        ("22", false, None),
+        // An expired claim is not a live claim, so code 5 cannot be what
+        // saves this row; only the shape can.
+        ("33", true, Some(("frontend-b".to_owned(), -60.0))),
+    ] {
+        let mut row = Row::new(byte, "pending");
+        row.shape = Shape::Legacy;
+        row.parked = parked;
+        row.claim = claim;
+        row.attempt_count = 2;
+        row.last_error = Some(
+            "candidate document is not a native candidate; drain with the 2.x.x image".to_owned(),
+        );
+        seed(&ledger.pool, &row).await?;
+        let before = whole_row(&ledger.pool, &row.hash).await?;
+        assert_eq!(before["storage_version"], 1, "the case under test is v1");
+        assert!(
+            before["candidate"]["block_hash_hex"].is_string(),
+            "the fixture must be the 2.x.x document: {before}"
+        );
+        let refused = cli(
+            &db,
+            &node,
+            &[
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &row.hash,
+                "--reason",
+                "operator sweep",
+            ],
+        )
+        .await?;
+        assert_eq!(code(&refused), 8, "{}", stderr(&refused));
+        let message = stderr(&refused);
+        assert!(
+            message.contains("pre-migration 2.x.x document"),
+            "{message}"
+        );
+        assert!(message.contains("evidence preserved"), "{message}");
+        assert!(message.contains("pinned 2.x.x"), "{message}");
+        // Not "still pending": the whole row, column for column, including
+        // the document, `updated_at` and `completed_at`.
+        assert_eq!(whole_row(&ledger.pool, &row.hash).await?, before);
+    }
+    // The same guard on the rows it exists to keep abandonable: the 007
+    // window reference this release writes, and the inline bundle native
+    // 3.x.x wrote before it.
+    for (byte, shape) in [("44", Shape::NativeWindow), ("55", Shape::NativeBundle)] {
+        let mut native = Row::new(byte, "pending");
+        native.shape = shape;
+        seed(&ledger.pool, &native).await?;
+        let abandoned = cli(
+            &db,
+            &node,
+            &[
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &native.hash,
+                "--reason",
+                "INC-425: superseded before any offer",
+            ],
+        )
+        .await?;
+        assert_eq!(code(&abandoned), 0, "{}", stderr(&abandoned));
+        let after = whole_row(&ledger.pool, &native.hash).await?;
+        assert_eq!(after["state"], "abandoned", "{shape:?} was not abandoned");
+        assert_eq!(after["candidate"], Value::Null);
     }
     node.assert_never_reached();
     assert_no_new_instances(&ledger.pool).await?;

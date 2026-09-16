@@ -1492,13 +1492,25 @@ impl Ledger {
 
     /// Abandon one candidate, as the single statement whose `WHERE` *is* the
     /// safety property: `pending` (never offered, so no `submitblock` can
-    /// have been made for it), supported storage version 1, no live claim,
-    /// and no landed block. The
+    /// have been made for it), supported storage version 1, a document this
+    /// release wrote itself, no live claim, and no landed block. The
     /// column list is the supersession path's
     /// (`policy_transition.rs`), with the operator's reason taking
     /// `last_error`'s place; `next_attempt_at` is left untouched there and
     /// here, because no lane selects a terminal row and an `infinity` left
     /// in it is the evidence that the row had been parked.
+    ///
+    /// `storage_version = 1` alone does not mean native (#425). The native
+    /// claim lane parks a pre-migration 2.x.x v1 document at that version
+    /// rather than rewriting it, so the version guard by itself would let an
+    /// operator destroy the very evidence the legacy drain still needs. The
+    /// shape predicate here is the migrator's own, from
+    /// `migration::refuse_undrained_outbox`: a row this server wrote carries
+    /// `payout_revision` and `block_hash` beside either an inline `bundle`
+    /// (pre-007) or a `window` reference (007 and later). A `candidate` that
+    /// is not that shape — a legacy document, or a `NULL` an unknown writer
+    /// left on a pending row — keeps every column, and the diagnosis below
+    /// names the legacy drain as its remedy.
     ///
     /// The state is a predicate, never a preceding `SELECT`: a row can move
     /// between a check and a write. When the predicate refuses, the
@@ -1517,7 +1529,7 @@ impl Ledger {
         // writer during a cutover.
         writable(&mut tx).await?;
         let abandoned: Option<String> = sqlx::query_scalar(
-            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
             .bind(block_hash).bind(reason).fetch_optional(&mut *tx).await?;
         let outcome = match abandoned {
             Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
@@ -1561,12 +1573,17 @@ fn candidate_summary(row: &PgRow) -> Result<Value> {
 
 /// Why the abandon statement changed no row, read after it and never before
 /// it. This gates no write: the refusal is already decided.
+///
+/// `native` restates the statement's shape predicate rather than a copy of
+/// its reasoning, so a `storage_version = 1` row holding a pre-migration
+/// 2.x.x document is reported as the legacy row it is instead of falling
+/// through to the `bail!` below.
 async fn diagnose_abandon_refusal(
     tx: &mut Transaction<'_, Postgres>,
     block_hash: &str,
 ) -> Result<Value> {
     let Some(row) = sqlx::query(
-        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
+        "SELECT o.state,o.storage_version,o.claim_instance_id,o.claim_expires_at,o.claim_expires_at>clock_timestamp() AS claim_live,EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) AS landed,COALESCE((o.candidate ?& ARRAY['payout_revision','block_hash']) AND (o.candidate ? 'bundle' OR o.candidate ? 'window'),false) AS native FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1")
         .bind(block_hash).fetch_optional(&mut **tx).await?
     else {
         return Ok(json!({"outcome":"missing"}));
@@ -1574,6 +1591,8 @@ async fn diagnose_abandon_refusal(
     let state: String = row.try_get("state")?;
     let storage_version: i32 = row.try_get("storage_version")?;
     let landed: bool = row.try_get("landed")?;
+    // The same shape the statement tested, read back in the same transaction.
+    let native: bool = row.try_get("native")?;
     let claim_live: bool = row
         .try_get::<Option<bool>, _>("claim_live")?
         .unwrap_or(false);
@@ -1589,6 +1608,10 @@ async fn diagnose_abandon_refusal(
             "outcome": "unsupported_storage_version",
             "storage_version": storage_version,
         }),
+        // Reported ahead of a claim for the same reason as the version above:
+        // a claim expires by itself, and a document this release cannot
+        // replay never becomes replayable by waiting.
+        "pending" if !native => json!({"outcome": "legacy_candidate"}),
         "pending" if claim_live => json!({
             "outcome": "claimed",
             "claim_instance_id": row.try_get::<Option<String>, _>("claim_instance_id")?,

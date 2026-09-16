@@ -394,7 +394,9 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
 /// lifecycle refusals: a block that may already have been
 /// offered to the node (3) and a block whose accounting has landed (6).
 /// Unsupported storage versions (7) retain their evidence for a compatible reader.
-/// An outcome this function does not recognise is a failure, never a
+/// A pre-migration 2.x.x document parked at the supported storage version (8)
+/// retains its evidence for the legacy drain, which is the only thing that may
+/// finish it. An outcome this function does not recognise is a failure, never a
 /// "nothing to do".
 fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i32, String)> {
     let field = |name: &str| outcome[name].as_str().unwrap_or("unknown").to_owned();
@@ -438,6 +440,15 @@ fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i3
                  Only version 1 is supported; drain legacy rows with the pinned 2.x.x image, \
                  and use a compatible release for newer formats",
                 outcome["storage_version"]
+            ),
+        ),
+        "legacy_candidate" => (
+            8,
+            format!(
+                "candidate {block_hash} holds a pre-migration 2.x.x document at storage_version \
+                 1; evidence preserved. This release cannot replay it, and abandoning it would \
+                 discard the block the legacy drain still owes: drain it with the pinned 2.x.x \
+                 image, never an operator abandon"
             ),
         ),
         other => bail!("unrecognized abandon outcome {other:?} for candidate {block_hash}"),
