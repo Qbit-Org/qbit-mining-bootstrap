@@ -264,16 +264,26 @@ the primary, with the frontends running:
 
 | Command | Effect |
 | --- | --- |
-| `plan --network-difficulty D [--retention-days N]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
+| `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root>` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` only for that full comparison, so a verify after the detach reports but never counts as the proof the detach required |
-| `detach <partition>` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY` (finalized if an earlier attempt was interrupted); the table stays as a standalone relation |
+| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY` (finalized if an earlier attempt was interrupted); the table stays as a standalone relation |
 | `drop <partition>` | requires `detached` and verified; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
 
 `plan` also reports the attached partition count, the lead ahead of the
-sequence, and any `share_id` present in more than one attached leaf.
+sequence, and, with `--check-duplicates` (one pass over every attached
+leaf, so not the default), any `share_id` present in more than one attached
+leaf; `detach` with that flag refuses while such a duplicate exists. A
+partition that is not attached gets `not_applicable` for each condition
+rather than `clear`, and a condition whose evidence is missing (no rollup
+watermark row, a catalog row without its relation) is reported as unknown,
+never as clear. Every command prints JSON. `restore` creates the table,
+loads the rows, re-streams the digest and, with `--attach`, attaches and
+records the catalog in one transaction, so a failed restore leaves nothing
+behind; `detach`, `drop` and the restore run their DDL without statement or
+lock timeouts, as the migration runner does.
 
 ## Archive format v1
 
@@ -311,8 +321,12 @@ The manifest:
 | `created_at`, `created_by` | UTC timestamp and the operator tool's instance id |
 
 The manifest's own SHA-256 is what the catalog and the next manifest
-record. Signing manifests with the ledger key is a possible extension; the
-public artifact digests already commit to every share a block paid on.
+record, and a manifest is accepted only when it is the canonical encoding
+of itself (re-serializing it reproduces the bytes on disk), so a hand
+edit is detected before any digest is compared. `created_by` is the
+operator process's `PRISM_INSTANCE_ID`. Signing manifests with the ledger
+key is a possible extension; the public artifact digests already commit
+to every share a block paid on.
 
 ## Measurements
 

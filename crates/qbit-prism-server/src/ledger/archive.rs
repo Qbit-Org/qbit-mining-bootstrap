@@ -1454,7 +1454,8 @@ fn manifest_location(root: &Path, record: &PartitionRecord) -> Result<PathBuf> {
 /// Re-read the archive, recompute both digests, check the manifest against the
 /// catalog row and the chain, and, while the partition is still attached,
 /// stream the live rows again and compare the stream digest and the count.
-/// Records `archive_verified_at` only when everything agreed.
+/// Records `archive_verified_at` only when everything agreed and the live
+/// rows were compared; after a detach the verification is reported only.
 pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
     let mut connection = ledger.acquire().await?;
@@ -1566,16 +1567,24 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
     }
 
     drop(connection);
+    let live_rows_compared = attachment.attached && attachment.relation_present;
     let mut tx = ledger.begin().await?;
-    let updated = sqlx::query("UPDATE qbit_prism_share_partitions SET archive_verified_at=clock_timestamp() WHERE partition_name=$1 AND archived_at IS NOT NULL")
-        .bind(partition_name)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    ensure!(
-        updated == 1,
-        "{partition_name} has no archived_at in qbit_prism_share_partitions, so the verification cannot be recorded. Run share-archive archive {partition_name} --dir <root> first"
-    );
+    if live_rows_compared {
+        // The timestamp is the proof detach and drop require: the archive
+        // was compared with the live rows. A verify after the detach checks
+        // the archive against itself and the catalog only, and reports
+        // that without recording it, so it can never stand in for the
+        // comparison the detach needed.
+        let updated = sqlx::query("UPDATE qbit_prism_share_partitions SET archive_verified_at=clock_timestamp() WHERE partition_name=$1 AND archived_at IS NOT NULL")
+            .bind(partition_name)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        ensure!(
+            updated == 1,
+            "{partition_name} has no archived_at in qbit_prism_share_partitions, so the verification cannot be recorded. Run share-archive archive {partition_name} --dir <root> first"
+        );
+    }
     let verified_at: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT archive_verified_at FROM qbit_prism_share_partitions WHERE partition_name=$1",
     )
@@ -1593,7 +1602,7 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         "rows_gz_sha256": manifest.rows_gz_sha256,
         "chain_previous_upper_seq": manifest.previous_upper_seq,
         "chain_adjacent": chain_adjacent,
-        "live_rows_compared": attachment.attached && attachment.relation_present,
+        "live_rows_compared": live_rows_compared,
         "live": live,
         "archive_verified_at": verified_at,
     }))

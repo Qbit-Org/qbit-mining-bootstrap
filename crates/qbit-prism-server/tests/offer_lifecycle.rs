@@ -719,7 +719,10 @@ async fn migration_011_waits_for_in_flight_instance_registration() -> Result<()>
                 .execute(&mut *heartbeat).await?;
             let url = db.url.clone();
             let registration = async {
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                // The scratch replay every migrate runs first (001 and every native
+                // migration) takes seconds under load, so the lock wait is watched
+                // for well past it.
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     loop {
                         let waiting: bool = sqlx::query_scalar(
                             "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='qbit_prism_instances'::regclass AND mode='ShareRowExclusiveLock' AND NOT granted)",
@@ -766,7 +769,10 @@ async fn migration_011_rejects_pre_011_registration_queued_behind_cutover() -> R
             sqlx::query("LOCK TABLE qbit_prism_instances IN SHARE MODE")
                 .execute(&mut *blocker).await?;
             let wait_for = |mode: &'static str| async move {
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                // The scratch replay every migrate runs first (001 and every native
+                // migration) takes seconds under load, so the lock wait is watched
+                // for well past it.
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     loop {
                         let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='qbit_prism_instances'::regclass AND mode=$1 AND NOT granted)")
                             .bind(mode).fetch_one(&db.pool).await?;

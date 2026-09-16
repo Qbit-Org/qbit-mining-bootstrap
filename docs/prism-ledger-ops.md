@@ -1027,11 +1027,11 @@ primary, with the frontends running. Nothing here needs a maintenance window.
 
 | Command | Effect |
 | --- | --- |
-| `plan --network-difficulty D [--retention-days N]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
+| `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
 | `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
-| `archive <partition> --dir <root>` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count |
 | `verify <partition> --dir <root>` | re-reads the archive, checks both digests and the manifest chain, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` |
-| `detach <partition>` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
+| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified; `DETACH PARTITION ... CONCURRENTLY`, finalized if an earlier attempt was interrupted; the table stays as a standalone relation |
 | `drop <partition>` | requires `detached` and verified; `DROP TABLE`; the archive is the copy of record |
 | `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
 
@@ -1048,7 +1048,7 @@ qbit-prism-server share-archive plan --network-difficulty 402304 --retention-day
 qbit-prism-server share-archive seal qbit_share_ledger_p0
 qbit-prism-server share-archive archive qbit_share_ledger_p0 --dir "$ARCHIVE_ROOT"
 qbit-prism-server share-archive verify qbit_share_ledger_p0 --dir "$ARCHIVE_ROOT"
-qbit-prism-server share-archive detach qbit_share_ledger_p0
+qbit-prism-server share-archive detach qbit_share_ledger_p0 --network-difficulty 402304 --retention-days 30
 qbit-prism-server share-archive drop qbit_share_ledger_p0
 ```
 
