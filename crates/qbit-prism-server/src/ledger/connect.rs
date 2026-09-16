@@ -120,6 +120,33 @@ impl Drop for SessionId {
     }
 }
 
+/// What a connection tells the cluster about itself once its startup gates
+/// have passed. Every variant reads the schema version, the declared
+/// capabilities and the migration source first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Registration {
+    /// A `run` frontend: refuse a halted cluster, then write the `starting`
+    /// heartbeat that `fatal-state clear` later expects to become `stopped`.
+    Frontend,
+    /// A one-shot command that writes ordinary ledger rows: refuse a halted
+    /// cluster exactly as a frontend would, but write no heartbeat. The
+    /// command has no shutdown path that could attest `stopped`, and its
+    /// instance ID may be a live frontend's.
+    Tool,
+    /// Recovery and migration: usable during a halt, never registered.
+    Operator,
+}
+
+impl Registration {
+    fn refuses_halt(self) -> bool {
+        matches!(self, Self::Frontend | Self::Tool)
+    }
+
+    fn announces_frontend(self) -> bool {
+        self == Self::Frontend
+    }
+}
+
 impl Ledger {
     #[cfg(test)]
     pub(crate) fn offline_for_tests(pool: PgPool, instance_id: String) -> Self {
@@ -167,11 +194,48 @@ impl Ledger {
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
     ) -> Result<Self> {
-        Self::connect_inner(url, instance_id, max_connections, initialize, metrics, true).await
+        Self::connect_inner(
+            url,
+            instance_id,
+            max_connections,
+            initialize,
+            metrics,
+            Registration::Frontend,
+        )
+        .await
     }
 
-    /// Operator tools must be usable during a halt without registering a
-    /// frontend. Ordinary ledger mutations still enforce the write guard.
+    /// Connect for a one-shot operator command (`self-check`, `import-audits`,
+    /// `backfill-ctv`, `broadcast-ctv`). The startup gates are those of
+    /// [`Ledger::connect`]: the schema version, the declared capabilities,
+    /// the migration source and the halt guard. What differs is that no
+    /// `starting` heartbeat is written, so a normally exited command leaves
+    /// no `qbit_prism_instances` row for `fatal-state clear` to refuse, and a
+    /// live frontend that shares the configured instance ID keeps its status
+    /// and session-owner token. `instance_id` still names this process in
+    /// the rows it claims. Ordinary ledger mutations enforce the write guard
+    /// as they do for a frontend.
+    pub async fn connect_tool(
+        url: &str,
+        instance_id: String,
+        max_connections: u32,
+        initialize: bool,
+        metrics: Option<std::sync::Arc<Metrics>>,
+    ) -> Result<Self> {
+        Self::connect_inner(
+            url,
+            instance_id,
+            max_connections,
+            initialize,
+            metrics,
+            Registration::Tool,
+        )
+        .await
+    }
+
+    /// Recovery and migration must be usable during a halt without
+    /// registering a frontend. Ordinary ledger mutations still enforce the
+    /// write guard.
     pub async fn connect_operator(url: &str, initialize: bool) -> Result<Self> {
         Self::connect_inner(
             url,
@@ -179,7 +243,7 @@ impl Ledger {
             2,
             initialize,
             None,
-            false,
+            Registration::Operator,
         )
         .await
     }
@@ -190,7 +254,7 @@ impl Ledger {
         max_connections: u32,
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
-        register: bool,
+        registration: Registration,
     ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
@@ -262,10 +326,12 @@ impl Ledger {
             prior_schema_version = source.prior_schema_version,
             "PRISM database source"
         );
-        if register {
+        if registration.refuses_halt() {
             let mut tx = ledger.begin().await?;
             writable(&mut tx).await?;
             tx.commit().await?;
+        }
+        if registration.announces_frontend() {
             ledger.heartbeat(HeartbeatStatus::Starting).await?;
         }
         Ok(ledger)
