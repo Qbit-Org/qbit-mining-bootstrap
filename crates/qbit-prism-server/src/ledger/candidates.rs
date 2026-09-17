@@ -1945,7 +1945,7 @@ async fn diagnose_recovery_refusal(
     };
     let state = facts.state.as_str();
     Ok(match state {
-        "submitted" | "abandoned" => json!({"outcome":"terminal","state":state}),
+        "submitted" | "abandoned" | "orphaned" => json!({"outcome":"terminal","state":state}),
         _ if facts.storage_version != 1 => json!({
             "outcome": "unsupported_storage_version",
             "storage_version": facts.storage_version,

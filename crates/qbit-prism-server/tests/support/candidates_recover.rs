@@ -430,6 +430,7 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     node.script(|chain| chain.extend(101, &good.hash, &parent));
 
     let abandoned = Row::new("22", "abandoned");
+    let terminal_orphan = Row::new("23", "orphaned");
     let mut unaudited = Row::new("33", "submitted");
     unaudited.height = Some(102);
     let mut unlanded = Row::new("34", "submitted");
@@ -456,6 +457,7 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     above_tip.height = Some(112);
     for row in [
         &abandoned,
+        &terminal_orphan,
         &unaudited,
         &unlanded,
         &stale,
@@ -471,6 +473,11 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
         seed(&ledger.pool, row).await?;
     }
     confirmed_block(&ledger.pool, &unaudited.hash, 102).await?;
+    confirmed_block(&ledger.pool, &terminal_orphan.hash, 102).await?;
+    sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive' WHERE block_hash=$1")
+        .bind(&terminal_orphan.hash)
+        .execute(&ledger.pool)
+        .await?;
     node.script(|chain| {
         chain.extend(102, &unaudited.hash, &parent);
         chain.extend(103, &unlanded.hash, &parent);
@@ -495,6 +502,38 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     });
     let before = everything(&ledger.pool).await?;
     let missing = "ee".repeat(32);
+
+    for apply in [false, true] {
+        let mut args = allowlist(&[&good.hash, &terminal_orphan.hash]);
+        if apply {
+            args.push("--apply");
+        }
+        let refused = recover(&db, &node, &args).await?;
+        assert_eq!(code(&refused), 4, "{}", stderr(&refused));
+        let message = stderr(&refused);
+        assert!(
+            message.contains(&format!(
+                "candidate {} is already orphaned",
+                terminal_orphan.hash
+            )),
+            "{message}"
+        );
+        assert!(message.contains("reconciliation"), "{message}");
+        assert!(!message.contains("2.x.x"), "{message}");
+        assert_eq!(everything(&ledger.pool).await?, before);
+    }
+
+    // A frontend can settle the orphan after planning but before the claim.
+    // The claim refusal must still identify a terminal native row, even
+    // though its candidate document has already been released.
+    let refused = ledger
+        .claim_candidate_for_recovery(&terminal_orphan.hash, 120, "orphan-recovery-test")
+        .await?;
+    let qbit_prism_server::ledger::RecoveryClaim::Refused(outcome) = refused else {
+        bail!("recovery claimed a terminal orphan");
+    };
+    assert_eq!(outcome, json!({"outcome":"terminal","state":"orphaned"}));
+    assert_eq!(everything(&ledger.pool).await?, before);
 
     for (listed, expected_code, expected) in [
         (vec![good.hash.as_str(), missing.as_str()], 2, format!("no candidate row for {missing}")),

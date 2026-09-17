@@ -654,6 +654,13 @@ fn legacy_candidate_message(hash: &str) -> String {
     )
 }
 
+fn orphaned_candidate_message(hash: &str) -> String {
+    format!(
+        "candidate {hash} is already orphaned; its candidate payload was released and its \
+         accounting remains in the ledger. Leave chain changes to reconciliation"
+    )
+}
+
 /// Decide the whole allowlist, fail-closed: every hash must have a row that
 /// is either unfinished and provably on the active chain, or `submitted`
 /// with proven accounting; an unfinished parent that is not listed refuses
@@ -692,6 +699,7 @@ async fn plan_recovery(
             complete,
         };
         match row.state.as_str() {
+            "orphaned" => plan.problems.push((4, orphaned_candidate_message(hash))),
             "abandoned" => plan.problems.push((
                 4,
                 format!("candidate {hash} is already abandoned; its evidence was released and it cannot be recovered"),
@@ -900,6 +908,7 @@ fn recover_refusal(outcome: &Value, hash: &str) -> Result<(i32, String)> {
         "terminal" => (
             4,
             match field("state").as_str() {
+                "orphaned" => orphaned_candidate_message(hash),
                 "abandoned" => format!(
                     "candidate {hash} is already abandoned; its evidence was released and it cannot be recovered"
                 ),

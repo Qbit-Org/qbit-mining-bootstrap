@@ -279,12 +279,14 @@ fn candidate_document(row: &Row) -> Value {
     }
 }
 
-/// Seed `row` exactly as migration 011's lifecycle, payload and offer rules
-/// require for its state, so all four unfinished states and both terminal
-/// states can be held at once without driving six claims.
+/// Seed `row` exactly as the lifecycle, payload and offer rules require for
+/// its state, including migration 015's terminal orphan disposition.
 pub(super) async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
-    let terminal = matches!(row.state, "submitted" | "abandoned");
-    let offered = matches!(row.state, "offer_reserved" | "offered" | "reconciliation");
+    let terminal = matches!(row.state, "submitted" | "abandoned" | "orphaned");
+    let offered = matches!(
+        row.state,
+        "offer_reserved" | "offered" | "reconciliation" | "orphaned"
+    );
     // `block_bytes` and the six window columns arrived with 007. A parked
     // 2.x.x row and a pre-007 native row both predate them and keep their
     // block inside their own document, so seeding either with those columns
@@ -295,13 +297,14 @@ pub(super) async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
     let last_error = match (row.state, &row.last_error) {
         // 011 requires a nonblank reason on a reconciliation row.
         ("reconciliation", None) => Some("node answer was lost in transport".to_owned()),
+        ("orphaned", None) => Some("a confirmed competitor replaced the block".to_owned()),
         (_, other) => other.clone(),
     };
     sqlx::query(
         "INSERT INTO qbit_block_candidate_outbox(block_hash,candidate_sha256,candidate,block_bytes,state,storage_version,attempt_count,last_error,next_attempt_at,completed_at,window_anchor_ms,window_prior_balances_sha256,offer_reserved_at,offer_reserved_by,offered_at_ms,offer_outcome,proof_observed_at_ms,claim_token,claim_instance_id,claim_expires_at) \
          VALUES($1,$1,$2,$3,$4,$5,$6,$7,\
          CASE WHEN $8 THEN 'infinity'::timestamptz ELSE clock_timestamp()+make_interval(secs=>$9) END,\
-         CASE WHEN $4 IN ('submitted','abandoned') THEN clock_timestamp() END,$10,$11,\
+         CASE WHEN $4 IN ('submitted','abandoned','orphaned') THEN clock_timestamp() END,$10,$11,\
          CASE WHEN $12::text IS NOT NULL THEN clock_timestamp() END,$12,$13,$14,$15,\
          CASE WHEN $16::text IS NOT NULL THEN 'token-'||$16 END,$16,\
          CASE WHEN $16::text IS NOT NULL THEN clock_timestamp()+make_interval(secs=>$17) END)")
@@ -320,7 +323,7 @@ pub(super) async fn seed(pool: &PgPool, row: &Row) -> Result<()> {
         .bind((row.state == "offered").then_some(1_800_000_001_000i64))
         .bind(match row.state {
             "offered" => Some("accepted"),
-            "reconciliation" => Some("unknown"),
+            "reconciliation" | "orphaned" => Some("unknown"),
             _ => None,
         })
         .bind(row.proof_observed_at_ms)
