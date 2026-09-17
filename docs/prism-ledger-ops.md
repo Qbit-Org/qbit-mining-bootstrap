@@ -91,7 +91,10 @@ original IDs, payloads and expiries. Committed, undelivered children retain thei
 dependency through their original expiries with the existing renewal headroom,
 including when every caller cancels during COMMIT. Cancellation does not delete
 committed metadata, undo its retention, or restart its expiry; normal pruning
-still applies. A durable row may remain undelivered after
+still applies. An unexpired committed child also keeps its payload's
+`extranonce1` referenced, preventing session allocation from reusing that value
+until the child's original expiry even when its caller has canceled.
+A durable row may remain undelivered after
 authority revocation: the original caller still revalidates after persistence,
 and Stratum never sends work before successful durable commit and revalidation.
 
