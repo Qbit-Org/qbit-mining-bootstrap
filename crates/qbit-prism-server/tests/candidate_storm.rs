@@ -950,8 +950,8 @@ async fn drain_the_storm(storm: &Storm, candidates: usize) -> Result<()> {
 ///
 /// - `Ledger::claim_candidate`, 5: `BEGIN`; the writer fence
 ///   (`fatal_error` and the legacy writer lease, read from
-///   `qbit_prism_cluster`); the due-work probe, which is the `nextval` under
-///   the `EXISTS` of `Ledger::due_work_probe_sql`; the one claiming lane
+///   `qbit_prism_cluster`); the due-work probe, which conditionally allocates
+///   one sequence slot via `Ledger::due_work_probe_sql`; the one claiming lane
 ///   statement, `Ledger::claim_lane_sql` wrapped in the `UPDATE` that takes
 ///   the token and bumps `attempt_count`; `COMMIT`.
 /// - `Coordinator::process_candidate`'s opening `Ledger::renew_candidate_claim`,
@@ -1234,32 +1234,16 @@ async fn explain_the_lanes(storm: &Storm, candidates: usize) -> Result<()> {
         }
     }
 
-    // The dispatch probe is an `EXISTS`, so its cost is not the table size but
-    // how far it reads before the first match. Its plan is not asserted at the
-    // run's cardinality, because at storm size PostgreSQL stops using 011's
-    // partial index for it — and that is a finding about the server, recorded
-    // here rather than asserted away.
+    // The pre-#432 EXISTS probe could choose a sequential scan at storm
+    // size: volatile clock predicates caused the planner to expect an early
+    // match, but an idle backed-off population scanned retained history too.
+    // #432 replaced that probe with an ordered LIMIT 1 derived query using
+    // the same advancing clocks and existing unfinished partial index.
     //
-    // The mechanism: the probe compares `next_attempt_at` against
-    // `clock_timestamp()`, which is VOLATILE, so no histogram applies and the
-    // planner falls back to its default selectivity of about one third of the
-    // indexed rows. At 24 or 100 unfinished rows that estimate is small enough
-    // that the index wins. At 3,120 it estimates ~1,035 matches, decides an
-    // `EXISTS` will hit one almost immediately, and takes a sequential scan —
-    // whose startup cost it charges as near zero.
-    //
-    // When rows really are due the gamble pays: a match is found in the first
-    // pages. The damaging case is a pool left idle behind a storm — thousands
-    // of unfinished rows all backing off, none due — where the same plan must
-    // read the entire outbox, retained terminal history included, on *every*
-    // poll to prove nothing is due. That is a per-poll cost that grows with
-    // retained history, engaged by exactly the state this suite exists to
-    // study, and 011's index cannot prevent it because the planner declines to
-    // use it.
-    //
-    // So: both regimes are recorded at the run's cardinality, and the
-    // guarantee is asserted at the baseline, where it does hold. The
-    // difference between the two recorded lines is the evidence.
+    // This suite still records busy/idle plans at the run's cardinality and
+    // asserts index use at baseline. The separate candidate_dispatch_probe
+    // target checks canonical direct/prepared plans at exact unfinished and
+    // retained populations, including churn; no universal cost bound follows.
     let busy_probe = probe_plan_nodes(storm).await?;
     sqlx::query(&format!(
         "UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp()+interval '1 hour' WHERE state IN {}",
@@ -1272,9 +1256,9 @@ async fn explain_the_lanes(storm: &Storm, candidates: usize) -> Result<()> {
         .await?;
     let idle_probe = probe_plan_nodes(storm).await?;
 
-    // Trim the unfinished set to the baseline and re-plan: the index is used
-    // again, which proves the flip above is a function of unfinished
-    // cardinality and not of a missing or unusable index.
+    // Trim the unfinished set to the baseline and re-plan, retaining this
+    // suite's baseline index-use assertion alongside the recorded storm-size
+    // plans.
     sqlx::query(&format!(
         "DELETE FROM qbit_block_candidate_outbox WHERE state IN {} AND block_hash LIKE 'b%' AND block_hash > 'b'||lpad(to_hex($1::bigint),63,'0')",
         CandidateState::UNFINISHED_SQL
