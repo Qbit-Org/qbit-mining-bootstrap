@@ -43,12 +43,13 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, ensure, Context, Result};
+use futures_util::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
@@ -94,8 +95,8 @@ pub enum Protocol {
 pub enum Outcome {
     /// No answer observed yet, or the connection closed before one.
     Pending,
-    /// `CommandComplete` (or `EmptyQueryResponse`); `delivered` is false when
-    /// a [`Fault`] withheld it from the client.
+    /// `CommandComplete` (or `EmptyQueryResponse`); `delivered` becomes true
+    /// only after forwarding the entire frame to the client succeeds.
     Completed { tag: String, delivered: bool },
     /// `ErrorResponse` with its SQLSTATE and message.
     Failed { code: String, message: String },
@@ -609,9 +610,43 @@ async fn serve(
     let connection = Arc::new(Mutex::new(Connection::default()));
     // Whichever direction ends first (client EOF, server EOF, or a fault)
     // drops both sockets; the server then aborts any open transaction.
+    relay(
+        pump_client(
+            client_read,
+            server_write,
+            connection.clone(),
+            shared.clone(),
+            id,
+        ),
+        pump_server(server_read, client_write, connection, shared, id),
+    )
+    .await
+}
+
+async fn relay(
+    client: impl Future<Output = Result<()>>,
+    server: impl Future<Output = Result<ServerEnd>>,
+) -> Result<()> {
+    tokio::pin!(client);
     tokio::select! {
-        result = pump_client(client_read, server_write, connection.clone(), shared.clone(), id) => result,
-        result = pump_server(server_read, client_write, connection, shared, id) => result,
+        result = &mut client => result,
+        result = server => match result? {
+            ServerEnd::Closed => Ok(()),
+            ServerEnd::ClientWrite(error) => {
+                // A client can close while a reply is being forwarded, before
+                // select polls its readable EOF. Only a frame-boundary EOF
+                // observed NOW justifies the same outcome as the client arm.
+                // Do not wait for it, accept resets, or hide malformed/partial
+                // frames. Polling the original future preserves any buffered
+                // COMMIT/ROLLBACK requests and their still-unknown outcomes.
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    if let Some(result) = client.as_mut().now_or_never() {
+                        return result.context("client boundary after failed reply delivery");
+                    }
+                }
+                Err(error).context("forwarding server frame to client")
+            }
+        },
     }
 }
 
@@ -686,8 +721,8 @@ fn record(
 }
 
 async fn pump_client(
-    mut from: BufReader<OwnedReadHalf>,
-    mut to: OwnedWriteHalf,
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
     id: u64,
@@ -743,6 +778,7 @@ async fn pump_client(
                     _ => {}
                 }
             }
+            b'X' => ensure!(body.is_empty(), "invalid Terminate frame"),
             _ => {}
         }
         to.write_all(&frame(kind, &body)?).await?;
@@ -752,6 +788,9 @@ async fn pump_client(
 
 enum Action {
     Forward,
+    Complete {
+        index: usize,
+    },
     Sever,
     Pause {
         index: usize,
@@ -759,13 +798,18 @@ enum Action {
     },
 }
 
+enum ServerEnd {
+    Closed,
+    ClientWrite(std::io::Error),
+}
+
 async fn pump_server(
-    mut from: BufReader<OwnedReadHalf>,
-    mut to: OwnedWriteHalf,
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
     id: u64,
-) -> Result<()> {
+) -> Result<ServerEnd> {
     while let Some((kind, body)) = read_frame(&mut from).await? {
         let action = match kind {
             b'C' => {
@@ -799,15 +843,12 @@ async fn pump_server(
                 notice(&shared, &connection, &message)?;
                 Action::Forward
             }
-            b'Z' => {
-                ready(&shared, &connection, id, body.first().copied());
-                Action::Forward
-            }
             _ => Action::Forward,
         };
-        match action {
-            Action::Forward => to.write_all(&frame(kind, &body)?).await?,
-            Action::Sever => return Ok(()),
+        let completed = match action {
+            Action::Forward => None,
+            Action::Complete { index } => Some(index),
+            Action::Sever => return Ok(ServerEnd::Closed),
             Action::Pause { index, control } => {
                 // No observer lock or PostgreSQL transaction lock is held here.
                 loop {
@@ -819,15 +860,23 @@ async fn pump_server(
                     }
                     release.await;
                 }
-                to.write_all(&frame(kind, &body)?).await?;
-                let mut state = shared.state.lock().expect("proxy state");
-                if let Outcome::Completed { delivered, .. } = &mut state.executions[index].outcome {
-                    *delivered = true;
-                }
+                Some(index)
+            }
+        };
+        if let Err(error) = to.write_all(&frame(kind, &body)?).await {
+            return Ok(ServerEnd::ClientWrite(error));
+        }
+        if let Some(index) = completed {
+            let mut state = shared.state.lock().expect("proxy state");
+            if let Outcome::Completed { delivered, .. } = &mut state.executions[index].outcome {
+                *delivered = true;
             }
         }
+        if kind == b'Z' {
+            ready(&shared, &connection, id, body.first().copied());
+        }
     }
-    Ok(())
+    Ok(ServerEnd::Closed)
 }
 
 /// SQLSTATE and message of an ErrorResponse or NoticeResponse.
@@ -920,7 +969,7 @@ fn complete(
     }
     execution.outcome = Outcome::Completed {
         tag,
-        delivered: !sever && pause.is_none(),
+        delivered: false,
     };
     if let Some(control) = &pause {
         control.seq.store(execution.seq, Ordering::SeqCst);
@@ -940,7 +989,7 @@ fn complete(
     } else if let Some(control) = pause {
         Ok(Action::Pause { index, control })
     } else {
-        Ok(Action::Forward)
+        Ok(Action::Complete { index })
     }
 }
 
@@ -1052,3 +1101,7 @@ fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Optio
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ledger_execution_proxy_close.rs"]
+mod close_tests;
