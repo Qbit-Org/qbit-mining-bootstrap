@@ -26,15 +26,20 @@ shares, an empty transaction template and a synthetic local node remain.
 Bulk fixture loading bypasses share submission: this is not D1 throughput.
 
 Each case gets a fresh schema, initial full-window refresh, then all client
-logins and initial work before timing. No new shares or payout-state changes
-arrive before the timed parent change. The 600-second snapshot interval and
-unchanged cutoff/network/revision/balances permit retained-window reuse; every
-whole test process finished within 77 seconds. Reuse is a source-supported
-inference, not an exported cache-hit measurement. It avoids a new SQL snapshot
-scan, but still permits full-window payout construction and audit hashing.
-This qualifies the **window size of a warm-window delivery workload**, not
-cold refresh, changing-share windows, recipient cardinality, large templates,
-real-node/network latency, separate frontend hosts, full HA or #291.
+logins and initial work before timing. No new shares or balances arrive before
+the timed parent change, but that change itself advances `payout_revision` in
+the [frozen chain-observation path](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/e4b3c9c9/crates/qbit-prism-server/src/ledger/window.rs#L489).
+The [frozen reuse predicate](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/e4b3c9c9/crates/qbit-prism-server/src/coordinator/refresh_window.rs#L20)
+requires revision equality, so the 600-second snapshot interval cannot preserve
+the old retained window across this transition. The refresh therefore captures
+a fresh snapshot, including its SQL scan and native share digest, before
+building the new work. This corrects the earlier retained-window-reuse inference;
+the frozen runs exported no cache-hit or phase measurements, and later diagnostic
+traces are not measurements of these 20 cases.
+This qualifies the **window size of a preloaded-window refresh/rebuild and
+delivery workload**, with initial work already issued. It does not qualify
+cold-database startup, changing-share windows, recipient cardinality, large
+templates, real-node/network latency, separate frontend hosts, full HA or #291.
 
 The original common Tokio monotonic `Instant` starts immediately before
 concurrent `refresh_once` polling after the synthetic parent switch and ends
@@ -160,9 +165,10 @@ Across the eight measured 400k repetitions, excluding the two warmups, the
 latest refresh return accounts for 90.0–91.5% of final-client elapsed time;
 the residual is 0.313–0.365s, not an exclusive fanout phase.
 The ordinary observed settlement acquisition waits do not explain the seconds
-before refresh returns. Full-window build/hash work is a source-supported
-candidate, not a measured phase attribution. Build, hashing, executor scheduling,
-prepared SQL and commit remain unsplit; `commit_seconds` is explicitly null.
+before refresh returns. Snapshot scanning, native share digesting and full-window
+build/hash work are source-supported candidates, not measured phase attribution.
+Those phases, executor scheduling, prepared SQL and commit remain unsplit in the
+frozen data; `commit_seconds` is explicitly null.
 No lock-removal optimization follows from these observations alone.
 
 A separate supervisor stopped on 8 GiB sampled test RSS, less than 15% host
