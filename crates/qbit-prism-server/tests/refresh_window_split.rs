@@ -86,6 +86,15 @@ async fn unchanged_empty_and_nonempty_refresh_probe_execution_counts() -> Result
             ensure!(balance_reads.len() == 2, "idle balance-read count differs");
             for read in balance_reads { ensure!(read.returned_rows()? == 1, "balance DataRows differ"); }
             eprintln!("idle has_shares={has_shares}: payout_component_sql={} balance_reads=2 balance_rows=2 refresh_wall_us={}", probe_sql + cutoff_queries, wall.as_micros());
+            if has_shares {
+                // Sensitivity control: counting metadata as zero must not hide
+                // an actual payload read on the same observed connection.
+                let mark = f.proxy.mark();
+                let rows = sqlx::query("SELECT share_seq,payout_order_key,share_difficulty FROM qbit_share_ledger WHERE accepted LIMIT 1")
+                    .fetch_all(f.pool()).await?;
+                ensure!(rows.len() == 1, "payload control has no accepted share");
+                one_read(f, mark, 1).await?;
+            }
             Ok(())
         })).await?;
     }
