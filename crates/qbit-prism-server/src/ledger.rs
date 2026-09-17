@@ -28,7 +28,8 @@ use candidates::prepare_candidate_observed;
 pub use candidates::{
     authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
     Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimLifecycle, ClaimParts,
-    LandedAudit, OfferOutcome, OfferRecord, SignerKeys, ORPHANED_STATE,
+    LandedAudit, OfferOutcome, OfferRecord, RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys,
+    ORPHANED_STATE,
 };
 mod connect;
 use connect::{require_revision, writable};
@@ -42,9 +43,9 @@ pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInsta
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
 pub use jobs::{
-    BlobPruneCursor, BlobPruneResult, CompactDependency, CompactPrepared, CompactRepair,
-    IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
-    StoredCompactPrepared,
+    BlobPruneCursor, BlobPruneResult, CompactBatchAttempt, CompactDependency, CompactIssuedJob,
+    CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes, PreparedDependency,
+    PreparedTemplate, StoredCompactPrepared,
 };
 mod migration;
 pub use migration::{
@@ -61,7 +62,7 @@ pub use window::{
     WindowRef,
 };
 use window::{read_prior_balances, share_from_row};
-pub(crate) use window::{ChainObservationBehind, ChainObservationRetry};
+pub(crate) use window::{ChainObservationBehind, ChainObservationRetry, RefreshProbe};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -102,3 +103,7 @@ type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "../tests/support/ledger_execution_proxy.rs"]
+mod execution_proxy;

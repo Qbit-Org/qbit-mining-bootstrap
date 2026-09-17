@@ -1,9 +1,9 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    BlockingDrop, ChainObservationState, ChainTransition, CompactDependency, CompactPrepared,
-    CompactRepair, IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission,
-    StoredCompactPrepared,
+    BlockingDrop, ChainObservationState, ChainTransition, CompactBatchAttempt, CompactDependency,
+    CompactIssuedJob, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
+    PreparedTemplate, ReadAdmission, RefreshProbe, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -15,7 +15,10 @@ pub(super) trait WorkLedger: Send + Sync {
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>>;
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>>;
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
     fn read_window_with_permit<'a>(
@@ -93,12 +96,23 @@ pub(super) trait WorkLedger: Send + Sync {
         repair: Option<&'a CompactRepair>,
     ) -> BoxFuture<'a, Result<IssuedJobSave>>;
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>>;
+    fn save_issued_jobs_compact<'a>(
+        &'a self,
+        jobs: &'a [CompactIssuedJob],
+        revision: i64,
+        parent: &'a str,
+        dependency: CompactDependency<'a>,
+        attempt: &'a CompactBatchAttempt,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>>;
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>>;
 }
 
 impl WorkLedger for Ledger {
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(Ledger::latest_accepted_share_seq(self))
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
+        Box::pin(Ledger::refresh_probe(self, completion))
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(Ledger::payout_revision(self))
@@ -231,6 +245,18 @@ impl WorkLedger for Ledger {
     }
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
         Box::pin(Ledger::job(self, id))
+    }
+    fn save_issued_jobs_compact<'a>(
+        &'a self,
+        jobs: &'a [CompactIssuedJob],
+        revision: i64,
+        parent: &'a str,
+        dependency: CompactDependency<'a>,
+        attempt: &'a CompactBatchAttempt,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>> {
+        Box::pin(Ledger::save_issued_jobs_compact(
+            self, jobs, revision, parent, dependency, attempt,
+        ))
     }
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(async move {

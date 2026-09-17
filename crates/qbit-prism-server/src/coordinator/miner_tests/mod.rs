@@ -331,6 +331,7 @@ impl Fixture {
             ledger,
             submit_ledger: store.clone(),
             work_ledger: store.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::without_dwell_for_tests(store.clone()),
             prepared: Arc::new(RwLock::new(None)),
             refresh,
             wake: Notify::new(),

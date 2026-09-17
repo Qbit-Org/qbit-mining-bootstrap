@@ -96,6 +96,7 @@ struct Fixture {
     stratum: [u16; 2],
     highdiff: [u16; 2],
     api: [u16; 2],
+    ports: PortReservations,
     servers: Vec<Process>,
     miners: Vec<Process>,
     node: Process,
@@ -175,6 +176,55 @@ impl Startup {
         ];
         diagnostics::report(&children, self.database_url.as_deref())
     }
+}
+
+/// Keep all not-yet-started listeners bound: dropping each ephemeral bind
+/// immediately can hand the same port to another listener in this fixture.
+#[derive(Default)]
+struct PortReservations(Mutex<Vec<(u16, TcpListener)>>);
+impl PortReservations {
+    fn reserve(&self) -> Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        self.0.lock().unwrap().push((port, listener));
+        Ok(port)
+    }
+    fn release(&self, ports: &[u16]) {
+        self.0
+            .lock()
+            .unwrap()
+            .retain(|(port, _)| !ports.contains(port));
+    }
+}
+
+#[test]
+fn fixture_ports_stay_reserved_until_their_child_starts() -> Result<()> {
+    let reservations = PortReservations::default();
+    let ports = (0..8)
+        .map(|_| reservations.reserve())
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        ports.iter().collect::<std::collections::HashSet<_>>().len(),
+        8
+    );
+    for port in &ports {
+        assert!(TcpListener::bind(("127.0.0.1", *port)).is_err());
+    }
+    // Starting one child releases only its ports; later children stay protected.
+    reservations.release(&ports[..2]);
+    let child = ports[..2]
+        .iter()
+        .map(|port| TcpListener::bind(("127.0.0.1", *port)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for port in &ports[2..] {
+        assert!(TcpListener::bind(("127.0.0.1", *port)).is_err());
+    }
+    drop(reservations);
+    for port in &ports[2..] {
+        let _listener = TcpListener::bind(("127.0.0.1", *port))?;
+    }
+    drop(child);
+    Ok(())
 }
 
 fn free_port() -> Result<u16> {
@@ -270,7 +320,12 @@ impl Fixture {
             .path()
             .to_path_buf();
         startup.database_url = Some(database.database_url.clone());
-        let rpc_port = free_port()?;
+        let ports = PortReservations::default();
+        let rpc_port = ports.reserve()?;
+        let p2p_port = ports.reserve()?;
+        let stratum = [ports.reserve()?, ports.reserve()?];
+        let highdiff = [ports.reserve()?, ports.reserve()?];
+        let api = [ports.reserve()?, ports.reserve()?];
         let mut node_command = Command::new(&launch.qbitd);
         node_command
             .args([
@@ -286,14 +341,12 @@ impl Fixture {
             ])
             .arg(format!("-datadir={}", directory.display()))
             .arg(format!("-rpcport={rpc_port}"))
-            .arg(format!("-port={}", free_port()?));
+            .arg(format!("-port={p2p_port}"));
+        ports.release(&[rpc_port, p2p_port]);
         startup.node = Some(Process::spawn(
             &mut node_command,
             directory.join("qbit.log"),
         )?);
-        let stratum = [free_port()?, free_port()?];
-        let highdiff = [free_port()?, free_port()?];
-        let api = [free_port()?, free_port()?];
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()?;
@@ -309,6 +362,7 @@ impl Fixture {
             stratum,
             highdiff,
             api,
+            ports,
             servers: Vec::new(),
             miners: Vec::new(),
             node: startup.node.take().expect("node spawned above"),
@@ -414,6 +468,10 @@ impl Fixture {
                 .env("PRISM_CTV_BROADCASTER_WALLET", "prism")
                 .env("PRISM_CTV_BROADCASTER_FEE_BITS", fee.to_string());
         }
+        // Release only this child's ports immediately before spawn. Later
+        // servers remain reserved through node startup and migrations.
+        self.ports
+            .release(&[self.stratum[index], self.highdiff[index], self.api[index]]);
         Process::spawn(
             &mut command,
             self.directory.path().join(format!("server-{index}.log")),

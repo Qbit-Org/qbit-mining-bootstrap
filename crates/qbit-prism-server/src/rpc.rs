@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
     sync::{
@@ -7,6 +7,18 @@ use std::{
     },
     time::Duration,
 };
+
+/// The node answered a call with a JSON-RPC error object: the request reached
+/// the node and the node refused it, as distinct from a transport or protocol
+/// failure. The message is the one every caller always saw; what this adds is
+/// a type a caller can downcast to when "no such block" must be told apart
+/// from "the node is unreachable", as the operator recovery command must.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("qbit RPC {method}: {error}")]
+pub struct RpcReplyError {
+    pub method: String,
+    pub error: Value,
+}
 
 /// Reusable, deadline-bound HTTP connections. Mutating calls are never retried
 /// blindly: callers reconcile their durable outbox against chain state first.
@@ -99,7 +111,11 @@ impl Rpc {
             anyhow::anyhow!("qbit RPC {method} returned invalid JSON (HTTP {status})")
         })?;
         if !value["error"].is_null() {
-            bail!("qbit RPC {method}: {}", value["error"]);
+            return Err(RpcReplyError {
+                method: method.to_owned(),
+                error: value["error"].clone(),
+            }
+            .into());
         }
         anyhow::ensure!(
             status.is_success(),

@@ -71,9 +71,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 // The proxy file carries its own `#![allow(dead_code)]`.
-#[path = "../../../tests/support/ledger_execution_proxy.rs"]
-mod execution_proxy;
-use execution_proxy::{
+use crate::ledger::execution_proxy::{
     target_executions, target_statement_count, Execution, ExecutionProxy, Fault, FaultPhase,
     Outcome,
 };

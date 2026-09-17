@@ -4,8 +4,8 @@ use crate::{
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
         BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
-        HeartbeatHealth, Ledger, OfferOutcome, SignerKeys, Snapshot, Window, WindowError,
-        WindowRef, ORPHANED_STATE,
+        HeartbeatHealth, Ledger, OfferOutcome, RecoveryClaim, SignerKeys, Snapshot, Window,
+        WindowError, WindowRef, ORPHANED_STATE,
     },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
@@ -34,6 +34,7 @@ mod bundle_build;
 mod chain_observation;
 mod compact_resume;
 mod compact_runtime;
+mod issued_batcher;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
@@ -229,6 +230,7 @@ pub struct Coordinator {
     pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
+    issued_batcher: issued_batcher::IssuedBatcher,
     pub last_error: RwLock<Option<String>>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
@@ -368,6 +370,26 @@ enum RebuildFailure {
     /// The caller may fall back to a `Current` read, which proves the digest
     /// itself before it returns any balances.
     BalanceSnapshotMissing,
+}
+
+/// Why an operator recovery (#418) stopped short of finishing its row. Each
+/// variant is a stop the operator reads, not a failure of the machinery.
+/// After confirmed cleanup the row is left recoverable with the reason in
+/// `last_error`, and the command maps the variant to its exit status. Node,
+/// database and unconfirmed cleanup errors propagate as failures instead.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryStop {
+    /// The node does not hold the block on its active chain. Nothing is
+    /// offered: a block the node never accepted stays the coordinator's, and
+    /// a block a reorg removed stays in reconciliation.
+    #[error("not on the active chain: {0}")]
+    NotActive(String),
+    /// The identity check or the landing refused the row, for the reason.
+    #[error("{0}")]
+    Refused(String),
+    /// The operator's one deadline expired.
+    #[error("the recovery deadline expired")]
+    Deadline,
 }
 
 /// Map a window read error to the claim's action. A database error is not
@@ -712,6 +734,7 @@ impl Coordinator {
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
             ledger,
             rpc,
             refresh,
@@ -968,8 +991,12 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let state = self.work_ledger.payout_state().await?;
-        let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
+        let probe = self
+            .work_ledger
+            .refresh_probe(crate::ledger::ReadAdmission::default())
+            .await?;
+        let state = probe.payout_state;
+        let share_seq = probe.accepted_share_seq;
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
@@ -1046,9 +1073,16 @@ impl Coordinator {
         // fresh snapshot would be read. Later shares belong to the next window;
         // the selected WindowRef remains immutable through build/publication.
         let reuse_window = if let Some(window) = cached_window.as_ref() {
-            let state = self.work_ledger.payout_state().await?;
-            let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
-            window.reusable(network, share_seq, state, self.config.snapshot_interval)
+            let probe = self
+                .work_ledger
+                .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
+                .await?;
+            window.reusable(
+                network,
+                probe.accepted_share_seq,
+                probe.payout_state,
+                self.config.snapshot_interval,
+            )
         } else {
             false
         };
@@ -1344,6 +1378,19 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
+        self.with_candidate_heartbeat(claim, lease, self.process_candidate_inner(claim, lease))
+            .await
+    }
+
+    /// Run `work` on a claimed row while the ordinary heartbeat renews its
+    /// lease: the one owner of a claim's lifetime, for the submit loop's
+    /// processing and for the operator recovery alike.
+    async fn with_candidate_heartbeat(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
         // Establish ownership before even waiting for build capacity. Keep
         // renewal and processing independently polled: processing may hold a
         // database row lock while a renewal waits for that same transaction.
@@ -1420,7 +1467,7 @@ impl Coordinator {
         };
         // Neither future is spawned. Completion, cancellation and lease loss
         // all drop the other future; no orphan task can keep a lease alive.
-        let mut work = Box::pin(self.process_candidate_inner(claim, lease));
+        let mut work = Box::pin(work);
         tokio::select! {
             biased;
             result = &mut work => result,
@@ -1439,6 +1486,192 @@ impl Coordinator {
                 if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
             },
         }
+    }
+
+    /// Claim one row by hash for the operator recovery command (#418), with
+    /// the lease every claim takes, so [`Coordinator::recover_candidate`]'s
+    /// heartbeat renews it exactly as the submit loop's does. Keep the token
+    /// outside the deadline: COMMIT can succeed before its reply arrives or
+    /// before decoding finishes, so cancellation does not prove no claim.
+    pub async fn claim_candidate_for_recovery(
+        &self,
+        block_hash: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<RecoveryClaim> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let result = match tokio::time::timeout_at(
+            deadline,
+            self.ledger
+                .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds, &token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RecoveryStop::Deadline.into()),
+        };
+        if let Err(error) = &result {
+            let reason = format!("operator recovery claim stopped: {error:#}");
+            // The token fence preserves any later owner's claim. Taking
+            // the row lock also orders release after an in-flight COMMIT.
+            // Cleanup has its own bound even when the operation expired.
+            tokio::time::timeout(
+                CANDIDATE_LEASE.timeout,
+                self.ledger.release_recovery_token(block_hash, &token, &reason),
+            )
+            .await
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} timed out after {error:#}; the claim may remain until its lease expires"
+            ))?
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} failed after {error:#}; the claim may remain until its lease expires"
+            ))?;
+        }
+        result
+    }
+
+    /// Land an already-accepted block for the operator recovery command
+    /// (#418), under the operator's one `deadline`, and never offer it.
+    ///
+    /// This is the post-offer phase, driven for a row the operator named
+    /// instead of one a lane claimed: the chain must hold the block now, the
+    /// node's header must be the candidate's identity, a `pending` row is
+    /// adopted first so no claim on any frontend can offer it whatever
+    /// happens next, and then the landing, the second observation and the
+    /// finish are the coordinator's own. The only difference from a lane's
+    /// attempt is the rebuild deadline, which is the operator's rather than
+    /// the lane's 60 s.
+    ///
+    /// Every stop, the deadline included, attempts a bounded claim release.
+    /// A confirmed release leaves the row recoverable with its reason: its
+    /// state (a row adopted into `reconciliation` stays there), evidence and
+    /// schedule are untouched, and an audit that landed is reused by the next
+    /// attempt. A [`RecoveryStop`] names why; node and database errors
+    /// propagate as themselves. Unconfirmed cleanup is a failure that names
+    /// the original stop without asserting the row's current disposition.
+    pub async fn recover_candidate(
+        &self,
+        claim: &CandidateClaim,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let block = &claim.candidate.block_hash;
+        let lease = CandidateLease {
+            // The operator's deadline bounds the window read and rebuild
+            // too; the lane's own bound is what this command exists to
+            // exceed. The deadline around the whole work fires first.
+            rebuild_deadline: deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .max(Duration::from_secs(1)),
+            ..CANDIDATE_LEASE
+        };
+        let work =
+            self.with_candidate_heartbeat(claim, lease, self.recover_candidate_inner(claim, lease));
+        let result = match tokio::time::timeout_at(deadline, work).await {
+            Ok(result) => result,
+            Err(_) => Err(RecoveryStop::Deadline.into()),
+        };
+        let Err(error) = &result else {
+            return result;
+        };
+        // Only a confirmed release proves this attempt left the row
+        // recoverable. Cleanup is separately bounded; if it fails, the
+        // claim may remain until its lease expires.
+        let reason = format!("operator recovery stopped: {error:#}");
+        let released = tokio::time::timeout(
+            lease.timeout,
+            self.ledger.release_recovery_claim(claim, &reason),
+        )
+        .await
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} timed out after {error:#}; the claim may remain until its lease expires"
+        ))?
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} failed after {error:#}; the claim may remain until its lease expires"
+        ))?;
+        if !released {
+            anyhow::bail!(
+                "recovery claim cleanup for {block} did not release this attempt's claim after {error:#}; the candidate may have completed or changed owners; inspect the row before retrying"
+            );
+        }
+        result
+    }
+
+    async fn recover_candidate_inner(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+    ) -> Result<()> {
+        let candidate = &claim.candidate;
+        let block = &candidate.block_hash;
+        let height = candidate.found_block.block_height;
+        // The chain must hold the block now. There is no offer here, for any
+        // state: a block the node does not hold is not this command's.
+        let CandidateObservation { active, tip, .. } = self.observe_candidate(claim).await?;
+        if !active {
+            return Err(RecoveryStop::NotActive(format!(
+                "the node's active chain (tip {tip}) does not hold {block} at height {height}"
+            ))
+            .into());
+        }
+        // The node's header is the block's identity: its height must be the
+        // one the candidate records, and its parent the one in the
+        // candidate's block bytes.
+        let header = self.rpc.call("getblockheader", json!([block])).await?;
+        let node_height = header["height"]
+            .as_u64()
+            .context("qbit block header has no height")?;
+        if node_height != height {
+            return Err(RecoveryStop::Refused(format!(
+                "the candidate records height {height} but the node holds the block at height {node_height}"
+            ))
+            .into());
+        }
+        let node_parent = header["previousblockhash"]
+            .as_str()
+            .context("qbit block header has no previousblockhash")?;
+        let parent = header_parent(&candidate.block_bytes)?;
+        if !parent.eq_ignore_ascii_case(node_parent) {
+            return Err(RecoveryStop::Refused(format!(
+                "the candidate's block names parent {parent} but the node's header names {node_parent}"
+            ))
+            .into());
+        }
+        // A pending row is adopted before anything lands, exactly as the
+        // pre-offer probe adopts an active pending block: from this commit
+        // on, no claim on any frontend offers it, whatever happens next.
+        if claim.lifecycle.state == CandidateState::Pending {
+            let evidence =
+                format!("node reports block {block} active at height {height} with tip {tip}");
+            let reason = format!(
+                "adopted by operator recovery before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
+            );
+            tracing::warn!(%block, %reason, "operator recovery is adopting an active pending block");
+            self.ledger
+                .adopt_active_candidate(claim, &evidence, &reason)
+                .await?;
+        }
+        // The normal post-offer landing, refusals and all.
+        if let Err(reason) = self.land_offered(claim, lease).await? {
+            return Err(RecoveryStop::Refused(reason).into());
+        }
+        // Finished only on active-chain evidence observed now, at a revision
+        // proven now, exactly as the post-offer phase finishes.
+        let CandidateObservation {
+            active,
+            revision,
+            tip,
+            ..
+        } = self.observe_candidate(claim).await?;
+        if !active {
+            return Err(RecoveryStop::NotActive(format!(
+                "after the landing the node's active chain (tip {tip}) no longer holds {block} at height {height}; the audit is durable and the row awaits reconciliation"
+            ))
+            .into());
+        }
+        self.ledger
+            .finish_candidate_at_revision(claim, true, None, revision)
+            .await?;
+        self.blocks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Whether the block's audit has already landed and, if so, whether the

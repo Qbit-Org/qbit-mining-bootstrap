@@ -1,7 +1,8 @@
 use super::*;
 use crate::ledger::{
-    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
-    PreparedTemplate, StoredCompactPrepared,
+    CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared, CompactRepair,
+    IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission, RefreshProbe,
+    StoredCompactPrepared,
 };
 use anyhow::bail;
 use std::collections::VecDeque;
@@ -22,6 +23,8 @@ pub(crate) struct CompactStore {
     pub save_calls: StdMutex<Vec<CompactSave>>,
     pub issued_saves: StdMutex<VecDeque<Result<IssuedJobSave>>>,
     pub issued_calls: StdMutex<Vec<CompactIssuedSave>>,
+    pub batch_calls: StdMutex<Vec<usize>>,
+    pub batch_commit_gate: StdMutex<Option<Arc<Gate>>>,
     pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
     pub state_gate: StdMutex<Option<Arc<Gate>>>,
     pub state_calls: AtomicUsize,
@@ -74,8 +77,40 @@ impl MemoryLedger {
 }
 
 impl work_ledger::WorkLedger for MemoryLedger {
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async { Ok(self.snapshot.lock().unwrap().as_ref().unwrap().share_seq) })
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
+        Box::pin(async move {
+            let _completion = completion;
+            self.compact.state_calls.fetch_add(1, Ordering::SeqCst);
+            let scripted = self.compact.states.lock().unwrap().pop_front();
+            let result = {
+                let snapshot = self.snapshot.lock().unwrap();
+                let snapshot = snapshot.as_ref().expect("fixture snapshot");
+                let state = scripted.unwrap_or_else(|| {
+                    if self.fail_revision.load(Ordering::SeqCst) {
+                        return Err(WindowError::Database(sqlx::Error::PoolClosed));
+                    }
+                    Ok(PayoutState {
+                        payout_revision: self.revision.load(Ordering::SeqCst),
+                        prior_balances_digest: qbit_prism::prior_balances_digest(
+                            &snapshot.prior_balances,
+                        ),
+                    })
+                });
+                state.map(|payout_state| RefreshProbe {
+                    payout_state,
+                    accepted_share_seq: snapshot.share_seq,
+                })
+            };
+            let gate = self.compact.state_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            result
+        })
     }
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         self.compact.drop_probe.lock().unwrap().take()
@@ -595,6 +630,131 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 revision,
                 parent: parent.into(),
             });
+            Ok(IssuedJobSave::Saved)
+        })
+    }
+    fn save_issued_jobs_compact<'a>(
+        &'a self,
+        entries: &'a [CompactIssuedJob],
+        revision: i64,
+        parent: &'a str,
+        dependency: CompactDependency<'a>,
+        attempt: &'a CompactBatchAttempt,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>> {
+        Box::pin(async move {
+            self.compact.batch_calls.lock().unwrap().push(entries.len());
+            for entry in entries {
+                self.compact
+                    .issued_calls
+                    .lock()
+                    .unwrap()
+                    .push(CompactIssuedSave {
+                        id: entry.job_id.clone(),
+                        payload: entry.payload.clone(),
+                        current_revision: revision,
+                        parent: parent.into(),
+                        expires_at_ms: entry.expires_at_ms,
+                        key: dependency.key.into(),
+                        original_revision: dependency.original_revision,
+                        original_expires_at_ms: dependency.original_expires_at_ms,
+                        template_sha256: dependency.template_sha256.into(),
+                        prior_balances_digest: dependency.prior_balances_digest,
+                        repair: false,
+                    });
+            }
+            let gate = self.save_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if let Some(scripted) = self.compact.issued_saves.lock().unwrap().pop_front() {
+                if scripted? == IssuedJobSave::PreparedMissing {
+                    return Ok(IssuedJobSave::PreparedMissing);
+                }
+            }
+            ensure!(
+                !self.fail_save.load(Ordering::SeqCst),
+                "controlled persistence failure"
+            );
+            ensure!(
+                revision == self.revision.load(Ordering::SeqCst),
+                "revision changed"
+            );
+            {
+                let mut jobs = self.jobs.lock().unwrap();
+                let mut unique = std::collections::BTreeMap::new();
+                for entry in entries {
+                    ensure!(
+                        entry.expires_at_ms > self.database_now(),
+                        "issued job deadline elapsed"
+                    );
+                    ensure!(
+                        !entry.job_id.is_empty() && entry.job_id != dependency.key,
+                        "invalid issued job dependency"
+                    );
+                    ensure!(
+                        entry.payload["prepared_key"] == dependency.key
+                            && entry.payload["expires_at_ms"] == entry.expires_at_ms
+                            && parent == dependency.parent,
+                        "issued job dependency or deadline mismatch"
+                    );
+                    if let Some(previous) = unique.insert(&entry.job_id, entry) {
+                        ensure!(
+                            previous.payload == entry.payload
+                                && previous.expires_at_ms == entry.expires_at_ms,
+                            "immutable job ID conflict"
+                        );
+                    }
+                    if let Some(child) = jobs.get(&entry.job_id) {
+                        ensure!(
+                            child.payload == entry.payload
+                                && child.expires_at_ms == entry.expires_at_ms
+                                && child.parent == parent
+                                && child.revision == revision,
+                            "immutable job ID conflict"
+                        );
+                    }
+                }
+                let Some(original) = jobs.get_mut(dependency.key) else {
+                    return Ok(IssuedJobSave::PreparedMissing);
+                };
+                ensure!(
+                    original.revision == dependency.original_revision
+                        && original.parent == dependency.parent
+                        && original.payload["original_expires_at_ms"]
+                            == dependency.original_expires_at_ms
+                        && original.payload["template_sha256"] == dependency.template_sha256
+                        && original.payload["window"]["prior_balances_digest"]
+                            == hex::encode(dependency.prior_balances_digest),
+                    "immutable prepared dependency conflict"
+                );
+                let max_expiry = entries
+                    .iter()
+                    .map(|entry| entry.expires_at_ms)
+                    .max()
+                    .context("empty batch")?;
+                let renewed = max_expiry
+                    .checked_add(60_000)
+                    .context("prepared dependency expiry overflow")?;
+                attempt.start_commit()?;
+                if original.expires_at_ms < max_expiry {
+                    original.expires_at_ms = renewed;
+                }
+                for entry in unique.values() {
+                    jobs.entry(entry.job_id.clone()).or_insert(MemoryJob {
+                        payload: entry.payload.clone(),
+                        expires_at_ms: entry.expires_at_ms,
+                        revision,
+                        parent: parent.into(),
+                    });
+                }
+            }
+            // Deliberately represents a commit whose acknowledgement is lost.
+            let gate = self.compact.batch_commit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             Ok(IssuedJobSave::Saved)
         })
     }
