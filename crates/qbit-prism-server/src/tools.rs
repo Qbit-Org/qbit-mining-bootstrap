@@ -583,8 +583,12 @@ async fn active_block(rpc: &Rpc, hash: &str) -> Result<Result<(u64, String), Str
     let header = match rpc.call("getblockheader", json!([hash])).await {
         Ok(header) => header,
         Err(error) => {
-            // The node answered, and has no such block.
-            if let Some(reply) = error.downcast_ref::<RpcReplyError>() {
+            // Only RPC_INVALID_ADDRESS_OR_KEY means this header is missing.
+            // Warm-up and internal errors say nothing about chain membership.
+            if let Some(reply) = error
+                .downcast_ref::<RpcReplyError>()
+                .filter(|reply| reply.error["code"].as_i64() == Some(-5))
+            {
                 return Ok(Err(format!(
                     "the node has no such block: {}",
                     reply.error["message"].as_str().unwrap_or("no reason given")

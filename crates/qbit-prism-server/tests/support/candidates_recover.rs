@@ -33,6 +33,7 @@ const RECOVERY_INSTANCE: &str = "operator-recovery-test";
 struct Chain {
     active: BTreeMap<u64, String>,
     headers: HashMap<String, (u64, String)>,
+    header_error: Option<Value>,
     methods: Vec<String>,
 }
 
@@ -152,6 +153,9 @@ async fn answer(State(chain): State<Arc<Mutex<Chain>>>, Json(request): Json<Valu
                     json!({"code":-8,"message":"Block height out of range"}),
                 ),
             },
+            "getblockheader" if chain.header_error.is_some() => {
+                (Value::Null, chain.header_error.clone().unwrap())
+            }
             "getblockheader" => match request["params"][0]
                 .as_str()
                 .and_then(|hash| chain.headers.get(hash).map(|header| (hash, header)))
@@ -570,6 +574,34 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     assert!(message.contains("is already abandoned"), "{message}");
     assert!(message.contains("no candidate row for"), "{message}");
     assert!(message.contains("is not on the active chain"), "{message}");
+
+    // A node failure is not proof that an accepted block is missing, in
+    // either a plan or --apply. Preserve the RPC diagnostic and every row.
+    for error in [
+        json!({"code": -28, "message": "Loading block index"}),
+        json!({"code": -32603, "message": "Internal error"}),
+        json!({"message": "No error code"}),
+        json!({"code": "-5", "message": "Invalid error code"}),
+    ] {
+        node.script(|chain| chain.header_error = Some(error.clone()));
+        for apply in [false, true] {
+            let mut args = allowlist(&[&good.hash]);
+            if apply {
+                args.push("--apply");
+            }
+            let failed = recover(&db, &node, &args).await?;
+            assert_eq!(code(&failed), 1, "{}", stderr(&failed));
+            let message = stderr(&failed);
+            assert!(message.contains("qbit RPC getblockheader"), "{message}");
+            assert!(
+                message.contains(error["message"].as_str().unwrap()),
+                "{message}"
+            );
+            assert!(!message.contains("nothing to recover"), "{message}");
+            assert!(!message.contains("may be abandoned"), "{message}");
+        }
+    }
+    node.script(|chain| chain.header_error = None);
 
     // Malformed, duplicate and out-of-range allowlists are refused at the
     // entry boundary, before any connection: the node is not asked.
