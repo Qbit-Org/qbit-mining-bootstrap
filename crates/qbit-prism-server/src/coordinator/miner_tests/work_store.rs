@@ -1,7 +1,8 @@
 use super::*;
 use crate::ledger::{
     CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared, CompactRepair,
-    IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, StoredCompactPrepared,
+    IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission, RefreshProbe,
+    StoredCompactPrepared,
 };
 use anyhow::bail;
 use std::collections::VecDeque;
@@ -76,8 +77,40 @@ impl MemoryLedger {
 }
 
 impl work_ledger::WorkLedger for MemoryLedger {
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async { Ok(self.snapshot.lock().unwrap().as_ref().unwrap().share_seq) })
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
+        Box::pin(async move {
+            let _completion = completion;
+            self.compact.state_calls.fetch_add(1, Ordering::SeqCst);
+            let scripted = self.compact.states.lock().unwrap().pop_front();
+            let result = {
+                let snapshot = self.snapshot.lock().unwrap();
+                let snapshot = snapshot.as_ref().expect("fixture snapshot");
+                let state = scripted.unwrap_or_else(|| {
+                    if self.fail_revision.load(Ordering::SeqCst) {
+                        return Err(WindowError::Database(sqlx::Error::PoolClosed));
+                    }
+                    Ok(PayoutState {
+                        payout_revision: self.revision.load(Ordering::SeqCst),
+                        prior_balances_digest: qbit_prism::prior_balances_digest(
+                            &snapshot.prior_balances,
+                        ),
+                    })
+                });
+                state.map(|payout_state| RefreshProbe {
+                    payout_state,
+                    accepted_share_seq: snapshot.share_seq,
+                })
+            };
+            let gate = self.compact.state_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            result
+        })
     }
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         self.compact.drop_probe.lock().unwrap().take()
