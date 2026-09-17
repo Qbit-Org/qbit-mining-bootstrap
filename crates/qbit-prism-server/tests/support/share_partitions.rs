@@ -665,6 +665,94 @@ async fn migration_017_moves_a_bound_whose_headroom_ran_out() -> Result<()> {
     db.close(ledgers).await
 }
 
+#[tokio::test]
+async fn retained_legacy_header_duplicates_remain_exactly_replayable() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    super::two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    // The legacy writer accepted the same header under two worker identities.
+    // Migration 002 preserves both rows but maps the header to the first only.
+    insert_share(&pool, None, 1, "first").await?;
+    insert_share(&pool, None, 1, "later").await?;
+    let ledger = db.ledger("legacy-replay").await?;
+    let result = async {
+        assert_converted(&pool).await?;
+        let shares = ledger.snapshot(100).await?.shares;
+        ensure!(shares.len() == 2, "migration lost a legacy duplicate");
+        let hash = format!("{:064x}", 1);
+        let credited: String = sqlx::query_scalar(
+            "SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1",
+        )
+        .bind(&hash)
+        .fetch_one(&pool)
+        .await?;
+        ensure!(credited == format!("first:{hash}"));
+        let later = shares
+            .iter()
+            .find(|row| row.share_id == format!("later:{hash}"))
+            .context("later legacy share is missing")?;
+        let bound = conversion_bound(&pool).await?.context("conversion bound is missing")?;
+        for older_partition in [false, true] {
+            if older_partition {
+                sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
+                    .bind(bound + 2 * WIDTH + 10)
+                    .execute(&pool)
+                    .await?;
+                sqlx::query("SELECT qbit_prism_share_partition_ensure()")
+                    .execute(&pool)
+                    .await?;
+            }
+            let floor: i64 = sqlx::query_scalar("SELECT qbit_prism_share_probe_floor()")
+                .fetch_one(&pool)
+                .await?;
+            ensure!((floor > later.share_seq as i64) == older_partition);
+            let before: (i64, i64) = sqlx::query_as(
+                "SELECT ledger_clock_ms,(SELECT last_value FROM qbit_share_ledger_share_seq_seq) FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await?;
+            for original in &shares {
+                let replay = ledger.append(original.clone(), None).await?;
+                ensure!(!replay.inserted && replay.share == *original);
+            }
+            let mut altered = later.clone();
+            altered.share_difficulty += 1;
+            let error = ledger.append(altered, None).await.unwrap_err().to_string();
+            ensure!(error.contains("duplicate share_id payload mismatch"), "{error}");
+            let mut other = later.clone();
+            other.share_id = format!("new-worker:{hash}");
+            let error = ledger.append(other, None).await.unwrap_err().to_string();
+            ensure!(error.contains("header already credited globally"), "{error}");
+            ensure!(share_count(&pool).await? == 2);
+            let after: (i64, i64) = sqlx::query_as(
+                "SELECT ledger_clock_ms,(SELECT last_value FROM qbit_share_ledger_share_seq_seq) FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await?;
+            ensure!(before == after, "replays changed the ledger clock or sequence");
+        }
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger DETACH PARTITION qbit_share_ledger_p0")
+            .execute(&pool)
+            .await?;
+        for original in shares {
+            let error = ledger.append(original, None).await.unwrap_err().to_string();
+            ensure!(error.contains("duplicate-share"), "{error}");
+        }
+        ensure!(share_count(&pool).await? == 0, "a detached share was credited again");
+        let mappings: Vec<String> = sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes")
+            .fetch_all(&pool)
+            .await?;
+        ensure!(mappings == [credited], "replays changed the global header mapping");
+        Ok(())
+    }
+    .await;
+    pool.close().await;
+    db.close(vec![ledger]).await?;
+    result
+}
+
 /// share_id uniqueness is per leaf after the conversion. The append path
 /// is what keeps it global: it consults qbit_prism_share_hashes first, so
 /// an exact replay of a share in an older partition is matched (bounded
