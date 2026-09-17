@@ -235,6 +235,15 @@ async fn recover(db: &Database, node: &ScriptedNode, args: &[&str]) -> Result<Ou
 }
 
 async fn recover_at(database_url: &str, node: &ScriptedNode, args: &[&str]) -> Result<Output> {
+    recover_at_with_env(database_url, node, args, &[]).await
+}
+
+async fn recover_at_with_env(
+    database_url: &str,
+    node: &ScriptedNode,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
@@ -257,6 +266,7 @@ async fn recover_at(database_url: &str, node: &ScriptedNode, args: &[&str]) -> R
             .env("PRISM_USERNAME_FALLBACK_ADDRESS", "recovery-test-fallback")
             .env("PRISM_INSTANCE_ID", RECOVERY_INSTANCE);
     }
+    command.envs(env.iter().copied());
     Ok(tokio::time::timeout(Duration::from_secs(90), command.output()).await??)
 }
 
@@ -1473,7 +1483,25 @@ async fn recover_apply_reports_failed_claim_cleanup() -> Result<()> {
         let mut args = allowlist(&[&hash]);
         args.extend(["--apply", "--timeout-seconds", "4"]);
         let started = std::time::Instant::now();
-        let expired = recover(&db, &node, &args).await?;
+        let expired = if fail_cleanup {
+            recover(&db, &node, &args).await?
+        } else {
+            // Select the coordinator's five-second cleanup timeout. The
+            // default five-second database lock timeout can win that race
+            // and correctly report a database error instead of "timed out".
+            // Keep both database timers beyond the unchanged 30-second
+            // assertion below; production defaults and other tests stay intact.
+            recover_at_with_env(
+                &db.url,
+                &node,
+                &args,
+                &[
+                    ("PRISM_DATABASE_LOCK_TIMEOUT_MS", "60000"),
+                    ("PRISM_DATABASE_STATEMENT_TIMEOUT_MS", "60000"),
+                ],
+            )
+            .await?
+        };
         let message = stderr(&expired);
         assert_eq!(code(&expired), 1, "{message}");
         assert!(started.elapsed() < Duration::from_secs(30));
