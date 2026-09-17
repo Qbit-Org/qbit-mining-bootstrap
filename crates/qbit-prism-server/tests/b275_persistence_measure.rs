@@ -57,9 +57,24 @@ async fn retried_delivery_is_not_reported_as_failure_free() -> Result<()> {
 #[ignore = "coordinate an uncontended disposable PostgreSQL16 measurement slot first"]
 async fn measure_2000_sessions_one_and_two_frontends() -> Result<()> {
     let raw = gate::required_database_url(gate::site!())?;
+    // Measurement controls only: the session count and original deadlines stay fixed.
+    let shares = std::env::var("PRISM_B275_WINDOW_SHARES").unwrap_or_else(|_| "16".into());
+    let shares: u64 = shares.parse()?;
+    anyhow::ensure!(
+        [16, 400_000, 500_000].contains(&shares),
+        "unsupported window size"
+    );
+    let order = std::env::var("PRISM_B275_FRONTEND_ORDER").unwrap_or_else(|_| "1,2".into());
+    let order: &[usize] = match order.as_str() {
+        "1,2" => &[1, 2],
+        "2,1" => &[2, 1],
+        "1" => &[1],
+        "2" => &[2],
+        _ => anyhow::bail!("frontend order must be 1,2 / 2,1 / 1 / 2"),
+    };
     // Separate schemas and fully closed listeners/pools between topologies.
-    for frontends in [1, 2] {
-        support::run(&raw, frontends, |fixture, deadline| {
+    for &frontends in order {
+        support::run_window(&raw, frontends, shares, |fixture, deadline| {
             support::delivery(fixture, 2_000, deadline).boxed_local()
         })
         .await?;

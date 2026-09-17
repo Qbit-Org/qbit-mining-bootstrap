@@ -41,10 +41,11 @@ pub struct Fixture {
     admin: PgPool,
     schema: String,
     settings: Value,
+    shares: u64,
 }
 
 impl Fixture {
-    async fn open(raw: &str, count: usize) -> Result<Self> {
+    async fn open(raw: &str, count: usize, shares: u64) -> Result<Self> {
         ensure!((1..=2).contains(&count));
         let admin = PgPoolOptions::new().max_connections(2).connect(raw).await?;
         let row = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes, current_setting('synchronous_commit') AS synchronous_commit")
@@ -84,6 +85,7 @@ impl Fixture {
             admin,
             schema,
             settings,
+            shares,
         };
         let opened = async {
             for index in 0..count {
@@ -100,11 +102,14 @@ impl Fixture {
                     .frontends
                     .push(Coordinator::new(config, Arc::new(Metrics::default())).await?);
             }
-            window_fixture::WindowPlan::new(SHARES)?
-                .load(&fixture.direct, "b275")
-                .await?;
+            let plan = window_fixture::WindowPlan::new(shares)?;
+            let load = plan.load(&fixture.direct, "b275").await?;
+            plan.verify_round_trip(&fixture.direct, &[1, shares.div_ceil(2), shares]).await?;
+            sqlx::query("ANALYZE qbit_share_ledger").execute(&fixture.direct).await?;
+            println!("B275_FIXTURE {}", json!({"shares":load.rows,"serialized_bytes":load.serialized_bytes,"load_seconds":load.seconds,"sampled_round_trip":true,"analyzed":true,"schema":fixture.schema,"node_endpoint":fixture.node.url}));
             for frontend in &fixture.frontends {
                 frontend.refresh_once().await?;
+                ensure!(frontend.prepared.read().await.as_ref().and_then(|p| p.window.shares).is_some_and(|r| r.share_count == shares), "initial prepared window has wrong share count");
                 fixture
                     .listeners
                     .push(socket::Listener::start(frontend).await?);
@@ -195,8 +200,17 @@ pub async fn run(
     frontends: usize,
     body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
 ) -> Result<()> {
+    run_window(raw, frontends, SHARES, body).await
+}
+
+pub async fn run_window(
+    raw: &str,
+    frontends: usize,
+    shares: u64,
+    body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
+) -> Result<()> {
     let _serial = SERIAL.lock().await;
-    let fixture = Fixture::open(raw, frontends).await?;
+    let fixture = Fixture::open(raw, frontends, shares).await?;
     let case_deadline = Instant::now() + Duration::from_secs(240);
     let result = AssertUnwindSafe(timeout_at(case_deadline, body(&fixture, case_deadline)))
         .catch_unwind()
@@ -324,9 +338,9 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
     let complete = seconds.len() == sessions && refresh_errors.is_empty() && failure_free;
     let max = seconds.last().copied();
     let report = json!({
-        "schema":"b275.delivery.v3", "historical_baseline_sha":HISTORICAL_BASELINE,
+        "schema":"b275.delivery.v4", "historical_baseline_sha":HISTORICAL_BASELINE,
         "frontends":frontends,"sessions_total":sessions,"sessions_per_frontend":sessions/frontends,
-        "fixture_shares":SHARES,"database":fixture.settings,
+        "fixture_shares":fixture.shares,"database":fixture.settings,
         "runtime_threads":tokio::runtime::Handle::current().metrics().num_workers(),
         "frontend_settings":fixture.frontends.iter().zip(&fixture.listeners).map(|(f,l)| json!({"build_workers":f.config.build_workers,"database_connections":f.config.database_connections,"listener":l.settings})).collect::<Vec<_>>(),
         "delivery_attempt_deltas_per_frontend":delivery_attempts,"delivery_failure_free":failure_free,
@@ -334,6 +348,8 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         "deadline_seconds":120,"effective_delivery_budget_seconds":deadline.saturating_duration_since(start).as_secs_f64(),"received":seconds.len(),"complete":complete,
         "refresh_return_seconds":refreshes.iter().map(|r| r.as_ref().ok().copied()).collect::<Vec<_>>(),
         "p50_delivery_seconds":seconds.get(seconds.len().saturating_sub(1)/2),
+        "p95_delivery_seconds":seconds.get((seconds.len()*95).div_ceil(100).saturating_sub(1)),
+        "quantiles":"p50 lower median (historical definition); p95 nearest rank; received clients only",
         "max_observed_delivery_seconds":max,
         "all_sessions_within_one_second":complete && max.is_some_and(|s| s <= 1.0),
         "refresh_errors":refresh_errors,"delivery_errors":delivery_errors,
@@ -343,9 +359,8 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         "performance_acceptance":"not established by this harness result alone"
     });
     println!("B275_MEASUREMENT {report}");
-    ensure!(complete, "incomplete delivery measurement: {report}");
     let mut ids = HashSet::new();
-    for (_, received) in &deliveries {
+    for (_, received) in deliveries.iter().filter(|(_, r)| r.is_ok()) {
         ensure!(
             ids.insert(received.as_ref().unwrap().0.clone()),
             "duplicate job ID"
@@ -367,7 +382,7 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
                 .shares
                 .context("no window range")?
                 .share_count
-                == SHARES
+                == fixture.shares
         );
         let original = frontend
             .ledger
@@ -386,7 +401,7 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         );
         let jobs: Vec<_> = deliveries
             .iter()
-            .filter(|(f, _)| *f == index)
+            .filter(|(f, r)| *f == index && r.is_ok())
             .map(|(_, r)| r.as_ref().unwrap().0.clone())
             .collect();
         let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id=ANY($1) AND parent_hash=$2 AND payout_revision=$3 AND payload->>'prepared_key'=$4 AND expires_at>clock_timestamp()")
@@ -394,6 +409,46 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         ensure!(
             valid as usize == jobs.len(),
             "issued rows lost prepared identity or revision"
+        );
+        let rows = sqlx::query("SELECT job_id, instance_id, payload, (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+            .bind(&jobs).fetch_all(&fixture.direct).await?;
+        let rows: BTreeMap<String, _> = rows
+            .into_iter()
+            .map(|row| Ok((row.try_get("job_id")?, row)))
+            .collect::<Result<_>>()?;
+        let mut children = Vec::new();
+        for ((owner, received), (_, client)) in deliveries.iter().zip(&clients) {
+            if *owner != index {
+                continue;
+            }
+            let Ok((job_id, seconds)) = received else {
+                continue;
+            };
+            let row = rows
+                .get(job_id)
+                .context("delivered child missing durable row")?;
+            let payload: Value = row.try_get("payload")?;
+            ensure!(
+                row.try_get::<String, _>("instance_id")? == frontend.config.instance_id,
+                "child belongs to another frontend"
+            );
+            ensure!(
+                payload["worker"]["username"] == client.username
+                    && payload["extranonce1"] == client.extranonce1
+                    && payload["extranonce2_size"] == client.extranonce2_size,
+                "durable child differs from subscribed client: {job_id}"
+            );
+            ensure!(
+                payload["expires_at_ms"] == row.try_get::<i64, _>("expires_at_ms")?,
+                "child expiry differs from durable row"
+            );
+            children.push(
+                json!({"job_id":job_id,"delivery_seconds":seconds,"subscribed_username":client.username,"subscribed_extranonce1":client.extranonce1,"subscribed_extranonce2_size":client.extranonce2_size,"durable_payload":payload}),
+            );
+        }
+        println!(
+            "B275_CHILD_IDENTITIES {}",
+            json!({"frontend":index,"children":children})
         );
         let issued: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE instance_id=$1 AND parent_hash=$2 AND payload ? 'prepared_key'")
             .bind(&frontend.config.instance_id).bind(&parent).fetch_one(&fixture.direct).await?;
@@ -412,7 +467,11 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
             "readback rewrote immutable prepared bytes"
         );
     }
-    println!("B275_DURABILITY frontends={frontends} sessions={sessions} verified=true");
+    println!(
+        "B275_DURABILITY frontends={frontends} sessions={sessions} delivered={} verified=true",
+        ids.len()
+    );
+    ensure!(complete, "incomplete delivery measurement: {report}");
     Ok(())
 }
 
