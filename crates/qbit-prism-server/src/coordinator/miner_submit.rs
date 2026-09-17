@@ -14,6 +14,10 @@ use crate::metrics::StaleJobCause;
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
+#[cfg(test)]
+#[path = "miner_submit_acquire_tests.rs"]
+mod acquire_tests;
+
 /// How a persistence attempt ended, as far as its acknowledgement can tell.
 #[derive(Debug)]
 pub(super) enum SaveOutcome {
@@ -621,14 +625,14 @@ impl Coordinator {
         // `share_seq` lands in, which prunes the probe to at most three
         // leaves holding rows at executor start, whatever width each
         // partition was created with.
-        let exists = tokio::time::timeout_at(
-            bound,
+        let exists = tokio::time::timeout_at(bound, async {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
             )
             .bind(&share.share_id)
-            .fetch_one(&self.ledger.pool),
-        )
+            .fetch_one(&mut *self.ledger.acquire().await?)
+            .await
+        })
         .await;
         match exists {
             Err(_) => {
@@ -696,15 +700,15 @@ impl Coordinator {
             // leaves and carries the same probe floor as the probe above:
             // without it, every poll of this loop would descend one per-leaf
             // `share_id` index per attached partition.
-            let poll = tokio::time::timeout_at(
-                bound,
+            let poll = tokio::time::timeout_at(bound, async {
                 sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
                     "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)
-                .fetch_one(&self.ledger.pool),
-            )
+                .fetch_one(&mut *self.ledger.acquire().await?)
+                .await
+            })
             .await;
             match poll {
                 Err(_) => break,

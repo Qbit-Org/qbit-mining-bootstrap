@@ -358,7 +358,7 @@ impl Ledger {
         let (payout_revision, chain_epoch, best_tip_hash) = sqlx::query_as(
             "SELECT payout_revision,chain_epoch,best_tip_hash FROM qbit_prism_cluster WHERE singleton",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *self.acquire().await?)
         .await?;
         Ok(ChainObservationState {
             payout_revision,

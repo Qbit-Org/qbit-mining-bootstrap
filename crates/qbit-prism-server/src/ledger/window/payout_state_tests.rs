@@ -10,11 +10,8 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tokio_util::task::AbortOnDropHandle;
 
-#[allow(dead_code)]
-#[path = "../../../tests/support/ledger_database.rs"]
-mod database;
-
 use crate::ledger::execution_proxy as proxy;
+use crate::ledger_test_database as database;
 
 tokio::task_local! {
     pub(super) static HASH_CALLS: Arc<AtomicUsize>;

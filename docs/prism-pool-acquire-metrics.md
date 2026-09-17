@@ -40,6 +40,8 @@ acquisitions, these direct statements use the shared checkout timer:
 - `migration_source`, the one-row pages of `import_legacy_audits` (including
   the final empty read), and `backfill_ctv`'s initial audit list;
 - `job`, `compact_prepared`, and `prune_expired_jobs`;
+- `WorkLedger::now_ms`, `chain_observation_state`, and `persist_block_only`'s
+  initial duplicate probe and credit/disposition polls;
 - `apply_online_migration`'s startup checkout, before the connection is detached.
 
 Each pending online migration records one checkout when metrics are attached.
@@ -96,6 +98,31 @@ SQL or the later reconstruction does not relabel completed checkouts. The
 snapshot authority, anchored range, canonical bytes and digest checks are
 unchanged.
 
+The coordinator database clock and chain-observation state each record one
+checkout. The latter retains its one-statement revision/epoch/tip snapshot.
+Each block-only duplicate probe and each credit/disposition poll records its
+own checkout, inside the
+original acknowledgement deadline. The two block-only probes are not issued-job
+reads. Credit and disposition still share one SQL statement and MVCC snapshot.
+Connections are released at the statement boundary, before enqueue or poll
+sleep. Missing rows, duplicates and terminal dispositions retain successful
+checkout observations; SQL errors or cancellation after acquisition do too.
+Cancellation while acquiring records a failure. Before enqueue a read failure
+is definite; after enqueue a failed or missing read does not prove whether the
+durable candidate earned credit. Timing changes neither that distinction nor
+the enqueue's existing handling of an unknown outcome.
+
+Polls contribute actual acquisition attempts to the same aggregate histogram
+as the other covered callers. Expanding coverage can change its percentile:
+a pending candidate can produce many fast acquisitions when the pool has spare
+capacity, even if settlement is stalled. Each poll waits for its checkout and
+SQL before the existing 50 ms sleep, so a saturated pool slows those attempts
+and their observed waits increase. The pool-wait alert's five-minute p99 and
+ten-attempt minimum describe this combined population, not distinct submissions,
+per-caller latency or settlement latency. Adding fast samples can lower the
+aggregate p99; this coverage change does not change the alert's grouping,
+threshold or minimum count.
+
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
 Other direct coordinator, candidate and startup queries still acquire without
 this helper. The pool-only public helpers have no attached metrics owner:
@@ -116,11 +143,11 @@ Remaining sites outside this slice include:
   connection ownership.
 
 Coordinator startup checks, candidate lease/terminal reconciliation,
-miner-submit issued-job checks, and `WorkLedger::now_ms` remain outside this
-slice, as do public read pools, operator connections and the rollup transaction.
-At this revision `ledger/window.rs` takes transactions through `Ledger::begin`
-and passes existing connections to its range/probe readers; those readers
-must not be counted as fresh checkouts.
+public read pools, operator connections and the rollup transaction remain
+outside this slice.
+The other `ledger/window.rs` reads take transactions through `Ledger::begin`
+and pass existing connections to range/probe readers; those readers must not
+be counted as fresh checkouts.
 
 ## Adding a caller
 
