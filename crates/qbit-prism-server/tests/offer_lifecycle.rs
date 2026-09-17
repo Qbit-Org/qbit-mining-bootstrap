@@ -56,7 +56,7 @@ const PRE_011: [(i32, &str); 10] = [
     ),
     (14, include_str!("../migrations/014_policy_transition.sql")),
 ];
-const ALL_VERSIONS: [i32; 14] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const ALL_VERSIONS: [i32; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
 /// The proof time the lifecycle test enqueues with, and the call time it
@@ -436,6 +436,10 @@ impl Database {
                     self.versions().await? == ALL_VERSIONS,
                     "the runner did not migrate the #258 source"
                 );
+                // Undo epoch authority with the later lifecycle metadata:
+                // this fixture models an old writer, not a mixed-version one.
+                sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=18; DELETE FROM qbit_prism_schema_capabilities WHERE capability='chain_observation_epoch'; ALTER TABLE qbit_prism_cluster DROP COLUMN chain_epoch")
+                    .execute(&self.pool).await?;
                 sqlx::raw_sql(
                     "ALTER TABLE qbit_prism_instances DROP CONSTRAINT qbit_prism_instances_offer_startup; DELETE FROM qbit_prism_schema_capabilities WHERE capability='instance_offer_startup'; DELETE FROM qbit_prism_schema_migrations WHERE version IN (11,12,15); \
                      DELETE FROM qbit_prism_schema_capabilities WHERE capability IN ('candidate_offer_lifecycle','candidate_orphan_disposition'); \
@@ -2195,7 +2199,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2232,11 +2236,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 18 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 18]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2273,7 +2277,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );

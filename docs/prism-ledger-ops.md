@@ -309,6 +309,60 @@ idempotent and claim-fenced. Do not infer active-chain acceptance from a
 socket write or a missing RPC reply: an offered block is confirmed only by a
 fresh active-chain observation.
 
+## Chain observation epoch upgrade (018)
+
+Migration 018 adds `qbit_prism_cluster.chain_epoch` and declares
+`chain_observation_epoch = 1`. The counter changes atomically with every
+accepted chain checkpoint and payout revision. Accounting-only revision
+updates do not change it. Equal-work observations bind their transition to
+the original epoch before node I/O, so a peer's A-to-C-to-A round trip cannot
+be mistaken for accounting-only drift. Fresh retries retain that original
+epoch; cancellation, unknown COMMIT outcomes and failed publication cannot
+rearm them. Lower-work refusals retain the previous local tip without
+restoring consumed retry authority.
+
+Epochs order fresh observation attempts against committed cluster changes;
+they do not timestamp node choices that occurred between polls. A new
+observation started after a completed peer round trip can establish a new
+transition from the currently accepted predecessor, using the current epoch.
+That is distinct from retaining an older in-flight witness across the round
+trip. Subsequent unchanged polls cannot repeat the replacement.
+
+A scheduler tick or wake permits at most one immediate fresh retry after a
+definite accounting-only refusal. Another refusal returns to normal polling,
+and shutdown prevents the extra attempt. The original witness epoch and all
+publication checks still apply; repeated concurrent interference has no
+unconditional two-second completion guarantee.
+
+This is an **offline development-line upgrade**, not a rolling upgrade.
+Stop every earlier frontend and one-shot writer, disable automatic restarts,
+and finish or cancel any old startup already past its capability check.
+Every registered instance must explicitly report `stopped` or `drained`;
+do not delete instance rows or treat heartbeat expiry as shutdown. The
+migrator holds the registration lock through the schema commit and refuses
+active instances before applying 018. That database check cannot discover an
+unregistered old tool or evict an already connected process: excluding all
+old writers is an operator prerequisite. Start only epoch-aware binaries
+after commit. No production deployment is implied by this development change.
+
+Existing checkpoint and accounting values are preserved; epoch begins at zero
+because old processes and their observations no longer exist at the offline
+boundary. Restart, accounting, policy changes and fatal-state recovery never
+reset it. The capability refuses older binaries on subsequent connection,
+including operator tools that use the same gate. Removing the capability or
+resetting the counter is not a supported downgrade. Restoring an older full
+backup requires all writers stopped and the existing accounting-reconciliation
+procedure; post-upgrade shares and candidates must not be silently discarded.
+
+Recovery evidence includes every nonzero epoch in `chain_checkpoint`, while
+the zero default preserves pre/post-migration evidence equivalence. Restore
+the whole cluster checkpoint, never its epoch independently. Issued balances,
+WindowRef, prepared/job/candidate payloads, protocol and payout/candidate
+revision fences are unchanged. A cold conflicting equal-work frontend still
+waits for convergence or more work; this introduces no authoritative-node
+setting. Migration numbers 016/017 belong to the separate share-partitioning
+change; 018 is independently required on this branch.
+
 ## Blocks, balances, and reorgs
 
 Core durable tables remain:
