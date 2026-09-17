@@ -14,6 +14,10 @@ use crate::metrics::StaleJobCause;
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
+#[cfg(test)]
+#[path = "miner_submit_acquire_tests.rs"]
+mod acquire_tests;
+
 /// How a persistence attempt ended, as far as its acknowledgement can tell.
 #[derive(Debug)]
 pub(super) enum SaveOutcome {
