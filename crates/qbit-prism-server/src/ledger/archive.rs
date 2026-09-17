@@ -2460,6 +2460,23 @@ pub async fn restore(
             sqlx::query("LOCK TABLE ONLY qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
                 .execute(&mut *tx)
                 .await?;
+            // PostgreSQL checks overlap only against attached leaves. The
+            // archive chain also reserves detached and dropped ranges.
+            let overlapping: Option<String> = sqlx::query_scalar(
+                "SELECT partition_name FROM qbit_prism_share_partitions \
+                 WHERE ($1::bigint IS NULL OR upper_seq>$1) \
+                 AND (lower_seq IS NULL OR lower_seq<$2) \
+                 ORDER BY upper_seq,partition_name LIMIT 1",
+            )
+            .bind(lower)
+            .bind(upper)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(recorded) = overlapping {
+                bail!(
+                    "refusing to import {partition_name}: its bounds overlap cataloged partition {recorded}. Reattach that partition's recorded archive, or restore without --attach to inspect this archive"
+                );
+            }
         }
         let duplicate: Option<String> = sqlx::query_scalar(&format!(
             "SELECT restored.share_id FROM {partition_name} restored \

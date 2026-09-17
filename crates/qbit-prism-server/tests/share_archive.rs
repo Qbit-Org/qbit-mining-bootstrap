@@ -2087,6 +2087,83 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
     }
 }
 
+/// Empty imports still reserve a range in the archive chain. A renamed or
+/// narrower archive cannot occupy the bounds of detached or dropped history.
+#[tokio::test]
+async fn restore_import_rejects_overlapping_cataloged_bounds() -> Result<()> {
+    for (partition, state) in [
+        (P0, "detached"),
+        (P0, "dropped"),
+        (P1, "detached"),
+        (P1, "dropped"),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("restore-overlapping-bounds").await?;
+            let root = tempfile::tempdir()?;
+            let (lower, upper) = bounds(&ledger.pool, partition).await?;
+            set_sequence(&ledger.pool, upper - 1).await?;
+            for name in if partition == P0 { vec![P0] } else { vec![P0, P1] } {
+                archive::archive(&ledger, name, root.path(), false, "operator-a").await?;
+                archive::verify(&ledger, name, root.path()).await?;
+            }
+            let recorded = catalog(&ledger.pool, partition).await?;
+            let manifest_path = PathBuf::from(recorded.try_get::<String, _>("archive_uri")?);
+            let manifest: archive::ArchiveManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+            sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger DETACH PARTITION {partition}"))
+                .execute(&ledger.pool).await?;
+            if state == "dropped" {
+                sqlx::raw_sql(&format!("DROP TABLE {partition}"))
+                    .execute(&ledger.pool).await?;
+            }
+            sqlx::query("UPDATE qbit_prism_share_partitions SET state=$1,detached_at=clock_timestamp(),dropped_at=CASE WHEN $1='dropped' THEN clock_timestamp() END WHERE partition_name=$2")
+                .bind(state).bind(partition).execute(&ledger.pool).await?;
+            let imported_name = "qbit_share_ledger_p99";
+            let import_path = manifest_path.with_file_name("import-manifest.json");
+            for (import_lower, import_upper) in [(lower, upper), (Some(lower.unwrap_or(0) + 1), upper - 1)] {
+                let mut imported = manifest.clone();
+                imported.partition_name = imported_name.into();
+                imported.lower_seq = import_lower;
+                imported.upper_seq = import_upper;
+                imported.previous_upper_seq = import_lower;
+                std::fs::write(&import_path, imported.canonical()?.0)?;
+                let error = archive::restore(&ledger, &import_path, root.path(), true).await
+                    .expect_err("imported a range reserved by departed catalog history").to_string();
+                ensure!(error.contains("overlap cataloged partition") && error.contains(partition), "{error}");
+                let unchanged: bool = sqlx::query_scalar(
+                    "SELECT to_regclass($1) IS NULL \
+                     AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+                     AND EXISTS(SELECT 1 FROM qbit_prism_share_partitions \
+                                WHERE partition_name=$2 AND state=$3 AND archive_manifest_sha256=$4) \
+                     AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes) \
+                     AND qbit_prism_share_next_seq()=$5",
+                )
+                .bind(imported_name).bind(partition).bind(state)
+                .bind(recorded.try_get::<String, _>("archive_manifest_sha256")?).bind(upper)
+                .fetch_one(&ledger.pool).await?;
+                ensure!(unchanged, "refused overlapping import changed the destination");
+            }
+            let inspected = archive::restore(&ledger, &import_path, root.path(), false).await?;
+            ensure!(inspected["attached"] == false && inspected["row_count"] == 0, "{inspected}");
+            if state == "dropped" {
+                let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+                ensure!(restored["attached"] == true, "recorded reattachment was refused: {restored}");
+            }
+            Ok(ledger)
+        }.await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A retained global mapping is still authoritative when its original row
 /// is detached or dropped. Moving that ID to a later sequence is a replay.
 #[tokio::test]

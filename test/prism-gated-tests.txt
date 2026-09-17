@@ -537,6 +537,7 @@ qbit-prism-server::share_archive::restore_import_rebuilds_hashes_and_rejects_con
 qbit-prism-server::share_archive::restore_import_refuses_a_gap_above_the_attached_range
 qbit-prism-server::share_archive::restore_import_rejects_duplicate_share_ids
 qbit-prism-server::share_archive::restore_import_rejects_ids_credited_in_departed_partitions
+qbit-prism-server::share_archive::restore_import_rejects_overlapping_cataloged_bounds
 qbit-prism-server::share_archive::restore_import_rejects_rows_at_or_below_the_rollup_watermark
 qbit-prism-server::share_archive::restore_import_waits_for_an_inflight_rollup
 qbit-prism-server::share_archive::restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent
