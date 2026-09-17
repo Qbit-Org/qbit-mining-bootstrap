@@ -2313,9 +2313,10 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) 
 ///
 /// The whole restore is one transaction: the table, its constraints, its
 /// trigger, every row, the re-streamed digest and, with `--attach`, the
-/// attachment and the catalog row. A failure at any point leaves the database
-/// exactly as it was, so the command is always safe to run again; that is also
-/// why the relation must not exist beforehand, rather than being adopted.
+/// attachment, the catalog row and an import's global hash mappings. A failure
+/// at any point leaves the database exactly as it was, so the command is always
+/// safe to run again; that is also why the relation must not exist beforehand,
+/// rather than being adopted.
 ///
 /// The rows are inserted with their archived `share_seq`, so the share
 /// sequence is never read and never set: a restore of old history must not
@@ -2471,6 +2472,7 @@ pub async fn restore(
                 .execute(&mut *tx)
                 .await?;
         } else {
+            restore_import_hashes(&mut tx, &partition_name).await?;
             sqlx::query("INSERT INTO qbit_prism_share_partitions(partition_name,lower_seq,upper_seq,state) VALUES($1,$2,$3,'attached')")
                 .bind(&partition_name)
                 .bind(lower)
@@ -2492,6 +2494,55 @@ pub async fn restore(
         "upper_seq": upper,
         "attached": attached,
     }))
+}
+
+/// A cataloged partition retains its global mappings after detach/drop. An
+/// import has no such history, so rebuild it before the attachment commits.
+/// Keep legacy duplicate headers within the archive, but refuse a mapping to
+/// a share outside it. ON CONFLICT checks the current mapping even if an append
+/// committed after this transaction's read; a conflict rolls back the import.
+async fn restore_import_hashes(
+    tx: &mut Transaction<'_, Postgres>,
+    partition_name: &str,
+) -> Result<()> {
+    let mut after: Option<i64> = None;
+    loop {
+        let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
+            "SELECT share_seq,share_id FROM {partition_name} \
+             WHERE accepted AND ($1::bigint IS NULL OR share_seq>$1) \
+             ORDER BY share_seq LIMIT {RESTORE_BATCH_ROWS}"
+        ))
+        .bind(after)
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut mappings = std::collections::BTreeMap::new();
+        for (seq, share_id) in rows {
+            after = Some(seq);
+            mappings
+                .entry(super::window::share_header_hash(&share_id))
+                .or_insert(share_id);
+        }
+        let (hashes, share_ids): (Vec<_>, Vec<_>) = mappings.into_iter().unzip();
+        let recorded = sqlx::query(&format!(
+            "INSERT INTO qbit_prism_share_hashes AS credited(header_hash,share_id) \
+             SELECT * FROM unnest($1::text[],$2::text[]) \
+             ON CONFLICT(header_hash) DO UPDATE SET share_id=credited.share_id \
+             WHERE credited.share_id=EXCLUDED.share_id OR EXISTS (\
+                 SELECT 1 FROM {partition_name} restored \
+                 WHERE restored.accepted AND restored.share_id=credited.share_id)"
+        ))
+        .bind(&hashes)
+        .bind(&share_ids)
+        .execute(&mut **tx)
+        .await?;
+        ensure!(
+            recorded.rows_affected() == hashes.len() as u64,
+            "refusing to import {partition_name}: global share hash conflict; a restored header is already credited to a share outside this archive"
+        );
+    }
 }
 
 /// `LIKE ... INCLUDING INDEXES` names the copied indexes after their columns.

@@ -1269,7 +1269,7 @@ fn refused_for_want_of_a_partition(error: &anyhow::Error) -> bool {
     })
 }
 
-fn share_header_hash(share_id: &str) -> String {
+pub(super) fn share_header_hash(share_id: &str) -> String {
     if let Some(suffix) = share_id.get(share_id.len().saturating_sub(64)..) {
         if suffix.len() == 64 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
             return suffix.to_ascii_lowercase();

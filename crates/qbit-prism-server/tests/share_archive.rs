@@ -1853,6 +1853,178 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
     }
 }
 
+/// Importing history also imports its global replay protection; conflicting
+/// destination mappings must leave both the archive and that protection intact.
+#[tokio::test]
+async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("restore-import").await?;
+        let root = tempfile::tempdir()?;
+        let original = ledger.append(share(10), None).await?.share;
+        // More than one restore batch: a conflict in the later batch must
+        // roll back earlier mappings, and a later legacy duplicate must reuse
+        // the first batch's canonical mapping.
+        insert_shares(&ledger.pool, 20, 600, 1, "archive-history", 7200.0).await?;
+        set_sequence(&ledger.pool, 600).await?;
+        let mut uppercase = share(11);
+        uppercase.share_id = uppercase.share_id.to_uppercase();
+        let uppercase = ledger.append(uppercase, None).await?.share;
+        let mut fallback = share(12);
+        fallback.share_id = "legacy-worker:é-without-a-header".into();
+        let fallback = ledger.append(fallback, None).await?.share;
+        // A legacy archive can contain two worker-scoped IDs for one header.
+        // Both rows must survive, with just one global mapping for the header.
+        let mut legacy = original.clone();
+        legacy.share_id = format!("legacy-worker:{:064x}", 10);
+        legacy.share_seq = 1000;
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,\
+             p2mr_program,share_difficulty,network_difficulty,template_height,job_id,\
+             job_issued_at,ntime,accepted_at,accepted,reject_reason,credit_policy,writer_id,writer_epoch) \
+             SELECT 1000,$1,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,\
+             template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,\
+             credit_policy,writer_id,writer_epoch FROM qbit_share_ledger WHERE share_seq=$2",
+        )
+        .bind(&legacy.share_id)
+        .bind(i64::try_from(original.share_seq)?)
+        .execute(&ledger.pool)
+        .await?;
+        // The fixture's eleventh row is rejected and must not reserve a hash.
+        insert_shares(&ledger.pool, 11, 11, 1, "rejected", 7200.0).await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        let manifest_path = PathBuf::from(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
+        );
+        // Remove the source partition and its metadata to exercise an import
+        // with no catalog entry, rather than a restore of recorded history.
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}; DROP TABLE {P0}; \
+             DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'; \
+             DELETE FROM qbit_prism_share_hashes"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+
+        archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+        let hashes: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(hashes == 0, "a standalone restore reserved global hashes");
+        sqlx::raw_sql(&format!("DROP TABLE {P0}"))
+            .execute(&ledger.pool)
+            .await?;
+
+        let header = format!("{:064x}", 11);
+        let conflict = format!("another-worker:{header}");
+        let mut writer = ledger.pool.begin().await?;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,$2)")
+            .bind(&header)
+            .bind(&conflict)
+            .execute(&mut *writer)
+            .await?;
+        // Observe the unique-index wait, then let the competing credit commit.
+        // A preflight query followed by ON CONFLICT DO NOTHING would miss it.
+        let (imported, written) = tokio::join!(
+            archive::restore(&ledger, &manifest_path, root.path(), true),
+            async {
+                let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let blocked: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                        )
+                        .bind(writer_pid)
+                        .fetch_one(&db.admin)
+                        .await?;
+                        if blocked {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                writer.commit().await?;
+                waiting.context("the import never waited for the competing credit")??;
+                Ok::<(), anyhow::Error>(())
+            }
+        );
+        written?;
+        let error = imported
+            .expect_err("imported an archive whose header was credited to another worker")
+            .to_string();
+        ensure!(error.contains("global share hash conflict"), "{error}");
+        let absent: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
+            .bind(P0)
+            .fetch_one(&ledger.pool)
+            .await?;
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_prism_share_partitions WHERE partition_name=$1",
+        )
+        .bind(P0)
+        .fetch_one(&ledger.pool)
+        .await?;
+        let mappings: Vec<(String, String)> =
+            sqlx::query_as("SELECT header_hash,share_id FROM qbit_prism_share_hashes")
+                .fetch_all(&ledger.pool)
+                .await?;
+        ensure!(
+            absent && catalog_rows == 0 && mappings == vec![(header.clone(), conflict)],
+            "the refused import did not roll back its table, catalog and hash changes"
+        );
+
+        sqlx::query("UPDATE qbit_prism_share_hashes SET share_id=$2 WHERE header_hash=$1")
+            .bind(&header)
+            .bind(&uppercase.share_id)
+            .execute(&ledger.pool)
+            .await?;
+        let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+        ensure!(restored["attached"] == true && restored["row_count"] == 586, "{restored}");
+        let mut expected = vec![
+            (format!("{:064x}", 10), original.share_id.clone()),
+            (header, uppercase.share_id.clone()),
+            (hex::encode(Sha256::digest(fallback.share_id.as_bytes())), fallback.share_id.clone()),
+        ];
+        expected.sort();
+        let mappings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT header_hash,share_id FROM qbit_prism_share_hashes \
+             WHERE header_hash=ANY($1) ORDER BY header_hash",
+        )
+        .bind(expected.iter().map(|(hash, _)| hash.clone()).collect::<Vec<_>>())
+        .fetch_all(&ledger.pool)
+        .await?;
+        ensure!(mappings == expected, "imported hash mappings differ: {mappings:?}");
+        let hashes: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(hashes == 531, "expected one mapping per accepted header, got {hashes}");
+        for replay in [original.clone(), uppercase, fallback, legacy] {
+            let replayed = ledger.append(replay.clone(), None).await?;
+            ensure!(!replayed.inserted && replayed.share == replay, "replay changed {replay:?}");
+        }
+        let mut duplicate = original;
+        duplicate.share_id = format!("new-worker:{:064x}", 10);
+        let error = ledger.append(duplicate, None).await
+            .expect_err("credited an imported header under a new worker")
+            .to_string();
+        ensure!(error.contains("duplicate-share"), "{error}");
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// The verification is a proof at the instant it was taken. A row that lands
 /// after it, whether an append that committed late or one written into the
 /// standalone relation by name, is caught by the count the detach and the
