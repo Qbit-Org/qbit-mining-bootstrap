@@ -199,8 +199,11 @@ async fn exercise(
             let output = tokio::process::Command::new(binary)
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-                .env("PRISM_TEST_DATABASE_URL", &managed.primary_url)
-                .env("PRISM_TEST_REQUIRE_INTEGRATION", "1")
+                .env(
+                    qbit_prism_test_gate::Input::DatabaseUrl.name(),
+                    &managed.primary_url,
+                )
+                .env(qbit_prism_test_gate::SWITCH_VAR, "1")
                 .arg(test)
                 .args(["--exact", "--nocapture", "--test-threads=1"])
                 .kill_on_drop(true)
