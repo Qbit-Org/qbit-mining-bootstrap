@@ -486,6 +486,13 @@ qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::one_c
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_control
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::same_revision_balance_identity_and_accepted_cutoff_are_fresh
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::unavailable_read_only_and_invalid_values_are_errors
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_batch_and_no_work_each_count_one_checkout
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_begin_delay_error_and_cancel_keep_checkout_success
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_exhausted_checkout_errors_cancel_and_reuse
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_run_shutdown_cancels_checkout_once
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_run_shutdown_during_sql_preserves_success_and_compatibility
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_sql_cancellation_retains_success_and_rolls_back
+qbit-prism-server::qbit_prism_server::rollups::tests::postgres_sql_wait_and_failure_keep_completed_checkout
 qbit-prism-server::readiness_rpc::another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace
 qbit-prism-server::readiness_rpc::cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
 qbit-prism-server::readiness_rpc::coordinator_reports_wrap_exhaustion_truthfully
