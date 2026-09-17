@@ -144,6 +144,14 @@ replace it:
    online ledger is refused as the duplicate it is. The coordinator's
    replays are seconds old, so that last case is unreachable in practice
    and safe if reached.
+   Rejected rows reserve their exact IDs separately in
+   `qbit_prism_rejected_share_ids`, without reserving their header hashes.
+   Verification records those IDs and sequences atomically with
+   `archive_verified_at`, before detach is permitted; fresh imports register
+   them atomically with attachment. These records survive detach and drop.
+   Append uses the retained sequence to compare an online rejected row and
+   refuses its ID when the row is archived. Unregistered legacy rejected rows
+   remain covered by a lookup below the conversion bound.
 2. **Per-leaf `UNIQUE (share_id)`** on every partition, created explicitly
    by the partition procedure (a `PARTITION OF` table would get none).
 3. **Bounded probes.** Every `share_id` lookup on the ledger (the replay

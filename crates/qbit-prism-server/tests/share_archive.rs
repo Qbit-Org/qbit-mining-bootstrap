@@ -2033,6 +2033,9 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
             absent && catalog_rows == 0 && mappings == vec![(header.clone(), conflict)],
             "the refused import did not roll back its table, catalog and hash changes"
         );
+        let rejected_ids: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_rejected_share_ids")
+            .fetch_one(&ledger.pool).await?;
+        ensure!(rejected_ids == 0, "the refused import retained rejected IDs");
 
         sqlx::query("UPDATE qbit_prism_share_hashes SET share_id=$2 WHERE header_hash=$1")
             .bind(&header)
@@ -2151,6 +2154,240 @@ async fn restore_import_rejects_overlapping_cataloged_bounds() -> Result<()> {
                 let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
                 ensure!(restored["attached"] == true, "recorded reattachment was refused: {restored}");
             }
+            Ok(ledger)
+        }.await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verification cannot publish permission to detach while an append still
+/// relies on a registry lookup made before the rejected IDs were retained.
+#[tokio::test]
+async fn verification_drains_appends_after_retaining_rejected_ids() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("registry-fence-a").await?;
+        let verifier = db.ledger("registry-fence-b").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 11, 11, 1, "legacy", 7200.0).await?;
+        let (_, upper) = bounds(&ledger.pool, P0).await?;
+        set_sequence(&ledger.pool, upper - 1).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        // Pause after verify's initial append drain and live comparison, but
+        // before its registry insert can become visible to another session.
+        sqlx::raw_sql(
+            "CREATE FUNCTION pause_rejected_registry() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_advisory_xact_lock(4194039967); RETURN NEW; END $$;
+             CREATE TRIGGER pause_rejected_registry BEFORE INSERT ON qbit_prism_rejected_share_ids
+             FOR EACH ROW EXECUTE FUNCTION pause_rejected_registry()",
+        ).execute(&ledger.pool).await?;
+        let mut blocker = db.admin.begin().await?;
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(4194039967)")
+            .execute(&mut *blocker).await?;
+        let verifying = tokio::spawn(async move {
+            let result = archive::verify(&verifier, P0, root.path()).await;
+            (verifier, result)
+        });
+        let verifier_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) LIMIT 1",
+                ).bind(blocker_pid).fetch_optional(&db.admin).await?;
+                if let Some(pid) = pid {
+                    return Ok::<_, anyhow::Error>(pid);
+                }
+                ensure!(!verifying.is_finished(), "verify never reached ID retention");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.context("verify did not pause before retaining IDs")??;
+        let mut writer = ledger.pool.begin().await?;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(0x505249534d000002_i64).execute(&mut *writer).await?;
+        let absent: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM qbit_prism_rejected_share_ids)")
+            .fetch_one(&mut *writer).await?;
+        ensure!(absent, "the simulated append already saw the rejected ID");
+        blocker.commit().await?;
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $1=ANY(pg_blocking_pids($2))")
+                    .bind(writer_pid).bind(verifier_pid).fetch_one(&db.admin).await?;
+                if blocked {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                ensure!(!verifying.is_finished(), "verification published before the old registry reader finished");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await;
+        writer.commit().await?;
+        let (verifier, verified) = verifying.await?;
+        waiting.context("verification never fenced the old registry reader")??;
+        verified?;
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM qbit_prism_rejected_share_ids WHERE share_seq=11) \
+             AND (SELECT archive_verified_at IS NOT NULL FROM qbit_prism_share_partitions WHERE partition_name=$1)",
+        ).bind(P0).fetch_one(&ledger.pool).await?;
+        ensure!(retained, "verification and rejected ID retention did not commit together");
+        Ok(vec![ledger, verifier])
+    }.await;
+    match result {
+        Ok(ledgers) => db.close(ledgers).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+/// Rejected IDs survive retention without reserving their header as credited.
+/// Imported rejected rows can live beyond the release partition's bounds.
+#[tokio::test]
+async fn rejected_share_ids_survive_detach_drop_and_restore() -> Result<()> {
+    for imported in [false, true] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("rejected-retention").await?;
+            let root = tempfile::tempdir()?;
+            let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+            let partition = if imported { P1 } else { P0 };
+            if imported {
+                set_sequence(&ledger.pool, p0_upper - 1).await?;
+                archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+                archive::verify(&ledger, P0, root.path()).await?;
+            }
+            let original = share(11);
+            let seq = if imported { p0_upper } else { 1 };
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,\
+                 p2mr_program,share_difficulty,network_difficulty,template_height,job_id,\
+                 job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch) \
+                 VALUES($1,$2,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',\
+                 to_timestamp(0.001),1800000000,to_timestamp(1),false,'stale-job','legacy',0)",
+            )
+            .bind(seq).bind(&original.share_id).execute(&ledger.pool).await?;
+            let rejected_row: Value = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s WHERE share_id=$1")
+                .bind(&original.share_id).fetch_one(&ledger.pool).await?;
+            let (_, upper) = bounds(&ledger.pool, partition).await?;
+            set_sequence(&ledger.pool, upper - 1).await?;
+            archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+            let manifest_path = PathBuf::from(
+                catalog(&ledger.pool, partition).await?.try_get::<String, _>("archive_uri")?,
+            );
+            if imported {
+                // Simulate an external archive: no earlier verification or ID
+                // registration exists in the destination.
+                sqlx::raw_sql(&format!(
+                    "ALTER TABLE qbit_share_ledger DETACH PARTITION {partition}; \
+                     DROP TABLE {partition}; \
+                     DELETE FROM qbit_prism_share_partitions WHERE partition_name='{partition}'"
+                )).execute(&ledger.pool).await?;
+                archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+                // Move the bounded probe beyond this nonlegacy import.
+                set_sequence(&ledger.pool, upper + 3 * p0_upper).await?;
+                qbit_prism_server::partitions::ensure(&ledger.pool).await?;
+                ensure!(!ledger.append(original.clone(), None).await?.inserted,
+                    "credited an imported rejected ID below the probe floor");
+                archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+            }
+            advance_rollups(&ledger.pool).await?;
+            archive::seal(&ledger, partition).await?;
+            if !imported {
+                // ID retention and verification must commit together. A
+                // conflicting registry entry cannot leave a verification.
+                sqlx::query("INSERT INTO qbit_prism_rejected_share_ids(share_id,share_seq) VALUES($1,$2)")
+                    .bind(&original.share_id).bind(seq + 1).execute(&ledger.pool).await?;
+                let error = archive::verify(&ledger, partition, root.path()).await
+                    .expect_err("verified conflicting rejected history").to_string();
+                ensure!(error.contains("global share ID conflict"), "{error}");
+                ensure!(catalog(&ledger.pool, partition).await?
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("archive_verified_at")?.is_none(),
+                    "failed ID retention left the partition verified");
+                sqlx::query("DELETE FROM qbit_prism_rejected_share_ids WHERE share_id=$1")
+                    .bind(&original.share_id).execute(&ledger.pool).await?;
+            }
+            archive::verify(&ledger, partition, root.path()).await?;
+            archive::verify(&ledger, partition, root.path()).await?;
+            archive::detach(&ledger, partition, &retention(0)).await?;
+            for dropped in [false, true] {
+                if dropped {
+                    archive::drop_partition(&ledger, partition, root.path()).await?;
+                }
+                let error = ledger.append(original.clone(), None).await
+                    .expect_err("credited a rejected ID after its partition departed").to_string();
+                ensure!(error.contains("duplicate-share"), "{error}");
+                let unchanged: bool = sqlx::query_scalar(
+                    "SELECT NOT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1) \
+                     AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes WHERE share_id=$1)",
+                ).bind(&original.share_id).fetch_one(&ledger.pool).await?;
+                ensure!(unchanged, "a rejected replay changed the ledger or header credits");
+            }
+            // A foreign archive cannot move a retained rejected ID to a new
+            // range, whether it labels the replay accepted or rejected.
+            let replay_partition = if imported { P2 } else { P1 };
+            let (replay_lower, replay_upper) = bounds(&ledger.pool, replay_partition).await?;
+            for accepted in [false, true] {
+                // Restore the empty destination leaf after the previous
+                // iteration removed it to simulate a fresh external import.
+                if accepted {
+                    sqlx::query("SELECT qbit_prism_share_partition_create($1,$2,$3)")
+                        .bind(replay_partition).bind(replay_lower).bind(replay_upper)
+                        .execute(&ledger.pool).await?;
+                }
+                sqlx::query(
+                    "INSERT INTO qbit_share_ledger SELECT * FROM jsonb_populate_record(\
+                     NULL::qbit_share_ledger,$1::jsonb || jsonb_build_object(\
+                     'share_seq',$2::bigint,'accepted',$3::boolean,\
+                     'reject_reason',CASE WHEN $3 THEN NULL ELSE 'stale-job' END))",
+                ).bind(&rejected_row).bind(replay_lower).bind(accepted)
+                    .execute(&ledger.pool).await?;
+                sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',GREATEST(qbit_prism_share_next_seq(),$1))")
+                    .bind(replay_upper).execute(&ledger.pool).await?;
+                archive::archive(&ledger, replay_partition, root.path(), false, "operator-a").await?;
+                let replay_path = PathBuf::from(
+                    catalog(&ledger.pool, replay_partition).await?.try_get::<String, _>("archive_uri")?,
+                );
+                sqlx::raw_sql(&format!(
+                    "ALTER TABLE qbit_share_ledger DETACH PARTITION {replay_partition}; \
+                     DROP TABLE {replay_partition}; \
+                     DELETE FROM qbit_prism_share_partitions WHERE partition_name='{replay_partition}'"
+                )).execute(&ledger.pool).await?;
+                let error = archive::restore(&ledger, &replay_path, root.path(), true).await
+                    .expect_err("imported a retained rejected ID in another range").to_string();
+                ensure!(error.contains("global share ID conflict"), "{error}");
+                let retained: i64 = sqlx::query_scalar("SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$1")
+                    .bind(&original.share_id).fetch_one(&ledger.pool).await?;
+                ensure!(retained == seq, "the refused import changed the retained rejected ID");
+            }
+            // The copy of record can return with the same ID and sequence.
+            let manifest_path = PathBuf::from(
+                catalog(&ledger.pool, partition).await?.try_get::<String, _>("archive_uri")?,
+            );
+            archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+            ensure!(!ledger.append(original.clone(), None).await?.inserted,
+                "credited a restored rejected ID");
+            let mut changed = original.clone();
+            changed.share_difficulty += 1;
+            let error = ledger.append(changed, None).await
+                .expect_err("accepted a changed rejected payload").to_string();
+            ensure!(error.contains("duplicate share_id payload mismatch"), "{error}");
+            let mut other_worker = original;
+            other_worker.share_id = format!("another-worker:{:064x}", 11);
+            ensure!(ledger.append(other_worker, None).await?.inserted,
+                "a rejected ID reserved the header across workers");
             Ok(ledger)
         }.await;
         match result {

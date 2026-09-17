@@ -271,6 +271,7 @@ pub(super) async fn undo_016(pool: &PgPool) -> Result<()> {
          DROP FUNCTION qbit_prism_share_next_seq();
          DROP TABLE qbit_prism_share_partitions;
          DROP TABLE qbit_prism_share_partitioning;
+         DROP TABLE qbit_prism_rejected_share_ids;
          DROP TRIGGER qbit_pool_blocks_capture_solver ON qbit_pool_blocks;
          DROP FUNCTION qbit_prism_capture_block_solver();
          ALTER TABLE qbit_pool_blocks DROP COLUMN solver_miner_id, DROP COLUMN solver_share_id, DROP COLUMN solver_share_difficulty, DROP COLUMN solver_network_difficulty;

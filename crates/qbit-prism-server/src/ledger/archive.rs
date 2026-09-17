@@ -1935,6 +1935,15 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
             updated == 1,
             "{partition_name}'s archive was rewritten during verification or has no archived_at in qbit_prism_share_partitions, so the verification cannot be recorded. Run share-archive archive and verify for {partition_name} again"
         );
+        // The legacy-range append fallback stops seeing these rows after
+        // detach. Commit their durable IDs with the verification that permits
+        // it, while leaving accepted-header deduplication unchanged.
+        retain_rejected_share_ids(&mut tx, partition_name).await?;
+        // An append may have read the registry before these IDs existed. It
+        // must finish probing the still-attached legacy rows before detach
+        // becomes eligible. Take the ordering lock only after the scan, and
+        // keep it through commit so the next append sees the retained IDs.
+        ledger.lock(&mut tx, ORDER_LOCK).await?;
     }
     let verified_at: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT archive_verified_at FROM qbit_prism_share_partitions WHERE partition_name=$1",
@@ -2319,9 +2328,9 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) 
 ///
 /// The whole restore is one transaction: the table, its constraints, its
 /// trigger, every row, the re-streamed digest and, with `--attach`, the
-/// attachment, the catalog row and an import's global hash mappings. A failure
-/// at any point leaves the database exactly as it was, so the command is always
-/// safe to run again; that is also why the relation must not exist beforehand,
+/// attachment, the catalog row and an import's global hash and rejected-ID
+/// mappings. A failure at any point leaves the database exactly as it was,
+/// so the command is always safe to run again; that is also why the relation must not exist beforehand,
 /// rather than being adopted.
 ///
 /// The rows are inserted with their archived `share_seq`. An attached import
@@ -2445,8 +2454,9 @@ pub async fn restore(
     let mut attached = false;
     if attach {
         // Per-leaf uniqueness does not detect IDs in another partition, and
-        // rejected rows have no global hash mapping. Drain and fence appends
-        // through commit so none can race this check and the attachment.
+        // unarchived legacy rejected rows have no global mapping. Drain and
+        // fence appends through commit so none can race this check and the
+        // attachment.
         ledger.lock(&mut tx, ORDER_LOCK).await?;
         let existing = sqlx::query("SELECT lower_seq,upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
             .bind(&partition_name)
@@ -2592,15 +2602,17 @@ async fn restore_import_hashes(
     // cannot distinguish this import's earlier batch from departed history.
     let duplicate: Option<String> = sqlx::query_scalar(&format!(
         "SELECT restored.share_id FROM {partition_name} restored \
-         JOIN qbit_prism_share_hashes credited ON credited.share_id=restored.share_id LIMIT 1"
+         WHERE EXISTS(SELECT 1 FROM qbit_prism_share_hashes credited WHERE credited.share_id=restored.share_id) \
+         OR EXISTS(SELECT 1 FROM qbit_prism_rejected_share_ids rejected WHERE rejected.share_id=restored.share_id) LIMIT 1"
     ))
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(share_id) = duplicate {
         bail!(
-            "refusing to import {partition_name}: global share ID conflict; {share_id} was already credited, even if its original partition has departed. Restore without --attach to inspect the archive"
+            "refusing to import {partition_name}: global share ID conflict; {share_id} was already credited or retained as rejected, even if its original partition has departed. Restore without --attach to inspect the archive"
         );
     }
+    retain_rejected_share_ids(tx, partition_name).await?;
     let mut after: Option<i64> = None;
     loop {
         let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
@@ -2639,6 +2651,45 @@ async fn restore_import_hashes(
             "refusing to import {partition_name}: global share hash conflict; a restored header is already credited to a share outside this archive"
         );
     }
+}
+
+/// Retain exact rejected IDs without turning their headers into credits.
+/// Verification may repeat for the same immutable rows. A different sequence
+/// for an already-retained ID is a conflict, never a replacement of history.
+async fn retain_rejected_share_ids(
+    tx: &mut Transaction<'_, Postgres>,
+    partition_name: &str,
+) -> Result<()> {
+    // This scan is deliberate archive maintenance, potentially over a large
+    // leaf. Restore the transaction's timeout before any subsequent work;
+    // rollback also discards the local setting if the scan fails.
+    let timeout: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+        .fetch_one(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout=0")
+        .execute(&mut **tx)
+        .await?;
+    let retained: bool = sqlx::query_scalar(&format!(
+        "WITH rejected AS MATERIALIZED (\
+             SELECT share_id,share_seq FROM {partition_name} WHERE NOT accepted\
+         ), recorded AS (\
+             INSERT INTO qbit_prism_rejected_share_ids AS retained(share_id,share_seq) \
+             SELECT share_id,share_seq FROM rejected \
+             ON CONFLICT(share_id) DO UPDATE SET share_seq=retained.share_seq \
+             WHERE retained.share_seq=EXCLUDED.share_seq RETURNING share_id\
+         ) SELECT (SELECT count(*) FROM recorded)=(SELECT count(*) FROM rejected)"
+    ))
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query("SELECT set_config('statement_timeout',$1,true)")
+        .bind(timeout)
+        .execute(&mut **tx)
+        .await?;
+    ensure!(
+        retained,
+        "refusing to retain rejected IDs for {partition_name}: global share ID conflict with an earlier rejected row"
+    );
+    Ok(())
 }
 
 /// `LIKE ... INCLUDING INDEXES` names the copied indexes after their columns.

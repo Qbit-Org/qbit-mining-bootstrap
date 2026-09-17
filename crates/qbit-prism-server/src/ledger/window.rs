@@ -698,20 +698,25 @@ impl Ledger {
         // share_id uniqueness is per leaf, so a share_id probe without a
         // share_seq bound descends one index per attached partition.
         // qbit_prism_share_hashes is the authority for accepted headers, but
-        // legacy rejected rows have no mapping. They were all in the release
-        // table at conversion, below conversion_bound; native writers only
-        // insert accepted rows. Probe the newest partitions first, then that
-        // legacy range on an unmapped miss, so a new share never probes every
-        // retained leaf. Only a credited header needs the full-parent fallback,
-        // including legacy worker-scoped duplicates mapped to an earlier row.
+        // legacy rejected rows have no header mapping. Before a partition can
+        // leave, verification retains their exact IDs and sequences; imports
+        // register them on attachment. Unregistered rejected rows are in the
+        // release table below conversion_bound; native writers only insert
+        // accepted rows. Probe the newest partitions first, then a registered
+        // rejected sequence or the legacy range on an unmapped miss, so a new
+        // share never probes every retained leaf. A credited header needs the
+        // full-parent fallback, including legacy worker-scoped duplicates
+        // mapped to an earlier row.
         // A credited row that has left the online ledger cannot be compared
         // and is refused as the duplicate it is.
         let header_hash = share_header_hash(&share.share_id);
-        let (credited, legacy_bound): (Option<String>, i64) = sqlx::query_as(
-            "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),conversion_bound \
+        let (credited, rejected_seq, legacy_bound): (Option<String>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),\
+             (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2),conversion_bound \
              FROM qbit_prism_share_partitioning WHERE singleton",
         )
         .bind(&header_hash)
+        .bind(&share.share_id)
         .fetch_one(&mut **tx)
         .await?;
         let mut existing = sqlx::query(&format!(
@@ -721,7 +726,15 @@ impl Ledger {
         .fetch_optional(&mut **tx)
         .await?;
         if existing.is_none() {
-            existing = if credited.is_some() {
+            existing = if let Some(seq) = rejected_seq {
+                sqlx::query(&format!(
+                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq=$2"
+                ))
+                .bind(&share.share_id)
+                .bind(seq)
+                .fetch_optional(&mut **tx)
+                .await?
+            } else if credited.is_some() {
                 sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
                     .bind(&share.share_id)
                     .fetch_optional(&mut **tx)
@@ -746,6 +759,10 @@ impl Ledger {
                 inserted: false,
             });
         }
+        ensure!(
+            rejected_seq.is_none(),
+            "duplicate-share: rejected share_id is retained globally, and its share is archived"
+        );
         if let Some(credited) = credited {
             ensure!(
                 credited == share.share_id,

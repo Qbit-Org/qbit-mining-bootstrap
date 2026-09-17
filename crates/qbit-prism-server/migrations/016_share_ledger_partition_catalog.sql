@@ -44,6 +44,16 @@ ALTER TABLE qbit_block_candidate_outbox
 ALTER TABLE qbit_prism_share_hashes
     DROP CONSTRAINT IF EXISTS qbit_prism_share_hashes_share_id_fkey;
 
+-- Rejected rows do not reserve a header hash, but their exact IDs must not
+-- become reusable when their partition leaves. Verification fills this
+-- registry before certifying a partition for detach; fresh archive imports
+-- fill it atomically with attachment. Keep these rows after detach/drop.
+-- No ledger FK: retaining an ID must not pin its partition.
+CREATE TABLE qbit_prism_rejected_share_ids (
+    share_id text PRIMARY KEY,
+    share_seq bigint NOT NULL
+);
+
 CREATE TABLE qbit_prism_share_partitioning (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     -- Rows per partition. 2^24 rows is about 7.5 GB of heap plus about
