@@ -2570,6 +2570,20 @@ async fn restore_import_hashes(
     tx: &mut Transaction<'_, Postgres>,
     partition_name: &str,
 ) -> Result<()> {
+    // ORDER_LOCK fences appends and the lifecycle lock fences other imports.
+    // Check every ID before creating any mappings: otherwise ON CONFLICT
+    // cannot distinguish this import's earlier batch from departed history.
+    let duplicate: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT restored.share_id FROM {partition_name} restored \
+         JOIN qbit_prism_share_hashes credited ON credited.share_id=restored.share_id LIMIT 1"
+    ))
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(share_id) = duplicate {
+        bail!(
+            "refusing to import {partition_name}: global share ID conflict; {share_id} was already credited, even if its original partition has departed. Restore without --attach to inspect the archive"
+        );
+    }
     let mut after: Option<i64> = None;
     loop {
         let rows: Vec<(i64, String)> = sqlx::query_as(&format!(

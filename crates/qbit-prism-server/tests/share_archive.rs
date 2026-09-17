@@ -2039,6 +2039,12 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
             .bind(&uppercase.share_id)
             .execute(&ledger.pool)
             .await?;
+        let error = archive::restore(&ledger, &manifest_path, root.path(), true).await
+            .expect_err("imported an archive whose share ID was already credited").to_string();
+        ensure!(error.contains("global share ID conflict"), "{error}");
+        // Only a fresh import with no prior credit can rebuild its mappings.
+        sqlx::query("DELETE FROM qbit_prism_share_hashes WHERE header_hash=$1")
+            .bind(&header).execute(&ledger.pool).await?;
         let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
         ensure!(restored["attached"] == true && restored["row_count"] == 586, "{restored}");
         let mut expected = vec![
@@ -2079,6 +2085,81 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
             Err(error)
         }
     }
+}
+
+/// A retained global mapping is still authoritative when its original row
+/// is detached or dropped. Moving that ID to a later sequence is a replay.
+#[tokio::test]
+async fn restore_import_rejects_ids_credited_in_departed_partitions() -> Result<()> {
+    for state in ["detached", "dropped"] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("restore-departed-id").await?;
+            let root = tempfile::tempdir()?;
+            let original = ledger.append(share(10), None).await?.share;
+            let row: Value = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s WHERE share_id=$1")
+                .bind(&original.share_id).fetch_one(&ledger.pool).await?;
+            let watermark = advance_rollups(&ledger.pool).await?;
+            let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+            let (_, p1_upper) = bounds(&ledger.pool, P1).await?;
+            set_sequence(&ledger.pool, p0_upper - 1).await?;
+            archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+            archive::verify(&ledger, P0, root.path()).await?;
+            sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}"))
+                .execute(&ledger.pool).await?;
+            if state == "dropped" {
+                sqlx::raw_sql(&format!("DROP TABLE {P0}"))
+                    .execute(&ledger.pool).await?;
+            }
+            sqlx::query("UPDATE qbit_prism_share_partitions SET state=$1,detached_at=clock_timestamp(),dropped_at=CASE WHEN $1='dropped' THEN clock_timestamp() END WHERE partition_name=$2")
+                .bind(state).bind(P0).execute(&ledger.pool).await?;
+            // Build an external archive that reuses the credited ID above
+            // the rollup watermark, in a non-overlapping partition range.
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger SELECT * FROM jsonb_populate_record(\
+                 NULL::qbit_share_ledger,$1::jsonb || jsonb_build_object('share_seq',$2::bigint))",
+            )
+            .bind(&row).bind(p0_upper).execute(&ledger.pool).await?;
+            set_sequence(&ledger.pool, p1_upper - 1).await?;
+            archive::archive(&ledger, P1, root.path(), false, "operator-a").await?;
+            let manifest_path = PathBuf::from(
+                catalog(&ledger.pool, P1).await?.try_get::<String, _>("archive_uri")?,
+            );
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {P1}; DROP TABLE {P1}; \
+                 DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P1}'"
+            )).execute(&ledger.pool).await?;
+
+            let error = archive::restore(&ledger, &manifest_path, root.path(), true).await
+                .expect_err("imported a share ID credited in a departed partition").to_string();
+            ensure!(error.contains("global share ID conflict") && error.contains(&original.share_id), "{error}");
+            let unchanged: bool = sqlx::query_scalar(
+                "SELECT to_regclass($1) IS NULL \
+                 AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+                 AND NOT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$2) \
+                 AND (SELECT count(*) FROM qbit_prism_share_hashes)=1 \
+                 AND EXISTS(SELECT 1 FROM qbit_prism_share_hashes WHERE share_id=$2) \
+                 AND (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton)=$3 \
+                 AND qbit_prism_share_next_seq()=$4",
+            )
+            .bind(P1).bind(&original.share_id).bind(watermark).bind(p1_upper)
+            .fetch_one(&ledger.pool).await?;
+            ensure!(unchanged, "refused replay changed the destination");
+            let inspected = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+            ensure!(inspected["attached"] == false && inspected["row_count"] == 1, "{inspected}");
+            Ok(ledger)
+        }.await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Per-leaf uniqueness cannot protect an import from IDs in other leaves,
