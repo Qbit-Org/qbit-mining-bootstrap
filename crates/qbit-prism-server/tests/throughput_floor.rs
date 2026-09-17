@@ -1653,12 +1653,11 @@ fn write_json(config: &Config, report: &Value) -> Result<()> {
 
 /// One line per measured run, written straight to the process's stderr.
 ///
-/// libtest captures `println!` and `eprintln!` from a passing test and throws
-/// the output away, and CI keeps no report artifact, so a green
-/// `prism-native-postgres` run would otherwise record nothing about how far
-/// above the floor it was. A write through `std::io::stderr()` is not captured,
-/// so every CI log carries the per-level rates that calibrate
-/// `CI_MIN_SHARES_PER_SEC`.
+/// libtest captures `println!` and `eprintln!` from a passing test by default.
+/// A write through `std::io::stderr()` keeps the per-level rates visible even
+/// when capture is enabled. CI also retains the detailed report artifact;
+/// this summary puts the rates directly in the log for calibrating
+/// `CI_MIN_SHARES_PER_SEC` without downloading that artifact.
 fn emit_summary(config: &Config, measurement: &Measurement) {
     let levels = measurement
         .levels

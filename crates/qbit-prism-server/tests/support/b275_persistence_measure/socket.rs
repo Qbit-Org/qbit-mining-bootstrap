@@ -85,6 +85,9 @@ pub struct Client {
     // Keep the write half alive throughout the delivery bracket.
     writer: OwnedWriteHalf,
     pub initial_job: String,
+    pub username: String,
+    pub extranonce1: String,
+    pub extranonce2_size: u64,
 }
 
 impl Client {
@@ -94,16 +97,42 @@ impl Client {
             let stream = TcpStream::connect(address).await?;
             stream.set_nodelay(true)?;
             let (reader, writer) = stream.into_split();
-            let mut client = Self { reader: BufReader::new(reader), writer, initial_job: String::new() };
-            client.send(json!({"id":1,"method":"mining.subscribe","params":[]})).await?;
+            let mut client = Self {
+                reader: BufReader::new(reader),
+                writer,
+                initial_job: String::new(),
+                username: format!("b275.worker{index}"),
+                extranonce1: String::new(),
+                extranonce2_size: 0,
+            };
+            client
+                .send(json!({"id":1,"method":"mining.subscribe","params":[]}))
+                .await?;
             let response = client.response(1).await?;
-            ensure!(response["error"].is_null() && response["result"].is_array(), "subscribe failed: {response}");
-            client.send(json!({"id":2,"method":"mining.authorize","params":[format!("b275.worker{index}"),"x"]})).await?;
+            ensure!(
+                response["error"].is_null() && response["result"].is_array(),
+                "subscribe failed: {response}"
+            );
+            client.extranonce1 = response["result"][1]
+                .as_str()
+                .context("subscribe lacks extranonce1")?
+                .into();
+            client.extranonce2_size = response["result"][2]
+                .as_u64()
+                .context("subscribe lacks extranonce2 size")?;
+            client
+                .send(json!({"id":2,"method":"mining.authorize","params":[client.username,"x"]}))
+                .await?;
             let response = client.response(2).await?;
-            ensure!(response["error"].is_null() && response["result"] == true, "authorize failed: {response}");
+            ensure!(
+                response["error"].is_null() && response["result"] == true,
+                "authorize failed: {response}"
+            );
             client.initial_job = client.notify(parent).await?;
             Ok(client)
-        }).await.context("login deadline elapsed")?
+        })
+        .await
+        .context("login deadline elapsed")?
     }
 
     async fn send(&mut self, value: Value) -> Result<()> {
