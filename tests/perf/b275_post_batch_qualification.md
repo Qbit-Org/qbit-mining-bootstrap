@@ -162,6 +162,7 @@ not replace the original deadlines; standalone harness setup remains unbounded.
 A supervisor stop requires checking retained schemas and stopping the owned
 disposable primary, since killed processes cannot guarantee Rust teardown.
 Every timed case confirmed zero remaining measurement schemas.
+Final regression cleanup again found zero schemas and stopped the owned primary.
 
 ## Acceptance and review
 
@@ -230,3 +231,5 @@ Raw JSON, child receipts, host logs, gate manifests, scripts and build metadata
 remain outside Git in the coordinator's issue275-post-batch-20260917 artifact
 bundle. No production/testnet endpoint was accessed and PR441 proxy code was
 neither changed nor exercised by this harness.
+The 101-file raw artifact manifest has SHA-256
+`60e8dc788f943e4ae338e779f33d2ae97da40dd5261c8165f30c2a278c409b14`.
