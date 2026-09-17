@@ -10,6 +10,12 @@
 //! swapped under a drop target while the builds run is refused too, and
 //! that a kept index swapped while the other replacement builds is refused
 //! before the version is recorded.
+//!
+//! Since 017 the ledger is a partitioned table whose release table is the
+//! first partition: `undo_013` undoes 017 first (the concurrent builds need
+//! the plain table), the trimmed set is asserted on the parent and on that
+//! partition, and every successful migrate here ends with 017 applied
+//! again through its online runner.
 use super::*;
 use qbit_prism_server::{ledger::REQUIRED_SCHEMA_VERSIONS, metrics::Metrics};
 use sqlx::Row;
@@ -49,11 +55,17 @@ const KEPT: [&str; 4] = [
     "qbit_share_ledger_share_id_key",
 ];
 
-/// Every index on the share ledger: name, definition as the server renders
-/// it (without the schema it always puts on the table), validity and the
-/// index relation's OID, ordered by name.
+/// Every index on the share ledger (the plain table before 017, the
+/// partitioned parent after it): name, definition as the server renders it
+/// (without the schema it always puts on the table), validity and the index
+/// relation's OID, ordered by name.
 async fn ledger_indexes(pool: &PgPool) -> Result<Vec<(String, String, bool, String)>> {
-    let rows = sqlx::query("SELECT i.relname::text AS name,replace(pg_get_indexdef(x.indexrelid),current_schema()||'.','') AS definition,x.indisvalid AS valid,x.indexrelid::text AS oid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid WHERE x.indrelid='qbit_share_ledger'::regclass ORDER BY 1")
+    table_indexes(pool, "qbit_share_ledger").await
+}
+
+async fn table_indexes(pool: &PgPool, table: &str) -> Result<Vec<(String, String, bool, String)>> {
+    let rows = sqlx::query("SELECT i.relname::text AS name,replace(pg_get_indexdef(x.indexrelid),current_schema()||'.','') AS definition,x.indisvalid AS valid,x.indexrelid::text AS oid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid WHERE x.indrelid=to_regclass($1) ORDER BY 1")
+        .bind(table)
         .fetch_all(pool)
         .await?;
     rows.iter()
@@ -68,6 +80,13 @@ async fn ledger_indexes(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
         .collect()
 }
 
+/// The name an index of the release table carries once 017 has attached
+/// that table as `qbit_share_ledger_p0`: the index keeps its OID under it,
+/// while the parent gets a new partitioned index under the release name.
+fn leaf_name(name: &str) -> String {
+    name.replacen("qbit_share_ledger_", "qbit_share_ledger_p0_", 1)
+}
+
 async fn schema_versions(pool: &PgPool) -> Result<Vec<i32>> {
     Ok(
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
@@ -76,11 +95,19 @@ async fn schema_versions(pool: &PgPool) -> Result<Vec<i32>> {
     )
 }
 
-/// The index set 013 leaves: the kept release indexes and the two
-/// replacements, every one valid, with 13 recorded.
+/// The index set 013 leaves, as 017 then partitions it: on the parent the
+/// kept release indexes and the two replacements as partitioned indexes,
+/// without the global share_id key a partitioned table cannot carry; on
+/// the release table, now the first partition, the same set under its
+/// `_p0` names plus its own share_id key. Every index valid, with 13 and
+/// 16 recorded. Returns the parent's indexes.
 async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, String)>> {
     let indexes = ledger_indexes(pool).await?;
-    let mut expected: Vec<&str> = KEPT.to_vec();
+    let mut expected: Vec<&str> = KEPT
+        .iter()
+        .copied()
+        .filter(|name| *name != "qbit_share_ledger_share_id_key")
+        .collect();
     expected.extend([MINER_HISTORY, SEQ_WALK]);
     expected.sort_unstable();
     let names: Vec<&str> = indexes.iter().map(|(name, ..)| name.as_str()).collect();
@@ -88,10 +115,38 @@ async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
     for (name, definition, valid, _) in &indexes {
         assert!(valid, "{name} is not valid");
         if name == SEQ_WALK {
-            assert_eq!(definition, SEQ_WALK_DEFINITION);
+            assert_eq!(
+                definition,
+                &SEQ_WALK_DEFINITION
+                    .replace(" ON qbit_share_ledger ", " ON ONLY qbit_share_ledger ")
+            );
         }
         if name == MINER_HISTORY {
-            assert_eq!(definition, MINER_HISTORY_DEFINITION);
+            assert_eq!(
+                definition,
+                &MINER_HISTORY_DEFINITION
+                    .replace(" ON qbit_share_ledger ", " ON ONLY qbit_share_ledger ")
+            );
+        }
+    }
+    let leaf = table_indexes(pool, "qbit_share_ledger_p0").await?;
+    let mut expected: Vec<String> = KEPT
+        .iter()
+        .chain([MINER_HISTORY, SEQ_WALK].iter())
+        .map(|name| name.replacen("qbit_share_ledger_", "qbit_share_ledger_p0_", 1))
+        .collect();
+    expected.sort_unstable();
+    let names: Vec<&str> = leaf.iter().map(|(name, ..)| name.as_str()).collect();
+    assert_eq!(names, expected);
+    for (name, definition, valid, _) in &leaf {
+        assert!(valid, "{name} is not valid");
+        if name == "qbit_share_ledger_p0_accepted_seq_walk_idx" {
+            assert_eq!(
+                definition,
+                &SEQ_WALK_DEFINITION
+                    .replace(SEQ_WALK, name)
+                    .replace(" ON qbit_share_ledger ", " ON qbit_share_ledger_p0 ")
+            );
         }
     }
     assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
@@ -100,7 +155,11 @@ async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
 
 /// Undo 013: restore the release indexes as 001 creates them and remove
 /// its record, preserving the other migrations present in the fixture.
+/// 017 is undone first, so the ledger is the plain table the concurrent
+/// builds need; 016 stays, and the next migrate applies 013 and then 017
+/// again, both online.
 pub(super) async fn undo_013(pool: &PgPool) -> Result<()> {
+    super::share_partitions::undo_017(pool).await?;
     let versions = schema_versions(pool).await?;
     assert!(versions.contains(&13));
     let mut sql = format!(
@@ -283,10 +342,11 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
     );
     writer.commit().await?;
     let online = timeout(Duration::from_secs(60), migrate).await??;
-    // Registration's transaction and heartbeat add two observed checkouts;
+    // Migration 017's detached connection, registration's transaction and
+    // heartbeat add three observed checkouts;
     // the intervening startup validation checkouts remain untimed. The
     // online version-recording transaction reuses its detached connection.
-    assert_acquire_counts(&metrics, 4, 0);
+    assert_acquire_counts(&metrics, 5, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
 
@@ -303,7 +363,7 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         Some(metrics.clone()),
     ));
     let pid = blocked_build(&pool, migrate.as_mut()).await?;
-    assert_acquire_counts(&metrics, 6, 0);
+    assert_acquire_counts(&metrics, 7, 0);
     let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
         .bind(pid)
         .fetch_one(&pool)
@@ -323,12 +383,12 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         "{error:#}"
     );
     // SQL cancellation neither relabels the checkout nor observes it again.
-    assert_acquire_counts(&metrics, 6, 0);
+    assert_acquire_counts(&metrics, 7, 0);
     writer.rollback().await?;
     // The runner awaits close on SQL error; its session lock must be released
     // so the metrics-None restart can rebuild the interrupted index.
     let resumed = timeout(Duration::from_secs(60), db.ledger("resumed-no-metrics")).await??;
-    assert_acquire_counts(&metrics, 6, 0);
+    assert_acquire_counts(&metrics, 7, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
     db.close(vec![first, online, resumed]).await
@@ -460,7 +520,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         assert_eq!(ledger_indexes(&pool).await?, before);
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18]
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18]
         );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
             .execute(&pool)
@@ -538,7 +598,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     assert_eq!(ledger_indexes(&pool).await?, before);
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18]
     );
     // The declared definition under the reserved name is an earlier build
     // of the migration's own: kept as it is, not rebuilt.
@@ -551,10 +611,13 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         .find(|(name, ..)| name == SEQ_WALK)
         .context("the pre-built index is missing")?;
     let adopted = db.ledger("adopted").await?;
-    let trimmed = assert_trimmed(&pool).await?;
-    let kept = trimmed
+    assert_trimmed(&pool).await?;
+    // 017 then attached the table as the first partition, renaming the
+    // adopted index; it is the same relation.
+    let leaf = table_indexes(&pool, "qbit_share_ledger_p0").await?;
+    let kept = leaf
         .iter()
-        .find(|(name, ..)| name == SEQ_WALK)
+        .find(|(name, ..)| *name == leaf_name(SEQ_WALK))
         .context("the adopted index is missing")?;
     assert_eq!(kept.3, prebuilt.3, "the pre-built index was rebuilt");
     assert_eq!(share_count(&pool).await?, 2);
@@ -700,7 +763,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     }
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18]
     );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both builds
@@ -711,10 +774,11 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     .execute(&pool)
     .await?;
     let resumed = db.ledger("resumed").await?;
-    let trimmed = assert_trimmed(&pool).await?;
+    assert_trimmed(&pool).await?;
+    let leaf = table_indexes(&pool, "qbit_share_ledger_p0").await?;
     for name in [MINER_HISTORY, SEQ_WALK] {
         assert_eq!(
-            oid(&trimmed, name),
+            oid(&leaf, &leaf_name(name)),
             oid(&after_refusal, name),
             "{name} was rebuilt"
         );
@@ -779,7 +843,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     );
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18]
     );
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
@@ -787,14 +851,15 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     .execute(&pool)
     .await?;
     let rebuilt = db.ledger("rebuilt").await?;
-    let trimmed = assert_trimmed(&pool).await?;
+    assert_trimmed(&pool).await?;
+    let leaf = table_indexes(&pool, "qbit_share_ledger_p0").await?;
     assert_eq!(
-        oid(&trimmed, MINER_HISTORY),
+        oid(&leaf, &leaf_name(MINER_HISTORY)),
         oid(&after_refusal, MINER_HISTORY),
         "the kept build was rebuilt"
     );
     assert_ne!(
-        oid(&trimmed, SEQ_WALK).unwrap(),
+        oid(&leaf, &leaf_name(SEQ_WALK)).unwrap(),
         leftover.3,
         "the interrupted build's invalid index was not replaced"
     );
@@ -856,7 +921,7 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
     assert!(error.contains("migrate again"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 18]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18]
     );
     let after_refusal = ledger_indexes(&pool).await?;
     let mut expected: Vec<&str> = KEPT.to_vec();
@@ -886,14 +951,15 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
     .execute(&pool)
     .await?;
     let resumed = db.ledger("resumed").await?;
-    let trimmed = assert_trimmed(&pool).await?;
+    assert_trimmed(&pool).await?;
+    let leaf = table_indexes(&pool, "qbit_share_ledger_p0").await?;
     assert_eq!(
-        oid(&trimmed, SEQ_WALK),
+        oid(&leaf, &leaf_name(SEQ_WALK)),
         oid(&prebuilt, SEQ_WALK),
         "the kept index was rebuilt"
     );
     assert_eq!(
-        oid(&trimmed, MINER_HISTORY),
+        oid(&leaf, &leaf_name(MINER_HISTORY)),
         oid(&after_refusal, MINER_HISTORY),
         "the built index was rebuilt"
     );

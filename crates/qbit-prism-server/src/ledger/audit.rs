@@ -1,5 +1,6 @@
 use super::*;
 use qbit_prism::FoundBlock;
+use sqlx::{pool::PoolConnection, PgConnection};
 
 /// Audit history available from shared PostgreSQL storage, without relying on
 /// a filesystem mount on the public tier. This checks presence, not integrity:
@@ -50,13 +51,97 @@ pub async fn audit_completeness<'e>(
     })
 }
 
+/// Where a reconstruction reads from: the pool, or one connection.
+///
+/// The public read pool applies a request's remaining deadline to each
+/// checkout (`api/public_service.rs`), so a reconstruction serving a request
+/// takes one checkout per statement; retaining one would give a late range
+/// scan the first statement's whole budget. A maintenance command runs every
+/// statement on one connection of its own instead: a production window is
+/// hundreds of megabytes, and its unpaged range read does not finish inside
+/// the pool's ordinary `statement_timeout`, which that connection has lifted.
+pub enum AuditReader<'a> {
+    /// One checkout per statement, each under the pool's own settings.
+    Pool(&'a PgPool),
+    /// Every statement on this connection, under its session settings.
+    Connection(&'a mut PgConnection),
+}
+
+impl<'a> From<&'a PgPool> for AuditReader<'a> {
+    fn from(pool: &'a PgPool) -> Self {
+        Self::Pool(pool)
+    }
+}
+
+impl<'a> From<&'a mut PgConnection> for AuditReader<'a> {
+    fn from(connection: &'a mut PgConnection) -> Self {
+        Self::Connection(connection)
+    }
+}
+
+/// A reborrow, so one reader serves a reconstruction and the rebuild it
+/// delegates to without giving up its connection.
+impl<'a> From<&'a mut AuditReader<'_>> for AuditReader<'a> {
+    fn from(reader: &'a mut AuditReader<'_>) -> Self {
+        match reader {
+            AuditReader::Pool(pool) => Self::Pool(pool),
+            AuditReader::Connection(connection) => Self::Connection(connection),
+        }
+    }
+}
+
+impl AuditReader<'_> {
+    /// The connection for the next statement: a fresh checkout from the
+    /// pool, returned when the statement is done, or the one connection.
+    async fn connection(
+        &mut self,
+        metrics: Option<&crate::metrics::Metrics>,
+    ) -> Result<AuditConnection<'_>> {
+        Ok(match self {
+            Self::Pool(pool) => AuditConnection::Pooled(
+                crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?,
+            ),
+            Self::Connection(connection) => AuditConnection::Borrowed(connection),
+        })
+    }
+}
+
+enum AuditConnection<'c> {
+    Pooled(PoolConnection<Postgres>),
+    Borrowed(&'c mut PgConnection),
+}
+
+impl std::ops::Deref for AuditConnection<'_> {
+    type Target = PgConnection;
+
+    fn deref(&self) -> &PgConnection {
+        match self {
+            Self::Pooled(connection) => connection,
+            Self::Borrowed(connection) => connection,
+        }
+    }
+}
+
+impl std::ops::DerefMut for AuditConnection<'_> {
+    fn deref_mut(&mut self) -> &mut PgConnection {
+        match self {
+            Self::Pooled(connection) => connection,
+            Self::Borrowed(connection) => connection,
+        }
+    }
+}
+
 /// Exact content-addressed bytes for the public artifact route. Imported
 /// legacy bytes are authoritative; missing legacy sidecars permit the old
 /// logical-JSON fallback. Native bodies are reproducible from their immutable
 /// share snapshot and never need a second stored copy of the full window.
-pub async fn audit_canonical_bytes(pool: &PgPool, block_hash: &str) -> Result<Option<Vec<u8>>> {
+pub async fn audit_canonical_bytes<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    block_hash: &str,
+) -> Result<Option<Vec<u8>>> {
+    let mut reader = reader.into();
     let row = sqlx::query("SELECT audit_bundle,audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1")
-        .bind(block_hash).fetch_optional(pool).await?;
+        .bind(block_hash).fetch_optional(&mut *reader.connection(None).await?).await?;
     let Some(row) = row else { return Ok(None) };
     let expected: String = row.try_get("audit_bundle_sha256")?;
     if let Some(bytes) = row.try_get::<Option<Vec<u8>>, _>("canonical_audit_bytes")? {
@@ -77,7 +162,7 @@ pub async fn audit_canonical_bytes(pool: &PgPool, block_hash: &str) -> Result<Op
     }
     let body: Option<Value> = row.try_get("audit_bundle")?;
     let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
-    materialize_audit_row(pool, &mut logical, None).await?;
+    materialize_audit_row(&mut reader, &mut logical, None).await?;
     let bundle: AuditBundle = serde_json::from_value(logical["audit_bundle"].take())?;
     let bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?;
     ensure!(
@@ -138,18 +223,18 @@ pub async fn decode_canonical_audit_body(
 /// they run on one blocking thread. A `permit` is held by that job itself:
 /// Tokio keeps running it after its awaiting caller is dropped, and the permit
 /// must bound it anyway. Callers outside the public API pass `None`.
-pub async fn materialize_audit_row(
-    pool: &PgPool,
+pub async fn materialize_audit_row<'a>(
+    reader: impl Into<AuditReader<'a>>,
     row: &mut Value,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
-    // Public pool-only readers have no metrics owner. Ledger reconstruction
+    // Public and maintenance readers have no metrics owner. Ledger reconstruction
     // supplies its attached handle through the private helper below.
-    materialize_audit_row_with_metrics(pool, row, permit, None).await
+    materialize_audit_row_with_metrics(reader, row, permit, None).await
 }
 
-async fn materialize_audit_row_with_metrics(
-    pool: &PgPool,
+async fn materialize_audit_row_with_metrics<'a>(
+    reader: impl Into<AuditReader<'a>>,
     row: &mut Value,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     metrics: Option<&crate::metrics::Metrics>,
@@ -158,17 +243,20 @@ async fn materialize_audit_row_with_metrics(
         return Ok(());
     };
     let digest = digest.to_owned();
+    let mut reader = reader.into();
     // Snapshots and their share history are immutable, and both hashes below
-    // authenticate the reconstruction. Separate checkouts let the public read
-    // pool apply the remaining request deadline to each query; retaining one
-    // transaction would give a late range scan the first query's full budget.
-    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+    // authenticate the reconstruction. Each statement takes the reader's
+    // connection on its own: from the pool, a separate checkout per statement
+    // lets the public read pool apply the remaining request deadline to each;
+    // retaining one transaction would give a late range scan the first
+    // query's full budget.
+    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *reader.connection(metrics).await?).await?;
     let inline: Option<Value> = snapshot.try_get("inline_shares")?;
     let shares: Vec<AcceptedShare> = if let Some(inline) = inline {
         serde_json::from_value(inline)?
     } else {
         read_range(
-            pool,
+            &mut reader,
             snapshot.try_get("first_share_seq")?,
             snapshot.try_get("last_share_seq")?,
             snapshot.try_get("anchor_ms")?,
@@ -231,13 +319,20 @@ async fn materialize_audit_row_with_metrics(
 }
 
 impl Ledger {
-    /// New range-backed bodies, imported canonical bytes, then old inline
+    /// Stored canonical bytes, then range-backed bodies, then old inline
     /// bodies. Legacy filesystem bodies are imported by the migration command
-    /// or resolved by the public API reader. Imported bytes that fail their
+    /// or resolved by the public API reader. Stored bytes that fail their
     /// digest or parse are an error, never a fallback to another source.
+    ///
+    /// Stored bytes win whatever the row's shape (#144). A native row is
+    /// sealed before its shares are archived, and after the detach the
+    /// reconstruction it used to serve has nothing to read: the block keeps
+    /// its advertised `audit_bundle_sha256` only because the bytes proved
+    /// against that digest at seal time are preferred here.
     pub async fn audit_bundle(&self, block_hash: &str) -> Result<Option<Value>> {
-        // Load only the representation that will be served.
-        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,CASE WHEN share_snapshot_sha256 IS NULL THEN canonical_audit_bytes END AS canonical_audit_bytes,CASE WHEN share_snapshot_sha256 IS NOT NULL OR canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        // Load only the representation that will be served: the inline body is
+        // needed for a reconstruction, which only happens without bytes.
+        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes,CASE WHEN canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
             .bind(block_hash)
             .fetch_optional(&mut *self.acquire().await?)
             .await?;
@@ -251,6 +346,11 @@ impl Ledger {
         // The row still holds its own copy of the bytes; free it before the
         // decode instead of keeping two copies alive across the await.
         drop(row);
+        if let Some(bytes) = canonical {
+            return Ok(Some(
+                decode_canonical_audit_body(bytes, expected, None).await?,
+            ));
+        }
         if snapshot.is_some() {
             let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
             materialize_audit_row_with_metrics(
@@ -261,11 +361,6 @@ impl Ledger {
             )
             .await?;
             return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
-        }
-        if let Some(bytes) = canonical {
-            return Ok(Some(
-                decode_canonical_audit_body(bytes, expected, None).await?,
-            ));
         }
         Ok(body.filter(|body| !body.is_null()))
     }
@@ -396,7 +491,11 @@ pub(super) async fn verify_durable_range(
     while cursor < last {
         // Release this page's checkout before its blocking comparison and the
         // next page, observing each acquisition rather than the whole proof.
+        // Planned per page with its bounds, as `read_range_owned` does
+        // (`ledger/window.rs`): a cached generic plan for a `share_seq` range
+        // sorts the partitioned ledger instead of walking it in order.
         let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
+            .persistent(false)
             .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         if rows.is_empty() {
             break;
@@ -499,7 +598,7 @@ pub(super) async fn persist_audit_snapshot(
 /// The unpaged range read the API's `materialize_audit_row` keeps. Landing no
 /// longer uses it; its re-read is paged.
 async fn read_range(
-    pool: &PgPool,
+    reader: &mut AuditReader<'_>,
     first: i64,
     last: i64,
     anchor: i64,
@@ -510,10 +609,12 @@ async fn read_range(
         "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
         anchored_eligibility_sql(3)
     ))
+    // Planned with its bounds; see `read_range_owned` in `ledger/window.rs`.
+    .persistent(false)
     .bind(first)
     .bind(last)
     .bind(anchor)
-    .fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?)
+    .fetch_all(&mut *reader.connection(metrics).await?)
     .await?;
     rows.iter().map(share_from_row).collect()
 }

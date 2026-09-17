@@ -27,20 +27,34 @@ grouped AS (
     FROM window_rows
     GROUP BY miner_id
 ),
+-- Blocks found per miner, from the block row's own solver attribution
+-- (written at landing and backfilled by migration 016, #144), so the count
+-- does not change when the partition holding the solving share is detached.
+-- The LATERAL is the compatibility path for a row whose columns are still
+-- unset; after 016's backfill no such row exists. A block with neither is
+-- counted for no miner, as the inner join this replaced did.
 blocks AS (
-    SELECT solver.miner_id, count(*) AS blocks_found_total
+    SELECT COALESCE(block.solver_miner_id, solver.miner_id) AS miner_id, count(*) AS blocks_found_total
     FROM qbit_pool_blocks block
-    JOIN LATERAL (
+    LEFT JOIN LATERAL (
+        -- The guard is inside the subquery, not on the join: PostgreSQL
+        -- evaluates a LEFT JOIN's ON clause per inner row, so a
+        -- `ON block.solver_share_id IS NULL` still runs the lookup for every
+        -- block (measured: 202 buffers against 2 over 50 blocks), while the
+        -- same predicate here becomes a One-Time Filter and the index scan
+        -- reads "never executed".
         SELECT share.miner_id
         FROM qbit_share_ledger share
-        WHERE share.accepted
+        WHERE block.solver_share_id IS NULL
+          AND share.accepted
           AND length(share.share_id) >= 65
           AND lower(right(share.share_id, 64)) = block.block_hash
         ORDER BY share.accepted_at DESC, share.share_seq DESC
         LIMIT 1
     ) solver ON true
     WHERE block.chain_state = 'confirmed'
-    GROUP BY solver.miner_id
+      AND COALESCE(block.solver_miner_id, solver.miner_id) IS NOT NULL
+    GROUP BY COALESCE(block.solver_miner_id, solver.miner_id)
 ),
 ranked AS (
     SELECT

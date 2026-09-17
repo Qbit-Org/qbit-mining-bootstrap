@@ -159,7 +159,12 @@ canonical ledger range. Reconstruction verifies the share digest and canonical
 bundle hash before serving the full logical bundle. Overlapping block windows
 therefore reuse share rows instead of copying the same arrays into every audit.
 Existing inline bundles and imported filesystem artifacts retain their canonical
-hashes. See [storage sizing](docs/prism-storage-sizing.md).
+hashes. Before a share partition is archived, every audit that depends on it is
+sealed: its canonical artifact is rebuilt, checked against its advertised
+digest and stored, and served from those bytes afterwards, so a block keeps its
+published digest once its shares have left the online ledger. See
+[storage sizing](docs/prism-storage-sizing.md) and
+[share ledger partitions and retention](docs/prism-ledger-ops.md#share-ledger-partitions-and-retention).
 
 Verify against an independently trusted ledger public key and on-chain coinbase:
 
@@ -243,11 +248,16 @@ qbit-prism-server self-check
 qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
 qbit-prism-server backfill-ctv
 qbit-prism-server broadcast-ctv
+qbit-prism-server share-archive plan --network-difficulty "$NETWORK_DIFFICULTY"
 ```
 
 `check-config` validates configuration without listeners. `self-check` checks a
 live deployment, including node identity, database integrity/durability, and
-HTTP readiness. Migration/import commands and native defaults are documented
+HTTP readiness. `share-archive` is the share ledger retention path: it plans,
+seals, archives, verifies, detaches, drops and restores whole partitions, with
+the frontends running, and never deletes a share. See
+[share ledger partitions and retention](docs/prism-ledger-ops.md#share-ledger-partitions-and-retention).
+Migration/import commands and native defaults are documented
 in the [server README](crates/qbit-prism-server/README.md).
 
 Tune `PRISM_RUNTIME_WORKERS`, `PRISM_JOB_BUILD_EXECUTOR_WORKERS`, and

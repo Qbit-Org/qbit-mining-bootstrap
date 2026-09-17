@@ -95,11 +95,12 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
 | `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised` | run | Share rejections by canonical bounded reason ID. Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. | `qbit_prism_rejections_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
-| `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
-| `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Oldest active operation time since progress; zero when idle. | none |
-| `qbit_prism_runtime_task_stalled` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Whether an active poll or operation exceeds its progress budget. | none |
+| `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
+| `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Oldest active operation time since progress; zero when idle. | none |
+| `qbit_prism_runtime_task_stalled` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Whether an active poll or operation exceeds its progress budget. | none |
 | `qbit_prism_runtime_workers` | gauge | none | run | Configured Tokio runtime worker threads. | none |
 | `qbit_prism_share_ack_seconds` | histogram | `result=accepted,rejected` | run | Complete mining.submit frame arrival to completed response write, by outcome. Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines. | `qbit_prism_share_ack_seconds` |
+| `qbit_prism_share_ledger_partition_lead_rows` | gauge | none | run | Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown. max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it. | none |
 | `qbit_prism_stale_job_rejections_total` | counter | `cause=resume_expired,fee_floor,parent_grace,payout_revision` | run | Stale-job share rejections by the internal decision that refused them. Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id="stale-job"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero. | none |
 | `qbit_prism_stale_shares_total` | counter | none | run | Shares rejected as stale or unknown jobs. | `qbit_prism_stale_shares_total` |
 | `qbit_prism_stratum_connection_limit` | gauge | none | run | Configured global Stratum connection limit, not currently available permits; -1 before a listener starts. Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`. | none |
@@ -198,6 +199,20 @@ acquisition completes or is cancelled; subsequent transaction work is excluded.
 Collector status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
+
+`qbit_prism_share_ledger_partition_lead_rows` is read in the same transaction
+as those two, so a collection failure leaves all three unknown together. It is
+the number of `share_seq` values the attached share ledger partitions still
+cover above the next one the sequence will hand out (#144): about 67 million
+with the default width and lead, several hours of appends at any rate this pool
+has run at. It falls as shares are appended and steps back up each time the
+maintenance task attaches a partition, so a value that only falls means the
+task is not running or its calls are failing, which
+`PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS` in
+[prism-configuration.md](prism-configuration.md) describes. Reaching zero does
+not lose a share: the append that finds no partition attaches the lead itself
+and retries once. A never-partitioned ledger and a failed read both read -1;
+neither is a report of exhausted headroom.
 
 The pending predicate is the four unfinished outbox states (`pending`,
 `offer_reserved`, `offered`, `reconciliation`). Since #415 (migration 015) a

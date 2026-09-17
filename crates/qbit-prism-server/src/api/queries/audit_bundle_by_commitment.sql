@@ -9,11 +9,13 @@ SELECT COALESCE(
             'audit_commitment_leaf_hex', $1,
             'audit_bundle_sha256', bundle.audit_bundle_sha256,
             'coinbase_tx_hex', bundle.coinbase_tx_hex,
-            -- Imported canonical bytes supersede any inline copy; load only
-            -- the representation the reader will serve.
+            -- Stored canonical bytes supersede any inline copy, whatever the
+            -- row's shape: a native row sealed before its shares were
+            -- archived (#144) is served from its bytes too, since the
+            -- reconstruction its body supports no longer has shares to read.
+            -- Load only the representation the reader will serve.
             'audit_bundle', CASE
-                WHEN bundle.share_snapshot_sha256 IS NULL
-                 AND bundle.canonical_audit_bytes IS NOT NULL THEN NULL
+                WHEN bundle.canonical_audit_bytes IS NOT NULL THEN NULL
                 ELSE bundle.audit_bundle
             END,
             'body_uri', bundle.body_uri,

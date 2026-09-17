@@ -95,9 +95,16 @@ Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
 hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
-transaction, including carry-forward summary repair, except migration 013,
-the share ledger index trim, whose index builds run after the commit with
-`CREATE INDEX CONCURRENTLY` ([below](#migration-013-the-share-ledger-index-trim-applied-online)). The migration is
+transaction, including carry-forward summary repair, except migrations 013 and
+017. Migration 013, the share ledger index trim, builds its indexes after the
+commit with `CREATE INDEX CONCURRENTLY`
+([below](#migration-013-the-share-ledger-index-trim-applied-online)).
+Migration 017, the share ledger partition conversion, validates its bound and
+swaps the table after the commit on a dedicated connection
+([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
+Both are applied inside the migration transaction where the ledger is empty,
+under the cutover locks that exclude writers, and each records its version only
+after its last change. The migration is
 idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
@@ -163,7 +170,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
-| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `013_share_ledger_index_trim.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `017_share_ledger_partitions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 Migration requires visible `qbit_` relations and functions to resolve in
@@ -243,6 +250,22 @@ object or column in both readings, the capability table on a #258 source
 for instance, or the outbox's `storage_version` there (the release 002
 added it; on a pre-#258 source 006 adds it, so it is reserved), stays
 governed by the release checks.
+
+Migration 017 reserves a family of names rather than a list. The partitions of
+the share ledger are named `qbit_share_ledger_p<n>` in creation order, and their
+indexes take that name as a prefix, so any relation in the ledger's schema
+matching `qbit_share_ledger_p<n>` or `qbit_share_ledger_p<n>_<suffix>` is
+refused before the conversion takes its first step, whatever kind of relation
+it is. The names the swap itself takes are `qbit_share_ledger_p0` for the
+converted release table and `qbit_share_ledger_p0_pkey`,
+`qbit_share_ledger_p0_share_id_key`,
+`qbit_share_ledger_p0_accepted_recent_idx`,
+`qbit_share_ledger_p0_accepted_block_suffix_idx`,
+`qbit_share_ledger_p0_accepted_seq_walk_idx` and
+`qbit_share_ledger_p0_accepted_miner_history_idx` for its six indexes. An
+operator's own relation under one of those names is named in the refusal with
+its kind and is never adopted; rename it out of the `qbit_share_ledger_p`
+prefix, or move it aside, and migrate again.
 
 **The release-schema check.** 001 is the idempotent schema every `2.x.x`
 start re-applied, so the migrator applies it next: that repairs everything
@@ -505,7 +528,7 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 15 and 18,
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 18,
 each checked on its own rather than as a high-water mark: a later migration
 being present never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
@@ -516,9 +539,12 @@ for the quiesce and recovery steps. Stop all frontends again before applying
 and does not evict older processes already serving the database. Keep automatic
 restarts disabled throughout the cutover. 013 is recorded only once its online
 index builds have completed, so a start after an interrupted build is
-refused until `migrate` finishes them. Migration 018 adds the durable chain epoch
-and declares `chain_observation_epoch = 1`; 016/017 are reserved by the separate
-share-partitioning change. Apply 018 only after stopping every old frontend,
+refused until `migrate` finishes them. 017 is recorded the same way and for
+the same reason: it is recorded only after the swap has made the release table
+the first partition of the partitioned parent, so a start after an interrupted
+validation or an interrupted swap is refused until `migrate` has resumed and
+finished the conversion. Migration 018 adds the durable chain epoch
+and declares `chain_observation_epoch = 1`. Apply 018 only after stopping every old frontend,
 one-shot writer and paused startup, with restarts disabled, then start only
 epoch-aware binaries. The registered-instance shutdown check does not evict a
 connected writer or discover an unregistered old tool. See the
@@ -648,6 +674,208 @@ keep that headroom free. A concurrent build reads the table twice. Run
 relying on a starting frontend, whose readiness stays down until the build
 completes. Then run `ANALYZE qbit_share_ledger` and take the measurements the
 inventory lists before scheduling #144.
+
+### Migration 016: the partition catalog and solver attribution
+
+Migration 016 (#144) is everything the partition conversion needs before the
+table changes shape, and it is transactional: 017's SQL is the functions 016
+installs, so 016 must have committed before the online runner starts. It does
+four things.
+
+It drops the two foreign keys onto `qbit_share_ledger(share_id)`, the 001
+outbox key and the 002 `qbit_prism_share_hashes` key. A unique index on a
+partitioned table must include the partition key, so the global
+`UNIQUE (share_id)` cannot survive 017 and nothing can reference `share_id`
+afterwards. Both keys would also pin partitions: PostgreSQL re-validates
+inbound foreign keys at DETACH, and the outbox is never pruned, so a single
+retained outbox row would pin the partition holding its block's solving share
+forever. The outbox keeps its own `UNIQUE (share_id)`, and
+`qbit_prism_share_hashes` keeps its `UNIQUE (share_id)` and header-hash primary
+key and becomes the global uniqueness authority the append path consults first.
+The schema rule from here on is that **no object may carry a foreign key to
+`qbit_share_ledger`**.
+
+It creates the partition catalog, `qbit_prism_share_partitioning` (the one
+settings row: grid width, lead count, the conversion bound and when the swap
+completed) and `qbit_prism_share_partitions` (per partition: bounds, state,
+and the sealed, archived, verified, detached and dropped timestamps with the
+archive URI and digests). Both are documented column by column in
+[the ledger operations guide](prism-ledger-ops.md#share-ledger-partitions-and-retention).
+
+It creates the maintenance and conversion functions:
+`qbit_prism_share_next_seq()`, `qbit_prism_share_probe_floor()`,
+`qbit_prism_share_partition_create()`,
+`qbit_prism_share_partition_ensure()`, and the three steps of the conversion,
+`qbit_prism_share_ledger_convert_prepare()`,
+`qbit_prism_share_ledger_convert_validate()` and
+`qbit_prism_share_ledger_convert_swap()`. Defining them here is what lets the
+online runner and the transactional empty-ledger path run the same code.
+
+Finally it moves block solver attribution onto `qbit_pool_blocks`. Four
+dashboard queries found each block's solving share by suffix-matching every
+block's hash against the ledger on every request, and after a detach that
+lookup would silently blank a historical block's solver. The columns
+(`solver_miner_id`, `solver_share_id`, `solver_share_difficulty`,
+`solver_network_difficulty`) are added and backfilled here, written at landing
+from now on, and read by the queries. The backfill is one
+`accepted_block_suffix_idx` probe per block without a solver recorded, exactly
+the lookup those queries performed on every request, so its cost is
+proportional to the pool's block count and not to the share count.
+
+### Migration 017: the share ledger partition conversion, applied online
+
+Migration 017 (#144) converts `qbit_share_ledger` into a partitioned table,
+`RANGE (share_seq)`, with the release table attached as its first partition.
+Nothing is copied and no index is rebuilt: with a validated
+`CHECK (share_seq < bound)` on the release table, `ATTACH PARTITION` proves the
+bound from the constraint and adopts every existing index, so the swap is
+catalog work and takes milliseconds whatever the table holds. The layout it
+produces, the retention path it enables and the per-partition index set are in
+[the ledger operations guide](prism-ledger-ops.md#share-ledger-partitions-and-retention);
+the reasoning is in
+[the design record](prism-share-ledger-partitioning.md).
+
+On a fresh deployment or an empty `2.x.x` source the migration file is applied
+as written, inside the migration transaction, under the cutover locks that
+exclude writers; a fresh deployment's first partition is one grid cell.
+Everywhere else, including an existing native ledger whose first share is still
+uncommitted, the same three steps run after the commit, each in its own
+transaction on a dedicated connection with no statement timeout, resumable from
+whatever stage the database is in, and 16 is recorded last. Until then every
+start refuses the database, as for every other required migration. The
+migration transaction cannot do this work: its statement timeout and its lock
+hold would not survive a validation scan that runs for hours, and the swap's
+lock has to be taken with a short timeout and retried rather than queued.
+
+**1. Prepare.** `CHECK (share_seq < bound) NOT VALID` on the release table,
+where `bound` is the first grid boundary at least two partition widths above
+the next `share_seq`. That is 33.5 M rows of headroom at the default width:
+nineteen hours at 500 shares per second, ten days at 39. The constraint is
+enforced on new rows at once, and adding it takes the table lock only for the
+catalog change, which is why it is taken with the same short timeout and
+retries as the swap. The sequence is never restarted: rows keep landing in the
+release table until it reaches the bound, then in the next cell, so `share_seq`
+stays gap-free.
+
+**2. Validate.** `ALTER TABLE ... VALIDATE CONSTRAINT` for every `CHECK` the
+table still carries as NOT VALID, in name order. That is the bound, and the
+release's `qbit_share_ledger_credit_policy_check` where 001 left it pending on
+a ledger upgraded from before the column existed, which is the one NOT VALID
+constraint the migrator tolerates on a source. Each is one scan of the table
+under SHARE UPDATE EXCLUSIVE, which blocks neither appends nor reads, and each
+runs for hours on a production-sized ledger. ATTACH refuses a partition whose
+constraint is NOT VALID while the parent's is validated, so both have to be
+validated before the swap, not just the bound.
+
+**Re-bounding.** A run that is interrupted and resumed later may find the
+sequence has eaten the headroom. `prepare` is therefore called again at the
+start of the pending stage and of the validated stage: it returns the existing
+bound while at least one partition width of headroom is left, and otherwise
+drops the constraint, pending or validated, bounds further out and records the
+new bound, which then has to be validated again. That is the one case where a validation scan has to start
+over, and it is why an interrupted conversion is better resumed promptly than
+left for a week.
+
+**3. Swap.** One transaction of catalog work: rename the table and its six
+indexes to their `_p0` names; create the parent `LIKE` the release table, with
+the same columns, defaults and `CHECK` constraints under the same names, which
+is what ATTACH matches on; give the parent the primary key and the four
+secondary indexes under the release names; move the sequence's ownership and
+the grants across; `ATTACH PARTITION ... FROM (MINVALUE) TO (bound)`, which
+proves the bound from the validated constraint and adopts every existing index;
+recreate `qbit_shares_since_template_height`, the one release function bound to
+the old row type by OID; install the immutability trigger on the parent,
+because PostgreSQL does not clone a statement trigger to a partition; record the
+catalog; create the lead partitions. Measured on the container at 16 ms with
+5,000 rows, and none of its terms is a function of the row count. The swap needs
+ACCESS EXCLUSIVE, so it is requested with a two-second `lock_timeout` and
+retried for up to ten minutes: a long read delays the swap instead of holding
+every append queued behind an ACCESS EXCLUSIVE request. Each retry logs the
+wait so far. The function also counts the indexes on the partition afterwards
+and refuses if ATTACH built one instead of adopting it, because a build there
+would hold that lock for hours.
+
+**Resumability.** The runner reads the ledger's stage afresh before each step
+and after it, from the relation kind of `qbit_share_ledger`, the validation
+state of `qbit_share_ledger_p0_bound` and `converted_at` in the catalog:
+
+| Stage found | What it means | What the run does |
+| --- | --- | --- |
+| plain | an ordinary table with no bound | refuses the reserved names, prepares the bound, then validates and swaps |
+| pending | the bound is on the table and enforced on new rows, not yet validated | prepares again (which re-bounds only if the headroom is gone), validates every pending `CHECK`, then swaps |
+| validated | the bound is validated | prepares again (which re-bounds and validates again only if the headroom is gone), then swaps |
+| converted | the parent is partitioned and the catalog records the conversion | ensures the lead partitions and records 16 |
+
+Every name the run would take is checked while the ledger is still plain,
+before the first step, so a refusal at that point has changed nothing. A run
+that resumes from the pending or validated stage does not repeat that sweep,
+because the bound is already on the table; the swap re-checks the seven `_p0`
+names itself and refuses without changing anything if one has been taken since.
+The version is recorded in its own transaction under the migration lock, after
+the stage has been re-read and found still converted. A version another
+instance recorded meanwhile is not applied again.
+
+**Refusals, and what each one means.** From the runner:
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to apply migration 16: table qbit_share_ledger_p0 already hold names the share ledger partitions take. The migration is not recorded and nothing was changed by it. Check what they hold, then rename or move them aside and migrate again` | every relation named `qbit_share_ledger_p<k>` or `qbit_share_ledger_p<k>_<suffix>` is listed with its kind; rename or move each aside, then migrate again |
+| `migration 16: swapping the share ledger could not take its lock on qbit_share_ledger within 600 s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again` | also raised for `preparing the partition bound` and `checking the partition bound`; find the holder in `pg_stat_activity` and `pg_locks`, let it finish or stop the frontends, and migrate again. Nothing after the last completed step was changed |
+| `qbit_share_ledger does not exist` | the runner was pointed at a schema without the ledger; check `search_path` and the database |
+| `qbit_share_ledger is a partitioned table but qbit_prism_share_partitioning does not record a conversion; the migrator did not partition it. Check what did, then restore the full backup or move the table aside and migrate again` | something other than this migrator partitioned the ledger; the runner will not adopt it |
+| `qbit_share_ledger is a relation of kind v, not a table; the migrator cannot partition it` | a view or other relation holds the ledger's name; restore the table from the full backup |
+| `refusing to record migration 16: qbit_share_ledger is no longer the converted table this run left; migrate again` | the ledger changed between the conversion and the recording; nothing is recorded, and the next run plans afresh from what it finds |
+| `validating the share ledger bound for migration 16; migrate again to resume` | the context on a failed or cancelled validation scan; the pending constraint stays, and the next `migrate` resumes from the pending stage |
+
+From the SQL functions that do the work:
+
+| Refusal | What to do |
+| --- | --- |
+| `share ledger is already converted` | raised by `prepare` and `swap` when `converted_at` is already set. The runner reads the stage first and never reaches them in that state, so this appears only when the functions are called by hand |
+| `qbit_share_ledger is not a plain table` | raised by `prepare`, `validate` and `swap` when the ledger is already partitioned or is not a table at all; see the runner refusals above |
+| `qbit_share_ledger_p0_bound exists with an unexpected definition: <definition>` | a constraint under the bound's name that is not `share_seq < <n>`; inspect it, drop it if it is not the migrator's, and migrate again |
+| `qbit_share_ledger_p0_bound is missing; run qbit_prism_share_ledger_convert_prepare() first` | the swap was called out of order; `migrate` calls the three in order, so this appears only when the functions are called by hand |
+| `qbit_share_ledger_p0_bound is not validated; run qbit_prism_share_ledger_convert_validate() first` | the same, one stage later |
+| `qbit_share_ledger carries a NOT VALID CHECK constraint (<names>); run qbit_prism_share_ledger_convert_validate() first` | a `CHECK` was added NOT VALID after the validation step ran; validate it, or drop it if it is not wanted, then migrate again |
+| `qbit_share_ledger_p0_bound reads <n> but the catalog recorded <m>` | the constraint and `qbit_prism_share_partitioning.conversion_bound` disagree, so one of them was edited; restore the full backup rather than reconciling them by hand |
+| `the share sequence has reached the conversion bound <n>; prepare again with more headroom` | the sequence passed the bound before the swap ran, which needs a full partition width of shares to land during the validation scan. The runner re-prepares only from the plain and pending stages, so a `migrate` from the validated stage repeats this refusal; drop `qbit_share_ledger_p0_bound` so that the next run prepares a new bound, and expect the validation scan again |
+| `refusing to convert the share ledger: a relation already holds the reserved name qbit_share_ledger_p0_pkey` | one of the seven `_p0` names is taken; rename or move that relation aside and migrate again |
+| `refusing to convert the share ledger: index qbit_share_ledger_accepted_recent_idx is not on qbit_share_ledger` | one of the six release indexes is missing or sits on another table, so 013 did not finish or an index was moved; repair the index set and migrate again |
+| `attaching qbit_share_ledger_p0 built 1 new index(es) instead of adopting the existing ones` | a release index did not match the parent's definition, so ATTACH built one; the transaction rolls back, nothing is converted, and the index definitions have to be reconciled with 013's declarations first |
+| `refusing to create share ledger partition qbit_share_ledger_p7: a relation already holds that name` | from `qbit_prism_share_partition_create`, at conversion time or later from the periodic ensure; rename or move that relation aside |
+| `share ledger is converted but no partition is attached in qbit_prism_share_partitions` | from the ensure function: the catalog has no attached row to extend from, so it was edited or selectively restored; restore the full backup |
+
+And from the scratch apply, which proves before any DDL that the migration file
+converts the table: `migration 16: qbit_share_ledger is missing before it`,
+`migration 16: qbit_share_ledger already has partitions before it`,
+`migration 16: qbit_share_ledger is missing after it`, and
+`migration 16: qbit_share_ledger_p0 is not a partition of qbit_share_ledger
+after it`. These refuse the binary's own migration file, not the source
+database, and mean the file and the runner have gone out of step.
+
+**Plan for the conversion on a large ledger.** Budget one full scan of the
+table per pending `CHECK` constraint, which is hours on a production-sized
+ledger: the bound always, and the release's
+`qbit_share_ledger_credit_policy_check` as well where 001 left it NOT VALID.
+Appends and reads continue throughout, at SHARE UPDATE EXCLUSIVE. The swap
+itself is milliseconds, but it needs ACCESS EXCLUSIVE, so allow for up to ten
+minutes of `lock_timeout` retries and stop long-running reports for that
+window if the retries are being exhausted. Run `migrate` from a shell where a
+multi-hour command is acceptable, not from a starting frontend, whose readiness
+stays down until the conversion completes. Unlike 013, this migration needs no
+extra disk and rebuilds no index: it copies no rows and every index is adopted
+by ATTACH. Run `ANALYZE qbit_share_ledger` afterwards and take the before and
+after measurements the
+[operations runbook](prism-ledger-ops.md#measuring-before-and-after) lists,
+which are acceptance criterion 4 of #144.
+
+**One-way, per decision D5.** No revert script ships. Reverting means a second
+cutover: rebuilding a global `UNIQUE (share_id)` over the whole table under
+ACCESS EXCLUSIVE, measured at 43 s over 5.5 M rows in the design spike and
+proportional to the table, and that rebuild fails at the end on the first
+duplicate `share_id` accepted across two leaves. Recovery is the
+[isolated-restore reconciliation](prism-ledger-ops.md#one-way-migration-and-isolated-restore-reconciliation)
+of #287, as for every other native migration.
 
 ## Bring up native instances
 

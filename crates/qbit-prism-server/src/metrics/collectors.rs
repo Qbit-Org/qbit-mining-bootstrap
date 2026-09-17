@@ -30,12 +30,11 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:
 /// every row the offer lifecycle (migration 011) has not finished, pending
-/// and offered-but-not-landed alike. The predicate is
-/// `CandidateState::UNFINISHED_SQL` itself, so the gauges and the claim
-/// lanes can never disagree about what "unfinished" means: a row settled
-/// `submitted`, `abandoned` or, since migration 015, `orphaned` is terminal
-/// and counted by neither. No share-table scan, candidate JSON decode, or
-/// accounting lock.
+/// and offered-but-not-landed alike, using `CandidateState::UNFINISHED_SQL`
+/// so terminal submitted, abandoned and orphaned rows are excluded. The same
+/// snapshot reads attached share ledger partition headroom (#144). Both reads
+/// are catalog-sized: no share-table scan, candidate JSON decode, or accounting
+/// lock. A failure of either leaves every sample of this collector unknown.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
@@ -47,7 +46,10 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
             &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {}", crate::ledger::CandidateState::UNFINISHED_SQL)
         ).fetch_one(&mut *tx).await?;
-        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)? };
+        let partition_lead_rows: Option<i64> = sqlx::query_scalar(
+            "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"
+        ).fetch_one(&mut *tx).await?;
+        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, partition_lead_rows };
         tx.commit().await?;
         Ok::<_, anyhow::Error>(snapshot)
     }).await.context("metrics database collection deadline exceeded")?

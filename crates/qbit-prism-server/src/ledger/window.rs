@@ -585,6 +585,64 @@ impl Ledger {
             }
             None => None,
         };
+        // The copy the retry below would need: `append_in` takes the share by
+        // value, and six short string allocations against a round trip to
+        // PostgreSQL is the whole price of keeping a refused append
+        // recoverable.
+        let retry_share = share.clone();
+        let attempt = self
+            .append_prepared(share, prepared.as_ref(), expected_revision, pre_commit)
+            .await;
+        // The ledger is partitioned on `share_seq` with no DEFAULT partition
+        // (migration 017): once the sequence runs past the last attached
+        // bound, the INSERT is refused with SQLSTATE 23514, "no partition of
+        // relation ... found for row". That refusal is definite and total. It
+        // is raised by the ledger INSERT itself, inside the transaction
+        // `append_prepared` opened, and that transaction is rolled back with
+        // the share, the clock update, the hash row and any prepared
+        // candidate bytes undone together, so nothing of the attempt
+        // survives it. [`crate::partitions::run`] should have kept the lead
+        // attached; where it has not, a miner's share is not the place to
+        // lose the work. Attach the lead on a fresh pool connection and run
+        // the whole attempt again, exactly once. Any other error, and a
+        // second failure of any kind, is returned unchanged: reconcile,
+        // never repeat.
+        //
+        // `pre_commit` is still called at most once. It runs only after every
+        // statement of an attempt has succeeded, which an attempt refused by
+        // 23514 never reaches.
+        let Err(error) = attempt else { return attempt };
+        if !refused_for_want_of_a_partition(&error) {
+            return Err(error);
+        }
+        let created = crate::partitions::ensure(&self.pool).await.context(
+            "the share ledger has no partition for the next share_seq and attaching the partition lead failed; run qbit_prism_share_partition_ensure() against the primary",
+        )?;
+        tracing::warn!(
+            created,
+            %error,
+            "share append found no partition for its sequence; attached the partition lead and retried"
+        );
+        self.append_prepared(
+            retry_share,
+            prepared.as_ref(),
+            expected_revision,
+            pre_commit,
+        )
+        .await
+    }
+
+    /// One complete attempt of [`Ledger::append_checked`], from BEGIN to
+    /// COMMIT. Runs the share append, the prepared candidate persistence and
+    /// the pre-commit gate under one `ORDER_LOCK`; every path out of it has
+    /// either committed or rolled the transaction back.
+    async fn append_prepared(
+        &self,
+        share: AcceptedShare,
+        prepared: Option<&super::candidates::PreparedCandidate>,
+        expected_revision: Option<i64>,
+        pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<AppendResult> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
@@ -596,7 +654,7 @@ impl Ledger {
             );
         }
         let result = self.append_in(&mut tx, share).await?;
-        if let Some(prepared) = &prepared {
+        if let Some(prepared) = prepared {
             self.persist_prepared_candidate(&mut tx, prepared, Some(&result.share.share_id))
                 .await?;
         }
@@ -636,10 +694,61 @@ impl Ledger {
         let program = hex::decode(&share.p2mr_program_hex)?;
         ensure!(program.len() == 32, "P2MR program must be 32 bytes");
         share.p2mr_program_hex = hex::encode(program);
-        let existing = sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
-            .bind(&share.share_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+        // The ledger is partitioned by share_seq (migration 017) and its
+        // share_id uniqueness is per leaf, so a share_id probe without a
+        // share_seq bound descends one index per attached partition.
+        // qbit_prism_share_hashes is the authority for accepted headers, but
+        // legacy rejected rows have no header mapping. Before a partition can
+        // leave, verification retains their exact IDs and sequences; imports
+        // register them on attachment. Unregistered rejected rows are in the
+        // release table below conversion_bound; native writers only insert
+        // accepted rows. Probe the newest partitions first, then a registered
+        // rejected sequence or the legacy range on an unmapped miss, so a new
+        // share never probes every retained leaf. A credited header needs the
+        // full-parent fallback, including legacy worker-scoped duplicates
+        // mapped to an earlier row.
+        // A credited row that has left the online ledger cannot be compared
+        // and is refused as the duplicate it is.
+        let header_hash = share_header_hash(&share.share_id);
+        let (credited, rejected_seq, legacy_bound): (Option<String>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),\
+             (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2),conversion_bound \
+             FROM qbit_prism_share_partitioning WHERE singleton",
+        )
+        .bind(&header_hash)
+        .bind(&share.share_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let mut existing = sqlx::query(&format!(
+            "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()"
+        ))
+        .bind(&share.share_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if existing.is_none() {
+            existing = if let Some(seq) = rejected_seq {
+                sqlx::query(&format!(
+                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq=$2"
+                ))
+                .bind(&share.share_id)
+                .bind(seq)
+                .fetch_optional(&mut **tx)
+                .await?
+            } else if credited.is_some() {
+                sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
+                    .bind(&share.share_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+            } else {
+                sqlx::query(&format!(
+                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq<$2"
+                ))
+                .bind(&share.share_id)
+                .bind(legacy_bound)
+                .fetch_optional(&mut **tx)
+                .await?
+            };
+        }
         if let Some(row) = existing {
             let previous = share_from_row(&row)?;
             share.share_seq = previous.share_seq;
@@ -650,17 +759,17 @@ impl Ledger {
                 inserted: false,
             });
         }
-        let header_hash = share_header_hash(&share.share_id);
-        let duplicate: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM qbit_prism_share_hashes WHERE header_hash=$1)",
-        )
-        .bind(&header_hash)
-        .fetch_one(&mut **tx)
-        .await?;
         ensure!(
-            !duplicate,
-            "duplicate-share: header already credited globally"
+            rejected_seq.is_none(),
+            "duplicate-share: rejected share_id is retained globally, and its share is archived"
         );
+        if let Some(credited) = credited {
+            ensure!(
+                credited == share.share_id,
+                "duplicate-share: header already credited globally"
+            );
+            bail!("duplicate-share: header already credited globally, and its share is archived");
+        }
         let accepted_at_ms: i64 = sqlx::query_scalar("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms").fetch_one(&mut **tx).await?;
         ensure!(
             share.job_issued_at_ms <= accepted_at_ms,
@@ -948,11 +1057,20 @@ where
     // bounds are known here, so rows arrive in canonical order and a digest
     // over them can stream. `$1` is the exclusive cursor, which starts one
     // below `first` and advances to each page's last `share_seq`.
+    //
+    // Each page is planned with its bounds (`persistent(false)`: an unnamed
+    // statement, never a cached generic plan). On the partitioned ledger the
+    // generic plan for a `share_seq` range with unknown bounds estimates a
+    // few hundred rows, so it appends the leaves and sorts them instead of
+    // walking the primary key in order; against a 400k-row window that sort
+    // reads the whole remaining range on every page, forty times the cost
+    // of the ordered scan. Planning a page costs a fraction of a millisecond.
     let page = format!(
         "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}"
     );
     while carried.get().2 < last {
         let rows = sqlx::query(&page)
+            .persistent(false)
             .bind(carried.get().2)
             .bind(last)
             .bind(anchor_ms)
@@ -1161,7 +1279,26 @@ impl WindowRead {
 #[path = "window/reference_tests.rs"]
 mod reference_tests;
 
-fn share_header_hash(share_id: &str) -> String {
+/// Whether `error` is PostgreSQL refusing a row because the partitioned share
+/// ledger has no partition for its `share_seq`.
+///
+/// SQLSTATE 23514 is `check_violation`, which the ledger also raises for its
+/// own CHECK constraints (a bad `credit_policy`, a leaf's bound), so the
+/// message is part of the identification: only the routing failure names the
+/// missing partition, and only it is repaired by attaching the lead.
+fn refused_for_want_of_a_partition(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(|database| {
+                database.code().as_deref() == Some("23514")
+                    && database.message().contains("no partition of relation")
+            })
+    })
+}
+
+pub(super) fn share_header_hash(share_id: &str) -> String {
     if let Some(suffix) = share_id.get(share_id.len().saturating_sub(64)..) {
         if suffix.len() == 64 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
             return suffix.to_ascii_lowercase();

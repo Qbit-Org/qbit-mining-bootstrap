@@ -796,13 +796,36 @@ Native accepted-block audits store the non-share bundle fields and a
 records the canonical share interval, anchor, count, and digest. Its shares are
 reconstructed from the immutable ledger. Bootstrap snapshots may retain their
 synthetic share inline. The reader verifies the reconstructed share digest and
-canonical bundle SHA before returning a logical v1/v1.1 bundle.
+canonical bundle SHA before returning a logical v1/v1.1 bundle. A row whose
+shares have been archived is served from stored canonical bytes instead: before
+a partition leaves the ledger every audit whose snapshot intersects it is
+sealed, the artifact rebuilt from the still-online shares and checked against
+its advertised `audit_bundle_sha256`, and the bytes kept in
+`canonical_audit_bytes`, exactly as an imported legacy audit keeps them.
+Readers prefer stored bytes over reconstruction whatever the row's shape, so
+the artifact route, the audit bundle route and the operator tools keep serving
+the block under its published digest. The snapshot metadata row stays: it
+records the range and digest those bytes were proved against.
 
-Share UPDATE, DELETE, and TRUNCATE are prohibited. Removing a share could break
-both future accounting and already published audit hashes. No supported pruning
-or share-compaction command exists. Keep the canonical share history and all
-referenced snapshot rows. A future archive design must preserve exact range
-reconstruction and verification before relaxing this invariant.
+Share UPDATE, DELETE, and TRUNCATE are prohibited, on the partitioned parent
+and on every leaf. Migration 017 installs the immutability trigger on the
+parent, and `qbit_prism_share_partition_create` installs it on each partition
+it creates, because PostgreSQL does not clone a statement trigger to a
+partition. Removing a share could break both future accounting and already
+published audit hashes, and nothing in the native runtime deletes one: shares
+are immutable and are never deleted.
+
+Retention is not deletion. Space is reclaimed a whole partition at a time,
+after the partition has been sealed, written to an archive outside PostgreSQL,
+and verified against the live rows: `DETACH PARTITION ... CONCURRENTLY`, then
+`DROP TABLE` of the detached relation, with the archive as the copy of record
+from then on. `qbit-prism-server share-archive` is that path and the only one;
+there is still no row-level prune or share-compaction command, and no `DELETE`
+runs on the ledger. Keep the canonical share history and all referenced
+snapshot rows online until that procedure clears them, and keep the archive
+under the same retention plan as the database backups. The procedure is
+[below](#share-ledger-partitions-and-retention); the decision behind it is
+decision D6 in [the design record](prism-share-ledger-partitioning.md).
 
 Imported historical external audits retain their verified canonical bytes;
 they are not silently rewritten into references to potentially incomplete
@@ -1155,10 +1178,35 @@ amplification without a reader. Migration 013 (#153) trimmed the secondary
 indexes to the native query set below. The table is what to check against
 before adding an index or a query that reads the ledger.
 
+Migration 017 (#144) changed where that set lives, not what is in it. The
+ledger is a partitioned table now, so the parent carries the primary key and
+the four secondary indexes as partitioned indexes and every leaf carries one
+index of its own for each of them, adopted from the release table for
+`qbit_share_ledger_p0` and created with the partition for every cell after it.
+The definitions below are the parent's; `pg_stat_user_indexes` reports the
+leaves, one row per partition per index, and that is where sizes and scan
+counts are read. Each leaf's indexes are cache-resident while the partition is
+hot and are never touched again once it is not.
+
+The one index that could not survive the conversion is the global
+`UNIQUE (share_id)`: a unique index on a partitioned table must include the
+partition key, and `share_id` is not it.
+`qbit_share_ledger_share_id_key` is now the leaf index
+`qbit_share_ledger_p0_share_id_key`, and every partition created afterwards
+gets its own `<partition>_share_id_key` from
+`qbit_prism_share_partition_create`. The authority on `share_id` uniqueness
+across the whole ledger is `qbit_prism_share_hashes`, which the native append
+already wrote one row of per share, in the same transaction as the ledger row,
+keyed by the header hash with `UNIQUE (share_id)`. It is not partitioned, its
+rows are never removed, it stays O(1) per share, and the append path consults
+it first: a header hash it holds under the same `share_id` is an exact replay,
+under another `share_id` it is the cross-identity duplicate refused as before,
+and a header hash it does not hold is a new share.
+
 | Index | Definition | Native readers | Plan |
 | --- | --- | --- | --- |
 | `qbit_share_ledger_pkey` | `(share_seq)` | every `share_seq` walk that projects share rows: the payout page walk of `snapshot`, the audit range reads, `qbit_prism_window`'s ranking pass, the rollup batch in `rollups.sql`, the latest-share probe | index scan, then the heap for the projected columns |
-| `qbit_share_ledger_share_id_key` | `(share_id)`, unique | the duplicate-share probes on submit, `share_accepted_at_ms` | index scan |
+| `<partition>_share_id_key` | `(share_id)`, unique, one per leaf, no partitioned parent | the replay comparison in the append path, the block-only reconciliation probes, the vardiff evidence lookup, `share_accepted_at_ms` | index scan on the leaves a bounded probe leaves after pruning |
 | `qbit_share_ledger_accepted_seq_walk_idx` (013) | `(share_seq DESC) INCLUDE (job_issued_at, accepted_at, share_difficulty) WHERE accepted` | `qbit_prism_window`'s newest-first page walk (pool snapshot, reward leaderboard), the landing durable-range count under the settlement lock, `max(share_seq)`, the rollup boundary and tail passes | index-only |
 | `qbit_share_ledger_accepted_recent_idx` | `(accepted_at DESC) INCLUDE (share_difficulty, miner_id, share_seq) WHERE accepted` | pool hashrate series, leaderboard window, pool snapshot rollups, the miner summary's pool figure, evidence counts | index-only |
 | `qbit_share_ledger_accepted_miner_history_idx` (013) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
@@ -1185,6 +1233,38 @@ insert accepted rows, but every reader excludes rejected rows by contract
 (the window and rollup tests write `accepted = false` rows to prove it), and
 the predicate is what lets the frozen `qbit_prism_window` walk stay
 index-only without carrying the column.
+
+**The probe floor rule for any new `share_id` query.** A `share_id` lookup
+with no `share_seq` bound has to descend one leaf index per attached
+partition, because uniqueness is per leaf and the executor cannot prune on a
+column that is not the partition key. Every native `share_id` read of the
+ledger therefore carries
+`share_seq >= qbit_prism_share_probe_floor()`, a `STABLE` function that
+returns the lower bound of the attached partition two below the one the next
+`share_seq` lands in, read from `qbit_prism_share_partitions`, so PostgreSQL
+prunes to at most three leaves holding rows (plus the empty lead) at executor
+start, whatever width each partition was created with. The proof is
+`Subplans Removed` in the plan of the query. Carry the same bound in any new query that looks a
+share up by `share_id`; if the question is only whether a header was ever
+credited, read `qbit_prism_share_hashes` instead and do not touch the ledger
+at all. An unbounded probe stays correct and gets slower with every partition:
+the design spike measured 31 buffers against 8.
+
+The one place that still probes without the bound is the append path's replay
+comparison, and only on a miss: when `qbit_prism_share_hashes` says the header
+was credited under this `share_id` but the bounded probe does not find the row,
+the append probes once more without the bound, so a replay of any online row is
+still compared field by field. A row that has left the online ledger cannot be
+compared and is refused as the duplicate it is
+(`duplicate-share: header already credited globally, and its share is
+archived`). The coordinator's replays are seconds old, so that refusal is
+unreachable in practice and safe if reached.
+
+One invariant this leaves is worth stating plainly. A row inserted around the
+append path, by a direct `INSERT` from an operator or a harness, with a
+`share_id` already present in another partition is not refused by PostgreSQL.
+The native writers cannot create one; `share-archive plan` and the archive
+verification report any `share_id` present in more than one attached leaf.
 
 Known full scan: the boundary and tail passes of
 `dashboard_hashrate_rollups.sql` bound `accepted_at` through CTE values the
@@ -1236,6 +1316,474 @@ FROM qbit_prism_window(clock_timestamp(), (<network difficulty> * 8)::numeric);
 Record the index sizes before and after 013, the scan counts, the
 `Heap Fetches` lines of the page walk, and the share acknowledgement latency
 histogram from `/metrics` before and after, in #153 and #144.
+
+## Share ledger partitions and retention
+
+Nothing ever left `qbit_share_ledger`, and everything that touches it paid for
+that: every insert maintained the primary key, a global `UNIQUE (share_id)` and
+four secondary indexes at ever-growing depth, and vacuum, base backups, restore
+drills and cache hit rates all degraded with the lifetime share count. What
+reads the table is narrow. The payout window reads the newest slice bounded by
+difficulty, the audit of a landed block reads its own range, the dashboard
+aggregates cover at most the last 24 hours, and a handful of probes by
+`share_id` run seconds after the share was written. Since #267 a landed block's
+audit is rebuilt from the ledger at read time rather than stored, so no aged
+share row is needed online except by the audits that still depend on it.
+
+Migration 017 (#144) gives the ledger a shape whole partitions can leave from,
+and decision D6 of #260 says when one may: shares are immutable and are never
+deleted, and
+retention is detach-and-archive of a whole partition after the audits that
+depend on it have been sealed. This section is the operator procedure. The
+reasoning, the reader inventory and the archive format specification are in
+[the design record](prism-share-ledger-partitioning.md), and the conversion
+itself is in
+[the migration guide](prism-rust-migration.md#migration-017-the-share-ledger-partition-conversion-applied-online).
+
+### The layout
+
+The ledger is `RANGE (share_seq)`. `share_seq` is the routing key every ordered
+read already carries, a `bigserial` routing key cannot fail, and
+`PRIMARY KEY (share_seq)` survives on the parent. There is no DEFAULT
+partition: a missing partition would otherwise silently collect rows that a
+later ATTACH would have to move.
+
+Partitions are cells of a grid. Each new one is `partition_rows` wide and
+starts where the highest attached one ends, so with the width unchanged cell k
+covers `[k*rows, (k+1)*rows)`; `rows` is `partition_rows` in
+`qbit_prism_share_partitioning`. The default is 2^24 = 16,777,216 rows, about
+7.5 GB of heap plus about 20 GB of indexes at the production row shape, five
+days at 39 shares per second and nine hours at 500. Names are
+`qbit_share_ledger_p<n>`, n one above the highest number the catalog has ever
+recorded in any state (`qbit_prism_share_partition_next_number()`): a name is
+never reused, and never derived from the width. Changing the width affects
+partitions created afterwards only; bounds already attached stay as they are,
+and the next partition starts at the last bound with the new width. The
+probe floor (`qbit_prism_share_probe_floor()`, below) is read from the
+attached bounds, not from the width, so raising the width does not widen the
+probes over the narrower partitions still attached. The
+release table becomes `qbit_share_ledger_p0`, `[MINVALUE, bound)`, and spans
+as many cells as it needs.
+
+Two catalog tables record the settings and what happened to each partition.
+PostgreSQL's `pg_inherits` remains the authority on what is attached and with
+which bounds; the catalog adds what happened to a partition after it left, and
+every `share-archive` command cross-checks the two.
+
+`qbit_prism_share_partitioning`, one row:
+
+| Column | Meaning |
+| --- | --- |
+| `singleton` | always true, the primary key of the one row |
+| `partition_rows` | the grid width in rows (default 16,777,216, accepted range 1,048,576 to 1,073,741,824) |
+| `lead_partitions` | how many empty partitions to keep attached ahead of the sequence (default 4, accepted range 1 to 64) |
+| `conversion_bound` | the exclusive upper bound chosen for the release table when 017 prepared the conversion |
+| `converted_at` | when the swap completed; NULL until then, and the maintenance function does nothing while it is NULL |
+| `updated_at` | when this row last changed |
+
+`qbit_prism_share_partitions`, one row per partition:
+
+| Column | Meaning |
+| --- | --- |
+| `partition_name` | the relation name, the primary key |
+| `lower_seq`, `upper_seq` | the recorded bounds; `lower_seq` is NULL for MINVALUE, which only `qbit_share_ledger_p0` has |
+| `state` | `attached`, `detached` or `dropped` |
+| `attached_at` | when the partition joined the ledger |
+| `sealed_at` | when the last audit row depending on this partition got its stored canonical bytes |
+| `archive_uri`, `archive_manifest_sha256` | where the archive was written and the SHA-256 of its manifest |
+| `archive_rows`, `archive_rows_sha256` | the row count in the archive and the SHA-256 of the uncompressed row stream |
+| `archived_at`, `archive_verified_at` | when the archive was written and when it was last re-read and compared |
+| `detached_at`, `dropped_at` | when the partition left the ledger and when its relation was dropped |
+
+The table's own CHECK constraints hold the lifecycle: an archive URI implies a
+manifest digest and an `archived_at`, a verification implies an archive, a
+`detached` state implies `detached_at`, a `dropped` state implies both
+timestamps, and any state other than `attached` implies
+`archive_verified_at IS NOT NULL`. A partition cannot be recorded as having
+left without having been archived and verified first.
+
+### Lead partitions
+
+`qbit_prism_share_partition_ensure()` keeps `lead_partitions` empty partitions
+attached above the next `share_seq`, about 67 M rows of headroom at the
+defaults. Every instance calls it at startup and then every
+`PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS`, default 60. The call takes
+the online migration runner's advisory lock, so it is serialized per schema,
+two frontends never race on one partition name, and no partition is created
+while a conversion is swapping the table. It creates
+nothing when the lead is intact and returns the number it created.
+
+A new partition is a standalone table `LIKE` the parent with a validated bound
+`CHECK`, its own `UNIQUE (share_id)` and the immutability trigger, and is then
+attached. The attach takes only SHARE UPDATE EXCLUSIVE on the parent: appends
+and reads continue. A name already held by any relation is refused and never
+adopted:
+
+```
+refusing to create share ledger partition qbit_share_ledger_p7: a relation already holds that name
+```
+
+Should an insert ever find no partition for its `share_seq`, PostgreSQL
+refuses it with SQLSTATE 23514 and the append path runs `ensure` once and
+retries the share, so a lead that ran out costs one retry rather than a lost
+share. That is the recovery, not the plan: if it is reached, the ensure task is
+not running on any instance, or the lead is too small for the share rate.
+Alert on the distance between the highest attached `upper_seq` and
+`qbit_prism_share_next_seq()`, and raise `lead_partitions` rather than relying
+on the retry:
+
+```sql
+SELECT (SELECT max(upper_seq) FROM qbit_prism_share_partitions WHERE state = 'attached')
+         - qbit_prism_share_next_seq() AS lead_rows,
+       (SELECT lead_partitions * partition_rows FROM qbit_prism_share_partitioning WHERE singleton) AS target_rows;
+```
+
+### The online horizon
+
+A share row stays online while any of these holds. All five are properties of a
+whole partition, `share-archive plan` checks each one and names its blocker,
+and a partition leaves only when all five clear.
+
+1. **It can still be in a payout window.** Its `share_seq` is at or above the
+   floor of the current window taken at four times the requested weight,
+   `qbit_prism_window(clock_timestamp(), 8 * D * 4)` with D the network
+   difficulty the operator supplies, so a difficulty rise of up to 4x between
+   two retention runs cannot reach into archived history.
+2. **It is younger than the retention age**, 30 days by default. The longest
+   dashboard read of raw rows is 24 hours, so this covers every one of them
+   with margin.
+3. **The hashrate rollup watermark has not reached its newest row.** While
+   `qbit_hashrate_rollup_progress` is behind the partition's newest committed
+   `share_seq`, or the share sequence has not yet passed the partition's upper
+   bound, the permanent rollup tables do not yet hold its whole contribution.
+   The mark is the newest row, not the bound: the sweep advances only to rows
+   that committed, and a `share_seq` an append drew and rolled back is never
+   folded.
+4. **A landed block's audit still depends on it**, that is, an audit row whose
+   share snapshot intersects the partition and that has no stored
+   `canonical_audit_bytes`. Sealing clears this condition.
+5. **An unfinished block candidate or a deferred share references it.**
+
+### Sealing, per D6
+
+Before a partition is detached, every audit row whose snapshot intersects it is
+sealed: the canonical artifact is rebuilt from the still-online shares, its
+digest is checked against the advertised `audit_bundle_sha256`, and the bytes
+are stored in `canonical_audit_bytes`, exactly as imported legacy audits are
+stored since #325. The block then keeps serving under its advertised digest
+after its shares are gone, through the artifact route, the audit bundle route
+and the operator tools alike, because readers prefer stored bytes over
+reconstruction whatever the row's shape.
+
+The price is the artifact size back per archived block, about 111 MB
+uncompressed at 100,000 shares, TOAST-compressed in the column. The
+alternative, pinning every landed block's window online forever, would have
+left cost scaling with blocks found, which is what this work exists to stop.
+Sealing is idempotent and can run ahead of any detach, so run it early and
+keep it out of the critical path of the detach.
+
+Two documented reader changes follow from a detach, and both are intended:
+
+- A miner's `last_share_at` in the miner share summary is the newest share
+  within the online horizon, so a miner whose last share is older than the
+  retention age reads `null`.
+- `/audit/share-window?anchor=` for an anchor inside an archived range returns
+  `rows: []`. The shares are in the archive and in every sealed artifact whose
+  window covers them. An anchor-to-archive index is deferred.
+
+Everything else that was lifetime-scoped keeps working across a detach. Block
+solver attribution moved onto `qbit_pool_blocks.solver_*` in migration 016,
+written at landing and backfilled for every existing block.
+`accepted_share_count` and `distinct_miner_count` in `/audit/latest-evidence`
+and `GET /public/v1/hashrate-series?range=all` are served from the permanent
+rollup tables plus the raw tail above the watermark, which condition 3 keeps
+online until the sweep has folded it.
+
+### The operator procedure
+
+`qbit-prism-server share-archive <command>` runs as the operator against the
+primary, with the frontends running. Nothing here needs a maintenance window.
+
+| Command | Effect |
+| --- | --- |
+| `plan --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | every partition with its bounds, row count, age, and each of the five conditions above with its blocker named; nothing is changed |
+| `seal <partition>` | stores canonical bytes for every audit row whose snapshot intersects the partition and has none, verifying each against its advertised digest; records `sealed_at` when none is left |
+| `archive <partition> --dir <root> [--force]` | writes `<root>/qbit_share_ledger/<partition>/<manifest-sha256>/rows.ndjson.gz` and `manifest.json`, records the URI, digests and row count; refused while the share sequence has not passed the partition, since appends could still land in it, and refused out of order, so the chain of manifests stays contiguous, and refused over a predecessor whose archive is not verified, so every link is to a certified manifest; `--force` writes an archive again, clearing its verification and that of every later archive, which must then be written and verified again in order, each over its verified predecessor, and is refused once a later archived partition has left the ledger |
+| `verify <partition> --dir <root>` | re-reads the archive, checks both digests and that the manifest chains, without a gap, to the nearest archived partition, whose own archive has to be verified, and, while the partition is attached, streams the live rows again and compares; records `archive_verified_at` for that full comparison, and only once the share sequence has passed the partition |
+| `detach <partition> --network-difficulty D [--retention-days N] [--window-multiple M] [--check-duplicates]` | requires every plan condition, sealed, archived and verified, and counts the live rows against the archive again; `DETACH PARTITION ... CONCURRENTLY`, or FINALIZE for an attempt interrupted after PostgreSQL marked the partition detach-pending, held to every condition again because the mark does not tell a `share-archive detach` from a statement run by hand; a pending partition that fails one is brought back with the `FINALIZE` and `ATTACH PARTITION` statements the refusal prints. The table stays as a standalone relation. A partition PostgreSQL no longer holds, whether an earlier run's catalog update was lost or the DDL ran by hand, is only reconciled into the catalog as sealed and verified; otherwise it is attached again under its recorded bounds and sealed first |
+| `drop <partition> --dir <root>` | requires `detached`, sealed and verified; reads the recorded archive back from disk, checking both digests against the catalog, and counts the rows against it again; `DROP TABLE`; the archive is the copy of record |
+| `restore <manifest> --dir <root> [--attach]` | recreates the partition table from the archive, verifies count and digests, and optionally attaches it under its recorded bounds |
+
+`plan` also reports the attached partition count, the lead ahead of the
+sequence, and any `share_id` present in more than one attached leaf. While a
+partition carries the detach-pending mark PostgreSQL hides its rows from every
+new query of the parent, including the payout window, so `plan` counts the
+hidden rows into that condition itself; the rollup sweep cannot, so never run
+`DETACH PARTITION` by hand on a partition whose rows are not yet folded.
+
+A session that retires the oldest partition, with the network difficulty of the
+moment and the default retention age:
+
+```sh
+ARCHIVE_ROOT=/var/lib/qbit-prism/share-archive
+
+qbit-prism-server share-archive plan --network-difficulty 402304 --retention-days 30
+qbit-prism-server share-archive seal qbit_share_ledger_p0
+qbit-prism-server share-archive archive qbit_share_ledger_p0 --dir "$ARCHIVE_ROOT"
+qbit-prism-server share-archive verify qbit_share_ledger_p0 --dir "$ARCHIVE_ROOT"
+qbit-prism-server share-archive detach qbit_share_ledger_p0 --network-difficulty 402304 --retention-days 30
+qbit-prism-server share-archive drop qbit_share_ledger_p0 --dir "$ARCHIVE_ROOT"
+```
+
+Run `plan` again after `drop` and keep its output with the run. `verify`
+compares the archive against the live rows only while the partition is still
+attached, so the order above is the order that gets that comparison: archive,
+verify, then detach. Both refuse a partition the share sequence has not passed,
+because a comparison of a partition that can still receive rows proves nothing
+about the rows still to come; and since ledger rows are immutable, `detach` and
+`drop` each count the rows against the archive again before acting, so an
+append that committed after the comparison is refused rather than lost. `drop`
+also reads the archive back from disk under `--dir` right before `DROP TABLE`:
+`archive_verified_at` proves the archive was complete when it was compared, not
+that its files are still there, and a copy of record that went missing or was
+altered in between is refused rather than made the only copy.
+Between `detach` and `drop` the rows are still on disk
+under the standalone relation and can be read directly by name, which is the
+last chance to look at them without a restore; do not collapse those two steps
+into one to save a command. Read the catalog back afterwards:
+
+```sql
+SELECT partition_name, lower_seq, upper_seq, state, sealed_at, archived_at,
+       archive_verified_at, detached_at, dropped_at, archive_rows,
+       archive_uri, archive_manifest_sha256, archive_rows_sha256
+FROM qbit_prism_share_partitions ORDER BY upper_seq;
+
+-- What PostgreSQL actually holds attached, which is the authority.
+SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bounds
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'qbit_share_ledger'::regclass
+ORDER BY c.relname;
+```
+
+### What to keep outside PostgreSQL
+
+The archive is the copy of record for every share that has left the ledger, so
+the archive root is accounting data. Keep it off the database volume, back it
+up with the same retention and encryption as the database backups, and keep it
+in the isolated-restore evidence set described in
+[one-way migration and isolated-restore reconciliation](#one-way-migration-and-isolated-restore-reconciliation).
+A share range that has left the online ledger is proved from its manifest
+chain, not from a database export.
+
+The layout under the root:
+
+```
+<root>/qbit_share_ledger/<partition_name>/<manifest-sha256>/
+    rows.ndjson.gz     gzip; one JSON object per line, share_seq ascending
+    manifest.json      UTF-8, no trailing newline
+```
+
+Every `archive` run writes into a new version directory named after the
+SHA-256 of the manifest it holds, and the catalog points at that version only
+once both files and their directory entries are durable: `archive_uri` is the
+full path of the recorded `manifest.json` and `archive_manifest_sha256` is the
+directory's name. A partition directory can hold more than one version after
+`--force` or an interrupted run; the earlier ones stay on disk so that a failed
+catalog update cannot destroy the copy of record, but only the version the
+catalog records is that copy, and `verify` reads that one. An archive written
+before this version scheme, with both files directly under the partition
+directory, is still read by `verify`, which checks its digest against the
+catalog as for any other.
+
+A row is the whole ledger row with a fixed key order: difficulties are decimal
+strings (`numeric(78,0)`), timestamps are microseconds since the epoch (exact
+for `timestamptz`), the P2MR program is hex.
+
+```
+{"share_seq":1,"share_id":"alice:…","miner_id":"alice","payout_order_key":"…",
+ "p2mr_program_hex":"…","share_difficulty":"1","network_difficulty":"100",
+ "template_height":100,"job_id":"job","job_issued_at_us":1000000,
+ "accepted_at_us":1758000000000000,"ntime":1,"accepted":true,"reject_reason":null,
+ "credit_policy":null,"writer_id":"…","writer_epoch":0}
+```
+
+The manifest carries `schema` (`qbit.prism.share-archive.v1`), the recorded
+bounds, what the rows hold (`row_count`, first and last `share_seq`, first and
+last `accepted_at_us`; zero rows is a valid archive), the digests and sizes of
+both the uncompressed stream and the file (`rows_sha256`, `rows_gz_sha256`,
+`rows_bytes`, `rows_gz_bytes`), the chain link, the
+`qbit_prism_schema_migrations` versions at archive time, and who created it
+when. The full field list is in
+[the design record](prism-share-ledger-partitioning.md#archive-format-v1).
+
+**The manifest chain.** `previous_manifest_sha256` and `previous_upper_seq`
+point at the archived partition with the next-lower `upper_seq`, and are null
+only for the first. A gap between one manifest's `previous_upper_seq` and its
+own `lower_seq` means a partition is missing from the chain; `archive` refuses
+to write such a manifest and `verify` refuses to certify one, so partitions are
+archived in `upper_seq` order. The manifest's own SHA-256 is what the catalog
+and the next manifest record, so a manifest cannot be rewritten without
+breaking both: `archive --force` clears the verification of every later
+archive along with its own, and each has to be written again with `--force`,
+in `upper_seq` order, and verified again. That order is enforced, not
+assumed: a link proves one hop, and `verify` checks only the manifest's own
+link, so both `archive` and `verify` refuse a partition whose nearest archived
+predecessor has no `archive_verified_at`. A verification therefore stands for
+the whole chain below it, and a repair proceeds from the rewritten partition
+up, verify then archive then verify; a later partition cannot be written
+against a middle manifest whose own link is obsolete, certified on that one
+hop, and detached over a chain that can then never be repaired. The rewrite
+is refused once a later archived partition has been detached or dropped,
+because that partition can no longer be archived from its live rows; bring
+the missing files back from a copy of the archive root instead.
+
+**Verifying an archive by hand.** `rows_sha256` is the SHA-256 of the
+uncompressed byte stream, so a verifier streams the file without materializing
+it. Start from the version directory the catalog records, which is the
+`archive_manifest_sha256` from the catalog read above (the `archive` command
+prints the same value); the off-host copy has no catalog to ask, so carry the
+digest along with it:
+
+```sh
+MANIFEST_SHA256=…                        # archive_manifest_sha256 for qbit_share_ledger_p0
+cd "$ARCHIVE_ROOT/qbit_share_ledger/qbit_share_ledger_p0/$MANIFEST_SHA256"
+gzip -dc rows.ndjson.gz | sha256sum      # must equal the manifest's rows_sha256
+sha256sum rows.ndjson.gz                 # must equal the manifest's rows_gz_sha256
+gzip -dc rows.ndjson.gz | wc -l          # must equal the manifest's row_count
+sha256sum manifest.json                  # must equal $MANIFEST_SHA256, the directory's name,
+                                         # and the next manifest's previous_manifest_sha256
+gzip -dc rows.ndjson.gz | head -1        # the first row; its share_seq is first_share_seq
+gzip -dc rows.ndjson.gz | tail -1        # the last row; its share_seq is last_share_seq
+```
+
+Do this on the archive copy that was written off the database host, not only on
+the one the tool just produced; the point of the check is the copy that will
+outlive the rows.
+
+### Restoring a partition
+
+`share-archive restore <manifest> --dir <root>` recreates the partition table
+from the archive and verifies count and digests. With `--attach` it also
+attaches it back under its recorded bounds, which makes the rows readable
+through `qbit_share_ledger` again. Restore into an isolated database for
+inspection wherever the question does not require the production ledger.
+Attaching back into production is for reconciliation, not for routine reads:
+the partition's rows are outside the online horizon by construction, so every
+dashboard query that reaches them pays for a leaf that nothing else needs.
+After an inspection, run `verify` and then `detach` and `drop` again rather
+than leaving the partition attached.
+
+### Measuring before and after
+
+Acceptance criterion 4 of #144 is this same set of measurements on a
+production-sized copy, before and after 017, taken by the operator. It needs
+production access. Run `ANALYZE qbit_share_ledger` first, both times: the
+statistics captured for #144 were hundreds of times below the row count, and
+every plan is provisional until they are current. After 017 that statement
+analyzes the parent and every attached leaf.
+
+**Insert latency.** The share acknowledgement histogram
+`qbit_prism_share_ack_seconds{result="accepted"}` in `/metrics` is the
+end-to-end bound on a share: `mining.submit` frame arrival to completed
+response write. Scrape it on every coordinator before the conversion and again
+after, over comparable load, and compare percentiles from the bucket counts
+rather than the average. These are elapsed ACK bounds, not measured ledger
+deadlines, so read them alongside
+`qbit_prism_database_pool_acquire_seconds` and
+`qbit_prism_database_advisory_lock_wait_seconds` to tell an ingest change from
+a database one.
+
+**Vacuum duration.** The point of the conversion is that vacuum stops scanning
+lifetime history, so measure it per partition and against the recorded
+duration of the old whole-table run:
+
+```sql
+\timing on
+VACUUM (VERBOSE, ANALYZE) qbit_share_ledger_p0;
+VACUUM (VERBOSE, ANALYZE) qbit_share_ledger_p1;
+```
+
+Record the elapsed time, the index scan lines and the page counts of each, and
+the sum against the single pre-017 `VACUUM (VERBOSE, ANALYZE) qbit_share_ledger`.
+
+**Sizes and scan counts per partition.** After 017 there is one row per leaf
+per index, which is where a partition that no reader touches becomes visible:
+
+```sql
+SELECT c.relname AS partition,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_with_indexes,
+       pg_size_pretty(pg_relation_size(c.oid)) AS heap,
+       s.n_live_tup, s.last_vacuum, s.last_autovacuum, s.last_analyze
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE i.inhparent = 'qbit_share_ledger'::regclass
+ORDER BY c.relname;
+
+SELECT relname AS partition, indexrelname,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE relname LIKE 'qbit\_share\_ledger\_p%'
+ORDER BY relname, pg_relation_size(indexrelid) DESC;
+```
+
+`idx_scan` is counted since `stats_reset`; read
+`SELECT stats_reset FROM pg_stat_database WHERE datname = current_database()`
+with it.
+
+**The page walk.** The payout window read is the query the conversion must not
+regress. Run it as the pool snapshot runs it, with the network difficulty of
+the moment, before and after:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*), sum(counted_difficulty)
+FROM qbit_prism_window(clock_timestamp(), (<network difficulty> * 8)::numeric);
+```
+
+Record the total buffers and the `Heap Fetches` line on
+`qbit_share_ledger_p<k>_accepted_seq_walk_idx`. Heap fetches near zero mean the
+covering index is earning index-only reads; large heap fetches mean the
+visibility map is cold, so vacuum the leaf and run it again. After 017 the walk
+should touch the newest leaves only, and the older ones should not appear in
+the plan at all.
+
+**The bounded `share_id` probe.** This is the plan that proves the probe floor
+is doing its job. `Subplans Removed` must be present and must account for every
+leaf outside the floor's three:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT share_seq, share_id, accepted_at
+FROM qbit_share_ledger
+WHERE share_id = '<a recent share_id>'
+  AND share_seq >= qbit_prism_share_probe_floor();
+```
+
+For contrast, and to keep the number that justifies the rule, run the same
+query without the `share_seq` predicate and record its buffer count. It must be
+the one that grows with the attached partition count.
+
+#### Container evidence
+
+Container evidence (PostgreSQL 16.15) is lock-semantics and phase-shape
+evidence on a synthetic ledger, not a production absolute. It belongs here so
+the production numbers above have something to be read against.
+
+Taken on 2026-09-16 in Docker on an Apple M-series laptop: a synthetic
+ledger of 1,000,000 production-shaped rows (1,000 MB with its indexes, 500
+miners), `VACUUM (ANALYZE)` before each read, insert latency from 2,000
+single-row inserts timed in PL/pgSQL with `clock_timestamp()`.
+
+| Measurement | Before 017 | After 017 | Notes |
+| --- | --- | --- | --- |
+| Prepare, validate, swap | | 2.3 ms, 47 ms, 16.7 ms | the validation scan is the only term that grows with the table (about 300 MB of heap here); the swap renamed, created the parent, adopted five indexes, attached and created two lead partitions |
+| Insert latency p50 / p95 / p99 | 0.031 / 0.048 / 0.066 ms | 0.032 / 0.047 / 0.069 ms into the release partition; 0.025 / 0.038 / 0.061 ms into a fresh lead partition | a hot leaf's indexes are small and cache-resident |
+| `VACUUM (ANALYZE)` duration | 0.32 s | 0.44 s for every partition; 0.02 s for one lead partition | retention bounds the set vacuum visits |
+| Page-walk plan, `qbit_prism_window` over about 200k shares | 15,809 shared buffers | 17,353 shared buffers | the same recursive page walk through the partitioned parent |
+| Bounded `share_id` probe | | 8 shared buffers over the three attached leaves | `Subplans Removed` appears once the floor clears a partition; at 1 M rows the floor is still 0 |
+| Unbounded `share_id` probe | | 6 shared buffers | one index descent per attached leaf; grows with the attached count, which is the cost the bound removes |
 
 ## Offline pool-fee and CTV fee-rate changes
 
