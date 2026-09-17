@@ -1538,3 +1538,7 @@ use faults::Fault;
 #[cfg(test)]
 #[path = "candidates/park_tests.rs"]
 mod park_tests;
+
+#[cfg(test)]
+#[path = "candidates/storm_fault_tests.rs"]
+mod storm_fault_tests;

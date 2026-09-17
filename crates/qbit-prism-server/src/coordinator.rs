@@ -2571,3 +2571,6 @@ mod window_switch_tests;
 
 #[cfg(test)]
 mod window_incident_tests;
+
+#[cfg(test)]
+mod storm_evidence_tests;
