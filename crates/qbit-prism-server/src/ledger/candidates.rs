@@ -1392,7 +1392,10 @@ impl Ledger {
     /// unclaimed, so empty polling never advances the sequence. Public so a
     /// test can EXPLAIN the statement the server runs rather than a copy.
     pub fn due_work_probe_sql() -> String {
-        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') WHERE EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))", CandidateState::UNFINISHED_SQL)
+        // Keep the ordering outside EXISTS so PostgreSQL can use the existing
+        // unfinished index even when retained history dominates an idle poll.
+        // The advancing clock and slot allocation contract stay unchanged.
+        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') FROM (SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) ORDER BY next_attempt_at,created_at,block_hash LIMIT 1) AS due", CandidateState::UNFINISHED_SQL)
     }
 
     /// The row selection of one claim lane, exactly as
