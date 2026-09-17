@@ -39,6 +39,13 @@ struct Chain {
     header_error: Option<Value>,
     hash_error: Option<Value>,
     methods: Vec<String>,
+    pause: Option<RpcPause>,
+}
+
+struct RpcPause {
+    method: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Chain {
@@ -107,6 +114,26 @@ impl ScriptedNode {
         self.chain.lock().unwrap().methods.clear();
     }
 
+    fn pause_next(
+        &self,
+        method: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        self.script(|chain| {
+            assert!(chain.pause.is_none());
+            chain.pause = Some(RpcPause {
+                method: method.to_owned(),
+                entered,
+                release: released,
+            });
+        });
+        (arrival, release)
+    }
+
     /// Not one `submitblock`, whatever else was asked.
     fn assert_never_offered(&self) {
         let methods = self.methods();
@@ -132,6 +159,22 @@ impl ScriptedNode {
 
 async fn answer(State(chain): State<Arc<Mutex<Chain>>>, Json(request): Json<Value>) -> Json<Value> {
     let method = request["method"].as_str().unwrap_or("<unnamed>").to_owned();
+    let pause = {
+        let mut chain = chain.lock().unwrap();
+        if chain
+            .pause
+            .as_ref()
+            .is_some_and(|pause| pause.method == method)
+        {
+            chain.pause.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.await;
+    }
     let (result, error) = {
         let mut chain = chain.lock().unwrap();
         chain.methods.push(method.clone());
@@ -955,6 +998,222 @@ async fn recover_apply_lands_the_listed_blocks_and_verifies_completed_ones_idemp
     );
     node.assert_never_offered();
     assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn recover_apply_revalidates_completed_blocks_after_planning() -> Result<()> {
+    for (change, expected_code, diagnostic) in [
+        ("reorg", 9, "is not on the active chain"),
+        ("accounting", 4, "its pool block is inactive, not confirmed"),
+        ("audit", 4, "no qbit_pool_audit_bundles row"),
+        ("orphaned", 4, "is already orphaned"),
+        ("height", 10, "landed at height 102"),
+        ("rpc", 1, "Loading block index"),
+        ("deadline", 11, "exceeded (verifying)"),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let ledger = db.ledger("frontend-a").await?;
+        let node = ScriptedNode::open().await?;
+        ledger.append(share(1), None).await?;
+        let block = rebuildable(&ledger.snapshot(100).await?, 101, 426)?;
+        let hash = block.block_hash.clone();
+        ledger.enqueue_candidate(block.candidate.clone()).await?;
+        node.script(|chain| chain.extend(101, &hash, &fixture_parent()));
+        let mut args = allowlist(&[&hash]);
+        args.push("--apply");
+        let landed = recover(&db, &node, &args).await?;
+        assert_eq!(code(&landed), 0, "{}", stderr(&landed));
+
+        // This RPC belongs to new_tool: the read-only plan has already
+        // proven the row complete, but apply has not begun to skip it.
+        let (entered, release) = node.pause_next("getblockchaininfo");
+        args.extend(["--timeout-seconds", "4"]);
+        let database_url = db.url.clone();
+        let run = recover_at(&database_url, &node, &args);
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                arrived = entered => { arrived?; Ok(()) },
+                output = &mut run => bail!("recovery ended before connection barrier: {}", stderr(&output?)),
+            }
+        }).await.context("connection RPC did not reach the barrier")??;
+        match change {
+            "reorg" => node.script(|chain| {
+                chain.extend(101, &"aa".repeat(32), &fixture_parent());
+            }),
+            "accounting" => {
+                sqlx::query(
+                    "UPDATE qbit_pool_blocks SET chain_state='inactive' WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .execute(&ledger.pool)
+                .await?;
+            }
+            "audit" => {
+                sqlx::query("DELETE FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+                    .bind(&hash)
+                    .execute(&ledger.pool)
+                    .await?;
+            }
+            "orphaned" => {
+                sqlx::query(
+                    "UPDATE qbit_block_candidate_outbox SET state='orphaned',last_error='a confirmed competitor replaced the block' WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .execute(&ledger.pool)
+                .await?;
+            }
+            "height" => {
+                sqlx::query("UPDATE qbit_pool_blocks SET block_height=102 WHERE block_hash=$1")
+                    .bind(&hash)
+                    .execute(&ledger.pool)
+                    .await?;
+            }
+            "rpc" => node.script(|chain| {
+                chain.header_error = Some(json!({"code": -28, "message": "Loading block index"}));
+            }),
+            "deadline" => {}
+            _ => unreachable!(),
+        }
+        let before = everything(&ledger.pool).await?;
+        let stalled = (change == "deadline").then(|| node.pause_next("getblockheader"));
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("connection RPC ended early"))?;
+        let started = std::time::Instant::now();
+        let output = tokio::time::timeout(Duration::from_secs(12), &mut run).await??;
+        assert_eq!(
+            code(&output),
+            expected_code,
+            "{change}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(diagnostic),
+            "{change}: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stdout(&output).contains(&format!("verified {hash}")),
+            "{}",
+            stdout(&output)
+        );
+        assert_eq!(everything(&ledger.pool).await?, before, "{change}");
+        if let Some((mut entered, release)) = stalled {
+            assert!(
+                entered.try_recv().is_ok(),
+                "verification never called the node"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "verification exceeded the operation deadline"
+            );
+            let _ = release.send(());
+        }
+        node.assert_never_offered();
+        assert_no_new_instances(&ledger.pool).await?;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recover_apply_revalidates_completed_blocks_after_earlier_landings() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = ScriptedNode::open().await?;
+    ledger.append(share(1), None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let complete = rebuildable(&snapshot, 102, 427)?;
+    let first = rebuildable(&snapshot, 101, 428)?;
+    let later = rebuildable(&snapshot, 103, 429)?;
+    ledger.enqueue_candidate(complete.candidate.clone()).await?;
+    node.script(|chain| chain.extend(102, &complete.block_hash, &fixture_parent()));
+    let landed = recover(
+        &db,
+        &node,
+        &["--block-hash", &complete.block_hash, "--apply"],
+    )
+    .await?;
+    assert_eq!(code(&landed), 0, "{}", stderr(&landed));
+    for block in [&first, &later] {
+        ledger.enqueue_candidate(block.candidate.clone()).await?;
+        node.script(|chain| {
+            chain.extend(
+                block.found_block.block_height,
+                &block.block_hash,
+                &fixture_parent(),
+            );
+        });
+    }
+    let later_before = whole_row(&ledger.pool, &later.block_hash).await?;
+    // Hold the earlier recovery's terminal reply after its durable commit.
+    // The completed block was planned as complete before this landing.
+    sqlx::raw_sql(
+        "CREATE FUNCTION mark_completed_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_block_candidate_outbox UPDATE'; RETURN NEW; END $$;
+         CREATE TRIGGER mark_completed_recovery AFTER UPDATE OF state ON qbit_block_candidate_outbox FOR EACH ROW WHEN (OLD.state <> NEW.state AND NEW.state = 'submitted') EXECUTE FUNCTION mark_completed_recovery();"
+    ).execute(&ledger.pool).await?;
+    let raw = url::Url::parse(&db.url)?;
+    let upstream = tokio::net::lookup_host((
+        raw.host_str().context("database URL names a host")?,
+        raw.port().unwrap_or(5432),
+    ))
+    .await?
+    .next()
+    .context("database host resolves")?;
+    let proxy = execution_proxy::ExecutionProxy::start(upstream).await?;
+    let proxied_url = proxy.rewrite_url(&db.url)?;
+    let pause = proxy.pause_after_commit("qbit_block_candidate_outbox", "UPDATE")?;
+    let mut args = allowlist(&[&complete.block_hash, &later.block_hash, &first.block_hash]);
+    args.push("--apply");
+    let run = recover_at(&proxied_url, &node, &args);
+    tokio::pin!(run);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::select! {
+            _ = pause.entered() => Ok(()),
+            output = &mut run => bail!("recovery ended before earlier landing: {}", stderr(&output?)),
+        }
+    }).await.context("earlier landing did not reach its commit barrier")??;
+    assert_eq!(
+        whole_row(&ledger.pool, &first.block_hash).await?["state"],
+        "submitted"
+    );
+    node.script(|chain| chain.extend(102, &"aa".repeat(32), &fixture_parent()));
+    let before = everything(&ledger.pool).await?;
+    pause.release();
+    let output = run.await?;
+    assert_eq!(code(&output), 9, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "candidate {} is not on the active chain",
+            complete.block_hash
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!("recovered {} at height 101", first.block_hash)),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains(&format!("verified {}", complete.block_hash)),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(everything(&ledger.pool).await?, before);
+    assert_eq!(
+        whole_row(&ledger.pool, &later.block_hash).await?,
+        later_before
+    );
+    node.assert_never_offered();
+    assert_no_new_instances(&ledger.pool).await?;
+    proxy.finish().await?;
     db.close(vec![ledger]).await
 }
 

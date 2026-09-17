@@ -848,9 +848,45 @@ async fn apply_recovery(
     let (mut recovered, mut verified) = (0, 0);
     for block in blocks {
         if block.complete {
+            // Connection and earlier landings may outlive the plan's view
+            // of the chain and accounting. Recheck at the point of use,
+            // with the same read-only rules and whole-operation deadline.
+            let checked = tokio::time::timeout_at(deadline, async {
+                let reader = RecoveryReader::open(&coordinator.config.database_url).await?;
+                let plan =
+                    plan_recovery(&reader, &coordinator.rpc, std::slice::from_ref(&block.hash))
+                        .await;
+                reader.close().await;
+                plan
+            })
+            .await;
+            let checked = match checked {
+                Ok(plan) => plan?,
+                Err(_) => {
+                    return Err(Stop::Exit(
+                        11,
+                        format!(
+                            "recovery deadline of {timeout_seconds} seconds exceeded (verifying); candidate {} was not verified",
+                            block.hash
+                        ),
+                    ))
+                }
+            };
+            if let Some((code, message)) = checked.problems.into_iter().next() {
+                return Err(Stop::Exit(code, message));
+            }
+            let Some(current) = checked.blocks.first().filter(|current| current.complete) else {
+                return Err(Stop::Exit(
+                    4,
+                    format!(
+                        "candidate {} is no longer complete; its state changed since planning, rerun recover to inspect it",
+                        block.hash
+                    ),
+                ));
+            };
             println!(
                 "verified {} at height {}: already complete",
-                block.hash, block.height
+                current.hash, current.height
             );
             verified += 1;
             continue;

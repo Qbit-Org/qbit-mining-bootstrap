@@ -297,8 +297,11 @@ command itself (exit 1). There is no "recover everything" mode.
 **Apply.** `--apply` runs the plan first, and a refused plan applies nothing.
 Then, for each planned block in height order:
 
-1. A block the plan marked `complete` prints `verified <hash> at height <h>:
-   already complete` on stdout and is skipped idempotently.
+1. A block the plan marked `complete` rechecks its current outbox state,
+   confirmed accounting, audit presence and active-chain membership before
+   printing `verified <hash> at height <h>: already complete` on stdout and
+   skipping it idempotently. A changed or unproven result stops the command
+   without claiming that block or attempting later blocks.
 2. Otherwise the command prints `recovering <hash> at height <h> from
    <state>` and takes the durable, token-fenced claim on that row by hash,
    through the existing claim mechanism: `attempt_count` increments,
@@ -338,7 +341,10 @@ exits 0. Rerunning the same allowlist after a success prints only the
 **Deadline.** `--timeout-seconds N` (1 to 3600, default 600) is one deadline
 carried across the whole operation: the plan's database read, every node RPC
 call, the coordinator connection, and each candidate's claim, window read,
-audit rebuild, landing transaction and confirmation. When it expires the
+audit rebuild, landing transaction and confirmation, including revalidation
+of already-complete blocks. A verification timeout exits 11 with
+`exceeded (verifying); candidate <hash> was not verified`; it takes no claim
+on that block. When the deadline expires during recovery the
 command attempts a bounded release of the in-flight candidate's claim and
 exits 11 when cleanup confirms release. If cleanup fails or times out, the
 command exits 1 and reports that the claim may remain until its lease expires.
