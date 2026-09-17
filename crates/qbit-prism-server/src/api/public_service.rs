@@ -2,11 +2,13 @@
 //! mutation is available through this role.
 #[cfg(test)]
 mod metrics_tests;
+mod readiness_events;
 #[cfg(test)]
 mod readiness_tests;
 
 use super::*;
 use anyhow::{ensure, Context, Result};
+use readiness_events::ReadinessEvents;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 #[cfg(test)]
 use std::str::FromStr;
@@ -199,6 +201,7 @@ struct ProbeSnapshot {
     last_error: Option<ProbeFailure>,
     replica: Option<Value>,
     replica_at: Option<Instant>,
+    events: ReadinessEvents,
 }
 #[derive(Default)]
 struct ServiceMetrics {
@@ -246,11 +249,20 @@ impl ServiceState {
         let result = READ_DEADLINE
             .scope(Some(deadline), tokio::time::timeout_at(deadline, probe))
             .await;
+        let result = match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err((phase, error))) => Err((ProbeFailure::from_sqlx(&error), phase)),
+            Err(_) => Err((ProbeFailure::Timeout, "probe")),
+        };
+        self.publish_probe(result);
+    }
+
+    fn publish_probe(&self, result: Result<Value, (ProbeFailure, &'static str)>) {
         let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         snapshot.checked = Some(Instant::now());
         snapshot.checked_at = Some(now());
         let failure = match result {
-            Ok(Ok(value)) => {
+            Ok(value) => {
                 snapshot.ready = value["schema_ready"] == true
                     && (!self.config.replica_required || value["in_recovery"] == true);
                 snapshot.last_error =
@@ -261,27 +273,32 @@ impl ServiceState {
                 }
                 snapshot.last_error.map(|failure| (failure, "schema"))
             }
-            Ok(Err((phase, error))) => {
+            Err((failure, phase)) => {
                 snapshot.ready = false;
-                let failure = ProbeFailure::from_sqlx(&error);
                 snapshot.last_error = Some(failure);
                 Some((failure, phase))
             }
-            Err(_) => {
-                snapshot.ready = false;
-                snapshot.last_error = Some(ProbeFailure::Timeout);
-                Some((ProbeFailure::Timeout, "probe"))
-            }
         };
+        // Reuse the HTTP health policy so a successful query cannot announce
+        // recovery while replica policy still refuses readiness.
+        let view = self.snapshot_view(&snapshot);
+        let event = snapshot.events.observe(
+            failure,
+            view.database_ready && view.replica_error.is_none(),
+            Instant::now(),
+        );
         // A synchronous operator log sink can block. Publish the snapshot and
         // release its lock first so health requests can still read the result.
         drop(snapshot);
-        if let Some((failure, phase)) = failure {
-            failure.log(phase);
+        if let Some(event) = event {
+            event.emit();
         }
     }
     pub(super) fn view(&self) -> ServiceView {
         let snapshot = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        self.snapshot_view(&snapshot)
+    }
+    fn snapshot_view(&self, snapshot: &ProbeSnapshot) -> ServiceView {
         let age = snapshot.checked.map(|v| v.elapsed().as_secs_f64());
         let database_ready = snapshot.ready
             && age.is_some_and(|age| {
