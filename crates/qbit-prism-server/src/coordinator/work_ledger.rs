@@ -3,7 +3,7 @@ use super::*;
 use crate::ledger::{
     BlockingDrop, ChainObservationState, ChainTransition, CompactDependency, CompactPrepared,
     CompactRepair, IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission,
-    StoredCompactPrepared,
+    RefreshProbe, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -15,7 +15,10 @@ pub(super) trait WorkLedger: Send + Sync {
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>>;
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>>;
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
     fn read_window_with_permit<'a>(
@@ -97,8 +100,11 @@ pub(super) trait WorkLedger: Send + Sync {
 }
 
 impl WorkLedger for Ledger {
-    fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(Ledger::latest_accepted_share_seq(self))
+    fn refresh_probe(
+        &self,
+        completion: ReadAdmission,
+    ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
+        Box::pin(Ledger::refresh_probe(self, completion))
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(Ledger::payout_revision(self))

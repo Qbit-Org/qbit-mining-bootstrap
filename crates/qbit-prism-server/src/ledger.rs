@@ -61,7 +61,7 @@ pub use window::{
     WindowRef,
 };
 use window::{read_prior_balances, share_from_row};
-pub(crate) use window::{ChainObservationBehind, ChainObservationRetry};
+pub(crate) use window::{ChainObservationBehind, ChainObservationRetry, RefreshProbe};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -102,3 +102,7 @@ type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "../tests/support/ledger_execution_proxy.rs"]
+mod execution_proxy;
