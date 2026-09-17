@@ -251,8 +251,11 @@ The coordinator adds the three health compatibility aliases whose native sources
 are known; the fixture deliberately identifies unmapped legacy fields: `ready_miner_count` (accepted-share participants) and `max_blocks` (the 2.x accepted-block pool-close cap) have no native health equivalents.
 
 No new configuration setting is introduced. Worker slots, per-worker series,
-node gauges, rollup-lag series, cardinality/privacy qualification, payout build
-and landing-phase instrumentation are outside this trimmed change.
+node gauges, rollup-lag series, payout build and landing-phase instrumentation
+remain outside the trimmed metrics scope. The subsequent
+[#278 cardinality/privacy qualification](prism-metrics-cardinality-privacy.md)
+pins the complete run-role wire census and tests identifier-bearing inputs
+through Stratum and the candidate collector without expanding the family set.
 
 ## Diagnosing Stratum admission saturation
 
@@ -286,7 +289,9 @@ series at its next publication. Neither count is a share rejection.
 
 ## Follow-up ownership
 
-First-offer timing remains **declared, not yet populated**; A/#266 wires it.
+First-offer timing is populated by A/#266's offer owner. It remains declared
+without samples until an actual first-offer observation occurs; this startup
+state is included in the cardinality qualification.
 Since #328, instrumented coordinator ledger transactions record into
 `database_pool_acquire_seconds`, and the coordinator's migration, order and
 settlement advisory-lock acquisitions record into

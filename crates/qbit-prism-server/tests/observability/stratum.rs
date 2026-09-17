@@ -633,7 +633,7 @@ async fn serve_admission_metrics_for_manual_inspection() {
 }
 
 /// Serve the coordinator API router on a real listener and scrape it by HTTP.
-async fn http_metrics(metrics: Arc<Metrics>) -> String {
+pub(super) async fn http_metrics(metrics: Arc<Metrics>) -> String {
     use qbit_prism_server::api::{router, ApiConfig, ApiState};
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
@@ -649,6 +649,7 @@ async fn http_metrics(metrics: Arc<Metrics>) -> String {
     assert_eq!(response.status(), 200);
     let body = response.text().await.unwrap();
     server.abort();
+    let _ = server.await;
     body
 }
 

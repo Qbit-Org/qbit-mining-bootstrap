@@ -7,6 +7,9 @@ use qbit_prism_server::{
 };
 use qbit_prism_test_gate as gate;
 
+#[path = "observability/database_privacy.rs"]
+mod database_privacy;
+
 /// The signing keys `configure` pins alongside the fingerprint since #265.
 /// This suite exercises connection deadlines rather than signing, so one fixed
 /// pair is enough.
