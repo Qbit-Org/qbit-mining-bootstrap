@@ -102,6 +102,47 @@ idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
 
+### Two drains, one for each era
+
+**Legacy rows and native rows have different drains.** Every `2.x.x` candidate
+must be drained with the pinned legacy image *before* migrating, as in step 1
+above and in [the drain requirement](#supported-2xx-source-schemas); the
+migrator refuses while any remains. The native `qbit-prism-server candidates`
+commands act on native-era rows only — they cannot read a chunked v2 body or a
+pre-migration v1 document, and running them neither satisfies nor bypasses the
+migrator's drain check.
+
+Use them after the cutover, on rows this release wrote:
+
+```sh
+qbit-prism-server candidates list
+qbit-prism-server candidates abandon --block-hash <hash> --reason "<nonblank explanation>"
+qbit-prism-server candidates recover --block-hash <hash> [--block-hash <hash> ...] [--apply]
+```
+
+`candidates list` exits zero on an empty list, so it is the check a `set -e`
+runbook waits on before stopping native frontends; `candidates abandon` applies
+to a `pending` row only and refuses everything the node may already have been
+offered. `candidates recover` lands a native-era block the node has already
+accepted, under an explicit allowlist, and never offers one; like the other
+two it cannot read a chunked v2 body or a pre-migration v1 document (exit 7
+and exit 8, evidence preserved), so it neither satisfies nor bypasses the
+migrator's drain check. All three are documented in full under
+[Candidate commands](prism-ledger-ops.md#candidate-commands). A pre-migration
+row reaching a native frontend is parked by the claim lane with a `last_error`
+naming its `storage_version`; `candidates list` shows it, but the answer is
+still the legacy drain, with the pinned `2.x.x` image, never an operator
+abandon.
+
+That rule is enforced, not only documented. A `2.x.x` v1 document is parked at
+`storage_version = 1`, the same version the native writer uses, so `abandon`
+tests the document rather than the version: it changes a row only when the
+`candidate` carries `payout_revision` and `block_hash` beside an inline
+`bundle` or a `window` reference — the predicate
+`refuse_undrained_outbox` classifies native rows with, above. A legacy document
+is refused atomically with exit 8 and keeps every column, so an operator
+sweeping a stalled outbox cannot delete the evidence this drain still needs.
+
 ### Supported 2.x.x source schemas
 
 The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0
