@@ -610,6 +610,65 @@ async fn share_id_probes_are_bounded_and_the_vardiff_lookup_is_still_exact() -> 
     result
 }
 
+/// Legacy rejected rows have no global header mapping, but their IDs must
+/// remain unique after the append probe's floor moves beyond their leaf.
+#[tokio::test]
+async fn append_preserves_old_rejected_share_ids() -> Result<()> {
+    let Some(db) = Database::open("rejected_id").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let original = share(1, "alice");
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,\
+             share_difficulty,network_difficulty,template_height,job_id,job_issued_at,\
+             ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch) \
+             VALUES($1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,\
+             to_timestamp($9::double precision/1000),$10,clock_timestamp(),false,'stale-job','legacy',0)",
+        )
+        .bind(&original.share_id)
+        .bind(&original.miner_id)
+        .bind(&original.order_key)
+        .bind(&original.p2mr_program_hex)
+        .bind(original.share_difficulty.to_string())
+        .bind(original.network_difficulty.to_string())
+        .bind(i64::try_from(original.template_height)?)
+        .bind(&original.job_id)
+        .bind(original.job_issued_at_ms)
+        .bind(i64::from(original.ntime))
+        .execute(db.pool())
+        .await?;
+        let width = db.partition_rows().await?;
+        db.set_next_seq(3 * width + 10).await?;
+        partitions::ensure(db.pool()).await?;
+        ensure!(
+            !bounded_probe_finds(db.pool(), &original.share_id).await?,
+            "the rejected row is still inside the bounded probe"
+        );
+        let replay = db.ledger.append(original.clone(), None).await?;
+        ensure!(!replay.inserted, "reinserted an old rejected share ID");
+        let mut changed = original.clone();
+        changed.share_difficulty += 1;
+        let error = db.ledger.append(changed, None).await
+            .expect_err("accepted a changed payload for an old rejected ID").to_string();
+        ensure!(error.contains("duplicate share_id payload mismatch"), "{error}");
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM qbit_share_ledger WHERE share_id=$1)=1 \
+             AND NOT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND accepted) \
+             AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes WHERE share_id=$1)",
+        )
+        .bind(&original.share_id)
+        .fetch_one(db.pool())
+        .await?;
+        ensure!(unchanged, "replaying a rejected ID changed its row or credit");
+        ensure!(db.ledger.append(share(2, "alice"), None).await?.inserted,
+            "a different share ID was refused");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    db.close().await?;
+    result
+}
+
 /// The leaves the bounded probe descends, by name, and how many attached
 /// partitions executor-startup pruning removed before it ran.
 async fn bounded_probe_plan(pool: &PgPool, share_id: &str) -> Result<(Vec<String>, i64)> {

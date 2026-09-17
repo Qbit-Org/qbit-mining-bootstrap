@@ -697,15 +697,14 @@ impl Ledger {
         // The ledger is partitioned by share_seq (migration 017) and its
         // share_id uniqueness is per leaf, so a share_id probe without a
         // share_seq bound descends one index per attached partition.
-        // qbit_prism_share_hashes, written with every ledger row in the
-        // same transaction, is the authority for new credits: one primary-key
-        // probe says whether this header was ever credited, and under which
-        // share_id. The ledger is then read only for a replay, bounded to
-        // the newest partitions first (qbit_prism_share_probe_floor) and
-        // unbounded on a miss, so a replay of any online row is still
-        // matched exactly, including legacy worker-scoped duplicates whose
-        // header mapping points to an earlier row. A row that has left the
-        // online ledger cannot be compared and is refused as the duplicate it is.
+        // qbit_prism_share_hashes is the authority for accepted headers, but
+        // legacy rejected rows have no mapping. Probe the newest partitions
+        // first (qbit_prism_share_probe_floor), then every attached partition
+        // on a miss regardless of the header mapping, so an old rejected ID
+        // cannot be inserted again in another leaf. This also matches legacy
+        // worker-scoped duplicates whose header maps to an earlier row.
+        // A credited row that has left the online ledger cannot be compared
+        // and is refused as the duplicate it is.
         let header_hash = share_header_hash(&share.share_id);
         let credited: Option<String> =
             sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1")
@@ -718,7 +717,7 @@ impl Ledger {
         .bind(&share.share_id)
         .fetch_optional(&mut **tx)
         .await?;
-        if existing.is_none() && credited.is_some() {
+        if existing.is_none() {
             existing = sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
                 .bind(&share.share_id)
                 .fetch_optional(&mut **tx)
