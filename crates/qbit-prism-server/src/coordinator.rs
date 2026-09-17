@@ -1564,7 +1564,7 @@ impl Coordinator {
         let height = candidate.found_block.block_height;
         // The chain must hold the block now. There is no offer here, for any
         // state: a block the node does not hold is not this command's.
-        let (active, _, tip) = self.observe_candidate(claim).await?;
+        let CandidateObservation { active, tip, .. } = self.observe_candidate(claim).await?;
         if !active {
             return Err(RecoveryStop::NotActive(format!(
                 "the node's active chain (tip {tip}) does not hold {block} at height {height}"
@@ -1614,7 +1614,12 @@ impl Coordinator {
         }
         // Finished only on active-chain evidence observed now, at a revision
         // proven now, exactly as the post-offer phase finishes.
-        let (active, revision, tip) = self.observe_candidate(claim).await?;
+        let CandidateObservation {
+            active,
+            revision,
+            tip,
+            ..
+        } = self.observe_candidate(claim).await?;
         if !active {
             return Err(RecoveryStop::NotActive(format!(
                 "after the landing the node's active chain (tip {tip}) no longer holds {block} at height {height}; the audit is durable and the row awaits reconciliation"
