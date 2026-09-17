@@ -335,6 +335,41 @@ async fn malformed_server_frames_remain_errors() -> Result<()> {
 }
 
 #[tokio::test]
+async fn malformed_ready_for_query_cannot_complete_a_select() -> Result<()> {
+    for body in [b"".as_slice(), b"?", b"II"] {
+        let (result, shared) = ordered_close(
+            frame(b'Q', b"SELECT 1 WHERE false\0")?,
+            vec![],
+            [frame(b'C', b"SELECT 0\0")?, frame(b'Z', body)?].concat(),
+            ClientEnd::Pending,
+            io::ErrorKind::BrokenPipe,
+            usize::MAX,
+        )
+        .await;
+        assert!(result.is_err(), "malformed ReadyForQuery was accepted");
+        assert!(shared.state.lock().unwrap().executions[0]
+            .returned_rows()
+            .is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_frontend_frame_cannot_qualify_broken_pipe_recovery() -> Result<()> {
+    let (result, _) = ordered_close(
+        frame(b'Q', b"COMMIT\0")?,
+        frame(b'?', b"")?,
+        frame(b'C', b"COMMIT\0")?,
+        ClientEnd::Eof,
+        io::ErrorKind::BrokenPipe,
+        0,
+    )
+    .await;
+    assert!(result.is_err(), "unknown frontend frame was accepted");
+    Ok(())
+}
+
+#[tokio::test]
 async fn lost_or_partial_completion_and_ready_frames_keep_select_incomplete() -> Result<()> {
     let completion = frame(b'C', b"SELECT 0\0")?;
     let response = [completion.clone(), frame(b'Z', b"I")?].concat();

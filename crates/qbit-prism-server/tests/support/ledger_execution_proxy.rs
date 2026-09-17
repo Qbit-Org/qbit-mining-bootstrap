@@ -779,7 +779,12 @@ async fn pump_client(
                 }
             }
             b'X' => ensure!(body.is_empty(), "invalid Terminate frame"),
-            _ => {}
+            // Other messages used by authentication, extended queries and
+            // COPY do not start a separately counted execution. Unknown kinds
+            // (including unobserved FunctionCall execution) must not become
+            // evidence of a clean stream just because EOF follows them.
+            b'D' | b'H' | b'S' | b'p' | b'd' | b'c' | b'f' => {}
+            _ => bail!("unsupported client frame kind {kind:#x}"),
         }
         to.write_all(&frame(kind, &body)?).await?;
     }
@@ -843,6 +848,13 @@ async fn pump_server(
                 notice(&shared, &connection, &message)?;
                 Action::Forward
             }
+            b'Z' => {
+                ensure!(
+                    matches!(body.as_slice(), [b'I' | b'T' | b'E']),
+                    "invalid ReadyForQuery frame"
+                );
+                Action::Forward
+            }
             _ => Action::Forward,
         };
         let completed = match action {
@@ -873,7 +885,7 @@ async fn pump_server(
             }
         }
         if kind == b'Z' {
-            ready(&shared, &connection, id, body.first().copied());
+            ready(&shared, &connection, id, body[0]);
         }
     }
     Ok(ServerEnd::Closed)
@@ -1076,7 +1088,7 @@ fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) -> Res
     Ok(())
 }
 
-fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Option<u8>) {
+fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: u8) {
     {
         // Every frame before this `ReadyForQuery` has been answered, or was
         // skipped by the server after an earlier error in the same batch; a
@@ -1089,7 +1101,7 @@ fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Optio
         state.parses.clear();
         state.inflight.clear();
     }
-    if status == Some(b'I') {
+    if status == b'I' {
         // The transaction ended without the COMMIT the fault was waiting for
         // (a rollback): the arming no longer applies to this connection.
         let mut state = shared.state.lock().expect("proxy state");
