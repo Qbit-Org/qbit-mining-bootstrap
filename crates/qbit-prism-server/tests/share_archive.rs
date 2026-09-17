@@ -2132,6 +2132,37 @@ async fn restore_import_refuses_a_gap_above_the_attached_range() -> Result<()> {
             appended.inserted && appended.share.share_seq == u64::try_from(p0_upper)?,
             "an append could not cross the old upper bound: {appended:?}"
         );
+        // Adjacency alone is insufficient: explicit restored sequence values
+        // must not collide with any value a future append can draw. Check
+        // both a future row and the exact next-value boundary, with rollback.
+        for next in [p0_upper + 1, p2_lower] {
+            set_sequence(&ledger.pool, next - 1).await?;
+            let error = archive::restore(&ledger, &manifest_path, root.path(), true)
+                .await
+                .expect_err("imported a row at or ahead of the destination sequence")
+                .to_string();
+            ensure!(
+                error.contains("next share sequence")
+                    && error.contains(&next.to_string())
+                    && error.contains(&p2_lower.to_string()),
+                "{error}"
+            );
+            let unchanged: bool = sqlx::query_scalar(
+                "SELECT to_regclass($1) IS NULL \
+                 AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+                 AND (SELECT count(*) FROM qbit_prism_share_hashes)=1 \
+                 AND qbit_prism_share_next_seq()=$2",
+            )
+            .bind(P2)
+            .bind(next)
+            .fetch_one(&ledger.pool)
+            .await?;
+            ensure!(
+                unchanged,
+                "the refused future import changed the destination"
+            );
+        }
+        set_sequence(&ledger.pool, p2_lower).await?;
         let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
         ensure!(
             restored["attached"] == true && restored["row_count"] == 1,
@@ -2140,6 +2171,11 @@ async fn restore_import_refuses_a_gap_above_the_attached_range() -> Result<()> {
         ensure!(
             bounds(&ledger.pool, P1).await?.1 == bounds(&ledger.pool, P2).await?.0.unwrap(),
             "the imported range is not adjacent to the maintenance-created partition"
+        );
+        let appended = ledger.append(share(701), None).await?;
+        ensure!(
+            appended.inserted && appended.share.share_seq == u64::try_from(p2_lower + 1)?,
+            "the next append collided with imported history: {appended:?}"
         );
         Ok(ledger)
     }

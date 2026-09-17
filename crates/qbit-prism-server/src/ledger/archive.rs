@@ -2318,9 +2318,9 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) 
 /// safe to run again; that is also why the relation must not exist beforehand,
 /// rather than being adopted.
 ///
-/// The rows are inserted with their archived `share_seq`, so the share
-/// sequence is never read and never set: a restore of old history must not
-/// move the sequence that live appends draw from.
+/// The rows are inserted with their archived `share_seq`. An attached import
+/// must contain only rows below the next share sequence, and never advances
+/// the sequence that live appends draw from.
 pub async fn restore(
     ledger: &Ledger,
     manifest_path: &Path,
@@ -2487,6 +2487,12 @@ pub async fn restore(
                 "refusing to import {partition_name}: its lower bound {} is beyond the highest attached upper bound {}, leaving a routing gap. Restore the intervening ranges first, or restore without --attach",
                 number_or(lower, "MINVALUE"),
                 number_or(covered, "(none)")
+            );
+            let next = next_share_seq(&mut tx).await?;
+            ensure!(
+                summary.last_share_seq.is_none_or(|last| last < next),
+                "refusing to import {partition_name}: its last share sequence {} is not below the destination's next share sequence {next}, so a future append would collide with restored history. Restore without --attach to inspect the archive",
+                number_or(summary.last_share_seq, "(none)")
             );
             restore_import_hashes(&mut tx, &partition_name).await?;
             sqlx::query("INSERT INTO qbit_prism_share_partitions(partition_name,lower_seq,upper_seq,state) VALUES($1,$2,$3,'attached')")
