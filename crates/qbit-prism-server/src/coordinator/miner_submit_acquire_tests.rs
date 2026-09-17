@@ -1,15 +1,12 @@
 //! The coordinator clock and block-only probes use the real checkout boundary.
 use super::*;
 use crate::coordinator::{miner_tests::Fixture, work_ledger::WorkLedger};
+use crate::ledger_test_database as ledger_database;
 use crate::metrics::Metrics;
 use futures_util::{future::LocalBoxFuture, FutureExt};
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, PgPool, Postgres};
 use std::panic::{resume_unwind, AssertUnwindSafe};
 use tokio::time::Instant as TokioInstant;
-
-#[path = "../../tests/support/ledger_database.rs"]
-#[allow(dead_code)]
-mod ledger_database;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -174,7 +171,11 @@ fn sql_code(error: &anyhow::Error) -> Option<String> {
 }
 
 fn state_values(state: crate::ledger::ChainObservationState) -> (i64, i64, Option<String>) {
-    (state.payout_revision, state.chain_epoch, state.best_tip_hash)
+    (
+        state.payout_revision,
+        state.chain_epoch,
+        state.best_tip_hash,
+    )
 }
 
 async fn wait_counts(metrics: &Metrics, expected: (f64, f64)) -> Result<()> {
@@ -210,9 +211,17 @@ async fn clock_and_block_only_duplicate_checkouts_are_lazy_and_cancel_once() -> 
                 let sum = sample(h.metrics(), "failure", "sum");
                 tokio::time::pause();
                 let resume = ResumeClock;
-                let unpolled = run();
-                tokio::time::advance(Duration::from_secs(60)).await;
-                drop(unpolled);
+                // Construct the actual caller, particularly now_ms's boxed
+                // future, so an eager observation cannot hide behind run().
+                if clock {
+                    let unpolled = h.ledger().now_ms();
+                    tokio::time::advance(Duration::from_secs(60)).await;
+                    drop(unpolled);
+                } else {
+                    let unpolled = h.persist(TokioInstant::now());
+                    tokio::time::advance(Duration::from_secs(60)).await;
+                    drop(unpolled);
+                }
                 assert_eq!(counts(h.metrics()), before);
                 let mut acquiring = Box::pin(run());
                 tokio::time::advance(Duration::from_secs(60)).await;
@@ -561,19 +570,28 @@ async fn chain_state_checkout_preserves_snapshot_errors_and_cancellation() -> Re
 
 #[tokio::test]
 async fn coordinator_reads_without_metrics_keep_results_and_emit_nothing() -> Result<()> {
-    with_database(|h| Box::pin(async move {
-        h.plain.append(h.share.clone(), None).await?;
-        let expected = state_values(h.ledger().chain_observation_state().await?);
-        // Keep the original registry, but give the coordinator a ledger with
-        // no telemetry owner. Its one-slot pool is unchanged.
-        let mut plain = h.plain.clone();
-        plain.pool = h.ledger().pool.clone();
-        Arc::get_mut(&mut h.fixture.coordinator).unwrap().ledger = Arc::new(plain);
-        let before = family(h.metrics());
-        assert!(h.ledger().now_ms().await? > 0);
-        assert_eq!(state_values(h.ledger().chain_observation_state().await?), expected);
-        assert!(matches!(h.persist(TokioInstant::now()).await, SaveOutcome::Duplicate));
-        assert_eq!(family(h.metrics()), before);
-        Ok(())
-    })).await
+    with_database(|h| {
+        Box::pin(async move {
+            h.plain.append(h.share.clone(), None).await?;
+            let expected = state_values(h.ledger().chain_observation_state().await?);
+            // Keep the original registry, but give the coordinator a ledger with
+            // no telemetry owner. Its one-slot pool is unchanged.
+            let mut plain = h.plain.clone();
+            plain.pool = h.ledger().pool.clone();
+            Arc::get_mut(&mut h.fixture.coordinator).unwrap().ledger = Arc::new(plain);
+            let before = family(h.metrics());
+            assert!(h.ledger().now_ms().await? > 0);
+            assert_eq!(
+                state_values(h.ledger().chain_observation_state().await?),
+                expected
+            );
+            assert!(matches!(
+                h.persist(TokioInstant::now()).await,
+                SaveOutcome::Duplicate
+            ));
+            assert_eq!(family(h.metrics()), before);
+            Ok(())
+        })
+    })
+    .await
 }

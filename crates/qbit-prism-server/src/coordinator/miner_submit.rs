@@ -615,14 +615,14 @@ impl Coordinator {
         };
         // Nothing is written before the enqueue, so every failure up to it is
         // definite.
-        let exists = tokio::time::timeout_at(
-            bound,
+        let exists = tokio::time::timeout_at(bound, async {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1)",
             )
             .bind(&share.share_id)
-            .fetch_one(&self.ledger.pool),
-        )
+            .fetch_one(&mut *self.ledger.acquire().await?)
+            .await
+        })
         .await;
         match exists {
             Err(_) => {
@@ -685,15 +685,15 @@ impl Coordinator {
         loop {
             // Observe credit and disposition in one MVCC snapshot so
             // finalization cannot fall between two separate reads.
-            let poll = tokio::time::timeout_at(
-                bound,
+            let poll = tokio::time::timeout_at(bound, async {
                 sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
                     "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)
-                .fetch_one(&self.ledger.pool),
-            )
+                .fetch_one(&mut *self.ledger.acquire().await?)
+                .await
+            })
             .await;
             match poll {
                 Err(_) => break,

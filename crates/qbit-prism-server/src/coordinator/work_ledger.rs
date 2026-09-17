@@ -263,7 +263,7 @@ impl WorkLedger for Ledger {
             Ok(sqlx::query_scalar(
                 "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.acquire().await?)
             .await?)
         })
     }

@@ -100,8 +100,8 @@ unchanged.
 
 The coordinator database clock and chain-observation state each record one
 checkout. The latter retains its one-statement revision/epoch/tip snapshot.
-Each block-only duplicate
-probe and each credit/disposition poll records its own checkout, inside the
+Each block-only duplicate probe and each credit/disposition poll records its
+own checkout, inside the
 original acknowledgement deadline. The two block-only probes are not issued-job
 reads. Credit and disposition still share one SQL statement and MVCC snapshot.
 Connections are released at the statement boundary, before enqueue or poll

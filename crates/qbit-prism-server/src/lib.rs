@@ -16,3 +16,8 @@ pub mod tools;
 pub mod vardiff;
 
 pub mod capacity;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/ledger_database.rs"]
+pub(crate) mod ledger_test_database;
