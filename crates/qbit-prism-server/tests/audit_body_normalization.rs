@@ -48,6 +48,9 @@ use window_fixture::WindowPlan;
 #[path = "support/audit_acquire_metrics.rs"]
 mod acquire_metrics;
 
+#[path = "support/audit_reconstruction_metrics.rs"]
+mod reconstruction_metrics;
+
 // ---------------------------------------------------------------------------
 // Per-test database and the small fixture from `tests/ledger_postgres.rs`
 // ---------------------------------------------------------------------------
