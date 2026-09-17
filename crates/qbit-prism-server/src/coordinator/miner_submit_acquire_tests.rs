@@ -110,6 +110,8 @@ where
         pools.push(side.clone());
         let mut plain =
             Ledger::connect(&database.url, "coordinator-no-metrics".into(), 2, false).await?;
+        // Both fixture writers use the unmeasured side pool. Complete writes
+        // before taking a conflicting SQL lock, even if using different pools.
         let old = std::mem::replace(&mut plain.pool, side.clone());
         old.close().await;
         let job = fixture.job(1, 0, "checkout.worker");
@@ -131,7 +133,9 @@ where
             credit_policy: None,
         };
         let candidate = submission_candidate(&job, proof, share.clone()).await?;
-        Arc::get_mut(&mut fixture.coordinator).unwrap().ledger = Arc::new(ledger);
+        Arc::get_mut(&mut fixture.coordinator)
+            .expect("fixture coordinator has no other owners before the test starts")
+            .ledger = Arc::new(ledger);
         case(&mut Harness {
             fixture,
             side,
@@ -265,7 +269,12 @@ async fn clock_sql_wait_error_and_cancel_keep_the_successful_checkout() -> Resul
         let measured = h.ledger().now_ms().await?;
         let after_time: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint").fetch_one(&h.side).await?;
         assert!((before_time..=after_time).contains(&measured));
-        sqlx::raw_sql("CREATE FUNCTION clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(352); RETURN pg_catalog.clock_timestamp(); END; $$").execute(&h.side).await?;
+        sqlx::raw_sql("CREATE FUNCTION clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM pg_advisory_xact_lock(352);
+                    RETURN pg_catalog.clock_timestamp();
+                END;
+            $$").execute(&h.side).await?;
         // The earlier real-clock statement may be prepared against pg_catalog.
         // Reparse it under the fixture's explicit search_path after injection.
         let mut connection = h.ledger().pool.acquire().await?;
@@ -275,14 +284,24 @@ async fn clock_sql_wait_error_and_cancel_keep_the_successful_checkout() -> Resul
         sqlx::query("SELECT pg_advisory_xact_lock(352)").execute(&mut *lock).await?;
         let before = counts(h.metrics());
         let mut clock = Box::pin(h.ledger().now_ms());
-        tokio::select! { result = &mut clock => panic!("clock escaped SQL lock: {result:?}"), result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result? }
+        tokio::select! {
+            result = &mut clock => panic!("clock escaped SQL lock: {result:?}"),
+            result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+        }
         let acquired = family(h.metrics());
-        tokio::select! { result = &mut clock => panic!("clock escaped SQL lock: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(75)) => {} }
+        tokio::select! {
+            result = &mut clock => panic!("clock escaped SQL lock: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(75)) => {},
+        }
         drop(clock);
         assert_eq!(family(h.metrics()), acquired);
         lock.rollback().await?;
         tokio::time::timeout(WAIT, h.ledger().now_ms()).await??;
-        sqlx::raw_sql("CREATE OR REPLACE FUNCTION clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'clock test refusal' USING ERRCODE='22012'; END; $$").execute(&h.side).await?;
+        sqlx::raw_sql("CREATE OR REPLACE FUNCTION clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'clock test refusal' USING ERRCODE='22012';
+                END;
+            $$").execute(&h.side).await?;
         let before = counts(h.metrics());
         assert_eq!(sql_code(&h.ledger().now_ms().await.unwrap_err()).as_deref(), Some("22012"));
         assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
@@ -292,70 +311,118 @@ async fn clock_sql_wait_error_and_cancel_keep_the_successful_checkout() -> Resul
 
 #[tokio::test]
 async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Result<()> {
-    with_database(|h| Box::pin(async move {
-        let before = family(h.metrics());
-        let missing = h.coordinator().persist_block_only(&h.share, None, None, &h.candidate.block_hash, TokioInstant::now()).await;
-        let SaveOutcome::Failed(error) = missing else { panic!("missing candidate must fail") };
-        assert_eq!(error.to_string(), "missing candidate");
-        assert_eq!(family(h.metrics()), before);
-        let mut lock = h.side.begin().await?;
-        sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await?;
-        let before = counts(h.metrics());
-        let mut persist = Box::pin(h.persist(TokioInstant::now()));
-        tokio::select! { result = &mut persist => panic!("probe escaped lock: {result:?}"), result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result? }
-        let acquired = family(h.metrics());
-        tokio::select! { result = &mut persist => panic!("probe escaped lock: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(75)) => {} }
-        drop(persist);
-        assert_eq!(family(h.metrics()), acquired);
-        lock.rollback().await?;
-        sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN share_id TO hidden_share_id").execute(&h.side).await?;
-        let before = counts(h.metrics());
-        let SaveOutcome::Failed(error) = h.persist(TokioInstant::now()).await else { panic!("SQL error before enqueue must be definite") };
-        assert_eq!(sql_code(&error).as_deref(), Some("42703"));
-        assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
-        sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN hidden_share_id TO share_id").execute(&h.side).await?;
-        // Spend time in checkout, then in SQL, under the original bound.
-        let held = h.ledger().pool.acquire().await?;
-        let mut lock = h.side.begin().await?;
-        sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await?;
-        let before = counts(h.metrics());
-        let start = TokioInstant::now() - WAIT + Duration::from_secs(2);
-        let bound = start + WAIT;
-        let mut persist = Box::pin(h.persist(start));
-        assert!(futures_util::poll!(&mut persist).is_pending());
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert_eq!(counts(h.metrics()), before);
-        drop(held);
-        tokio::select! { result = &mut persist => panic!("SQL wait escaped: {result:?}"), result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result? }
-        let acquired = family(h.metrics());
-        tokio::time::pause(); let resume = ResumeClock;
-        let remaining = bound.checked_duration_since(TokioInstant::now()).context("fixture missed original bound")?;
-        tokio::time::advance(remaining - Duration::from_millis(1)).await;
-        assert!(futures_util::poll!(&mut persist).is_pending());
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let SaveOutcome::Failed(error) = persist.await else { panic!("SQL timeout before enqueue must be definite") };
-        assert_eq!(error.to_string(), "block-only acknowledgement bound passed before the candidate was enqueued");
-        assert_eq!(family(h.metrics()), acquired);
-        drop(resume);
-        lock.rollback().await?;
-        let held = h.ledger().pool.acquire().await?;
-        let before = counts(h.metrics());
-        tokio::time::pause();
-        let resume = ResumeClock;
-        let start = TokioInstant::now();
-        tokio::time::advance(WAIT - Duration::from_millis(75)).await;
-        let mut persist = Box::pin(h.persist(start));
-        assert!(futures_util::poll!(&mut persist).is_pending());
-        tokio::time::advance(Duration::from_millis(75)).await;
-        let SaveOutcome::Failed(error) = persist.await else { panic!("checkout deadline before enqueue must be definite") };
-        assert_eq!(error.to_string(), "block-only acknowledgement bound passed before the candidate was enqueued");
-        drop(resume);
-        assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
-        drop(held);
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_block_candidate_outbox").fetch_one(&h.side).await?;
-        assert_eq!(rows, 0);
-        Ok(())
-    })).await
+    with_database(|h| {
+        Box::pin(async move {
+            let before = family(h.metrics());
+            let missing = h
+                .coordinator()
+                .persist_block_only(
+                    &h.share,
+                    None,
+                    None,
+                    &h.candidate.block_hash,
+                    TokioInstant::now(),
+                )
+                .await;
+            let SaveOutcome::Failed(error) = missing else {
+                panic!("missing candidate must fail")
+            };
+            assert_eq!(error.to_string(), "missing candidate");
+            assert_eq!(family(h.metrics()), before);
+            let mut lock = h.side.begin().await?;
+            sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let before = counts(h.metrics());
+            let mut persist = Box::pin(h.persist(TokioInstant::now()));
+            tokio::select! {
+                result = &mut persist => panic!("probe escaped lock: {result:?}"),
+                result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+            }
+            let acquired = family(h.metrics());
+            tokio::select! {
+                result = &mut persist => panic!("probe escaped lock: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(75)) => {},
+            }
+            drop(persist);
+            assert_eq!(family(h.metrics()), acquired);
+            lock.rollback().await?;
+            sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN share_id TO hidden_share_id")
+                .execute(&h.side)
+                .await?;
+            let before = counts(h.metrics());
+            let SaveOutcome::Failed(error) = h.persist(TokioInstant::now()).await else {
+                panic!("SQL error before enqueue must be definite")
+            };
+            assert_eq!(sql_code(&error).as_deref(), Some("42703"));
+            assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
+            sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN hidden_share_id TO share_id")
+                .execute(&h.side)
+                .await?;
+            // Spend time in checkout, then in SQL, under the original bound.
+            let held = h.ledger().pool.acquire().await?;
+            let mut lock = h.side.begin().await?;
+            sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let before = counts(h.metrics());
+            let start = TokioInstant::now() - WAIT + Duration::from_secs(2);
+            let bound = start + WAIT;
+            let mut persist = Box::pin(h.persist(start));
+            assert!(futures_util::poll!(&mut persist).is_pending());
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert_eq!(counts(h.metrics()), before);
+            drop(held);
+            tokio::select! {
+                result = &mut persist => panic!("SQL wait escaped: {result:?}"),
+                result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+            }
+            let acquired = family(h.metrics());
+            tokio::time::pause();
+            let resume = ResumeClock;
+            let remaining = bound
+                .checked_duration_since(TokioInstant::now())
+                .context("fixture missed original bound")?;
+            tokio::time::advance(remaining - Duration::from_millis(1)).await;
+            assert!(futures_util::poll!(&mut persist).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let SaveOutcome::Failed(error) = persist.await else {
+                panic!("SQL timeout before enqueue must be definite")
+            };
+            assert_eq!(
+                error.to_string(),
+                "block-only acknowledgement bound passed before the candidate was enqueued"
+            );
+            assert_eq!(family(h.metrics()), acquired);
+            drop(resume);
+            lock.rollback().await?;
+            let held = h.ledger().pool.acquire().await?;
+            let before = counts(h.metrics());
+            tokio::time::pause();
+            let resume = ResumeClock;
+            let start = TokioInstant::now();
+            tokio::time::advance(WAIT - Duration::from_millis(75)).await;
+            let mut persist = Box::pin(h.persist(start));
+            assert!(futures_util::poll!(&mut persist).is_pending());
+            tokio::time::advance(Duration::from_millis(75)).await;
+            let SaveOutcome::Failed(error) = persist.await else {
+                panic!("checkout deadline before enqueue must be definite")
+            };
+            assert_eq!(
+                error.to_string(),
+                "block-only acknowledgement bound passed before the candidate was enqueued"
+            );
+            drop(resume);
+            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+            drop(held);
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_block_candidate_outbox")
+                .fetch_one(&h.side)
+                .await?;
+            assert_eq!(rows, 0);
+            Ok(())
+        })
+    })
+    .await
 }
 
 // Drive exactly through the initial probe, enqueue transaction and first
@@ -447,66 +514,67 @@ async fn block_only_poll_checkout_cancel_and_deadline_stay_unknown() -> Result<(
 }
 
 #[tokio::test]
-async fn block_only_poll_results_errors_and_sql_cancel_preserve_checkout_success() -> Result<()> {
-    for result in [
-        "accepted",
-        "abandoned",
-        "orphaned",
-        "rejected",
-        "missing",
-        "sql-error",
-        "sql-cancel",
+async fn block_only_poll_terminal_results_preserve_checkout_success() -> Result<()> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Disposition {
+        Accepted,
+        Abandoned,
+        Orphaned,
+        Rejected,
+    }
+    for disposition in [
+        Disposition::Accepted,
+        Disposition::Abandoned,
+        Disposition::Orphaned,
+        Disposition::Rejected,
     ] {
+        eprintln!("block-only terminal disposition: {disposition:?}");
         with_database(|h| Box::pin(async move {
-            let start = TokioInstant::now();
-            let mut persist = Box::pin(h.persist(start));
+            let mut persist = Box::pin(h.persist(TokioInstant::now()));
             let held = first_poll(h, &mut persist).await?;
-            match result {
-                "accepted" => {
+            match disposition {
+                Disposition::Accepted => {
                     h.plain.append(h.share.clone(), None).await?;
                 }
-                "abandoned" | "orphaned" => {
-                    sqlx::query("UPDATE qbit_block_candidate_outbox SET state=$1,completed_at=clock_timestamp(),candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,offer_reserved_at=CASE WHEN $1='orphaned' THEN clock_timestamp() END,offer_reserved_by=CASE WHEN $1='orphaned' THEN 'test' END,offer_outcome=CASE WHEN $1='orphaned' THEN 'unknown' END,last_error='test disposition'").bind(result).execute(&h.side).await?;
+                Disposition::Abandoned | Disposition::Orphaned => {
+                    let state = match disposition {
+                        Disposition::Abandoned => "abandoned",
+                        _ => "orphaned",
+                    };
+                    sqlx::query(
+                        "UPDATE qbit_block_candidate_outbox SET
+                            state=$1,completed_at=clock_timestamp(),candidate=NULL,
+                            block_bytes=NULL,window_anchor_ms=NULL,
+                            window_prior_balances_sha256=NULL,window_first_share_seq=NULL,
+                            window_last_share_seq=NULL,window_share_count=NULL,
+                            window_snapshot_sha256=NULL,
+                            offer_reserved_at=CASE WHEN $1='orphaned' THEN clock_timestamp() END,
+                            offer_reserved_by=CASE WHEN $1='orphaned' THEN 'test' END,
+                            offer_outcome=CASE WHEN $1='orphaned' THEN 'unknown' END,
+                            last_error='test disposition'",
+                    ).bind(state).execute(&h.side).await?;
                 }
-                "rejected" => { sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome='rejected',offer_reserved_at=clock_timestamp(),offer_reserved_by='test',offered_at_ms=1234,offer_reply='test refusal',last_error='test refusal'").execute(&h.side).await?; }
-                "missing" => { sqlx::raw_sql("DELETE FROM qbit_prism_deferred_shares; DELETE FROM qbit_block_candidate_outbox").execute(&h.side).await?; }
-                "sql-error" => { sqlx::query("ALTER TABLE qbit_block_candidate_outbox RENAME COLUMN offer_outcome TO hidden_outcome").execute(&h.side).await?; }
-                _ => {}
+                Disposition::Rejected => {
+                    sqlx::query(
+                        "UPDATE qbit_block_candidate_outbox SET
+                            state='reconciliation',offer_outcome='rejected',
+                            offer_reserved_at=clock_timestamp(),offer_reserved_by='test',
+                            offered_at_ms=1234,offer_reply='test refusal',last_error='test refusal'",
+                    ).execute(&h.side).await?;
+                }
             }
-            let mut lock = h.side.begin().await?;
-            if result == "sql-cancel" { sqlx::query("LOCK TABLE qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await?; }
             let before = counts(h.metrics());
             drop(held);
-            if matches!(result, "accepted" | "abandoned" | "orphaned" | "rejected") {
-                let answer = tokio::time::timeout(WAIT, persist).await?;
-                if result == "accepted" { assert!(matches!(answer, SaveOutcome::Accepted)); }
-                else { let SaveOutcome::Failed(error) = answer else { panic!("terminal disposition: {answer:?}") }; assert_eq!(error.to_string(), "block-only proof was not accepted on the active chain"); }
-                assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
+            let answer = tokio::time::timeout(WAIT, persist).await?;
+            if disposition == Disposition::Accepted {
+                assert!(matches!(answer, SaveOutcome::Accepted));
             } else {
-                tokio::select! { biased; result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?, answer = &mut persist => panic!("nonterminal disposition: {answer:?}") }
-                let acquired = family(h.metrics());
-                if result == "sql-cancel" {
-                    tokio::select! { answer = &mut persist => panic!("SQL lock escaped: {answer:?}"), _ = tokio::time::sleep(Duration::from_millis(75)) => {} }
-                    drop(persist);
-                    assert_eq!(family(h.metrics()), acquired);
-                } else {
-                    // Drain that statement and hold the returned slot across
-                    // the next sleep: errors/missing rows remain indeterminate.
-                    let held = tokio::select! { biased; connection = h.ledger().pool.acquire() => connection?, answer = &mut persist => panic!("nonterminal: {answer:?}") };
-                    assert_eq!(family(h.metrics()), acquired);
-                    tokio::time::pause(); let resume = ResumeClock;
-                    tokio::time::advance(Duration::from_millis(50)).await;
-                    assert!(futures_util::poll!(&mut persist).is_pending());
-                    tokio::time::advance((start + WAIT).saturating_duration_since(TokioInstant::now())).await;
-                    let answer = persist.await;
-                    let SaveOutcome::Unknown { phase, .. } = answer else { panic!("nonterminal: {answer:?}") };
-                    assert_eq!(phase, if result == "sql-error" { "poll-error" } else { "candidate-pending" });
-                    assert_eq!(counts(h.metrics()), (before.0 + 1., before.1 + 1.));
-                    drop(resume);
-                    drop(held);
-                }
+                let SaveOutcome::Failed(error) = answer else {
+                    panic!("terminal disposition {disposition:?}: {answer:?}")
+                };
+                assert_eq!(error.to_string(), "block-only proof was not accepted on the active chain");
             }
-            lock.rollback().await?;
+            assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
             drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
             Ok(())
         })).await?;
@@ -515,57 +583,184 @@ async fn block_only_poll_results_errors_and_sql_cancel_preserve_checkout_success
 }
 
 #[tokio::test]
+async fn block_only_poll_missing_and_sql_error_stay_unknown() -> Result<()> {
+    for (setup, expected_phase) in [
+        (
+            "DELETE FROM qbit_prism_deferred_shares; DELETE FROM qbit_block_candidate_outbox",
+            "candidate-pending",
+        ),
+        (
+            "ALTER TABLE qbit_block_candidate_outbox RENAME COLUMN offer_outcome TO hidden_outcome",
+            "poll-error",
+        ),
+    ] {
+        eprintln!("block-only indeterminate poll: {expected_phase}");
+        with_database(|h| {
+            Box::pin(async move {
+                let start = TokioInstant::now();
+                let mut persist = Box::pin(h.persist(start));
+                let held = first_poll(h, &mut persist).await?;
+                sqlx::raw_sql(setup).execute(&h.side).await?;
+                let before = counts(h.metrics());
+                drop(held);
+                tokio::select! {
+                    biased;
+                    result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+                    answer = &mut persist => panic!("nonterminal disposition: {answer:?}"),
+                }
+                let acquired = family(h.metrics());
+                // Drain that statement and hold the returned slot across
+                // the next sleep: errors/missing rows remain indeterminate.
+                let held = tokio::select! {
+                    biased;
+                    connection = h.ledger().pool.acquire() => connection?,
+                    answer = &mut persist => panic!("nonterminal: {answer:?}"),
+                };
+                assert_eq!(family(h.metrics()), acquired);
+                tokio::time::pause();
+                let resume = ResumeClock;
+                tokio::time::advance(Duration::from_millis(50)).await;
+                assert!(futures_util::poll!(&mut persist).is_pending());
+                tokio::time::advance((start + WAIT).saturating_duration_since(TokioInstant::now()))
+                    .await;
+                let answer = persist.await;
+                let SaveOutcome::Unknown { phase, .. } = answer else {
+                    panic!("nonterminal: {answer:?}")
+                };
+                assert_eq!(phase, expected_phase);
+                assert_eq!(counts(h.metrics()), (before.0 + 1., before.1 + 1.));
+                drop(resume);
+                drop(held);
+                drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
+                Ok(())
+            })
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_only_poll_sql_cancel_preserves_checkout_success() -> Result<()> {
+    with_database(|h| {
+        Box::pin(async move {
+            let mut persist = Box::pin(h.persist(TokioInstant::now()));
+            let held = first_poll(h, &mut persist).await?;
+            let mut lock = h.side.begin().await?;
+            sqlx::query("LOCK TABLE qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let before = counts(h.metrics());
+            drop(held);
+            tokio::select! {
+                biased;
+                result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+                answer = &mut persist => panic!("nonterminal disposition: {answer:?}"),
+            }
+            let acquired = family(h.metrics());
+            tokio::select! {
+                answer = &mut persist => panic!("SQL lock escaped: {answer:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(75)) => {},
+            }
+            drop(persist);
+            assert_eq!(family(h.metrics()), acquired);
+            lock.rollback().await?;
+            drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
 async fn chain_state_checkout_preserves_snapshot_errors_and_cancellation() -> Result<()> {
-    with_database(|h| Box::pin(async move {
-        let initial = state_values(h.ledger().chain_observation_state().await?);
-        let mut change = h.side.begin().await?;
-        sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=7,chain_epoch=11,best_tip_hash=$1")
-            .bind("ab".repeat(32)).execute(&mut *change).await?;
-        let before = counts(h.metrics());
-        assert_eq!(state_values(h.ledger().chain_observation_state().await?), initial);
-        assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
-        change.commit().await?;
-        let current = h.ledger().chain_observation_state().await?;
-        assert_eq!((current.payout_revision, current.chain_epoch, current.best_tip_hash), (7, 11, Some("ab".repeat(32))));
-        assert_eq!(counts(h.metrics()), (before.0 + 2., before.1));
-        let held = h.ledger().pool.acquire().await?;
-        let before = counts(h.metrics());
-        let sum = sample(h.metrics(), "failure", "sum");
-        tokio::time::pause(); let resume = ResumeClock;
-        let unpolled = h.ledger().chain_observation_state();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        drop(unpolled);
-        assert_eq!(counts(h.metrics()), before);
-        let mut state = Box::pin(h.ledger().chain_observation_state());
-        assert!(futures_util::poll!(&mut state).is_pending());
-        tokio::time::advance(Duration::from_millis(75)).await;
-        drop(state); drop(resume);
-        assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
-        assert!((sample(h.metrics(), "failure", "sum") - sum - 0.075).abs() < 0.000001);
-        drop(held);
-        let mut lock = h.side.begin().await?;
-        sqlx::query("LOCK TABLE qbit_prism_cluster IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await?;
-        let before = counts(h.metrics());
-        let mut state = Box::pin(h.ledger().chain_observation_state());
-        tokio::select! { result = &mut state => panic!("state escaped SQL lock: {result:?}"), result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result? }
-        let acquired = family(h.metrics());
-        tokio::select! { result = &mut state => panic!("state escaped SQL lock: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(75)) => {} }
-        drop(state);
-        assert_eq!(family(h.metrics()), acquired);
-        lock.rollback().await?;
-        sqlx::query("ALTER TABLE qbit_prism_cluster RENAME COLUMN chain_epoch TO hidden_epoch").execute(&h.side).await?;
-        let before = counts(h.metrics());
-        assert_eq!(sql_code(&h.ledger().chain_observation_state().await.unwrap_err()).as_deref(), Some("42703"));
-        assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
-        sqlx::query("ALTER TABLE qbit_prism_cluster RENAME COLUMN hidden_epoch TO chain_epoch").execute(&h.side).await?;
-        tokio::time::timeout(WAIT, h.ledger().chain_observation_state()).await??;
-        h.ledger().pool.close().await;
-        let before = counts(h.metrics());
-        let error = h.ledger().chain_observation_state().await.unwrap_err();
-        assert!(matches!(error.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::PoolClosed)));
-        assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
-        Ok(())
-    })).await
+    with_database(|h| {
+        Box::pin(async move {
+            let initial = state_values(h.ledger().chain_observation_state().await?);
+            let mut change = h.side.begin().await?;
+            sqlx::query(
+                "UPDATE qbit_prism_cluster SET payout_revision=7,chain_epoch=11,best_tip_hash=$1",
+            )
+            .bind("ab".repeat(32))
+            .execute(&mut *change)
+            .await?;
+            let before = counts(h.metrics());
+            assert_eq!(
+                state_values(h.ledger().chain_observation_state().await?),
+                initial
+            );
+            assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
+            change.commit().await?;
+            let current = h.ledger().chain_observation_state().await?;
+            assert_eq!(
+                (
+                    current.payout_revision,
+                    current.chain_epoch,
+                    current.best_tip_hash
+                ),
+                (7, 11, Some("ab".repeat(32)))
+            );
+            assert_eq!(counts(h.metrics()), (before.0 + 2., before.1));
+            let held = h.ledger().pool.acquire().await?;
+            let before = counts(h.metrics());
+            let sum = sample(h.metrics(), "failure", "sum");
+            tokio::time::pause();
+            let resume = ResumeClock;
+            let unpolled = h.ledger().chain_observation_state();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            drop(unpolled);
+            assert_eq!(counts(h.metrics()), before);
+            let mut state = Box::pin(h.ledger().chain_observation_state());
+            assert!(futures_util::poll!(&mut state).is_pending());
+            tokio::time::advance(Duration::from_millis(75)).await;
+            drop(state);
+            drop(resume);
+            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+            assert!((sample(h.metrics(), "failure", "sum") - sum - 0.075).abs() < 0.000001);
+            drop(held);
+            let mut lock = h.side.begin().await?;
+            sqlx::query("LOCK TABLE qbit_prism_cluster IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let before = counts(h.metrics());
+            let mut state = Box::pin(h.ledger().chain_observation_state());
+            tokio::select! {
+                result = &mut state => panic!("state escaped SQL lock: {result:?}"),
+                result = wait_counts(h.metrics(), (before.0 + 1., before.1)) => result?,
+            }
+            let acquired = family(h.metrics());
+            tokio::select! {
+                result = &mut state => panic!("state escaped SQL lock: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(75)) => {},
+            }
+            drop(state);
+            assert_eq!(family(h.metrics()), acquired);
+            lock.rollback().await?;
+            sqlx::query("ALTER TABLE qbit_prism_cluster RENAME COLUMN chain_epoch TO hidden_epoch")
+                .execute(&h.side)
+                .await?;
+            let before = counts(h.metrics());
+            assert_eq!(
+                sql_code(&h.ledger().chain_observation_state().await.unwrap_err()).as_deref(),
+                Some("42703")
+            );
+            assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
+            sqlx::query("ALTER TABLE qbit_prism_cluster RENAME COLUMN hidden_epoch TO chain_epoch")
+                .execute(&h.side)
+                .await?;
+            tokio::time::timeout(WAIT, h.ledger().chain_observation_state()).await??;
+            h.ledger().pool.close().await;
+            let before = counts(h.metrics());
+            let error = h.ledger().chain_observation_state().await.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::PoolClosed)
+            ));
+            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[tokio::test]
@@ -578,7 +773,9 @@ async fn coordinator_reads_without_metrics_keep_results_and_emit_nothing() -> Re
             // no telemetry owner. Its one-slot pool is unchanged.
             let mut plain = h.plain.clone();
             plain.pool = h.ledger().pool.clone();
-            Arc::get_mut(&mut h.fixture.coordinator).unwrap().ledger = Arc::new(plain);
+            Arc::get_mut(&mut h.fixture.coordinator)
+                .expect("fixture coordinator has no other owners before replacing its ledger")
+                .ledger = Arc::new(plain);
             let before = family(h.metrics());
             assert!(h.ledger().now_ms().await? > 0);
             assert_eq!(

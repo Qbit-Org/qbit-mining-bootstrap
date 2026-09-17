@@ -416,7 +416,9 @@ qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::an_empty_
 qbit-prism-server::qbit_prism_server::coordinator::issued_batcher::tests::postgres::active_cancellation_keeps_live_peers_and_reconciles_all_gone
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_initial_probe_sql_error_cancel_and_original_deadline
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_checkout_cancel_and_deadline_stay_unknown
-qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_results_errors_and_sql_cancel_preserve_checkout_success
+qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_missing_and_sql_error_stay_unknown
+qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_sql_cancel_preserves_checkout_success
+qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_terminal_results_preserve_checkout_success
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::chain_state_checkout_preserves_snapshot_errors_and_cancellation
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::clock_and_block_only_duplicate_checkouts_are_lazy_and_cancel_once
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::clock_sql_wait_error_and_cancel_keep_the_successful_checkout

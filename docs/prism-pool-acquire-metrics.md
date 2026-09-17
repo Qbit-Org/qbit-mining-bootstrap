@@ -112,6 +112,17 @@ is definite; after enqueue a failed or missing read does not prove whether the
 durable candidate earned credit. Timing changes neither that distinction nor
 the enqueue's existing handling of an unknown outcome.
 
+Polls contribute actual acquisition attempts to the same aggregate histogram
+as the other covered callers. Expanding coverage can change its percentile:
+a pending candidate can produce many fast acquisitions when the pool has spare
+capacity, even if settlement is stalled. Each poll waits for its checkout and
+SQL before the existing 50 ms sleep, so a saturated pool slows those attempts
+and their observed waits increase. The pool-wait alert's five-minute p99 and
+ten-attempt minimum describe this combined population, not distinct submissions,
+per-caller latency or settlement latency. Adding fast samples can lower the
+aggregate p99; this coverage change does not change the alert's grouping,
+threshold or minimum count.
+
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
 Other direct coordinator, candidate and startup queries still acquire without
 this helper. The pool-only public helpers have no attached metrics owner:
