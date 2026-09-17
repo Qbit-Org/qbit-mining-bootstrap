@@ -87,9 +87,11 @@ impl AsyncWrite for PauseAtReadyDelivery {
                     self.remaining = None;
                     // Test-only scheduler barrier: the real TCP write has
                     // completed, but its proxy worker cannot publish yet.
-                    // Another worker reads the reply and inspects the observer.
-                    if let Err(error) = self.release.recv_timeout(std::time::Duration::from_secs(5))
-                    {
+                    // Hand off the Tokio worker while blocking so the TCP
+                    // reader and I/O driver can progress even with one worker.
+                    if let Err(error) = tokio::task::block_in_place(|| {
+                        self.release.recv_timeout(std::time::Duration::from_secs(5))
+                    }) {
                         return Poll::Ready(Err(io::Error::other(error)));
                     }
                 }
@@ -467,7 +469,9 @@ async fn successful_zero_and_incorrect_row_counts_remain_distinct() -> Result<()
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// One worker makes an unannounced blocking wait in the writer starve the TCP
+// reader deterministically, rather than depending on multi-worker scheduling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn acknowledgement_delivery_cannot_expose_an_incomplete_observer_snapshot() -> Result<()> {
     let shared = observations();
     let connection = Arc::new(Mutex::new(Connection::default()));
