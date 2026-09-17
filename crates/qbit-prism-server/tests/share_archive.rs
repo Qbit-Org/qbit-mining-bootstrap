@@ -1894,7 +1894,8 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
         .await?;
         // The fixture's eleventh row is rejected and must not reserve a hash.
         insert_shares(&ledger.pool, 11, 11, 1, "rejected", 7200.0).await?;
-        move_horizon_past_p0(&ledger.pool).await?;
+        let (_, upper) = bounds(&ledger.pool, P0).await?;
+        set_sequence(&ledger.pool, upper - 1).await?;
         archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
         let manifest_path = PathBuf::from(
             catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
@@ -2140,6 +2141,165 @@ async fn restore_import_rejects_duplicate_share_ids() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// New history must still be ahead of the rollup sweep. Otherwise the
+/// watermark would certify rows that were never counted by this ledger.
+#[tokio::test]
+async fn restore_import_rejects_rows_at_or_below_the_rollup_watermark() -> Result<()> {
+    for (watermark, empty) in [
+        (None, false),
+        (Some(9), false),
+        (Some(10), false),
+        (Some(20), false),
+        (Some(20), true),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("restore-import-rollup").await?;
+            let root = tempfile::tempdir()?;
+            if !empty {
+                insert_shares(&ledger.pool, 10, 12, 7, "archive-history", 7200.0).await?;
+            }
+            let (_, upper) = bounds(&ledger.pool, P0).await?;
+            set_sequence(&ledger.pool, upper - 1).await?;
+            archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+            let manifest_path = PathBuf::from(
+                catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
+            );
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}; DROP TABLE {P0}; \
+                 DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'"
+            ))
+            .execute(&ledger.pool)
+            .await?;
+            if let Some(watermark) = watermark {
+                sqlx::query("INSERT INTO qbit_hashrate_rollup_progress(singleton,last_share_seq) VALUES(true,$1)")
+                    .bind(watermark)
+                    .execute(&ledger.pool)
+                    .await?;
+            }
+            let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await;
+            if !empty && watermark.is_some_and(|watermark| watermark >= 10) {
+                let error = restored.expect_err("imported history the rollup sweep would skip").to_string();
+                ensure!(error.contains("rollup watermark") && error.contains("first share sequence 10"), "{error}");
+                let unchanged: bool = sqlx::query_scalar(
+                    "SELECT to_regclass($1) IS NULL \
+                     AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+                     AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes) \
+                     AND (SELECT last_share_seq FROM qbit_hashrate_rollup_progress)=$2 \
+                     AND qbit_prism_share_next_seq()=$3",
+                )
+                .bind(P0)
+                .bind(watermark)
+                .bind(upper)
+                .fetch_one(&ledger.pool)
+                .await?;
+                ensure!(unchanged, "refused historical import changed the destination");
+                let inspected = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+                ensure!(inspected["attached"] == false && inspected["row_count"] == 3, "{inspected}");
+            } else {
+                let restored = restored?;
+                ensure!(restored["attached"] == true, "{restored}");
+                for _ in 0..2 {
+                    advance_rollups(&ledger.pool).await?;
+                    for table in ["qbit_hashrate_rollup_pool", "qbit_hashrate_rollup_miner"] {
+                        let totals: Vec<(i32, i64, String)> = sqlx::query_as(&format!(
+                            "SELECT grain_seconds,sum(accepted_share_count)::bigint,sum(accepted_share_difficulty)::text \
+                             FROM {table} GROUP BY grain_seconds ORDER BY grain_seconds"
+                        ))
+                        .fetch_all(&ledger.pool)
+                        .await?;
+                        let expected = if empty { vec![] } else {
+                            vec![(300, 2, "14".into()), (3600, 2, "14".into()), (86400, 2, "14".into())]
+                        };
+                        ensure!(totals == expected, "{table} did not fold imported history exactly once: {totals:?}");
+                    }
+                }
+            }
+            Ok(ledger)
+        }.await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A sweep already in flight must finish before import checks its watermark;
+/// otherwise it could certify later rows while never seeing imported history.
+#[tokio::test]
+async fn restore_import_waits_for_an_inflight_rollup() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("restore-import-rollup-race").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 10, 12, 7, "archive-history", 7200.0).await?;
+        let (_, upper) = bounds(&ledger.pool, P0).await?;
+        set_sequence(&ledger.pool, upper - 1).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        let manifest_path = PathBuf::from(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
+        );
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}; DROP TABLE {P0}; \
+             DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        insert_shares(&ledger.pool, upper, upper, 1, "destination", 1.0).await?;
+        set_sequence(&ledger.pool, upper).await?;
+        let mut sweep = ledger.pool.begin().await?;
+        let sweep_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *sweep).await?;
+        sqlx::query(include_str!("../src/rollups.sql"))
+            .bind(50_000i64).execute(&mut *sweep).await?;
+        let (restored, finished) = tokio::join!(
+            archive::restore(&ledger, &manifest_path, root.path(), true),
+            async {
+                let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let blocked: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                        )
+                        .bind(sweep_pid).fetch_one(&db.admin).await?;
+                        if blocked { return Ok::<(), anyhow::Error>(()); }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await;
+                sweep.commit().await?;
+                waiting.context("the import did not wait for the in-flight sweep")??;
+                Ok::<(), anyhow::Error>(())
+            }
+        );
+        finished?;
+        let error = restored.expect_err("imported behind a concurrently committed watermark").to_string();
+        ensure!(error.contains("rollup watermark") && error.contains(&upper.to_string()), "{error}");
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT to_regclass($1) IS NULL \
+             AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+             AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes) \
+             AND (SELECT last_share_seq FROM qbit_hashrate_rollup_progress)=$2",
+        )
+        .bind(P0).bind(upper).fetch_one(&ledger.pool).await?;
+        ensure!(unchanged, "the raced import changed the destination");
+        Ok(ledger)
+    }.await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
 }
 
 /// An import must not advance maintenance's covered bound past an unfilled

@@ -2319,8 +2319,8 @@ pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) 
 /// rather than being adopted.
 ///
 /// The rows are inserted with their archived `share_seq`. An attached import
-/// must contain only rows below the next share sequence, and never advances
-/// the sequence that live appends draw from.
+/// must contain only rows above the rollup watermark and below the next share
+/// sequence, and never advances the sequence that live appends draw from.
 pub async fn restore(
     ledger: &Ledger,
     manifest_path: &Path,
@@ -2442,6 +2442,19 @@ pub async fn restore(
         // rejected rows have no global hash mapping. Drain and fence appends
         // through commit so none can race this check and the attachment.
         ledger.lock(&mut tx, ORDER_LOCK).await?;
+        let existing = sqlx::query("SELECT lower_seq,upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
+            .bind(&partition_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if existing.is_none() {
+            // Drain sweeps that cannot see this import, then prevent another
+            // from taking its snapshot until attachment commits. Locking only
+            // the progress row would let a stale sweep skip imported rows
+            // after the lock is released, even if this check saw no watermark.
+            sqlx::query("LOCK TABLE ONLY qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+        }
         let duplicate: Option<String> = sqlx::query_scalar(&format!(
             "SELECT restored.share_id FROM {partition_name} restored \
              JOIN {PARENT} live ON live.share_id=restored.share_id LIMIT 1"
@@ -2463,10 +2476,6 @@ pub async fn restore(
             .await
             .with_context(|| format!("running: {statement}"))?;
         rename_leaf_indexes(&mut tx, &partition_name).await?;
-        let existing = sqlx::query("SELECT lower_seq,upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
-            .bind(&partition_name)
-            .fetch_optional(&mut *tx)
-            .await?;
         if let Some(existing) = existing {
             let recorded_lower: Option<i64> = existing.try_get("lower_seq")?;
             let recorded_upper: i64 = existing.try_get("upper_seq")?;
@@ -2508,6 +2517,16 @@ pub async fn restore(
                 summary.last_share_seq.is_none_or(|last| last < next),
                 "refusing to import {partition_name}: its last share sequence {} is not below the destination's next share sequence {next}, so a future append would collide with restored history. Restore without --attach to inspect the archive",
                 number_or(summary.last_share_seq, "(none)")
+            );
+            let watermark: i64 = sqlx::query_scalar(
+                "SELECT COALESCE((SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton),0)",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure!(
+                summary.first_share_seq.is_none_or(|first| first > watermark),
+                "refusing to import {partition_name}: its first share sequence {} is not above the destination's rollup watermark {watermark}, so the rollup sweep would skip restored history. Restore without --attach to inspect the archive",
+                number_or(summary.first_share_seq, "(none)")
             );
             restore_import_hashes(&mut tx, &partition_name).await?;
             sqlx::query("INSERT INTO qbit_prism_share_partitions(partition_name,lower_seq,upper_seq,state) VALUES($1,$2,$3,'attached')")
