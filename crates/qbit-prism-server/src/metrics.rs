@@ -41,6 +41,9 @@ impl Metrics {
     pub fn new(runtime: Arc<runtime::RuntimeMonitor>) -> Self {
         let mut registry = Registry::default();
         for family in [
+            Family::CtvTipRefreshYields,
+            Family::CtvChunkRows,
+            Family::CtvChunkSeconds,
             Family::Health,
             Family::Workers,
             Family::Connections,

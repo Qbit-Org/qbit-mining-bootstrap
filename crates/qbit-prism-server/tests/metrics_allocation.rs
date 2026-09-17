@@ -154,9 +154,16 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
     }
     let body = metrics.render();
     let histogram_count = body.lines().filter(|line| line.contains("_count")).count();
-    assert_eq!(histogram_count, 11);
+    // Eleven exercised event series plus two eagerly registered, idle CTV
+    // histograms. Broadcaster observations are owned by the runtime suite.
+    assert_eq!(histogram_count, 13);
     for line in body.lines().filter(|line| line.contains("_count")) {
         let (key, count) = line.rsplit_once(' ').unwrap();
+        if key.starts_with("qbit_prism_ctv_fanout_broadcaster_") {
+            assert_eq!(count, "0");
+            assert_eq!(sample(&body, &key.replace("_count", "_sum")), 0.);
+            continue;
+        }
         assert_eq!(count, "2048");
         assert_eq!(sample(&body, &key.replace("_count", "_sum")), 256.);
     }

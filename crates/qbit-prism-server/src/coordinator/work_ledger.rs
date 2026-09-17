@@ -1,9 +1,9 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    BlockingDrop, CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared,
-    CompactRepair, IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission,
-    StoredCompactPrepared,
+    BlockingDrop, ChainObservationState, ChainTransition, CompactBatchAttempt, CompactDependency,
+    CompactIssuedJob, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
+    PreparedTemplate, ReadAdmission, StoredCompactPrepared,
 };
 use futures_util::future::BoxFuture;
 
@@ -14,6 +14,7 @@ pub(super) trait WorkLedger: Send + Sync {
         None
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>>;
     fn latest_accepted_share_seq(&self) -> BoxFuture<'_, Result<u64>>;
     // One coherent observation for balance-aware replacement lease admission.
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
@@ -48,6 +49,14 @@ pub(super) trait WorkLedger: Send + Sync {
         tip: &'a str,
         height: u64,
         chainwork: &'a str,
+    ) -> BoxFuture<'a, Result<i64>>;
+    fn observe_chain_transition<'a>(
+        &'a self,
+        transition: &'a ChainTransition,
+        tip: &'a str,
+        height: u64,
+        chainwork: &'a str,
+        observed: &'a ChainObservationState,
     ) -> BoxFuture<'a, Result<i64>>;
     fn snapshot_with_admission(
         &self,
@@ -101,6 +110,9 @@ impl WorkLedger for Ledger {
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(Ledger::payout_revision(self))
+    }
+    fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>> {
+        Box::pin(Ledger::chain_observation_state(self))
     }
     fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>> {
         Box::pin(Ledger::payout_state(self))
@@ -157,6 +169,18 @@ impl WorkLedger for Ledger {
         chainwork: &'a str,
     ) -> BoxFuture<'a, Result<i64>> {
         Box::pin(Ledger::observe_chain_view(self, tip, height, chainwork))
+    }
+    fn observe_chain_transition<'a>(
+        &'a self,
+        transition: &'a ChainTransition,
+        tip: &'a str,
+        height: u64,
+        chainwork: &'a str,
+        observed: &'a ChainObservationState,
+    ) -> BoxFuture<'a, Result<i64>> {
+        Box::pin(Ledger::observe_chain_transition(
+            self, transition, tip, height, chainwork, observed,
+        ))
     }
     fn snapshot_with_admission(
         &self,

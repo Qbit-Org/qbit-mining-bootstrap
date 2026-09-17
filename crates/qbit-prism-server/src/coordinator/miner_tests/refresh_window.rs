@@ -140,7 +140,7 @@ async fn retained_prepared_work_does_not_retain_retired_window_rows() {
     let first = f.coordinator.prepared.read().await.clone().unwrap();
     let window = {
         let cache = f.coordinator.refresh_lock.lock().await;
-        Arc::downgrade(cache.as_ref().unwrap())
+        Arc::downgrade(cache.cached_window.as_ref().unwrap())
     };
     assert_eq!(window.strong_count(), 1, "issued work retained the window");
     f.coordinator.refresh_once().await.unwrap();
@@ -196,7 +196,7 @@ async fn failed_reanchor_retries_publication_from_cached_inputs() {
     f.coordinator.refresh_once().await.unwrap();
     let first = f.coordinator.prepared.read().await.clone().unwrap();
     // Force a fresh anchor with otherwise identical economics and template.
-    f.coordinator.refresh_lock.lock().await.take();
+    f.coordinator.refresh_lock.lock().await.cached_window.take();
     f.store.snapshot.lock().unwrap().as_mut().unwrap().anchor_ms += 1;
     f.store.fail_save.store(true, Ordering::SeqCst);
     assert!(f.coordinator.refresh_once().await.is_err());

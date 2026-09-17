@@ -39,6 +39,7 @@ struct NodeState {
     height: u64,
     chainwork: String,
     template: Option<Value>,
+    replies: HashMap<String, Value>,
     pauses: HashMap<String, PauseRequest>,
     next_pause: u64,
 }
@@ -102,6 +103,7 @@ impl FakeNode {
             height: 100,
             chainwork: "01".into(),
             template: None,
+            replies: HashMap::new(),
             pauses: HashMap::new(),
             next_pause: 0,
         }));
@@ -128,6 +130,15 @@ impl FakeNode {
     /// None restores the default template with a fresh time on every request.
     pub fn set_template(&self, template: Option<Value>) {
         self.state.lock().expect("fake node state").template = template;
+    }
+
+    /// Override one method for a focused RPC fixture; pauses still apply.
+    pub fn set_reply(&self, method: &str, params: Value, value: Value) {
+        self.state
+            .lock()
+            .expect("fake node state")
+            .replies
+            .insert(format!("{method}:{params}"), value);
     }
 
     pub fn pause_next(&self, method: &str) -> Result<RpcPause> {
@@ -168,7 +179,13 @@ async fn answer(
     let method = request["method"].as_str().unwrap_or("");
     let (result, pause) = {
         let mut state = state.lock().expect("fake node state");
-        let result = match method {
+        let result = if let Some(reply) = state
+            .replies
+            .get(&format!("{method}:{}", request["params"]))
+        {
+            reply.clone()
+        } else {
+            match method {
         "getblockchaininfo" => json!({
             "chain":"test","initialblockdownload":false,"blocks":state.height,"headers":state.height,
             "bestblockhash":state.tip,"chainwork":state.chainwork
@@ -207,7 +224,8 @@ async fn answer(
                 "error":{"code":-32601,"message":"unexpected RPC"}
             }))
         }
-    };
+    }
+        };
         (result, state.pauses.remove(method))
     };
     if let Some(pause) = pause {

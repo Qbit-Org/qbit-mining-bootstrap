@@ -31,6 +31,7 @@ use std::{
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod bundle_build;
+mod chain_observation;
 mod compact_resume;
 mod compact_runtime;
 mod issued_batcher;
@@ -208,6 +209,12 @@ struct StoredJob {
     expires_at_ms: i64,
 }
 
+#[derive(Default)]
+struct RefreshState {
+    observation: chain_observation::ChainObservation,
+    cached_window: Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>,
+}
+
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
@@ -235,8 +242,9 @@ pub struct Coordinator {
     /// share appends and the candidate-lease heartbeat, which must not wait out
     /// the 15 s acquire timeout behind a multi-page read.
     window_reads: Arc<Semaphore>,
-    refresh_lock:
-        Mutex<Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>>,
+    // Both states survive cancelled refreshes under the same serialization:
+    // retiring cached inputs must not reset a consumed node transition.
+    refresh_lock: Mutex<RefreshState>,
     resume_flights: compact_resume::ResumeFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -718,7 +726,7 @@ impl Coordinator {
             readiness: Arc::new(RwLock::new(ReadinessState::default())),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
-            refresh_lock: Mutex::new(None),
+            refresh_lock: Mutex::new(RefreshState::default()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -895,12 +903,19 @@ impl Coordinator {
     }
 
     pub async fn refresh_once(&self) -> Result<()> {
-        let mut cached_window = self.refresh_lock.lock().await;
+        let mut refresh = self.refresh_lock.lock().await;
+        let RefreshState {
+            observation,
+            cached_window,
+        } = &mut *refresh;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
         let proof = self.begin_compact_build().await;
         let readiness_generation = proof.readiness_epoch();
+        // Capture before node I/O, so a delayed equal-work observation cannot
+        // overwrite a replacement accepted while its proof was in flight.
+        let chain_observation = self.work_ledger.chain_observation_state().await?;
         let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
@@ -934,9 +949,14 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = self
-            .work_ledger
-            .observe_chain_view(parent, height - 1, chainwork)
+        let observed_revision = observation
+            .observe(
+                &*self.work_ledger,
+                parent,
+                height - 1,
+                chainwork,
+                &chain_observation,
+            )
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
@@ -1174,13 +1194,27 @@ impl Coordinator {
         let mut last_hint_prune = Instant::now();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
-            match self.refresh_once().await {
-                Ok(()) => {
-                    *self.last_error.write().await = None;
+            // One definite accounting-only refusal may retry immediately with
+            // a fresh proof. The allowance belongs to this external trigger:
+            // another refusal must return to tick/wake cadence, not replenish
+            // it. refresh_once retains the original witness epoch itself.
+            for attempt in 0..2 {
+                if attempt > 0 && shutdown.has_changed().unwrap_or(true) {
+                    return;
                 }
-                Err(error) => {
-                    tracing::warn!(%error,"template refresh deferred");
-                    *self.last_error.write().await = Some(error.to_string());
+                match self.refresh_once().await {
+                    Ok(()) => {
+                        *self.last_error.write().await = None;
+                        break;
+                    }
+                    Err(error) => {
+                        let retry = error.is::<crate::ledger::ChainObservationRetry>();
+                        tracing::warn!(%error,"template refresh deferred");
+                        *self.last_error.write().await = Some(error.to_string());
+                        if !retry {
+                            break;
+                        }
+                    }
                 }
             }
             if last_hint_prune.elapsed() >= Duration::from_secs(300) {
@@ -2540,3 +2574,6 @@ mod window_switch_tests;
 
 #[cfg(test)]
 mod window_incident_tests;
+
+#[cfg(test)]
+mod storm_evidence_tests;

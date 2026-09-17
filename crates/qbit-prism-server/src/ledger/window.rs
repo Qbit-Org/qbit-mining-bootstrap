@@ -27,6 +27,49 @@ impl std::fmt::Display for CommitGateClosed {
 
 impl std::error::Error for CommitGateClosed {}
 
+/// A transition was refused before any write, with its original chain epoch
+/// unchanged and its predecessor still accepted. Only a new coherent proof
+/// may retry it, retaining the ORIGINAL witness epoch.
+#[derive(Debug)]
+pub(crate) struct ChainObservationRetry;
+
+impl std::fmt::Display for ChainObservationRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chain observation revision changed")
+    }
+}
+
+impl std::error::Error for ChainObservationRetry {}
+
+/// A strictly lower-work view was refused before any write or COMMIT.
+#[derive(Debug)]
+pub(crate) struct ChainObservationBehind;
+
+impl std::fmt::Display for ChainObservationBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local node is behind the cluster's cumulative chainwork")
+    }
+}
+
+impl std::error::Error for ChainObservationBehind {}
+
+/// One coherent cluster snapshot captured before the node proof begins.
+/// This token is runtime-only; it does not change issued-work formats.
+#[derive(Clone, Debug)]
+pub struct ChainObservationState {
+    pub payout_revision: i64,
+    pub chain_epoch: i64,
+    pub best_tip_hash: Option<String>,
+}
+
+/// A local transition remains bound to the epoch that first authorized it.
+/// A fresh attempt must never replace this epoch with its newer snapshot.
+#[derive(Clone, Debug)]
+pub struct ChainTransition {
+    pub predecessor: String,
+    pub origin_chain_epoch: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchor_ms: i64,
@@ -310,13 +353,75 @@ impl Ledger {
             .await
     }
 
-    /// Coordinate nodes by cumulative proof of work. A slower peer or an
-    /// equal-work sibling cannot reverse another instance's accepted chain.
+    pub async fn chain_observation_state(&self) -> Result<ChainObservationState> {
+        let (payout_revision, chain_epoch, best_tip_hash) = sqlx::query_as(
+            "SELECT payout_revision,chain_epoch,best_tip_hash FROM qbit_prism_cluster WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ChainObservationState {
+            payout_revision,
+            chain_epoch,
+            best_tip_hash,
+        })
+    }
+
+    /// Coordinate nodes by cumulative proof of work. Unsequenced observations
+    /// cannot replace an accepted tip with an equal-work sibling.
     pub async fn observe_chain_view(
         &self,
         tip: &str,
         height: u64,
         chainwork_hex: &str,
+    ) -> Result<i64> {
+        self.observe_chain_view_checked(tip, height, chainwork_hex, None)
+            .await
+    }
+
+    /// Follow an observed local node transition from the accepted predecessor,
+    /// with a coherent cluster token read *before* its fresh node proof. A delayed
+    /// observation must not reverse a replacement another observer committed.
+    /// Callers consume this transition before I/O: unchanged opposing polls,
+    /// cancellation, unknown COMMIT outcomes and failed later publication must
+    /// not create another transition. Only `ChainObservationRetry` establishes
+    /// that no write occurred and no intervening chain epoch invalidated the
+    /// original witness. A fresh proof may retry it without rebinding its epoch.
+    /// Greater-work observations and the already accepted tip retain their
+    /// existing monotonic/no-op semantics, even if the revision has advanced.
+    /// Callers must prove that tip, height and work describe the same active tip.
+    /// Candidate/settlement observers and cold observers without a coherent
+    /// local predecessor use the strict [`Self::observe_chain_view`] path.
+    /// A cold conflicting equal-work node waits for convergence or more work;
+    /// this is not an authoritative-node election or a failover policy.
+    pub async fn observe_chain_transition(
+        &self,
+        transition: &ChainTransition,
+        tip: &str,
+        height: u64,
+        chainwork_hex: &str,
+        observed: &ChainObservationState,
+    ) -> Result<i64> {
+        let predecessor = &transition.predecessor;
+        ensure!(
+            predecessor.len() == 64
+                && predecessor.bytes().all(|c| c.is_ascii_hexdigit())
+                && !predecessor.eq_ignore_ascii_case(tip),
+            "invalid chain transition predecessor"
+        );
+        ensure!(
+            transition.origin_chain_epoch >= 0,
+            "invalid chain transition epoch"
+        );
+        self.observe_chain_view_checked(tip, height, chainwork_hex, Some((transition, observed)))
+            .await
+    }
+
+    async fn observe_chain_view_checked(
+        &self,
+        tip: &str,
+        height: u64,
+        chainwork_hex: &str,
+        transition: Option<(&ChainTransition, &ChainObservationState)>,
     ) -> Result<i64> {
         ensure!(
             tip.len() == 64 && tip.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -340,25 +445,48 @@ impl Ledger {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
-        let row=sqlx::query("SELECT payout_revision,best_chainwork=$1::text::numeric AS same_work,best_chainwork<$1::text::numeric AS more_work,best_tip_hash,best_tip_height FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        let row=sqlx::query("SELECT payout_revision,chain_epoch,best_chainwork=$1::text::numeric AS same_work,best_chainwork<$1::text::numeric AS more_work,best_tip_hash,best_tip_height FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
             .bind(&work).fetch_one(&mut *tx).await?;
         let same: bool = row.try_get("same_work")?;
         let greater: bool = row.try_get("more_work")?;
-        ensure!(
-            greater || same,
-            "local node is behind the cluster's cumulative chainwork"
-        );
+        if !greater && !same {
+            return Err(ChainObservationBehind.into());
+        }
         let mut revision: i64 = row.try_get("payout_revision")?;
+        let accepted_tip: Option<String> = row.try_get("best_tip_hash")?;
+        let same_tip = accepted_tip.as_deref() == Some(&tip);
         if same {
+            let same_height = row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height);
+            if !same_tip {
+                if let Some((witness, observed)) = transition {
+                    let from = witness.predecessor.to_ascii_lowercase();
+                    ensure!(
+                        row.try_get::<i64, _>("chain_epoch")? == witness.origin_chain_epoch
+                            && observed.chain_epoch == witness.origin_chain_epoch
+                            && observed.best_tip_hash.as_deref() == Some(from.as_str()),
+                        "chain observation epoch changed"
+                    );
+                    if revision != observed.payout_revision {
+                        if accepted_tip.as_deref() == Some(from.as_str()) && same_height {
+                            // No UPDATE or COMMIT has been attempted. Preserve
+                            // this distinction from an indeterminate SQL error.
+                            return Err(ChainObservationRetry.into());
+                        }
+                        bail!("chain observation revision changed");
+                    }
+                    ensure!(
+                        accepted_tip.as_deref() == Some(from.as_str()),
+                        "chain transition predecessor changed"
+                    );
+                }
+            }
             ensure!(
-                row.try_get::<Option<String>, _>("best_tip_hash")?
-                    .as_deref()
-                    == Some(&tip)
-                    && row.try_get::<Option<i64>, _>("best_tip_height")? == Some(height),
+                (same_tip || transition.is_some()) && same_height,
                 "local node follows a conflicting equal-work chain tip"
             );
-        } else {
-            revision=sqlx::query_scalar("UPDATE qbit_prism_cluster SET best_chainwork=$1::text::numeric,best_tip_hash=$2,best_tip_height=$3,payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision")
+        }
+        if greater || !same_tip {
+            revision=sqlx::query_scalar("UPDATE qbit_prism_cluster SET best_chainwork=$1::text::numeric,best_tip_hash=$2,best_tip_height=$3,payout_revision=payout_revision+1,chain_epoch=chain_epoch+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision")
                 .bind(work).bind(tip).bind(height).fetch_one(&mut *tx).await?;
         }
         tx.commit().await?;

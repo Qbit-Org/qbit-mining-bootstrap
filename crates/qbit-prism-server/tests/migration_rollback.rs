@@ -510,6 +510,9 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             "best_tip_hash=repeat('cc',32)",
             "best_tip_height=7",
             "best_chainwork=3",
+            "chain_epoch=1",
+            "chain_epoch=2",
+            "chain_epoch=0",
         ] {
             sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation}"))
                 .execute(&source.pool).await?;
@@ -1469,7 +1472,7 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1),('chain_observation_epoch',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
@@ -1511,6 +1514,21 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_orphan_disposition'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_orphan_disposition'".into(),
             "candidate_orphan_disposition",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='chain_observation_epoch'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('chain_observation_epoch',1)".into(),
+            "chain_observation_epoch",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='chain_observation_epoch'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='chain_observation_epoch'".into(),
+            "chain_observation_epoch",
+        ),
+        (
+            "ALTER TABLE qbit_prism_cluster RENAME COLUMN chain_epoch TO saved_chain_epoch".into(),
+            "ALTER TABLE qbit_prism_cluster RENAME COLUMN saved_chain_epoch TO chain_epoch".into(),
+            "chain_epoch",
         ),
         (
             "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),

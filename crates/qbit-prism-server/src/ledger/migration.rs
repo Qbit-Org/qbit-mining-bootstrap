@@ -25,7 +25,8 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// ledgers apply 013 online (`ONLINE_MIGRATIONS`) and record it after its
 /// last index change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+// 016/017 are reserved by the independent share-partitioning change (#419).
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -61,6 +62,9 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // reported shutdown, and old frontends must stay stopped until it has
     // committed.
     ("candidate_orphan_disposition", 1),
+    // 018: every accepted chain update advances a durable epoch. Older
+    // writers must be stopped before migration, not just refused at restart.
+    ("chain_observation_epoch", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -592,7 +596,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}, then start or migrate again");
+        let epoch_remedy = if versions.contains(&18) {
+            " and restore chain_observation_epoch = 1 from migrations/018_chain_observation_epoch.sql only after restoring the original durable chain_epoch; never reset the epoch or resume an older writer"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -619,6 +628,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
             "database is at schema migration 15 but does not declare candidate_orphan_disposition = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 015's lifecycle constraints and capability; nothing was changed"
         );
     }
+    if versions.contains(&18) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "chain_observation_epoch" && *value == 1),
+            "database is at schema migration 18 but does not declare chain_observation_epoch = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup including its durable chain_epoch and migration 018 capability; never reset the epoch or resume an older writer; nothing was changed"
+        );
+    }
     Ok(())
 }
 
@@ -638,6 +653,7 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
         && !versions.contains(&11)
         && !versions.contains(&12)
         && !versions.contains(&15)
+        && !versions.contains(&18)
     {
         return Ok(());
     }
@@ -2104,6 +2120,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         15,
         include_str!("../../migrations/015_candidate_orphan_disposition.sql"),
     ),
+    (
+        18,
+        include_str!("../../migrations/018_chain_observation_epoch.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3031,6 +3051,18 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
     }
+    if !versions.contains(&18) {
+        // A capability only refuses future connects. All old frontends,
+        // tools, paused startups and automatic restarts must already be
+        // stopped; the instance registration lock remains held until COMMIT.
+        refuse_unquiesced_instances(tx, 18).await?;
+        sqlx::raw_sql(native_migration(18))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(18)")
+            .execute(&mut **tx)
+            .await?;
+    }
     // Only a fresh or empty 2.x.x source reaches this DDL, with writers
     // excluded by the cutover locks. Existing native ledgers and populated
     // 2.x.x sources returned their changes above for the caller to apply
@@ -3198,7 +3230,17 @@ where
             .await?;
     let rows = read_capabilities(&mut *connection).await?;
     require_declared_capabilities(rows.as_deref(), &versions)?;
-    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)
+    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)?;
+    if versions.contains(&18) {
+        let epoch: i64 = sqlx::query_scalar("SELECT chain_epoch FROM qbit_prism_cluster WHERE singleton")
+            .fetch_one(&mut *connection).await
+            .context("migration 018 chain_epoch metadata is missing or unreadable; restore the full backup, never reset the epoch")?;
+        ensure!(
+            epoch >= 0,
+            "migration 018 chain_epoch is negative; restore the full backup"
+        );
+    }
+    Ok(())
 }
 
 async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSource>>
@@ -5109,7 +5151,7 @@ mod tests {
 
     #[test]
     fn a_database_at_15_names_the_orphan_disposition_in_its_capability_remedies() {
-        let at_15 = REQUIRED_SCHEMA_VERSIONS;
+        let at_15 = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let declared = [
             ("candidate_storage_version", 1),
             ("candidate_offer_lifecycle", 1),

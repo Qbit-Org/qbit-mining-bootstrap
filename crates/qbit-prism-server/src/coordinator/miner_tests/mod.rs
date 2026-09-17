@@ -43,6 +43,7 @@ pub(crate) struct Gate {
 #[derive(Default)]
 pub(crate) struct MemoryLedger {
     pub revision: AtomicI64,
+    pub chain_epoch: AtomicI64,
     pub records: StdMutex<Vec<(AcceptedShare, Option<Candidate>, i64)>>,
     pub revision_gate: StdMutex<Option<Arc<Gate>>>,
     pub append_gate: StdMutex<Option<Arc<Gate>>>,
@@ -345,7 +346,7 @@ impl Fixture {
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
-            refresh_lock: Mutex::new(None),
+            refresh_lock: Mutex::new(RefreshState::default()),
             resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
