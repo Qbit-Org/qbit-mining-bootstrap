@@ -600,6 +600,59 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
         assert!(stdout(&refused).contains(&good.hash), "{}", stdout(&refused));
         assert!(!stdout(&refused).contains("plan:"), "{}", stdout(&refused));
     }
+    // Deferred parent refusals keep their allowlist position relative to
+    // direct problems, in both planning and apply mode. A valid row between
+    // them must not affect the exit status or diagnostic order.
+    for (listed, expected_code, expected_messages) in [
+        (
+            vec![
+                orphaned.hash.as_str(),
+                &good.hash,
+                &missing,
+                &abandoned.hash,
+            ],
+            10,
+            vec![
+                "has an unfinished parent",
+                "no candidate row for",
+                "is already abandoned",
+            ],
+        ),
+        (
+            vec![
+                missing.as_str(),
+                &good.hash,
+                &orphaned.hash,
+                &abandoned.hash,
+            ],
+            2,
+            vec![
+                "no candidate row for",
+                "has an unfinished parent",
+                "is already abandoned",
+            ],
+        ),
+    ] {
+        for apply in [false, true] {
+            let mut args = allowlist(&listed);
+            if apply {
+                args.push("--apply");
+            }
+            let refused = recover(&db, &node, &args).await?;
+            let message = stderr(&refused);
+            assert_eq!(code(&refused), expected_code, "{listed:?}: {message}");
+            let positions: Vec<_> = expected_messages
+                .iter()
+                .map(|expected| message.find(expected).expect(&message))
+                .collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{message}"
+            );
+            assert_eq!(everything(&ledger.pool).await?, before);
+        }
+    }
+
     // The parent rule is satisfied by listing the parent, whatever the order.
     let ordered = recover(
         &db,

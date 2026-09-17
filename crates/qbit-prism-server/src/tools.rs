@@ -677,7 +677,7 @@ async fn plan_recovery(
         .collect();
     let listed: HashSet<&str> = hashes.iter().map(String::as_str).collect();
     let mut plan = RecoveryPlan::default();
-    let mut unlisted_parents: Vec<(String, String)> = Vec::new();
+    let mut unlisted_parents: Vec<(usize, String, String)> = Vec::new();
     for hash in hashes {
         let Some(row) = rows.get(hash.as_str()) else {
             plan.problems
@@ -795,7 +795,7 @@ async fn plan_recovery(
                     Some(_) => {}
                 }
                 if !listed.contains(parent.as_str()) {
-                    unlisted_parents.push((hash.clone(), parent.clone()));
+                    unlisted_parents.push((plan.problems.len(), hash.clone(), parent.clone()));
                 }
                 plan.blocks.push(planned(height, parent, false));
             }
@@ -804,17 +804,24 @@ async fn plan_recovery(
     if !unlisted_parents.is_empty() {
         let parents: Vec<String> = unlisted_parents
             .iter()
-            .map(|(_, parent)| parent.clone())
+            .map(|(_, _, parent)| parent.clone())
             .collect();
         let unfinished = reader.unfinished_states(&parents).await?;
-        for (child, parent) in &unlisted_parents {
+        let mut inserted = 0;
+        for (position, child, parent) in &unlisted_parents {
             if let Some((_, state)) = unfinished.iter().find(|(hash, _)| hash == parent) {
-                plan.problems.push((
-                    10,
-                    format!(
-                        "candidate {child} has an unfinished parent {parent} ({state}) that is not in the allowlist; add --block-hash {parent} so it lands first"
+                // The parent lookup is batched, but its refusal belongs at
+                // the child's allowlist position, before later problems.
+                plan.problems.insert(
+                    position + inserted,
+                    (
+                        10,
+                        format!(
+                            "candidate {child} has an unfinished parent {parent} ({state}) that is not in the allowlist; add --block-hash {parent} so it lands first"
+                        ),
                     ),
-                ));
+                );
+                inserted += 1;
             }
         }
     }
