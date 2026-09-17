@@ -1837,17 +1837,19 @@ impl Ledger {
     /// The claimed row is decoded and authenticated as the lane does it. A
     /// row that fails is not parked: its claim is released with the reason,
     /// and the refusal reports it, because the operator asked for this row
-    /// by name and decides what to do with it.
+    /// by name and decides what to do with it. The caller supplies a fresh
+    /// token and retains it to release a claim after cancellation, including
+    /// when COMMIT succeeded but its acknowledgement was not received.
     pub async fn claim_candidate_for_recovery(
         &self,
         block_hash: &str,
         lease_seconds: i64,
+        token: &str,
     ) -> Result<RecoveryClaim> {
         ensure!(
             (1..=600).contains(&lease_seconds),
             "invalid candidate lease duration"
         );
-        let token = Uuid::new_v4().to_string();
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         // The claim decision and its explanation use one database instant,
@@ -1860,7 +1862,7 @@ impl Ledger {
             CandidateState::UNFINISHED_SQL
         ))
         .bind(block_hash)
-        .bind(&token)
+        .bind(token)
         .bind(&self.instance_id)
         .bind(lease_seconds)
         .bind(claim_at)
@@ -1874,14 +1876,14 @@ impl Ledger {
         tx.commit().await?;
         // The document is O(1) but the block digest scales with the block:
         // off the runtime, as the lane keeps it.
-        let decode_token = token.clone();
+        let decode_token = token.to_owned();
         let decoded =
             tokio::task::spawn_blocking(move || decode_claimed_row(&row, decode_token)).await?;
         match decoded {
             Ok(claim) => Ok(RecoveryClaim::Claimed(Box::new(claim))),
             Err(error) => {
                 let reason = format!("operator recovery could not authenticate the row: {error:#}");
-                self.release_recovery_token(block_hash, &token, &reason)
+                self.release_recovery_token(block_hash, token, &reason)
                     .await
                     .context("releasing the recovery claim of a row that failed validation")?;
                 Ok(RecoveryClaim::Refused(
@@ -1911,7 +1913,7 @@ impl Ledger {
             .await
     }
 
-    async fn release_recovery_token(
+    pub(crate) async fn release_recovery_token(
         &self,
         block_hash: &str,
         token: &str,

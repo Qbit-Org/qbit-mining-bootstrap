@@ -823,27 +823,25 @@ async fn apply_recovery(
             "recovering {} at height {} from {}",
             block.hash, block.height, block.state
         );
-        let claimed = tokio::time::timeout_at(
-            deadline,
-            coordinator.claim_candidate_for_recovery(&block.hash),
-        )
-        .await;
+        let claimed = coordinator
+            .claim_candidate_for_recovery(&block.hash, deadline)
+            .await;
         let claim = match claimed {
-            Err(_) => {
+            Err(error) if matches!(error.downcast_ref::<RecoveryStop>(), Some(RecoveryStop::Deadline)) => {
                 return Err(Stop::Exit(
                     11,
                     format!(
-                        "recovery deadline of {timeout_seconds} seconds exceeded (claiming); candidate {} was not claimed",
+                        "recovery deadline of {timeout_seconds} seconds exceeded (claiming); candidate {} is no longer claimed by this attempt",
                         block.hash
                     ),
                 ))
             }
-            Ok(Err(error)) => return Err(Stop::Failure(error)),
-            Ok(Ok(RecoveryClaim::Refused(outcome))) => {
+            Err(error) => return Err(Stop::Failure(error)),
+            Ok(RecoveryClaim::Refused(outcome)) => {
                 let (code, message) = recover_refusal(&outcome, &block.hash)?;
                 return Err(Stop::Exit(code, message));
             }
-            Ok(Ok(RecoveryClaim::Claimed(claim))) => *claim,
+            Ok(RecoveryClaim::Claimed(claim)) => *claim,
         };
         if let Err(error) = coordinator.recover_candidate(&claim, deadline).await {
             return Err(recovery_stop(error, &block.hash, timeout_seconds));

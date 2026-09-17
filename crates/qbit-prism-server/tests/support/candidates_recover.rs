@@ -23,6 +23,9 @@ use std::{
 };
 use tokio::process::Command;
 
+#[path = "ledger_execution_proxy.rs"]
+mod execution_proxy;
+
 /// The instance ID every `--apply` run below names itself with, as the
 /// runbook recommends, so a claim it holds is legible in `candidates list`.
 const RECOVERY_INSTANCE: &str = "operator-recovery-test";
@@ -181,6 +184,10 @@ async fn answer(State(chain): State<Arc<Mutex<Chain>>>, Json(request): Json<Valu
 /// a frontend gets, with the seeds the fixtures sign with (so the rebuild is
 /// this frontend's) and the named instance the runbook recommends.
 async fn recover(db: &Database, node: &ScriptedNode, args: &[&str]) -> Result<Output> {
+    recover_at(&db.url, node, args).await
+}
+
+async fn recover_at(database_url: &str, node: &ScriptedNode, args: &[&str]) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
@@ -191,7 +198,7 @@ async fn recover(db: &Database, node: &ScriptedNode, args: &[&str]) -> Result<Ou
         .args(["candidates", "recover"])
         .args(args)
         .kill_on_drop(true)
-        .env("PRISM_DATABASE_URL", &db.url)
+        .env("PRISM_DATABASE_URL", database_url)
         .env("QBIT_RPC_URL", &node.url)
         .env("PRISM_RUNTIME_WORKERS", "2");
     if args.contains(&"--apply") {
@@ -914,6 +921,111 @@ async fn recover_apply_refuses_a_live_foreign_claim_and_leaves_the_row_untouched
     );
     assert_eq!(after["block_bytes"], before["block_bytes"]);
 
+    node.assert_never_offered();
+    assert_no_new_instances(&ledger.pool).await?;
+    db.close(vec![ledger]).await
+}
+
+/// COMMIT is durable but its reply has not reached the claimant: the
+/// deadline must release that attempt's token without touching a new owner.
+#[tokio::test]
+async fn recover_apply_releases_a_committed_claim_when_its_reply_times_out() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("frontend-a").await?;
+    let node = ScriptedNode::open().await?;
+    ledger.append(share(1), None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    sqlx::raw_sql(
+        "CREATE FUNCTION mark_recovery_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_block_candidate_outbox UPDATE'; RETURN NEW; END $$; CREATE TRIGGER mark_recovery_claim AFTER UPDATE OF claim_token ON qbit_block_candidate_outbox FOR EACH ROW EXECUTE FUNCTION mark_recovery_claim();",
+    )
+    .execute(&ledger.pool)
+    .await?;
+    let raw = url::Url::parse(&db.url)?;
+    let upstream = tokio::net::lookup_host((
+        raw.host_str().context("database URL names a host")?,
+        raw.port().unwrap_or(5432),
+    ))
+    .await?
+    .next()
+    .context("database host resolves")?;
+    let proxy = execution_proxy::ExecutionProxy::start(upstream).await?;
+    let proxied_url = proxy.rewrite_url(&db.url)?;
+
+    for (nonce, replace_claim) in [(422, false), (423, true)] {
+        let block = rebuildable(&snapshot, 101, nonce)?;
+        let hash = block.block_hash.clone();
+        ledger.enqueue_candidate(block.candidate.clone()).await?;
+        node.script(|chain| chain.extend(101, &hash, &fixture_parent()));
+        let before = whole_row(&ledger.pool, &hash).await?;
+        let pause = proxy.pause_after_commit("qbit_block_candidate_outbox", "UPDATE")?;
+        let mut args = allowlist(&[&hash]);
+        args.extend(["--apply", "--timeout-seconds", "4"]);
+        let run = recover_at(&proxied_url, &node, &args);
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                _ = pause.entered() => Ok(()),
+                output = &mut run => bail!("recovery ended before its committed claim was paused: {}", stderr(&output?)),
+            }
+        })
+        .await
+        .context("the claim COMMIT did not reach the reply barrier")??;
+        // Read directly, bypassing the proxy, to prove the claim really
+        // committed before the command's deadline fires.
+        let claimed = whole_row(&ledger.pool, &hash).await?;
+        assert!(claimed["claim_token"].is_string(), "{claimed}");
+        assert_eq!(claimed["claim_instance_id"], RECOVERY_INSTANCE);
+        assert_eq!(
+            claimed["attempt_count"],
+            before["attempt_count"].as_i64().unwrap() + 1
+        );
+        let replacement = if replace_claim {
+            sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=$2,claim_instance_id='replacement-owner',claim_expires_at=clock_timestamp()+interval '120 seconds' WHERE block_hash=$1")
+                .bind(&hash).bind(Uuid::new_v4().to_string()).execute(&ledger.pool).await?;
+            Some(whole_row(&ledger.pool, &hash).await?)
+        } else {
+            None
+        };
+        let expired = tokio::time::timeout(Duration::from_secs(20), &mut run).await??;
+        assert_eq!(code(&expired), 11, "{}", stderr(&expired));
+        assert!(
+            stderr(&expired).contains("exceeded (claiming)"),
+            "{}",
+            stderr(&expired)
+        );
+        assert!(
+            stderr(&expired).contains("is no longer claimed by this attempt"),
+            "{}",
+            stderr(&expired)
+        );
+        let after = whole_row(&ledger.pool, &hash).await?;
+        if let Some(replacement) = replacement {
+            assert_eq!(after, replacement, "cleanup changed another owner's row");
+        } else {
+            for field in ["claim_token", "claim_instance_id", "claim_expires_at"] {
+                assert_eq!(after[field], Value::Null, "{field}: {after}");
+            }
+            for field in ["state", "candidate", "block_bytes", "next_attempt_at"] {
+                assert_eq!(after[field], before[field], "cleanup changed {field}");
+            }
+            assert!(after["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("the recovery deadline expired"));
+        }
+        pause.release();
+        if !replace_claim {
+            // No wait for the old 120-second lease: the same row can be
+            // recovered immediately after the timed-out command exits.
+            let mut resumed = allowlist(&[&hash]);
+            resumed.push("--apply");
+            let done = recover(&db, &node, &resumed).await?;
+            assert_eq!(code(&done), 0, "{}", stderr(&done));
+        }
+    }
+    proxy.finish().await?;
     node.assert_never_offered();
     assert_no_new_instances(&ledger.pool).await?;
     db.close(vec![ledger]).await

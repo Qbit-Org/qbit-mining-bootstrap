@@ -1476,11 +1476,43 @@ impl Coordinator {
 
     /// Claim one row by hash for the operator recovery command (#418), with
     /// the lease every claim takes, so [`Coordinator::recover_candidate`]'s
-    /// heartbeat renews it exactly as the submit loop's does.
-    pub async fn claim_candidate_for_recovery(&self, block_hash: &str) -> Result<RecoveryClaim> {
-        self.ledger
-            .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds)
+    /// heartbeat renews it exactly as the submit loop's does. Keep the token
+    /// outside the deadline: COMMIT can succeed before its reply arrives or
+    /// before decoding finishes, so cancellation does not prove no claim.
+    pub async fn claim_candidate_for_recovery(
+        &self,
+        block_hash: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<RecoveryClaim> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let result = match tokio::time::timeout_at(
+            deadline,
+            self.ledger
+                .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds, &token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RecoveryStop::Deadline.into()),
+        };
+        if let Err(error) = &result {
+            let reason = format!("operator recovery claim stopped: {error:#}");
+            // The token fence preserves any later owner's claim. Taking
+            // the row lock also orders release after an in-flight COMMIT.
+            // Cleanup has its own bound even when the operation expired.
+            tokio::time::timeout(
+                CANDIDATE_LEASE.timeout,
+                self.ledger.release_recovery_token(block_hash, &token, &reason),
+            )
             .await
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} timed out after {error:#}; the claim may remain until its lease expires"
+            ))?
+            .with_context(|| format!(
+                "releasing the recovery claim for {block_hash} failed after {error:#}; the claim may remain until its lease expires"
+            ))?;
+        }
+        result
     }
 
     /// Land an already-accepted block for the operator recovery command
