@@ -58,6 +58,13 @@ per batch, one active batch through cleanup and 1ms collection dwell.
 
 Cases ran serially on 2026-09-17, 15:25:41–15:50:15 UTC. Order is shown below:
 400k warm AB then AB/BA/BA/AB; 500k warm BA then BA/AB/AB/BA.
+This timestamp span includes supervisor preflight and 308.957s of gaps between
+case envelopes, including 111.575s before 500k-p1-B. It is not the sum of test
+process runtimes: `/usr/bin/time` recorded 19.08–76.05s per process, while the
+supervisor's launch-to-observed-exit `elapsed_seconds` ranged 19.508–76.403s.
+The JSON `start_utc` precedes preflight snapshots; `elapsed_seconds` starts
+immediately before subprocess launch. All timings come from the retained logs
+and case metadata, without another measurement run.
 All rows completed and passed durability checks; **every row failed 1s**.
 Seconds are rounded to six decimals. p50 preserves the historical lower
 median; p95 is nearest rank (receipt index 1,899 of 2,000).
@@ -124,7 +131,9 @@ excluding PostgreSQL. Full process/memory/swap snapshots were taken about every
 
 **† 500k-p1-A has observed formatter activity.** One process sample at
 15:43:10.065 UTC saw Cargo with parent `cargo-fmt`, at 1.9%/0.9% sampled CPU.
-It occurred 35.773s into a case whose fixture load alone took 53.093s, so it
+It occurred 35.773s after subprocess launch, following the case's preflight
+(metadata start 15:42:31.232 UTC, launch clock about 15:42:34.292 UTC).
+The fixture load alone took 53.093s, so the formatter observation
 preceded delivery timing. The case is retained and labeled; there is no claim
 of guaranteed isolation or a quiet-host speedup. No rustc or other test binary
 was found in these snapshots. Six unrelated `ord`/`qord` services were present
@@ -147,8 +156,9 @@ are **not additive wall time, commit duration, lock hold time or per-job latency
 | 500k / 1 | 70.877–80.756 (8,046–8,047) | 0.001441–0.001796 (39–40) |
 | 500k / 2 | 110.648–151.449 (8,062–8,063) | 0.009555–0.032117 (48–49) |
 
-At 400k the latest refresh return accounts for 90.0–91.5% of final-client
-elapsed time; the residual is 0.313–0.365s, not an exclusive fanout phase.
+Across the eight measured 400k repetitions, excluding the two warmups, the
+latest refresh return accounts for 90.0–91.5% of final-client elapsed time;
+the residual is 0.313–0.365s, not an exclusive fanout phase.
 The ordinary observed settlement acquisition waits do not explain the seconds
 before refresh returns. Full-window build/hash work is a source-supported
 candidate, not a measured phase attribution. Build, hashing, executor scheduling,
@@ -182,12 +192,17 @@ control recovered 8 clients after 8 failed attempts and correctly retained
 
 Independent medium and thermo Opus, Fable adversarial and Sol adversarial
 reviews were static during timing. Required reporting fixes landed separately
-at `8fb465f4`: incomplete delivery remains the primary error even when validation
-fails, other frontends are still checked, received identities survive failed SQL
+at `8fb465f4`: when validation finishes within the unchanged 240s body deadline,
+incomplete delivery remains the primary error even when validation fails,
+other frontends are still checked, received identities survive failed SQL
 validation, and delivered-subset verification cannot masquerade as complete
 success. Run/progress envelopes explicitly name requested/completed topologies,
 position and control sources without renaming gates; non-Unicode controls fail.
 Received-subset quantiles remain labeled and include population counts.
+If the body deadline expires during evidence reporting or validation, the
+terminal error is the outer timeout and the final durability line may be absent.
+Any already-emitted incomplete measurement remains evidence; absent validation
+does not establish complete durable success.
 
 These reporting fixes do not reattribute the 20 frozen measurements to a later
 SHA. The follow-up release smoke passed 9 tests (4/4 DB gates), including the
@@ -205,7 +220,7 @@ any later source. Build before timing, with a dedicated disposable durable PG16
 primary and a coordinated interval. Select one topology per process to retain
 an independent result even if its paired case fails; `1,2` and `2,1` also work.
 The allowed window sizes are `16` (historical default), `400000`, `500000`;
-frontend-order values are `1`, `2`, `1,2`, `2,1` (default). Session count is fixed.
+frontend-order values are `1`, `2`, `1,2` (default), `2,1`. Session count is fixed.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --release --locked -p qbit-prism-server \
