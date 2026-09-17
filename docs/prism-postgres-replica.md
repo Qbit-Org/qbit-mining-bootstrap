@@ -1,9 +1,11 @@
 # PRISM Postgres read replica
 
-For two mining frontends, the operator load-balancer contract and the primary
-plus **one** standby promotion/ACK policy choices, see the
-[HA reference architecture](prism-ha-reference-architecture.md). Replication and
-standby-down ACK policy remain open under D3; the bundled replica is asynchronous.
+For two mining frontends, the operator TCP load-balancer contract and the approved
+D3 promotion/ACK policy, see the [HA reference architecture](prism-ha-reference-architecture.md).
+D3 selects one primary plus one **dedicated asynchronous failover standby**,
+separate from this public-read replica. ACKs require local WAL durability without
+waiting for the standby; primary loss can lose the replication gap. The bundled
+public-read replica does not provision the dedicated HA standby.
 
 `prism-public-api` runs `qbit-prism-server public-api` and serves public reads
 from a hot standby in the default Compose topology. The native process uses a
@@ -365,13 +367,16 @@ of the primary. No cluster manager or automatic promotion is configured by
 these Compose files.
 
 Native mining frontends can recover through a stable HA writer endpoint after
-promotion of a suitable synchronous standby. Configure and validate that
-replication and promotion policy using the [HA migration guide](prism-rust-migration.md).
-The database retains the same accounting history and signing configuration;
-there is no application writer lease to elect.
+promotion of the eligible dedicated standby. Follow the approved async D3
+policy, fencing and reconciliation in the [HA reference architecture](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint);
+acknowledged shares absent from the promoted replica can be lost. Preserve the
+signing configuration and reconcile the surviving accounting history; there is
+no application writer lease to elect. The [HA migration guide](prism-rust-migration.md#ha-durability-and-failover)
+also describes the distinct requirements for a no-loss policy, which D3 does not select.
 
 A public process configured with `PRISM_PUBLIC_REPLICA_MODE=require` refuses a
 server after it is promoted: it is now a writer rather than the required
-standby. Repoint the public read endpoint at the replacement standby, or
+standby. Repoint the public read endpoint at the separate public-read replica, or
 explicitly use `off` to serve bounded reads from the new primary. Keep mining
-and settlement connections on the authoritative writer endpoint.
+and settlement connections on the authoritative writer endpoint, and keep public
+queries off the dedicated HA standby.
