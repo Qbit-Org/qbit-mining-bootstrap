@@ -247,6 +247,9 @@ impl Fixture {
             );
             if execution.sql.contains("FROM qbit_share_ledger")
                 && execution.sql.contains("payout_order_key")
+                // A cutoff subquery can accompany balance payout_order_key
+                // rows. Share payload also selects its work difficulty.
+                && execution.sql.contains("share_difficulty")
             {
                 rows = rows
                     .checked_add(execution.returned_rows()?)

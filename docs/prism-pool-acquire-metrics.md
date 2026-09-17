@@ -23,9 +23,10 @@ Advisory-lock observations retain their separate standard monotonic clock.
 ## Coverage
 
 In addition to the existing ledger transaction and metrics collector
-acquisitions, the shared ledger helper covers these direct statements:
+acquisitions, these direct statements use the shared checkout timer:
 
 - `payout_revision` and `release_session_owner_reservations`;
+- `SessionId::release` and its spawned drop cleanup;
 - `worker_difficulty` and `share_accepted_at_ms`;
 - `cpfp_package` and `retired_cpfp_funding`;
 - `heartbeat` and the attached ledger's `fatal_state` read;
@@ -62,6 +63,19 @@ verification work, then acquire separately for each write transaction.
 Recording requires an attached metrics handle. Operator-only connections and
 ledgers created without telemetry continue to work without observations.
 
+Session reservations retain their creating ledger's metrics handle. Explicit
+release and background drop cleanup each time only their own checkout, before
+the unchanged token-fenced DELETE. A successful explicit release disarms drop
+cleanup and records once. An error or cancellation retains the existing drop
+fallback: if that task runs, it attempts and records a separate checkout.
+Dropping an unpolled release future records nothing for that release, but still
+spawns its background cleanup when a Tokio runtime is current. Without a current
+runtime, drop retains the reservation and records nothing. An unpolled background
+task records nothing; runtime shutdown during checkout records one failure. SQL waits and errors
+after checkout keep the successful observation. Failed cleanup can retain a
+reservation for the existing owner cleanup/reclamation paths; timing adds no
+retry, deadline or change to reservation ownership.
+
 Each durable-range boundary statement records one checkout and releases it
 before any proof refusal, blocking fold or subsequent query. Bootstrap uses
 only its existence probe; a non-inline range uses its existing page checkouts
@@ -70,20 +84,19 @@ SQL failures and boundary refusals after checkout retain a success observation.
 These probes add no transaction and do not time the SQL or the proof itself.
 
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
-Other direct coordinator, candidate, startup and session-reservation
-cleanup queries still acquire without this helper. Audit reconstruction
+Other direct coordinator, candidate and startup queries still acquire without
+this helper. Audit reconstruction
 (`audit_canonical_bytes`, the snapshot lookup in `materialize_audit_row`, and
 its range read) remains untimed, including when `audit_bundle` invokes it.
 The separate rollup transaction also remains untimed. Public API read pools and the public role's export
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
 
-Remaining startup/session and ledger-owned sites include:
+Remaining startup and ledger-owned sites include:
 
-- `ledger/connect.rs`: startup schema/capability/provenance checks and
-  `SessionId::release` plus its spawned drop cleanup. The reservation write
-  already uses `Ledger::begin`; releasing an owner's reservations already
-  uses `Ledger::acquire`.
+- `ledger/connect.rs`: startup schema/capability/provenance checks. The
+  reservation write uses `Ledger::begin`; releasing an owner's reservations
+  uses `Ledger::acquire` and remains one observation.
 - `ledger/candidates.rs`: `landed_audit` and `record_landed_audit_bits`.
 - `ledger/audit.rs`: the reconstruction reads described above;
   startup/migration validation helpers keep their existing

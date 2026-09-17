@@ -2,6 +2,7 @@ use super::*;
 
 mod payout_state;
 pub use payout_state::PayoutState;
+pub(crate) use payout_state::RefreshProbe;
 pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 
@@ -683,16 +684,6 @@ impl Ledger {
         })
     }
 
-    /// Probe the accepted cutoff without selecting share payloads. Appends
-    /// serialize under ORDER_LOCK and reject future job times, so a committed
-    /// accepted row is eligible at the next snapshot's ledger-clock barrier.
-    pub(crate) async fn latest_accepted_share_seq(&self) -> Result<u64> {
-        let cutoff: i64 = sqlx::query_scalar(ACCEPTED_CUTOFF_SQL)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(u64::try_from(cutoff)?)
-    }
-
     /// Captures all three inputs under the same database boundary: ordered
     /// shares, prior balances and their revision. Timestamp barriers preserve
     /// the existing public audit format without relying on host clock sync.
@@ -803,9 +794,10 @@ pub(super) async fn read_prior_balances(
     tokio::task::spawn_blocking(move || decode_prior_balances(rows)).await?
 }
 
+const PRIOR_BALANCE_SQL: &str = "SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()";
+
 async fn prior_balance_rows(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query("SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()")
-        .fetch_all(&mut **tx).await
+    sqlx::query(PRIOR_BALANCE_SQL).fetch_all(&mut **tx).await
 }
 
 fn decode_prior_balances(rows: Vec<PgRow>) -> Result<Vec<CarryForwardBalance>> {

@@ -34,6 +34,7 @@ mod bundle_build;
 mod chain_observation;
 mod compact_resume;
 mod compact_runtime;
+mod issued_batcher;
 mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
@@ -229,6 +230,7 @@ pub struct Coordinator {
     pub observed_tip: Arc<RwLock<TipState>>,
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
+    issued_batcher: issued_batcher::IssuedBatcher,
     pub last_error: RwLock<Option<String>>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
@@ -712,6 +714,7 @@ impl Coordinator {
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
             ledger,
             rpc,
             refresh,
@@ -968,8 +971,12 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let state = self.work_ledger.payout_state().await?;
-        let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
+        let probe = self
+            .work_ledger
+            .refresh_probe(crate::ledger::ReadAdmission::default())
+            .await?;
+        let state = probe.payout_state;
+        let share_seq = probe.accepted_share_seq;
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
@@ -1046,9 +1053,16 @@ impl Coordinator {
         // fresh snapshot would be read. Later shares belong to the next window;
         // the selected WindowRef remains immutable through build/publication.
         let reuse_window = if let Some(window) = cached_window.as_ref() {
-            let state = self.work_ledger.payout_state().await?;
-            let share_seq = self.work_ledger.latest_accepted_share_seq().await?;
-            window.reusable(network, share_seq, state, self.config.snapshot_interval)
+            let probe = self
+                .work_ledger
+                .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
+                .await?;
+            window.reusable(
+                network,
+                probe.accepted_share_seq,
+                probe.payout_state,
+                self.config.snapshot_interval,
+            )
         } else {
             false
         };
