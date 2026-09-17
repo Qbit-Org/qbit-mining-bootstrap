@@ -2438,6 +2438,21 @@ pub async fn restore(
 
     let mut attached = false;
     if attach {
+        // Per-leaf uniqueness does not detect IDs in another partition, and
+        // rejected rows have no global hash mapping. Drain and fence appends
+        // through commit so none can race this check and the attachment.
+        ledger.lock(&mut tx, ORDER_LOCK).await?;
+        let duplicate: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT restored.share_id FROM {partition_name} restored \
+             JOIN {PARENT} live ON live.share_id=restored.share_id LIMIT 1"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(share_id) = duplicate {
+            bail!(
+                "refusing to attach {partition_name}: duplicate share_id {share_id} already exists in an attached partition. Restore without --attach to inspect the archive"
+            );
+        }
         let from = lower
             .map(|lower| lower.to_string())
             .unwrap_or_else(|| "MINVALUE".into());

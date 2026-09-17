@@ -2025,6 +2025,123 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
     }
 }
 
+/// Per-leaf uniqueness cannot protect an import from IDs in other leaves,
+/// including rejected rows and a competing append that has not committed yet.
+#[tokio::test]
+async fn restore_import_rejects_duplicate_share_ids() -> Result<()> {
+    for (accepted, concurrent) in [(true, false), (false, false), (true, true)] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("restore-import-id").await?;
+            let root = tempfile::tempdir()?;
+            let seq = if accepted { 10 } else { 11 };
+            insert_shares(&ledger.pool, seq, seq, 1, "archive-history", 7200.0).await?;
+            let row: Value = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s WHERE share_seq=$1")
+                .bind(seq)
+                .fetch_one(&ledger.pool)
+                .await?;
+            let share_id = row["share_id"].as_str().context("missing share ID")?;
+            move_horizon_past_p0(&ledger.pool).await?;
+            archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+            let manifest_path = PathBuf::from(
+                catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
+            );
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}; DROP TABLE {P0}; \
+                 DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'; \
+                 DELETE FROM qbit_prism_share_hashes"
+            ))
+            .execute(&ledger.pool)
+            .await?;
+
+            let mut writer = ledger.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(0x505249534d000002_i64)
+                .execute(&mut *writer)
+                .await?;
+            let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *writer)
+                .await?;
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger SELECT * FROM jsonb_populate_record(\
+                 NULL::qbit_share_ledger,$1::jsonb || jsonb_build_object('share_seq',\
+                 nextval(pg_get_serial_sequence('qbit_share_ledger','share_seq'))))",
+            )
+            .bind(&row)
+            .execute(&mut *writer)
+            .await?;
+            if accepted {
+                sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,$2)")
+                    .bind(hex::encode(Sha256::digest(share_id.as_bytes())))
+                    .bind(share_id)
+                    .execute(&mut *writer)
+                    .await?;
+            }
+            let imported = if concurrent {
+                let (imported, written) = tokio::join!(
+                    archive::restore(&ledger, &manifest_path, root.path(), true),
+                    async {
+                        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            loop {
+                                let blocked: bool = sqlx::query_scalar(
+                                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                                )
+                                .bind(writer_pid)
+                                .fetch_one(&db.admin)
+                                .await?;
+                                if blocked {
+                                    return Ok::<(), anyhow::Error>(());
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await;
+                        writer.commit().await?;
+                        waiting.context("the import never waited for the competing append")??;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                );
+                written?;
+                imported
+            } else {
+                writer.commit().await?;
+                archive::restore(&ledger, &manifest_path, root.path(), true).await
+            };
+            let error = imported
+                .expect_err("imported a share ID already present in another partition")
+                .to_string();
+            ensure!(error.contains("duplicate share_id") && error.contains(share_id), "{error}");
+            let unchanged: bool = sqlx::query_scalar(
+                "SELECT to_regclass($1) IS NULL \
+                 AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_partitions WHERE partition_name=$1) \
+                 AND (SELECT count(*) FROM qbit_share_ledger WHERE share_id=$2)=1 \
+                 AND (SELECT count(*) FROM qbit_prism_share_hashes)=$3",
+            )
+            .bind(P0)
+            .bind(share_id)
+            .bind(i64::from(accepted))
+            .fetch_one(&ledger.pool)
+            .await?;
+            ensure!(unchanged, "the refused duplicate import changed the destination");
+            // Inspection-only restore does not publish the duplicate row.
+            let restored = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+            ensure!(restored["attached"] == false && restored["row_count"] == 1, "{restored}");
+            Ok(ledger)
+        }
+        .await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An import must not advance maintenance's covered bound past an unfilled
 /// range. Refusal leaves the boundary routable once maintenance creates its
 /// lead, and the same archive can then be imported adjacent to that lead.
