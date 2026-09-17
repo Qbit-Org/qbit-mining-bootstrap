@@ -80,6 +80,32 @@ as the snapshot and `self-check` heartbeat staleness budgets, both
 from 1 through 86400 seconds (default 2).
 The public API remains a separate process and does not need signing seeds.
 
+## Share ledger partition maintenance
+
+`qbit_share_ledger` is partitioned by `share_seq` and has no DEFAULT
+partition, so an append whose sequence value has run past the last attached
+bound is refused by PostgreSQL. Every frontend keeps the lead attached by
+calling `qbit_prism_share_partition_ensure()` once at startup and then every
+`PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS`, a whole number from 1
+through 86400 seconds (default 60). The call is serialized per schema, so
+running several frontends creates each partition once, and it creates nothing
+while the lead is intact; a run that creates partitions logs at info, and one
+that fails logs at warning and is retried on the next tick without ending the
+task.
+
+A server whose startup call fails does not start: an instance that cannot
+maintain its partitions must not accept shares until its lead runs out. The
+width of a partition and how many are kept ahead of the sequence are database
+settings, not environment settings; they live in the one row of
+`qbit_prism_share_partitioning` (default 2^24 rows and 4 partitions, about
+67 million rows of headroom). See
+[prism-share-ledger-partitioning.md](prism-share-ledger-partitioning.md) for
+the design record and
+[prism-ledger-ops.md](prism-ledger-ops.md#share-ledger-partitions-and-retention)
+for the operator procedure. `qbit_prism_share_ledger_partition_lead_rows`
+in `/metrics` reports the remaining headroom; see
+[prism-native-metrics.md](prism-native-metrics.md).
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name

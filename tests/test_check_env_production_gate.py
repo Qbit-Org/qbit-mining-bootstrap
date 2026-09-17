@@ -13,6 +13,9 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CHECK_ENV = ROOT_DIR / "scripts" / "check-env.sh"
 FAKE_PUBLIC_VALIDATION = ('if [ "$1" = compose ]; then\n'
+                          # Compose consumes the piped overlay. Exiting before
+                          # reading it can SIGPIPE the producer under pipefail.
+                          '  case " $* " in *" -f - "*) cat >/dev/null ;; esac\n'
                           '  echo "PRISM public database configuration valid; authentication is checked by readiness"\n'
                           'fi\n')
 class CheckEnvProductionGateTests(unittest.TestCase):
@@ -105,6 +108,23 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             '#!/bin/sh\n' + FAKE_PUBLIC_VALIDATION + f'exit {exit_code}\n', encoding="utf-8")
         docker.chmod(0o755)
         return fake_bin
+
+    def test_public_validation_fixture_consumes_compose_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            docker = self.write_fake_docker(Path(temp_dir)) / "docker"
+            # More than a pipe buffer makes an early reader exit deterministic,
+            # instead of depending on scheduling of the small real overlay.
+            result = subprocess.run(
+                [
+                    "/bin/bash", "-o", "pipefail", "-c",
+                    'printf "%1048576s" "" | "$1" compose -f -',
+                    "fixture-overlay", str(docker),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PRISM public database configuration valid", result.stdout)
 
     def production_testnet4_env(self, root: Path) -> dict[str, str]:
         checkout, commit = self.write_pinned_qbit_checkout(root)

@@ -41,10 +41,12 @@ pub struct Fixture {
     admin: PgPool,
     schema: String,
     settings: Value,
+    shares: u64,
+    run_context: Value,
 }
 
 impl Fixture {
-    async fn open(raw: &str, count: usize) -> Result<Self> {
+    async fn open(raw: &str, count: usize, shares: u64, run_context: Value) -> Result<Self> {
         ensure!((1..=2).contains(&count));
         let admin = PgPoolOptions::new().max_connections(2).connect(raw).await?;
         let row = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes, current_setting('synchronous_commit') AS synchronous_commit")
@@ -84,6 +86,8 @@ impl Fixture {
             admin,
             schema,
             settings,
+            shares,
+            run_context,
         };
         let opened = async {
             for index in 0..count {
@@ -100,11 +104,14 @@ impl Fixture {
                     .frontends
                     .push(Coordinator::new(config, Arc::new(Metrics::default())).await?);
             }
-            window_fixture::WindowPlan::new(SHARES)?
-                .load(&fixture.direct, "b275")
-                .await?;
+            let plan = window_fixture::WindowPlan::new(shares)?;
+            let load = plan.load(&fixture.direct, "b275").await?;
+            plan.verify_round_trip(&fixture.direct, &[1, shares.div_ceil(2), shares]).await?;
+            sqlx::query("ANALYZE qbit_share_ledger").execute(&fixture.direct).await?;
+            println!("B275_FIXTURE {}", json!({"shares":load.rows,"serialized_bytes":load.serialized_bytes,"serialized_bytes_source":"WindowPlan modeled native shares; not measured SQL storage bytes","payout_recipients":5,"payout_order_keys":1,"load_seconds":load.seconds,"sampled_round_trip":true,"analyzed":true,"schema":fixture.schema,"node_endpoint":fixture.node.url,"run_context":fixture.run_context}));
             for frontend in &fixture.frontends {
                 frontend.refresh_once().await?;
+                ensure!(frontend.prepared.read().await.as_ref().and_then(|p| p.window.shares).is_some_and(|r| r.share_count == shares), "initial prepared window has wrong share count");
                 fixture
                     .listeners
                     .push(socket::Listener::start(frontend).await?);
@@ -195,8 +202,18 @@ pub async fn run(
     frontends: usize,
     body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
 ) -> Result<()> {
+    run_window(raw, frontends, SHARES, json!({"frontend_order":[frontends],"topology_position":0,"fixture_shares":SHARES,"control_source":"fixed regression fixture"}), body).await
+}
+
+pub async fn run_window(
+    raw: &str,
+    frontends: usize,
+    shares: u64,
+    run_context: Value,
+    body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
+) -> Result<()> {
     let _serial = SERIAL.lock().await;
-    let fixture = Fixture::open(raw, frontends).await?;
+    let fixture = Fixture::open(raw, frontends, shares, run_context).await?;
     let case_deadline = Instant::now() + Duration::from_secs(240);
     let result = AssertUnwindSafe(timeout_at(case_deadline, body(&fixture, case_deadline)))
         .catch_unwind()
@@ -324,9 +341,10 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
     let complete = seconds.len() == sessions && refresh_errors.is_empty() && failure_free;
     let max = seconds.last().copied();
     let report = json!({
-        "schema":"b275.delivery.v3", "historical_baseline_sha":HISTORICAL_BASELINE,
+        "schema":"b275.delivery.v4", "historical_baseline_sha":HISTORICAL_BASELINE,
         "frontends":frontends,"sessions_total":sessions,"sessions_per_frontend":sessions/frontends,
-        "fixture_shares":SHARES,"database":fixture.settings,
+        "fixture_shares":fixture.shares,"database":fixture.settings,
+        "run_context":fixture.run_context,
         "runtime_threads":tokio::runtime::Handle::current().metrics().num_workers(),
         "frontend_settings":fixture.frontends.iter().zip(&fixture.listeners).map(|(f,l)| json!({"build_workers":f.config.build_workers,"database_connections":f.config.database_connections,"listener":l.settings})).collect::<Vec<_>>(),
         "delivery_attempt_deltas_per_frontend":delivery_attempts,"delivery_failure_free":failure_free,
@@ -334,6 +352,9 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         "deadline_seconds":120,"effective_delivery_budget_seconds":deadline.saturating_duration_since(start).as_secs_f64(),"received":seconds.len(),"complete":complete,
         "refresh_return_seconds":refreshes.iter().map(|r| r.as_ref().ok().copied()).collect::<Vec<_>>(),
         "p50_delivery_seconds":seconds.get(seconds.len().saturating_sub(1)/2),
+        "p95_delivery_seconds":seconds.get((seconds.len()*95).div_ceil(100).saturating_sub(1)),
+        "quantiles":"p50 lower median (historical definition); p95 nearest rank; received clients only",
+        "quantile_population":{"received":seconds.len(),"requested":sessions},
         "max_observed_delivery_seconds":max,
         "all_sessions_within_one_second":complete && max.is_some_and(|s| s <= 1.0),
         "refresh_errors":refresh_errors,"delivery_errors":delivery_errors,
@@ -343,50 +364,63 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
         "performance_acceptance":"not established by this harness result alone"
     });
     println!("B275_MEASUREMENT {report}");
-    ensure!(complete, "incomplete delivery measurement: {report}");
+    // join_all preserves the clients vector's order despite unordered logins.
+    // Retain every receipt even if a later SQL read cannot validate its identity.
+    println!(
+        "B275_RECEIVED_CHILDREN {}",
+        json!({"durability":"not yet checked",
+        "children":deliveries.iter().zip(&clients).filter_map(|((frontend, result),(_, client))| {
+            result.as_ref().ok().map(|(job_id, seconds)| json!({"frontend":frontend,"job_id":job_id,
+                "delivery_seconds":seconds,"subscribed_username":client.username,
+                "subscribed_extranonce1":client.extranonce1,"subscribed_extranonce2_size":client.extranonce2_size}))
+        }).collect::<Vec<_>>()})
+    );
+    let mut validation_errors = Vec::new();
     let mut ids = HashSet::new();
-    for (_, received) in &deliveries {
-        ensure!(
-            ids.insert(received.as_ref().unwrap().0.clone()),
-            "duplicate job ID"
-        );
+    for (_, received) in deliveries.iter().filter(|(_, r)| r.is_ok()) {
+        if !ids.insert(received.as_ref().unwrap().0.clone()) {
+            validation_errors.push("duplicate delivered job ID".to_owned());
+        }
     }
     // All SQL validation is after the measurement bracket, using a separate
     // uninstrumented pool. Confirm actual durable rows, not just notifications.
     for (index, frontend) in fixture.frontends.iter().enumerate() {
+        let validation = async {
         let prepared = frontend
             .prepared
             .read()
             .await
             .clone()
             .context("no prepared work")?;
-        ensure!(prepared.template["previousblockhash"] == parent);
+        ensure!(prepared.template["previousblockhash"] == parent, "frontend did not publish the measured parent");
         ensure!(
             prepared
                 .window
                 .shares
                 .context("no window range")?
                 .share_count
-                == SHARES
+                == fixture.shares,
+            "prepared window has wrong share count"
         );
         let original = frontend
             .ledger
             .compact_prepared(&prepared.storage_key)
             .await?
             .context("durable prepared record missing")?;
-        ensure!(original.record.payout_revision == prepared.snapshot.payout_revision);
-        ensure!(original.record.window == prepared.window);
+        ensure!(original.record.payout_revision == prepared.snapshot.payout_revision, "durable prepared revision differs");
+        ensure!(original.record.window == prepared.window, "durable prepared window differs");
         let hashes = original
             .record
             .audit_hashes
             .as_ref()
             .context("audit hashes absent")?;
         ensure!(
-            hashes.audit_bundle_sha256.len() == 64 && hashes.coinbase_manifest_sha256.len() == 64
+            hashes.audit_bundle_sha256.len() == 64 && hashes.coinbase_manifest_sha256.len() == 64,
+            "prepared audit hashes have wrong length"
         );
         let jobs: Vec<_> = deliveries
             .iter()
-            .filter(|(f, _)| *f == index)
+            .filter(|(f, r)| *f == index && r.is_ok())
             .map(|(_, r)| r.as_ref().unwrap().0.clone())
             .collect();
         let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id=ANY($1) AND parent_hash=$2 AND payout_revision=$3 AND payload->>'prepared_key'=$4 AND expires_at>clock_timestamp()")
@@ -395,13 +429,58 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
             valid as usize == jobs.len(),
             "issued rows lost prepared identity or revision"
         );
+        let rows = sqlx::query("SELECT job_id, instance_id, payload, (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+            .bind(&jobs).fetch_all(&fixture.direct).await?;
+        let rows: BTreeMap<String, _> = rows
+            .into_iter()
+            .map(|row| Ok((row.try_get("job_id")?, row)))
+            .collect::<Result<_>>()?;
+        let mut children = Vec::new();
+        for ((owner, received), (_, client)) in deliveries.iter().zip(&clients) {
+            if *owner != index {
+                continue;
+            }
+            let Ok((job_id, seconds)) = received else {
+                continue;
+            };
+            let row = rows
+                .get(job_id)
+                .context("delivered child missing durable row")?;
+            let payload: Value = row.try_get("payload")?;
+            ensure!(
+                row.try_get::<String, _>("instance_id")? == frontend.config.instance_id,
+                "child belongs to another frontend"
+            );
+            ensure!(
+                payload["worker"]["username"] == client.username
+                    && payload["extranonce1"] == client.extranonce1
+                    && payload["extranonce2_size"] == client.extranonce2_size,
+                "durable child differs from subscribed client: {job_id}"
+            );
+            ensure!(
+                payload["expires_at_ms"] == row.try_get::<i64, _>("expires_at_ms")?,
+                "child expiry differs from durable row"
+            );
+            children.push(
+                json!({"job_id":job_id,"delivery_seconds":seconds,"subscribed_username":client.username,"subscribed_extranonce1":client.extranonce1,"subscribed_extranonce2_size":client.extranonce2_size,"durable_payload":payload}),
+            );
+        }
+        println!(
+            "B275_CHILD_IDENTITIES {}",
+            json!({"frontend":index,"children":children})
+        );
         let issued: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE instance_id=$1 AND parent_hash=$2 AND payload ? 'prepared_key'")
             .bind(&frontend.config.instance_id).bind(&parent).fetch_one(&fixture.direct).await?;
         println!(
             "B275_ISSUED_ROWS {}",
-            json!({"frontend":index,"delivered":jobs.len(),"issued_rows":issued,"unmatched_rows":issued-valid})
+            json!({"frontend":index,"delivered":jobs.len(),"issued_rows":issued,
+                "unmatched_rows":complete.then_some(issued-valid),
+                "observed_issued_minus_valid":issued-valid,"delivery_complete":complete,
+                "scope":"post-bracket count; incomplete listeners may still commit rows"})
         );
-        ensure!(issued == valid, "committed issued rows were not delivered");
+        if complete {
+            ensure!(issued == valid, "committed issued rows were not delivered");
+        }
         let after = frontend
             .ledger
             .compact_prepared(&prepared.storage_key)
@@ -411,9 +490,62 @@ pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant
             after.record == original.record,
             "readback rewrote immutable prepared bytes"
         );
+        Ok::<_, anyhow::Error>(())
+        }.await;
+        if let Err(error) = validation {
+            let error = format!("frontend {index}: {error:#}");
+            println!(
+                "B275_DURABILITY_ERROR {}",
+                json!({"frontend":index,"error":error,"validation":"failed or unavailable"})
+            );
+            validation_errors.push(error);
+        }
     }
-    println!("B275_DURABILITY frontends={frontends} sessions={sessions} verified=true");
+    println!(
+        "B275_DURABILITY {}",
+        json!({"frontends":frontends,"sessions":sessions,
+        "delivered":seconds.len(),"delivery_complete":complete,
+        "delivered_subset_verified":validation_errors.is_empty(),
+        "verified":complete&&validation_errors.is_empty(),"validation_errors":validation_errors})
+    );
+    delivery_outcome(complete, &report, &validation_errors)
+}
+
+fn delivery_outcome(complete: bool, report: &Value, validation_errors: &[String]) -> Result<()> {
+    ensure!(complete, "incomplete delivery measurement: {report}; durable validation errors: {validation_errors:?}");
+    ensure!(
+        validation_errors.is_empty(),
+        "delivery durability validation failed: {validation_errors:?}; measurement: {report}"
+    );
     Ok(())
+}
+
+#[test]
+fn incomplete_delivery_keeps_primary_failure_when_validation_also_fails() {
+    for received in [0, 1] {
+        let report = json!({"received":received,"complete":false,"refresh_errors":["refresh deadline elapsed"]});
+        let error = delivery_outcome(false, &report, &["old prepared parent".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("incomplete delivery measurement:"));
+        assert!(error.contains("refresh deadline elapsed"));
+        assert!(error.contains("old prepared parent"));
+    }
+    assert!(delivery_outcome(false, &json!({"received":1}), &[]).is_err());
+}
+
+#[test]
+fn complete_receipts_do_not_hide_durable_identity_failure() {
+    let error = delivery_outcome(
+        true,
+        &json!({"received":2}),
+        &["child identity mismatch".into()],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("delivery durability validation failed:"));
+    assert!(error.contains("child identity mismatch"));
+    assert!(delivery_outcome(true, &json!({"received":2}), &[]).is_ok());
 }
 
 pub async fn landing_lock(fixture: &Fixture) -> Result<()> {

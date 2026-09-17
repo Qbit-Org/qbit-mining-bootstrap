@@ -41,6 +41,10 @@ This is useful for reviewers and operators who need implementation detail:
   Python 2.x, native multi-instance operation, and rollback.
 - [prism-ledger-ops.md](prism-ledger-ops.md): native ledger invariants,
   transaction ordering, retention, and readiness probes.
+- [prism-share-ledger-partitioning.md](prism-share-ledger-partitioning.md):
+  the design record for share ledger partitioning and retention (#144): the
+  online horizon, the sealing rule, the conversion, the archive format, and
+  every native reader against the partition key.
 - [prism-native-metrics.md](prism-native-metrics.md): native cutover metric
   inventory, measurement boundaries, and failure semantics.
 - [prism-overload-alerts.md](prism-overload-alerts.md): specification for

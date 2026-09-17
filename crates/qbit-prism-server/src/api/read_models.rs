@@ -168,40 +168,13 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
             "unknown PRISM block"
         }));
     }
-    if !value["share_snapshot_sha256"].is_null() {
-        // A native body is rebuilt from its share snapshot and its canonical
-        // digest is recomputed, both proportional to the window. That work
-        // runs after the read connections are released, so it shares the
-        // read concurrency through the same limit as an imported decode. The
-        // permit is taken here, before `materialize_audit_row`, so it also
-        // spans that call's snapshot lookup and window read, the two database
-        // round trips that precede the blocking job: the limit bounds a
-        // native row's database work as well as its CPU work. The permit
-        // moves into the blocking job: a dropped request cannot free it
-        // before the rebuild ends. Waiting for it spends the request's own
-        // deadline.
-        let permit = state
-            .audit_decodes
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal())?;
-        crate::ledger::materialize_audit_row(&state.pool, &mut value, Some(permit))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error,"audit snapshot reconstruction failed");
-                audit_read_error(error)
-            })?;
-        // The digest was checked against `audit_bundle_sha256` by the rebuild;
-        // the query above always projects that column, so a native row that
-        // reached here has proven its canonical bytes.
-        if value["audit_bundle_sha256"].as_str().is_none() {
-            return Err(ApiError::internal());
-        }
-    } else if value["has_canonical_audit_bytes"] == true {
-        // Imported canonical bytes are authoritative over any inline or
-        // filesystem copy, so the query above projected no inline body for
-        // them. A corrupt value refuses the row; it never falls back to
+    if value["has_canonical_audit_bytes"] == true {
+        // Stored canonical bytes are authoritative over any inline or
+        // filesystem copy and over a reconstruction, whatever the row's
+        // shape, so the query above projected no inline body for them. A
+        // native row is sealed before its shares are archived (#144), and
+        // after the detach only these bytes can still serve its advertised
+        // digest. A corrupt value refuses the row; it never falls back to
         // body_uri, even when that file still exists.
         //
         // The bytes and their decode outlive the read connection, so the
@@ -234,9 +207,39 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
                 crate::ledger::decode_canonical_audit_body(bytes, expected, Some(permit))
                     .await
                     .map_err(|error| {
-                        tracing::warn!(%error,"imported canonical audit decode failed");
+                        tracing::warn!(%error,"stored canonical audit decode failed");
                         audit_read_error(error)
                     })?;
+        }
+    } else if !value["share_snapshot_sha256"].is_null() {
+        // An unsealed native body is rebuilt from its share snapshot and its
+        // canonical digest is recomputed, both proportional to the window.
+        // That work runs after the read connections are released, so it
+        // shares the read concurrency through the same limit as a stored
+        // decode. The permit is taken here, before `materialize_audit_row`,
+        // so it also spans that call's snapshot lookup and window read, the
+        // two database round trips that precede the blocking job: the limit
+        // bounds a native row's database work as well as its CPU work. The
+        // permit moves into the blocking job: a dropped request cannot free
+        // it before the rebuild ends. Waiting for it spends the request's own
+        // deadline.
+        let permit = state
+            .audit_decodes
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        crate::ledger::materialize_audit_row(&state.pool, &mut value, Some(permit))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error,"audit snapshot reconstruction failed");
+                audit_read_error(error)
+            })?;
+        // The digest was checked against `audit_bundle_sha256` by the rebuild;
+        // the query above always projects that column, so a native row that
+        // reached here has proven its canonical bytes.
+        if value["audit_bundle_sha256"].as_str().is_none() {
+            return Err(ApiError::internal());
         }
     }
     if value["audit_bundle"].is_null() {
@@ -529,7 +532,54 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     let hash:Option<String>=sqlx::query_scalar("SELECT a.block_hash FROM qbit_pool_audit_bundles a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1").fetch_optional(&state.pool).await?;
     let hash = hash.ok_or_else(|| ApiError::missing("no PRISM evidence has been produced"))?;
     let body = bundle(state, &hash, false).await?;
-    let counts:Value=sqlx::query_scalar("SELECT jsonb_build_object('accepted_share_count',count(*),'distinct_miner_count',count(DISTINCT miner_id)) FROM qbit_share_ledger WHERE accepted").fetch_one(&state.pool).await?;
+    // Both counts are lifetime-scoped, and the share ledger is partitioned
+    // with a retention path since #144: a `count(*)` over the online rows
+    // would start falling the first time a partition is detached. The
+    // permanent daily rollups hold every share the sweep has folded, and the
+    // rollup watermark is one of the conditions a partition must clear before
+    // it may leave, so "rollups up to the watermark plus the raw rows above
+    // it" is exact and stays exact after a detach. A database whose rollups
+    // have never run has no `qbit_hashrate_rollup_progress` row; it reads the
+    // raw lifetime counts as before, which is also correct because nothing
+    // can have been detached yet.
+    let rollups_present: bool = sqlx::query_scalar("SELECT to_regclass('qbit_hashrate_rollup_progress') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_pool') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_miner') IS NOT NULL")
+        .fetch_one(&state.pool).await?;
+    let counts: Value = sqlx::query_scalar(if rollups_present {
+        "WITH progress AS (
+             SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton
+         ), watermark AS (
+             SELECT COALESCE((SELECT last_share_seq FROM progress),0) AS last_share_seq,
+                    EXISTS(SELECT 1 FROM progress) AS ready
+         ), rolled AS (
+             SELECT COALESCE(sum(rollup.accepted_share_count),0)::bigint AS accepted_share_count
+             FROM qbit_hashrate_rollup_pool rollup, watermark
+             WHERE watermark.ready AND rollup.grain_seconds=86400
+         ), tail AS (
+             SELECT count(*) AS accepted_share_count
+             FROM qbit_share_ledger ledger, watermark
+             WHERE ledger.accepted
+               AND (NOT watermark.ready OR ledger.share_seq>watermark.last_share_seq)
+         ), miners AS (
+             SELECT count(*) AS distinct_miner_count FROM (
+                 SELECT rollup.miner_id
+                 FROM qbit_hashrate_rollup_miner rollup, watermark
+                 WHERE watermark.ready AND rollup.grain_seconds=86400
+                 UNION
+                 SELECT ledger.miner_id
+                 FROM qbit_share_ledger ledger, watermark
+                 WHERE ledger.accepted
+                   AND (NOT watermark.ready OR ledger.share_seq>watermark.last_share_seq)
+             ) distinct_miners
+         )
+         SELECT jsonb_build_object(
+             'accepted_share_count',
+             (SELECT accepted_share_count FROM rolled)+(SELECT accepted_share_count FROM tail),
+             'distinct_miner_count',(SELECT distinct_miner_count FROM miners))"
+    } else {
+        "SELECT jsonb_build_object('accepted_share_count',count(*),'distinct_miner_count',count(DISTINCT miner_id)) FROM qbit_share_ledger WHERE accepted"
+    })
+    .fetch_one(&state.pool)
+    .await?;
     let payout_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM qbit_pool_payout_entries WHERE block_hash=$1")
             .bind(&hash)

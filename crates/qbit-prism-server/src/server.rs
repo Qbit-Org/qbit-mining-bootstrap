@@ -17,6 +17,7 @@ const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
 pub async fn run(config: Config) -> Result<()> {
     let rollup_settings = crate::rollups::settings_from_env()?;
+    let partition_settings = crate::partitions::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
     // Validate both listeners before coordinator startup can write cluster state.
@@ -24,6 +25,17 @@ pub async fn run(config: Config) -> Result<()> {
     let mut api_config = ApiConfig::from_env()?;
     let registry = Arc::new(metrics::Metrics::default());
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    // The share ledger has no DEFAULT partition, so an append whose sequence
+    // value has run past the last attached bound is refused (#144). Attaching
+    // the lead is a precondition of serving, not a background convenience: an
+    // instance that cannot maintain its partitions must refuse to start
+    // rather than accept shares until the lead runs out.
+    let attached = crate::partitions::ensure(&coordinator.ledger.pool)
+        .await
+        .context("attach the share ledger partition lead at startup")?;
+    if attached > 0 {
+        tracing::info!(created = attached, "share ledger partitions attached");
+    }
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
     let primary = TcpListener::bind((
@@ -136,6 +148,14 @@ pub async fn run(config: Config) -> Result<()> {
             ),
         ));
     }
+    tasks.spawn(runtime.track(
+        TaskKind::SharePartitions,
+        crate::partitions::run(
+            coordinator.ledger.pool.clone(),
+            partition_settings,
+            shutdown_rx.clone(),
+        ),
+    ));
     if let Some(listener) = api_listener {
         let mut rx = shutdown_rx.clone();
         let router = crate::api::router(api_state.clone());

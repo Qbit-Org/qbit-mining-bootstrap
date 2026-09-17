@@ -400,6 +400,19 @@ jobs:
             ${{ env.PRISM_TEST_LOG }}
           if-no-files-found: error
 
+      - name: Upload share-append throughput diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-throughput-shard-${{ matrix.shard }}
+          overwrite: true
+          # The owning shard writes this even when the throughput floor fails.
+          # Keep it separate so gate-manifest download paths stay unchanged.
+          path: target/prism-postgres-throughput-share_append_throughput_floor.json
+          # Other shards do not run this target; an earlier failure may also
+          # prevent the owning shard from reaching it.
+          if-no-files-found: ignore
+
   prism-integration-proof:
     name: Prove every Rust PRISM gated test executed
     if: ${{ !cancelled() }}

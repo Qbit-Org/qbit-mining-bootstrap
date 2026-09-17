@@ -70,7 +70,7 @@ labels!(TaskKind {
     Refresh => "refresh", Submit => "submit", BlockWait => "block_wait",
     Broadcast => "broadcast", Rollup => "rollup", HealthPublisher => "health_publisher",
     StratumListener => "stratum_listener", StratumSession => "stratum_session",
-    Collector => "collector"
+    Collector => "collector", SharePartitions => "share_partitions"
 });
 labels!(RejectReason {
     StaleJob => "stale-job", DuplicateShare => "duplicate-share", LowDifficulty => "low-difficulty",

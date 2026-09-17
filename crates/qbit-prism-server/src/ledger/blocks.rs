@@ -192,7 +192,19 @@ impl Ledger {
                 "ALERT: landing an as-issued audit whose prior balances differ from the current canonical balances; the block's issued accounts are recorded as evidence and the additive balances carry the difference"
             );
         }
-        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,as_issued_audit_sha256) VALUES($1,$2,$3,$4,$5,$6)")
+        // Solver attribution is recorded on the block row, once, here (#144).
+        // Four dashboard queries used to suffix-match every block's hash
+        // against the ledger on every request; a partition detach would blank
+        // a historical block's solver, and migration 015 backfilled the same
+        // lookup into these columns. The subselect is the expression 015 used,
+        // served by `qbit_share_ledger_accepted_block_suffix_idx`, and it
+        // carries no probe floor on purpose: a landing delayed by
+        // reconciliation may be older than the floor, and landings are rare
+        // enough that the unbounded descent costs nothing. A block with no
+        // matching accepted share (the bootstrap and below-target paths, where
+        // the proof is not a credited share) lands with the four columns NULL,
+        // which is what the readers' LATERAL fallback covers.
+        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,as_issued_audit_sha256,solver_miner_id,solver_share_id,solver_share_difficulty,solver_network_difficulty) SELECT $1,$2,$3,$4,$5,$6,solver.miner_id,solver.share_id,solver.share_difficulty,solver.network_difficulty FROM (VALUES (1)) AS block_row(one) LEFT JOIN LATERAL (SELECT share.miner_id,share.share_id,share.share_difficulty,share.network_difficulty FROM qbit_share_ledger share WHERE share.accepted AND length(share.share_id)>=65 AND lower(right(share.share_id,64))=$1 ORDER BY share.accepted_at DESC,share.share_seq DESC LIMIT 1) solver ON true")
             .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).bind(&report.audit_bundle_sha256_hex).execute(&mut *tx).await?;
         let snapshot_digest = persist_audit_snapshot(&mut tx, &landing.snapshot).await?;
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")

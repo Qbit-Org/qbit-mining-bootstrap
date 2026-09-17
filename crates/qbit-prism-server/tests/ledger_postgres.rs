@@ -39,6 +39,9 @@ mod candidates_recover;
 #[path = "support/index_trim.rs"]
 mod index_trim;
 
+#[path = "support/share_partitions.rs"]
+mod share_partitions;
+
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
 

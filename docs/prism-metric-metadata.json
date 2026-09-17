@@ -100,6 +100,9 @@
     "block_candidates_orphaned_total": {
       "status": "Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
     },
+    "share_ledger_partition_lead_rows": {
+      "status": "max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it."
+    },
     "process_resident_memory_bytes": {
       "replaces": [
         "qbit_prism_process_resident_memory_bytes"

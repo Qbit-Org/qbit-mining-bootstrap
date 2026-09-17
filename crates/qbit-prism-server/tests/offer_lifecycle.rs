@@ -56,7 +56,7 @@ const PRE_011: [(i32, &str); 10] = [
     ),
     (14, include_str!("../migrations/014_policy_transition.sql")),
 ];
-const ALL_VERSIONS: [i32; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18];
+const ALL_VERSIONS: [i32; 17] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
 /// The proof time the lifecycle test enqueues with, and the call time it
@@ -720,14 +720,10 @@ async fn migration_011_waits_for_in_flight_instance_registration() -> Result<()>
                 .execute(&mut *heartbeat).await?;
             let url = db.url.clone();
             let registration = async {
-                // The wait for the migration to reach the instance lock
-                // covers the migrator's scratch apply of every native
-                // migration, which grows with each migration (015 added
-                // ~12% on a fsync-bound host), and any other test's migrate
-                // queued ahead on the cluster-wide migration lock. The
-                // budget only bounds a hang; the assertion is that the
-                // lock wait is observed at all.
-                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                // The scratch replay every migrate runs first (001 and every native
+                // migration) takes seconds under load, so the lock wait is watched
+                // for well past it.
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     loop {
                         let waiting: bool = sqlx::query_scalar(
                             "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='qbit_prism_instances'::regclass AND mode='ShareRowExclusiveLock' AND NOT granted)",
@@ -774,7 +770,10 @@ async fn migration_011_rejects_pre_011_registration_queued_behind_cutover() -> R
             sqlx::query("LOCK TABLE qbit_prism_instances IN SHARE MODE")
                 .execute(&mut *blocker).await?;
             let wait_for = |mode: &'static str| async move {
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                // The scratch replay every migrate runs first (001 and every native
+                // migration) takes seconds under load, so the lock wait is watched
+                // for well past it.
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     loop {
                         let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='qbit_prism_instances'::regclass AND mode=$1 AND NOT granted)")
                             .bind(mode).fetch_one(&db.pool).await?;
@@ -2199,7 +2198,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2236,11 +2235,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 18 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 18]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2277,7 +2276,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
