@@ -28,10 +28,12 @@ def rendered_fixture():
                 "PRISM_AUDIT_BIND": env["PRISM_HA_AUDIT_BIND"],
                 "PRISM_DATABASE_URL": env["PRISM_DATABASE_URL"],
                 "PRISM_STRATUM_PORT": "3340",
+                "PRISM_STRATUM_HIGHDIFF_PORT": env["PRISM_STRATUM_HIGHDIFF_PORT"],
             },
             "ports": [
                 {"host_ip": "127.0.0.1", "target": 3340, "published": str(18440 if index == 1 else 18443)},
                 {"host_ip": "127.0.0.1", "target": 18441, "published": str(18441 if index == 1 else 18444)},
+                {"host_ip": "127.0.0.1", "target": 18446, "published": str(18442 if index == 1 else 18445)},
             ],
         }
     return {"services": services}
@@ -56,7 +58,7 @@ class QualificationTests(unittest.TestCase):
 
     def test_wrong_writer_instance_rpc_health_and_port_fail(self):
         document = rendered_fixture()
-        for key in ("PRISM_INSTANCE_ID", "QBIT_RPC_URL", "PRISM_DATABASE_URL", "PRISM_AUDIT_PORT", "PRISM_AUDIT_BIND"):
+        for key in ("PRISM_INSTANCE_ID", "QBIT_RPC_URL", "PRISM_DATABASE_URL", "PRISM_AUDIT_PORT", "PRISM_AUDIT_BIND", "PRISM_STRATUM_HIGHDIFF_PORT"):
             with self.subTest(key=key):
                 bad = copy.deepcopy(document)
                 bad["services"][qualification.FRONTENDS[1]]["environment"][key] = "secret"
@@ -64,6 +66,17 @@ class QualificationTests(unittest.TestCase):
                     qualification.check_render(bad, qualification.fixture_environment())
                 self.assertNotIn("secret", str(raised.exception))
         document["services"][qualification.FRONTENDS[1]]["ports"][0]["host_ip"] = "0.0.0.0"
+        with self.assertRaisesRegex(ValueError, "loopback ports"):
+            qualification.check_render(document, qualification.fixture_environment())
+
+    def test_high_difficulty_and_unexpected_exposed_ports_fail(self):
+        document = rendered_fixture()
+        document["services"][qualification.FRONTENDS[1]]["ports"][2]["host_ip"] = "0.0.0.0"
+        with self.assertRaisesRegex(ValueError, "loopback ports"):
+            qualification.check_render(document, qualification.fixture_environment())
+        document = rendered_fixture()
+        document["services"][qualification.FRONTENDS[0]]["ports"].append(
+            {"host_ip": "0.0.0.0", "target": 5432, "published": "5432"})
         with self.assertRaisesRegex(ValueError, "loopback ports"):
             qualification.check_render(document, qualification.fixture_environment())
 

@@ -34,6 +34,7 @@ def fixture_environment():
         "PRISM_HA_HEALTH_PORT_HOST_2": "127.0.0.1:18444",
         "PRISM_HA_HIGHDIFF_PORT_HOST_1": "127.0.0.1:18442",
         "PRISM_HA_HIGHDIFF_PORT_HOST_2": "127.0.0.1:18445",
+        "PRISM_STRATUM_HIGHDIFF_PORT": "18446",
         "PRISM_DATABASE_URL": "postgresql://fixture:fixture@writer.invalid:5432/fixture",
         "PRISM_PUBLIC_DATABASE_URL": "postgresql://fixture:fixture@public-reader.invalid:5432/fixture",
         "PRISM_PUBLIC_REPLICA_MODE": "require",
@@ -53,6 +54,7 @@ def check_render(document, expected):
             ("PRISM_AUDIT_PORT", "PRISM_HA_AUDIT_PORT"),
             ("PRISM_AUDIT_BIND", "PRISM_HA_AUDIT_BIND"),
             ("PRISM_DATABASE_URL", "PRISM_DATABASE_URL"),
+            ("PRISM_STRATUM_HIGHDIFF_PORT", "PRISM_STRATUM_HIGHDIFF_PORT"),
         ):
             if env[consumer] != expected[input_name]:
                 raise ValueError(f"{name}: effective {consumer} differs from fixture")
@@ -60,9 +62,10 @@ def check_render(document, expected):
         expected_ports = {
             ("127.0.0.1", int(env["PRISM_STRATUM_PORT"]), str(18440 if index == 1 else 18443)),
             ("127.0.0.1", 18441, str(18441 if index == 1 else 18444)),
+            ("127.0.0.1", 18446, str(18442 if index == 1 else 18445)),
         }
         observed_ports = {(p.get("host_ip"), p["target"], str(p["published"])) for p in ports}
-        if not expected_ports <= observed_ports:
+        if expected_ports != observed_ports:
             raise ValueError(f"{name}: expected loopback ports did not reach render")
         result[name] = {"instance_id": env["PRISM_INSTANCE_ID"], "fixture_rpc_matches": True,
                         "fixture_writer_matches": True, "loopback_ports_match": True}

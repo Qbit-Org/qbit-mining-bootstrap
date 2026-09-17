@@ -33,10 +33,10 @@ struct Args {
     out: PathBuf,
     /// Existing compact_runtime_e2e test executable, built with cargo --no-run.
     #[arg(long)]
-    runtime_tests: Option<PathBuf>,
+    runtime_tests: PathBuf,
     /// Existing qbit-prism-server library test executable for share ACK barriers.
     #[arg(long)]
-    ack_tests: Option<PathBuf>,
+    ack_tests: PathBuf,
 }
 
 /// The endpoint only changes AFTER positive old-primary fencing and promotion.
@@ -192,9 +192,6 @@ async fn exercise(
         ]),
     ];
     for (binary, tests) in suites {
-        let Some(binary) = binary else {
-            continue;
-        };
         for test in tests {
             let output = tokio::process::Command::new(binary)
                 .env_clear()
@@ -228,15 +225,13 @@ async fn exercise(
                 .push(json!(test));
         }
     }
-    if args.runtime_tests.is_some() || args.ack_tests.is_some() {
-        let schemas: Vec<String> = sqlx::query_scalar(
+    let schemas: Vec<String> = sqlx::query_scalar(
             "SELECT nspname::text FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname NOT IN ('public', 'information_schema')",
         )
         .fetch_all(&admin)
         .await?;
-        evidence["runtime_schemas_remaining"] = json!(schemas);
-        ensure!(schemas.is_empty(), "fixture left owned schemas behind");
-    }
+    evidence["runtime_schemas_remaining"] = json!(schemas);
+    ensure!(schemas.is_empty(), "fixture left owned schemas behind");
 
     let endpoint = WriterEndpoint::start(managed.primary_port).await?;
     evidence["owned_writer_endpoint"] = json!(endpoint.address.to_string());
@@ -434,6 +429,52 @@ async fn exercise(
     b.pool.close().await;
     promoted.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Args;
+    use clap::{error::ErrorKind, Parser};
+
+    #[test]
+    fn missing_either_or_both_suites_fails_before_resource_setup() {
+        for extra in [
+            vec![],
+            vec!["--runtime-tests", "/unused/runtime"],
+            vec!["--ack-tests", "/unused/ack"],
+        ] {
+            let mut arguments = vec![
+                "ha_qualification",
+                "--pg-bin-dir",
+                "/unused/pg",
+                "--out",
+                "/unused/out",
+            ];
+            arguments.extend(extra);
+            let error = Args::try_parse_from(arguments)
+                .err()
+                .expect("missing suite parsed");
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn both_suite_paths_reach_the_consumer() {
+        let args = Args::try_parse_from([
+            "ha_qualification",
+            "--pg-bin-dir",
+            "/unused/pg",
+            "--out",
+            "/unused/out",
+            "--runtime-tests",
+            "/unused/runtime",
+            "--ack-tests",
+            "/unused/ack",
+        ])
+        .unwrap();
+        assert_eq!(args.runtime_tests.to_str(), Some("/unused/runtime"));
+        assert_eq!(args.ack_tests.to_str(), Some("/unused/ack"));
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]

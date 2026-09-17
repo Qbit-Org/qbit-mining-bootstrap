@@ -47,7 +47,7 @@ an artifact is not proof of cleanup.
 The first two commands are lightweight and start no services. Compose output is
 captured privately, validated using explicit fixture values and reduced to an
 allowlist; never print resolved Compose configuration containing real secrets.
-The render exercises nondefault IDs, separate RPC URLs, health/listener ports,
+The render exercises nondefault IDs, separate RPC URLs, health/high-difficulty listener ports,
 loopback host bindings and a shared writer DSN through the real Compose merge.
 It does not claim those values reached running frontend containers.
 
@@ -77,6 +77,8 @@ python3 scripts/prism_ha_qualification.py run \
   --out "$B281_BUILD_DIR/evidence"
 ```
 
+Both test executable arguments are required by the wrapper and the example;
+omitting either fails argument parsing before a PostgreSQL process can start.
 Select a PG16 `--pg-bin-dir` explicitly if `pg_config` names another version.
 If `CARGO_TARGET_DIR` is customized, select the example from that build's target
 directory too. Use the wrapper so startup failures also receive an owned-resource
