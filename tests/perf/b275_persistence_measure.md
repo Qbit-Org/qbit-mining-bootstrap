@@ -114,10 +114,14 @@ The branch incorporates PR #397 through
 bulk fixture loading for the separate 500k qualification. Its 25 s resume budget
 and correctness assertions remain unchanged. The six measurements above still
 belong only to `3d4775c`; they were not rerun or reattributed to this integration.
-New delivery output uses schema `b275.delivery.v3` and names the old reference
+That integrated harness used schema `b275.delivery.v3` and named the old reference
 `historical_baseline_sha`, so it cannot be mistaken for the tested runtime.
 Record the actual build revision in each new run's manifest. Timing boundaries,
-session counts, deadlines and acceptance checks are unchanged.
+session counts, deadlines and acceptance checks were unchanged by that integration.
+The current `b275.delivery.v4` controls, p95 definition, run-scope/child-receipt
+records and 400k/500k reproduction commands are documented in the
+[post-batching qualification](b275_post_batch_qualification.md). Its later
+observations do not replace or reattribute the historical rows above.
 
 On 2026-09-16 the integrated source passed 23 reconciliation tests (all 11
 database gates executed) and seven harness tests (all four gates executed) on
