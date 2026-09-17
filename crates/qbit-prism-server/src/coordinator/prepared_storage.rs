@@ -122,18 +122,31 @@ impl Coordinator {
     ) -> Result<IssuedJobSave> {
         let revision = self.revalidate_issued(issued).await?;
         let prepared = &issued.job.context.prepared;
-        let saved = self
-            .work_ledger
-            .save_issued_job_compact(
-                &issued.job.wire.job_id,
-                &issued.payload,
-                revision,
-                &issued.job.wire.previousblockhash,
-                issued.expires_at_ms,
-                prepared.reservation.dependency(&prepared.storage_key),
-                repair,
-            )
-            .await?;
+        let saved = if repair.is_none() {
+            self.issued_batcher
+                .save(
+                    &issued.job.wire.job_id,
+                    &issued.payload,
+                    revision,
+                    &issued.job.wire.previousblockhash,
+                    issued.expires_at_ms,
+                    prepared.reservation.dependency(&prepared.storage_key),
+                    issued.deadline.instant().into(),
+                )
+                .await?
+        } else {
+            self.work_ledger
+                .save_issued_job_compact(
+                    &issued.job.wire.job_id,
+                    &issued.payload,
+                    revision,
+                    &issued.job.wire.previousblockhash,
+                    issued.expires_at_ms,
+                    prepared.reservation.dependency(&prepared.storage_key),
+                    repair,
+                )
+                .await?
+        };
         if saved == IssuedJobSave::Saved {
             // A transaction may leave an immutable row after revocation, but
             // that row must never be delivered with the old admission proof.

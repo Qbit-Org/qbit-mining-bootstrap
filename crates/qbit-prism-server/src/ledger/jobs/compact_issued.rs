@@ -11,7 +11,7 @@ use super::*;
 /// Original identity carried by the caller from its prepared reservation.
 /// Current revision and publication/lease eligibility are separate caller
 /// decisions and must be revalidated after waits before issuing miner work.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactDependency<'a> {
     pub key: &'a str,
     pub original_revision: i64,
@@ -282,7 +282,7 @@ async fn check_balances(tx: &mut Transaction<'_, Postgres>, repair: &CompactRepa
 }
 
 impl CompactDependency<'_> {
-    fn validate(&self) -> Result<DateTime<Utc>> {
+    pub(super) fn validate(&self) -> Result<DateTime<Utc>> {
         ensure!(
             !self.key.is_empty() && !self.parent.is_empty() && self.original_revision >= 0,
             "invalid compact prepared dependency"
@@ -292,7 +292,7 @@ impl CompactDependency<'_> {
             .context("prepared original expiry out of range")
     }
 
-    fn check_row(&self, row: &PgRow) -> Result<()> {
+    pub(super) fn check_row(&self, row: &PgRow) -> Result<()> {
         let original: Option<Value> = row.try_get("original_expires_at_ms")?;
         ensure!(
             row.try_get::<String, _>("parent_hash")? == self.parent
@@ -321,7 +321,10 @@ impl CompactDependency<'_> {
 // Return only bounded identity/column metadata and server-side consistency
 // results: never transfer the prepared payload, template or balance bytes on
 // the hot path. The blob keys' existence is not proof of unseen byte integrity.
-async fn dependency_row(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result<Option<PgRow>> {
+pub(super) async fn dependency_row(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &str,
+) -> Result<Option<PgRow>> {
     Ok(sqlx::query(
         r#"SELECT parent_hash,payout_revision,expires_at,
         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,
@@ -348,7 +351,7 @@ async fn dependency_row(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result
     .await?)
 }
 
-async fn lock_blob_metadata(
+pub(super) async fn lock_blob_metadata(
     tx: &mut Transaction<'_, Postgres>,
     dependency: CompactDependency<'_>,
 ) -> Result<()> {
@@ -366,7 +369,10 @@ async fn lock_blob_metadata(
     Ok(())
 }
 
-async fn require_live(tx: &mut Transaction<'_, Postgres>, expires: DateTime<Utc>) -> Result<()> {
+pub(super) async fn require_live(
+    tx: &mut Transaction<'_, Postgres>,
+    expires: DateTime<Utc>,
+) -> Result<()> {
     let live: bool = sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")
         .bind(expires)
         .fetch_one(&mut **tx)
