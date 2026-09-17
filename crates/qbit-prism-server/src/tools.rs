@@ -882,9 +882,9 @@ async fn apply_recovery(
     Ok((recovered, verified))
 }
 
-/// The exit status of a recovery that stopped after its claim. The row was
-/// left recoverable by `Coordinator::recover_candidate` whichever way it
-/// stopped; a node or database error is returned as the failure it is.
+/// The exit status of a recovery that stopped after its claim. A typed stop
+/// confirms cleanup left the row recoverable; other errors may include
+/// unconfirmed cleanup and cannot assert the row's current disposition.
 fn recovery_stop(error: anyhow::Error, hash: &str, timeout_seconds: u64) -> Stop {
     match error.downcast_ref::<RecoveryStop>() {
         Some(RecoveryStop::NotActive(detail)) => Stop::Exit(9, not_active_message(hash, detail)),
@@ -898,9 +898,7 @@ fn recovery_stop(error: anyhow::Error, hash: &str, timeout_seconds: u64) -> Stop
                 "recovery deadline of {timeout_seconds} seconds exceeded (landing); candidate {hash} was left recoverable and its claim released"
             ),
         ),
-        None => Stop::Failure(error.context(format!(
-            "recovery of {hash} stopped; the candidate was left recoverable"
-        ))),
+        None => Stop::Failure(error.context(format!("recovery of {hash} stopped"))),
     }
 }
 

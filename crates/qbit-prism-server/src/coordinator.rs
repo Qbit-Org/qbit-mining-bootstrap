@@ -371,10 +371,10 @@ enum RebuildFailure {
 }
 
 /// Why an operator recovery (#418) stopped short of finishing its row. Each
-/// variant is a stop the operator reads, not a failure of the machinery: the
-/// row is left recoverable with the reason in `last_error`, and the command
-/// maps the variant to its exit status. Node and database errors are not
-/// variants; they propagate as themselves.
+/// variant is a stop the operator reads, not a failure of the machinery.
+/// After confirmed cleanup the row is left recoverable with the reason in
+/// `last_error`, and the command maps the variant to its exit status. Node,
+/// database and unconfirmed cleanup errors propagate as failures instead.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryStop {
     /// The node does not hold the block on its active chain. Nothing is
@@ -1527,12 +1527,13 @@ impl Coordinator {
     /// attempt is the rebuild deadline, which is the operator's rather than
     /// the lane's 60 s.
     ///
-    /// Every stop, the deadline included, releases the claim with its
-    /// reason (bounded) and leaves the row recoverable: its state (a row
-    /// adopted into `reconciliation` stays there), its evidence and its
-    /// schedule are untouched, and an audit that landed is reused by the
-    /// next attempt. A [`RecoveryStop`] names why; node and database errors
-    /// propagate as themselves.
+    /// Every stop, the deadline included, attempts a bounded claim release.
+    /// A confirmed release leaves the row recoverable with its reason: its
+    /// state (a row adopted into `reconciliation` stays there), evidence and
+    /// schedule are untouched, and an audit that landed is reused by the next
+    /// attempt. A [`RecoveryStop`] names why; node and database errors
+    /// propagate as themselves. Unconfirmed cleanup is a failure that names
+    /// the original stop without asserting the row's current disposition.
     pub async fn recover_candidate(
         &self,
         claim: &CandidateClaim,
@@ -1557,31 +1558,25 @@ impl Coordinator {
         let Err(error) = &result else {
             return result;
         };
-        // Whatever stopped it, the row is left recoverable: the claim goes,
-        // the reason stays, nothing else moves. Bounded, so a deadline that
-        // cut a landing short is not followed by an unbounded wait; a claim
-        // that cannot be released expires on its own.
+        // Only a confirmed release proves this attempt left the row
+        // recoverable. Cleanup is separately bounded; if it fails, the
+        // claim may remain until its lease expires.
         let reason = format!("operator recovery stopped: {error:#}");
-        match tokio::time::timeout(
+        let released = tokio::time::timeout(
             lease.timeout,
             self.ledger.release_recovery_claim(claim, &reason),
         )
         .await
-        {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => tracing::warn!(
-                %block,
-                "the recovery claim was already gone when it was released; a terminal commit may have won, inspect the row"
-            ),
-            Ok(Err(release)) => tracing::error!(
-                %block,
-                release = %format!("{release:#}"),
-                "the recovery claim could not be released; it expires on its own"
-            ),
-            Err(_) => tracing::error!(
-                %block,
-                "releasing the recovery claim exceeded its bound; it expires on its own"
-            ),
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} timed out after {error:#}; the claim may remain until its lease expires"
+        ))?
+        .with_context(|| format!(
+            "releasing the recovery claim for {block} failed after {error:#}; the claim may remain until its lease expires"
+        ))?;
+        if !released {
+            anyhow::bail!(
+                "recovery claim cleanup for {block} did not release this attempt's claim after {error:#}; the candidate may have completed or changed owners; inspect the row before retrying"
+            );
         }
         result
     }

@@ -1177,6 +1177,171 @@ async fn recover_apply_releases_a_committed_claim_when_its_reply_times_out() -> 
     db.close(vec![ledger]).await
 }
 
+/// Hold the landing past its deadline and force cleanup to fail or time out.
+#[tokio::test]
+async fn recover_apply_reports_failed_claim_cleanup() -> Result<()> {
+    const CLEANUP_GATE: i64 = 0x41800002;
+    for fail_cleanup in [true, false] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let ledger = db.ledger("frontend-a").await?;
+        let node = ScriptedNode::open().await?;
+        ledger.append(share(1), None).await?;
+        let block = rebuildable(&ledger.snapshot(100).await?, 101, 424)?;
+        let hash = block.block_hash.clone();
+        ledger.enqueue_candidate(block.candidate.clone()).await?;
+        node.script(|chain| chain.extend(101, &hash, &fixture_parent()));
+        let cleanup = if fail_cleanup {
+            "RAISE EXCEPTION 'injected recovery cleanup failure';".to_owned()
+        } else {
+            format!("PERFORM pg_advisory_xact_lock({CLEANUP_GATE});")
+        };
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION pause_candidate_landing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({CLEANUP_GATE}); RETURN NEW; END $$;
+             CREATE TRIGGER pause_candidate_landing AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION pause_candidate_landing();
+             CREATE FUNCTION fail_candidate_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {cleanup} RETURN NEW; END $$;
+             CREATE TRIGGER fail_candidate_cleanup BEFORE UPDATE OF claim_token ON qbit_block_candidate_outbox FOR EACH ROW WHEN (OLD.claim_token IS NOT NULL AND NEW.claim_token IS NULL) EXECUTE FUNCTION fail_candidate_cleanup();"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let mut gate = ledger.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(CLEANUP_GATE)
+            .execute(&mut *gate)
+            .await?;
+
+        let mut args = allowlist(&[&hash]);
+        args.extend(["--apply", "--timeout-seconds", "4"]);
+        let started = std::time::Instant::now();
+        let expired = recover(&db, &node, &args).await?;
+        let message = stderr(&expired);
+        assert_eq!(code(&expired), 1, "{message}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(
+            message.contains("the recovery deadline expired"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the claim may remain until its lease expires"),
+            "{message}"
+        );
+        assert!(!message.contains("left recoverable"), "{message}");
+        assert!(!message.contains("claim released"), "{message}");
+        assert!(
+            message.contains(if fail_cleanup {
+                "injected recovery cleanup failure"
+            } else {
+                "releasing the recovery claim"
+            }),
+            "{message}"
+        );
+        if !fail_cleanup {
+            assert!(message.contains("timed out"), "{message}");
+        }
+        let row = whole_row(&ledger.pool, &hash).await?;
+        assert_eq!(row["state"], "reconciliation", "{row}");
+        assert!(row["claim_token"].is_string(), "{row}");
+        assert_eq!(row["claim_instance_id"], RECOVERY_INSTANCE);
+        assert!(row["candidate"].is_object(), "{row}");
+        gate.commit().await?;
+        node.assert_never_offered();
+        assert_no_new_instances(&ledger.pool).await?;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
+/// A terminal COMMIT or a replacement owner can win before the deadline's
+/// token-fenced cleanup. Neither outcome proves the row was left recoverable.
+#[tokio::test]
+async fn recover_apply_reports_changed_claim_ownership_after_deadline() -> Result<()> {
+    for terminal in [false, true] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let ledger = db.ledger("frontend-a").await?;
+        let node = ScriptedNode::open().await?;
+        ledger.append(share(1), None).await?;
+        let block = rebuildable(&ledger.snapshot(100).await?, 101, 425)?;
+        let hash = block.block_hash.clone();
+        ledger.enqueue_candidate(block.candidate.clone()).await?;
+        node.script(|chain| chain.extend(101, &hash, &fixture_parent()));
+        let state = if terminal {
+            "submitted"
+        } else {
+            "reconciliation"
+        };
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION mark_recovery_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_block_candidate_outbox UPDATE'; RETURN NEW; END $$;
+             CREATE TRIGGER mark_recovery_commit AFTER UPDATE OF state ON qbit_block_candidate_outbox FOR EACH ROW WHEN (OLD.state <> NEW.state AND NEW.state = '{state}') EXECUTE FUNCTION mark_recovery_commit();"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let raw = url::Url::parse(&db.url)?;
+        let upstream = tokio::net::lookup_host((
+            raw.host_str().context("database URL names a host")?,
+            raw.port().unwrap_or(5432),
+        ))
+        .await?
+        .next()
+        .context("database host resolves")?;
+        let proxy = execution_proxy::ExecutionProxy::start(upstream).await?;
+        let proxied_url = proxy.rewrite_url(&db.url)?;
+        let pause = proxy.pause_after_commit("qbit_block_candidate_outbox", "UPDATE")?;
+        let mut args = allowlist(&[&hash]);
+        args.extend(["--apply", "--timeout-seconds", "4"]);
+        let run = recover_at(&proxied_url, &node, &args);
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                _ = pause.entered() => Ok(()),
+                output = &mut run => bail!("recovery ended before the {state} COMMIT reply was paused: {}", stderr(&output?)),
+            }
+        })
+        .await
+        .context("the recovery COMMIT did not reach the reply barrier")??;
+        assert_eq!(whole_row(&ledger.pool, &hash).await?["state"], state);
+        if !terminal {
+            sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=$2,claim_instance_id='replacement-owner',claim_expires_at=clock_timestamp()+interval '120 seconds' WHERE block_hash=$1")
+                .bind(&hash).bind(Uuid::new_v4().to_string()).execute(&ledger.pool).await?;
+        }
+        let before = everything(&ledger.pool).await?;
+        let expired = tokio::time::timeout(Duration::from_secs(20), &mut run).await??;
+        let message = stderr(&expired);
+        assert_eq!(code(&expired), 1, "{message}");
+        assert!(
+            message.contains("the recovery deadline expired"),
+            "{message}"
+        );
+        assert!(
+            message.contains("may have completed or changed owners"),
+            "{message}"
+        );
+        assert!(!message.contains("left recoverable"), "{message}");
+        assert!(!message.contains("claim released"), "{message}");
+        assert_eq!(everything(&ledger.pool).await?, before);
+        pause.release();
+        proxy.finish().await?;
+        if terminal {
+            let mut resumed = allowlist(&[&hash]);
+            resumed.push("--apply");
+            let done = recover(&db, &node, &resumed).await?;
+            assert_eq!(code(&done), 0, "{}", stderr(&done));
+            assert!(
+                stdout(&done).contains("verified 1 already complete"),
+                "{}",
+                stdout(&done)
+            );
+            assert_eq!(everything(&ledger.pool).await?, before);
+        }
+        node.assert_never_offered();
+        assert_no_new_instances(&ledger.pool).await?;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 /// Pause the real landing inside the database, after its block insert, past
 /// the operator's deadline.
 #[tokio::test]

@@ -339,11 +339,15 @@ exits 0. Rerunning the same allowlist after a success prints only the
 carried across the whole operation: the plan's database read, every node RPC
 call, the coordinator connection, and each candidate's claim, window read,
 audit rebuild, landing transaction and confirmation. When it expires the
-in-flight candidate's claim is released, with bounded cleanup, and the
-command exits 11.
+command attempts a bounded release of the in-flight candidate's claim and
+exits 11 when cleanup confirms release. If cleanup fails or times out, the
+command exits 1 and reports that the claim may remain until its lease expires.
+During landing, if the token no longer matches, it exits 1 and reports that
+the candidate may have completed or changed owners; inspect the row before retrying.
 
-**Failure and resume.** On any failure the command stops at that candidate,
-releases its claim (bounded), records the reason in the row's `last_error`,
+**Failure and resume.** On any failure the command stops at that candidate
+and attempts to release its claim (bounded). A confirmed release records the
+reason in the row's `last_error`,
 leaves the row in whatever unfinished state it is in — a pending row that
 was adopted stays `reconciliation`, and a landed audit stays landed and is
 reused by the next attempt — leaves `next_attempt_at` untouched, and exits
@@ -357,7 +361,7 @@ Codes shared with `abandon` keep their meaning.
 | Exit | Outcome | Message |
 | --- | --- | --- |
 | 0 | Plan printed, or every listed block recovered or verified complete. | The stdout described above. |
-| 1 | Configuration, database or node failure, including a halted cluster, a live legacy Python writer lease, a node that is unreachable or not caught up, and an allowlist the command refuses (a duplicate, more than 32 or a malformed hash). | The underlying error, as for every other command. |
+| 1 | Configuration, database or node failure, including unconfirmed claim cleanup, a halted cluster, a live legacy Python writer lease, a node that is unreachable or not caught up, and an allowlist the command refuses (a duplicate, more than 32 or a malformed hash). | The underlying error, as for every other command. |
 | 2 | A listed hash has no outbox row. | `no candidate row for <hash>` |
 | 4 | A listed row is terminal and cannot be recovered. | `candidate <hash> is already abandoned; its evidence was released and it cannot be recovered`, `candidate <hash> is already orphaned; its candidate payload was released and its accounting remains in the ledger. Leave chain changes to reconciliation`, or `candidate <hash> is submitted but its accounting is not proven complete (<what is missing>); inspect qbit_pool_blocks and qbit_pool_audit_bundles before retrying` |
 | 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
@@ -365,7 +369,7 @@ Codes shared with `abandon` keep their meaning.
 | 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | As for `abandon`, ending in `drain it with the pinned 2.x.x image` |
 | 9 | Not on the active chain: the node does not hold the block at its height. Nothing to recover; `recover` never offers. | `candidate <hash> is not on the active chain (<node detail>); nothing to recover. recover never offers a block: a block the node never accepted stays with the coordinator (or, while pending, may be abandoned); a block a reorg removed stays in reconciliation` |
 | 10 | Selection refused: an unfinished parent is not in the allowlist, or the stored height is unreadable or disagrees with the node. | `candidate <hash> has an unfinished parent <parent> (<state>) that is not in the allowlist; add --block-hash <parent> so it lands first` or `candidate <hash> is stored at height <h> but the node holds it at height <node height>` |
-| 11 | The deadline expired; the candidate was left recoverable. | `recovery deadline of <N> seconds exceeded (landing); candidate <hash> was left recoverable and its claim released`; before any claim was taken the phase is `planning`, `connecting` or `claiming` and the message says so (`nothing was claimed`, `candidate <hash> was not claimed`) |
+| 11 | The deadline expired; cleanup confirmed release, or this attempt no longer holds the claim. Unconfirmed cleanup exits 1 instead. | `recovery deadline of <N> seconds exceeded (landing); candidate <hash> was left recoverable and its claim released`; planning and connecting say `nothing was claimed`; a claim-phase timeout says `candidate <hash> is no longer claimed by this attempt` after cleanup succeeds. |
 | 12 | Landing refused or failed; the candidate was left recoverable with the reason in `last_error`. | `recovery of <hash> stopped: <reason>; the candidate was left recoverable` |
 
 Codes 3 (offered; never abandonable) and 6 (pending but landed) do not occur
