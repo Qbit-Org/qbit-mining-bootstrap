@@ -102,3 +102,7 @@ type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "../tests/support/ledger_execution_proxy.rs"]
+mod execution_proxy;

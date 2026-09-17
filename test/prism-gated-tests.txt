@@ -423,6 +423,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancellation_and_sql_timeout_release_probe_connection
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancelled_hash_keeps_build_admission_until_blocking_cleanup_finishes
+qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::failed_guard_precedes_locked_share_history
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::lost_or_cancelled_commit_reply_never_returns_a_successful_probe
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::one_checkout_five_executions_and_one_hash_per_probe
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_control

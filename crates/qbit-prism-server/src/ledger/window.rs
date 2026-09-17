@@ -794,9 +794,10 @@ pub(super) async fn read_prior_balances(
     tokio::task::spawn_blocking(move || decode_prior_balances(rows)).await?
 }
 
+const PRIOR_BALANCE_SQL: &str = "SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()";
+
 async fn prior_balance_rows(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query("SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()")
-        .fetch_all(&mut **tx).await
+    sqlx::query(PRIOR_BALANCE_SQL).fetch_all(&mut **tx).await
 }
 
 fn decode_prior_balances(rows: Vec<PgRow>) -> Result<Vec<CarryForwardBalance>> {

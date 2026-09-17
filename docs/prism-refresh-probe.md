@@ -12,12 +12,14 @@ sequence. A successful observation uses one connection and one repeatable-read
 transaction:
 
 1. Begin and set repeatable-read isolation without overriding read-only settings.
-2. Read revision and accepted cutoff in one SELECT, retaining the existing
-   primary, writable-session and fatal-state guards. The cutoff subquery uses
-   the same `ACCEPTED_CUTOFF_SQL` constant as anchored snapshot selection.
-3. Read current balances, decode them, and compute the existing semantic
-   `prior_balances_digest` on a blocking thread. Their vectors are also
-   destroyed there.
+2. Read revision in the original standalone SELECT, retaining the existing
+   primary, writable-session and fatal-state guards before accessing shares.
+3. Read accepted cutoff and current balances in one SELECT. The cutoff uses
+   the same `ACCEPTED_CUTOFF_SQL` constant as anchored snapshot selection; the
+   balance projection shares `PRIOR_BALANCE_SQL` with public payout reads.
+   A left join returns one explicitly marked placeholder for empty balances.
+   Remove that placeholder, decode and compute the existing semantic digest
+   on a blocking thread. All row vectors are also destroyed there.
 4. Commit before returning the observation.
 
 The first data SELECT establishes the snapshot. A concurrent atomic update of
@@ -50,7 +52,7 @@ Counts cover payout probes and separate accepted-cutoff probes only. They
 exclude chain observation/reconciliation, fee RPC, database clocks, anchored
 snapshots/share pages, persistence, connection validation and other hashes.
 One successful payout or combined probe executes five statements: BEGIN, SET,
-metadata SELECT, balance SELECT and COMMIT. These are SQL executions, not a
+revision SELECT, balance/cutoff SELECT and COMMIT. These are SQL executions, not a
 claim about network packet counts.
 
 | Path without publication-lock retry | Prior SQL / checkouts / balance hashes | Combined probe SQL / checkouts / balance hashes |
@@ -69,7 +71,9 @@ payload is returned. Parse frames do not count as executions.
 
 The private probe regression independently measures one checkout through the
 existing acquisition metric and one actual digest callback per invocation,
-with five executions and N+1 DataRows for N=0 and N=1. Full-path checkout/hash
+with five executions and max(N,1)+1 DataRows for N=0, N=1 and N=2.
+The empty case includes one outer-join placeholder; nonempty cases repeat only
+cutoff metadata alongside each existing balance row. Full-path checkout/hash
 totals in the table are derived from these observations and the call graph;
 the build rows are call-graph counts, not an instrumented full-build benchmark.
 
@@ -88,7 +92,8 @@ partition per nonzero program group (M=N). This was not production data or the
 full migrated schema.
 
 A libpq driver executed the baseline 11-statement idle sequence and the
-10-statement coalesced sequence. Ten samples followed warm-up, or five at
+10-statement first-SELECT-coalesced sequence proposed before the guard repair.
+Those timings do not measure the final guard-first query layout. Ten samples followed warm-up, or five at
 100,000 recipients, with alternating order. The Rust digest microtest used
 the exact shared digest function and encoding helpers, compiled in release
 mode on arm64 macOS; its timer excluded SQLx decoding, row transfer and input
@@ -103,8 +108,8 @@ string destruction.
 | 10,000 | 14.342 | 14.463 | 2.3996 |
 | 100,000 | 173.741 | 173.618 | 23.7845 |
 
-This supports an overhead reduction at small N, not a material large-N CPU
-reduction. Both sequences transfer and hash balances twice. SQL grouping cost
+These historical samples suggest a possible overhead reduction at small N,
+not a measured speedup for the final query layout or a large-N CPU reduction. Both sequences transfer and hash balances twice. SQL grouping cost
 also depends on active/inactive partition rows M, which can exceed N, and
 sorts may spill. The semantic digest still sorts bytewise independently of
 database collation. No revision-only cache is valid: supported balance changes
@@ -117,11 +122,29 @@ can occur without a payout revision bump.
 | Same-revision amount, recipient, order-key and program changes | Real PostgreSQL private-probe test checks the native digest after each change; Coordinator tests rebuild while preserving old reservation balances |
 | Concurrent revision, cutoff and balance update | First-SELECT advisory gate returns the old coherent triple; the same SQL under READ COMMITTED is an explicit failing control |
 | Balance or revision drift during build admission | Gated Coordinator tests require a fresh snapshot after the wait |
+| Fatal/read-only/missing cluster state plus locked share history | Standalone guard returns `RowNotFound`; the old combined first SELECT is a negative control that times out with SQLSTATE `57014` |
 | Checkout, metadata and balance cancellation or SQL timeout | Real PostgreSQL tests recover the single connection and preserve error categories |
 | Running hash cancelled | A blocking gate retains build admission until cleanup, while transaction rollback releases its connection |
 | Lost or cancelled commit acknowledgement | Wire faults and a commit-response gate prevent successful probe return and verify recovery |
 | Original anchor, selected shares, immutable storage order and foreign resume | Existing `refresh_window_split`, `window_reference` and `window_balance_order` suites retained |
 | Out-of-order refresh and publication waits | Existing readiness/tip and compact authority proofs retained; older-refresh regression remains green |
+
+The first-query guard matters under compound faults. The independent baseline
+measured fatal cluster state plus an ACCESS EXCLUSIVE share-table lock: the
+standalone guard returned no row in 8.919 ms, while the former combined SELECT
+waited and timed out with SQLSTATE `57014` after 212.254 ms. PostgreSQL resolves
+and locks referenced relations before evaluating the WHERE guard, so an SQL
+conditional cannot preserve this ordering. The regression runs the former query
+as a negative control and requires the repaired probe and public payout-state
+path to return `RowNotFound` while the lock remains held, also for read-only and
+missing cluster state. Timing is logged, not asserted against a flaky threshold.
+
+After the guard succeeds, cutoff and balance access now share one statement.
+Their relative error ordering under simultaneous failures is not claimed to
+match the old separate reads (which decoded balances before reading cutoff).
+Both paths still propagate failure and retain the original caller deadline;
+no error authorizes reuse or publishes work. This patch preserves the concrete
+first-guard contract, not exact equivalence for every compound error.
 
 The deterministic fee-RPC regression records the unchanged two-observation
 behavior: if same-revision balances change between the early and late probe,

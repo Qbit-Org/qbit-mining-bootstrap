@@ -14,8 +14,7 @@ use tokio_util::task::AbortOnDropHandle;
 #[path = "../../../tests/support/ledger_database.rs"]
 mod database;
 
-#[path = "../../../tests/support/ledger_execution_proxy.rs"]
-mod proxy;
+use crate::ledger::execution_proxy as proxy;
 
 tokio::task_local! {
     pub(super) static HASH_CALLS: Arc<AtomicUsize>;
@@ -145,10 +144,8 @@ async fn revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_con
                 // weaker isolation, with the writer committing before SELECT 2.
                 let mut tx = source.begin().await?;
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-                let row = sqlx::query(&refresh_probe_sql()).fetch_one(&mut *tx).await?;
-                let payout_revision = row.try_get("payout_revision")?;
-                let accepted_share_seq = row.try_get::<i64, _>("accepted_share_seq")? as u64;
-                let prior_balances_digest = current_balances_digest(&mut tx, &ReadAdmission::default()).await?;
+                let payout_revision = sqlx::query_scalar(PAYOUT_REVISION_SQL).fetch_one(&mut *tx).await?;
+                let (accepted_share_seq, prior_balances_digest) = refresh_balances(&mut tx, &ReadAdmission::default()).await?;
                 tx.commit().await?;
                 Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq })
             }));
@@ -163,12 +160,12 @@ async fn revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_con
             assert_eq!(after.accepted_share_seq, original.accepted_share_seq + 1);
             assert_ne!(after.payout_state.prior_balances_digest, original.payout_state.prior_balances_digest);
             assert_eq!(during.payout_state.payout_revision, original.payout_state.payout_revision);
-            assert_eq!(during.accepted_share_seq, original.accepted_share_seq);
             if repeatable_read {
                 assert_eq!(during, original, "mixed metadata and balance snapshots");
             } else {
                 assert_ne!(during, original, "negative control failed to detect the weaker isolation");
                 assert_eq!(during.payout_state.prior_balances_digest, after.payout_state.prior_balances_digest);
+                assert_eq!(during.accepted_share_seq, after.accepted_share_seq);
             }
         }
         Ok(())
@@ -304,11 +301,16 @@ async fn one_checkout_five_executions_and_one_hash_per_probe() -> Result<()> {
         let (source, observer) = proxied(ledger).await?;
         let hashes = Arc::new(AtomicUsize::new(0));
         HASH_CALLS.scope(hashes.clone(), async {
-            for (calls, recipients) in [(1, 0), (2, 1)] {
+            for (calls, recipients) in [(1, 0), (2, 1), (3, 2)] {
                 if recipients == 1 { seed(admin).await?; }
+                if recipients == 2 {
+                    sqlx::query("INSERT INTO qbit_payout_carry_forward_current(miner_id,payout_order_key,p2mr_program,balance_sats,active_row_count) VALUES('second','second',decode(repeat('33',32),'hex'),987,1)").execute(admin).await?;
+                }
+                let expected = ledger.payout_state().await?;
                 let mark = observer.mark();
                 let started = std::time::Instant::now();
-                source.refresh_probe(ReadAdmission::default()).await?;
+                let probe = source.refresh_probe(ReadAdmission::default()).await?;
+                assert_eq!(probe.payout_state, expected);
                 let elapsed = started.elapsed();
                 let executions = observer.executions_since(mark)?;
                 assert_eq!(executions.len(), 5, "{executions:?}");
@@ -316,12 +318,12 @@ async fn one_checkout_five_executions_and_one_hash_per_probe() -> Result<()> {
                 assert_eq!(executions.iter().filter(|e| e.sql.contains(ACCEPTED_CUTOFF_SQL)).count(), 1);
                 let balances: Vec<_> = executions.iter().filter(|e| e.sql.contains("qbit_current_carry_forward_balances()")).collect();
                 assert_eq!(balances.len(), 1);
-                assert_eq!(balances[0].returned_rows()?, recipients);
-                assert_eq!(executions.iter().map(|e| e.rows_received).sum::<u64>(), recipients + 1);
+                assert_eq!(balances[0].returned_rows()?, recipients.max(1));
+                assert_eq!(executions.iter().map(|e| e.rows_received).sum::<u64>(), recipients.max(1) + 1);
                 assert_eq!(hashes.load(Ordering::SeqCst), calls);
                 let checkout = format!("qbit_prism_database_pool_acquire_seconds_count{{result=\"success\"}} {calls}");
                 assert!(source.metrics.as_ref().unwrap().render().lines().any(|line| line == checkout));
-                eprintln!("refresh probe recipients={recipients}: executions=5 checkouts=1 hashes=1 rows={} wall_us={}", recipients + 1, elapsed.as_micros());
+                eprintln!("refresh probe recipients={recipients}: executions=5 checkouts=1 hashes=1 rows={} wall_us={}", recipients.max(1) + 1, elapsed.as_micros());
             }
             Ok::<_, anyhow::Error>(())
         }).await?;
@@ -411,4 +413,41 @@ async fn cancelled_hash_keeps_build_admission_until_blocking_cleanup_finishes() 
         })
     })
     .await
+}
+
+#[tokio::test]
+async fn failed_guard_precedes_locked_share_history() -> Result<()> {
+    run(gate::site!(), |ledger, admin| Box::pin(async move {
+        sqlx::query("SET statement_timeout='200ms'").execute(&ledger.pool).await?;
+        let mut lock = admin.begin().await?;
+        sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE").execute(&mut *lock).await?;
+        sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='compound-fault'").execute(admin).await?;
+        // Negative control: the previous combined metadata SELECT waits for a
+        // relation lock before it can evaluate the fatal-state predicate.
+        let mut tx = ledger.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut *tx).await?;
+        let started = std::time::Instant::now();
+        let error = sqlx::query(&format!("SELECT payout_revision, ({ACCEPTED_CUTOFF_SQL}) AS accepted_share_seq FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'"))
+            .fetch_one(&mut *tx).await.unwrap_err();
+        eprintln!("old combined guard under fatal+locked shares: {error}, wall_us={}", started.elapsed().as_micros());
+        assert!(matches!(error, sqlx::Error::Database(ref error) if error.code().as_deref() == Some("57014")));
+        tx.rollback().await?;
+        for state in ["fatal", "read-only", "missing"] {
+            if state == "read-only" {
+                sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL").execute(admin).await?;
+                sqlx::query("SET default_transaction_read_only=on").execute(&ledger.pool).await?;
+            } else if state == "missing" {
+                sqlx::query("SET default_transaction_read_only=off").execute(&ledger.pool).await?;
+                sqlx::query("DELETE FROM qbit_prism_cluster").execute(admin).await?;
+            }
+            let started = std::time::Instant::now();
+            let error = ledger.refresh_probe(ReadAdmission::default()).await.unwrap_err();
+            eprintln!("guard-first {state}+locked shares: {error}, wall_us={}", started.elapsed().as_micros());
+            assert!(matches!(error, WindowError::Database(sqlx::Error::RowNotFound)), "{error}");
+            // The old public payout path is the reference guard contract.
+            assert!(matches!(ledger.payout_state().await, Err(WindowError::Database(sqlx::Error::RowNotFound))));
+        }
+        lock.rollback().await?;
+        Ok(())
+    })).await
 }
