@@ -33,11 +33,44 @@ database names, hostnames, addresses, or server-provided SQL identifiers:
 | Cancellation | `database readiness query was canceled` | Database statement deadlines and operator query cancellations |
 | Other query/driver failure | `database readiness query failed` | Database service logs and readiness query compatibility |
 
-The public process emits a `public readiness probe failed` warning for failed
-database probes, with fixed `category`, `phase` (`schema`, `replica`, or `probe`
-for the whole-probe timeout), and `action` fields. Enable warnings for
-`qbit_prism_server::api::public_service` in `RUST_LOG` to collect these operator
-diagnostics. Classification uses SQLx variants and recognized SQLSTATE values;
+The public process emits bounded `public readiness probe failed` warnings for
+failed database probes, with fixed `category`, `phase` (`schema`, `replica`, or
+`probe` for the whole-probe timeout), and `action` fields. The event policy is:
+
+- The first failed probe emits one warning immediately.
+- A change of failure category emits one warning immediately, even within the
+  reminder interval. A phase change alone does not count as a category change.
+- An unchanged failure emits at most one reminder per 60 seconds, measured with
+  monotonic time from the last warning decision. The first completed failed
+  probe at or after that boundary emits the reminder; missed intervals do not
+  produce a burst of catch-up events.
+- After an unhealthy episode, the first healthy probe emits one
+  `public readiness probe recovered` event at INFO. Further healthy probes and
+  a healthy startup are silent. A new failure after recovery warns immediately;
+  flapping therefore preserves every observed failure/recovery transition.
+
+An episode begins with a database probe failure from the categories above.
+Recovery requires a fresh successful probe that also passes the existing
+replica readiness policy. A successful query while replica policy still refuses
+health does not announce recovery or reset the warning budget. Replica-only
+refusals without a preceding database probe failure remain visible through the
+existing health and metrics surfaces and do not start a diagnostic episode.
+These events describe completed probes; they do not create a second observer
+for startup or snapshot staleness between probes.
+
+The readiness snapshot and diagnostic state are published together and unlocked
+before calling the synchronous logging sink. A blocked sink can delay the probe
+task, but health readers can still see its freshly published result; the existing
+staleness policy continues to apply if subsequent probes cannot complete. There
+is no additional background task, event queue, or configuration setting.
+
+Set `RUST_LOG=qbit_prism_server::api::public_service=info` to collect warnings
+and recovery events, or use `=warn` to collect only warnings. Filters that exclude
+these levels hide the events; filtered events still advance the policy state,
+and enabling a filter does not replay them. The process continues to use its
+existing `RUST_LOG` reader and default filter.
+
+Classification uses SQLx variants and recognized SQLSTATE values;
 unknown errors remain failures without guessing their cause. PostgreSQL reports
 both an expired `statement_timeout` and an operator cancellation as SQLSTATE
 `57014`; both use the cancellation category with deadline/cancellation guidance.
