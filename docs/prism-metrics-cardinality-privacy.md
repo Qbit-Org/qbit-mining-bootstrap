@@ -23,7 +23,7 @@ collections. Neither observation values nor failure states may introduce names
 or labels. Unknown remains -1, distinct from a fresh successful zero. This is a
 run-role qualification; public-api family and label contracts are unchanged.
 
-Privacy checks cover three source-to-render paths:
+Privacy checks cover two producer-to-render paths:
 
 - `stratum_hashes_heights_jobs_and_miners_never_enter_metrics_exposition` seeds
   synthetic parent hashes, coinbase heights, job IDs and miner names through the
@@ -36,10 +36,13 @@ Privacy checks cover three source-to-render paths:
   in a disposable PostgreSQL schema. The real collector and HTTP renderer must
   expose aggregate counts/age only, including after a failed collection. It
   verifies the stored input and resulting count so an unused fixture cannot pass.
-- `census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapshots`
-  seeds the health publication with synthetic tip identifiers, then checks the
-  complete census and privacy rules through the real API router in all three
-  freshness states, along with cache headers and unknown age semantics.
+
+Separately, `census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapshots`
+checks the complete census, cache headers and unknown age semantics through the
+real API router in all three freshness states. Its seeded health payload checks
+separation between health and metrics publication: `/metrics` does not read
+`state.health`. That absence is not evidence of a third producer privacy path;
+the Stratum and candidate-collector tests provide that evidence.
 
 Heights are forbidden in metadata, names and labels. Numeric samples are compared
 across deliberately different source heights: a series that follows both input
@@ -71,6 +74,7 @@ or expand the separate SQL acquisition coverage work.
 ```sh
 CARGO_BUILD_JOBS=2 cargo test -p qbit-prism-server --test observability
 CARGO_BUILD_JOBS=2 cargo test -p qbit-prism-server --test stratum_protocol metrics_privacy
+CARGO_BUILD_JOBS=2 cargo test -p qbit-prism-server --lib api::metrics_snapshot::tests
 # Use only a disposable PostgreSQL database configured through the test gate:
 CARGO_BUILD_JOBS=2 cargo test -p qbit-prism-server --test observability_database -- --ignored
 ```
