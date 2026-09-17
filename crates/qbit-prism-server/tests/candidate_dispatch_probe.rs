@@ -193,8 +193,8 @@ async fn explain(
     let mut all = Vec::new();
     nodes(&plan[0]["Plan"], &mut all);
     assert_eq!(
-        plan[0]["Plan"]["Actual Rows"].as_u64(),
-        Some(u64::from(eligible))
+        plan[0]["Plan"]["Actual Rows"].as_f64(),
+        Some(f64::from(u8::from(eligible)))
     );
     let scans: Vec<_> = all
         .iter()
@@ -210,7 +210,9 @@ async fn explain(
             .any(|n| n["Node Type"] == "Sort" || n["Node Type"] == "Seq Scan"),
         "unexpected sort/scan in {label}: {plan}"
     );
-    // Visible tuples visited, not dead index entries or buffer accesses.
+    // EXPLAIN reports per-loop row averages. Require one scan execution so
+    // this counts visible tuples visited, not dead entries or buffer accesses.
+    assert_eq!(scans[0]["Actual Loops"].as_f64(), Some(1.0));
     let visible = scans[0]["Actual Rows"].as_f64().unwrap_or(0.0)
         + scans[0]["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
     ensure!(
@@ -433,16 +435,21 @@ async fn wait_for_probe_lock(conn: &mut PgConnection) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn canonical_probe_errors_and_cancellation_are_not_idle_or_replayed() -> Result<()> {
+async fn canonical_probe_errors_remain_failures_and_pool_recovers() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let db = Database::open(&raw).await?;
     let outcome = async {
         let mut control = PgConnection::connect(&db.fixture.url).await?;
+        // The empty outbox isolates error propagation and pool recovery.
+        // A cancelled future can leave its sent probe running on the server;
+        // due work could consume a slot even though its transaction rolls back.
+        // These empty-outbox checks establish no guarantee against replay or
+        // unknown sequence allocation after cancellation or a lost response.
         let before = sequence(&mut control).await?;
-        // Ledger keeps at least two connections. Hold one so the SET and
-        // subsequent claim necessarily use the same other pooled session.
+        // Ledger raises this fixture's requested pool limit of one to two.
+        // Hold one so SET and the claim use the same other pooled session.
         let _spare = db.ledger.pool.acquire().await?;
         let mut blocker = PgConnection::connect(&db.fixture.url).await?;
         sqlx::raw_sql("BEGIN; LOCK qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE").execute(&mut blocker).await?;

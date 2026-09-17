@@ -32,12 +32,19 @@ SHA-256, server/planner settings, exact counts, relation sizes, and
 - A clock-substituted canonical-query model checks exact due/expiry
   microsecond boundaries, separately from actual advancing-clock execution
   in an old transaction. Sequence allocation survives transaction rollback.
-- Native `claim_candidate` timeout, cancellation and connection-loss paths
-  preserve failure and release resources; they do not return false idle.
+- Native empty-outbox `claim_candidate` timeout, cancellation and
+  connection-loss controls check error propagation and pool recovery. A sent
+  probe can consume a sequence slot after its caller is cancelled, and a lost
+  response after allocation leaves an unknown outcome; this control does not
+  establish absence of replay or gap-free sequence allocation.
 
-The first qualification on PG16.14 executed 72 plans (36 direct and 36
-prepared), plus six preparatory executions per prepared case. All used the
-unfinished index without a Sort. With an old snapshot and stale statistics,
+The first qualification on PG16.14 used tree
+`d00602bc17c5403a7d1c73f1915c6fe97f7d8571` (published as commit `c510b436`)
+and canonical query SHA-256
+`24ffe2248cf3f9ea6100deac143402f9fae6c49783687499b57681328a5040a0`.
+It executed 72 plans (36 direct and 36 prepared), plus six preparatory
+executions per prepared case. All used the unfinished index without a Sort.
+With an old snapshot and stale statistics,
 3,120 visible unfinished rows still incurred about 11,800 buffer accesses.
 Thus the assertions cover these plan shapes and visible rows; they impose no
 latency/page threshold or universal physical-work bound. Shared reads can
@@ -56,9 +63,11 @@ cargo test --locked -p qbit-prism-server --test candidate_dispatch_probe -- --te
 Record `git rev-parse HEAD` with the output. Each test owns and drops its own
 fixture database. The normal CI shard discovery includes this target, and
 its four gate identities are registered in `test/prism-gated-tests.txt`.
+CI runs the four database-isolated tests concurrently; the command above
+serializes the local qualification, so their resource conditions differ.
 The existing admission, lifecycle, claim fairness/owner-loss and storm/restart
 targets provide native runtime qualification separately; storm sizes 100 and
 3,120 refer to their existing configured sibling counts, not the exact total
-unfinished counts of this probe matrix. The merged storm tests and assertions
-are unchanged. No cold-cache latency, universal optimizer choice, or exact
+unfinished counts of this probe matrix. The merged storm test behavior and
+assertions are unchanged. No cold-cache latency, universal optimizer choice, or exact
 concurrent clock trace equivalence is claimed.
