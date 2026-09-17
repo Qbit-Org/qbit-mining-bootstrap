@@ -37,6 +37,7 @@ struct Chain {
     active: BTreeMap<u64, String>,
     headers: HashMap<String, (u64, String)>,
     header_error: Option<Value>,
+    hash_error: Option<Value>,
     methods: Vec<String>,
 }
 
@@ -146,6 +147,9 @@ async fn answer(State(chain): State<Arc<Mutex<Chain>>>, Json(request): Json<Valu
             ),
             "getnetworkinfo" => (json!({"connections": 2}), Value::Null),
             "getbestblockhash" => (json!(tip_hash), Value::Null),
+            "getblockhash" if chain.hash_error.is_some() => {
+                (Value::Null, chain.hash_error.clone().unwrap())
+            }
             "getblockhash" => match request["params"][0]
                 .as_u64()
                 .and_then(|height| chain.active.get(&height))
@@ -448,6 +452,8 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     let mut legacy = Row::new("aa", "pending");
     legacy.shape = Shape::Legacy;
     legacy.height = Some(110);
+    let mut above_tip = Row::new("ab", "pending");
+    above_tip.height = Some(112);
     for row in [
         &abandoned,
         &unaudited,
@@ -460,6 +466,7 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
         &unreadable,
         &chunked,
         &legacy,
+        &above_tip,
     ] {
         seed(&ledger.pool, row).await?;
     }
@@ -477,6 +484,8 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
         chain.extend(108, &unreadable.hash, &parent);
         chain.extend(109, &chunked.hash, &parent);
         chain.extend(110, &legacy.hash, &parent);
+        // A shortened active chain can still retain a header above its tip.
+        chain.side(112, &above_tip.hash, &parent);
     });
     // The chain of `misheight` at 101 displaced `good`; put it back on a
     // height of its own.
@@ -609,6 +618,51 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
         }
     }
     node.script(|chain| chain.header_error = None);
+
+    for apply in [false, true] {
+        let mut args = allowlist(&[&good.hash, &above_tip.hash]);
+        if apply {
+            args.push("--apply");
+        }
+        let refused = recover(&db, &node, &args).await?;
+        assert_eq!(code(&refused), 9, "{}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains(&format!(
+                "candidate {} is not on the active chain",
+                above_tip.hash
+            )),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(everything(&ledger.pool).await?, before);
+    }
+
+    // Only numeric -8 from getblockhash proves the height is inactive.
+    for error in [
+        json!({"code": -28, "message": "Loading block index"}),
+        json!({"code": -32603, "message": "Internal error"}),
+        json!({"message": "No error code"}),
+        json!({"code": "-8", "message": "Invalid error code"}),
+    ] {
+        node.script(|chain| chain.hash_error = Some(error.clone()));
+        for apply in [false, true] {
+            let mut args = allowlist(&[&good.hash]);
+            if apply {
+                args.push("--apply");
+            }
+            let failed = recover(&db, &node, &args).await?;
+            assert_eq!(code(&failed), 1, "{}", stderr(&failed));
+            let message = stderr(&failed);
+            assert!(message.contains("qbit RPC getblockhash"), "{message}");
+            assert!(
+                message.contains(error["message"].as_str().unwrap()),
+                "{message}"
+            );
+            assert!(!message.contains("nothing to recover"), "{message}");
+            assert_eq!(everything(&ledger.pool).await?, before);
+        }
+    }
+    node.script(|chain| chain.hash_error = None);
 
     // Malformed, duplicate and out-of-range allowlists are refused at the
     // entry boundary, before any connection: the node is not asked.

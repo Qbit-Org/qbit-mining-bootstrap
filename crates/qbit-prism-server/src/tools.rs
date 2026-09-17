@@ -606,7 +606,22 @@ async fn active_block(rpc: &Rpc, hash: &str) -> Result<Result<(u64, String), Str
         .to_ascii_lowercase();
     // A header the node knows can be on a side chain; only the active
     // chain's hash at that height proves the block active.
-    let active = rpc.call("getblockhash", json!([height])).await?;
+    let active = match rpc.call("getblockhash", json!([height])).await {
+        Ok(active) => active,
+        Err(error) => {
+            // A reorg can shorten the active chain below this known header.
+            // Only RPC_INVALID_PARAMETER means the height is out of range.
+            if error
+                .downcast_ref::<RpcReplyError>()
+                .is_some_and(|reply| reply.error["code"].as_i64() == Some(-8))
+            {
+                return Ok(Err(format!(
+                    "height {height} is beyond the node's active chain tip"
+                )));
+            }
+            return Err(error);
+        }
+    };
     if active.as_str() != Some(hash) {
         return Ok(Err(format!(
             "the node's active chain holds {} at height {height}",
