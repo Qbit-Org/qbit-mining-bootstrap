@@ -663,6 +663,52 @@ async fn append_preserves_old_rejected_share_ids() -> Result<()> {
         ensure!(unchanged, "replaying a rejected ID changed its row or credit");
         ensure!(db.ledger.append(share(2, "alice"), None).await?.inserted,
             "a different share ID was refused");
+
+        // A new header may still reuse a rejected legacy ID, so append must
+        // check the release partition. It must not probe all the intervening
+        // leaves, however. Observe the actual append transaction's scans in
+        // a BEFORE INSERT trigger, including probes that returned no rows.
+        sqlx::raw_sql(
+            "CREATE FUNCTION check_append_partition_scans() RETURNS trigger LANGUAGE plpgsql AS $$
+             DECLARE scanned text;
+             BEGIN
+               SELECT string_agg(stats.relname, ', ' ORDER BY stats.relname) INTO scanned
+               FROM pg_stat_xact_user_tables stats
+               JOIN qbit_prism_share_partitions part ON part.partition_name=stats.relname
+               WHERE stats.schemaname=current_schema()
+                 AND part.lower_seq IS NOT NULL
+                 AND part.upper_seq<=qbit_prism_share_probe_floor()
+                 AND stats.seq_scan+COALESCE(stats.idx_scan,0)>0;
+               IF scanned IS NOT NULL THEN
+                 RAISE EXCEPTION 'new share probed old nonlegacy partitions: %', scanned;
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER check_append_partition_scans BEFORE INSERT ON qbit_share_ledger
+             FOR EACH ROW EXECUTE FUNCTION check_append_partition_scans()",
+        )
+        .execute(db.pool())
+        .await?;
+        // Repeat after attaching more history so the test distinguishes a
+        // constant legacy lookup from a full-parent lookup as retention grows.
+        for cell in [8, 24] {
+            db.set_next_seq(cell * width + 10).await?;
+            partitions::ensure(db.pool()).await?;
+            // Flush setup's pending backend-local scan counters on every
+            // pool connection before the trigger observes the append.
+            let mut connections = Vec::new();
+            for _ in 0..db.pool().options().get_max_connections() {
+                let mut connection = db.pool().acquire().await?;
+                sqlx::query("SELECT pg_stat_force_next_flush()")
+                    .execute(&mut *connection).await?;
+                connections.push(connection);
+            }
+            drop(connections);
+            ensure!(db.ledger.append(share(u64::try_from(cell)?, "alice"), None).await?.inserted,
+                "a fresh header was refused at partition {cell}");
+            ensure!(!db.ledger.append(original.clone(), None).await?.inserted,
+                "a rejected legacy ID was credited at partition {cell}");
+        }
         Ok::<_, anyhow::Error>(())
     }.await;
     db.close().await?;

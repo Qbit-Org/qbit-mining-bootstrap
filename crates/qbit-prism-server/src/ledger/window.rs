@@ -698,19 +698,22 @@ impl Ledger {
         // share_id uniqueness is per leaf, so a share_id probe without a
         // share_seq bound descends one index per attached partition.
         // qbit_prism_share_hashes is the authority for accepted headers, but
-        // legacy rejected rows have no mapping. Probe the newest partitions
-        // first (qbit_prism_share_probe_floor), then every attached partition
-        // on a miss regardless of the header mapping, so an old rejected ID
-        // cannot be inserted again in another leaf. This also matches legacy
-        // worker-scoped duplicates whose header maps to an earlier row.
+        // legacy rejected rows have no mapping. They were all in the release
+        // table at conversion, below conversion_bound; native writers only
+        // insert accepted rows. Probe the newest partitions first, then that
+        // legacy range on an unmapped miss, so a new share never probes every
+        // retained leaf. Only a credited header needs the full-parent fallback,
+        // including legacy worker-scoped duplicates mapped to an earlier row.
         // A credited row that has left the online ledger cannot be compared
         // and is refused as the duplicate it is.
         let header_hash = share_header_hash(&share.share_id);
-        let credited: Option<String> =
-            sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1")
-                .bind(&header_hash)
-                .fetch_optional(&mut **tx)
-                .await?;
+        let (credited, legacy_bound): (Option<String>, i64) = sqlx::query_as(
+            "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),conversion_bound \
+             FROM qbit_prism_share_partitioning WHERE singleton",
+        )
+        .bind(&header_hash)
+        .fetch_one(&mut **tx)
+        .await?;
         let mut existing = sqlx::query(&format!(
             "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()"
         ))
@@ -718,10 +721,20 @@ impl Ledger {
         .fetch_optional(&mut **tx)
         .await?;
         if existing.is_none() {
-            existing = sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
+            existing = if credited.is_some() {
+                sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
+                    .bind(&share.share_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+            } else {
+                sqlx::query(&format!(
+                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq<$2"
+                ))
                 .bind(&share.share_id)
+                .bind(legacy_bound)
                 .fetch_optional(&mut **tx)
-                .await?;
+                .await?
+            };
         }
         if let Some(row) = existing {
             let previous = share_from_row(&row)?;
