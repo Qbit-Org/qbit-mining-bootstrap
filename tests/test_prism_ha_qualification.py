@@ -3,11 +3,14 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -195,6 +198,74 @@ class QualificationTests(unittest.TestCase):
             self.assertIsNone(census["process_exit"])
             self.assertTrue(census["cleanup"]["owned_parent_removed"])
             self.assertFalse(owned.exists())
+
+    def test_wrapper_sigterm_stops_owned_child_and_records_cleanup(self):
+        with tempfile.TemporaryDirectory() as parent:
+            base = Path(parent)
+            binary = base / "pg_ctl"
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                "import pathlib, sys, time\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1])\n"
+                "out.mkdir()\n"
+                "(out / 'ready').touch()\n"
+                "time.sleep(60)\n")
+            binary.chmod(0o700)
+            out = base / "evidence"
+            process = subprocess.Popen([
+                sys.executable, str(qualification.ROOT / "scripts/prism_ha_qualification.py"),
+                "run", "--example-bin", str(binary), "--runtime-tests", str(binary),
+                "--ack-tests", str(binary), "--pg-bin-dir", str(base), "--out", str(out),
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 10
+                while not (out / "functional" / "ready").exists():
+                    self.assertIsNone(process.poll(), "fixture wrapper exited before readiness")
+                    self.assertLess(time.monotonic(), deadline, "fixture readiness timed out")
+                    time.sleep(0.01)
+                process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=10)
+                self.assertNotEqual(process.returncode, 0)
+                census = json.loads((out / "resource-census.json").read_text())
+                self.assertEqual(census["process_exit"], -signal.SIGTERM)
+                self.assertIn("interrupted", census["failure"])
+                self.assertTrue(census["cleanup"]["owned_parent_removed"])
+                self.assertFalse(Path(census["owned_parent"]).exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(census["process_pid"], 0)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=10)
+
+    def test_diagnostic_copy_failure_preserves_original_interruption(self):
+        with tempfile.TemporaryDirectory() as parent:
+            base = Path(parent)
+            binary = base / "pg_ctl"
+            binary.write_text("fixture")
+            binary.chmod(0o700)
+            owned = base / "owned"
+            cluster = owned / "prism-load-fixture"
+            cluster.mkdir(parents=True)
+            (cluster / "primary.log").write_text("fixture diagnostics")
+            args = SimpleNamespace(example_bin=binary, runtime_tests=binary, ack_tests=binary,
+                                   pg_bin_dir=base, out=base / "evidence")
+            process = SimpleNamespace(pid=42, returncode=-signal.SIGTERM, poll=lambda: -signal.SIGTERM,
+                                      communicate=Mock(side_effect=[KeyboardInterrupt(), ("", "")]))
+            with patch.object(qualification.tempfile, "mkdtemp", return_value=str(owned)), \
+                    patch.object(qualification.subprocess, "Popen", return_value=process), \
+                    patch.object(qualification.os, "killpg") as kill, \
+                    patch.object(qualification.shutil, "copyfile", side_effect=OSError("copy failed")), \
+                    patch.object(qualification.subprocess, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, "a" * 40), subprocess.CompletedProcess([], 0, ""),
+                    ]):
+                with self.assertRaisesRegex(RuntimeError, "functional run failed"):
+                    qualification.run(args)
+            kill.assert_called_once_with(42, signal.SIGTERM)
+            census = json.loads((args.out / "resource-census.json").read_text())
+            self.assertIn("interrupted", census["failure"])
+            self.assertIn("diagnostics", census["failure"])
+            self.assertTrue(census["cleanup"]["owned_parent_removed"])
 
 
 if __name__ == "__main__":

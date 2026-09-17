@@ -189,7 +189,8 @@ def run(args):
                     saved.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(log, saved)
         except Exception:
-            failure = "could not retain owned PostgreSQL diagnostics"
+            diagnostic_failure = "could not retain owned PostgreSQL diagnostics"
+            failure = f"{failure}; {diagnostic_failure}" if failure else diagnostic_failure
         try:
             cleanup = cleanup_owned(root, args.pg_bin_dir)
         except Exception as error:
@@ -206,6 +207,13 @@ def run(args):
             "live_acceptance": "not established"}
 
 
+def terminate_as_interrupt(_signum, _frame):
+    # Let run's existing interruption path stop only its own process group and
+    # verify its exact PG directories. A repeated TERM must not interrupt cleanup.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -214,7 +222,11 @@ def main():
     for option in ("example-bin", "runtime-tests", "ack-tests", "pg-bin-dir", "out"):
         functional.add_argument(f"--{option}", type=lambda p: Path(p).resolve(), required=True)
     args = parser.parse_args()
-    print(json.dumps(render() if args.command == "render" else run(args), indent=2))
+    previous = signal.signal(signal.SIGTERM, terminate_as_interrupt)
+    try:
+        print(json.dumps(render() if args.command == "render" else run(args), indent=2))
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

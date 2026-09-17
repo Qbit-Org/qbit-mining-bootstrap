@@ -38,8 +38,9 @@ It never stops a process/container by name, scans for another user's databases,
 or runs global Docker cleanup. Its resource census records the owned parent,
 child PID, child exit status and exact PG paths. PG shutdown must be verified
 with `pg_ctl status` and disappearance of `postmaster.pid` before deleting data.
-Unknown cleanup retains the owned directory and fails the command. A killed
-wrapper or machine loss requires inspecting that recorded parent; absence of
+Unknown cleanup retains the owned directory and fails the command. SIGTERM and
+Ctrl-C use the wrapper's owned-resource cleanup path. SIGKILL or machine loss
+requires inspecting that recorded parent; absence of
 an artifact is not proof of cleanup.
 
 ## Run the reusable preparation

@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::oneshot,
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
@@ -40,11 +41,12 @@ struct Args {
 }
 
 /// The endpoint only changes AFTER positive old-primary fencing and promotion.
-/// JoinSet owns every accepted stream; dropping it closes existing connections.
+/// Shutdown joins the listener task and every accepted stream before returning.
 struct WriterEndpoint {
     address: SocketAddr,
     target: Arc<AtomicU16>,
     task: JoinHandle<()>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 impl WriterEndpoint {
     async fn start(port: u16) -> Result<Self> {
@@ -52,10 +54,12 @@ impl WriterEndpoint {
         let address = listener.local_addr()?;
         let target = Arc::new(AtomicU16::new(port));
         let routing = target.clone();
+        let (shutdown, mut requested) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut streams = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = &mut requested => break,
                     accepted = listener.accept() => {
                         let Ok((mut client, _)) = accepted else { break };
                         let port = routing.load(Ordering::SeqCst);
@@ -68,12 +72,24 @@ impl WriterEndpoint {
                     _ = streams.join_next(), if !streams.is_empty() => {}
                 }
             }
+            drop(listener);
+            streams.shutdown().await;
         });
         Ok(Self {
             address,
             target,
             task,
+            shutdown: Some(shutdown),
         })
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        (&mut self.task)
+            .await
+            .context("writer endpoint task failed")
     }
 }
 impl Drop for WriterEndpoint {
@@ -139,6 +155,7 @@ async fn exercise(
     managed: &cluster::ManagedPostgres,
     primary: &Path,
     standby: &Path,
+    owned_endpoint: &mut Option<WriterEndpoint>,
     evidence: &mut Value,
 ) -> Result<()> {
     let admin = PgPool::connect(&managed.primary_url).await?;
@@ -233,7 +250,8 @@ async fn exercise(
     evidence["runtime_schemas_remaining"] = json!(schemas);
     ensure!(schemas.is_empty(), "fixture left owned schemas behind");
 
-    let endpoint = WriterEndpoint::start(managed.primary_port).await?;
+    *owned_endpoint = Some(WriterEndpoint::start(managed.primary_port).await?);
+    let endpoint = owned_endpoint.as_ref().context("writer endpoint missing")?;
     evidence["owned_writer_endpoint"] = json!(endpoint.address.to_string());
     // This DSN remains identical for both Ledger pools throughout the exercise.
     let writer_url = managed.primary_url.replace(
@@ -377,6 +395,12 @@ async fn exercise(
         .fetch_one(&promoted)
         .await?;
     ensure!(!in_recovery, "promotion did not establish writer role");
+    let promoted_durability = cluster::durability(&promoted).await?;
+    ensure!(
+        promoted_durability == ("on".into(), "on".into(), "on".into()),
+        "promoted writer durability disabled"
+    );
+    evidence["promoted_durability"] = json!(promoted_durability);
     let promotion_ms = failover_started.elapsed().as_millis();
     endpoint
         .target
@@ -477,6 +501,49 @@ mod cli_tests {
     }
 }
 
+#[cfg(test)]
+mod endpoint_tests {
+    use super::WriterEndpoint;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::timeout,
+    };
+
+    #[tokio::test]
+    async fn shutdown_before_listener_task_runs_closes_the_listener() {
+        let mut endpoint = WriterEndpoint::start(1).await.unwrap();
+        timeout(Duration::from_secs(2), endpoint.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(TcpStream::connect(endpoint.address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_listener_and_open_forwarding_streams() {
+        timeout(Duration::from_secs(2), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut endpoint = WriterEndpoint::start(upstream.local_addr().unwrap().port())
+                .await
+                .unwrap();
+            let mut client = TcpStream::connect(endpoint.address).await.unwrap();
+            let (mut server, _) = upstream.accept().await.unwrap();
+            client.write_all(b"x").await.unwrap();
+            let mut byte = [0];
+            server.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, *b"x");
+            endpoint.shutdown().await.unwrap();
+            assert!(TcpStream::connect(endpoint.address).await.is_err());
+            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -513,10 +580,20 @@ async fn main() -> Result<()> {
     evidence["owned_resources"] = json!({"root": root, "primary": primary, "standby": standby,
         "primary_port": managed.primary_port, "standby_port": managed.standby_port,
         "containers": [], "external_databases": []});
+    let mut owned_endpoint = None;
     let result = tokio::select! {
-        result = timeout(Duration::from_secs(180), exercise(&args, &managed, &primary, &standby, &mut evidence)) => result.context("functional exercise deadline expired").and_then(|r| r),
+        result = timeout(Duration::from_secs(180), exercise(&args, &managed, &primary, &standby, &mut owned_endpoint, &mut evidence)) => result.context("functional exercise deadline expired").and_then(|r| r),
         _ = interrupt.recv() => Err(anyhow::anyhow!("interrupted")),
         _ = terminate.recv() => Err(anyhow::anyhow!("terminated")),
+    };
+    // Keep the endpoint in this owner even if the exercise is cancelled. Joining
+    // its task also joins all forwarding tasks, so closure needs no scheduler guess.
+    let endpoint_joined = match owned_endpoint.take() {
+        Some(mut endpoint) => matches!(
+            timeout(Duration::from_secs(5), endpoint.shutdown()).await,
+            Ok(Ok(()))
+        ),
+        None => true,
     };
     // Retain directories until positive process-exit evidence, even on failure.
     managed.stop();
@@ -525,12 +602,11 @@ async fn main() -> Result<()> {
             evidence["diagnostic_copy_error"] = json!(format!("{name}: {error}"));
         }
     }
-    // Let cancellation drop the endpoint's JoinSet and close its accepted streams.
-    tokio::task::yield_now().await;
-    let endpoint_closed = match evidence["owned_writer_endpoint"].as_str() {
-        Some(address) => TcpStream::connect(address).await.is_err(),
-        None => true,
-    };
+    let endpoint_closed = endpoint_joined
+        && match evidence["owned_writer_endpoint"].as_str() {
+            Some(address) => TcpStream::connect(address).await.is_err(),
+            None => true,
+        };
     let primary_stopped = stopped(&args.pg_bin_dir, &primary).unwrap_or(false);
     let standby_stopped = stopped(&args.pg_bin_dir, &standby).unwrap_or(false);
     let ports_closed = TcpStream::connect(("127.0.0.1", managed.primary_port))
@@ -546,7 +622,7 @@ async fn main() -> Result<()> {
         false
     };
     evidence["cleanup"] = json!({"primary_stopped": primary_stopped, "standby_stopped": standby_stopped,
-        "postgres_ports_closed": ports_closed, "writer_endpoint_closed": endpoint_closed,
+        "postgres_ports_closed": ports_closed, "writer_endpoint_joined": endpoint_joined, "writer_endpoint_closed": endpoint_closed,
         "owned_directory_removed": removed,
         "complete": primary_stopped && standby_stopped && ports_closed && endpoint_closed && removed});
     if let Err(error) = &result {
