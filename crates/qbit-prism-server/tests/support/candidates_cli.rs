@@ -1301,7 +1301,7 @@ async fn abandon_refuses_a_terminal_row_and_a_pending_row_whose_block_landed() -
 
     // Already terminal: legible as "nothing to do", and distinct from a row
     // that was never there, so a repeated abandon is not a lost row.
-    for (byte, state) in [("11", "submitted"), ("22", "abandoned")] {
+    for (byte, state) in [("11", "submitted"), ("22", "abandoned"), ("23", "orphaned")] {
         let row = Row::new(byte, state);
         seed(&ledger.pool, &row).await?;
         let before = whole_row(&ledger.pool, &row.hash).await?;

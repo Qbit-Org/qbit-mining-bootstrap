@@ -180,7 +180,7 @@ there stays as evidence that the row had been parked.
 | 1 | Configuration or database failure, including the two fences below. | The underlying error, as for every other command. |
 | 2 | No such row. | `no candidate row for <hash>` |
 | 3 | Offered to the node; never abandonable. | `candidate <hash> is in state <state>; it was offered to the node and is never abandoned. Its block may already have been submitted. Leave it to reconciliation` |
-| 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned>; nothing to do` |
+| 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned\|orphaned>; nothing to do` |
 | 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version and directs legacy rows to the pinned `2.x.x` drain, newer formats to a compatible release. |

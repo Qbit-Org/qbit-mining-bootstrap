@@ -1590,7 +1590,7 @@ async fn diagnose_abandon_refusal(
     };
     let state = facts.state.as_str();
     Ok(match state {
-        "submitted" | "abandoned" => json!({"outcome":"terminal","state":state}),
+        "submitted" | "abandoned" | "orphaned" => json!({"outcome":"terminal","state":state}),
         "offer_reserved" | "offered" | "reconciliation" => {
             json!({"outcome":"offered","state":state})
         }
