@@ -1186,7 +1186,9 @@ async fn partition_plan(
         ));
     }
 
-    if !attachment.attached || !attachment.relation_present {
+    // A relation that left the parent before the catalog recorded its detach
+    // still has to pass every gate before reconciliation can authorize drop.
+    if !attachment.relation_present || (!attachment.attached && record.state != "attached") {
         for name in CONDITION_NAMES {
             conditions.push(Condition::not_applicable(
                 name,
@@ -1212,18 +1214,22 @@ async fn partition_plan(
         newest_accepted_at = newest;
         newest_share_seq = newest_seq;
 
-        // PostgreSQL hides a detach-pending partition from every new snapshot
-        // of the parent, so the window just walked could not count this
-        // partition's rows. A floor the window reached at its full weight
-        // above the partition is exact, since nothing hidden lies in what it
-        // counted; a window that ran out of visible rows first would have
-        // gone on into these.
-        let hidden_rows = attachment.detach_pending && accepted_rows > 0;
+        // PostgreSQL hides a detached or detach-pending partition from every
+        // new snapshot of the parent, so the window just walked could not
+        // count this partition's rows. A floor reached at its full weight
+        // above the partition is exact; a window that ran out of visible
+        // rows first would have gone on into these.
+        let hidden_rows = (!attachment.attached || attachment.detach_pending) && accepted_rows > 0;
+        let hidden_state = if attachment.detach_pending {
+            "detach-pending"
+        } else {
+            "detached"
+        };
         conditions.push(match horizon.window_floor {
             _ if hidden_rows && horizon.window_short => Condition::blocked(
                 "payout_window",
                 format!(
-                    "the payout window at {}x ran out of rows before reaching its weight, and {PARENT} hides this detach-pending partition's {accepted_rows} accepted row(s) from it, so the window reaches into this partition's bounds {}",
+                    "the payout window at {}x ran out of rows before reaching its weight, and {PARENT} hides this {hidden_state} partition's {accepted_rows} accepted row(s) from it, so the window reaches into this partition's bounds {}",
                     options.window_multiple,
                     record.bounds()
                 ),
@@ -2018,9 +2024,9 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
     if !attachment.attached {
         // The DDL of an earlier run succeeded and its catalog update did not,
         // or the DDL was run by hand. The catalog records either one only as
-        // a detach the gates below would have allowed: the archive verified,
-        // and the audits sealed. `plan` no longer evaluates the seal for a
-        // relation that is off the parent, so it is taken here directly.
+        // a detach the gates below would have allowed. The seal is also
+        // checked directly for idempotent retries whose catalog already
+        // records the partition detached and whose plan skips the gates.
         ensure!(
             attachment.relation_present,
             "{partition_name} is neither a partition of {PARENT} nor a relation; it was dropped. Restore it from its archive with share-archive restore"
@@ -2035,6 +2041,24 @@ pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions
             "record the detach of",
         )
         .await?;
+        if record.state == "attached" {
+            // The catalog/pg_inherits mismatch is the unknown this branch
+            // repairs. Every retention condition, including unknown inputs,
+            // is in blockers and must pass before that repair is recorded.
+            ensure!(
+                entry.blockers.is_empty(),
+                "refusing to record the detach of {partition_name}: {}. {PARENT} hides this detached partition's rows, so bring them back with {}; clear each condition with share-archive plan and start again from share-archive detach {partition_name}",
+                entry.blockers.join("; "),
+                reattach_statement(record)
+            );
+            ensure!(
+                entry.live_rows.is_some() && entry.live_rows == record.archive_rows,
+                "refusing to record the detach of {partition_name}: it holds {} live rows but its verified archive records {}; run {}, then archive and verify it again before share-archive detach {partition_name}",
+                number_or(entry.live_rows, "an unknown number of"),
+                number_or(record.archive_rows, "no"),
+                reattach_statement(record)
+            );
+        }
         let reconciled = record_detached(ledger, partition_name).await?;
         return Ok(json!({
             "schema": "qbit.prism.share-archive-detach.v1",
@@ -2163,9 +2187,9 @@ fn reattach_statement(record: &PartitionRecord) -> String {
 /// The seal, held to for a relation that is no longer an attached partition:
 /// once it is recorded detached the drop is one command away, and a canonical
 /// artifact can only be rebuilt while the shares it paid on are still online
-/// under the parent. `plan` marks every condition not applicable for a
-/// relation off the parent, so the `audits_sealed` condition that gates a
-/// detach is taken here directly, from the catalog and from the audit rows.
+/// under the parent. `plan` marks every condition not applicable once the
+/// catalog records the relation detached, so the `audits_sealed` condition
+/// is taken here directly, from the catalog and from the audit rows.
 /// The seal itself needs the rows online, so the way forward is to attach the
 /// relation again under its recorded bounds, not to record the state.
 async fn check_seal_off_parent(

@@ -654,7 +654,10 @@ async fn archive_and_verify_round_trip_chain_and_tamper_detection() -> Result<()
         archive::verify(&ledger, P1, root.path()).await?;
         // Once a later archive has left the ledger it cannot be written again
         // to follow a new manifest, so the manifest it chains to is fixed.
-        // The catalog records a detach that ran by hand only over a seal.
+        // A detach run by hand still needs the seal and the online horizon
+        // clear before the catalog may record it.
+        insert_shares(&ledger.pool, p1_upper, p1_upper + 4, 1_000_000, "server-c", 1.0).await?;
+        advance_rollups(&ledger.pool).await?;
         archive::seal(&ledger, P1).await?;
         sqlx::raw_sql(&format!(
             "ALTER TABLE qbit_share_ledger DETACH PARTITION {P1} CONCURRENTLY"
@@ -1892,6 +1895,24 @@ async fn detach_and_drop_refuse_a_partition_that_outgrew_its_verified_archive() 
                 && catalog(&ledger.pool, P0).await?.try_get::<String, _>("state")? == "attached",
             "the refused detach changed something"
         );
+        // Completing the DDL by hand cannot bypass the same count check
+        // when the tool reconciles the catalog afterwards.
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0} CONCURRENTLY"
+        )).execute(&ledger.pool).await?;
+        let error = archive::detach(&ledger, P0, &retention(0))
+            .await
+            .expect_err("reconciled a partition holding a row its archive does not")
+            .to_string();
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        let reattach = format!(
+            "ALTER TABLE qbit_share_ledger ATTACH PARTITION {P0} FOR VALUES FROM (MINVALUE) TO ({p0_upper})"
+        );
+        ensure!(
+            error.contains("41 live rows") && error.contains("records 40") && error.contains(&reattach),
+            "{error}"
+        );
+        sqlx::raw_sql(&reattach).execute(&ledger.pool).await?;
         // Archiving again, and verifying again, is the recovery.
         archive::archive(&ledger, P0, root.path(), true, "operator-a").await?;
         archive::verify(&ledger, P0, root.path()).await?;
@@ -2060,6 +2081,134 @@ async fn reconcile_and_drop_hold_a_hand_detached_partition_to_the_seal() -> Resu
             Err(error)
         }
     }
+}
+
+/// A fully detached relation has no pending mark, but its physical state is
+/// still no proof that the retention gates passed. Reconciliation must keep
+/// every blocker, including an unknown watermark and rows hidden from the
+/// parent's payout window, from authorizing a subsequent drop.
+#[tokio::test]
+async fn reconcile_holds_a_hand_detached_partition_to_every_condition() -> Result<()> {
+    for (gate_name, status) in [
+        ("payout_window", "blocked"),
+        ("retention_age", "blocked"),
+        ("rollup_watermark", "blocked"),
+        ("rollup_watermark", "unknown"),
+        ("pending_references", "blocked"),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let ledger = db.ledger("reconcile-gates-a").await?;
+            let root = tempfile::tempdir()?;
+            insert_shares(&ledger.pool, 1, 40, 7, "server-a", 7200.0).await?;
+            let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+            set_sequence(&ledger.pool, 40).await?;
+            if gate_name == "pending_references" {
+                let snapshot = ledger.snapshot(100).await?;
+                let (coinbase_key, ledger_key) = keys();
+                let bundle = build_audit_bundle(
+                    snapshot.shares.clone(),
+                    FoundBlock {
+                        block_height: 102,
+                        coinbase_value_sats: 500_000_000,
+                        network_difficulty: 100,
+                        anchor_job_issued_at_ms: snapshot.anchor_ms,
+                    },
+                    snapshot.prior_balances.clone(),
+                    PayoutPolicy::day_one_default(),
+                    &coinbase_key,
+                    &ledger_key,
+                )?;
+                ledger.enqueue_candidate(candidate_with_bundle(
+                    &bundle,
+                    WindowRef::from_snapshot(&snapshot)?,
+                    snapshot.payout_revision,
+                    1452,
+                )?).await?;
+            }
+            if gate_name == "payout_window" {
+                set_sequence(&ledger.pool, p0_upper - 1).await?;
+                advance_rollups(&ledger.pool).await?;
+            } else {
+                move_horizon_past_p0(&ledger.pool).await?;
+            }
+            if gate_name == "rollup_watermark" {
+                let statement = if status == "unknown" {
+                    "DELETE FROM qbit_hashrate_rollup_progress"
+                } else {
+                    "UPDATE qbit_hashrate_rollup_progress SET last_share_seq=0"
+                };
+                sqlx::query(statement).execute(&ledger.pool).await?;
+            }
+            archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+            archive::verify(&ledger, P0, root.path()).await?;
+            archive::seal(&ledger, P0).await?;
+            let options = retention(if gate_name == "retention_age" { 30 } else { 0 });
+            let before = archive::plan(&ledger, &options).await?;
+            ensure!(
+                entry(&before, P0).blockers.len() == 1
+                    && condition(entry(&before, P0), gate_name).status == status,
+                "the fixture does not isolate {gate_name} ({status}): {:?}",
+                entry(&before, P0)
+            );
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0} CONCURRENTLY"
+            )).execute(&ledger.pool).await?;
+            let error = archive::detach(&ledger, P0, &options)
+                .await
+                .expect_err("reconciled a hand-detached partition with an unmet retention condition")
+                .to_string();
+            let reattach = format!(
+                "ALTER TABLE qbit_share_ledger ATTACH PARTITION {P0} FOR VALUES FROM (MINVALUE) TO ({p0_upper})"
+            );
+            ensure!(error.contains(gate_name) && error.contains(&reattach), "{error}");
+            let report = archive::plan(&ledger, &options).await?;
+            ensure!(
+                condition(entry(&report, P0), gate_name).status == status,
+                "plan lost {gate_name} ({status}) after the detach: {:?}",
+                entry(&report, P0)
+            );
+            let record = catalog(&ledger.pool, P0).await?;
+            ensure!(
+                record.try_get::<String, _>("state")? == "attached"
+                    && record.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("detached_at")?.is_none(),
+                "the refused reconciliation changed the catalog"
+            );
+            let error = archive::drop_partition(&ledger, P0, root.path())
+                .await
+                .expect_err("dropped a partition whose retention condition still fails")
+                .to_string();
+            ensure!(error.contains("recorded attached"), "{error}");
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {P0}"))
+                .fetch_one(&ledger.pool).await?;
+            ensure!(rows == 40, "the refused reconciliation/drop lost rows");
+
+            if gate_name == "payout_window" {
+                // Recovery remains resumable once new shares carry the whole
+                // payout window without the hidden partition.
+                move_horizon_past_p0(&ledger.pool).await?;
+                let reconciled = archive::detach(&ledger, P0, &options).await?;
+                ensure!(reconciled["action"] == "reconciled", "{reconciled}");
+                let repeated = archive::detach(&ledger, P0, &options).await?;
+                ensure!(
+                    repeated["detached_at"] == reconciled["detached_at"],
+                    "an idempotent retry moved detached_at: {repeated}"
+                );
+                archive::drop_partition(&ledger, P0, root.path()).await?;
+            }
+            Ok(ledger)
+        }.await;
+        match result {
+            Ok(ledger) => db.close(vec![ledger]).await?,
+            Err(error) => {
+                db.close(Vec::new()).await?;
+                return Err(error.context(format!("{gate_name} ({status})")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `archive_verified_at` proves the archive was whole when it was compared,
