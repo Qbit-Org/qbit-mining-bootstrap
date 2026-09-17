@@ -105,7 +105,7 @@ The separate rollup transaction also remains untimed. Public API read pools and 
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
 
-Remaining startup and ledger-owned sites include:
+Remaining sites outside this slice include:
 
 - `ledger/connect.rs`: startup schema/capability/provenance checks. The
   reservation write uses `Ledger::begin`; releasing an owner's reservations

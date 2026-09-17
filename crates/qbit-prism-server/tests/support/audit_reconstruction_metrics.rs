@@ -47,8 +47,9 @@ async fn assert_read(
     );
     assert_eq!(counts(metrics), (before.0 + checkouts, before.1));
     let observed = family(metrics);
-    // The pool-only public helper has no metrics owner. Its bytes and policy
-    // remain unchanged, even when the pool also belongs to a metered ledger.
+    // Signature-enforced compatibility smoke check: this pool-only helper
+    // cannot access the ledger's registry. Bytes must still match. The shared
+    // timer's unit tests independently exercise None's clock/guard behavior.
     assert_eq!(
         audit_canonical_bytes(&ledger.pool, block.hash()).await?,
         Some(block.canonical.clone())
@@ -145,7 +146,8 @@ async fn error_cases(ledger: &Ledger, metrics: &Metrics) -> Result<()> {
         .execute(&ledger.pool)
         .await?;
     }
-    // Corrupt only this disposable fixture, and restore before the next case.
+    // Corrupt only this disposable fixture. Retain the final bad digest to
+    // prove that the later range-decode and missing-snapshot errors precede it.
     for (statement, restore, checkouts, message) in [
         ("UPDATE qbit_prism_audit_snapshots SET inline_shares='{}'", "UPDATE qbit_prism_audit_snapshots SET inline_shares=NULL", 2., "invalid type"),
         ("UPDATE qbit_prism_audit_snapshots SET first_share_seq=last_share_seq+1,last_share_seq=last_share_seq+1", "UPDATE qbit_prism_audit_snapshots SET first_share_seq=first_share_seq-1,last_share_seq=last_share_seq-1", 3., "audit share history is incomplete"),
@@ -201,6 +203,7 @@ async fn cancellation_distinguishes_pending_checkout_from_each_running_query() -
 async fn cancellation_cases(db: &Database, ledger: &mut Ledger, metrics: &Metrics) -> Result<()> {
     let block = land_small_block(ledger, 35232).await?;
     let before = family(metrics);
+    // Pin the lazy public async boundary as well as the inner checkout waits.
     drop(ledger.audit_bundle(block.hash()));
     assert_eq!(family(metrics), before, "unpolled future");
     let held = ledger.pool.acquire().await?;
@@ -219,12 +222,14 @@ async fn cancellation_cases(db: &Database, ledger: &mut Ledger, metrics: &Metric
 
     // Stop each subsequent checkout inside its real before_acquire hook. The
     // first N-1 SQL statements have finished, but checkout N has not succeeded.
-    for stop_at in [2, 3] {
+    // connect() leaves a warm idle connection: hook calls map to checkouts.
+    // Exercise both caller cancellation and the pool's own checkout timeout.
+    for (stop_at, expire) in [(2, false), (3, false), (2, true), (3, true)] {
         let calls = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let hooked = PgPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(WAIT)
+            .acquire_timeout(if expire { Duration::from_secs(2) } else { WAIT })
             .before_acquire({
                 let calls = calls.clone();
                 let gate = gate.clone();
@@ -256,8 +261,19 @@ async fn cancellation_cases(db: &Database, ledger: &mut Ledger, metrics: &Metric
         })
         .await?;
         assert_eq!(counts(metrics), (before.0 + (stop_at - 1) as f64, before.1));
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        if expire {
+            let error = tokio::time::timeout(WAIT, task).await??.unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<sqlx::Error>(),
+                    Some(sqlx::Error::PoolTimedOut)
+                ),
+                "{error:#}"
+            );
+        } else {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
         assert_eq!(
             counts(metrics),
             (before.0 + (stop_at - 1) as f64, before.1 + 1.)
@@ -330,7 +346,11 @@ fn reconstruction_releases_sole_connection_before_blocking_and_without_metrics()
             };
             let metrics = Arc::new(Metrics::default());
             let ledger = ledger(&db, &metrics).await?;
-            let plain = db.ledger("reconstruction-no-metrics").await?;
+            let mut plain = db.ledger("reconstruction-no-metrics").await?;
+            // Exercise the same sole connection with and without a metrics
+            // owner, including the public pool-only canonical reader.
+            let old = std::mem::replace(&mut plain.pool, ledger.pool.clone());
+            old.close().await;
             let result = blocking_cases(&ledger, &plain, &metrics).await;
             result.and(db.close(vec![ledger, plain]).await)
         })
@@ -346,6 +366,8 @@ async fn blocking_cases(ledger: &Ledger, plain: &Ledger, metrics: &Metrics) -> R
                 .await?;
         }
         let before = family(metrics);
+        // A functional no-metrics compatibility smoke check: this ledger was
+        // constructed without a registry handle.
         assert_eq!(
             plain.audit_bundle(block.hash()).await?,
             Some(block.logical.clone())
