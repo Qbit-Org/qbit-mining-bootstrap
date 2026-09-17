@@ -45,10 +45,13 @@
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::future::Future;
+use std::future::{poll_fn, Future};
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -96,9 +99,11 @@ pub enum Outcome {
     /// No answer observed yet, or the connection closed before one.
     Pending,
     /// `CommandComplete` (or `EmptyQueryResponse`); `delivered` becomes true
-    /// only after forwarding the entire frame to the client succeeds.
+    /// only after the transport accepts the entire frame. This does not prove
+    /// that the peer application read the bytes.
     Completed { tag: String, delivered: bool },
-    /// `ErrorResponse` with its SQLSTATE and message.
+    /// Server-observed `ErrorResponse` with its SQLSTATE and message, whether
+    /// or not the client received it. This is never a complete success response.
     Failed { code: String, message: String },
 }
 
@@ -152,7 +157,7 @@ impl Execution {
         )
     }
 
-    /// The SQLSTATE of a failed execution.
+    /// The server-observed SQLSTATE, not proof the client received that error.
     pub fn sqlstate(&self) -> Option<&str> {
         match &self.outcome {
             Outcome::Failed { code, .. } => Some(code),
@@ -190,6 +195,7 @@ impl Execution {
 /// run it. A statement the client prepares first is rejected at `Parse`, for
 /// example, when it is sent into an aborted transaction, and no `Execute`
 /// frame for it ever exists.
+/// This records the server's rejection, not delivery of that error to the client.
 #[derive(Clone, Debug)]
 pub struct Rejection {
     /// Same order as [`Execution::seq`], so [`ExecutionProxy::mark`] covers
@@ -639,6 +645,8 @@ async fn relay(
                 // Do not wait for it, accept resets, or hide malformed/partial
                 // frames. Polling the original future preserves any buffered
                 // COMMIT/ROLLBACK requests and their still-unknown outcomes.
+                // Reactor readiness or cooperative yielding can still leave
+                // EOF pending: conservatively retain the error in that case.
                 if error.kind() == std::io::ErrorKind::BrokenPipe {
                     if let Some(result) = client.as_mut().now_or_never() {
                         return result.context("client boundary after failed reply delivery");
@@ -793,14 +801,18 @@ async fn pump_client(
 
 enum Action {
     Forward,
-    Complete {
-        index: usize,
-    },
+    Deliver(Delivery),
     Sever,
     Pause {
         index: usize,
         control: Arc<CommitPauseState>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum Delivery {
+    Complete(usize),
+    Ready(u8),
 }
 
 enum ServerEnd {
@@ -853,13 +865,13 @@ async fn pump_server(
                     matches!(body.as_slice(), [b'I' | b'T' | b'E']),
                     "invalid ReadyForQuery frame"
                 );
-                Action::Forward
+                Action::Deliver(Delivery::Ready(body[0]))
             }
             _ => Action::Forward,
         };
-        let completed = match action {
+        let delivery = match action {
             Action::Forward => None,
-            Action::Complete { index } => Some(index),
+            Action::Deliver(delivery) => Some(delivery),
             Action::Sever => return Ok(ServerEnd::Closed),
             Action::Pause { index, control } => {
                 // No observer lock or PostgreSQL transaction lock is held here.
@@ -872,23 +884,62 @@ async fn pump_server(
                     }
                     release.await;
                 }
-                Some(index)
+                Some(Delivery::Complete(index))
             }
         };
-        if let Err(error) = to.write_all(&frame(kind, &body)?).await {
-            return Ok(ServerEnd::ClientWrite(error));
-        }
-        if let Some(index) = completed {
-            let mut state = shared.state.lock().expect("proxy state");
-            if let Outcome::Completed { delivered, .. } = &mut state.executions[index].outcome {
-                *delivered = true;
+        let bytes = frame(kind, &body)?;
+        let forwarded = match delivery {
+            Some(delivery) => {
+                forward_observed(&mut to, &bytes, &shared, &connection, id, delivery).await
             }
-        }
-        if kind == b'Z' {
-            ready(&shared, &connection, id, body[0]);
+            None => to.write_all(&bytes).await,
+        };
+        if let Err(error) = forwarded {
+            return Ok(ServerEnd::ClientWrite(error));
         }
     }
     Ok(ServerEnd::Closed)
+}
+
+/// Serialize acknowledgement publication with its final nonblocking write.
+/// A peer can read the bytes on another thread before poll_write returns;
+/// observer readers must not see the old incomplete state in that interval.
+/// Guards exist only inside one poll, never across an await. A failed/partial
+/// write publishes nothing, so this does not premark or roll back success.
+async fn forward_observed(
+    to: &mut (impl AsyncWrite + Unpin),
+    mut bytes: &[u8],
+    shared: &Shared,
+    connection: &Mutex<Connection>,
+    id: u64,
+    delivery: Delivery,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let written = poll_fn(|cx| {
+            let mut connection = connection.lock().expect("proxy connection");
+            let mut state = shared.state.lock().expect("proxy state");
+            let result = Pin::new(&mut *to).poll_write(cx, bytes);
+            if matches!(result, Poll::Ready(Ok(written)) if written == bytes.len()) {
+                match delivery {
+                    Delivery::Complete(index) => {
+                        if let Outcome::Completed { delivered, .. } =
+                            &mut state.executions[index].outcome
+                        {
+                            *delivered = true;
+                        }
+                    }
+                    Delivery::Ready(status) => ready(&mut state, &mut connection, id, status),
+                }
+            }
+            result
+        })
+        .await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
 }
 
 /// SQLSTATE and message of an ErrorResponse or NoticeResponse.
@@ -1001,7 +1052,7 @@ fn complete(
     } else if let Some(control) = pause {
         Ok(Action::Pause { index, control })
     } else {
-        Ok(Action::Complete { index })
+        Ok(Action::Deliver(Delivery::Complete(index)))
     }
 }
 
@@ -1088,23 +1139,18 @@ fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) -> Res
     Ok(())
 }
 
-fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: u8) {
-    {
-        // Every frame before this `ReadyForQuery` has been answered, or was
-        // skipped by the server after an earlier error in the same batch; a
-        // skipped execution stays `Pending` and nothing later settles it.
-        let mut state = connection.lock().expect("proxy connection");
-        let mut observations = shared.state.lock().expect("proxy state");
-        for index in &state.inflight {
-            observations.executions[*index].ready = true;
-        }
-        state.parses.clear();
-        state.inflight.clear();
+fn ready(state: &mut State, connection: &mut Connection, id: u64, status: u8) {
+    // Every frame before this `ReadyForQuery` has been answered, or was
+    // skipped by the server after an earlier error in the same batch; a
+    // skipped execution stays `Pending` and nothing later settles it.
+    for index in &connection.inflight {
+        state.executions[*index].ready = true;
     }
+    connection.parses.clear();
+    connection.inflight.clear();
     if status == b'I' {
         // The transaction ended without the COMMIT the fault was waiting for
         // (a rollback): the arming no longer applies to this connection.
-        let mut state = shared.state.lock().expect("proxy state");
         if state.armed == Some(id) && state.fired.is_none() {
             state.armed = None;
         }

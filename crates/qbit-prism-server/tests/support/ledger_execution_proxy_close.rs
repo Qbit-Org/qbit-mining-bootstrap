@@ -64,6 +64,49 @@ struct BrokenClientWriter {
     remaining: usize,
 }
 
+struct PauseAtReadyDelivery {
+    socket: TcpStream,
+    remaining: Option<usize>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl AsyncWrite for PauseAtReadyDelivery {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.remaining.is_none() && bytes.first() == Some(&b'Z') {
+            self.remaining = Some(bytes.len());
+        }
+        let result = Pin::new(&mut self.socket).poll_write(cx, bytes);
+        if let Poll::Ready(Ok(written)) = result {
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= written;
+                if *remaining == 0 {
+                    self.remaining = None;
+                    // Test-only scheduler barrier: the real TCP write has
+                    // completed, but its proxy worker cannot publish yet.
+                    // Another worker reads the reply and inspects the observer.
+                    if let Err(error) = self.release.recv_timeout(std::time::Duration::from_secs(5))
+                    {
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
 impl AsyncWrite for BrokenClientWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -424,6 +467,94 @@ async fn successful_zero_and_incorrect_row_counts_remain_distinct() -> Result<()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledgement_delivery_cannot_expose_an_incomplete_observer_snapshot() -> Result<()> {
+    let shared = observations();
+    let connection = Arc::new(Mutex::new(Connection::default()));
+    record(
+        &shared,
+        &connection,
+        1,
+        Protocol::Simple,
+        "SELECT 1 WHERE false".into(),
+    );
+    let proxy = observer(shared.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let (client, server) = tokio::join!(
+        TcpStream::connect(listener.local_addr()?),
+        listener.accept()
+    );
+    let mut client = BufReader::new(client?);
+    let (release, pause) = std::sync::mpsc::channel();
+    let replies = [frame(b'C', b"SELECT 0\0")?, frame(b'Z', b"I")?].concat();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(pump_server(
+        io::Cursor::new(replies),
+        PauseAtReadyDelivery {
+            socket: server?.0,
+            remaining: None,
+            release: pause,
+        },
+        connection,
+        shared.clone(),
+        1,
+    ));
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        ensure!(read_frame(&mut client).await? == Some((b'C', b"SELECT 0\0".to_vec())));
+        ensure!(read_frame(&mut client).await? == Some((b'Z', b"I".to_vec())));
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    // Inspect through the public observer while the forwarding worker is
+    // paused. If publication holds its lock, readers must wait for it; if it
+    // does not, an actual snapshot here must already report completion.
+    let readable = shared.state.try_lock().is_ok();
+    let during_delivery = readable.then(|| proxy.executions_since(0));
+    let released = release.send(());
+    let pumped = tasks.join_next().await.context("missing server pump")?;
+    received??;
+    released?;
+    pumped??;
+    if let Some(snapshot) = during_delivery {
+        assert!(
+            snapshot?[0].complete_response(),
+            "client-visible acknowledgement raced observer publication"
+        );
+    }
+    assert_eq!(
+        shared.state.lock().unwrap().executions[0].returned_rows()?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn undelivered_error_remains_a_server_observation_not_a_complete_response() -> Result<()> {
+    let (result, shared) = ordered_close(
+        frame(b'Q', b"COMMIT\0")?,
+        frame(b'X', b"")?,
+        frame(b'E', b"C40001\0Mserialization failure\0\0")?,
+        ClientEnd::Eof,
+        io::ErrorKind::BrokenPipe,
+        0,
+    )
+    .await;
+    result?;
+    let state = shared.state.lock().unwrap();
+    assert_eq!(state.executions.len(), 1);
+    let execution = &state.executions[0];
+    assert_eq!(execution.sqlstate(), Some("40001"));
+    assert!(!execution.delivered());
+    assert!(!execution.complete_response());
+    assert!(execution.returned_rows().is_err());
+    assert_eq!(state.rejections.len(), 1);
+    assert_eq!(
+        state.rejections[0].frame,
+        RejectedFrame::Execution(execution.seq)
+    );
+    Ok(())
+}
+
 fn observer(shared: Arc<Shared>) -> ExecutionProxy {
     ExecutionProxy {
         addr: "127.0.0.1:0".parse().unwrap(),
@@ -435,7 +566,7 @@ fn observer(shared: Arc<Shared>) -> ExecutionProxy {
 }
 
 #[tokio::test]
-async fn close_does_not_hide_unidentified_executions_or_task_failures() -> Result<()> {
+async fn executions_reject_unknown_frames_and_keep_reported_task_failures() -> Result<()> {
     let (result, shared) = ordered_close(
         frame(b'E', b"unbound\0\0\0\0\0")?,
         vec![],
@@ -472,7 +603,9 @@ async fn close_does_not_hide_unidentified_executions_or_task_failures() -> Resul
             .to_string()
             .contains("failed"));
     }
+    // Cleanup joins resources; check() retains the already-reported failure.
     proxy.finish().await?;
     assert!(proxy.tasks.lock().unwrap().is_empty());
+    assert!(proxy.executions_since(0).is_err());
     Ok(())
 }
