@@ -1853,6 +1853,61 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
     }
 }
 
+/// A lost, never-archived partition has a catalog row but no proof that an
+/// external archive is its history. It must not bypass the import safeguards.
+#[tokio::test]
+async fn restore_refuses_reattachment_without_a_recorded_manifest() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("restore-untrusted-catalog").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 10, 12, 7, "archive-history", 7200.0).await?;
+        let (_, upper) = bounds(&ledger.pool, P0).await?;
+        set_sequence(&ledger.pool, upper - 1).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        let manifest_path = PathBuf::from(
+            catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?,
+        );
+        // Model the destination's lost partition with its original, never-
+        // archived catalog entry and a sequence behind the external archive.
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DETACH PARTITION {P0}; DROP TABLE {P0}; \
+             DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        sqlx::query("INSERT INTO qbit_prism_share_partitions(partition_name,lower_seq,upper_seq) VALUES($1,NULL,$2)")
+            .bind(P0).bind(upper).execute(&ledger.pool).await?;
+        set_sequence(&ledger.pool, 1).await?;
+        let error = archive::restore(&ledger, &manifest_path, root.path(), true)
+            .await
+            .expect_err("re-attached an archive without a recorded manifest digest")
+            .to_string();
+        ensure!(error.contains("catalog has no recorded archive manifest digest") && error.contains("without --attach"), "{error}");
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT to_regclass($1) IS NULL \
+             AND EXISTS(SELECT 1 FROM qbit_prism_share_partitions \
+                        WHERE partition_name=$1 AND state='attached' AND archive_manifest_sha256 IS NULL) \
+             AND NOT EXISTS(SELECT 1 FROM qbit_prism_share_hashes) \
+             AND qbit_prism_share_next_seq()=2",
+        )
+        .bind(P0).fetch_one(&ledger.pool).await?;
+        ensure!(unchanged, "refused untrusted re-attachment changed the destination");
+        let inspected = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+        ensure!(inspected["attached"] == false && inspected["row_count"] == 3, "{inspected}");
+        Ok(ledger)
+    }.await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Importing history also imports its global replay protection; conflicting
 /// destination mappings must leave both the archive and that protection intact.
 #[tokio::test]

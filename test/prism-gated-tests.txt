@@ -539,6 +539,7 @@ qbit-prism-server::share_archive::restore_import_rejects_duplicate_share_ids
 qbit-prism-server::share_archive::restore_import_rejects_rows_at_or_below_the_rollup_watermark
 qbit-prism-server::share_archive::restore_import_waits_for_an_inflight_rollup
 qbit-prism-server::share_archive::restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent
+qbit-prism-server::share_archive::restore_refuses_reattachment_without_a_recorded_manifest
 qbit-prism-server::share_archive::rollup_gate_measures_the_newest_committed_row_not_the_bound
 qbit-prism-server::share_archive::seal_is_idempotent_and_safe_to_run_concurrently
 qbit-prism-server::share_archive::seal_stores_a_slow_artifact_without_changing_pool_timeouts

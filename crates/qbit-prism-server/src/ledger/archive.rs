@@ -2483,14 +2483,17 @@ pub async fn restore(
                 recorded_lower == lower && recorded_upper == upper,
                 "refusing to re-attach {partition_name}: the catalog records bounds [{recorded_lower:?}, {recorded_upper}) but the archive records [{lower:?}, {upper})"
             );
-            if let Some(recorded) =
+            let Some(recorded) =
                 existing.try_get::<Option<String>, _>("archive_manifest_sha256")?
-            {
-                ensure!(
-                    recorded == manifest_sha256,
-                    "refusing to re-attach {partition_name}: the catalog records another archive as the copy of record ({recorded}); only that archive can return the partition, but the restored manifest hashes to {manifest_sha256}"
+            else {
+                bail!(
+                    "refusing to re-attach {partition_name}: the catalog has no recorded archive manifest digest, so matching bounds do not prove this is its history. Restore without --attach to inspect the archive"
                 );
-            }
+            };
+            ensure!(
+                recorded == manifest_sha256,
+                "refusing to re-attach {partition_name}: the catalog records another archive as the copy of record ({recorded}); only that archive can return the partition, but the restored manifest hashes to {manifest_sha256}"
+            );
             sqlx::query("UPDATE qbit_prism_share_partitions SET state='attached',detached_at=NULL,dropped_at=NULL WHERE partition_name=$1")
                 .bind(&partition_name)
                 .execute(&mut *tx)
