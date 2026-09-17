@@ -228,7 +228,13 @@ fn check_partition_name(name: &str) -> Result<()> {
     let grid = name.strip_prefix("qbit_share_ledger_p");
     ensure!(
         name.len() <= 63
-            && grid.is_some_and(|cell| !cell.is_empty() && cell.bytes().all(|b| b.is_ascii_digit())),
+            && grid.is_some_and(|cell| {
+                !cell.is_empty()
+                    && cell.bytes().all(|b| b.is_ascii_digit())
+                    // The catalog casts this suffix to bigint and adds one
+                    // when allocating the next partition name.
+                    && cell.parse::<i64>().is_ok_and(|number| number < i64::MAX)
+            }),
         "{name} is not a share ledger partition name; partitions are named qbit_share_ledger_p<cell>, as listed by share-archive plan"
     );
     Ok(())
@@ -2876,6 +2882,34 @@ mod tests {
         assert!(!chain_is_adjacent(Some(16_777_216), Some(33_554_432)));
         assert!(!chain_is_adjacent(None, Some(16_777_216)));
         assert!(!chain_is_adjacent(Some(16_777_216), None));
+    }
+
+    #[test]
+    fn manifest_partition_numbers_leave_room_for_the_next_bigint() {
+        for suffix in ["0", "12", "00012", "9223372036854775806"] {
+            let mut manifest = manifest();
+            manifest.partition_name = format!("qbit_share_ledger_p{suffix}");
+            let (bytes, _) = manifest.canonical().unwrap();
+            parse_manifest(&bytes, "manifest.json").unwrap();
+        }
+        for suffix in [
+            "9223372036854775807",
+            "9223372036854775808",
+            "99999999999999999999",
+            "-1",
+            "+1",
+        ] {
+            let mut manifest = manifest();
+            manifest.partition_name = format!("qbit_share_ledger_p{suffix}");
+            let (bytes, _) = manifest.canonical().unwrap();
+            let error = parse_manifest(&bytes, "manifest.json")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("is not a share ledger partition name"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
