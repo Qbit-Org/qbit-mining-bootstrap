@@ -428,8 +428,7 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
     }
 }
 
-/// Print the message and exit with the status: a refusal, never a failure of
-/// the command's machinery, which returns its error as every command does.
+/// Print a candidate command's diagnostic and exit with its status.
 fn refuse(code: i32, message: String) -> ! {
     eprintln!("{message}");
     std::process::exit(code)
@@ -531,12 +530,19 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
     // A landing the deadline cut short may hold its connection until the
     // server abandons it, so the close is bounded as well.
     let _ = tokio::time::timeout(Duration::from_secs(5), coordinator.ledger.pool.close()).await;
+    finish_recovery(outcome)
+}
+
+/// Report only after bounded claim and pool cleanup. A canceled rebuild
+/// may still be running in spawn_blocking, so every stop must exit directly:
+/// returning an error to main would wait for it during runtime shutdown.
+fn finish_recovery(outcome: Result<(usize, usize), Stop>) -> Result<()> {
     match outcome {
         Ok((recovered, verified)) => {
             println!("recovered {recovered}, verified {verified} already complete");
             Ok(())
         }
-        Err(Stop::Failure(error)) => Err(error),
+        Err(Stop::Failure(error)) => refuse(1, format!("Error: {error:?}")),
         Err(Stop::Exit(code, message)) => refuse(code, message),
     }
 }
@@ -564,7 +570,7 @@ struct RecoveryPlan {
 }
 
 /// How an apply stopped: a refusal with its exit status, or a failure of the
-/// machinery, returned as every command returns one.
+/// machinery, reported with exit 1 after bounded cleanup.
 enum Stop {
     Exit(i32, String),
     Failure(anyhow::Error),
@@ -1427,6 +1433,78 @@ fn benchmark(count: usize, miners: usize, iterations: usize) -> Result<Value> {
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
+
+    #[test]
+    fn recovery_stops_exit_with_an_active_blocking_rebuild() {
+        const CHILD: &str = "QBIT_RECOVERY_EXIT_TEST";
+        const TEST: &str =
+            "tools::configuration_tests::recovery_stops_exit_with_an_active_blocking_rebuild";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if let Ok(mode) = std::env::var(CHILD) {
+            let result = runtime.block_on(async {
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let build = tokio_util::task::AbortOnDropHandle::new(
+                    tokio::task::spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        // A started blocking task cannot be aborted. Only
+                        // process exit can end this deliberately stalled build.
+                        loop {
+                            std::thread::park();
+                        }
+                    }),
+                );
+                ready.await.unwrap();
+                drop(build);
+                let stop = if mode == "deadline" {
+                    recovery_stop(RecoveryStop::Deadline.into(), "test-block", 1)
+                } else {
+                    recovery_stop(
+                        anyhow::anyhow!("cleanup unavailable").context(
+                            "releasing the recovery claim for test-block failed after the recovery deadline expired; the claim may remain until its lease expires",
+                        ),
+                        "test-block",
+                        1,
+                    )
+                };
+                finish_recovery(Err(stop))
+            });
+            // Reproduce main's runtime drop if recovery returns an error.
+            drop(runtime);
+            result.unwrap();
+            panic!("recovery must exit the subprocess");
+        }
+        for (mode, code, message) in [
+            ("deadline", 11, "its claim released"),
+            (
+                "cleanup-failure",
+                1,
+                "the claim may remain until its lease expires",
+            ),
+        ] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, mode)
+                .kill_on_drop(true);
+            let output = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), child.output()).await
+                })
+                .unwrap_or_else(|_| panic!("{mode} waited for the blocking rebuild"))
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(code), "{error}");
+            assert!(error.contains(message), "{error}");
+            if mode == "cleanup-failure" {
+                assert!(error.starts_with("Error: "), "{error}");
+                assert!(error.contains("cleanup unavailable"), "{error}");
+                assert!(!error.contains("its claim released"), "{error}");
+            }
+        }
+    }
 
     /// The recover allowlist and deadline are checked where clap parses them
     /// and, for the bounds clap cannot express, at the top of `recover`.
