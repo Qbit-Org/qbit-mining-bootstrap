@@ -2472,6 +2472,22 @@ pub async fn restore(
                 .execute(&mut *tx)
                 .await?;
         } else {
+            // Maintenance extends only max(upper_seq), so a new import must
+            // not move that frontier past a range it would then never fill.
+            // ATTACH holds the parent DDL lock until commit, keeping this
+            // check and catalog publication together with respect to ensure.
+            // Older history can still return below the existing frontier.
+            let covered: Option<i64> = sqlx::query_scalar(
+                "SELECT max(upper_seq) FROM qbit_prism_share_partitions WHERE state='attached'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure!(
+                lower.is_none_or(|lower| covered.is_some_and(|covered| lower <= covered)),
+                "refusing to import {partition_name}: its lower bound {} is beyond the highest attached upper bound {}, leaving a routing gap. Restore the intervening ranges first, or restore without --attach",
+                number_or(lower, "MINVALUE"),
+                number_or(covered, "(none)")
+            );
             restore_import_hashes(&mut tx, &partition_name).await?;
             sqlx::query("INSERT INTO qbit_prism_share_partitions(partition_name,lower_seq,upper_seq,state) VALUES($1,$2,$3,'attached')")
                 .bind(&partition_name)

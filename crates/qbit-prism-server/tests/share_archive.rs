@@ -2025,6 +2025,134 @@ async fn restore_import_rebuilds_hashes_and_rejects_conflicting_credits() -> Res
     }
 }
 
+/// An import must not advance maintenance's covered bound past an unfilled
+/// range. Refusal leaves the boundary routable once maintenance creates its
+/// lead, and the same archive can then be imported adjacent to that lead.
+#[tokio::test]
+async fn restore_import_refuses_a_gap_above_the_attached_range() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("restore-import-gap").await?;
+        let root = tempfile::tempdir()?;
+        let (_, p0_upper) = bounds(&ledger.pool, P0).await?;
+        let (p2_lower, p2_upper) = bounds(&ledger.pool, P2).await?;
+        let p2_lower = p2_lower.context("p2 has no lower bound")?;
+        insert_shares(
+            &ledger.pool,
+            p2_lower,
+            p2_lower,
+            1,
+            "archive-history",
+            7200.0,
+        )
+        .await?;
+        set_sequence(&ledger.pool, p2_upper - 1).await?;
+        for partition in [P0, P1, P2] {
+            archive::archive(&ledger, partition, root.path(), false, "operator-a").await?;
+            archive::verify(&ledger, partition, root.path()).await?;
+        }
+        let manifest_path = PathBuf::from(
+            catalog(&ledger.pool, P2)
+                .await?
+                .try_get::<String, _>("archive_uri")?,
+        );
+        // Model an import into a ledger that only covers p0. The missing
+        // catalog entry is what distinguishes an import from a re-attachment.
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT partition_name FROM qbit_prism_share_partitions WHERE lower_seq IS NOT NULL",
+        )
+        .fetch_all(&ledger.pool)
+        .await?;
+        for partition in partitions {
+            sqlx::raw_sql(&format!(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION {partition}; DROP TABLE {partition}"
+            ))
+            .execute(&ledger.pool)
+            .await?;
+        }
+        sqlx::query("DELETE FROM qbit_prism_share_partitions WHERE lower_seq IS NOT NULL")
+            .execute(&ledger.pool)
+            .await?;
+        sqlx::query("UPDATE qbit_prism_share_partitioning SET lead_partitions=1 WHERE singleton")
+            .execute(&ledger.pool)
+            .await?;
+        set_sequence(&ledger.pool, p0_upper - 1).await?;
+
+        let error = archive::restore(&ledger, &manifest_path, root.path(), true)
+            .await
+            .expect_err("imported p2 while the range for p1 was missing")
+            .to_string();
+        ensure!(
+            error.contains("routing gap")
+                && error.contains(&p0_upper.to_string())
+                && error.contains(&p2_lower.to_string()),
+            "{error}"
+        );
+        let absent: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
+            .bind(P2)
+            .fetch_one(&ledger.pool)
+            .await?;
+        let catalog_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_partitions")
+                .fetch_one(&ledger.pool)
+                .await?;
+        let hashes: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(
+            absent && catalog_rows == 1 && hashes == 0,
+            "the refused import left a table, catalog row or global hash mapping"
+        );
+        let next: i64 = sqlx::query_scalar("SELECT qbit_prism_share_next_seq()")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(
+            next == p0_upper,
+            "the refused import moved the sequence to {next}"
+        );
+
+        // Inspection-only restores do not affect routing and remain allowed.
+        let restored = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+        ensure!(restored["attached"] == false, "{restored}");
+        sqlx::raw_sql(&format!("DROP TABLE {P2}"))
+            .execute(&ledger.pool)
+            .await?;
+
+        let created: i32 = sqlx::query_scalar("SELECT qbit_prism_share_partition_ensure()")
+            .fetch_one(&ledger.pool)
+            .await?;
+        ensure!(
+            created == 1,
+            "maintenance created {created} partitions instead of filling p1"
+        );
+        let appended = ledger.append(share(700), None).await?;
+        ensure!(
+            appended.inserted && appended.share.share_seq == u64::try_from(p0_upper)?,
+            "an append could not cross the old upper bound: {appended:?}"
+        );
+        let restored = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+        ensure!(
+            restored["attached"] == true && restored["row_count"] == 1,
+            "the now-adjacent import was refused: {restored}"
+        );
+        ensure!(
+            bounds(&ledger.pool, P1).await?.1 == bounds(&ledger.pool, P2).await?.0.unwrap(),
+            "the imported range is not adjacent to the maintenance-created partition"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
 /// The verification is a proof at the instant it was taken. A row that lands
 /// after it, whether an append that committed late or one written into the
 /// standalone relation by name, is caught by the count the detach and the
