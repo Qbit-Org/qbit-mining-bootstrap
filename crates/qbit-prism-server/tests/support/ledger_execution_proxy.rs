@@ -43,12 +43,16 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, ensure, Context, Result};
+use futures_util::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::{poll_fn, Future};
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use std::task::Poll;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
@@ -94,10 +98,12 @@ pub enum Protocol {
 pub enum Outcome {
     /// No answer observed yet, or the connection closed before one.
     Pending,
-    /// `CommandComplete` (or `EmptyQueryResponse`); `delivered` is false when
-    /// a [`Fault`] withheld it from the client.
+    /// `CommandComplete` (or `EmptyQueryResponse`); `delivered` becomes true
+    /// only after the transport accepts the entire frame. This does not prove
+    /// that the peer application read the bytes.
     Completed { tag: String, delivered: bool },
-    /// `ErrorResponse` with its SQLSTATE and message.
+    /// Server-observed `ErrorResponse` with its SQLSTATE and message, whether
+    /// or not the client received it. This is never a complete success response.
     Failed { code: String, message: String },
 }
 
@@ -151,7 +157,7 @@ impl Execution {
         )
     }
 
-    /// The SQLSTATE of a failed execution.
+    /// The server-observed SQLSTATE, not proof the client received that error.
     pub fn sqlstate(&self) -> Option<&str> {
         match &self.outcome {
             Outcome::Failed { code, .. } => Some(code),
@@ -189,6 +195,7 @@ impl Execution {
 /// run it. A statement the client prepares first is rejected at `Parse`, for
 /// example, when it is sent into an aborted transaction, and no `Execute`
 /// frame for it ever exists.
+/// This records the server's rejection, not delivery of that error to the client.
 #[derive(Clone, Debug)]
 pub struct Rejection {
     /// Same order as [`Execution::seq`], so [`ExecutionProxy::mark`] covers
@@ -609,9 +616,45 @@ async fn serve(
     let connection = Arc::new(Mutex::new(Connection::default()));
     // Whichever direction ends first (client EOF, server EOF, or a fault)
     // drops both sockets; the server then aborts any open transaction.
+    relay(
+        pump_client(
+            client_read,
+            server_write,
+            connection.clone(),
+            shared.clone(),
+            id,
+        ),
+        pump_server(server_read, client_write, connection, shared, id),
+    )
+    .await
+}
+
+async fn relay(
+    client: impl Future<Output = Result<()>>,
+    server: impl Future<Output = Result<ServerEnd>>,
+) -> Result<()> {
+    tokio::pin!(client);
     tokio::select! {
-        result = pump_client(client_read, server_write, connection.clone(), shared.clone(), id) => result,
-        result = pump_server(server_read, client_write, connection, shared, id) => result,
+        result = &mut client => result,
+        result = server => match result? {
+            ServerEnd::Closed => Ok(()),
+            ServerEnd::ClientWrite(error) => {
+                // A client can close while a reply is being forwarded, before
+                // select polls its readable EOF. Only a frame-boundary EOF
+                // observed NOW justifies the same outcome as the client arm.
+                // Do not wait for it, accept resets, or hide malformed/partial
+                // frames. Polling the original future preserves any buffered
+                // COMMIT/ROLLBACK requests and their still-unknown outcomes.
+                // Reactor readiness or cooperative yielding can still leave
+                // EOF pending: conservatively retain the error in that case.
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    if let Some(result) = client.as_mut().now_or_never() {
+                        return result.context("client boundary after failed reply delivery");
+                    }
+                }
+                Err(error).context("forwarding server frame to client")
+            }
+        },
     }
 }
 
@@ -686,8 +729,8 @@ fn record(
 }
 
 async fn pump_client(
-    mut from: BufReader<OwnedReadHalf>,
-    mut to: OwnedWriteHalf,
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
     id: u64,
@@ -743,7 +786,13 @@ async fn pump_client(
                     _ => {}
                 }
             }
-            _ => {}
+            b'X' => ensure!(body.is_empty(), "invalid Terminate frame"),
+            // Other messages used by authentication, extended queries and
+            // COPY do not start a separately counted execution. Unknown kinds
+            // (including unobserved FunctionCall execution) must not become
+            // evidence of a clean stream just because EOF follows them.
+            b'D' | b'H' | b'S' | b'p' | b'd' | b'c' | b'f' => {}
+            _ => bail!("unsupported client frame kind {kind:#x}"),
         }
         to.write_all(&frame(kind, &body)?).await?;
     }
@@ -752,6 +801,7 @@ async fn pump_client(
 
 enum Action {
     Forward,
+    Deliver(Delivery),
     Sever,
     Pause {
         index: usize,
@@ -759,13 +809,24 @@ enum Action {
     },
 }
 
+#[derive(Clone, Copy)]
+enum Delivery {
+    Complete(usize),
+    Ready(u8),
+}
+
+enum ServerEnd {
+    Closed,
+    ClientWrite(std::io::Error),
+}
+
 async fn pump_server(
-    mut from: BufReader<OwnedReadHalf>,
-    mut to: OwnedWriteHalf,
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
     connection: Arc<Mutex<Connection>>,
     shared: Arc<Shared>,
     id: u64,
-) -> Result<()> {
+) -> Result<ServerEnd> {
     while let Some((kind, body)) = read_frame(&mut from).await? {
         let action = match kind {
             b'C' => {
@@ -800,14 +861,18 @@ async fn pump_server(
                 Action::Forward
             }
             b'Z' => {
-                ready(&shared, &connection, id, body.first().copied());
-                Action::Forward
+                ensure!(
+                    matches!(body.as_slice(), [b'I' | b'T' | b'E']),
+                    "invalid ReadyForQuery frame"
+                );
+                Action::Deliver(Delivery::Ready(body[0]))
             }
             _ => Action::Forward,
         };
-        match action {
-            Action::Forward => to.write_all(&frame(kind, &body)?).await?,
-            Action::Sever => return Ok(()),
+        let delivery = match action {
+            Action::Forward => None,
+            Action::Deliver(delivery) => Some(delivery),
+            Action::Sever => return Ok(ServerEnd::Closed),
             Action::Pause { index, control } => {
                 // No observer lock or PostgreSQL transaction lock is held here.
                 loop {
@@ -819,13 +884,60 @@ async fn pump_server(
                     }
                     release.await;
                 }
-                to.write_all(&frame(kind, &body)?).await?;
-                let mut state = shared.state.lock().expect("proxy state");
-                if let Outcome::Completed { delivered, .. } = &mut state.executions[index].outcome {
-                    *delivered = true;
+                Some(Delivery::Complete(index))
+            }
+        };
+        let bytes = frame(kind, &body)?;
+        let forwarded = match delivery {
+            Some(delivery) => {
+                forward_observed(&mut to, &bytes, &shared, &connection, id, delivery).await
+            }
+            None => to.write_all(&bytes).await,
+        };
+        if let Err(error) = forwarded {
+            return Ok(ServerEnd::ClientWrite(error));
+        }
+    }
+    Ok(ServerEnd::Closed)
+}
+
+/// Serialize acknowledgement publication with its final nonblocking write.
+/// A peer can read the bytes on another thread before poll_write returns;
+/// observer readers must not see the old incomplete state in that interval.
+/// Guards exist only inside one poll, never across an await. A failed/partial
+/// write publishes nothing, so this does not premark or roll back success.
+async fn forward_observed(
+    to: &mut (impl AsyncWrite + Unpin),
+    mut bytes: &[u8],
+    shared: &Shared,
+    connection: &Mutex<Connection>,
+    id: u64,
+    delivery: Delivery,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let written = poll_fn(|cx| {
+            let mut connection = connection.lock().expect("proxy connection");
+            let mut state = shared.state.lock().expect("proxy state");
+            let result = Pin::new(&mut *to).poll_write(cx, bytes);
+            if matches!(result, Poll::Ready(Ok(written)) if written == bytes.len()) {
+                match delivery {
+                    Delivery::Complete(index) => {
+                        if let Outcome::Completed { delivered, .. } =
+                            &mut state.executions[index].outcome
+                        {
+                            *delivered = true;
+                        }
+                    }
+                    Delivery::Ready(status) => ready(&mut state, &mut connection, id, status),
                 }
             }
+            result
+        })
+        .await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
         }
+        bytes = &bytes[written..];
     }
     Ok(())
 }
@@ -920,7 +1032,7 @@ fn complete(
     }
     execution.outcome = Outcome::Completed {
         tag,
-        delivered: !sever && pause.is_none(),
+        delivered: false,
     };
     if let Some(control) = &pause {
         control.seq.store(execution.seq, Ordering::SeqCst);
@@ -940,7 +1052,7 @@ fn complete(
     } else if let Some(control) = pause {
         Ok(Action::Pause { index, control })
     } else {
-        Ok(Action::Forward)
+        Ok(Action::Deliver(Delivery::Complete(index)))
     }
 }
 
@@ -1027,23 +1139,18 @@ fn notice(shared: &Shared, connection: &Mutex<Connection>, message: &str) -> Res
     Ok(())
 }
 
-fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Option<u8>) {
-    {
-        // Every frame before this `ReadyForQuery` has been answered, or was
-        // skipped by the server after an earlier error in the same batch; a
-        // skipped execution stays `Pending` and nothing later settles it.
-        let mut state = connection.lock().expect("proxy connection");
-        let mut observations = shared.state.lock().expect("proxy state");
-        for index in &state.inflight {
-            observations.executions[*index].ready = true;
-        }
-        state.parses.clear();
-        state.inflight.clear();
+fn ready(state: &mut State, connection: &mut Connection, id: u64, status: u8) {
+    // Every frame before this `ReadyForQuery` has been answered, or was
+    // skipped by the server after an earlier error in the same batch; a
+    // skipped execution stays `Pending` and nothing later settles it.
+    for index in &connection.inflight {
+        state.executions[*index].ready = true;
     }
-    if status == Some(b'I') {
+    connection.parses.clear();
+    connection.inflight.clear();
+    if status == b'I' {
         // The transaction ended without the COMMIT the fault was waiting for
         // (a rollback): the arming no longer applies to this connection.
-        let mut state = shared.state.lock().expect("proxy state");
         if state.armed == Some(id) && state.fired.is_none() {
             state.armed = None;
         }
@@ -1052,3 +1159,7 @@ fn ready(shared: &Shared, connection: &Mutex<Connection>, id: u64, status: Optio
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ledger_execution_proxy_close.rs"]
+mod close_tests;
