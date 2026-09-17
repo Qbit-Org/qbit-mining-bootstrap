@@ -12,6 +12,9 @@ use std::{
 };
 use tower::ServiceExt;
 
+#[path = "../../../tests/observability/contract.rs"]
+mod contract;
+
 const HEALTHY: &str = "# TYPE qbit_prism_health_state gauge\nqbit_prism_health_state 1\n# TYPE qbit_prism_accepted_shares_total counter\nqbit_prism_accepted_shares_total 42\nqbit_prism_connections 7\n";
 
 async fn body(response: Response) -> String {
@@ -482,4 +485,78 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
     assert_eq!(sample(&text, "qbit_prism_health_state"), 1.);
     assert_eq!(sample(&text, "qbit_prism_metrics_snapshot_stale"), 0.);
     assert_eq!(sample(&text, "qbit_prism_accepted_shares_total"), 43.);
+}
+
+#[tokio::test]
+async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapshots() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    let metrics = Arc::new(Metrics::default());
+    let state = ApiState::new(pool, ApiConfig::default(), metrics.clone());
+    metrics.observe_first_offer(Duration::from_millis(125));
+    for lock in LockKind::ALL {
+        for outcome in Outcome::ALL {
+            metrics.observe_advisory_lock(*lock, *outcome, Duration::from_millis(25));
+        }
+    }
+    for (age, expected_state) in [
+        (None, "unavailable"),
+        (Some(0), "fresh"),
+        (Some(31), "stale"),
+    ] {
+        let mut previous: Option<(String, u64)> = None;
+        for height in [1_371_926_485_u64, 912_748_631] {
+            let hash = format!("{height:064x}");
+            state.publish_health(json!({"ok":true,"tip_hash":hash,"height":height}));
+            assert_eq!(state.health.read().unwrap()["height"], height);
+            metrics.publish_stratum(
+                &crate::stratum::StratumStats::default().snapshot(0),
+                true,
+                2,
+                0,
+            );
+            state.publish_metrics(metrics.render()).unwrap();
+            state.metrics.write().unwrap().published_at =
+                age.map(|seconds| Instant::now() - Duration::from_secs(seconds));
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["x-prism-metrics-state"], expected_state);
+            assert_eq!(response.headers().contains_key("age"), age.is_some());
+            assert_eq!(
+                response.headers().contains_key("warning"),
+                expected_state == "stale"
+            );
+            let text = body(response).await;
+            contract::validate(&text, true).unwrap();
+            contract::private_identifiers(&text, &[hash], &[height]).unwrap();
+            assert_eq!(
+                sample(&text, "qbit_prism_health_state"),
+                f64::from(expected_state == "fresh")
+            );
+            assert_eq!(
+                sample(&text, "qbit_prism_metrics_snapshot_available"),
+                f64::from(age.is_some())
+            );
+            assert_eq!(
+                sample(&text, "qbit_prism_metrics_snapshot_stale"),
+                f64::from(expected_state != "fresh")
+            );
+            let snapshot_age = sample(&text, "qbit_prism_metrics_snapshot_age_seconds");
+            assert!(age.map_or(snapshot_age == -1., |age| snapshot_age >= age as f64));
+            if let Some((before, before_height)) = previous {
+                contract::height_independent(&before, before_height, &text, height).unwrap();
+            }
+            previous = Some((text, height));
+        }
+    }
 }

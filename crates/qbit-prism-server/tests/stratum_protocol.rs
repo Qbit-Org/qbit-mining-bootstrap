@@ -1322,3 +1322,6 @@ async fn admission_timeout_records_failure_and_shutdown_releases_session_stats()
 
 #[path = "observability/stratum.rs"]
 mod observability;
+
+#[path = "observability/privacy.rs"]
+mod metrics_privacy;
