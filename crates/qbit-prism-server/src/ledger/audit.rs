@@ -143,6 +143,17 @@ pub async fn materialize_audit_row(
     row: &mut Value,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
+    // Public pool-only readers have no metrics owner. Ledger reconstruction
+    // supplies its attached handle through the private helper below.
+    materialize_audit_row_with_metrics(pool, row, permit, None).await
+}
+
+async fn materialize_audit_row_with_metrics(
+    pool: &PgPool,
+    row: &mut Value,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<()> {
     let Some(digest) = row.get("share_snapshot_sha256").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -151,7 +162,7 @@ pub async fn materialize_audit_row(
     // authenticate the reconstruction. Separate checkouts let the public read
     // pool apply the remaining request deadline to each query; retaining one
     // transaction would give a late range scan the first query's full budget.
-    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(pool).await?;
+    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
     let inline: Option<Value> = snapshot.try_get("inline_shares")?;
     let shares: Vec<AcceptedShare> = if let Some(inline) = inline {
         serde_json::from_value(inline)?
@@ -161,6 +172,7 @@ pub async fn materialize_audit_row(
             snapshot.try_get("first_share_seq")?,
             snapshot.try_get("last_share_seq")?,
             snapshot.try_get("anchor_ms")?,
+            metrics,
         )
         .await?
     };
@@ -241,7 +253,13 @@ impl Ledger {
         drop(row);
         if snapshot.is_some() {
             let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
-            materialize_audit_row(&self.pool, &mut logical, None).await?;
+            materialize_audit_row_with_metrics(
+                &self.pool,
+                &mut logical,
+                None,
+                self.metrics.as_deref(),
+            )
+            .await?;
             return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
         }
         if let Some(bytes) = canonical {
@@ -480,24 +498,24 @@ pub(super) async fn persist_audit_snapshot(
 
 /// The unpaged range read the API's `materialize_audit_row` keeps. Landing no
 /// longer uses it; its re-read is paged.
-async fn read_range<'e>(
-    executor: impl sqlx::Executor<'e, Database = Postgres>,
+async fn read_range(
+    pool: &PgPool,
     first: i64,
     last: i64,
     anchor: i64,
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<Vec<AcceptedShare>> {
-    sqlx::query(&format!(
+    // Release the range checkout at the SQL boundary, before decoding rows.
+    let rows = sqlx::query(&format!(
         "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
         anchored_eligibility_sql(3)
     ))
     .bind(first)
     .bind(last)
     .bind(anchor)
-    .fetch_all(executor)
-    .await?
-    .iter()
-    .map(share_from_row)
-    .collect()
+    .fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?)
+    .await?;
+    rows.iter().map(share_from_row).collect()
 }
 
 #[cfg(test)]
