@@ -25,6 +25,57 @@ impl LogCapture {
     }
 }
 
+#[test]
+fn readiness_event_visibility_uses_existing_module_filter_without_replaying() {
+    use super::readiness_events::{ReadinessEvent, ReadinessEvents};
+
+    for (level, warnings, recoveries) in [("error", 0, 0), ("warn", 1, 0), ("info", 1, 1)] {
+        let logs = LogCapture::default();
+        let writer = logs.clone();
+        tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter(format!("qbit_prism_server::api::public_service={level}"))
+                .with_writer(move || writer.clone())
+                .finish(),
+            || {
+                ReadinessEvent::Failed(ProbeFailure::Connection, "schema").emit();
+                ReadinessEvent::Recovered.emit();
+            },
+        );
+        let text = logs.text();
+        assert_eq!(
+            text.matches("public readiness probe failed").count(),
+            warnings
+        );
+        assert_eq!(
+            text.matches("public readiness probe recovered").count(),
+            recoveries
+        );
+        assert_private_absent(&text);
+    }
+
+    let mut events = ReadinessEvents::default();
+    let start = Instant::now();
+    let failure = Some((ProbeFailure::Connection, "schema"));
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        events.observe(failure, false, start).unwrap().emit();
+    });
+    // Subscriber visibility cannot reset the warning budget or invent a replay.
+    assert!(events
+        .observe(failure, false, start + Duration::from_secs(59))
+        .is_none());
+    assert_eq!(
+        events.observe(failure, false, start + Duration::from_secs(60)),
+        Some(ReadinessEvent::Failed(ProbeFailure::Connection, "schema"))
+    );
+    assert_eq!(
+        events.observe(None, true, start + Duration::from_secs(60)),
+        Some(ReadinessEvent::Recovered)
+    );
+}
+
 fn service(pool: PgPool, config: ServiceConfig) -> (Router, Arc<ServiceState>) {
     router(
         ApiState::new(
@@ -299,6 +350,95 @@ async fn probe_deadline_still_fails_and_releases_waiting_acquisition() {
 }
 
 #[tokio::test]
+async fn recovery_waits_for_replica_policy_and_replica_only_refusals_stay_silent() {
+    let (app, service) = service(
+        read_pool(PgConnectOptions::new_without_pgpass(), 1),
+        ServiceConfig {
+            replica_required: true,
+            ..Default::default()
+        },
+    );
+    service.pool.close().await;
+    let healthy = json!({
+        "schema_ready": true,
+        "in_recovery": true,
+        "receiver_heartbeat_age_seconds": 0,
+    });
+    let refusals = [
+        (
+            json!({"schema_ready": true, "in_recovery": false}),
+            "public read service refuses a database that is not in recovery",
+        ),
+        (
+            json!({"schema_ready": true, "in_recovery": true}),
+            "read replica replication stream is not connected",
+        ),
+        (
+            json!({"schema_ready": true, "in_recovery": true, "receiver_heartbeat_age_seconds": 61}),
+            "read replica replication stream exceeded its heartbeat age bound",
+        ),
+    ];
+    let logs = LogCapture::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    async {
+        service.publish_probe(Ok(healthy.clone()));
+        health(&app, StatusCode::OK).await;
+        for (value, message) in &refusals {
+            service.publish_probe(Ok(value.clone()));
+            let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
+            assert_eq!(body["error"], *message);
+        }
+        service.publish_probe(Ok(healthy.clone()));
+        assert!(
+            logs.text().is_empty(),
+            "healthy startup and replica-only refusal"
+        );
+
+        for episode in 1..=2 {
+            service.publish_probe(Err((ProbeFailure::Timeout, "probe")));
+            let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
+            assert_eq!(body["database_ready"], false);
+            assert_eq!(body["error"], "database probe timed out");
+            for (value, message) in &refusals {
+                service.publish_probe(Ok(value.clone()));
+                let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
+                assert_eq!(body["error"], *message);
+                assert_eq!(
+                    logs.text()
+                        .matches("public readiness probe recovered")
+                        .count(),
+                    episode - 1
+                );
+            }
+            // A query success with a replica refusal must not clear the episode
+            // or reset its warning budget when the same database error returns.
+            service.publish_probe(Err((ProbeFailure::Timeout, "probe")));
+            assert_eq!(
+                logs.text().matches("public readiness probe failed").count(),
+                episode
+            );
+            service.publish_probe(Ok(healthy.clone()));
+            health(&app, StatusCode::OK).await;
+            service.publish_probe(Ok(healthy.clone()));
+            assert_eq!(
+                logs.text()
+                    .matches("public readiness probe recovered")
+                    .count(),
+                episode
+            );
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+    assert_private_absent(&logs.text());
+}
+
+#[tokio::test]
 async fn blocked_operator_log_does_not_hold_the_health_snapshot_lock() {
     type Release = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
     #[derive(Clone)]
@@ -329,44 +469,81 @@ async fn blocked_operator_log_does_not_hold_the_health_snapshot_lock() {
         }
     }
 
-    let (app, service) = service(
-        read_pool(PgConnectOptions::new_without_pgpass(), 1),
-        ServiceConfig::default(),
-    );
-    service.pool.close().await;
-    let (entered, observed) = std::sync::mpsc::sync_channel(1);
-    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let guard = ReleaseOnDrop(release.clone());
-    let writer = BlockedLog { entered, release };
-    let probe_service = service.clone();
-    // Separate threads ensure the test can release the fake backpressured sink
-    // even if the old implementation holds a synchronous RwLock while logging.
-    let probe = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .finish();
-        runtime.block_on(probe_service.probe_once().with_subscriber(subscriber));
-    });
-    let entered_log = observed.recv_timeout(Duration::from_secs(3));
-    let published = service
-        .snapshot
-        .try_read()
-        .ok()
-        .map(|snapshot| (snapshot.ready, snapshot.last_error));
-    // Do not acquire a blocking read lock on the negative-control path. The
-    // normal path exercises HTTP while the warning writer is still blocked.
-    if published.is_some() {
-        let body = health(&app, StatusCode::SERVICE_UNAVAILABLE).await;
-        assert_eq!(body["error"], "database connection failed");
+    for recovering in [false, true] {
+        let (app, service) = service(
+            read_pool(PgConnectOptions::new_without_pgpass(), 1),
+            ServiceConfig::default(),
+        );
+        service.pool.close().await;
+        service.publish_probe(if recovering {
+            Err((ProbeFailure::Connection, "schema"))
+        } else {
+            Ok(json!({"schema_ready": true}))
+        });
+        let old_checked = Instant::now() - Duration::from_secs(60);
+        service.snapshot.write().unwrap().checked = Some(old_checked);
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let guard = ReleaseOnDrop(release.clone());
+        let writer = BlockedLog { entered, release };
+        let probe_service = service.clone();
+        // Separate threads let the test release the backpressured sink even
+        // when a regression holds a synchronous RwLock while emitting an event.
+        let probe = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .finish();
+            runtime.block_on(
+                async move {
+                    if recovering {
+                        probe_service.publish_probe(Ok(json!({"schema_ready": true})));
+                    } else {
+                        probe_service.probe_once().await;
+                    }
+                }
+                .with_subscriber(subscriber),
+            );
+        });
+        let entered_log = observed.recv_timeout(Duration::from_secs(3));
+        let published = service
+            .snapshot
+            .try_read()
+            .ok()
+            .map(|snapshot| (snapshot.ready, snapshot.last_error, snapshot.checked));
+        // Do not acquire a blocking read lock on the negative-control path.
+        // The normal path exercises HTTP before releasing either event sink.
+        if published.is_some() {
+            let body = health(
+                &app,
+                if recovering {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+            )
+            .await;
+            assert!(body["probe_age_seconds"].as_f64().unwrap() < 15.);
+            if recovering {
+                assert!(body.get("error").is_none());
+            } else {
+                assert_eq!(body["error"], "database connection failed");
+            }
+        }
+        drop(guard);
+        probe.join().unwrap();
+        entered_log.unwrap();
+        let (ready, error, checked) = published.expect("snapshot lock held by diagnostic sink");
+        assert_eq!(ready, recovering);
+        assert_eq!(error, (!recovering).then_some(ProbeFailure::Connection));
+        assert!(
+            checked.unwrap() > old_checked,
+            "must read the new probe result"
+        );
     }
-    drop(guard);
-    probe.join().unwrap();
-    entered_log.unwrap();
-    assert_eq!(published, Some((false, Some(ProbeFailure::Connection))));
 }
 
 #[tokio::test]
