@@ -424,6 +424,20 @@ async fn pending_age_of(coordinator: &Coordinator, metrics: &Metrics) -> Result<
     Ok(age)
 }
 
+/// The statement every settlement write ends with, made from the test's own
+/// pool as another frontend's would be: the cluster revision moves past this
+/// frontend's published work with nothing else changed.
+async fn bump_revision(pool: &PgPool) -> Result<()> {
+    let bumped = sqlx::query(
+        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    ensure!(bumped == 1, "the cluster row is missing");
+    Ok(())
+}
+
 fn age_seconds(age: PendingAge) -> Result<f64> {
     match age {
         PendingAge::Oldest(age) => Ok(age.as_secs_f64()),
@@ -516,6 +530,10 @@ async fn an_accepted_row_that_has_not_landed_yields_no_sample() -> Result<()> {
 
 async fn unlanded_row(fixture: &Fixture) -> Result<()> {
     fixture.refresh().await?;
+    ensure!(
+        fixture.pending_age().await? == PendingAge::None,
+        "the seeding tick is not zero"
+    );
     // The durable state a frontend leaves between its accepted `submitblock`
     // call and the landing: `offered`, with the node's acceptance recorded.
     let claim = fixture
@@ -539,8 +557,69 @@ async fn unlanded_row(fixture: &Fixture) -> Result<()> {
         fixture.samples("published") == (0., 0.) && fixture.samples("superseded") == (0., 0.),
         "an unlanded row was sampled"
     );
-    let pending = age_seconds(fixture.pending_age().await?)?;
-    eprintln!("accepted publication: unlanded row pending for {pending:.3} s, no sample");
+    // Behind the cluster, so an uncovered landing would count: an accepted
+    // row that has not landed still does not. The candidate gauges own it.
+    bump_revision(&fixture.pool).await?;
+    ensure!(
+        fixture.pending_age().await? == PendingAge::None,
+        "an accepted row that has not landed counted as pending"
+    );
+    eprintln!("accepted publication: unlanded row not pending, no sample");
+    Ok(())
+}
+
+/// P3-1: a lost tip race. The node accepted the block (a null reply) and a
+/// same-height competitor replaced it, so the row sits in reconciliation with
+/// the accepted outcome until an orphan proof: it never lands, is never
+/// sampled and is never pending here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_race_is_never_pending_and_never_sampled() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = lost_race(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn lost_race(fixture: &Fixture) -> Result<()> {
+    fixture.refresh().await?;
+    ensure!(fixture.pending_age().await? == PendingAge::None);
+    let claim = fixture
+        .claim_found(TIP_HEIGHT + 1, &PARENT.repeat(32))
+        .await?;
+    let hash = claim.candidate.block_hash.clone();
+    fixture
+        .node
+        .state
+        .lock()
+        .await
+        .lose_next_race_to(&"bb".repeat(32));
+    tokio::time::timeout(PROCESS_BOUND, fixture.coordinator.process_candidate(&claim))
+        .await
+        .context("the post-offer settlement did not complete")??;
+    let (state, outcome): (String, Option<String>) = sqlx::query_as(
+        "SELECT state,offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&fixture.pool)
+    .await?;
+    ensure!(
+        state == "reconciliation" && outcome.as_deref() == Some("accepted"),
+        "the lost race left the row {state} with outcome {outcome:?}"
+    );
+    // The frontend is behind the cluster, and publishes again: neither makes
+    // a block that never landed pending or measurable.
+    bump_revision(&fixture.pool).await?;
+    ensure!(
+        fixture.pending_age().await? == PendingAge::None,
+        "a lost race counted as an unpublished landing"
+    );
+    fixture.refresh().await?;
+    ensure!(
+        fixture.samples("published") == (0., 0.) && fixture.samples("superseded") == (0., 0.),
+        "a lost race was sampled"
+    );
+    ensure!(fixture.pending_age().await? == PendingAge::None);
     Ok(())
 }
 
@@ -595,7 +674,7 @@ async fn adopted_row(fixture: &Fixture) -> Result<()> {
 }
 
 /// T3. While a landing stays unpublished, across a failed refresh too, the
-/// gauge rises; a second acceptance never resets it; a failed derivation is
+/// gauge rises; a second landing never resets it; a failed derivation is
 /// unknown, never zero. Its return to zero at the publication is T1's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pending_age_rises_until_the_landing_is_published_and_is_unknown_when_the_read_fails(
@@ -609,6 +688,10 @@ async fn the_pending_age_rises_until_the_landing_is_published_and_is_unknown_whe
 
 async fn pending_age_rises(fixture: &Fixture) -> Result<()> {
     fixture.refresh().await?;
+    ensure!(
+        fixture.pending_age().await? == PendingAge::None,
+        "the seeding tick is not zero"
+    );
     let hash = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
     let first = age_seconds(fixture.pending_age().await?)?;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -618,8 +701,16 @@ async fn pending_age_rises(fixture: &Fixture) -> Result<()> {
         "the gauge did not rise across two ticks ({first:.3} s then {second:.3} s)"
     );
 
+    // A second, newer landing must not reset the oldest pending age.
+    fixture.land(TIP_HEIGHT + 2, &hash).await?;
+    let third = age_seconds(fixture.pending_age().await?)?;
+    ensure!(
+        third >= second,
+        "a second landing reset the gauge to {third:.3} s from {second:.3} s"
+    );
+
     // Refresh fails (the node is gone): nothing is published, so nothing is
-    // sampled, and the landing stays pending.
+    // sampled, and the landings stay pending.
     fixture.node.stop();
     let observations = fixture.coordinator.accepted_publication_observations();
     ensure!(
@@ -634,25 +725,12 @@ async fn pending_age_rises(fixture: &Fixture) -> Result<()> {
     );
     let failed = age_seconds(fixture.pending_age().await?)?;
     ensure!(
-        failed > second,
+        failed > third,
         "the gauge did not keep rising across a failed refresh ({failed:.3} s)"
-    );
-
-    // A second, newer acceptance must not reset the oldest pending age.
-    let claim = fixture.claim_found(TIP_HEIGHT + 2, &hash).await?;
-    fixture.ledger().reserve_offer(&claim).await?;
-    fixture
-        .ledger()
-        .record_offer(&claim, unix_ms_now()?, OfferOutcome::Accepted, None)
-        .await?;
-    let third = age_seconds(fixture.pending_age().await?)?;
-    ensure!(
-        third >= failed,
-        "a second acceptance reset the gauge to {third:.3} s from {failed:.3} s"
     );
     eprintln!(
         "accepted publication: pending age {first:.3} s, {second:.3} s, \
-         {failed:.3} s after a failed refresh, {third:.3} s after a second acceptance"
+         {third:.3} s after a second landing, {failed:.3} s after a failed refresh"
     );
 
     // The read fails: unknown, never a healthy zero.
@@ -809,6 +887,10 @@ async fn a_superseded_publication_records_nothing_until_the_next_one() -> Result
 
 async fn superseded_revalidation(fixture: &Fixture) -> Result<()> {
     fixture.refresh().await?;
+    ensure!(
+        fixture.pending_age().await? == PendingAge::None,
+        "the seeding tick is not zero"
+    );
     let published_revision = fixture.ledger().payout_revision().await?;
     let hash = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
     let landed_revision = fixture.ledger().payout_revision().await?;
@@ -847,82 +929,171 @@ async fn superseded_revalidation(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
-/// A restart in the middle of a landed-but-unpublished hold (the #413 class)
-/// keeps reporting the hold: the gauge reads every retained accepted row, not
-/// only those offered since this process started. The row is covered once
-/// this frontend publishes the cluster's revision, and the histogram, bounded
-/// by the process start, never samples it a second time.
+/// F1b: a restarted frontend cannot attribute history it did not see, so
+/// until it has published the cluster's revision once its gauge is unknown
+/// (-1), which the readiness and coverage alerts own. Once it publishes, the
+/// gauge is a real zero; a landing after that which it does not publish is
+/// the hold it reports, rising, not reset by a second landing, and back to
+/// zero at the publication that carries both. A block offered before it
+/// started is never sampled by it; one offered after is, once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restart_during_an_unpublished_landing_keeps_the_pending_age() -> Result<()> {
+async fn a_restarted_frontend_is_unknown_until_it_publishes_then_reports_new_holds() -> Result<()> {
     let Some(fixture) = Fixture::open().await? else {
         return Ok(());
     };
-    let result = restart_keeps_pending(&fixture).await;
+    let result = restart_semantics(&fixture).await;
     fixture.close(result).await
 }
 
-async fn restart_keeps_pending(fixture: &Fixture) -> Result<()> {
+async fn restart_semantics(fixture: &Fixture) -> Result<()> {
     fixture.refresh().await?;
-    let hash = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
-    let offered_at_ms = fixture.offered_at_ms(&hash).await?;
+    let before_restart = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
     tokio::time::sleep(Duration::from_millis(5)).await;
     let (restarted, metrics) = fixture.restarted().await?;
     let result = async {
-        // The new process started after the offer and has published nothing:
-        // its published revision is behind the cluster's, so the landing
-        // still waits, at its full age.
-        let before = age_seconds(pending_age_of(&restarted, &metrics).await?)?;
-        let floor = (unix_ms_now()? - offered_at_ms) as f64 / 1e3 - 0.05;
+        // Nothing published yet: unknown, not the age of a landing it cannot
+        // attribute.
         ensure!(
-            before >= floor,
-            "the restarted gauge reads {before:.3} s, not the hold's age (>= {floor:.3} s)"
+            pending_age_of(&restarted, &metrics).await? == PendingAge::Unknown,
+            "a restarted frontend that has not published reports an age"
         );
 
-        // It publishes the cluster's revision: covered, a real zero, and no
-        // sample for a block offered before it started.
-        let published = restarted.refresh.subscribe();
-        let observations = restarted.accepted_publication_observations();
-        restarted.refresh_once().await?;
-        ensure!(published.has_changed()?, "the restarted frontend published nothing");
-        tokio::time::timeout(PROCESS_BOUND, async {
-            while restarted.accepted_publication_observations() <= observations {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .context("the restarted publication observation never finished")?;
+        // It publishes the cluster's revision: a real zero, and no sample for
+        // a block offered before it started.
+        publish(&restarted).await?;
         ensure!(
             pending_age_of(&restarted, &metrics).await? == PendingAge::None,
-            "the published landing still reads as pending after the restart"
+            "the seeding tick after the restart is not zero"
         );
-        let body = metrics.render();
-        for result in ["published", "superseded"] {
-            ensure!(
-                sample(&body, &format!("{SAMPLE_PREFIX}_count{{result=\"{result}\"}}"))
-                    .unwrap_or(0.)
-                    == 0.,
-                "the restarted process sampled a block offered before it started"
-            );
-        }
+        ensure!(
+            restarted_samples(&metrics) == (0., 0.),
+            "the restarted process sampled a block offered before it started"
+        );
+
+        // A landing it does not publish is the hold, and it rises.
+        let second = fixture.land(TIP_HEIGHT + 2, &before_restart).await?;
+        let first = age_seconds(pending_age_of(&restarted, &metrics).await?)?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rising = age_seconds(pending_age_of(&restarted, &metrics).await?)?;
+        ensure!(
+            rising > first,
+            "the hold did not rise ({first:.3} s then {rising:.3} s)"
+        );
+        // A second landing does not reset it.
+        fixture.land(TIP_HEIGHT + 3, &second).await?;
+        let later = age_seconds(pending_age_of(&restarted, &metrics).await?)?;
+        ensure!(
+            later >= rising,
+            "a second landing reset the hold to {later:.3} s from {rising:.3} s"
+        );
+
+        // The publication that carries both returns it to zero, sampling
+        // each once.
+        publish(&restarted).await?;
+        ensure!(
+            pending_age_of(&restarted, &metrics).await? == PendingAge::None,
+            "the published landings still read as pending"
+        );
+        let (published, superseded) = restarted_samples(&metrics);
+        eprintln!(
+            "accepted publication: restarted process unknown, then 0, then a hold of \
+             {first:.3} s, {rising:.3} s, {later:.3} s, then 0; published count {published}, \
+             superseded count {superseded}"
+        );
+        ensure!(
+            (published, superseded) == (1., 1.),
+            "the two landings after the restart produced {published} published and \
+             {superseded} superseded samples"
+        );
 
         // An unrelated later revision bump does not make a landing this
         // frontend already published wait again.
-        sqlx::query(
-            "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton",
-        )
-        .execute(&fixture.pool)
-        .await?;
+        bump_revision(&fixture.pool).await?;
         ensure!(
             pending_age_of(&restarted, &metrics).await? == PendingAge::None,
             "an unrelated revision bump resurrected a published landing"
-        );
-        eprintln!(
-            "accepted publication: restarted process read the hold at {before:.3} s, \
-             then 0 after publishing the cluster revision; no sample"
         );
         Ok(())
     }
     .await;
     restarted.ledger.pool.close().await;
     result
+}
+
+/// One refresh on `coordinator` that must publish, with its queued
+/// observation awaited.
+async fn publish(coordinator: &Coordinator) -> Result<()> {
+    let published = coordinator.refresh.subscribe();
+    let observations = coordinator.accepted_publication_observations();
+    coordinator.refresh_once().await?;
+    ensure!(published.has_changed()?, "the refresh published nothing");
+    tokio::time::timeout(PROCESS_BOUND, async {
+        while coordinator.accepted_publication_observations() <= observations {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .context("the publication observation never finished")?;
+    Ok(())
+}
+
+/// `(published, superseded)` sample counts on `metrics`.
+fn restarted_samples(metrics: &Metrics) -> (f64, f64) {
+    let body = metrics.render();
+    let count = |result: &str| {
+        sample(
+            &body,
+            &format!("{SAMPLE_PREFIX}_count{{result=\"{result}\"}}"),
+        )
+        .unwrap_or(0.)
+    };
+    (count("published"), count("superseded"))
+}
+
+/// F3: observations run in publication order. Two publications at the same
+/// revision are queued first-then-second; the block is claimed by the first,
+/// so its sample ends at the first publication's instant, never the second's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_observations_sample_a_block_at_the_first_publication_that_carries_it() -> Result<()>
+{
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = publication_order(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn publication_order(fixture: &Fixture) -> Result<()> {
+    fixture.refresh().await?;
+    let hash = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
+    let offered_at_ms = fixture.offered_at_ms(&hash).await?;
+    let revision = fixture.ledger().payout_revision().await?;
+    let first_ms = unix_ms_now()?;
+    let second_ms = first_ms + 10_000;
+    let observations = fixture.coordinator.accepted_publication_observations();
+    fixture
+        .coordinator
+        .enqueue_accepted_publication_observation(revision, first_ms);
+    fixture
+        .coordinator
+        .enqueue_accepted_publication_observation(revision, second_ms);
+    tokio::time::timeout(PROCESS_BOUND, async {
+        while fixture.coordinator.accepted_publication_observations() < observations + 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .context("the queued observations never finished")?;
+    let (count, sum) = fixture.samples("published");
+    let expected = (first_ms - offered_at_ms) as f64 / 1e3;
+    eprintln!(
+        "accepted publication: queued publications at {first_ms} and {second_ms} ms; \
+         block offered at {offered_at_ms} ms sampled once at {sum:.3} s (expected {expected:.3} s)"
+    );
+    ensure!(count == 1., "the block was sampled {count} times");
+    ensure!(
+        (sum - expected).abs() < 1e-6,
+        "the sample {sum:.3} s is not the first publication's {expected:.3} s"
+    );
+    Ok(())
 }
