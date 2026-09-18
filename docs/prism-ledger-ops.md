@@ -1847,7 +1847,9 @@ cluster's pinned fee policy after **every frontend has stopped**. It supports
 pool-fee enablement, recipient and basis-point changes, and explicit/automatic
 CTV fee rates and premiums. Signing keys, genesis, username fallback, output
 ordering, payout thresholds, CTV enablement and settlement layout must stay
-unchanged. Signing-key rotation and multi-epoch verification are deferred.
+unchanged. Signing-key rotation has its own command,
+[`signing-transition`](#signing-key-rotation); multi-epoch verification
+remains deferred.
 
 1. Preserve the current configuration, signing material and database backup.
    Prepare a protected env file containing the target overrides. For example,
@@ -1917,6 +1919,104 @@ unchanged. Signing-key rotation and multi-epoch verification are deferred.
    revision. Miners disconnect during the stop and receive fresh work after
    reconnecting; revision-bound jobs prepared before the transition cannot be
    issued. Historical verification continues to use the unchanged public keys.
+
+## Signing-key rotation
+
+`qbit-prism-server signing-transition --confirm` resets the pinned cluster
+fingerprint so that frontends configured with new signing keys can pin theirs.
+It is the guarded form of the reset the rotation rehearsal (#291) performs by
+hand, and it leaves a durable record. The fingerprint is the SHA-256 of the
+policy document, which includes both public keys (`ledger_key`,
+`manifest_key`), so any key change is a fingerprint change, and
+[`policy-transition`](#offline-pool-fee-and-ctv-fee-rate-changes) keeps
+refusing it. Migration `019` adds the immutable journal
+`qbit_prism_signing_transitions`; run `qbit-prism-server migrate` first.
+
+The one outcome the command exists to exclude is a reset while a frontend
+still holds a claim, an offer reservation or a fresh heartbeat. Its checks and
+its one write happen in one transaction that holds the settlement and order
+locks, the instance registration lock, and the cluster row `FOR UPDATE`, the
+same row lock every `configure` takes and every candidate writer reads `FOR
+SHARE`: a concurrent startup or write serialises behind it and then sees the
+reset. There is no force flag. Without `--confirm` the command prints what it
+would check and do, reads neither its configuration nor the database,
+changes nothing and exits non-zero.
+
+1. Preserve the current configuration, both old signing seeds, their public
+   keys and a database backup. Generate the new key pair; keep the old public
+   keys (they also end up in the journal): every bundle signed before the
+   rotation verifies only with them.
+
+2. Disable automatic restarts and stop every frontend and one-shot tool.
+   Confirm the candidate outbox is drained: the command refuses while any
+   candidate is `pending`, `offer_reserved`, `offered` or in `reconciliation`,
+   whatever keys it carries (stricter than `configure`, which only refuses
+   other keys), and names the counts, states and first block hashes. Let
+   offered candidates land or settle through their existing recovery
+   procedures; `candidates abandon` handles a pending one.
+
+3. With the **current** (old-key) environment, the one the cluster is pinned
+   to, run:
+
+   ```sh
+   qbit-prism-server migrate
+   qbit-prism-server signing-transition --confirm
+   ```
+
+   The command refuses when the pinned fingerprint is not this environment's:
+   the journal must record the keys being retired. It refuses a halted
+   cluster: clear the fatal state with the current keys first, because
+   `fatal-state clear` compares the pinned fingerprint. It refuses while any
+   registered frontend is live. A row is quiescent when its status is
+   `stopped`, or when its heartbeat is older, by the database clock, than the
+   freshness window `self-check` uses: three `PRISM_HEALTH_REFRESH_SECONDS`,
+   never less than fifteen seconds. Run the command with the frontends'
+   cadence in its environment. A killed frontend never writes `stopped`; its
+   row stops refusing once its heartbeat is stale. A `starting` or `running`
+   row with a fresh heartbeat, a status this binary cannot read, or a
+   future-dated heartbeat (an unknown age) refuses by instance name. If the
+   fingerprint is already unset, the command reports the last journal row and
+   writes nothing, so a lost commit response is resolved by running it again.
+
+4. Save the returned JSON: the journal row (`transition_id`, the old
+   fingerprint, the old policy document with both old public keys, every
+   instance row with its measured heartbeat age and the window applied, the
+   unchanged payout revision, the database login) and the next steps. The
+   payout revision does not change: a rotation is not a payout-policy change.
+   Existing audit and CTV manifest bytes are unchanged. One overall deadline
+   of 120 seconds covers the node calls, the lock waits and the transaction;
+   a failure or timeout before commit leaves the fingerprint pinned and the
+   journal without a row.
+
+5. Start the new-key frontends. The cluster fingerprint is unknown until the
+   first of them configures: **the first `configure` after the reset pins the
+   fingerprint, whatever keys it brings.** An old-key frontend or one-shot
+   tool started by mistake pins the old fingerprint again; that is safe (the
+   new-key frontends refuse with `cluster configuration fingerprint mismatch`)
+   and the command can be run again. Once a new-key frontend has pinned,
+   old-key starts are refused with the same message, and `signing-transition`
+   in the old environment refuses because the pinned fingerprint is no longer
+   its own. `fatal-state clear` again works with the new environment.
+
+6. Do not run `backfill-ctv` or `import-audits` with the new key against
+   audits signed before the rotation: every ledger-attestation verifier checks
+   one configured key, and both commands abort on the first old-key row.
+   Multi-epoch verification remains deferred; the journal's `previous_policy`
+   is the anchor for it. The public API and the read tier verify no
+   signatures and are unaffected.
+
+**Halted while the fingerprint is unset.** The fatal-state writers (a mature
+pool block or a deep CTV fanout disconnected) are not fenced on the
+fingerprint, and a partitioned-but-alive old frontend is indistinguishable
+from a killed one once its heartbeat is stale. If such a process halts the
+cluster between the reset and the first new-key pin, `fatal-state clear`
+refuses (the fingerprint is missing) and no frontend can start (halted). The
+exposure is the same as the by-hand reset's. Recovery, as the database owner:
+restore the old fingerprint from the journal row,
+`UPDATE qbit_prism_cluster SET config_fingerprint=(SELECT previous_fingerprint FROM qbit_prism_signing_transitions ORDER BY transition_id DESC LIMIT 1) WHERE singleton`,
+make sure the process that wrote the halt is really gone, run
+`fatal-state clear` with the **old** key environment, then run
+`signing-transition --confirm` again; the journal keeps both rows.
 
 ## Fatal-state recovery
 
