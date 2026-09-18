@@ -1154,15 +1154,17 @@ impl Coordinator {
             )))
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
+        #[cfg(test)]
+        self.publication_probe().await;
         self.lock_compact_publication(reserved).await?.publish()?;
         // Observation only, after the publication succeeded: the revision
         // miners can now be issued work at, and the wall clock at that
-        // moment. The measurement itself runs in a detached task, so this
-        // refresh does no further work and its timing is unchanged.
+        // moment. The measurement itself runs later, in publication order, so
+        // this refresh only enqueues and its timing is unchanged.
         // A wall clock this process cannot read is not a refresh failure:
         // the publication already happened and only the sample is lost.
         match unix_ms_now() {
-            Ok(published_at_ms) => self.spawn_accepted_publication_observation(
+            Ok(published_at_ms) => self.enqueue_accepted_publication_observation(
                 captured.record.payout_revision,
                 published_at_ms,
             ),
@@ -2446,20 +2448,16 @@ impl MiningBackend for Coordinator {
                 .cloned()
                 .context("no current template")?;
             drop(initial);
-            let admitted = self
-                .begin_issuance_authority(
-                    tip_observation::PreparedIdentity::of(&prepared),
-                    readiness_epoch,
-                    None,
-                )
-                .await?;
-            if admitted.is_none() {
-                // Observation only, at the one arm that refuses a build
-                // because the published payout snapshot is no longer the
-                // cluster's. The refusal itself is unchanged.
-                self.metrics.record_stale_revision_refusal();
-            }
-            let mut issuance_authority = admitted.context("payout snapshot stale")?;
+            // The admission runs with the stale-revision refusal observation
+            // armed; `work_authority_in_epoch` counts only that refusal, and
+            // only here. The admission and its errors are unchanged.
+            let mut issuance_authority = Self::build_admission(self.begin_issuance_authority(
+                tip_observation::PreparedIdentity::of(&prepared),
+                readiness_epoch,
+                None,
+            ))
+            .await?
+            .context("payout snapshot stale")?;
             ensure!(
                 self.observed_tip.read().await.publication_stamp() == published_tip,
                 "work publication changed during work admission"

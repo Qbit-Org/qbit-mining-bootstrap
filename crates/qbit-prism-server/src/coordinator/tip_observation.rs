@@ -591,6 +591,11 @@ impl Coordinator {
                     deadline: clock,
                 })
         } else {
+            if identity.revision != revision {
+                // Observation only (#458): the work's payout revision is not
+                // the cluster's. Counted for `build_job`'s admission alone.
+                self.observe_stale_revision_refusal();
+            }
             (identity.revision == revision).then_some(WorkAuthority {
                 revision,
                 lease: None,

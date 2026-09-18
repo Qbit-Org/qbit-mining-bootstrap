@@ -89,7 +89,7 @@ families! {
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
     AcceptedPublication: Histogram, "accepted_block_work_publication_seconds", "Durable accepted offer time of a pool block to this frontend's first publication of work whose payout revision includes its landing, by result; adopted blocks carry no offer time and yield no sample.";
-    AcceptedPendingAge: Gauge, "accepted_block_oldest_unpublished_seconds", "Age of the oldest accepted pool block whose landed payout revision this frontend has not yet published; 0 when none, or -1 when unknown.";
+    AcceptedPendingAge: Gauge, "accepted_block_oldest_unpublished_seconds", "Age since its accepted offer of the oldest landed pool block whose payout revision this frontend has not yet published; 0 when none, or -1 when unknown, including before this frontend first publishes the cluster revision.";
     StaleRevisionRefusals: Counter, "stale_payout_revision_job_refusals_total", "Job builds refused because this frontend's published payout revision was behind the cluster's.";
 }
 
