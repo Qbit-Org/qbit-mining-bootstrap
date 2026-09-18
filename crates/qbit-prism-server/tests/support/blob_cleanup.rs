@@ -111,6 +111,76 @@ async fn repair_before_gc_retains_blobs_through_the_child_deadline() -> Result<(
     .await
 }
 
+#[tokio::test]
+async fn surviving_orphan_repair_and_gc_fence_both_orders_before_reference_scan() -> Result<()> {
+    for writer_first in [false, true] {
+        for candidate_reference in [false, true] {
+            run(move |db| Box::pin(async move {
+                let original = seed(db, true).await?;
+                if candidate_reference {
+                    db.ledger.enqueue_candidate(candidate(&original)).await?;
+                }
+                // Crucially, both immutable blobs survive without a prepared row.
+                delete_dependencies(db, false).await?;
+                let repair = original.repair()?;
+                let mut gate = db.ledger.pool.begin().await?;
+                let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *gate).await?;
+                if writer_first {
+                    sqlx::raw_sql(&format!("CREATE FUNCTION gate_orphan_repair() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({TEST_GATE}); RETURN NEW; END $$; CREATE TRIGGER gate_orphan_repair BEFORE INSERT ON qbit_prism_jobs FOR EACH ROW WHEN (NEW.job_id='prepared') EXECUTE FUNCTION gate_orphan_repair();"))
+                        .execute(&db.ledger.pool).await?;
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(TEST_GATE)
+                        .execute(&mut *gate).await?;
+                } else {
+                    // Stop the real collector AFTER its exclusive cluster fence,
+                    // BEFORE its first blob-key/reference scan.
+                    sqlx::query("LOCK TABLE qbit_prism_templates IN ACCESS EXCLUSIVE MODE")
+                        .execute(&mut *gate).await?;
+                }
+                let start_gc = || {
+                    let ledger = db.ledger.clone();
+                    Running(tokio::spawn(async move {
+                        ledger.prune_unreferenced_blobs(&mut BlobPruneCursor::default(),
+                            Instant::now() + Duration::from_secs(10)).await
+                    }))
+                };
+                let (mut writer, mut gc) = if writer_first {
+                    let writer = spawn_save(db.ledger.clone(), repair, original.expires);
+                    // BEFORE INSERT is after both put/check byte comparisons.
+                    let writer_pid = blocked_query(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
+                    let gc = start_gc();
+                    blocked_query(db, writer_pid, "SELECT singleton FROM qbit_prism_cluster").await?;
+                    (writer, gc)
+                } else {
+                    let gc = start_gc();
+                    let gc_pid = blocked_query(db, gate_pid, "SELECT template_sha256").await?;
+                    let writer = spawn_save(db.ledger.clone(), repair, original.expires);
+                    blocked_query(db, gc_pid, "SELECT config_fingerprint").await?;
+                    (writer, gc)
+                };
+                ensure!(db.ledger.job("child").await?.is_none());
+                gate.rollback().await?;
+                ensure!(timeout(Duration::from_secs(5), &mut writer.0).await??? == IssuedJobSave::Saved);
+                let collected = timeout(Duration::from_secs(5), &mut gc.0).await???;
+                ensure!(collected.templates == u64::from(!writer_first));
+                ensure!(collected.balances == u64::from(!writer_first && !candidate_reference));
+                let restored = db.ledger.compact_prepared("prepared").await?.context("dangling repair")?;
+                ensure!(restored.record == original.record && restored.template == template()
+                    && restored.original_expires_at_ms == original.expires);
+                ensure!(db.ledger.job("child").await? == Some(child(original.expires)));
+                ensure!(sweep(db, &mut BlobPruneCursor::default()).await? == JobPruneResult::default());
+                if candidate_reference {
+                    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox c JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=c.window_prior_balances_sha256)")
+                        .fetch_one(&db.ledger.pool).await?;
+                    ensure!(valid, "collector lost candidate balance reference");
+                }
+                Ok(())
+            })).await?;
+        }
+    }
+    Ok(())
+}
+
 fn candidate(original: &Original) -> Candidate {
     let block = vec![0u8; 81];
     let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
@@ -221,7 +291,7 @@ async fn collector_waits_for_repair_and_candidate_writers_in_lock_order() -> Res
         let mut gc = Running(tokio::spawn(async move {
             sweep_ledger(&ledger, &mut BlobPruneCursor::default(), Duration::from_secs(5)).await
         }));
-        blocked_query(db, writer_pid, "SELECT pg_advisory_xact_lock").await?;
+        blocked_query(db, writer_pid, "SELECT singleton FROM qbit_prism_cluster").await?;
         gate.rollback().await?;
         ensure!((&mut writer.0).await?? == IssuedJobSave::Saved);
         ensure!((&mut gc.0).await?? == JobPruneResult::default());
@@ -239,6 +309,9 @@ async fn collector_waits_for_repair_and_candidate_writers_in_lock_order() -> Res
         blocked_query(db, pid, "SELECT pg_advisory_xact_lock").await?;
         let holds_settlement: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1)").bind(SETTLEMENT_LOCK).fetch_one(&mut *tx).await?;
         ensure!(holds_settlement, "collector acquired ORDER before SETTLEMENT");
+        // Real candidate writers take this shared fence after ORDER. If GC
+        // acquired its exclusive fence first, this is a lock-order deadlock.
+        timeout(Duration::from_secs(1), sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR SHARE").execute(&mut *tx)).await??;
         sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,window_anchor_ms,window_prior_balances_sha256) VALUES('pending','{}',repeat('0',64),1,$1)")
             .bind(hex::encode(original.record.window.prior_balances_digest)).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -495,6 +568,56 @@ async fn one_deadline_covers_pool_and_both_advisory_waits() -> Result<()> {
             timeout(Duration::from_secs(1), rollback_fence(db)).await??;
             ordering.rollback().await?;
             ensure!(snapshot(db).await? == before && cursor == BlobPruneCursor::default());
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cluster_fence_wait_uses_remaining_gc_deadline_and_preserves_cursor() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            seed(db, true).await?;
+            delete_dependencies(db, false).await?;
+            let before = snapshot(db).await?;
+            let mut hold = db.ledger.pool.begin().await?;
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR SHARE")
+                .execute(&mut *hold)
+                .await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *hold)
+                .await?;
+            let ledger = db.ledger.clone();
+            let mut gc = Running(tokio::spawn(async move {
+                let mut cursor = BlobPruneCursor::default();
+                let result = ledger
+                    .prune_unreferenced_blobs(
+                        &mut cursor,
+                        Instant::now() + Duration::from_millis(700),
+                    )
+                    .await;
+                (result, cursor)
+            }));
+            blocked_query(db, pid, "SELECT singleton FROM qbit_prism_cluster").await?;
+            let (result, cursor) = timeout(Duration::from_secs(2), &mut gc.0).await??;
+            ensure!(deadline_error(&result.unwrap_err()) && cursor == BlobPruneCursor::default());
+            // Keep the row blocked. Server cancellation must release both advisory
+            // locks without assistance from the holder or a replacement deadline.
+            timeout(Duration::from_secs(1), async {
+                let mut probe = db.ledger.pool.begin().await?;
+                for lock in [SETTLEMENT_LOCK, ORDER_LOCK] {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(lock)
+                        .execute(&mut *probe)
+                        .await?;
+                }
+                probe.rollback().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            ensure!(snapshot(db).await? == before);
+            hold.rollback().await?;
             Ok(())
         })
     })

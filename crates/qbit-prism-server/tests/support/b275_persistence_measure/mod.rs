@@ -185,15 +185,15 @@ impl Fixture {
             .collect()
     }
 
-    async fn settlement_waiter(&self) -> Result<i32> {
+    async fn cluster_waiter(&self, blocker: i32) -> Result<i32> {
         timeout(Duration::from_secs(2), async {
             loop {
-                let waiting: Option<i32> = sqlx::query_scalar("SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE locktype='advisory' AND classid=$1::bigint::oid AND objid=$2::bigint::oid AND objsubid=1 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.application_name=$3 LIMIT 1")
-                    .bind(SETTLEMENT_LOCK >> 32).bind(SETTLEMENT_LOCK & 0xffff_ffff).bind(&self.schema).fetch_optional(&self.direct).await?;
+                let waiting: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND application_name=$2 AND query LIKE 'SELECT config_fingerprint%' LIMIT 1")
+                    .bind(blocker).bind(&self.schema).fetch_optional(&self.direct).await?;
                 if let Some(pid) = waiting { return Ok::<_, anyhow::Error>(pid); }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.context("no settlement lock waiter observed")?
+        }).await.context("no authority row waiter observed")?
     }
 }
 
@@ -548,16 +548,19 @@ fn complete_receipts_do_not_hide_durable_identity_failure() {
     assert!(delivery_outcome(true, &json!({"received":2}), &[]).is_ok());
 }
 
-pub async fn landing_lock(fixture: &Fixture) -> Result<()> {
+/// Preserve the old blocking assertion at the actual authority fence. The
+/// historical advisory baseline remains attributed to its original revision.
+pub async fn authority_lock(fixture: &Fixture) -> Result<()> {
     let frontend = &fixture.frontends[0];
-    let worker = frontend.authorize("b275.lock").await?;
+    let worker = frontend.authorize("b275.authority").await?;
     let job = frontend.build_job(&worker, "11223344", 1.0, 0.0).await?;
     let mut tx = fixture.direct.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(SETTLEMENT_LOCK)
+    sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=ledger_clock_ms WHERE singleton")
         .execute(&mut *tx)
         .await?;
-    let before = fixture.metrics()?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await?;
     let start = Instant::now();
     let persist = async {
         frontend
@@ -566,28 +569,139 @@ pub async fn landing_lock(fixture: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(start.elapsed().as_secs_f64())
     };
     let release = async {
-        let observed = fixture.settlement_waiter().await;
+        let observed = fixture.cluster_waiter(blocker).await;
         tokio::time::sleep_until(start + Duration::from_secs(3)).await;
         tx.rollback().await?;
-        let pid = observed?;
-        Ok::<_, anyhow::Error>((start.elapsed().as_secs_f64(), pid))
+        observed?;
+        Ok::<_, anyhow::Error>(())
     };
     let (persist, released) = tokio::join!(persist, release);
+    released?;
     let elapsed = persist?;
-    let (released, waiter_pid) = released?;
     ensure!(
         elapsed >= 3.0,
-        "persistence completed before the controlled hold elapsed"
+        "persistence bypassed the held authority fence"
     );
-    let delta = metric_delta(before, fixture.metrics()?)?;
     ensure!(
         frontend.ledger.job(&job.wire.job_id).await?.is_some(),
         "persist succeeded without durable row"
     );
     println!(
-        "B275_LOCK {}",
-        json!({"historical_baseline_sha":HISTORICAL_BASELINE,"stub_hold_target_seconds":3,"release_observed_seconds":released,"persist_seconds":elapsed,"settlement_waiter_observed":true,"waiter_pid":waiter_pid,"database_metric_deltas":delta,"commit_seconds":null,"lock_free_acceptance_met":false})
+        "B275_AUTHORITY_LOCK {}",
+        json!({"hold_target_seconds":3,"persist_seconds":elapsed,
+        "ordinary_update_wait_observed":true,"scope":"legitimate authority row contention retained"})
     );
+    Ok(())
+}
+
+/// Acceptance for persistence only. The old blocking measurement remains in
+/// tests/perf/b275_persistence_measure.md at its recorded historical revision.
+pub async fn settlement_isolation(fixture: &Fixture) -> Result<()> {
+    for (mode, children) in [
+        ("hot-single", 1),
+        ("hot-cohort", 64),
+        ("repair-survivors", 1),
+        ("repair-missing", 1),
+    ] {
+        let mut requests = Vec::new();
+        let mut originals = Vec::new();
+        for (index, frontend) in fixture.frontends.iter().enumerate() {
+            let worker = frontend.authorize(&format!("b275.lock-{index}")).await?;
+            for child in 0..children {
+                let job = frontend
+                    .build_job(&worker, &format!("{child:08x}"), 1.0, 0.0)
+                    .await?;
+                if child == 0 {
+                    let stored = frontend
+                        .ledger
+                        .compact_prepared(&job.context.prepared.storage_key)
+                        .await?
+                        .context("original prepared row missing")?;
+                    originals.push((index, job.context.prepared.storage_key.clone(), stored));
+                }
+                requests.push((index, worker.clone(), job));
+            }
+        }
+        if mode.starts_with("repair") {
+            let keys: Vec<_> = originals.iter().map(|(_, key, _)| key.clone()).collect();
+            sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+                .bind(&keys)
+                .execute(&fixture.direct)
+                .await?;
+            if mode == "repair-missing" {
+                sqlx::query("DELETE FROM qbit_prism_templates")
+                    .execute(&fixture.direct)
+                    .await?;
+                sqlx::query("DELETE FROM qbit_prism_balance_snapshots")
+                    .execute(&fixture.direct)
+                    .await?;
+            }
+        }
+        let mut stub = fixture.direct.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SETTLEMENT_LOCK)
+            .execute(&mut *stub)
+            .await?;
+        let stub_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *stub)
+            .await?;
+        let start = Instant::now();
+        let release_at = start + Duration::from_secs(3);
+        let before = fixture.metrics()?;
+        // Nothing can release the stub until return AND durable verification
+        // finish. The timeout catches a regression without manufacturing a
+        // post-unlock success; SQL lock ownership is the synchronization proof.
+        let verified = timeout_at(release_at, async {
+            let results = join_all(requests.iter().map(|(index, worker, job)| async move {
+                fixture.frontends[*index].persist_issued_job(worker, job, 0, Duration::from_secs(60)).await
+            })).await;
+            for result in results { result?; }
+            let ids: HashSet<_> = requests.iter().map(|(_, _, job)| job.wire.job_id.as_str()).collect();
+            ensure!(ids.len() == requests.len(), "runtime cohort reused a child ID");
+            for (index, worker, job) in &requests {
+                let row = sqlx::query("SELECT instance_id,parent_hash,payout_revision,payload,(extract(epoch FROM expires_at)*1000)::bigint AS expiry,expires_at>clock_timestamp() AS live,num_nulls(window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256)=7 AS child_shape FROM qbit_prism_jobs WHERE job_id=$1")
+                    .bind(&job.wire.job_id).fetch_one(&fixture.direct).await?;
+                let expiry: i64 = row.try_get("expiry")?;
+                let expected = json!({"prepared_key":job.context.prepared.storage_key,"worker":worker,
+                    "extranonce1":job.wire.extranonce1,"extranonce2_size":job.wire.extranonce2_size,
+                    "share_target_hex":job.wire.share_target.to_str_radix(16),"share_difficulty":job.wire.share_difficulty,
+                    "version_mask":0,"expires_at_ms":expiry});
+                // PostgreSQL expands exponent-form JSON numbers to decimal.
+                // Compare every field with exact JSONB equality, the same
+                // comparator as immutable retries, without rounding to f64.
+                let exact: bool = sqlx::query_scalar("SELECT payload=$2 FROM qbit_prism_jobs WHERE job_id=$1")
+                    .bind(&job.wire.job_id).bind(&expected).fetch_one(&fixture.direct).await?;
+                ensure!(exact && row.try_get::<bool,_>("child_shape")?
+                    && row.try_get::<bool,_>("live")?, "durable child identity or expiry differs: mode={mode}, expected={expected}, actual={}, shape={}, live={}",
+                    row.try_get::<Value,_>("payload")?, row.try_get::<bool,_>("child_shape")?, row.try_get::<bool,_>("live")?);
+                ensure!(row.try_get::<String,_>("instance_id")? == fixture.frontends[*index].config.instance_id
+                    && row.try_get::<String,_>("parent_hash")? == job.wire.previousblockhash
+                    && row.try_get::<i64,_>("payout_revision")? == job.context.prepared.snapshot.payout_revision);
+            }
+            for (index, key, original) in &originals {
+                let stored = fixture.frontends[*index].ledger.compact_prepared(key).await?.context("dangling prepared reference")?;
+                ensure!(stored.record == original.record && stored.template == original.template
+                    && stored.prior_balances == original.prior_balances
+                    && stored.original_expires_at_ms == original.original_expires_at_ms);
+            }
+            let (owned, waiters): (bool, i64) = sqlx::query_as("SELECT bool_or(l.pid=$1 AND l.granted),count(*) FILTER (WHERE NOT l.granted AND a.application_name=$4) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=$2::bigint::oid AND l.objid=$3::bigint::oid AND l.objsubid=1")
+                .bind(stub_pid).bind(SETTLEMENT_LOCK >> 32).bind(SETTLEMENT_LOCK & 0xffff_ffff).bind(&fixture.schema).fetch_one(&fixture.direct).await?;
+            ensure!(owned && waiters == 0, "stub ownership or settlement independence lost");
+            Ok::<_, anyhow::Error>(start.elapsed().as_secs_f64())
+        }).await.context("persistence and exact durable rows did not precede stub release")?;
+        let elapsed = verified?;
+        tokio::time::sleep_until(release_at).await;
+        stub.rollback().await?;
+        println!(
+            "B275_LOCK {}",
+            json!({"schema":"b275.lock-isolation.v1","mode":mode,
+            "frontends":fixture.frontends.len(),"children_per_frontend":children,"stub_hold_target_seconds":3,
+            "return_and_durable_verification_seconds":elapsed,"release_observed_seconds":start.elapsed().as_secs_f64(),
+            "exact_rows_before_release":true,"stub_owned_at_verification":true,"settlement_waiter_observed":false,
+            "database_metric_deltas":metric_delta(before,fixture.metrics()?)?,"commit_seconds":null,
+            "lock_free_acceptance_met":true,"scope":"prebuilt issuance persistence; no full refresh latency claim"})
+        );
+    }
     Ok(())
 }
 
@@ -648,9 +762,11 @@ pub async fn revision_fence(fixture: &Fixture) -> Result<()> {
             .fetch_one(&fixture.direct)
             .await?;
     let mut tx = fixture.direct.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(SETTLEMENT_LOCK)
+    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
         .execute(&mut *tx)
+        .await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
         .await?;
     // Drive the actual compact-issued transaction under its own lock wait.
     // The public coordinator deliberately erases the underlying error cause.
@@ -672,12 +788,7 @@ pub async fn revision_fence(fixture: &Fixture) -> Result<()> {
         None,
     );
     let bump = async {
-        fixture.settlement_waiter().await?;
-        sqlx::query(
-            "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton",
-        )
-        .execute(&mut *tx)
-        .await?;
+        fixture.cluster_waiter(blocker).await?;
         tx.commit().await?;
         Ok::<_, anyhow::Error>(())
     };

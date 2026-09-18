@@ -160,9 +160,11 @@ impl Ledger {
             .context("prepared dependency expiry overflow")?;
 
         let mut tx = self.begin().await?;
-        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         // Acquire the row fence before reading mutable cluster state: if this
-        // waits behind configure/reset, all checks below see its committed state.
+        // waits behind an ordinary authority UPDATE, all checks below see its
+        // committed state. SHARE (not KEY SHARE) also excludes blob GC through
+        // commit, including repair that reuses surviving orphan blobs. Never
+        // acquire SETTLEMENT or ORDER after this fence.
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
         )
@@ -184,8 +186,8 @@ impl Ledger {
         if let Some(row) = &row {
             dependency.check_row(row)?;
             // These row locks also prevent a delete between the existence check
-            // and the optional exact-byte verification below. Future GC still
-            // takes SETTLEMENT then ORDER before scanning/deleting references.
+            // and the optional exact-byte verification below. GC takes
+            // SETTLEMENT -> ORDER -> cluster FOR UPDATE before fresh scans.
             lock_blob_metadata(&mut tx, dependency).await?;
         } else {
             let Some(repair) = repair else {
