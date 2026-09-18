@@ -117,6 +117,32 @@ for the operator procedure. `qbit_prism_share_ledger_partition_lead_rows`
 in `/metrics` reports the remaining headroom; see
 [prism-native-metrics.md](prism-native-metrics.md).
 
+## Stratum per-source cap and per-session budgets
+
+Five settings bound what one source address or one connection can cost. Every
+one defaults to the value that keeps today's behavior, and `check-config`
+rejects an out-of-range value rather than falling back.
+
+| Setting | Default | Accepted range | Failure when rejected |
+| --- | --- | --- | --- |
+| `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP` | 0 (disabled) | 0 through the semaphore capacity | `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP exceeds semaphore capacity` |
+| `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS` | 60 | finite, above 0, at most 3600 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS must be finite, positive and at most 3600` |
+| `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL must be at most 1000000` |
+| `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL must be at most 1000000` |
+| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL must be at most 1000000` |
+
+A value that is not a number fails as `invalid <name>`; an empty value selects
+the default. The three budgets are rates measured over the shared interval, not
+session lifetime totals: a full window's allowance is admitted as a burst and
+refills whole at the next window. Valid `mining.submit` traffic is never
+charged against any of them.
+
+The per-source cap keys on the address this listener observed, which is the
+last hop. Leave it at 0 unless the deployment preserves miner source addresses.
+See [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) for the
+runbook, the recommended starting values and the topologies that make a cap
+unsafe.
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name
