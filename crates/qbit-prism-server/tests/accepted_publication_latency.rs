@@ -354,19 +354,18 @@ impl Fixture {
     /// One health tick's gauge derivation, with the rendered gauge proven to
     /// carry the same value the derivation returned.
     async fn pending_age(&self) -> Result<PendingAge> {
-        let age = self.coordinator.publish_accepted_pending_age().await;
-        let rendered = sample(&self.metrics.render(), PENDING_GAUGE)
-            .context("the pending-age gauge is not rendered")?;
-        let expected = match age {
-            PendingAge::Unknown => -1.,
-            PendingAge::None => 0.,
-            PendingAge::Oldest(age) => age.as_secs_f64(),
-        };
-        ensure!(
-            rendered == expected,
-            "the gauge renders {rendered}, not the derived {expected}"
-        );
-        Ok(age)
+        pending_age_of(&self.coordinator, &self.metrics).await
+    }
+
+    /// A second frontend process on the same database and node: a restart
+    /// of this one, with its own metrics and in-memory state.
+    async fn restarted(&self) -> Result<(Arc<Coordinator>, Arc<Metrics>)> {
+        let mut config = (*self.coordinator.config).clone();
+        config.instance_id = "accepted-publication-restarted".into();
+        config.initialize_schema = false;
+        let metrics = Arc::new(Metrics::default());
+        let coordinator = Coordinator::new(config, metrics.clone()).await?;
+        Ok((coordinator, metrics))
     }
 
     async fn close(self, result: Result<()>) -> Result<()> {
@@ -405,6 +404,24 @@ fn sample(body: &str, key: &str) -> Option<f64> {
     body.lines()
         .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|value| value.parse().ok())
+}
+
+/// One health tick's gauge derivation on `coordinator`, with the rendered
+/// gauge proven to carry the same value the derivation returned.
+async fn pending_age_of(coordinator: &Coordinator, metrics: &Metrics) -> Result<PendingAge> {
+    let age = coordinator.publish_accepted_pending_age().await;
+    let rendered = sample(&metrics.render(), PENDING_GAUGE)
+        .context("the pending-age gauge is not rendered")?;
+    let expected = match age {
+        PendingAge::Unknown => -1.,
+        PendingAge::None => 0.,
+        PendingAge::Oldest(age) => age.as_secs_f64(),
+    };
+    ensure!(
+        rendered == expected,
+        "the gauge renders {rendered}, not the derived {expected}"
+    );
+    Ok(age)
 }
 
 fn age_seconds(age: PendingAge) -> Result<f64> {
@@ -828,4 +845,84 @@ async fn superseded_revalidation(fixture: &Fixture) -> Result<()> {
         "the block was sampled twice"
     );
     Ok(())
+}
+
+/// A restart in the middle of a landed-but-unpublished hold (the #413 class)
+/// keeps reporting the hold: the gauge reads every retained accepted row, not
+/// only those offered since this process started. The row is covered once
+/// this frontend publishes the cluster's revision, and the histogram, bounded
+/// by the process start, never samples it a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_during_an_unpublished_landing_keeps_the_pending_age() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = restart_keeps_pending(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn restart_keeps_pending(fixture: &Fixture) -> Result<()> {
+    fixture.refresh().await?;
+    let hash = fixture.land(TIP_HEIGHT + 1, &PARENT.repeat(32)).await?;
+    let offered_at_ms = fixture.offered_at_ms(&hash).await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let (restarted, metrics) = fixture.restarted().await?;
+    let result = async {
+        // The new process started after the offer and has published nothing:
+        // its published revision is behind the cluster's, so the landing
+        // still waits, at its full age.
+        let before = age_seconds(pending_age_of(&restarted, &metrics).await?)?;
+        let floor = (unix_ms_now()? - offered_at_ms) as f64 / 1e3 - 0.05;
+        ensure!(
+            before >= floor,
+            "the restarted gauge reads {before:.3} s, not the hold's age (>= {floor:.3} s)"
+        );
+
+        // It publishes the cluster's revision: covered, a real zero, and no
+        // sample for a block offered before it started.
+        let published = restarted.refresh.subscribe();
+        let observations = restarted.accepted_publication_observations();
+        restarted.refresh_once().await?;
+        ensure!(published.has_changed()?, "the restarted frontend published nothing");
+        tokio::time::timeout(PROCESS_BOUND, async {
+            while restarted.accepted_publication_observations() <= observations {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .context("the restarted publication observation never finished")?;
+        ensure!(
+            pending_age_of(&restarted, &metrics).await? == PendingAge::None,
+            "the published landing still reads as pending after the restart"
+        );
+        let body = metrics.render();
+        for result in ["published", "superseded"] {
+            ensure!(
+                sample(&body, &format!("{SAMPLE_PREFIX}_count{{result=\"{result}\"}}"))
+                    .unwrap_or(0.)
+                    == 0.,
+                "the restarted process sampled a block offered before it started"
+            );
+        }
+
+        // An unrelated later revision bump does not make a landing this
+        // frontend already published wait again.
+        sqlx::query(
+            "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton",
+        )
+        .execute(&fixture.pool)
+        .await?;
+        ensure!(
+            pending_age_of(&restarted, &metrics).await? == PendingAge::None,
+            "an unrelated revision bump resurrected a published landing"
+        );
+        eprintln!(
+            "accepted publication: restarted process read the hold at {before:.3} s, \
+             then 0 after publishing the cluster revision; no sample"
+        );
+        Ok(())
+    }
+    .await;
+    restarted.ledger.pool.close().await;
+    result
 }

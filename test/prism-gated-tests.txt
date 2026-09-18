@@ -4,6 +4,7 @@
 # minimum executed count. scripts/check_gate_manifest.py compares the gate's
 # removed must be changed here too. See docs/prism-integration-test-gate.md.
 qbit-prism-load::quorum_replication::an_any_1_quorum_standby_on_postgres_16_is_observed_as_sync_like_first_1
+qbit-prism-server::accepted_publication_latency::a_restart_during_an_unpublished_landing_keeps_the_pending_age
 qbit-prism-server::accepted_publication_latency::a_stale_payout_revision_refusal_is_counted_once_and_a_build_is_not
 qbit-prism-server::accepted_publication_latency::a_superseded_publication_records_nothing_until_the_next_one
 qbit-prism-server::accepted_publication_latency::an_accepted_landing_is_sampled_once_from_its_durable_offer_time

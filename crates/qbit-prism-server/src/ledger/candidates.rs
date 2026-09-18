@@ -984,8 +984,9 @@ impl Ledger {
     }
 
     /// One read-only snapshot for #458's accepted-publication observations:
-    /// the cluster's current payout revision together with every outbox row
-    /// the node accepted at or after `offered_since_ms`.
+    /// the cluster's current payout revision together with every retained
+    /// outbox row the node accepted, or only those offered at or after
+    /// `offered_since_ms` when it is given.
     ///
     /// Both halves come from one statement, so the revision is the one the
     /// rows were read under: the observer revalidates the revision it
@@ -995,16 +996,18 @@ impl Ledger {
     /// adopted row (`adopt_active_candidate`) records the `unknown` outcome
     /// and no `offered_at_ms`, and a row whose outcome commit was lost keeps
     /// `offered_at_ms` NULL; neither is measurable and neither is returned.
-    /// The `offered_since_ms` bound is the observing process's own start, so
-    /// a restart cannot resample a block the previous process measured.
-    pub async fn accepted_offers_since(&self, offered_since_ms: i64) -> Result<AcceptedOffers> {
+    /// The histogram passes the observing process's own start, so a restart
+    /// cannot resample a block the previous process measured; the pending
+    /// gauge passes none, so a restart cannot forget a block still waiting.
+    pub async fn accepted_offers(&self, offered_since_ms: Option<i64>) -> Result<AcceptedOffers> {
         let rows = sqlx::query(
             "SELECT c.payout_revision, o.block_hash, o.offered_at_ms, o.state, \
              (o.state='submitted' OR EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash AND b.chain_state='confirmed')) AS landed, \
              (extract(epoch FROM o.completed_at)*1000)::bigint AS completed_at_ms \
              FROM qbit_prism_cluster c \
              LEFT JOIN qbit_block_candidate_outbox o \
-             ON o.offer_outcome='accepted' AND o.offered_at_ms>=$1 \
+             ON o.offer_outcome='accepted' AND o.offered_at_ms IS NOT NULL \
+             AND ($1::bigint IS NULL OR o.offered_at_ms>=$1) \
              WHERE c.singleton",
         )
         .bind(offered_since_ms)
@@ -1041,7 +1044,7 @@ impl Ledger {
     }
 }
 
-/// One coherent read of [`Ledger::accepted_offers_since`].
+/// One coherent read of [`Ledger::accepted_offers`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AcceptedOffers {
     /// The cluster payout revision the rows were read under.
