@@ -65,7 +65,7 @@ This map is evidence for the cutover go/no-go (#291), so it is checked, not trus
 - a deleted file from the pinned manifest has no file row, a file row names a file outside that manifest, or the manifest is unreadable, empty or contains duplicates;
 - a case from the pinned case manifest has no case row, a case row names a case outside that manifest, or the case manifest is unreadable, empty or contains duplicates;
 - a `path::name` reference names a file that is not in the repository, a function that is not in that file, or a function that is not a test;
-- a table line does not parse, a status is not one the legend defines, a row's text does not lead with its status, a full row cites no test, or an open gap row links no issue;
+- a table line does not parse, a status is not one the legend defines, a row's text does not lead with its status, a full or partial row cites no test, or an open gap row links no issue;
 - the summary table or the section row counts differ from the rows, or the needs triage index differs from the needs triage rows;
 - an issue link does not point at this repository's issue of the same number, or an owner arrow is followed by a bare `#N` instead of a link.
 

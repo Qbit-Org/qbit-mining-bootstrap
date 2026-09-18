@@ -19,7 +19,7 @@ Without flags the check is offline and is what required CI runs:
 - every `path::name` reference names a file in the repository and a test
   function in it (`#[test]`-style attribute in Rust, `def test_` in Python);
 - a status is one of the five the legend defines, the row's text leads with
-  it, a full row cites a test and an open gap row links the issue that owns it;
+  it, a full or partial row cites a test and an open gap row links its owner issue;
 - the summary table and the per-section counts equal the rows;
 - the needs triage index lists exactly the needs triage rows;
 - every issue link points at this repository's issue of the same number, and
@@ -352,10 +352,10 @@ def check_rows(parsed: ParsedMap) -> list[str]:
         if row.status == FULL:
             if lead not in (None, FULL):
                 errors.append(at(row.line, f"status is full but the text leads with {lead!r}"))
-            if not references_in(row.text)[0]:
-                errors.append(at(row.line, "a full row must cite at least one `path::name` test"))
         elif lead != row.status:
             errors.append(at(row.line, f"status is {row.status!r} but the text does not lead with it"))
+        if row.status in (FULL, PARTIAL) and not references_in(row.text)[0]:
+            errors.append(at(row.line, f"a {row.status} row must cite at least one `path::name` test"))
         if row.status == OPEN_GAP and row.line not in linked_lines:
             errors.append(at(row.line, "an open gap row must link the issue that closes the gap"))
     return errors

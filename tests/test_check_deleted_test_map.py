@@ -425,6 +425,27 @@ class OfflineTests(unittest.TestCase):
             "an open gap row must link the issue that closes the gap",
         )
 
+    def test_a_partial_file_row_must_cite_a_test(self) -> None:
+        for citation in ("", "the native suite", "`server::run`", "`tests/test_kept::test_kept`"):
+            with self.subTest(citation=citation):
+                self.assert_fails(
+                    edited("`tests/test_kept.py::test_kept`", citation),
+                    f":{line_of('`tests/test_b.py`')}: a partial row must cite at least one `path::name` test",
+                )
+
+    def test_a_partial_case_row_must_cite_a_test(self) -> None:
+        self.assert_fails(
+            edited(
+                "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+                "| `test_case_one` | partial | partial: covered by the native suite |",
+            ),
+            f":{line_of('`test_case_one`')}: a partial row must cite at least one `path::name` test",
+        )
+
+    def test_a_partial_case_row_with_a_test_citation_passes(self) -> None:
+        result = self.check(edited("| `test_case_one` | full |", "| `test_case_one` | partial | partial: covered by"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_duplicate_rows_fail(self) -> None:
         self.assert_fails(
             edited("| `tests/test_c.py` | retired | retired — Python only |", "| `tests/test_a.py` | retired | retired — Python only |"),
