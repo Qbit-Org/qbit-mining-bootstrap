@@ -77,8 +77,8 @@ Trusted proxy and edge address handling remain P2 follow-ups in
 [#262](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/262); load
 balancer policy itself belongs to
 [#281](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/281). The
-per-source cap, malformed-frame budget, bounded unknown-job lookups with
-negative caching and the authorization budget are the second slice, below.
+per-source cap, malformed-frame budget, bounded unknown-job lookups and the
+authorization budget are the second slice, below.
 
 # Second slice: per-source cap and per-session budgets
 
@@ -112,13 +112,21 @@ request and then closes the connection, recording the reason on
   not bytes, and includes the malformed non-submit frames that were previously
   answered and forgotten at no accounting cost. One frame is one charge
   whatever it weighs.
-- `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` counts **distinct** unknown job
-  IDs. The cost is bounded first: each session keeps up to 64 recently missed
-  IDs for 10 seconds, so repeats of the same unknown ID cost no further ledger
-  query. The cache is per session, is never shared, and is dropped with the
-  connection; a miss cannot become a hit inside its lifetime because work is
-  persisted before it is delivered. The budget then bounds the rate of distinct
-  IDs, which is what actually reaches the database.
+- `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` counts every `mining.submit`
+  whose job is not held by the session and whose ledger resume lookup misses.
+  Each such submit costs exactly one lookup, so the budget bounds the ledger
+  work one session can drive: a flood of unknown-job submits produces at most
+  the budget plus one lookup per interval before the disconnect, whether the
+  IDs repeat or not. There is deliberately no negative cache. A resume miss is
+  not proof that the ID is bogus: besides honest staleness after a tip or
+  payout-revision change, a resume returns a miss when its publication stamp
+  changes mid-resume, when issuance authority loses a lease or tip race during
+  revalidation, and while this frontend is momentarily behind on the parent or
+  payout revision. Each of those clears on the miner's next share, so every
+  submit must re-query, and each counts as a miss against the budget. That is
+  also why the default stays 0: with the budget off, behavior is exactly as
+  before, and an operator who enables it must size it above the worst honest
+  miss rate rather than rely on a cache.
 - `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` counts `mining.authorize`
   attempts, charged before the address validation RPC, which is what bounds the
   `validateaddress` calls one connection can drive by cycling usernames.
@@ -136,7 +144,7 @@ is set below an honest rate.
 | --- | --- | --- |
 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS` | 60 | Long enough that a burst is averaged out, short enough that a spent budget recovers within a miner's patience. |
 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL` | 64 | An honest miner sends none. 64 tolerates a broken proxy or a firmware bug without ejecting the rig on the first bad frame. |
-| `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 256 | Sized for honest staleness: after a tip or payout-revision change a large rig's in-flight work legitimately arrives as unknown, and the largest miners produce the largest bursts. |
+| `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 256 | Must sit well above an honest miner's in-flight submits per interval, because in the worst case every one of them misses: after a tip or payout-revision change, or through a run of transient resume races, all work a rig still holds arrives as unknown. At the default 15-second vardiff target a connection submits about 4 shares a minute, and a connection holds at most 64 retained jobs (`PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION`); 256 covers several whole-retention flushes in one window. |
 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 32 | Normal sessions authorize once or twice. 32 leaves room for a client that re-authorizes on every reconnect attempt inside one connection. |
 | `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP` | 0 | See the runbook rule below. |
 

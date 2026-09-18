@@ -250,21 +250,25 @@ async fn unknown_job_budget_bounds_ledger_queries_and_a_capped_source_runs_none(
     );
 
     // 1,000 unknown-job submits from one session, sent as fast as the socket
-    // takes them, all inside one budget window.
+    // takes them, all inside one budget window. Ten IDs repeat, so a cache
+    // that skipped repeated lookups would show up as fewer than budget + 1.
     let flood = observer.mark();
     let started = std::time::Instant::now();
     for id in 0..1_000u64 {
         client
-            .send(unknown_submit(100 + id, &format!("absent-{id}")))
+            .send(unknown_submit(100 + id, &format!("absent-{}", id % 10)))
             .await;
     }
     client.expect_closed().await;
     let elapsed = started.elapsed();
     server.connections(0).await;
     let lookups = job_lookups(&observer.executions_since(flood)?);
-    assert!(
-        lookups <= budget as usize + 1,
-        "{lookups} qbit_prism_jobs lookups for 1,000 unknown submits at a budget of {budget}"
+    // Every miss is charged, repeated IDs included, so the lookup count is
+    // exactly the budget plus the one lookup whose miss spent it.
+    assert_eq!(
+        lookups,
+        budget as usize + 1,
+        "qbit_prism_jobs lookups for 1,000 unknown submits at a budget of {budget}"
     );
     assert_eq!(refusal_total(&metrics, "unknown_job_budget"), 1.);
     // The disconnected session released its reservation guard.
