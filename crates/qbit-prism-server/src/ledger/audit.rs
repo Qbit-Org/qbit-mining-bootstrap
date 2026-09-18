@@ -139,36 +139,59 @@ pub async fn audit_canonical_bytes<'a>(
     reader: impl Into<AuditReader<'a>>,
     block_hash: &str,
 ) -> Result<Option<Vec<u8>>> {
+    audit_canonical_bytes_admitted(reader, block_hash, None).await
+}
+
+/// [`audit_canonical_bytes`] under an admission `permit`. The stored bytes'
+/// digest and parse, and a native row's rebuild and canonical serialization,
+/// are proportional to the window, so they run on one blocking thread that
+/// holds the permit itself: Tokio keeps running that job after its awaiting
+/// caller is dropped, and the permit must bound it anyway. Callers outside the
+/// public API pass `None`.
+pub async fn audit_canonical_bytes_admitted<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    block_hash: &str,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Option<Vec<u8>>> {
     let mut reader = reader.into();
     let row = sqlx::query("SELECT audit_bundle,audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1")
         .bind(block_hash).fetch_optional(&mut *reader.connection(None).await?).await?;
     let Some(row) = row else { return Ok(None) };
     let expected: String = row.try_get("audit_bundle_sha256")?;
-    if let Some(bytes) = row.try_get::<Option<Vec<u8>>, _>("canonical_audit_bytes")? {
-        ensure!(
-            hex::encode(Sha256::digest(&bytes)) == expected,
-            "stored canonical audit bytes have a digest mismatch"
-        );
-        let value: Value = serde_json::from_slice(&bytes)?;
-        ensure!(
-            value.is_object(),
-            "stored canonical audit bytes must contain a JSON object"
-        );
-        return Ok(Some(bytes));
-    }
+    let canonical: Option<Vec<u8>> = row.try_get("canonical_audit_bytes")?;
     let snapshot: Option<String> = row.try_get("share_snapshot_sha256")?;
+    let body: Option<Value> = match (&canonical, &snapshot) {
+        (None, Some(_)) => row.try_get("audit_bundle")?,
+        _ => None,
+    };
+    // The row still holds its own copy of the bytes; free it before the
+    // blocking job instead of keeping two copies alive across the await.
+    drop(row);
+    if let Some(bytes) = canonical {
+        return tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let _permit = permit;
+            ensure!(
+                hex::encode(Sha256::digest(&bytes)) == expected,
+                "stored canonical audit bytes have a digest mismatch"
+            );
+            let value: Value = serde_json::from_slice(&bytes)?;
+            ensure!(
+                value.is_object(),
+                "stored canonical audit bytes must contain a JSON object"
+            );
+            Ok(Some(bytes))
+        })
+        .await?;
+    }
     if snapshot.is_none() {
         return Ok(None);
     }
-    let body: Option<Value> = row.try_get("audit_bundle")?;
     let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
-    materialize_audit_row(&mut reader, &mut logical, None).await?;
-    let bundle: AuditBundle = serde_json::from_value(logical["audit_bundle"].take())?;
-    let bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?;
-    ensure!(
-        hex::encode(Sha256::digest(&bytes)) == expected,
-        "canonical reconstructed audit digest mismatch"
-    );
+    // The rebuild's own blocking job also produces the canonical bytes it
+    // proves against the digest, so the permit spans both in one job.
+    let bytes = materialize_audit_row_with_metrics(&mut reader, &mut logical, permit, None, true)
+        .await?
+        .context("canonical reconstruction produced no bytes")?;
     Ok(Some(bytes))
 }
 
@@ -230,17 +253,22 @@ pub async fn materialize_audit_row<'a>(
 ) -> Result<()> {
     // Public and maintenance readers have no metrics owner. Ledger reconstruction
     // supplies its attached handle through the private helper below.
-    materialize_audit_row_with_metrics(reader, row, permit, None).await
+    materialize_audit_row_with_metrics(reader, row, permit, None, false).await?;
+    Ok(())
 }
 
+/// With `canonical`, the blocking job returns the canonical bytes it proved
+/// against `audit_bundle_sha256` and drops the body, leaving `audit_bundle`
+/// null; without it, the body is materialized into `row` and nothing returns.
 async fn materialize_audit_row_with_metrics<'a>(
     reader: impl Into<AuditReader<'a>>,
     row: &mut Value,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<()> {
+    canonical: bool,
+) -> Result<Option<Vec<u8>>> {
     let Some(digest) = row.get("share_snapshot_sha256").and_then(Value::as_str) else {
-        return Ok(());
+        return Ok(None);
     };
     let digest = digest.to_owned();
     let mut reader = reader.into();
@@ -276,46 +304,52 @@ async fn materialize_audit_row_with_metrics<'a>(
     // row holds no second copy of it across the await.
     let body = std::mem::take(body);
     let expected = row["audit_bundle_sha256"].as_str().map(str::to_owned);
-    let materialized = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let _permit = permit;
-        ensure!(
-            hex::encode(Sha256::digest(serde_json::to_vec(&shares)?)) == digest,
-            "audit share snapshot digest mismatch"
-        );
-        let mut body = body;
-        let normalized = body
-            .get("reward_manifest")
-            .and_then(Value::as_object)
-            .is_some_and(|manifest| !manifest.contains_key("shares"));
-        if normalized {
-            let header: qbit_prism::PrismRewardManifestHeader = serde_json::from_value(
-                body.remove("reward_manifest")
-                    .context("audit body has no reward manifest")?,
-            )?;
-            let found_block = FoundBlock::deserialize(
-                body.get("found_block")
-                    .context("audit body has no found block")?,
-            )?;
-            let manifest = qbit_prism::restore_reward_manifest(header, &shares, &found_block)?;
-            body.insert("reward_manifest".into(), serde_json::to_value(&manifest)?);
-        }
-        body.insert("shares".into(), serde_json::to_value(shares)?);
-        let body = Value::Object(body);
-        if let Some(expected) = expected {
-            let bundle = AuditBundle::deserialize(&body)?;
-            let actual = hex::encode(Sha256::digest(qbit_prism::canonical_audit_bundle_bytes(
-                &bundle,
-            )?));
+    ensure!(
+        !canonical || expected.is_some(),
+        "canonical reconstruction needs the row's audit digest"
+    );
+    let (materialized, bytes) =
+        tokio::task::spawn_blocking(move || -> Result<(Value, Option<Vec<u8>>)> {
+            let _permit = permit;
             ensure!(
-                actual == expected,
-                "materialized audit body digest mismatch"
+                hex::encode(Sha256::digest(serde_json::to_vec(&shares)?)) == digest,
+                "audit share snapshot digest mismatch"
             );
-        }
-        Ok(body)
-    })
-    .await??;
+            let mut body = body;
+            let normalized = body
+                .get("reward_manifest")
+                .and_then(Value::as_object)
+                .is_some_and(|manifest| !manifest.contains_key("shares"));
+            if normalized {
+                let header: qbit_prism::PrismRewardManifestHeader = serde_json::from_value(
+                    body.remove("reward_manifest")
+                        .context("audit body has no reward manifest")?,
+                )?;
+                let found_block = FoundBlock::deserialize(
+                    body.get("found_block")
+                        .context("audit body has no found block")?,
+                )?;
+                let manifest = qbit_prism::restore_reward_manifest(header, &shares, &found_block)?;
+                body.insert("reward_manifest".into(), serde_json::to_value(&manifest)?);
+            }
+            body.insert("shares".into(), serde_json::to_value(shares)?);
+            let body = Value::Object(body);
+            if let Some(expected) = expected {
+                let bundle = AuditBundle::deserialize(&body)?;
+                let bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?;
+                ensure!(
+                    hex::encode(Sha256::digest(&bytes)) == expected,
+                    "materialized audit body digest mismatch"
+                );
+                if canonical {
+                    return Ok((Value::Null, Some(bytes)));
+                }
+            }
+            Ok((body, None))
+        })
+        .await??;
     row["audit_bundle"] = materialized;
-    Ok(())
+    Ok(bytes)
 }
 
 impl Ledger {
@@ -358,6 +392,7 @@ impl Ledger {
                 &mut logical,
                 None,
                 self.metrics.as_deref(),
+                false,
             )
             .await?;
             return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));

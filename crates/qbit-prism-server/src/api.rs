@@ -50,6 +50,12 @@ pub struct ApiConfig {
     pub cache_debug_headers: bool,
     pub read_timeout: Duration,
     pub read_concurrency: u32,
+    /// Window-sized audit artifact rebuilds and decodes admitted at once,
+    /// independently of `read_concurrency`.
+    pub audit_rebuild_concurrency: u32,
+    /// Audit artifact requests in flight, running or waiting for a rebuild;
+    /// the next distinct one is refused without waiting.
+    pub audit_artifact_max_in_flight: u32,
     pub public_stratum_url: Option<String>,
     pub public_stratum_highdiff_url: Option<String>,
     pub stratum_highdiff_port: Option<u16>,
@@ -212,6 +218,18 @@ impl ApiConfig {
                 1,
                 1024,
             )?,
+            audit_rebuild_concurrency: bounded(
+                "PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY",
+                defaults.audit_rebuild_concurrency,
+                1,
+                64,
+            )?,
+            audit_artifact_max_in_flight: bounded(
+                "PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT",
+                defaults.audit_artifact_max_in_flight,
+                1,
+                4096,
+            )?,
             public_stratum_url: config::optional("PRISM_PUBLIC_STRATUM_URL"),
             public_stratum_highdiff_url: config::optional("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"),
             stratum_highdiff_port: Some(config::number("PRISM_STRATUM_HIGHDIFF_PORT", 0u16)?)
@@ -265,6 +283,8 @@ impl Default for ApiConfig {
             cache_debug_headers: false,
             read_timeout: Duration::from_secs(20),
             read_concurrency: 4,
+            audit_rebuild_concurrency: 1,
+            audit_artifact_max_in_flight: 32,
             public_stratum_url: None,
             public_stratum_highdiff_url: None,
             stratum_highdiff_port: None,
@@ -297,6 +317,12 @@ pub struct ApiState {
     /// Imported audit decodes run after their read connection is released,
     /// so they share the read pool's concurrency through this limit instead.
     audit_decodes: Arc<Semaphore>,
+    /// Content-addressed audit artifacts are rebuilt from a share window or
+    /// decoded from sealed bytes, both proportional to the window; this limit
+    /// is sized on its own so a larger read pool admits no more of them.
+    audit_rebuilds: Arc<Semaphore>,
+    /// Audit artifact requests admitted to wait for, or run, a rebuild.
+    audit_artifacts: Arc<Semaphore>,
     public_service: Option<Arc<public_service::ServiceState>>,
 }
 #[derive(Clone, Debug)]
@@ -320,11 +346,17 @@ impl Payload {
 }
 impl ApiState {
     pub fn new(pool: PgPool, config: ApiConfig, registry: Arc<crate::metrics::Metrics>) -> Self {
-        let (public_pool, audit_decodes) = read_limits(&pool, config.read_concurrency);
+        let (public_pool, audit_decodes, audit_rebuilds) = read_limits(
+            &pool,
+            config.read_concurrency,
+            config.audit_rebuild_concurrency,
+        );
         Self {
             pool,
             public_pool,
             audit_decodes,
+            audit_rebuilds,
+            audit_artifacts: Arc::new(Semaphore::new(config.audit_artifact_max_in_flight as usize)),
             public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
@@ -341,15 +373,29 @@ impl ApiState {
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
-    /// Resize the public read pool and the audit decode limit together.
+    /// Resize the public read pool and the audit limits together.
     pub fn with_read_concurrency(mut self, concurrency: u32) -> Self {
-        (self.public_pool, self.audit_decodes) = read_limits(&self.pool, concurrency);
+        (self.public_pool, self.audit_decodes, self.audit_rebuilds) = read_limits(
+            &self.pool,
+            concurrency,
+            self.config.audit_rebuild_concurrency,
+        );
         self
     }
     /// The shared imported-audit decode limit, observed by the tests.
     #[doc(hidden)]
     pub fn audit_decode_limit(&self) -> Arc<Semaphore> {
         self.audit_decodes.clone()
+    }
+    /// The artifact route's rebuild and decode limit, observed by the tests.
+    #[doc(hidden)]
+    pub fn audit_rebuild_limit(&self) -> Arc<Semaphore> {
+        self.audit_rebuilds.clone()
+    }
+    /// The artifact route's in-flight admission, observed by the tests.
+    #[doc(hidden)]
+    pub fn audit_artifact_admission(&self) -> Arc<Semaphore> {
+        self.audit_artifacts.clone()
     }
     #[cfg(test)]
     pub(crate) fn health_published_at_for_test(&self) -> &RwLock<Instant> {
@@ -400,12 +446,24 @@ impl ApiState {
 }
 /// One read concurrency bounds both the public read pool and the imported
 /// audit decodes that continue after their connection is back in that pool.
-fn read_limits(pool: &PgPool, concurrency: u32) -> (PgPool, Arc<Semaphore>) {
+/// Artifact rebuilds have their own limit: each holds a window in memory, so
+/// raising the read concurrency must not admit more of them.
+fn read_limits(
+    pool: &PgPool,
+    concurrency: u32,
+    rebuilds: u32,
+) -> (PgPool, Arc<Semaphore>, Arc<Semaphore>) {
     (
         public_service::read_pool(pool.connect_options().as_ref().clone(), concurrency),
         Arc::new(Semaphore::new(concurrency as usize)),
+        Arc::new(Semaphore::new(rebuilds as usize)),
     )
 }
+/// Seconds an over-cap audit artifact request is told to wait before retrying:
+/// about one measured rebuild at a 100,000-share window.
+const AUDIT_ARTIFACT_RETRY_AFTER_SECONDS: u64 = 5;
+/// The error code of that refusal, which the public service counts.
+const AUDIT_ARTIFACT_BUSY: &str = "audit_artifact_busy";
 pub fn router(state: ApiState) -> Router {
     Router::new().fallback(any(handle)).with_state(state)
 }
@@ -445,6 +503,20 @@ impl ApiError {
             code: "read_timeout",
             message: "the read timed out; try again shortly".into(),
         }
+    }
+    /// Refused before any audit read: too many audit artifacts are in flight.
+    fn audit_artifact_busy() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: AUDIT_ARTIFACT_BUSY,
+            message:
+                "too many audit artifacts are being rebuilt; retry after the Retry-After delay"
+                    .into(),
+        }
+    }
+    /// The `Retry-After` delay an error carries, in seconds.
+    fn retry_after(&self) -> Option<u64> {
+        (self.code == AUDIT_ARTIFACT_BUSY).then_some(AUDIT_ARTIFACT_RETRY_AFTER_SECONDS)
     }
     fn internal() -> Self {
         Self {
@@ -648,14 +720,22 @@ async fn handle_inner(
             }
             response
         }
-        Err(error) => json_response(
-            error.status,
-            if is_public {
-                json!({"schema":"prism.dashboard.error.v1","error":{"code":error.code,"message":error.message,"request_id":null}})
-            } else {
-                operational_error(path, &error)
-            },
-        ),
+        Err(error) => {
+            let mut response = json_response(
+                error.status,
+                if is_public {
+                    json!({"schema":"prism.dashboard.error.v1","error":{"code":error.code,"message":error.message,"request_id":null}})
+                } else {
+                    operational_error(path, &error)
+                },
+            );
+            if let Some(seconds) = error.retry_after() {
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from(seconds));
+            }
+            response
+        }
     };
     let mut response = response;
     if is_public {
@@ -704,7 +784,7 @@ fn cors(headers: &mut HeaderMap) {
     headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     headers.insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("ETag, Age, X-Prism-Public-Cache, X-Prism-Staleness-Budget-Seconds, X-Prism-Database-State, X-Prism-Replica-Lag-Seconds, X-Prism-Artifact-Canonical-State, Warning"),
+        HeaderValue::from_static("ETag, Age, X-Prism-Public-Cache, X-Prism-Staleness-Budget-Seconds, X-Prism-Database-State, X-Prism-Replica-Lag-Seconds, X-Prism-Artifact-Canonical-State, Warning, Retry-After"),
     );
 }
 fn json_response(status: StatusCode, payload: Value) -> Response {

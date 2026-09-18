@@ -332,9 +332,38 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
     .await?;
     let block_hash =
         block_hash.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
-    let canonical = crate::ledger::audit_canonical_bytes(&state.pool, &block_hash)
+    // Only audit artifacts are admitted here: the manifests above are served
+    // from their stored JSON and never wait behind a rebuild. Past the cap a
+    // request is refused at once, after the two point lookups above and
+    // before any audit read, instead of spending its deadline in the queue.
+    // The admission lives in the single-flight leader's computation, so
+    // identical requests share one, and it ends with that computation.
+    let _admitted =
+        state
+            .audit_artifacts
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => ApiError::audit_artifact_busy(),
+                tokio::sync::TryAcquireError::Closed => ApiError::internal(),
+            })?;
+    // Stored bytes are digested and parsed, and a native row is rebuilt from
+    // its window, all proportional to the window and all outliving the read
+    // connection. Their own limit bounds them, never the read concurrency.
+    // The permit is taken before the row read, so it also spans a rebuild's
+    // snapshot lookup and window read, and it moves into the blocking job: a
+    // dropped request cannot free it before that job ends. Waiting for it
+    // spends the request's own deadline.
+    let permit = state
+        .audit_rebuilds
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(audit_read_error)?;
+        .map_err(|_| ApiError::internal())?;
+    let canonical =
+        crate::ledger::audit_canonical_bytes_admitted(&state.pool, &block_hash, Some(permit))
+            .await
+            .map_err(audit_read_error)?;
     if let Some(canonical) = canonical {
         if hex::encode(Sha256::digest(&canonical)) != hash {
             return Err(ApiError::internal());
