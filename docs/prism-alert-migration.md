@@ -117,9 +117,14 @@ and collector availability do not gate these live events. Cached gauges retain
 their freshness guards and stale/missing snapshots retain their unknown-data
 alerts. Deploy #351's live-histogram producer to every coordinator target before
 activating the revised expression; older cached-histogram producers do not satisfy
-its freshness contract. **Proof-to-first-offer waits are declared,
-rule deferred to A/#266; advisory-lock waits are recorded since #328 with no rule written yet**;
-neither has a firing rule.
+its freshness contract. Advisory-lock waits have been recorded since #328 and
+are now covered: **`PrismDatabaseAdvisoryLockWaitHigh` and
+`PrismDatabaseAdvisoryLockFailuresCritical`** watch the order and settlement
+locks from the cached snapshot body, and `lock="migration"` is deliberately
+outside both. Proof-to-first-offer timing is instrumented as
+`qbit_prism_block_submit_seconds` (#391) and still has no firing rule: it is
+observed at most once per found block, too sparse for a rate or percentile
+alarm.
 
 Numeric bounds without native measurement are explicitly **provisional, measure
 in #291** in each rule's `basis` and provisioned description. This includes RSS
@@ -302,13 +307,13 @@ All **46** distinct tokens in the historical appendix are mapped below, includin
 
 | Historical 2.x.x name | Native replacement / disposition | Reason |
 | --- | --- | --- |
-| `qbit_prism_accepted_block_landing_phase_seconds` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_landing_phase_seconds_count` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_landing_phase_seconds_max` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_landing_phase_seconds_sum` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_preview_publication_seconds` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_preview_publication_seconds_bucket` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
-| `qbit_prism_accepted_block_preview_publication_seconds_count` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266. |
+| `qbit_prism_accepted_block_landing_phase_seconds` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_landing_phase_seconds_count` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_landing_phase_seconds_max` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_landing_phase_seconds_sum` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_preview_publication_seconds` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_preview_publication_seconds_bucket` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
+| `qbit_prism_accepted_block_preview_publication_seconds_count` | no replacement | No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule. |
 | `qbit_prism_accepted_parent_preview_wait_timeouts_total` | no replacement | No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract. |
 | `qbit_prism_accepted_parent_unresolved_depth_max` | no replacement | No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract. |
 | `qbit_prism_accepted_parent_unresolved_oldest_seconds` | no replacement | No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract. |
