@@ -30,9 +30,16 @@ impl Ledger {
         current: &Config,
         health_refresh_interval: Duration,
     ) -> Result<Value> {
-        // One deadline covers the node calls, every lock wait and the
-        // transaction. Cancellation before COMMIT rolls back; once COMMIT has
-        // been sent, a lost response is resolved from the journal, and a retry
+        // 120 seconds is the ceiling for the whole command: the node calls,
+        // the transaction and its commit. It does not bound a lock wait. The
+        // operator connection's `lock_timeout`
+        // (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, five seconds by default) ends a
+        // wait for the advisory locks, the instance table or the cluster
+        // row, and its statement timeout
+        // (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, fifteen seconds by default)
+        // ends any one statement; both abort before COMMIT and roll back.
+        // Cancellation before COMMIT rolls back too; once COMMIT has been
+        // sent, a lost response is resolved from the journal, and a retry
         // then refuses with that row instead of writing another.
         tokio::time::timeout(
             Duration::from_secs(120),
@@ -40,6 +47,13 @@ impl Ledger {
         )
         .await
         .context("signing transition exceeded 120 seconds; inspect qbit_prism_signing_transitions before retrying")?
+        .map_err(|error| {
+            if lock_timed_out(&error) {
+                error.context("a lock wait exceeded PRISM_DATABASE_LOCK_TIMEOUT_MS and nothing was changed: something still holds the cluster row, the instance table or the settlement and order locks. Confirm every frontend and tool is stopped, then rerun; do not raise the timeout blindly")
+            } else {
+                error
+            }
+        })
     }
 
     async fn transition_signing_in(
@@ -174,6 +188,17 @@ impl Ledger {
             "next_steps": NEXT_STEPS,
         }))
     }
+}
+
+/// PostgreSQL's `lock_not_available`: "canceling statement due to lock
+/// timeout", anywhere in the chain.
+fn lock_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::Database(database)) if database.code().as_deref() == Some("55P03")
+        )
+    })
 }
 
 /// `Some(description)` when the instance may still be running. Only an

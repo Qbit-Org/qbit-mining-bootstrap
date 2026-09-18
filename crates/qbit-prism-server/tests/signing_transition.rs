@@ -823,6 +823,56 @@ async fn the_command_waits_for_the_cluster_row_and_decides_after_it() -> Result<
     fixture.close().await
 }
 
+/// The 120-second ceiling does not bound a lock wait: the operator
+/// connection's `lock_timeout` does, five seconds by default. A wait that
+/// runs out changes nothing and tells the operator what still holds the lock.
+#[tokio::test]
+async fn a_lock_wait_ends_at_the_lock_timeout_and_changes_nothing() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    fixture.stop_both().await?;
+    let before = fixture.state().await?;
+    // What a frontend still running does: hold the cluster row.
+    let mut holder = fixture.a.pool.begin().await?;
+    sqlx::query("SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .execute(&mut *holder)
+        .await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        fixture
+            .cli(OLD_SEEDS)
+            .arg("--confirm")
+            .env("PRISM_DATABASE_LOCK_TIMEOUT_MS", "200")
+            .output(),
+    )
+    .await??;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("lock timeout")
+            && stderr.contains("PRISM_DATABASE_LOCK_TIMEOUT_MS")
+            && stderr.contains("Confirm every frontend and tool is stopped"),
+        "{stderr}"
+    );
+    holder.rollback().await?;
+    assert_eq!(fixture.state().await?, before);
+    // Nothing was left behind: the same command now succeeds.
+    let output = fixture
+        .cli(OLD_SEEDS)
+        .arg("--confirm")
+        .env("PRISM_DATABASE_LOCK_TIMEOUT_MS", "200")
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.fingerprint().await?, None);
+    fixture.close().await
+}
+
 /// T5: between the command's checks and its reset there is no gap. With the
 /// command held at its journal write, after every check has passed, neither
 /// a heartbeat nor a configure can land; both wait for its commit.

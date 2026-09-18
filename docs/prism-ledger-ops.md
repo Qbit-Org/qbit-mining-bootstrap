@@ -1977,16 +1977,31 @@ changes nothing and exits non-zero.
    future-dated heartbeat (an unknown age) refuses by instance name. If the
    fingerprint is already unset, the command reports the last journal row and
    writes nothing, so a lost commit response is resolved by running it again.
+   That rerun assumes nothing pinned a fingerprint in between, which is why
+   restarts stay disabled from step 2 until step 5: if an old-key process did
+   start after a reset that had in fact committed, the rerun finds the old
+   fingerprint pinned again, refuses while that process is live, and otherwise
+   resets a second time and writes a second journal row. After an ambiguous
+   outcome, inspect `qbit_prism_signing_transitions` and
+   `qbit_prism_cluster.config_fingerprint` before rerunning.
 
 4. Save the returned JSON: the journal row (`transition_id`, the old
    fingerprint, the old policy document with both old public keys, every
    instance row with its measured heartbeat age and the window applied, the
    unchanged payout revision, the database login) and the next steps. The
    payout revision does not change: a rotation is not a payout-policy change.
-   Existing audit and CTV manifest bytes are unchanged. One overall deadline
-   of 120 seconds covers the node calls, the lock waits and the transaction;
-   a failure or timeout before commit leaves the fingerprint pinned and the
-   journal without a row.
+   Existing audit and CTV manifest bytes are unchanged. 120 seconds is the
+   ceiling for the whole command (the node calls, the transaction and its
+   commit); it does not bound a lock wait. Each wait for the settlement and
+   order locks, the instance table or the cluster row ends after
+   `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 seconds by default), and any one
+   statement after `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` (15 seconds by
+   default). A failure or timeout before commit leaves the fingerprint pinned
+   and the journal without a row. On `canceling statement due to lock
+   timeout`, something still holds the cluster row, the instance table or
+   those locks, which is what a running frontend or tool does: confirm every
+   frontend and tool is stopped and run the command again. Do not raise the
+   timeout blindly.
 
 5. Start the new-key frontends. The cluster fingerprint is unknown until the
    first of them configures: **the first `configure` after the reset pins the
