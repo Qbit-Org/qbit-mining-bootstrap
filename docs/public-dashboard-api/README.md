@@ -111,6 +111,17 @@ that has long since hung up, and returns `503` with error code `read_timeout`
 and `Cache-Control: no-store`. The refusal is never cached, so the next
 request — or a stale-while-revalidate refresh — retries the origin.
 
+`/public/v1/artifacts/{sha256}` also bounds how many block-audit artifacts it
+will rebuild or decode at once, because each holds a whole payout window in
+memory. Past that bound a request is refused immediately, before any audit
+read, with `503`, the error code `audit_artifact_busy`, `Retry-After: 5` and
+`Cache-Control: no-store`; retrying after the stated delay is the intended
+client behaviour, and the refusal, like every other error here, is never
+cached. CTV fanout manifests, which this route also serves, are never refused
+this way. Requests for one artifact that arrive together share a single
+computation, so a client that sees this code is competing with requests for
+*other* artifacts, not with itself.
+
 ## Staleness
 
 Every `/public/v1` response states how old an answer that route is willing to
