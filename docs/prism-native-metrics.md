@@ -8,7 +8,7 @@ Scraping performs no database, node, or filesystem I/O. Public-api metrics retai
 their existing contract.
 
 The generated table below is the sole inventory for both roles: **46 coordinator
-families and 14 public families**. Names, types and meanings for `run` come from
+families and 15 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
 [Compatibility annotations](prism-metric-metadata.json) add replacement names
@@ -19,8 +19,9 @@ families in both directions, and check the generator for drift.
 
 Every coordinator family has HELP and TYPE
 metadata, including families declared without samples. The public role retains
-its existing untyped exposition; the inventory records the counter/gauge intent
-from its producer. Public response/cache label sets are lazy and appear after a
+its existing untyped exposition, except
+`qbit_prism_public_audit_artifact_refusals_total`, which carries both; the
+inventory records the counter/gauge intent from its producer. Public response/cache label sets are lazy and appear after a
 request; replica gauges appear only with `PRISM_PUBLIC_REPLICA_MODE=require`.
 Default histogram boundaries in seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
 1, 2.5, 5, 10, 30, and +Inf. `qbit_prism_share_ack_seconds` adds 15 and 20.
@@ -78,6 +79,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_metrics_snapshot_stale` | gauge | none | run | Whether the metrics snapshot is missing or exceeds the health freshness budget. | `qbit_prism_metrics_snapshot_stale` |
 | `qbit_prism_pending_job_builds` | gauge | none | run | Current local pending job deliveries. Delivery count replaces the operational intent of queue depth, not its implementation. | `qbit_prism_job_delivery_queue_depth` |
 | `qbit_prism_process_resident_memory_bytes` | gauge | none | run | Process resident memory bytes from procfs, or -1 when unknown. | `qbit_prism_process_resident_memory_bytes` |
+| `qbit_prism_public_audit_artifact_refusals_total` | counter | none | public-api | Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight. Public-api role only: the mining process serves the same route on its operator listener and applies the same cap there, but has no public-service metrics owner, so those refusals are uncounted. | `qbit_prism_public_audit_artifact_refusals_total` |
 | `qbit_prism_public_cache_total` | counter | `state=HIT,MISS,STALE,BYPASS` | public-api | Public route cache outcomes; appears after a public route request. | `qbit_prism_public_cache_total` |
 | `qbit_prism_public_database_outage_refusals_total` | counter | none | public-api | Uncached database reads refused during database unavailability. | `qbit_prism_public_database_outage_refusals_total` |
 | `qbit_prism_public_degraded_responses_total` | counter | none | public-api | Cached HIT responses served during database unavailability. | `qbit_prism_public_degraded_responses_total` |

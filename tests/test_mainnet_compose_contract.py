@@ -259,6 +259,8 @@ class MainnetComposeContractTests(unittest.TestCase):
                 env = self._environment(service)
                 self.assertEqual(env["PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS"], "9")
                 self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "3")
+                self.assertEqual(env["PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY"], "2")
+                self.assertEqual(env["PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT"], "11")
                 self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_BITS"], "24576")
                 self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_SATS"], "24576")
 
