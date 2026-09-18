@@ -6,14 +6,17 @@ use qbit_prism_server::{
     config::Config,
     coordinator::Coordinator,
     ledger::{Candidate, CandidateClaim},
-    metrics::Metrics,
+    metrics::{Metrics, NodeObservation},
     readiness,
     rpc::Rpc,
     stratum::MiningBackend,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -252,6 +255,28 @@ async fn refused_node_rpcs_read_unknown_instead_of_the_last_observation() -> Res
 }
 
 #[tokio::test]
+async fn a_peer_count_below_the_floor_is_still_an_answered_count() -> Result<()> {
+    let node = Node::open().await?;
+    let metrics = Metrics::default();
+    // Readiness refuses the node, but the count it refused it for was answered.
+    // Recording -1 here would hide the very shortfall that closed admission,
+    // and a node answering zero peers is a real zero, not an unknown.
+    for peers in [json!(0), json!(1)] {
+        node.state.lock().await.network["connections"] = peers.clone();
+        ensure!(
+            readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+                .await
+                .is_err()
+        );
+        let body = metrics.render();
+        ensure!(gauge(&body, "node_peers") == peers.as_u64().unwrap() as f64);
+        ensure!(gauge(&body, "node_initial_block_download") == 0.);
+        ensure!((0. ..1.).contains(&gauge(&body, "node_observation_age_seconds")));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn short_circuited_readiness_leaves_peers_unknown_without_asking_the_node() -> Result<()> {
     let node = Node::open().await?;
     let metrics = Metrics::default();
@@ -288,6 +313,32 @@ async fn short_circuited_readiness_leaves_peers_unknown_without_asking_the_node(
     ensure!(gauge(&metrics.render(), "node_peers") == -1.);
     // Observation asked the node nothing beyond the one successful peer call.
     ensure!(node.state.lock().await.network_calls == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_observation_age_keeps_the_latest_answer_a_superseded_attempt_brought() -> Result<()> {
+    let metrics = Metrics::default();
+    let older = Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let newer = Instant::now();
+    // The newer-started attempt answered first, so it owns the published pair.
+    metrics.record_node_observation(NodeObservation {
+        started: newer,
+        peers: Some(4),
+        chain: Some((false, Instant::now())),
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // The older-started attempt answered later. Its values stay superseded, but
+    // the node demonstrably answered then, so the age must not report it stale.
+    metrics.record_node_observation(NodeObservation {
+        started: older,
+        peers: Some(9),
+        chain: Some((false, Instant::now())),
+    });
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == 4.);
+    ensure!(gauge(&body, "node_observation_age_seconds") < 0.05);
     Ok(())
 }
 

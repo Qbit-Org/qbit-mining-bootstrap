@@ -131,6 +131,11 @@ impl Metrics {
     /// short-circuited observation never leaves a stale reading in place.
     pub fn record_node_observation(&self, observation: NodeObservation) {
         let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        // The age asks when the node last answered, not which attempt owns the
+        // published pair, so a superseded attempt still contributes its answer.
+        if let Some((_, answered)) = observation.chain {
+            node.answered = node.answered.max(Some(answered));
+        }
         // A slower older attempt landing late must not roll back a newer one.
         if node
             .observed
@@ -139,9 +144,6 @@ impl Metrics {
             return;
         }
         node.observed = Some(observation.started);
-        if let Some((_, answered)) = observation.chain {
-            node.answered = Some(answered);
-        }
         // Publish under the same guard that authorised it, so two attempts
         // cannot pass the ordering check and then write out of order.
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());

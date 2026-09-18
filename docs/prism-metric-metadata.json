@@ -107,7 +107,7 @@
       "status": "Recorded whenever the latest getblockchaininfo answered with the boolean, including the 1 that then makes readiness fail. -1 means startup, a failed call, or a field that was not a boolean."
     },
     "node_observation_age_seconds": {
-      "status": "Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. A slower older attempt landing late cannot roll back a newer observation."
+      "status": "Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. Peers and the sync flag come from the latest attempt to start, so a slower older attempt landing late cannot roll them back, while the age keeps the latest answer any attempt received."
     },
     "hashrate_rollup_watermark_lag_seconds": {
       "status": "The stored watermark is a share sequence, not a time; a caught-up pass is one that advanced the watermark within its batch bound, leaving no unfolded share. A pass that lost the race to another frontend leaves the stamp unchanged, so a frontend that keeps losing reads high: alert on the minimum across instances. -1 runs from loop start until its first such pass, and PRISM_HASHRATE_ROLLUP_ENABLED=0 leaves the family declared with no sample at all."
