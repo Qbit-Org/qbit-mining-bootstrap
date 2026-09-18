@@ -746,37 +746,37 @@
     {
       "name": "qbit_prism_accepted_block_landing_phase_seconds",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_landing_phase_seconds_count",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_landing_phase_seconds_max",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_landing_phase_seconds_sum",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_bucket",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_count",
       "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is observed at most once per found block as `qbit_prism_block_submit_seconds` (#391) and carries no firing rule."
     },
     {
       "name": "qbit_prism_accepted_parent_preview_wait_timeouts_total",

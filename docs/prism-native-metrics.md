@@ -303,8 +303,13 @@ Covered non-transaction ledger queries are timed through `Ledger::acquire`;
 rollup and share-partition maintenance use the same acquisition timer. The
 [acquisition guide](prism-pool-acquire-metrics.md) records the source census,
 explicit exclusions and CI guard added for #352. The histogram counts observed
-checkout attempts at covered callers, not all process acquisitions. The native alert specification
-attaches no firing rule to first-offer or advisory-lock timing.
+checkout attempts at covered callers, not all process acquisitions. The native alert
+specification attaches no firing rule to first-offer timing: `block_submit_seconds`
+is observed at most once per found block (#391), too sparse for a rate or
+percentile alarm. Order and settlement advisory-lock waits are covered by
+`PrismDatabaseAdvisoryLockWaitHigh` and `PrismDatabaseAdvisoryLockFailuresCritical`;
+`lock="migration"` has no rule because that lock is taken only at schema
+initialization, where waiting out an online migration is expected.
 `PrismDatabasePoolWaitHigh` describes both collector and instrumented ledger
 acquisitions, including cancellation observations from #328 and #345. The collector
 acquires from the same pool as the ledger, so pool exhaustion can fail collection
