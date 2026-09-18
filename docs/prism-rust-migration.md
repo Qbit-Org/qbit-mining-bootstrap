@@ -552,6 +552,10 @@ connected writer or discover an unregistered old tool. See the
 The capability refuses older binaries at subsequent connects; deleting it or
 resetting the epoch is not a supported downgrade. A preexisting undeclared
 epoch column or capability causes migration refusal and transaction rollback.
+Migration 019 adds the immutable signing-key rotation journal
+(`qbit_prism_signing_transitions`). It is additive and declares no capability:
+a binary that does not know the table never reads or writes it. See
+[signing-key rotation](prism-ledger-ops.md#signing-key-rotation).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a

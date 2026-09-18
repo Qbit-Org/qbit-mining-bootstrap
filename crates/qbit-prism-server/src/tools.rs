@@ -52,6 +52,12 @@ enum Command {
         #[arg(long)]
         to: PathBuf,
     },
+    /// Reset the cluster fingerprint for a signing-key rotation after stopping every frontend.
+    SigningTransition {
+        /// Perform the reset. Without it, print the checks and effects, change nothing and fail.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Inspect a cluster halt or reconcile and record an operator recovery.
     FatalState {
         #[command(subcommand)]
@@ -316,6 +322,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
         }
+        Command::SigningTransition { confirm } => signing_transition(confirm).await,
         Command::FatalState { command } => fatal_state(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
@@ -422,6 +429,40 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
 
 fn audit_root(root: Option<PathBuf>) -> Option<PathBuf> {
     root.or_else(|| config::optional("PRISM_AUDIT_DIR").map(PathBuf::from))
+}
+
+/// What `signing-transition` prints, and all it does, without `--confirm`.
+const SIGNING_TRANSITION_PLAN: &str = "\
+signing-transition resets the pinned cluster fingerprint so that frontends with
+new signing keys can pin theirs. Run it with the OLD key environment.
+
+In one transaction, under the cluster row lock every configure takes, it checks:
+  1. the cluster is not halted;
+  2. the pinned fingerprint is set and is this environment's;
+  3. every registered frontend is stopped, or its heartbeat is older than
+     max(3 x PRISM_HEALTH_REFRESH_SECONDS, 15 seconds) by the database clock;
+  4. no block candidate is pending, offer_reserved, offered or in reconciliation.
+and then, in the same transaction:
+  - records the old fingerprint, the old policy document with both old public
+    keys, the instance rows and the payout revision in the immutable
+    qbit_prism_signing_transitions journal;
+  - sets qbit_prism_cluster.config_fingerprint to NULL.
+The first frontend configured afterwards pins the new fingerprint.";
+
+async fn signing_transition(confirm: bool) -> Result<()> {
+    if !confirm {
+        println!("{SIGNING_TRANSITION_PLAN}");
+        bail!("nothing was checked or changed; rerun signing-transition with --confirm to perform the reset");
+    }
+    let config = Config::from_env()?;
+    // The frontends' heartbeat cadence, through the reader they and
+    // self-check use: run this with their environment.
+    let refresh = crate::api::health_refresh_interval_from_env()?;
+    let ledger = crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+    let result = ledger.transition_signing(&config, refresh).await;
+    ledger.pool.close().await;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
 }
 
 async fn fatal_state(command: FatalStateCommand) -> Result<()> {
