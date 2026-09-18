@@ -491,6 +491,33 @@ async fn artifact_route_load(f: &Fixture, shares: u64, seconds: u64) -> Result<(
         hashes.push(sha256);
     }
 
+    // One SHA-256 pass over the artifact, in this build: the unit of any
+    // per-response hashing the route does outside the admission permit.
+    let clock = Instant::now();
+    let digest = hex::encode(Sha256::digest(&landed.canonical));
+    let hash_seconds = clock.elapsed().as_secs_f64();
+    ensure!(digest == landed.sha256);
+
+    // A probe that only sleeps: the delay it accumulates beyond its sleep is
+    // runtime scheduling delay, which is how CPU-bound work on the worker
+    // threads shows up to every other task, the fake node's RPC included.
+    let probe: Arc<Mutex<Vec<Duration>>> = Arc::default();
+    let probe_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prober = {
+        let probe = probe.clone();
+        let stop = probe_stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let tick = Instant::now();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                probe
+                    .lock()
+                    .expect("probe samples")
+                    .push(tick.elapsed().saturating_sub(Duration::from_millis(50)));
+            }
+        })
+    };
+
     // The load runs as its own task, so pool-summary is sampled while the
     // artifact route is under it rather than after it drains.
     let statuses: Arc<Mutex<BTreeMap<u16, u64>>> = Arc::default();
@@ -543,6 +570,10 @@ async fn artifact_route_load(f: &Fixture, shares: u64, seconds: u64) -> Result<(
     }
     driver.await?;
     let elapsed = started.elapsed();
+    probe_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    prober.await?;
+    let mut delays = std::mem::take(&mut *probe.lock().expect("probe samples"));
+    delays.sort();
 
     samples.sort();
     let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
@@ -578,8 +609,19 @@ async fn artifact_route_load(f: &Fixture, shares: u64, seconds: u64) -> Result<(
     );
     eprintln!(
         "[load n={shares}] canonical artifact {canonical_len} B ({:.1} B/share); one uncontended \
-         rebuild {rebuild_seconds:.3} s, one sealed decode {decode_seconds:.3} s",
+         rebuild {rebuild_seconds:.3} s, one sealed decode {decode_seconds:.3} s, one SHA-256 pass \
+         over the artifact {hash_seconds:.3} s",
         canonical_len as f64 / shares as f64,
+    );
+    let delay = |q: f64| delays[((delays.len() - 1) as f64 * q) as usize];
+    eprintln!(
+        "[load n={shares}] runtime scheduling delay over {} probe ticks: p50 {:.3} s, p99 {:.3} s, \
+         max {:.3} s (a sleeping task's overshoot; CPU-bound work on the worker threads is what \
+         makes it grow)",
+        delays.len(),
+        delay(0.5).as_secs_f64(),
+        delay(0.99).as_secs_f64(),
+        delays.last().expect("one probe tick").as_secs_f64(),
     );
     eprintln!(
         "[load n={shares}] test-process resident memory: {} before the rebuild, {} peak across it; \
