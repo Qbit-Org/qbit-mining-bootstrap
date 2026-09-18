@@ -1435,6 +1435,51 @@ async fn per_source_cap_refuses_at_accept_without_backend_work_and_frees_the_slo
 }
 
 #[tokio::test]
+async fn per_source_cap_is_one_budget_across_the_default_and_highdiff_listeners() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_connections_per_ip: 2,
+        ..Default::default()
+    };
+    // `highdiff_config` derives its listener by cloning the default config;
+    // derive it the same way so both listeners hold the one registry Arc.
+    let mut highdiff = config.clone();
+    highdiff.listener_name = "highdiff".into();
+    let stats = config.stats.clone();
+    let (address, backend, refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let high_address = listener.local_addr().unwrap();
+    let high_task = tokio::spawn(run_listener(
+        listener,
+        highdiff,
+        backend.clone(),
+        refresh.subscribe(),
+        shutdown.subscribe(),
+        metrics.clone(),
+    ));
+    let mut ordinary = Client::connect(address).await;
+    ordinary.login("miner.ordinary").await;
+    let mut high = Client::connect(high_address).await;
+    high.login("miner.high").await;
+    // Two slots are spent, one on each port: both ports now refuse.
+    assert_socket_refused(high_address).await;
+    assert_socket_refused(address).await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 2.);
+
+    // Closing the highdiff connection frees a slot the default port can use.
+    drop(high);
+    wait_for_connections(&stats, 1).await;
+    let mut replacement = Client::connect(address).await;
+    replacement.login("miner.replacement").await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 2.);
+    drop((ordinary, replacement));
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    high_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn per_source_cap_of_zero_admits_every_connection_from_one_address() {
     let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
     let config = StratumConfig::default();
@@ -1501,7 +1546,7 @@ async fn malformed_frame_budget_counts_frames_not_bytes_and_then_disconnects() {
 }
 
 #[tokio::test]
-async fn unknown_job_repeats_are_cached_and_distinct_ids_spend_the_budget() {
+async fn every_unknown_job_miss_is_requeried_and_charged_until_the_budget_disconnects() {
     let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
     let config = StratumConfig {
         max_unknown_jobs_per_interval: 8,
@@ -1512,20 +1557,11 @@ async fn unknown_job_repeats_are_cached_and_distinct_ids_spend_the_budget() {
         start_with_metrics(config, metrics.clone()).await;
     let mut client = Client::connect(address).await;
     client.login("miner.stale").await;
-    // One unknown ID repeated costs exactly one backend lookup and no budget.
-    for id in 0..50 {
+    // No negative cache: a repeated unknown ID is looked up again every time,
+    // and every lookup that misses is charged.
+    for id in 0..8 {
         let rejected = client
             .request_submit(1000 + id, "miner.stale", "repeated-unknown")
-            .await;
-        assert_eq!(rejected["error"][2]["reason_id"], "unknown-job");
-    }
-    assert_eq!(backend.resume_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
-
-    // Distinct IDs are what reach the backend, so they are what is budgeted.
-    for id in 0..7 {
-        let rejected = client
-            .request_submit(2000 + id, "miner.stale", &format!("distinct-{id}"))
             .await;
         assert_eq!(rejected["error"][2]["reason_id"], "unknown-job");
     }
@@ -1533,16 +1569,49 @@ async fn unknown_job_repeats_are_cached_and_distinct_ids_spend_the_budget() {
     assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
 
     for id in 0..200 {
-        let request = client.unknown_job_submit(3000 + id, "miner.stale", &format!("flood-{id}"));
+        let request = client.unknown_job_submit(3000 + id, "miner.stale", "repeated-unknown");
         client.send(request).await;
     }
     client.expect_closed().await;
     let lookups = backend.resume_calls.load(Ordering::SeqCst);
-    assert!(
-        lookups <= 9,
-        "{lookups} backend lookups for 200 unknown submits beyond a budget of 8"
+    assert_eq!(
+        lookups, 9,
+        "200 unknown submits beyond a budget of 8 must cost exactly one more lookup"
     );
     assert_eq!(budget_refusals(&metrics), [0., 1., 0.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_transient_resume_miss_recovers_on_the_next_submit_of_the_same_job() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(StratumConfig::default(), metrics.clone()).await;
+    // The job is issued to one connection and submitted on another, so the
+    // second session must resume it from the backend.
+    let mut issuer = Client::connect(address).await;
+    issuer.login("miner.race").await;
+    let job_id = issuer.notify["params"][0].as_str().unwrap().to_string();
+    let mut resumer = Client::connect(address).await;
+    resumer.login("miner.race").await;
+    assert_ne!(resumer.notify["params"][0], issuer.notify["params"][0]);
+
+    // A frontend momentarily behind on the payout revision misses the resume.
+    backend.payout_revision.fetch_add(1, Ordering::SeqCst);
+    let missed = resumer.request_submit(1, "miner.race", &job_id).await;
+    assert_eq!(missed["error"][2]["reason_id"], "unknown-job");
+    backend.payout_revision.fetch_sub(1, Ordering::SeqCst);
+    // The very next submit re-queries and finds the job: nothing remembered
+    // the transient miss.
+    let recovered = resumer.request_submit(2, "miner.race", &job_id).await;
+    assert_ne!(
+        recovered["error"][2]["reason_id"], "unknown-job",
+        "a transient miss must not stick: {recovered}"
+    );
+    assert_eq!(backend.resume_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+    drop((issuer, resumer));
     shutdown.send(true).unwrap();
     task.await.unwrap();
 }

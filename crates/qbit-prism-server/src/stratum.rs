@@ -253,13 +253,6 @@ impl ConnectionLimit {
 /// far above any honest per-interval rate.
 const MAX_SESSION_BUDGET: u32 = 1_000_000;
 
-/// Recently missed job IDs a session keeps so a repeat of the same unknown ID
-/// costs no second ledger query. A miss cannot become a hit inside the TTL:
-/// work is persisted before it is delivered, so an ID this session has never
-/// been issued is not about to appear.
-const UNKNOWN_JOB_CACHE_ENTRIES: usize = 64;
-const UNKNOWN_JOB_CACHE_TTL: Duration = Duration::from_secs(10);
-
 /// The per-source admission limit was already spent for this address.
 struct IpLimitExceeded;
 
@@ -746,10 +739,11 @@ impl StratumConfig {
 impl StratumConfig {
     /// Per-source admission for one accepted socket, decided from the address
     /// this listener observed. `Ok(None)` means the limit is disabled. The
-    /// registry holds weak references and drops dead keys on every decision,
-    /// so it is bounded by live connections rather than by observed addresses.
-    /// Both listeners share one registry, so an address spends one budget
-    /// across the ordinary and high-difficulty ports.
+    /// registry holds weak references; dead keys are dropped only when a new
+    /// key is inserted, so an accept from a known address stays O(1) while the
+    /// map stays bounded by the live connections at the last insertion, not by
+    /// every address observed. Both listeners share one registry, so an
+    /// address spends one budget across the ordinary and high-difficulty ports.
     fn try_acquire_ip(
         &self,
         ip: IpAddr,
@@ -762,10 +756,10 @@ impl StratumConfig {
                 .ip_connections
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            registry.retain(|_, entry| entry.strong_count() > 0);
             match registry.get(&ip).and_then(Weak::upgrade) {
                 Some(semaphore) => semaphore,
                 None => {
+                    registry.retain(|_, entry| entry.strong_count() > 0);
                     let semaphore = Arc::new(Semaphore::new(self.max_connections_per_ip));
                     registry.insert(ip, Arc::downgrade(&semaphore));
                     semaphore
@@ -810,7 +804,6 @@ struct Session<C> {
     malformed_frames: SessionBudget,
     unknown_jobs: SessionBudget,
     authorize_attempts: SessionBudget,
-    unknown_job_misses: VecDeque<(String, Instant)>,
     budget_exceeded: Option<crate::metrics::ConnectionRefusalReason>,
 }
 
@@ -850,7 +843,6 @@ impl<C> Session<C> {
                 config.max_authorize_attempts_per_interval,
                 interval,
             ),
-            unknown_job_misses: VecDeque::new(),
             budget_exceeded: None,
         }
     }
@@ -883,28 +875,6 @@ impl<C> Session<C> {
             "Stratum session exceeded a per-session budget"
         );
         false
-    }
-
-    /// Whether this session already missed this job ID recently. Repeats cost
-    /// no further ledger query and are not charged against the budget, which
-    /// counts distinct unknown IDs.
-    fn missed_job_recently(&mut self, job_id: &str) -> bool {
-        while self
-            .unknown_job_misses
-            .front()
-            .is_some_and(|(_, at)| at.elapsed() >= UNKNOWN_JOB_CACHE_TTL)
-        {
-            self.unknown_job_misses.pop_front();
-        }
-        self.unknown_job_misses.iter().any(|(id, _)| id == job_id)
-    }
-
-    fn remember_missed_job(&mut self, job_id: &str) {
-        if self.unknown_job_misses.len() >= UNKNOWN_JOB_CACHE_ENTRIES {
-            self.unknown_job_misses.pop_front();
-        }
-        self.unknown_job_misses
-            .push_back((job_id.into(), Instant::now()));
     }
 
     fn apply_requests(&mut self, config: &StratumConfig) {
@@ -1514,11 +1484,6 @@ async fn request<B: MiningBackend>(
                 if !session.jobs.iter().any(|j| j.job.wire.job_id == fields[1])
                     && session.retained.get(fields[1]).is_none()
                 {
-                    // An ID this session already missed cannot have become
-                    // resumable inside the cache TTL, so it costs no query.
-                    if session.missed_job_recently(fields[1]) {
-                        return Err(StratumError::new(21, "stale job", "unknown-job").into());
-                    }
                     if let Some(job) = timeout(
                         Duration::from_secs_f64(config.initial_job_timeout_seconds),
                         backend.resume_job(&worker, fields[1]),
@@ -1541,10 +1506,10 @@ async fn request<B: MiningBackend>(
                             retired_at: Some(tokio::time::Instant::now().into_std()),
                         });
                     } else {
-                        // Honest staleness after a tip or payout change lands
-                        // here too, so this budget is a rate over distinct IDs
-                        // and the cache already absorbed the repeats.
-                        session.remember_missed_job(fields[1]);
+                        // Every miss cost one ledger lookup, so every miss is
+                        // charged. A miss is not proof the ID is bogus: honest
+                        // staleness and transient resume races land here too,
+                        // and the next submit must still re-query.
                         if !session.charge(
                             crate::metrics::ConnectionRefusalReason::UnknownJobBudget,
                             metrics,
