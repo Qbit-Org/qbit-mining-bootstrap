@@ -103,12 +103,30 @@ range, and a sealed one has its stored canonical bytes digested and parsed.
 Since #267's admission half, both run under
 `PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` (default 1), which is independent of
 `PRISM_POSTGRES_READ_CONCURRENCY`: raising the read concurrency admits more
-ordinary reads and **no** more window-sized rebuilds, and the transient memory
-of this route is
+ordinary reads and **no** more window-sized reads *of this route*, and its
+transient memory is
 
 ```text
 artifact_read_bytes = PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY x peak_bytes_per_read
 ```
+
+That bound is the artifact route's alone. `/public/v1/blocks/<hash>/settlement-artifacts`
+falls back to the audit-bundle reader when the block has no CTV fanout set, and
+that reader still rebuilds or decodes the same window under the shared
+imported-audit decode limit, which is sized from `PRISM_POSTGRES_READ_CONCURRENCY`.
+Its bound is therefore `PRISM_POSTGRES_READ_CONCURRENCY x peak_bytes_per_read`,
+and raising the read concurrency does raise it; size a public process for both.
+Moving that route under the artifact limit is a behaviour change on another
+route and is not part of #267's admission half.
+
+What the bound covers is the work admitted under the permit: the range read and
+fold, the canonical serialization, and the stored bytes' digest and parse. It
+does not cover what is still alive after the permit is released — the route's
+own re-hash of the returned bytes, the ETag digest of the response, and the
+response body itself until the client has drained it — so a read's resident
+footprint outlasts its permit by roughly one more copy of the artifact. Those
+two SHA-256 passes are the route's pre-existing behaviour and #267's admission
+half does not change them.
 
 `peak_bytes_per_read` is a multiple of the canonical artifact length, which is
 `audit_body_byte_len` in the table above. Measured at a 5,000-share window by
