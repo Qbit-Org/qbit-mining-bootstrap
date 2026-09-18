@@ -93,8 +93,45 @@ compressed length of the non-share body.
 Serving a native audit rebuilds the window on every request: the range read,
 the counted-window fold, and the canonical hash. The same harness measured that
 read at 1.0 s for 20,000 and 5.4 s for 100,000 shares (release build, one
-request, no contention); budget CPU and the public read deadline for it, and
-for the concurrency limit those decodes share with imported audits.
+request, no contention); budget CPU and the public read deadline for it.
+
+### Memory bound on artifact reads
+
+`/public/v1/artifacts/<sha256>` holds a whole window in memory per read,
+whichever shape the row has: an unsealed native block is rebuilt from its share
+range, and a sealed one has its stored canonical bytes digested and parsed.
+Since #267's admission half, both run under
+`PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` (default 1), which is independent of
+`PRISM_POSTGRES_READ_CONCURRENCY`: raising the read concurrency admits more
+ordinary reads and **no** more window-sized rebuilds, and the transient memory
+of this route is
+
+```text
+artifact_read_bytes = PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY x peak_bytes_per_read
+```
+
+`peak_bytes_per_read` is a multiple of the canonical artifact length, which is
+`audit_body_byte_len` in the table above. Measured at a 5,000-share window by
+`cargo test -p qbit-prism-server --test artifact_admission -- --nocapture
+artifact_route_load_keeps_pool_summary_within_its_read_deadline` (debug build,
+process peak resident memory across one uncontended read, `VmHWM` reset before
+each): the canonical artifact was 5,570,372 B (**1,114 B per share**, measured),
+one rebuild peaked about **34 MiB** above the resident baseline (about 6x the
+artifact) and one sealed decode about **11 MiB** (about 2x). Those multiples are
+what the bound below extrapolates; they are measured only at that window and in
+a debug build, and the test process also holds the response body.
+
+Derived, not measured, at the sizes this pool plans for: at 1,114 B per share a
+400,000-share window is a **445 MB** canonical artifact, so one rebuild is on
+the order of **2.5 GB** of transient memory and one sealed decode on the order
+of **1 GB**, times the rebuild concurrency. No measurement at 400,000 shares
+exists; run the `#[ignore]` variant
+(`artifact_route_load_at_a_large_window`, `PRISM_ARTIFACT_ADMISSION_SHARES`) on
+a machine with that headroom before raising the setting. The default of 1 keeps
+one window in flight per public process; the in-flight cap
+(`PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT`, default 32) bounds only how many
+requests may queue for it, not memory, because a queued request holds neither a
+read connection nor a window.
 
 Legacy external body refs and v2 segment files remain readable by the offline
 Rust tools. During [migration](prism-rust-migration.md), import these into the
