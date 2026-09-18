@@ -902,9 +902,10 @@ read, with HTTP 503, the error code `audit_artifact_busy` and `Retry-After: 5`
 (`Cache-Control: no-store`) and is counted in
 `qbit_prism_public_audit_artifact_refusals_total` on the public service's
 `/metrics`. CTV fanout manifests, which the same route serves from stored JSON,
-are neither counted nor refused. Identical concurrent requests for one artifact
-collapse into a single computation and occupy one place under the cap, so the
-cap bounds distinct artifacts, not clients. A sustained stream of refusals means
+are neither counted nor refused. With the response cache enabled (the default),
+identical concurrent requests for one artifact collapse into a single
+computation and occupy one place under the cap, so the cap bounds distinct
+artifacts, not clients. A sustained stream of refusals means
 either an unusually wide fan-out of distinct blocks or a rebuild concurrency
 too low for the traffic; raise the cap only after checking that the memory bound
 in [prism-storage-sizing.md](prism-storage-sizing.md#memory-bound-on-artifact-reads)

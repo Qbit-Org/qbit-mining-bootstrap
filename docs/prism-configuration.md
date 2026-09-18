@@ -105,8 +105,8 @@ no more rebuilds. A request waits for a rebuild slot within its own
 
 `PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT` caps the audit artifact requests
 running or waiting for a slot, a whole number from 1 through 4096 (default 32).
-Identical concurrent requests share one computation and one place under the
-cap. A request past the cap is refused at once with 503
+With the response cache enabled (the default), identical concurrent requests
+share one computation and one place under the cap. A request past the cap is refused at once with 503
 `audit_artifact_busy` and `Retry-After: 5`, after two indexed point lookups and
 before any audit read. CTV manifests served from the same route are never
 counted or refused. Both settings apply to the public service and to the

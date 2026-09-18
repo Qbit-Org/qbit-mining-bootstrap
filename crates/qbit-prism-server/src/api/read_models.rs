@@ -336,8 +336,9 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
     // from their stored JSON and never wait behind a rebuild. Past the cap a
     // request is refused at once, after the two point lookups above and
     // before any audit read, instead of spending its deadline in the queue.
-    // The admission lives in the single-flight leader's computation, so
-    // identical requests share one, and it ends with that computation.
+    // The admission lives in the computation, not in the request, so with the
+    // response cache on, identical requests collapse into one computation and
+    // one place under the cap, and it ends with that computation.
     let _admitted =
         state
             .audit_artifacts
