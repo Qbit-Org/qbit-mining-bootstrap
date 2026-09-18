@@ -30,6 +30,7 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+mod accepted_publication;
 mod bundle_build;
 mod chain_observation;
 mod compact_resume;
@@ -252,6 +253,10 @@ pub struct Coordinator {
     /// disabled. A COMMIT that ran this long may be a cancelled synchronous
     /// replication wait that committed only locally.
     statement_timeout: Option<Duration>,
+    /// #458's per-process publication-observation state: the process start
+    /// that bounds which accepted rows it may sample, and the blocks it has
+    /// already sampled. Observation only; nothing here gates publication.
+    accepted_publication: Arc<accepted_publication::AcceptedPublication>,
     /// A test seam between the offer reservation and the token fence that
     /// precedes the `submitblock` call, so a test can take the row away in
     /// exactly the window the fence guards.
@@ -750,6 +755,7 @@ impl Coordinator {
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
+            accepted_publication: Arc::new(accepted_publication::AcceptedPublication::new()?),
             #[cfg(test)]
             offer_probe: Default::default(),
         }))
@@ -1149,6 +1155,22 @@ impl Coordinator {
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
         self.lock_compact_publication(reserved).await?.publish()?;
+        // Observation only, after the publication succeeded: the revision
+        // miners can now be issued work at, and the wall clock at that
+        // moment. The measurement itself runs in a detached task, so this
+        // refresh does no further work and its timing is unchanged.
+        // A wall clock this process cannot read is not a refresh failure:
+        // the publication already happened and only the sample is lost.
+        match unix_ms_now() {
+            Ok(published_at_ms) => self.spawn_accepted_publication_observation(
+                captured.record.payout_revision,
+                published_at_ms,
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "accepted publication: the wall clock is unreadable; no latency sample"
+            ),
+        }
         Ok(())
     }
 
@@ -2424,14 +2446,20 @@ impl MiningBackend for Coordinator {
                 .cloned()
                 .context("no current template")?;
             drop(initial);
-            let mut issuance_authority = self
+            let admitted = self
                 .begin_issuance_authority(
                     tip_observation::PreparedIdentity::of(&prepared),
                     readiness_epoch,
                     None,
                 )
-                .await?
-                .context("payout snapshot stale")?;
+                .await?;
+            if admitted.is_none() {
+                // Observation only, at the one arm that refuses a build
+                // because the published payout snapshot is no longer the
+                // cluster's. The refusal itself is unchanged.
+                self.metrics.record_stale_revision_refusal();
+            }
+            let mut issuance_authority = admitted.context("payout snapshot stale")?;
             ensure!(
                 self.observed_tip.read().await.publication_stamp() == published_tip,
                 "work publication changed during work admission"

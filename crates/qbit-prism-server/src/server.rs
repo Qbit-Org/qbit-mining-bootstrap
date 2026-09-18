@@ -353,6 +353,10 @@ async fn publish_health(
                 coordinator.blocks.load(Ordering::Relaxed),
             );
             registry.publish_delivery(stats.delivery_metrics());
+            // #458's durable pending-age gauge, recomputed here so the
+            // rendered body carries this tick's value. Its own derivation
+            // owns the metric; a failed read records the unknown value.
+            coordinator.publish_accepted_pending_age().await;
             state.publish_metrics(registry.render())?;
             Ok(health)
         })

@@ -351,6 +351,9 @@ impl Fixture {
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
+            accepted_publication: Arc::new(
+                super::accepted_publication::AcceptedPublication::new().unwrap(),
+            ),
             offer_probe: Default::default(),
         });
         let fixture = Self {

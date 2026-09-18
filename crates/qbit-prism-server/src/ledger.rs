@@ -29,9 +29,9 @@ mod candidates;
 use candidates::prepare_candidate_observed;
 pub use candidates::{
     authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
-    Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimLifecycle, ClaimParts,
-    LandedAudit, OfferOutcome, OfferRecord, RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys,
-    ORPHANED_STATE,
+    AcceptedOffer, AcceptedOffers, Candidate, CandidateClaim, CandidateCtv, CandidateState,
+    ClaimLifecycle, ClaimParts, LandedAudit, OfferOutcome, OfferRecord, RecoveryClaim,
+    RecoveryReader, RecoveryRow, SignerKeys, ORPHANED_STATE,
 };
 mod connect;
 use connect::{require_revision, writable};

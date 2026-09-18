@@ -982,6 +982,92 @@ impl Ledger {
     pub async fn candidate_revision_valid(&self, candidate: &Candidate) -> Result<bool> {
         Ok(candidate.payout_revision == self.payout_revision().await?)
     }
+
+    /// One read-only snapshot for #458's accepted-publication observations:
+    /// the cluster's current payout revision together with every outbox row
+    /// the node accepted at or after `offered_since_ms`.
+    ///
+    /// Both halves come from one statement, so the revision is the one the
+    /// rows were read under: the observer revalidates the revision it
+    /// published against this value before it records anything.
+    ///
+    /// Only `offer_outcome='accepted'` rows carry a durable offer time. An
+    /// adopted row (`adopt_active_candidate`) records the `unknown` outcome
+    /// and no `offered_at_ms`, and a row whose outcome commit was lost keeps
+    /// `offered_at_ms` NULL; neither is measurable and neither is returned.
+    /// The `offered_since_ms` bound is the observing process's own start, so
+    /// a restart cannot resample a block the previous process measured.
+    pub async fn accepted_offers_since(&self, offered_since_ms: i64) -> Result<AcceptedOffers> {
+        let rows = sqlx::query(
+            "SELECT c.payout_revision, o.block_hash, o.offered_at_ms, o.state, \
+             (o.state='submitted' OR EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash AND b.chain_state='confirmed')) AS landed, \
+             (extract(epoch FROM o.completed_at)*1000)::bigint AS completed_at_ms \
+             FROM qbit_prism_cluster c \
+             LEFT JOIN qbit_block_candidate_outbox o \
+             ON o.offer_outcome='accepted' AND o.offered_at_ms>=$1 \
+             WHERE c.singleton",
+        )
+        .bind(offered_since_ms)
+        .fetch_all(&mut *self.acquire().await?)
+        .await?;
+        let payout_revision = rows
+            .first()
+            .context("the cluster row is missing")?
+            .try_get("payout_revision")?;
+        let offers = rows
+            .iter()
+            .filter(|row| {
+                row.try_get::<Option<String>, _>("block_hash")
+                    .is_ok_and(|hash| hash.is_some())
+            })
+            .map(|row| {
+                let state: String = row.try_get("state")?;
+                Ok(AcceptedOffer {
+                    block_hash: row.try_get("block_hash")?,
+                    offered_at_ms: row.try_get("offered_at_ms")?,
+                    landed: row.try_get("landed")?,
+                    // Abandoned and orphaned rows are the failure-terminal
+                    // set: they never land a revision, so they are neither
+                    // measurable nor pending.
+                    settled_without_landing: matches!(state.as_str(), "abandoned" | ORPHANED_STATE),
+                    completed_at_ms: row.try_get("completed_at_ms")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AcceptedOffers {
+            payout_revision,
+            offers,
+        })
+    }
+}
+
+/// One coherent read of [`Ledger::accepted_offers_since`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcceptedOffers {
+    /// The cluster payout revision the rows were read under.
+    pub payout_revision: i64,
+    pub offers: Vec<AcceptedOffer>,
+}
+
+/// An outbox row the node accepted, with the durable facts an observation
+/// needs: when the block was offered, and whether its payout revision has
+/// landed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedOffer {
+    pub block_hash: String,
+    /// The offering frontend's wall clock immediately before its one
+    /// `submitblock` call, UNIX milliseconds.
+    pub offered_at_ms: i64,
+    /// The block's payouts are in the cluster's payout revision: the row is
+    /// terminal `submitted`, or chain reconciliation confirmed its pool block
+    /// first (`reconcile_blocks_in` confirms and bumps the revision in one
+    /// transaction, before the outbox row finishes).
+    pub landed: bool,
+    /// The row settled terminally without a landing (abandoned or orphaned).
+    pub settled_without_landing: bool,
+    /// The database clock when the row reached a terminal state, UNIX
+    /// milliseconds; `None` while it is unfinished.
+    pub completed_at_ms: Option<i64>,
 }
 
 /// The columns of a landed `qbit_pool_audit_bundles` row a recovered claim
