@@ -6,12 +6,16 @@ use qbit_prism_server::{
     api::router,
     metrics::{
         AckResult, CaptureDecision, Collector, ConnectionRefusalReason, DatabaseMetrics,
-        DeliveryMetrics, LockKind, Metrics, Outcome, ProcessMetrics, RefreshAcquisition,
-        RefreshTrigger, RejectReason, StaleJobCause, TaskKind, WindowAcquisition,
+        DeliveryMetrics, LockKind, Metrics, NodeObservation, Outcome, ProcessMetrics,
+        RefreshAcquisition, RefreshTrigger, RejectReason, StaleJobCause, TaskKind,
+        WindowAcquisition,
     },
     stratum::StratumStats,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[tokio::test]
 async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inputs() {
@@ -20,8 +24,18 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     let startup = running_scrape(router(state.clone()), &[]).await;
     contract::validate(&startup, false).unwrap();
     let startup_census = contract::census(&startup).unwrap();
-    assert_eq!(startup_census.families.len(), 60);
-    assert_eq!(startup_census.series.len(), 241);
+    // Declared without a sample, exactly as when the rollup is disabled.
+    assert!(startup.contains("# TYPE qbit_prism_hashrate_rollup_watermark_lag_seconds gauge\n"));
+    assert!(!startup_census
+        .series
+        .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
+    assert_eq!(startup_census.families.len(), 64);
+    assert_eq!(startup_census.series.len(), 244);
+    assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
+    assert_eq!(
+        sample(&startup, "qbit_prism_node_observation_age_seconds"),
+        -1.
+    );
     assert_eq!(sample(&startup, "qbit_prism_runtime_lag_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_block_candidates_pending"), -1.);
     assert_eq!(
@@ -31,6 +45,9 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         ),
         -1.
     );
+    // A running rollup loop publishes its lag as unknown; until it starts, the
+    // family is declared without a sample.
+    metrics.start_hashrate_rollup();
     // Drive ALL from the public enum to expose any newly added variant, but
     // compare its actual HTTP output with the independently pinned contract.
     for iteration in 0..24 {
@@ -79,6 +96,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         metrics.record_late_confirmation();
         metrics.record_candidate_orphaned();
         metrics.set_stratum_connection_limit(iteration as usize);
+        metrics.record_hashrate_rollup_pass(iteration % 2 == 0);
         let mut snapshot = StratumStats::default().snapshot(iteration);
         snapshot.authorized = iteration as usize;
         snapshot.authorized_with_current_work = iteration as usize / 2;
@@ -98,6 +116,13 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         metrics.publish_process(known.then_some(ProcessMetrics {
             resident_bytes: iteration,
         }));
+        // Vary every unknown combination a node attempt can report, including
+        // the fresh zero peer count that must not read as unknown.
+        metrics.record_node_observation(NodeObservation {
+            started: Instant::now(),
+            peers: known.then_some(iteration.saturating_sub(1)),
+            chain: (iteration % 4 != 3).then_some((iteration % 2 == 0, Instant::now())),
+        });
         if iteration % 3 == 2 {
             for collector in Collector::ALL {
                 drop(metrics.begin_collection(*collector));
@@ -114,8 +139,24 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 60);
-        assert_eq!(populated.series.len(), 675);
+        assert_eq!(populated.families.len(), 64);
+        assert_eq!(populated.series.len(), 679);
+        assert_eq!(
+            sample(&body, "qbit_prism_node_peers"),
+            if known {
+                iteration.saturating_sub(1) as f64
+            } else {
+                -1.
+            }
+        );
+        assert_eq!(
+            sample(&body, "qbit_prism_node_initial_block_download"),
+            if iteration % 4 == 3 {
+                -1.
+            } else {
+                f64::from(iteration % 2 == 0)
+            }
+        );
         assert_eq!(
             sample(&body, "qbit_prism_block_candidates_pending"),
             if known { iteration as f64 } else { -1. }

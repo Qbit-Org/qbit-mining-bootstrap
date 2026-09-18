@@ -154,6 +154,60 @@ impl Metrics {
             limit as f64,
         );
     }
+    /// Exactly once per readiness attempt, whatever its outcome, recording only
+    /// values that attempt fetched: observation adds no RPC call. Peers and the
+    /// IBD flag go to -1 when this attempt did not learn them, so a failed or
+    /// short-circuited observation never leaves a stale reading in place.
+    pub fn record_node_observation(&self, observation: NodeObservation) {
+        let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        // A slower older attempt landing late must not roll back a newer one.
+        if node
+            .observed
+            .is_some_and(|observed| observed > observation.started)
+        {
+            return;
+        }
+        node.observed = Some(observation.started);
+        if let Some((_, answered)) = observation.chain {
+            node.answered = Some(answered);
+        }
+        // Publish under the same guard that authorised it, so two attempts
+        // cannot pass the ordering check and then write out of order.
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(
+            Family::NodePeers,
+            Labels::Empty,
+            observation.peers.map_or(-1., |peers| peers as f64),
+        );
+        registry.set(
+            Family::NodeIbd,
+            Labels::Empty,
+            observation
+                .chain
+                .map_or(-1., |(ibd, _)| f64::from(u8::from(ibd))),
+        );
+        drop(node);
+    }
+    /// Once the rollup loop starts, so its lag reads unknown rather than absent
+    /// while it waits for a first caught-up pass.
+    pub fn start_hashrate_rollup(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
+            Family::RollupLag,
+            Labels::Empty,
+            -1.,
+        );
+    }
+    /// Once per committed rollup pass. Only a caught-up pass moves the stamp: a
+    /// pass that lost the watermark race, or stopped at its batch bound, left
+    /// unfolded shares behind and proves nothing about this frontend's lag.
+    pub fn record_hashrate_rollup_pass(&self, caught_up: bool) {
+        if caught_up {
+            *self
+                .rollup_caught_up
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+    }
     /// Exactly once, at the stale-job branch that refused the share. The coarse
     /// `stale-job` reason is still counted separately by the share observation.
     pub fn record_stale_job_rejection(&self, cause: StaleJobCause) {

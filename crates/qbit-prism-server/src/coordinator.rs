@@ -807,15 +807,19 @@ impl Coordinator {
 
     async fn observe_chain_info(&self, from_refresh: bool) -> Result<Value> {
         let sequence = self.observed_tip.write().await.reserve();
-        let result =
-            crate::readiness::chain_info(&self.rpc, &self.config.chain, self.config.min_peers)
-                .await
-                .and_then(|info| {
-                    let hash = tip_observation::tip_hash(&info["bestblockhash"])
-                        .context("qbit did not report a valid tip hash")?
-                        .to_owned();
-                    Ok((info, hash))
-                });
+        let result = crate::readiness::chain_info_with_metrics(
+            &self.rpc,
+            &self.config.chain,
+            self.config.min_peers,
+            Some(&self.metrics),
+        )
+        .await
+        .and_then(|info| {
+            let hash = tip_observation::tip_hash(&info["bestblockhash"])
+                .context("qbit did not report a valid tip hash")?
+                .to_owned();
+            Ok((info, hash))
+        });
         match result {
             Ok((info, hash)) => {
                 self.observed_tip
