@@ -268,7 +268,10 @@ pub fn prepare() -> Result<impl std::future::Future<Output = Result<()>>> {
 
 async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<()> {
     match command {
-        Command::Run => crate::server::run(Config::from_env()?).await,
+        Command::Run => {
+            config::check_environment()?;
+            crate::server::run(Config::from_env()?).await
+        }
         Command::PublicApi => {
             let (shutdown, receiver) = tokio::sync::watch::channel(false);
             let service = crate::api::public_service::run_from_env(receiver);

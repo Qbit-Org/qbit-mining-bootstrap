@@ -794,3 +794,92 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
             .unwrap();
     }
 }
+
+/// A deploy that skips `check-config` must not start on a 2.x.x environment:
+/// the serve path applies the same unread-settings check, and applies it before
+/// it parses configuration or contacts the node.
+#[tokio::test]
+async fn unread_environment_stops_the_serve_path_in_production() {
+    let settings = [
+        // A known setting the parser rejects. Ordering is what is under test:
+        // this error may only surface once the unread names are gone.
+        ("PRISM_BLOCKWAIT_ENABLED", "not-a-boolean"),
+        (
+            "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
+            "private-retired-value",
+        ),
+        ("PRISM_MISSPELLED_SETTING", "another-private-value"),
+    ];
+    let output = configured_command("run", true, &settings).await;
+    assert!(
+        !output.status.success(),
+        "serve path started on an unread environment: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("set but unread by native PRISM"), "{error}");
+    assert!(
+        error.contains("PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "{error}"
+    );
+    assert!(error.contains("PRISM_MISSPELLED_SETTING"), "{error}");
+    assert!(!error.contains("private-retired-value"));
+    assert!(!error.contains("another-private-value"));
+    assert!(!error.contains("test-only-password"));
+    // The refusal is the whole failure. Configuration was never parsed and the
+    // node was never contacted, so nothing downstream of the check ran.
+    assert!(
+        !error.contains("PRISM_BLOCKWAIT_ENABLED must be a boolean"),
+        "{error}"
+    );
+    assert!(!error.contains("transport failed"), "{error}");
+}
+
+/// Outside production the same names warn and the serve path keeps going, so an
+/// operator sees the leftovers without a lab frontend refusing to start.
+#[tokio::test]
+async fn unread_environment_only_warns_on_the_lab_serve_path() {
+    let settings = [
+        (
+            "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
+            "private-retired-value",
+        ),
+        ("PRISM_MISSPELLED_SETTING", "another-private-value"),
+    ];
+    let output = configured_command("run", false, &settings).await;
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("warning: set but unread by native PRISM"),
+        "{error}"
+    );
+    assert!(
+        error.contains("PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "{error}"
+    );
+    assert!(error.contains("PRISM_MISSPELLED_SETTING"), "{error}");
+    assert!(!error.contains("private-retired-value"));
+    assert!(!error.contains("another-private-value"));
+    // The warning did not stop the frontend: startup continued until the
+    // fixture's unreachable node refused the first RPC call.
+    assert!(
+        error.contains("qbit RPC getblockhash transport failed"),
+        "{error}"
+    );
+}
+
+/// The predecessor of the native orphan-confirmation setting stays inventoried,
+/// so operator guidance cannot present it as a live name again.
+#[tokio::test]
+async fn retired_inventory_covers_the_final_python_runtime_name() {
+    let retired: Vec<_> = include_str!("../src/config/retired-settings.txt")
+        .lines()
+        .filter(|line| line.starts_with("PRISM_"))
+        .collect();
+    assert!(
+        retired.contains(&"PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "retired inventory lost the 2.x.x orphan-confirmation name"
+    );
+    let mut sorted = retired.clone();
+    sorted.sort_unstable();
+    assert_eq!(retired, sorted, "retired inventory is not sorted");
+}
