@@ -351,6 +351,100 @@ class OfflineTests(unittest.TestCase):
             "`def helper` exists but is not a test function",
         )
 
+    def test_rust_citations_reject_ignored_tests_without_a_ci_selection(self) -> None:
+        attributes = (
+            "#[test]\n#[ignore]",
+            '#[ignore = "manual measurement"]\n#[test]',
+            '#[tokio::test]\n#[ignore = "manual measurement"]',
+            '#[test]\n#[ignore\n    = "multiline reason"\n]',
+            '#[test]\n# [ /* comment */ ignore ]',
+        )
+        for attribute in attributes:
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                source = RUST.replace("#[test]", attribute)
+                (root / "crates/demo/tests/ledger.rs").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ledger.rs::lands_one_block", result.stderr)
+                self.assertIn("#[ignore]", result.stderr)
+                self.assertIn("scripts/run_rust_test_shard.py", result.stderr)
+
+    def test_rust_ignored_citations_follow_ci_target_and_exact_test_selection(self) -> None:
+        exact = "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence"
+        cases = (
+            ("qbit-prism-server", "observability_database", "contract", False, True),
+            ("qbit-prism-server", "compact_runtime_scale", "contract", False, True),
+            ("qbit-prism-server", "issued_job_dependency", "contract", True, True),
+            ("qbit-prism-server", "stratum_admission_postgres", exact, False, True),
+            ("qbit-prism-server", "stratum_admission_postgres", "other_contract", False, False),
+            ("qbit-prism-server", "stratum_admission_postgres", exact + "_extra", False, False),
+            ("qbit-prism-server", "stratum_admission_postgres", exact, True, False),
+            ("qbit-prism-server", "audit_body_normalization", "contract", False, False),
+            ("another-package", "observability_database", "contract", False, False),
+        )
+        for package, target, name, nested, selected in cases:
+            with self.subTest(package=package, target=target, name=name, nested=nested):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    citation = f"crates/{package}/tests/{target}.rs"
+                    # Exercise partial rows as well as the full file/case rows above.
+                    write_tree(root, edited("tests/test_kept.py::test_kept", f"{citation}::{name}"))
+                    source = f'#[test]\n#[ignore = "explicit integration run"]\nfn {name}() {{}}\n'
+                    if nested:
+                        source = "mod nested {\n" + source + "}\n"
+                    source_path = root / citation
+                    source_path.parent.mkdir(parents=True, exist_ok=True)
+                    source_path.write_text(source, encoding="utf-8")
+                    result = run_check(root)
+                self.assertEqual(result.returncode, 0 if selected else 1, result.stderr)
+                if not selected:
+                    self.assertIn("#[ignore]", result.stderr)
+
+    def test_rust_ignored_citations_require_a_real_unfiltered_module_inclusion(self) -> None:
+        declaration = '#[path = "observability/database_privacy.rs"]\nmod database_privacy;\n'
+        cases = (
+            (declaration, "observability_database", True),
+            ("// comment\n" + declaration, "observability_database", True),
+            ("/*" + declaration + "*/", "observability_database", False),
+            ('const TEXT: &str = r###"' + declaration + '"###;', "observability_database", False),
+            ("#[cfg(any())]\n" + declaration, "observability_database", False),
+            ("mod nested {\n" + declaration + "}", "observability_database", False),
+            (declaration, "stratum_admission_postgres", False),
+            ("", "observability_database", False),
+        )
+        name = "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence"
+        citation = "crates/qbit-prism-server/tests/observability/database_privacy.rs"
+        for source, target, selected in cases:
+            with self.subTest(source=source, target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, edited("tests/test_kept.py::test_kept", f"{citation}::{name}"))
+                source_path = root / citation
+                source_path.parent.mkdir(parents=True)
+                source_path.write_text(f"#[test]\n#[ignore]\nfn {name}() {{}}\n", encoding="utf-8")
+                target_path = root / f"crates/qbit-prism-server/tests/{target}.rs"
+                target_path.write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0 if selected else 1, result.stderr)
+
+    def test_rust_ignore_text_does_not_skip_real_tests_or_leak_to_the_next_test(self) -> None:
+        for attribute in (
+            '// #[ignore]',
+            '/* #[ignore] */',
+            '#[doc = "#[ignore]"]',
+            '#[doc = r###"\n#[ignore]\n"###]',
+        ):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                source = '#[test]\n#[ignore]\nfn manual_only() {}\n' + RUST.replace(
+                    "#[test]", f"#[test]\n{attribute}"
+                )
+                (root / "crates/demo/tests/ledger.rs").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rust_citations_ignore_functions_inside_literals_and_comments(self) -> None:
         phantom = "\n#[test]\nfn phantom() {}\n"
         sources = {
