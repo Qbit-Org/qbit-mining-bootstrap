@@ -14,6 +14,13 @@ mode and an error when `QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, or
 to Compose or a replica bootstrap script should be passed to those tools,
 not exported into the native server process.
 
+Starting the server runs the same check: `qbit-prism-server` with no
+subcommand refuses to start in production, naming each unsupported variable,
+and warns in lab mode before serving. Unset the reported names in the unit or
+Compose environment, or move them to the tool that reads them; a name that
+belongs to no tool should be removed. `check-config` remains the preflight,
+because it validates every setting group without starting a listener.
+
 The supported names live in
 [`native-settings.txt`](../crates/qbit-prism-server/src/config/native-settings.txt).
 The retired 2.x.x names live in

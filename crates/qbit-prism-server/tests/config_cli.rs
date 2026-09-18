@@ -794,3 +794,84 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
             .unwrap();
     }
 }
+
+/// A deploy that skips `check-config` must not start on a 2.x.x environment:
+/// the serve path applies the same unread-settings check before anything binds.
+#[tokio::test]
+async fn unread_environment_stops_the_serve_path_in_production() {
+    // Hold the port the mining listener would take, so a bind attempt would be
+    // visible in the diagnostic rather than silently succeeding.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let settings = [
+        ("PRISM_STRATUM_PORT", port.as_str()),
+        (
+            "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
+            "private-retired-value",
+        ),
+        ("PRISM_MISSPELLED_SETTING", "another-private-value"),
+    ];
+    let started = Instant::now();
+    let output = configured_command("run", true, &settings).await;
+    assert!(
+        !output.status.success(),
+        "serve path started on an unread environment: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("set but unread by native PRISM"), "{error}");
+    assert!(
+        error.contains("PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "{error}"
+    );
+    assert!(error.contains("PRISM_MISSPELLED_SETTING"), "{error}");
+    assert!(!error.contains("private-retired-value"));
+    assert!(!error.contains("another-private-value"));
+    assert!(!error.contains("test-only-password"));
+    // Neither the mining listener nor PostgreSQL was reached before the refusal.
+    assert!(!error.to_ascii_lowercase().contains("address"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// Outside production the same names warn and the serve path keeps going, so an
+/// operator sees the leftovers without a lab frontend refusing to start.
+#[tokio::test]
+async fn unread_environment_only_warns_on_the_lab_serve_path() {
+    let settings = [
+        (
+            "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
+            "private-retired-value",
+        ),
+        ("PRISM_MISSPELLED_SETTING", "another-private-value"),
+    ];
+    let output = configured_command("run", false, &settings).await;
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("warning: set but unread by native PRISM"),
+        "{error}"
+    );
+    assert!(
+        error.contains("PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "{error}"
+    );
+    assert!(error.contains("PRISM_MISSPELLED_SETTING"), "{error}");
+    assert!(!error.contains("private-retired-value"));
+    assert!(!error.contains("another-private-value"));
+}
+
+/// The predecessor of the native orphan-confirmation setting stays inventoried,
+/// so operator guidance cannot present it as a live name again.
+#[tokio::test]
+async fn retired_inventory_covers_the_final_python_runtime_name() {
+    let retired: Vec<_> = include_str!("../src/config/retired-settings.txt")
+        .lines()
+        .filter(|line| line.starts_with("PRISM_"))
+        .collect();
+    assert!(
+        retired.contains(&"PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS"),
+        "retired inventory lost the 2.x.x orphan-confirmation name"
+    );
+    let mut sorted = retired.clone();
+    sorted.sort_unstable();
+    assert_eq!(retired, sorted, "retired inventory is not sorted");
+}
