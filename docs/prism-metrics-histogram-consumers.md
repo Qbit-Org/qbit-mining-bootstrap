@@ -39,7 +39,7 @@ alongside latency; failed response writes produce no ACK observation.
 For a fully populated scrape, there are 13 histogram label combinations: two
 ACK results, one first offer, two pool outcomes, six lock/outcome pairs and two
 accepted-block work publication results.
-Adding these bounds to the shared ladder would add 22 series. Restricting them
+Adding these bounds to the shared ladder would add 26 series. Restricting them
 to ACKs adds **four series per process** (two bounds × two results), including
 at startup: ACK exposition grows from 28 to 32 series. All existing buckets,
 `+Inf`, `_sum`, `_count`, family names and labels remain. Together with the

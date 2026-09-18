@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 042e18eacb4a2cc62550d73080b013963b2db39452497f8d07a394bdb43dd8dc
++   Specification SHA-256: 3f3ebdcf1420cd016d5480eba65602400b5f02a9b3002ece40f42989ffbeb7cb
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -650,7 +650,7 @@
 +      "page": "true"
 +    },
 +    "summary": "PrismAcceptedBlockWorkPublicationStalled",
-+    "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest accepted pool block whose landed payout revision this frontend has not yet published, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Zero when none; unknown -1 never fires. The gauge is rendered from the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
++    "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest node-accepted pool block whose landing this frontend's published work does not yet carry, whether the landing has not committed yet or has committed but is unpublished here, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Adopted blocks and abandoned or orphaned rows are never pending. Zero when none; -1 before the first derivation, when the ledger read fails or overruns its one-second budget, or when this frontend's clock is behind the offering one; unknown never fires. The gauge is recomputed each health tick into the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -669,7 +669,7 @@
 +      "page": "true"
 +    },
 +    "summary": "PrismStalePayoutRevisionJobRefusals",
-+    "description": "Per frontend: job builds refused because this frontend's published payout revision was behind the cluster's. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
++    "description": "Per frontend: job builds refused because this frontend's published payout revision was behind the cluster's, counted once at the build arm that refuses them; the refusal itself is unchanged. The counter starts at zero and is carried in the cached metrics body. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  }
