@@ -18,7 +18,7 @@ Without flags the check is offline and is what required CI runs:
   `docs/prism-deleted-test-cases.txt`;
 - every `path::name` reference names a file in the repository and a test
   function in it (`#[test]`-style attribute in Rust source, ignoring comments
-  and literal contents, or a Python method included by unittest discovery);
+  and literal contents, or a non-skipped Python method included by unittest discovery);
   Rust `#[ignore]` tests must be explicitly selected by the CI shard runner;
 - a status is one of the five the legend defines, the row's text leads with
   it, a full or partial row cites a test and an open gap row links its owner issue;
@@ -411,7 +411,12 @@ def discovered_python_tests(root: Path) -> dict[Path, set[str]] | str:
                 pending.extend(test)
                 continue
             method_name = test._testMethodName
-            method = inspect.unwrap(getattr(test, method_name))
+            method = getattr(test, method_name)
+            # Match TestCase.run before unwrapping: skip decorators attach the
+            # flag to the wrapper, and class-level flags may be inherited.
+            if getattr(type(test), "__unittest_skip__", False) or getattr(method, "__unittest_skip__", False):
+                continue
+            method = inspect.unwrap(method)
             if not method_name.startswith(loader.testMethodPrefix) or not inspect.isroutine(method):
                 continue
             source = inspect.getsourcefile(method)
@@ -467,7 +472,7 @@ class References:
         if name not in tests:
             wanted = (
                 "a #[test]-style attribute and, for #[ignore], selection by scripts/run_rust_test_shard.py"
-                if extension == "rs" else "membership in the discovered unittest suite"
+                if extension == "rs" else "non-skipped membership in the discovered unittest suite"
             )
             return f"`{path}::{name}`: `{keyword} {name}` exists but is not a test function ({wanted} is required)"
         return None

@@ -555,6 +555,49 @@ fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /
                 result = run_check(root)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_python_citations_reject_effectively_skipped_cases(self) -> None:
+        for decorator in (
+            '@unittest.skip("disabled")',
+            '@unittest.skipIf(True, "disabled")',
+            '@unittest.skipUnless(False, "disabled")',
+        ):
+            sources = {
+                "class": PYTHON.replace("class KeptTests", decorator + "\nclass KeptTests"),
+                "method": PYTHON.replace("    def test_kept", "    " + decorator + "\n    def test_kept"),
+                "inherited class flag": PYTHON.replace("class KeptTests", decorator + "\nclass BaseTests")
+                + "\nclass KeptTests(BaseTests):\n    pass\n",
+                "inherited method": PYTHON.replace("    def test_kept", "    " + decorator + "\n    def test_kept")
+                .replace("class KeptTests(unittest.TestCase):", "class Mixin:")
+                + "\nclass KeptTests(Mixin, unittest.TestCase):\n    pass\n",
+            }
+            for label, source in sources.items():
+                with self.subTest(decorator=decorator, case=label), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_tree(root)
+                    (root / "tests/test_kept.py").write_text(source, encoding="utf-8")
+                    result = run_check(root)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("`def test_kept` exists but is not a test function", result.stderr)
+
+    def test_python_citations_accept_inactive_skip_decorators_and_live_inherited_cases(self) -> None:
+        for decorator in ('@unittest.skipIf(False, "enabled")', '@unittest.skipUnless(True, "enabled")'):
+            for anchor in ("class KeptTests", "    def test_kept"):
+                with self.subTest(decorator=decorator, anchor=anchor), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_tree(root)
+                    indent = "    " if anchor.startswith(" ") else ""
+                    source = PYTHON.replace(anchor, indent + decorator + "\n" + anchor)
+                    (root / "tests/test_kept.py").write_text(source, encoding="utf-8")
+                    result = run_check(root)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root)
+            source = PYTHON + '\n@unittest.skip("disabled subclass")\nclass SkippedTests(KeptTests):\n    pass\n'
+            (root / "tests/test_kept.py").write_text(source, encoding="utf-8")
+            result = run_check(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_python_citations_reject_files_outside_the_discovery_pattern(self) -> None:
         for path in ("tests/kept.py", "tests/nested/test_kept.py", "scripts/test_kept.py"):
             with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
