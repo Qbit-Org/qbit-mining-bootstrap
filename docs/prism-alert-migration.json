@@ -865,27 +865,27 @@
     {
       "name": "qbit_prism_ledger_read_calls_total",
       "replacement": [],
-      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times pool acquisition by metrics collection, instrumented ledger transactions and selected direct ledger queries; non-transactional coverage remains partial under #352, and rollup worker transactions, public API queries and other pool traffic outside these paths are untimed, and it cannot replace query execution, advisory-lock waits or read-admission gate timing."
+      "reason": "No replacement: Python read-admission gate and execution timers are absent. Native database_pool_acquire_seconds aggregates observed checkout attempts at covered callers: metrics collection, instrumented ledger transactions and direct ledger queries, rollup transactions and share-partition maintenance. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. Pool acquisition timing cannot replace query execution, advisory-lock waits or read-admission gate timing."
     },
     {
       "name": "qbit_prism_ledger_read_execute_seconds_total",
       "replacement": [],
-      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times pool acquisition by metrics collection, instrumented ledger transactions and selected direct ledger queries; non-transactional coverage remains partial under #352, and rollup worker transactions, public API queries and other pool traffic outside these paths are untimed, and it cannot replace query execution, advisory-lock waits or read-admission gate timing."
+      "reason": "No replacement: Python read-admission gate and execution timers are absent. Native database_pool_acquire_seconds aggregates observed checkout attempts at covered callers: metrics collection, instrumented ledger transactions and direct ledger queries, rollup transactions and share-partition maintenance. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. Pool acquisition timing cannot replace query execution, advisory-lock waits or read-admission gate timing."
     },
     {
       "name": "qbit_prism_ledger_read_execute_timeouts_total",
       "replacement": [],
-      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times pool acquisition by metrics collection, instrumented ledger transactions and selected direct ledger queries; non-transactional coverage remains partial under #352, and rollup worker transactions, public API queries and other pool traffic outside these paths are untimed, and it cannot replace query execution, advisory-lock waits or read-admission gate timing."
+      "reason": "No replacement: Python read-admission gate and execution timers are absent. Native database_pool_acquire_seconds aggregates observed checkout attempts at covered callers: metrics collection, instrumented ledger transactions and direct ledger queries, rollup transactions and share-partition maintenance. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. Pool acquisition timing cannot replace query execution, advisory-lock waits or read-admission gate timing."
     },
     {
       "name": "qbit_prism_ledger_read_gate_timeouts_total",
       "replacement": [],
-      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times pool acquisition by metrics collection, instrumented ledger transactions and selected direct ledger queries; non-transactional coverage remains partial under #352, and rollup worker transactions, public API queries and other pool traffic outside these paths are untimed, and it cannot replace query execution, advisory-lock waits or read-admission gate timing."
+      "reason": "No replacement: Python read-admission gate and execution timers are absent. Native database_pool_acquire_seconds aggregates observed checkout attempts at covered callers: metrics collection, instrumented ledger transactions and direct ledger queries, rollup transactions and share-partition maintenance. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. Pool acquisition timing cannot replace query execution, advisory-lock waits or read-admission gate timing."
     },
     {
       "name": "qbit_prism_ledger_read_gate_wait_seconds_total",
       "replacement": [],
-      "reason": "No replacement: Python read-admission gate and execution timers are absent; native database_pool_acquire_seconds times pool acquisition by metrics collection, instrumented ledger transactions and selected direct ledger queries; non-transactional coverage remains partial under #352, and rollup worker transactions, public API queries and other pool traffic outside these paths are untimed, and it cannot replace query execution, advisory-lock waits or read-admission gate timing."
+      "reason": "No replacement: Python read-admission gate and execution timers are absent. Native database_pool_acquire_seconds aggregates observed checkout attempts at covered callers: metrics collection, instrumented ledger transactions and direct ledger queries, rollup transactions and share-partition maintenance. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. Pool acquisition timing cannot replace query execution, advisory-lock waits or read-admission gate timing."
     },
     {
       "name": "qbit_prism_metrics_snapshot_age_seconds",
