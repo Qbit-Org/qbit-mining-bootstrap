@@ -16,7 +16,6 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
 const TEST_GATE: i64 = 0x27300001;
 
 struct Database {
@@ -719,6 +718,103 @@ async fn wait_for_gate(db: &Database, key: i64) -> Result<()> {
     }).await.context("writer never reached gate")?
 }
 
+async fn blocked_cluster(db: &Database, blocker: i32) -> Result<()> {
+    blocked_query(db, blocker, "SELECT config_fingerprint").await?;
+    Ok(())
+}
+
+async fn blocked_query(db: &Database, blocker: i32, prefix: &str) -> Result<i32> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE $2 LIMIT 1")
+                .bind(blocker).bind(format!("{prefix}%")).fetch_optional(&db.admin).await?;
+            if let Some(pid) = waiting { return Ok::<_,anyhow::Error>(pid); }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }).await.context("writer never reached cluster fence")?
+}
+
+#[tokio::test]
+async fn prepared_authority_is_fenced_before_checks_in_both_update_orders() -> Result<()> {
+    for writer_first in [false, true] {
+        for mutation in [
+            "payout_revision=1",
+            "fatal_error='halt'",
+            "config_fingerprint=NULL",
+            "config_fingerprint='rotated'",
+        ] {
+            run(move |db| {
+                Box::pin(async move {
+                    let template = PreparedTemplate::encode(&template())?;
+                    let record = record(&template, &[], false);
+                    db.ledger.configure("original", &record.signer_keys).await?;
+                    let expires = db.expires().await?;
+                    let mut hold = db.ledger.pool.begin().await?;
+                    let hold_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *hold)
+                        .await?;
+                    if writer_first {
+                        gate_insert(db).await?;
+                        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                            .bind(TEST_GATE)
+                            .execute(&mut *hold)
+                            .await?;
+                    } else {
+                        sqlx::query(&format!(
+                            "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
+                        ))
+                        .execute(&mut *hold)
+                        .await?;
+                    }
+                    let ledger = db.ledger.clone();
+                    let saved_record = record.clone();
+                    let saving = tokio::spawn(async move {
+                        ledger
+                            .save_compact_prepared(
+                                "fenced",
+                                &saved_record,
+                                &template,
+                                &[],
+                                0,
+                                expires,
+                            )
+                            .await
+                    });
+                    if writer_first {
+                        let writer_pid =
+                            blocked_query(db, hold_pid, "INSERT INTO qbit_prism_jobs").await?;
+                        let pool = db.ledger.pool.clone();
+                        let update = tokio::spawn(async move {
+                            sqlx::query(&format!(
+                                "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
+                            ))
+                            .execute(&pool)
+                            .await
+                        });
+                        blocked_query(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+                        assert_empty(db).await?;
+                        hold.rollback().await?;
+                        ensure!(saving.await??);
+                        update.await??;
+                        let stored = db.ledger.compact_prepared("fenced").await?.unwrap();
+                        ensure!(
+                            stored.record == record && stored.original_expires_at_ms == expires
+                        );
+                    } else {
+                        blocked_cluster(db, hold_pid).await?;
+                        hold.commit().await?;
+                        ensure!(saving.await?.is_err());
+                        assert_empty(db).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn gate_insert(db: &Database) -> Result<()> {
     sqlx::raw_sql(&format!("CREATE FUNCTION gate_prepared_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({TEST_GATE}); RETURN NEW; END; $$; CREATE TRIGGER gate_prepared_insert AFTER INSERT ON qbit_prism_jobs FOR EACH ROW EXECUTE FUNCTION gate_prepared_insert();"))
         .execute(&db.ledger.pool).await?;
@@ -750,8 +846,7 @@ async fn cancellation_after_blob_inserts_rolls_back_all_effects() -> Result<()> 
             gate.rollback().await?;
             // Taking the same lock waits for the cancelled transaction's rollback.
             let mut fence = db.ledger.pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(SETTLEMENT_LOCK)
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
                 .execute(&mut *fence)
                 .await?;
             fence.rollback().await?;
@@ -770,15 +865,15 @@ async fn fixed_expiry_is_checked_after_lock_and_post_insert_waits() -> Result<()
                 if after_blobs {
                     gate_insert(db).await?;
                 }
-                let key = if after_blobs {
-                    TEST_GATE
+                let mut gate = db.ledger.pool.begin().await?;
+                let query = if after_blobs {
+                    format!("SELECT pg_advisory_xact_lock({TEST_GATE})")
                 } else {
-                    SETTLEMENT_LOCK
+                    "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE".into()
                 };
-                let mut gate = db.admin.begin().await?;
-                sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                    .bind(key)
-                    .execute(&mut *gate)
+                sqlx::query(&query).execute(&mut *gate).await?;
+                let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *gate)
                     .await?;
                 let expires = db.now_ms().await? + 300;
                 let ledger = db.ledger.clone();
@@ -789,7 +884,11 @@ async fn fixed_expiry_is_checked_after_lock_and_post_insert_waits() -> Result<()
                         .save_compact_prepared("deadline", &record, &template, &[], 0, expires)
                         .await
                 });
-                wait_for_gate(db, key).await?;
+                if after_blobs {
+                    wait_for_gate(db, TEST_GATE).await?;
+                } else {
+                    blocked_cluster(db, blocker).await?;
+                }
                 while db.now_ms().await? <= expires {
                     sleep(Duration::from_millis(5)).await;
                 }

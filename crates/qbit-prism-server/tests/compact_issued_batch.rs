@@ -4,16 +4,15 @@ use futures_util::future::LocalBoxFuture;
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::PayoutPolicy;
 use qbit_prism_server::ledger::{
-    CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared, IssuedJobSave,
-    Ledger, PreparedTemplate, SignerKeys, WindowRef,
+    CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared, CompactRepair,
+    IssuedJobSave, Ledger, PreparedTemplate, SignerKeys, WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout, Instant};
 
-const SETTLEMENT: i64 = 0x505249534d000003;
 const INSERT_GATE: i64 = 0x27500003;
 
 #[tokio::test]
@@ -40,18 +39,18 @@ async fn original_deadline_includes_pool_wait_and_preserves_stricter_statement_l
                 connections.push(connection);
             }
             let mut hold = connections.pop().unwrap();
-            sqlx::query("SELECT pg_advisory_lock($1)").bind(SETTLEMENT).execute(&mut *hold).await?;
+            let mut hold = hold.begin().await?;
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE").execute(&mut *hold).await?;
             drop(connections);
             let attempt = Arc::new(CompactBatchAttempt::new(Instant::now() + Duration::from_millis(150)));
             let started = Instant::now();
             let result = db.ledger.save_issued_jobs_compact(&entries, 0, &original.record.parent_hash, original.dependency(), &attempt).await;
             ensure!(result.is_err() && !attempt.commit_started());
             if limit != 0 { ensure!(format!("{:#}", result.unwrap_err()).contains("statement timeout")); }
-            // Keep settlement held: draining must finish under the SQL timeout.
+            // Keep the authority row held: draining must finish under the SQL timeout.
             timeout(Duration::from_secs(2), attempt.wait_for_cleanup()).await?;
             ensure!(started.elapsed() < Duration::from_secs(2));
-            sqlx::query("SELECT pg_advisory_unlock($1)").bind(SETTLEMENT).execute(&mut *hold).await?;
-            drop(hold);
+            hold.rollback().await?;
             rollback_fence(db).await?;
             ensure!(snapshot(db).await? == before);
             save(db, &original, &entries).await?;
@@ -70,6 +69,7 @@ struct Database {
     ledger: Ledger,
     admin: PgPool,
     schema: String,
+    url: String,
 }
 
 async fn run(
@@ -92,6 +92,7 @@ async fn run(
         ledger,
         admin,
         schema,
+        url: url.into(),
     };
     let result = body(&db).await;
     db.ledger.pool.close().await;
@@ -195,12 +196,12 @@ async fn snapshot(db: &Database) -> Result<Value> {
     Ok(sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY job_id),'[]'::jsonb) FROM qbit_prism_jobs j").fetch_one(&db.ledger.pool).await?)
 }
 
-async fn blocked(db: &Database, blocker: i32, prefix: &str) -> Result<()> {
+async fn blocked(db: &Database, blocker: i32, prefix: &str) -> Result<i32> {
     timeout(Duration::from_secs(5), async {
         loop {
-            let found: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE $2)")
-                .bind(blocker).bind(format!("{prefix}%")).fetch_one(&db.admin).await?;
-            if found { return Ok::<_, anyhow::Error>(()); }
+            let found: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE $2 LIMIT 1")
+                .bind(blocker).bind(format!("{prefix}%")).fetch_optional(&db.admin).await?;
+            if let Some(pid) = found { return Ok::<_, anyhow::Error>(pid); }
             sleep(Duration::from_millis(2)).await;
         }
     }).await.context("expected database wait did not occur")?
@@ -230,15 +231,14 @@ fn spawn(
 async fn rollback_fence(db: &Database) -> Result<()> {
     timeout(Duration::from_secs(5), async {
         let mut tx = db.ledger.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(SETTLEMENT)
+        sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
             .execute(&mut *tx)
             .await?;
         tx.rollback().await?;
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("canceled transaction did not release settlement")?
+    .context("canceled transaction did not release cluster fence")?
 }
 
 #[tokio::test]
@@ -361,8 +361,243 @@ async fn revision_configuration_and_fatal_state_revalidate_after_cluster_wait() 
 }
 
 #[tokio::test]
-async fn earliest_child_expiry_survives_settlement_dependency_blob_and_insert_waits() -> Result<()>
+async fn ordinary_authority_updates_wait_for_atomic_64_child_commit() -> Result<()> {
+    for mutation in [
+        "payout_revision=1",
+        "config_fingerprint=NULL",
+        "config_fingerprint='changed'",
+        "fatal_error='halt'",
+    ] {
+        run(move |db| Box::pin(async move {
+            let original = seed(db).await?;
+            db.ledger.configure("original", &original.record.signer_keys).await?;
+            let entries: Vec<_> = (0..64).map(|i| CompactIssuedJob {
+                job_id: format!("child-{i}"),
+                payload: json!({"prepared_key":"prepared","expires_at_ms":original.expiry+60_000+i,"nonce":i}),
+                expires_at_ms: original.expiry+60_000+i,
+            }).collect();
+            sqlx::raw_sql(&format!("CREATE FUNCTION gate_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({INSERT_GATE}); RETURN NEW; END; $$; CREATE TRIGGER gate_batch AFTER INSERT ON qbit_prism_jobs FOR EACH ROW WHEN (NEW.job_id='child-63') EXECUTE FUNCTION gate_batch();"))
+                .execute(&db.ledger.pool).await?;
+            let mut gate = db.ledger.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(INSERT_GATE).execute(&mut *gate).await?;
+            let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *gate).await?;
+            let saving = spawn(db, &original, entries.clone(), Arc::new(CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))));
+            let writer_pid = blocked(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
+            let pool = db.ledger.pool.clone();
+            let updating = tokio::spawn(async move {
+                sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation} WHERE singleton")).execute(&pool).await
+            });
+            blocked(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+            let children: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id LIKE 'child-%'").fetch_one(&db.ledger.pool).await?;
+            ensure!(children == 0, "partial cohort visible before commit");
+            gate.rollback().await?;
+            ensure!(saving.await?? == IssuedJobSave::Saved);
+            updating.await??;
+            let (count, transactions): (i64, i64) = sqlx::query_as("SELECT count(*),count(DISTINCT xmin::text) FROM qbit_prism_jobs WHERE job_id LIKE 'child-%'").fetch_one(&db.ledger.pool).await?;
+            ensure!((count, transactions) == (64, 1));
+            for entry in &entries { ensure!(db.ledger.job(&entry.job_id).await? == Some(entry.payload.clone())); }
+            let before = snapshot(db).await?;
+            ensure!(save(db, &original, &entries).await.is_err(), "revoked authority allowed retry");
+            rollback_fence(db).await?;
+            ensure!(snapshot(db).await? == before);
+            Ok(())
+        })).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_frontends_overlap_exact_children_without_renewal_loss_or_partial_conflicts(
+) -> Result<()> {
+    for cold in [false, true] {
+        run(move |db| Box::pin(async move {
+            let original = seed(db).await?;
+            let peer = Ledger::connect(&db.url, "batch-peer".into(), 3, true).await?;
+            let result: Result<()> = async {
+                let entries = jobs(original.expiry + 60_000);
+                let stored = db.ledger.compact_prepared("prepared").await?.unwrap();
+                let repair = CompactRepair::encode(&stored.record, &PreparedTemplate::encode(&stored.template)?,
+                    &stored.prior_balances, stored.original_expires_at_ms)?;
+                if cold {
+                    sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id='prepared'").execute(&db.ledger.pool).await?;
+                }
+                sqlx::raw_sql(&format!("CREATE FUNCTION gate_overlap() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({INSERT_GATE}); RETURN NEW; END; $$; CREATE TRIGGER gate_overlap AFTER INSERT ON qbit_prism_jobs FOR EACH ROW WHEN (NEW.job_id='child-0') EXECUTE FUNCTION gate_overlap();"))
+                    .execute(&db.ledger.pool).await?;
+                let mut hold = db.ledger.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(INSERT_GATE).execute(&mut *hold).await?;
+                let hold_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *hold).await?;
+                let ledger = db.ledger.clone();
+                let first_entries = entries.clone();
+                let first_original = original.clone();
+                let first = tokio::spawn(async move {
+                    if cold {
+                        let child = &first_entries[0];
+                        ledger.save_issued_job_compact(&child.job_id, &child.payload, 0,
+                            &first_original.record.parent_hash, child.expires_at_ms,
+                            repair.dependency("prepared"), Some(&repair)).await
+                    } else {
+                        ledger.save_issued_jobs_compact(&first_entries, 0, &first_original.record.parent_hash,
+                            first_original.dependency(), &CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))).await
+                    }
+                });
+                let first_pid = blocked(db, hold_pid, "INSERT INTO qbit_prism_jobs").await?;
+                let mut peer_entries = entries.clone();
+                // Same overlapping identities plus one longer-lived new child.
+                peer_entries.push(CompactIssuedJob { job_id:"child-peer".into(),
+                    expires_at_ms:original.expiry+180_000,
+                    payload:json!({"prepared_key":"prepared","expires_at_ms":original.expiry+180_000}) });
+                let peer_original = original.clone();
+                let peer_ledger = peer.clone();
+                let expected = peer_entries.clone();
+                let second = tokio::spawn(async move {
+                    peer_ledger.save_issued_jobs_compact(&peer_entries, 0, &peer_original.record.parent_hash,
+                        peer_original.dependency(), &CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))).await
+                });
+                if cold {
+                    // An uncommitted dependency is physically absent to this
+                    // reader. Runtime repair followers retry the same identity.
+                    ensure!(second.await?? == IssuedJobSave::PreparedMissing);
+                } else {
+                    blocked(db, first_pid, "UPDATE qbit_prism_jobs").await?;
+                    hold.rollback().await?;
+                    ensure!(first.await?? == IssuedJobSave::Saved);
+                    ensure!(second.await?? == IssuedJobSave::Saved);
+                    return finish_overlap(db, &peer, &original, &expected).await;
+                }
+                hold.rollback().await?;
+                ensure!(first.await?? == IssuedJobSave::Saved);
+                ensure!(peer.save_issued_jobs_compact(&expected, 0, &original.record.parent_hash, original.dependency(),
+                    &CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))).await? == IssuedJobSave::Saved);
+                finish_overlap(db, &peer, &original, &expected).await
+            }.await;
+            peer.pool.close().await;
+            result
+        })).await?;
+    }
+    Ok(())
+}
+
+async fn finish_overlap(
+    db: &Database,
+    peer: &Ledger,
+    original: &Original,
+    entries: &[CompactIssuedJob],
+) -> Result<()> {
+    for entry in entries {
+        ensure!(db.ledger.job(&entry.job_id).await? == Some(entry.payload.clone()));
+    }
+    let stored = db.ledger.compact_prepared("prepared").await?.unwrap();
+    ensure!(
+        stored.record == original.record
+            && stored.original_expires_at_ms == original.expiry
+            && stored.expires_at_ms == entries.last().unwrap().expires_at_ms + 60_000
+    );
+    let before = snapshot(db).await?;
+    let mut conflict = entries.to_vec();
+    conflict[0].payload["nonce"] = json!(999);
+    conflict.push(CompactIssuedJob {
+        job_id: "child-conflict".into(),
+        expires_at_ms: original.expiry + 360_000,
+        payload: json!({"prepared_key":"prepared","expires_at_ms":original.expiry+360_000}),
+    });
+    ensure!(peer
+        .save_issued_jobs_compact(
+            &conflict,
+            0,
+            &original.record.parent_hash,
+            original.dependency(),
+            &CompactBatchAttempt::new(Instant::now() + Duration::from_secs(10))
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("immutable job ID conflict"));
+    rollback_fence(db).await?;
+    ensure!(
+        snapshot(db).await? == before,
+        "conflicting cohort leaked child or renewal"
+    );
+    ensure!(save(db, original, entries).await? == IssuedJobSave::Saved);
+    ensure!(snapshot(db).await? == before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn atomic_64_cohort_is_durable_while_three_second_settlement_stub_remains_held() -> Result<()>
 {
+    run(|db| Box::pin(async move {
+        let original = seed(db).await?;
+        let entries: Vec<_> = (0..64).map(|i| CompactIssuedJob {
+            job_id:format!("child-{i}"), expires_at_ms:original.expiry+i,
+            payload:json!({"prepared_key":"prepared","expires_at_ms":original.expiry+i,"nonce":i}),
+        }).collect();
+        let mut stub = db.ledger.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(0x505249534d000003_i64).execute(&mut *stub).await?;
+        let release_at = Instant::now()+Duration::from_secs(3);
+        tokio::time::timeout_at(release_at, async {
+            ensure!(save(db, &original, &entries).await? == IssuedJobSave::Saved);
+            for entry in &entries { ensure!(db.ledger.job(&entry.job_id).await? == Some(entry.payload.clone())); }
+            let (count, transactions): (i64,i64) = sqlx::query_as("SELECT count(*),count(DISTINCT xmin::text) FROM qbit_prism_jobs WHERE job_id LIKE 'child-%'").fetch_one(&db.ledger.pool).await?;
+            ensure!((count,transactions) == (64,1));
+            Ok::<_,anyhow::Error>(())
+        }).await.context("64-child commit did not precede stub release")??;
+        tokio::time::sleep_until(release_at).await;
+        stub.rollback().await?;
+        Ok(())
+    })).await
+}
+
+#[tokio::test]
+async fn chain_transition_waits_for_issuance_then_fences_stale_revision_and_aba_epoch() -> Result<()>
+{
+    use qbit_prism_server::ledger::ChainTransition;
+    run(|db| Box::pin(async move {
+        let original = seed(db).await?;
+        let parent = original.record.parent_hash.clone();
+        let sibling = "cd".repeat(32);
+        let revision = db.ledger.observe_chain_view(&parent, 101, "01").await?;
+        let observed = db.ledger.chain_observation_state().await?;
+        let transition = ChainTransition { predecessor:parent.clone(), origin_chain_epoch:observed.chain_epoch };
+        sqlx::raw_sql(&format!("CREATE FUNCTION gate_epoch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({INSERT_GATE}); RETURN NEW; END; $$; CREATE TRIGGER gate_epoch AFTER INSERT ON qbit_prism_jobs FOR EACH ROW WHEN (NEW.job_id='child-7') EXECUTE FUNCTION gate_epoch();"))
+            .execute(&db.ledger.pool).await?;
+        let mut hold = db.ledger.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(INSERT_GATE).execute(&mut *hold).await?;
+        let hold_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *hold).await?;
+        let ledger = db.ledger.clone();
+        let first = original.clone();
+        let entries = jobs(original.expiry);
+        let saving = tokio::spawn(async move {
+            ledger.save_issued_jobs_compact(&entries, revision, &first.record.parent_hash, first.dependency(),
+                &CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))).await
+        });
+        let saving_pid = blocked(db, hold_pid, "INSERT INTO qbit_prism_jobs").await?;
+        let ledger = db.ledger.clone();
+        let next = transition.clone();
+        let state = observed.clone();
+        let tip = sibling.clone();
+        let changing = tokio::spawn(async move { ledger.observe_chain_transition(&next, &tip, 101, "01", &state).await });
+        blocked(db, saving_pid, "SELECT payout_revision,chain_epoch").await?;
+        hold.rollback().await?;
+        ensure!(saving.await?? == IssuedJobSave::Saved);
+        ensure!(changing.await?? == revision+1);
+        let state = db.ledger.chain_observation_state().await?;
+        ensure!(state.chain_epoch == observed.chain_epoch+1);
+        ensure!(db.ledger.save_issued_jobs_compact(&jobs(original.expiry), revision, &parent, original.dependency(),
+            &CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))).await.is_err());
+        db.ledger.observe_chain_transition(&ChainTransition {predecessor:sibling.clone(), origin_chain_epoch:state.chain_epoch},
+            &parent, 101, "01", &state).await?;
+        let aba = db.ledger.chain_observation_state().await?;
+        ensure!(aba.best_tip_hash.as_deref() == Some(parent.as_str()) && aba.chain_epoch == observed.chain_epoch+2);
+        ensure!(db.ledger.observe_chain_transition(&transition, &sibling, 101, "01", &aba).await.is_err(), "stale ABA epoch gained authority");
+        let durable: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id LIKE 'child-%' AND payout_revision=$1")
+            .bind(revision).fetch_one(&db.ledger.pool).await?;
+        ensure!(durable == 8, "later authority rewrote original issued rows");
+        Ok(())
+    })).await
+}
+
+#[tokio::test]
+async fn earliest_child_expiry_survives_cluster_dependency_blob_and_insert_waits() -> Result<()> {
     for phase in 0..4 {
         run(move |db| Box::pin(async move {
             let original = seed(db).await?;
@@ -370,7 +605,7 @@ async fn earliest_child_expiry_survives_settlement_dependency_blob_and_insert_wa
             let mut hold = db.ledger.pool.begin().await?;
             let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *hold).await?;
             let query = match phase {
-                0 => format!("SELECT pg_advisory_xact_lock({SETTLEMENT})"),
+                0 => "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE".into(),
                 1 => "SELECT true FROM qbit_prism_jobs WHERE job_id='prepared' FOR UPDATE".into(),
                 2 => "SELECT true FROM qbit_prism_templates FOR UPDATE".into(),
                 _ => {
@@ -383,7 +618,7 @@ async fn earliest_child_expiry_survives_settlement_dependency_blob_and_insert_wa
             entries[0].expires_at_ms = now(db).await? + 150;
             entries[0].payload["expires_at_ms"] = json!(entries[0].expires_at_ms);
             let saving = spawn(db, &original, entries, Arc::new(CompactBatchAttempt::new(Instant::now() + Duration::from_secs(10))));
-            let prefix = match phase { 0 => "SELECT pg_advisory_xact_lock", 1 => "SELECT parent_hash", 2 => "SELECT true FROM qbit_prism_templates", _ => "INSERT INTO qbit_prism_jobs" };
+            let prefix = match phase { 0 => "SELECT config_fingerprint", 1 => "SELECT parent_hash", 2 => "SELECT true FROM qbit_prism_templates", _ => "INSERT INTO qbit_prism_jobs" };
             blocked(db, blocker, prefix).await?;
             sleep(Duration::from_millis(180)).await;
             hold.rollback().await?;

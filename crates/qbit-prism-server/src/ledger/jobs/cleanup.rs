@@ -23,9 +23,10 @@ impl Ledger {
     /// expired. Never reads blob payloads. Run job expiry separately before
     /// starting this deadline: its larger DELETE must not hold advisory locks.
     ///
-    /// Settlement serializes prepared save/renewal/repair; ordering serializes
-    /// candidate insertion and its balance blob. Acquire them in that order
-    /// before inspecting references. Keep every remaining job reference (even
+    /// Acquire SETTLEMENT -> ORDER -> cluster FOR UPDATE before fresh reference
+    /// scans. Compact writers hold cluster FOR SHARE through commit; ORDER
+    /// must precede the row fence because candidate writers take it first.
+    /// Settlement still excludes legacy writers. Keep every job reference (even
     /// an expired row awaiting the next batch) and every candidate reference.
     /// Terminal candidate writes detach references atomically; a claim's lease
     /// expiry is irrelevant, and unexpected surviving references fail closed.
@@ -59,6 +60,13 @@ impl Ledger {
         };
         self.lock(tx.statement().await?, SETTLEMENT_LOCK).await?;
         self.lock(tx.statement().await?, ORDER_LOCK).await?;
+        // A separate statement AFTER acquiring this fence gets a fresh snapshot
+        // of any repair that committed while we waited. Blob row locks alone
+        // cannot protect an absent prepared reference or refresh a DELETE's
+        // earlier NOT EXISTS snapshot. Keep this wait inside the same deadline.
+        sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+            .fetch_one(&mut **tx.statement().await?)
+            .await?;
         writable(tx.statement().await?).await?;
 
         // Bound the inspected keys BEFORE reference filtering. OFFSET 0

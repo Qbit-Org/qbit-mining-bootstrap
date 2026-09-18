@@ -29,12 +29,26 @@ async fn small_public_delivery_measurement() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn three_second_landing_lock_baseline() -> Result<()> {
+async fn persistence_and_exact_rows_precede_three_second_stub_release() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    for frontends in [1, 2] {
+        support::run(&raw, frontends, |fixture, _| {
+            support::settlement_isolation(fixture).boxed_local()
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_second_authority_row_hold_still_blocks_persistence() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     support::run(&raw, 1, |fixture, _| {
-        support::landing_lock(fixture).boxed_local()
+        support::authority_lock(fixture).boxed_local()
     })
     .await
 }
