@@ -121,12 +121,31 @@ route and is not part of #267's admission half.
 
 What the bound covers is the work admitted under the permit: the range read and
 fold, the canonical serialization, and the stored bytes' digest and parse. It
-does not cover what is still alive after the permit is released — the route's
-own re-hash of the returned bytes, the ETag digest of the response, and the
-response body itself until the client has drained it — so a read's resident
-footprint outlasts its permit by roughly one more copy of the artifact. Those
-two SHA-256 passes are the route's pre-existing behaviour and #267's admission
-half does not change them.
+does not cover the response body, which stays alive after the permit is
+released until the client has drained it, so a read's resident footprint
+outlasts its permit by about one more copy of the artifact.
+
+CPU outside the permit matters as much as memory. Serving an audit artifact used
+to hash the whole body twice more on a runtime worker thread — once to check the
+returned bytes against the requested address, once for the ETag. One SHA-256
+pass over a 111 MB artifact measures 1.6-1.8 s in a debug build, so at 50
+requests per second those passes saturated the public process's worker threads:
+a task that only sleeps overshot by 23.5 s, the node RPC behind
+`/public/v1/pool-summary` timed out, and that route failed its 20 s deadline
+even though the read pool was idle (p99 pool-summary latency 0.107 s in the same
+run). Both passes are gone. The bytes are digested against `audit_bundle_sha256`
+inside the blocking job, under the permit; the row is found by that column, so
+the route compares it to the requested address as a string; and the ETag is that
+same address rather than a fresh hash of the body. The verification is the same
+digest it always was, and responses are byte-identical. After the change, the
+same load holds pool-summary at 0.118-0.364 s maximum with no failed sample and
+the sleeping probe's overshoot at 0.32-0.44 s. A public process still needs CPU
+headroom for the rebuild itself, which is what the permit bounds.
+
+The legacy fallback body — an audit row with neither canonical bytes nor a share
+snapshot, served through the audit-bundle reader — is still hashed on a runtime
+thread for its ETag, because it has no proven content address to carry. It is a
+pre-#267 import shape, and it is not admitted by the rebuild limit either.
 
 `peak_bytes_per_read` is a multiple of the canonical artifact length, which is
 `audit_body_byte_len` in the table above. Measured at a 5,000-share window by
