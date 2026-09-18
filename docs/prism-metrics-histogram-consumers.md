@@ -36,8 +36,9 @@ commit. A bucket crossing alone cannot identify a commit failure or an unknown
 ledger outcome. Inspect `result` and the rejection/late-confirmation counters
 alongside latency; failed response writes produce no ACK observation.
 
-For a fully populated scrape, there are 11 histogram label combinations: two
-ACK results, one first offer, two pool outcomes and six lock/outcome pairs.
+For a fully populated scrape, there are 13 histogram label combinations: two
+ACK results, one first offer, two pool outcomes, six lock/outcome pairs and two
+accepted-block work publication results.
 Adding these bounds to the shared ladder would add 22 series. Restricting them
 to ACKs adds **four series per process** (two bounds × two results), including
 at startup: ACK exposition grows from 28 to 32 series. All existing buckets,

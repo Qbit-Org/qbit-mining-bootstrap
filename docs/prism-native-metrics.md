@@ -7,7 +7,7 @@ observations, with the pool-acquisition histogram, collector measurements,
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **46 coordinator
+The generated table below is the sole inventory for both roles: **49 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -251,11 +251,55 @@ The coordinator adds the three health compatibility aliases whose native sources
 are known; the fixture deliberately identifies unmapped legacy fields: `ready_miner_count` (accepted-share participants) and `max_blocks` (the 2.x accepted-block pool-close cap) have no native health equivalents.
 
 No new configuration setting is introduced. Worker slots, per-worker series,
-node gauges, rollup-lag series, payout build and landing-phase instrumentation
-remain outside the trimmed metrics scope. The subsequent
+node gauges, rollup-lag series and payout build instrumentation
+remain outside the trimmed metrics scope; the accepted-block work publication
+families below were added afterwards by #458. The subsequent
 [#278 cardinality/privacy qualification](prism-metrics-cardinality-privacy.md)
 pins the complete run-role wire census and tests identifier-bearing inputs
 through Stratum and the candidate collector without expanding the family set.
+
+## Accepted-block work publication
+
+Three run-role families measure the back of the landing sequence: from a pool
+block the node accepted to the first job this frontend publishes under a payout
+revision that includes that block's landing. `qbit_prism_block_submit_seconds`
+measures the front of the same sequence (locally validated proof to first node
+offer) and is a different boundary, as is the load harness's approximated
+"time to new-revision work".
+
+- `qbit_prism_accepted_block_work_publication_seconds` (histogram,
+  `result=published,superseded`) starts at the durable accepted-offer time
+  recorded in `qbit_block_candidate_outbox.offered_at_ms` — the offering
+  frontend's wall clock read before its one `submitblock` call — and ends at
+  this frontend's first publication whose payout revision includes the block's
+  landing. Every frontend observes the block, including one that did not offer
+  it, so samples are per `instance` and are not one event to be summed across
+  frontends; a sample spanning two hosts also carries their clock skew.
+  A block adopted from the chain instead of accepted through the offer path
+  yields no sample. `result="superseded"` means a later landing was published in
+  the same publication under a dense cadence: a legitimate outcome, not a
+  failure, and the publication that carried it is still the one measured. A
+  block is sampled at most once per process, so a retried or replayed
+  publication adds no second sample.
+- `qbit_prism_accepted_block_oldest_unpublished_seconds` (gauge) is the age of
+  the oldest accepted block whose landed payout revision this frontend has not
+  yet published: 0 when there is none, and -1 when the age could not be derived.
+  Unknown is not healthy and never fires the page. This is the signal that
+  exists *during* a hold, before any histogram sample exists.
+- `qbit_prism_stale_payout_revision_job_refusals_total` (counter) counts job
+  builds this frontend refused because its published payout revision was behind
+  the cluster's. It counts refusals, not waits: there is no native degraded
+  publication path and no preview to wait for.
+
+Two rules read them, both provisional until #291 measures them.
+`PrismAcceptedBlockWorkPublicationStalled` pages while the gauge exceeds 120
+seconds for one minute, excluding the unknown -1;
+`PrismStalePayoutRevisionJobRefusals` pages on any refusal within ten minutes.
+No rule reads the histogram's buckets: it carries the distribution that #275's
+one-second budget and #447's harness comparison need, not a firing condition.
+The two rules replace the five deployed 2.x.x preview-publication and
+parent-preview-timeout alerts; see the
+[alert migration](prism-alert-migration.md).
 
 ## Diagnosing Stratum admission saturation
 
@@ -298,7 +342,9 @@ settlement advisory-lock acquisitions record into
 `database_advisory_lock_wait_seconds`; the CPFP funding lock is not timed.
 Selected non-transaction ledger queries are timed through `Ledger::acquire`,
 with remaining caller coverage tracked in #352; this is not an acquisition census. The native alert specification
-attaches no firing rule to first-offer or advisory-lock timing.
+attaches no firing rule to first-offer or advisory-lock timing, nor to the
+accepted-block work publication histogram; the oldest-unpublished gauge and the
+stale-payout-revision refusal counter each carry a paging rule.
 `PrismDatabasePoolWaitHigh` describes both collector and instrumented ledger
 acquisitions, including cancellation observations from #328 and #345. The collector
 acquires from the same pool as the ledger, so pool exhaustion can fail collection

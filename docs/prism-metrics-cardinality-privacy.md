@@ -7,10 +7,10 @@ generated from registry descriptors or the inventory document. The census
 compares every family name and type, requires one HELP and TYPE per family, and
 compares every sample name and complete label tuple. Duplicate samples fail.
 
-The current bound is **47 families and 264 series**, including histogram
-`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **166 series**:
-first-offer and advisory-lock metadata exist, but their 98 derived series remain
-absent until observations occur. All 14 rejection reasons, two ACK outcomes,
+The current bound is **50 families and 294 series**, including histogram
+`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **168 series**:
+first-offer, advisory-lock and accepted-block work publication metadata exist,
+but their 126 derived series remain absent until observations occur. All 14 rejection reasons, two ACK outcomes,
 two pool outcomes, six lock/outcome pairs, two collectors, ten task kinds, two
 connection refusal reasons and four stale-job causes are covered. Bucket bounds
 are independently pinned, including ACK's 15/20-second buckets and CTV chunk

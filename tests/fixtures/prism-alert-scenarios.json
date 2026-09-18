@@ -819,5 +819,89 @@
       "PrismHAStandbyReplayLagHigh": 1,
       "PrismHAStandbyDisconnected": 0
     }
+  },
+  {
+    "name": "landed revision held unpublished past the bound pages",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 307.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+0x200 1+0x160",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": 1,
+      "PrismStalePayoutRevisionJobRefusals": 1
+    }
+  },
+  {
+    "name": "landed revision published within the bound is healthy",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 3.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": 0,
+      "PrismStalePayoutRevisionJobRefusals": 0
+    }
+  },
+  {
+    "name": "no accepted block awaiting publication is a real zero",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": 0,
+      "PrismStalePayoutRevisionJobRefusals": 0
+    }
+  },
+  {
+    "name": "unknown oldest unpublished age never pages",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": null,
+      "PrismStalePayoutRevisionJobRefusals": 0
+    }
+  },
+  {
+    "name": "stale snapshot does not page on a retained unpublished age",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 307.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": null,
+      "PrismStalePayoutRevisionJobRefusals": 0
+    }
+  },
+  {
+    "name": "scrape gap does not page on held or refused work",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 307.0,
+      "qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+0x200 1+0x160",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0
+    },
+    "expect": {
+      "PrismAcceptedBlockWorkPublicationStalled": null,
+      "PrismStalePayoutRevisionJobRefusals": null
+    }
   }
 ]

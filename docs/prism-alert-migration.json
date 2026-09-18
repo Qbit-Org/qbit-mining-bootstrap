@@ -183,41 +183,51 @@
       "uid": "qbit-prism-preview-publish-latency",
       "title": "PrismAcceptedPreviewPublicationLatencyHigh",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismAcceptedBlockWorkPublicationStalled"
+      ],
+      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while an accepted block's landed payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-preview-publish-latency-crit",
       "title": "PrismAcceptedPreviewPublicationLatencyCritical",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismAcceptedBlockWorkPublicationStalled"
+      ],
+      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while an accepted block's landed payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-preview-publish-degraded",
       "title": "PrismAcceptedPreviewPublicationDegraded",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismStalePayoutRevisionJobRefusals"
+      ],
+      "reason": "Migrated to stale-revision job refusals: native has no degraded publication path, so there is nothing to count as degraded. A frontend that cannot serve the cluster's payout revision refuses the job build, and each refusal is counted and pages."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts",
       "title": "PrismAcceptedParentPreviewWaitTimeouts",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismStalePayoutRevisionJobRefusals"
+      ],
+      "reason": "Migrated to stale-revision job refusals: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes pages. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts-crit",
       "title": "PrismAcceptedParentPreviewWaitTimeoutsCritical",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismStalePayoutRevisionJobRefusals"
+      ],
+      "reason": "Migrated to stale-revision job refusals: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes pages. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-unresolved-parent-depth",
@@ -765,23 +775,32 @@
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_work_publication_seconds",
+        "qbit_prism_accepted_block_oldest_unpublished_seconds"
+      ],
+      "reason": "Native accepted-block work publication histogram: from the durable accepted-offer time to this frontend's first publication whose payout revision includes the landing, by result published or superseded; the oldest-unpublished gauge carries the stall signal. Adopted blocks yield no sample."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_bucket",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_work_publication_seconds"
+      ],
+      "reason": "Native accepted-block work publication histogram: from the durable accepted-offer time to this frontend's first publication whose payout revision includes the landing, by result published or superseded; the oldest-unpublished gauge carries the stall signal. Adopted blocks yield no sample."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_count",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_work_publication_seconds"
+      ],
+      "reason": "Native accepted-block work publication histogram: from the durable accepted-offer time to this frontend's first publication whose payout revision includes the landing, by result published or superseded; the oldest-unpublished gauge carries the stall signal. Adopted blocks yield no sample."
     },
     {
       "name": "qbit_prism_accepted_parent_preview_wait_timeouts_total",
-      "replacement": [],
-      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+      "replacement": [
+        "qbit_prism_stale_payout_revision_job_refusals_total"
+      ],
+      "reason": "Native stale-payout-revision job refusals: a stale-revision build is refused immediately rather than waited on, so refusals replace wait timeouts."
     },
     {
       "name": "qbit_prism_accepted_parent_unresolved_depth_max",

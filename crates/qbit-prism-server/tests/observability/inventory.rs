@@ -245,6 +245,51 @@ fn native_rules_reference_only_inventory_families_for_their_role() {
     }
 }
 
+fn duration_seconds(text: &str) -> u64 {
+    let (mut total, mut digits) = (0, String::new());
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            other => panic!("unsupported duration unit {other} in {text}"),
+        };
+        total += digits.parse::<u64>().unwrap() * unit;
+        digits.clear();
+    }
+    assert!(digits.is_empty(), "duration {text} lacks a unit");
+    total
+}
+
+#[test]
+fn accepted_work_publication_pages_during_the_hold() {
+    // #413: a five-minute dwell made the coverage-loss page fire only at
+    // recovery (docs/prism-alert-migration.md:257-260). A rule on the
+    // oldest-unpublished gauge must fire during the hold, not after it.
+    let spec: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../docs/prism-native-alert-rules.json"
+    ))
+    .unwrap();
+    let rules: Vec<_> = spec["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|rule| {
+            metric_tokens(rule["expr"].as_str().unwrap())
+                .contains("qbit_prism_accepted_block_oldest_unpublished_seconds")
+        })
+        .collect();
+    assert!(!rules.is_empty());
+    for rule in rules {
+        let dwell = duration_seconds(rule["for"].as_str().unwrap());
+        assert!(dwell < 300, "{} dwells {dwell} seconds", rule["title"]);
+    }
+}
+
 #[test]
 fn migration_covers_every_deployed_alert_and_all_46_historical_names() {
     let migration: serde_json::Value =
@@ -307,7 +352,7 @@ fn migration_covers_every_deployed_alert_and_all_46_historical_names() {
             other => panic!("unrecognized disposition: {other}"),
         }
     }
-    assert_eq!(counts, [22, 34, 22]);
+    assert_eq!(counts, [27, 34, 17]);
     let historical = metric_tokens(include_str!("../../../../docs/prism-overload-alerts.md"));
     assert_eq!(historical.len(), 46);
     let retired = migration["retired_names"].as_array().unwrap();

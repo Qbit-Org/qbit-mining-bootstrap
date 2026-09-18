@@ -327,7 +327,7 @@
         "page": "true"
       },
       "summary": "PrismSemanticWorkCoverageLossCritical",
-      "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
+      "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. PrismAcceptedBlockWorkPublicationStalled now pages during a landed-but-unpublished hold before coverage decays, so this rule is the backstop for the delivery side. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
       "basis": "Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
@@ -613,6 +613,60 @@
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",
         "crates/qbit-prism-server/src/metrics/registry.rs#L73",
         "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-accepted-work-publication-stalled",
+      "title": "PrismAcceptedBlockWorkPublicationStalled",
+      "role": "run",
+      "expr": "((qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 120) and on(job, instance, network) (qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismAcceptedBlockWorkPublicationStalled",
+      "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest accepted pool block whose landed payout revision this frontend has not yet published, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Zero when none; unknown -1 never fires. The gauge is rendered from the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L91",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L92",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L1",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-stale-revision-job-refusals",
+      "title": "PrismStalePayoutRevisionJobRefusals",
+      "role": "run",
+      "expr": "(increase(qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[10m]) > bool 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismStalePayoutRevisionJobRefusals",
+      "description": "Per frontend: job builds refused because this frontend's published payout revision was behind the cluster's. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L93",
         "crates/qbit-prism-server/src/metrics.rs#L39"
       ]
     },
