@@ -82,7 +82,7 @@ impl Database {
         Ledger::connect(&self.url, id.to_owned(), 8, true).await
     }
 
-    /// EP-ERRORS: the database goes away on success and on failure alike.
+    /// The database goes away on success and on failure alike.
     async fn close(self, ledgers: Vec<Ledger>) -> Result<()> {
         for ledger in ledgers {
             ledger.pool.close().await;
@@ -512,7 +512,7 @@ async fn serialization_case(db: &Database, ledger: &Ledger) -> Result<()> {
     Ok(())
 }
 
-/// EP-ERRORS. A reconstruction that fails or is cancelled returns the permit
+/// A reconstruction that fails or is cancelled returns the permit
 /// exactly once, whichever side of the blocking job it ends on: with the
 /// future when no job was queued, and with the job when one was.
 #[test]
