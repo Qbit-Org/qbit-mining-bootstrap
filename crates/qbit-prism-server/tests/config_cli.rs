@@ -796,22 +796,20 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
 }
 
 /// A deploy that skips `check-config` must not start on a 2.x.x environment:
-/// the serve path applies the same unread-settings check before anything binds.
+/// the serve path applies the same unread-settings check, and applies it before
+/// it parses configuration or contacts the node.
 #[tokio::test]
 async fn unread_environment_stops_the_serve_path_in_production() {
-    // Hold the port the mining listener would take, so a bind attempt would be
-    // visible in the diagnostic rather than silently succeeding.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
     let settings = [
-        ("PRISM_STRATUM_PORT", port.as_str()),
+        // A known setting the parser rejects. Ordering is what is under test:
+        // this error may only surface once the unread names are gone.
+        ("PRISM_BLOCKWAIT_ENABLED", "not-a-boolean"),
         (
             "PRISM_CANDIDATE_ORPHAN_TERMINAL_CONFIRMATIONS",
             "private-retired-value",
         ),
         ("PRISM_MISSPELLED_SETTING", "another-private-value"),
     ];
-    let started = Instant::now();
     let output = configured_command("run", true, &settings).await;
     assert!(
         !output.status.success(),
@@ -828,9 +826,13 @@ async fn unread_environment_stops_the_serve_path_in_production() {
     assert!(!error.contains("private-retired-value"));
     assert!(!error.contains("another-private-value"));
     assert!(!error.contains("test-only-password"));
-    // Neither the mining listener nor PostgreSQL was reached before the refusal.
-    assert!(!error.to_ascii_lowercase().contains("address"), "{error}");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // The refusal is the whole failure. Configuration was never parsed and the
+    // node was never contacted, so nothing downstream of the check ran.
+    assert!(
+        !error.contains("PRISM_BLOCKWAIT_ENABLED must be a boolean"),
+        "{error}"
+    );
+    assert!(!error.contains("transport failed"), "{error}");
 }
 
 /// Outside production the same names warn and the serve path keeps going, so an
@@ -857,6 +859,12 @@ async fn unread_environment_only_warns_on_the_lab_serve_path() {
     assert!(error.contains("PRISM_MISSPELLED_SETTING"), "{error}");
     assert!(!error.contains("private-retired-value"));
     assert!(!error.contains("another-private-value"));
+    // The warning did not stop the frontend: startup continued until the
+    // fixture's unreachable node refused the first RPC call.
+    assert!(
+        error.contains("qbit RPC getblockhash transport failed"),
+        "{error}"
+    );
 }
 
 /// The predecessor of the native orphan-confirmation setting stays inventoried,
