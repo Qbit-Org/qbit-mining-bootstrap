@@ -655,10 +655,48 @@ async fn artifact_route_load_at_a_large_window() -> Result<()> {
 // B2: permit discipline
 // ---------------------------------------------------------------------------
 
+/// Run one read while the runtime's only blocking thread is occupied: the
+/// request's deadline expires before its blocking job can start, and the job
+/// that holds the permit outlives the request that asked for it.
+async fn gate_a_read_and_let_it_time_out(
+    app: &Router,
+    path: &str,
+    rebuilds: &Arc<tokio::sync::Semaphore>,
+    shape: &str,
+) -> Result<()> {
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let gate = tokio::task::spawn_blocking(move || {
+        let _ = blocked.recv();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let clock = Instant::now();
+    let reply = fetch(app, path).await;
+    ensure!(
+        reply.status == StatusCode::SERVICE_UNAVAILABLE
+            && reply.json()["error"]["code"] == "read_timeout",
+        "a {shape} read that outlives the deadline is a read timeout, got {}: {}",
+        reply.status,
+        reply.json()
+    );
+    ensure!(clock.elapsed() < Duration::from_secs(5), "deadline overrun");
+    // The request is gone; the blocking job that holds the permit is not.
+    ensure!(
+        rebuilds.available_permits() == 0,
+        "a cancelled {shape} read freed the rebuild permit before its blocking work ended"
+    );
+    let _ = release.send(());
+    gate.await?;
+    until(
+        Duration::from_secs(10),
+        "the rebuild permit to come back",
+        || rebuilds.available_permits() == 1,
+    )
+    .await
+}
+
 async fn permit_discipline(f: &Fixture) -> Result<()> {
     let plan = WindowPlan::new(64)?;
     let landed = land_window(&f.ledger, &plan).await?;
-    seal(&f.ledger.pool, &landed).await?;
     let state = f.state(ApiConfig {
         cache_enabled: false,
         read_concurrency: 1,
@@ -679,40 +717,21 @@ async fn permit_discipline(f: &Fixture) -> Result<()> {
             && admission.available_permits() as u32 == state.config.audit_artifact_max_in_flight
     );
 
-    // Occupy the runtime's only blocking thread, so the decode's blocking job
-    // is queued but not running when the request's deadline expires.
-    let (release, blocked) = std::sync::mpsc::channel::<()>();
-    let gate = tokio::task::spawn_blocking(move || {
-        let _ = blocked.recv();
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let clock = Instant::now();
-    let reply = fetch(&app, &path).await;
-    ensure!(
-        reply.status == StatusCode::SERVICE_UNAVAILABLE
-            && reply.json()["error"]["code"] == "read_timeout",
-        "a decode that outlives the deadline is a read timeout, got {}: {}",
-        reply.status,
-        reply.json()
-    );
-    ensure!(clock.elapsed() < Duration::from_secs(5), "deadline overrun");
-    // The request is gone; the blocking job that holds the permit is not.
-    ensure!(
-        rebuilds.available_permits() == 0,
-        "a cancelled request freed the rebuild permit before its blocking work ended"
-    );
+    // Both shapes hold the permit in their own blocking job: the rebuild of an
+    // unsealed row, which the row still is, and the decode of a sealed one.
+    // The rebuild's job is inside the materialization, so a permit kept by the
+    // request frame instead would be freed here by the cancellation.
+    gate_a_read_and_let_it_time_out(&app, &path, &rebuilds, "unsealed rebuild").await?;
     ensure!(
         admission.available_permits() as u32 == state.config.audit_artifact_max_in_flight,
         "the in-flight cap is released with the request"
     );
-    let _ = release.send(());
-    gate.await?;
-    until(
-        Duration::from_secs(10),
-        "the rebuild permit to come back",
-        || rebuilds.available_permits() == 1,
-    )
-    .await?;
+    seal(&f.ledger.pool, &landed).await?;
+    gate_a_read_and_let_it_time_out(&app, &path, &rebuilds, "sealed decode").await?;
+    ensure!(
+        admission.available_permits() as u32 == state.config.audit_artifact_max_in_flight,
+        "the in-flight cap is released with the request"
+    );
 
     // A failed read releases the permit too.
     sqlx::query(
@@ -890,6 +909,98 @@ async fn an_over_cap_artifact_request_is_refused_before_any_audit_read() -> Resu
         );
         pool.close().await;
         proxy.finish().await
+    }
+    .await;
+    f.close(result).await
+}
+
+/// A refusal is not a result: with the response cache on, neither the request
+/// that is refused nor one sharing its computation may be served a stored or
+/// shared success, and the first read after the cap frees up must compute the
+/// artifact rather than find a refusal in the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_artifact_is_never_cached_nor_shared_as_a_success() -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let plan = WindowPlan::new(128)?;
+        let landed = land_window(&f.ledger, &plan).await?;
+        // The artifact is well under `cache_max_bytes`, so a success here is
+        // cacheable: a cached refusal would be visible as a hit below.
+        ensure!(
+            landed.canonical.len() < ApiConfig::default().cache_max_bytes,
+            "the fixture artifact must be small enough to be cached"
+        );
+        let state = f.state(ApiConfig {
+            cache_enabled: true,
+            cache_debug_headers: true,
+            audit_artifact_max_in_flight: 1,
+            ..f.config()
+        });
+        let app = router(state.clone());
+        let path = artifact_path(&landed.sha256);
+        let cache_state = |reply: &Reply| {
+            reply.headers["x-prism-public-cache"]
+                .to_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        // The one slot, taken as a concurrent read of another artifact would.
+        let held = state.audit_artifact_admission().try_acquire_owned()?;
+        let mut refused = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let app = app.clone();
+            let path = path.clone();
+            refused.spawn(async move { fetch(&app, &path).await });
+        }
+        // Requests for one artifact share a computation, so a follower is
+        // answered by the leader's refusal; it must be that refusal.
+        for reply in refused.join_all().await {
+            ensure!(
+                reply.status == StatusCode::SERVICE_UNAVAILABLE
+                    && reply.json()["error"]["code"] == "audit_artifact_busy"
+                    && reply.headers["cache-control"] == "no-store",
+                "a refused or shared request must be the refusal, got {}: {}",
+                reply.status,
+                reply.json()
+            );
+        }
+        // Still refused, and from the cap rather than from a stored refusal.
+        let reply = fetch(&app, &path).await;
+        ensure!(
+            reply.status == StatusCode::SERVICE_UNAVAILABLE
+                && reply.json()["error"]["code"] == "audit_artifact_busy",
+            "the cap still refuses, got {}: {}",
+            reply.status,
+            reply.json()
+        );
+
+        drop(held);
+        let reply = fetch(&app, &path).await;
+        ensure!(
+            reply.status == StatusCode::OK && reply.bytes == landed.canonical,
+            "the read after the cap frees up must serve the artifact, got {}",
+            reply.status
+        );
+        ensure!(
+            cache_state(&reply) != "HIT",
+            "the first read after a refusal came from the cache: {}",
+            cache_state(&reply)
+        );
+        // The success is cacheable, which is what makes the assertion above a
+        // real one rather than a route that never caches anything.
+        let reply = fetch(&app, &path).await;
+        ensure!(
+            reply.status == StatusCode::OK
+                && reply.bytes == landed.canonical
+                && cache_state(&reply) == "HIT",
+            "a served artifact is cached: {} {}",
+            reply.status,
+            cache_state(&reply)
+        );
+        Ok(())
     }
     .await;
     f.close(result).await
