@@ -26,7 +26,7 @@ In the replacement column `path::name` is a Rust test function (`#[test]` or `#[
 
 | Rows | Full | Partial | Open gap | Needs triage | Retired |
 | --- | --- | --- | --- | --- | --- |
-| 142 | 6 | 71 | 5 | 4 | 56 |
+| 142 | 6 | 72 | 5 | 3 | 56 |
 
 Open gap rows link: [#271](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/271) (1 row), [#272](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/272) (1 row), [#280](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/280) (1 row), [#285](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/285) (2 rows). Partial rows whose uncovered remainder is owned by an issue link it inline in the same way.
 
@@ -346,7 +346,6 @@ Rows with no native test and no issue that closes them. Each needs an owner to d
 | --- | --- | --- |
 | `tests/test_prism_issue_224_landing.py` | Payout window, payout state, window pipeline parity and issue #224 telemetry | landing-phase attribution (acceptance-to-preview interval, closed phase labels) has no native family; `docs/prism-native-metrics.md` lists landing-phase instrumentation as outside the cutover set and no candidate issue names it |
 | `tests/test_prism_accepted_preview_publication_latency.py` | Payout window, payout state, window pipeline parity and issue #224 telemetry | no native acceptance-to-usable-work latency histogram; landing-phase instrumentation is outside #278's trimmed cutover set and the cadence measurement it drove is only a criterion of #271, not a test |
-| `tests/test_prism_stratum_restart_bind.py` | Stratum sessions, admission, job delivery, retained jobs and the submit hot path | native `server::run` (`crates/qbit-prism-server/src/server.rs`) binds both Stratum listeners before coordinator work starts, but no native test asserts bind-before-recovery, bind retry against a draining predecessor, retry abort on shutdown, or port release on abort; no candidate issue names this |
 | `tests/test_prism_ctv_refresh_priority.py` | Job builder, template and tip refresh, refresh liveness | listed only as #260 backlog ("CTV yield"), no issue; the native broadcaster is an independent Tokio task with no yield-to-pending-tip contract to assert |
 
 ## Native storm evidence
