@@ -165,8 +165,10 @@ fn scan_line(path: &str, number: usize, line: &str, rust: bool, sites: &mut Vec<
     }
 }
 
-/// The server's Rust and SQL sources plus the shipped schema, relative to the
-/// workspace root so a failure names a path a reader can open.
+/// The server's Rust and SQL sources, its migrations and the shipped schema,
+/// relative to the workspace root so a failure names a path a reader can open.
+/// No migration spells the multiplier today; the directory is scanned so one
+/// that redefines the window view cannot introduce a copy unnoticed.
 fn scanned_sources() -> Vec<(String, PathBuf)> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -175,6 +177,7 @@ fn scanned_sources() -> Vec<(String, PathBuf)> {
     let mut sources = Vec::new();
     let mut pending = vec![
         workspace.join("crates/qbit-prism-server/src"),
+        workspace.join("crates/qbit-prism-server/migrations"),
         workspace.join("crates/qbit-prism/sql"),
     ];
     while let Some(directory) = pending.pop() {
