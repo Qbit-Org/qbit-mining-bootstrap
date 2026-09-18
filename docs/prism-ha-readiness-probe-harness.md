@@ -14,3 +14,9 @@ controls, including transient rebuild preservation, bounded ejection, recovery
 gating, timeout handling, and validation of non-default thresholds. It is a
 deterministic health-check and hysteresis simulator, not an integration,
 deployment, live load-balancer, or performance qualification.
+
+The [bounded #281 functional procedure](prism-ha-functional-qualification.md)
+reuses this simulator alongside the existing real PostgreSQL and Stratum
+fixtures. It records the remaining operator TCP endpoint, actual-overlay resume
+and full failover gates separately; a simulated readiness trace does not satisfy
+any live routing acceptance criterion.
