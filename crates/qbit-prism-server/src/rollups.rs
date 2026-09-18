@@ -1,7 +1,8 @@
 //! Incremental dashboard history, independently maintained by any frontend.
+use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
-use sqlx::PgPool;
-use std::time::Duration;
+use sqlx::{PgPool, Transaction};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy)]
@@ -42,11 +43,20 @@ pub fn settings_from_env() -> Result<Option<Settings>> {
 /// batch into all grains. A competing frontend can win; its loser adds nothing.
 /// This needs no lease or share-order lock and never changes accounting rows.
 pub async fn advance(pool: &PgPool, batch: u32) -> Result<Progress> {
+    advance_with_metrics(pool, batch, None).await
+}
+
+async fn advance_with_metrics(
+    pool: &PgPool,
+    batch: u32,
+    metrics: Option<&Metrics>,
+) -> Result<Progress> {
     ensure!(
         batch > 0 && batch <= 100_000,
         "rollup batch must be 1..100000"
     );
-    let mut transaction = pool.begin().await?;
+    let mut transaction =
+        Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await?;
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *transaction)
         .await?;
@@ -63,10 +73,15 @@ pub async fn advance(pool: &PgPool, batch: u32) -> Result<Progress> {
     })
 }
 
-pub async fn run(
+pub async fn run(pool: PgPool, settings: Settings, shutdown: watch::Receiver<bool>) -> Result<()> {
+    run_with_metrics(pool, settings, shutdown, None).await
+}
+
+pub(crate) async fn run_with_metrics(
     pool: PgPool,
     settings: Settings,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<Metrics>>,
 ) -> Result<()> {
     let mut tick = tokio::time::interval(settings.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -77,7 +92,7 @@ pub async fn run(
         }
         tokio::select! {
             _ = shutdown.changed() => break,
-            result = advance(&pool, settings.batch) => match result {
+            result = advance_with_metrics(&pool, settings.batch, metrics.as_deref()) => match result {
                 Ok(progress) => tracing::debug!(scanned=progress.scanned,
                     last_share_seq=progress.last_share_seq, advanced=progress.advanced,
                     "hashrate rollup maintenance"),
@@ -87,3 +102,6 @@ pub async fn run(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

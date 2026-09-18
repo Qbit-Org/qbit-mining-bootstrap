@@ -141,10 +141,11 @@ pub async fn run(config: Config) -> Result<()> {
     if let Some(settings) = rollup_settings {
         tasks.spawn(runtime.track(
             TaskKind::Rollup,
-            crate::rollups::run(
+            crate::rollups::run_with_metrics(
                 coordinator.ledger.pool.clone(),
                 settings,
                 shutdown_rx.clone(),
+                Some(registry.clone()),
             ),
         ));
     }

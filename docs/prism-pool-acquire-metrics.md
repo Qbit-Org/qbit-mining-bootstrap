@@ -12,7 +12,7 @@ records one `result="failure"` observation with its elapsed duration. Creating
 and dropping an acquisition future without polling it records nothing.
 An acquisition still waiting has not yet contributed to `_count`.
 
-Ledger and collector checkouts use `metrics::time_pool_acquire`, alongside
+Ledger, collector and rollup checkouts use `metrics::time_pool_acquire`, alongside
 the metrics recording hooks, and Tokio's monotonic clock.
 In an unpaused runtime this measures real elapsed time. In a paused test
 runtime it follows the runtime's controlled clock; ledger checkouts now share
@@ -23,7 +23,7 @@ Advisory-lock observations retain their separate standard monotonic clock.
 ## Coverage
 
 In addition to the existing ledger transaction and metrics collector
-acquisitions, these direct statements use the shared checkout timer:
+acquisitions, these paths use the shared checkout timer:
 
 - `payout_revision` and `release_session_owner_reservations`;
 - `SessionId::release` and its spawned drop cleanup;
@@ -42,6 +42,7 @@ acquisitions, these direct statements use the shared checkout timer:
 - `job`, `compact_prepared`, and `prune_expired_jobs`;
 - `WorkLedger::now_ms`, `chain_observation_state`, and `persist_block_only`'s
   initial duplicate probe and credit/disposition polls;
+- the server's rollup loop, once per valid `advance` attempt;
 - `apply_online_migration`'s startup checkout, before the connection is detached.
 
 Each pending online migration records one checkout when metrics are attached.
@@ -112,6 +113,19 @@ is definite; after enqueue a failed or missing read does not prove whether the
 durable candidate earned credit. Timing changes neither that distinction nor
 the enqueue's existing handling of an unknown outcome.
 
+The server passes its existing metrics handle to the rollup loop. Each valid
+rollup attempt records one checkout before `BEGIN`; `SET LOCAL`, the single
+rollup statement and `COMMIT` reuse that connection and add no observations.
+A real batch and an empty batch both record success. Invalid batches and
+unpolled futures record nothing. Pool errors and cancellation during checkout
+record failure; later SQL errors or cancellation retain the completed success
+and its duration. Shutdown drops the in-flight attempt using the existing
+select. Timing changes no transaction ownership, statement timeout, tick
+scheduling or error propagation. Cancellation after `COMMIT` starts can still
+be committed: the existing watermark and idempotence semantics reconcile that
+outcome. The public pool-only `rollups::advance` and `rollups::run` wrappers
+remain compatible and record nothing.
+
 Polls contribute actual acquisition attempts to the same aggregate histogram
 as the other covered callers. Expanding coverage can change its percentile:
 a pending candidate can produce many fast acquisitions when the pool has spare
@@ -123,12 +137,16 @@ per-caller latency or settlement latency. Adding fast samples can lower the
 aggregate p99; this coverage change does not change the alert's grouping,
 threshold or minimum count.
 
+Rollup attempts also join this aggregate population, including no-work ticks.
+Their checkout counts describe attempts, not folded shares or completed
+rollups; fast rollup checkouts can lower the aggregate percentile too.
+
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
 Other direct coordinator, candidate and startup queries still acquire without
 this helper. The pool-only public helpers have no attached metrics owner:
 `audit_canonical_bytes`'s representation lookup and its reconstruction, and
 direct public calls to `materialize_audit_row`, still record no observations.
-The separate rollup transaction also remains untimed. Public API read pools and the public role's export
+Public API read pools and the public role's export
 policy require a separate decision. Consequently `_count` is neither a census
 of pool acquisitions nor request throughput.
 
@@ -141,9 +159,10 @@ Remaining sites outside this slice include:
 - `ledger/audit.rs`: the pool-only public helper reads described above;
   startup/migration validation helpers keep their existing
   connection ownership.
+- `partitions.rs`: startup attachment and background partition maintenance.
 
 Coordinator startup checks, candidate lease/terminal reconciliation,
-public read pools, operator connections and the rollup transaction remain
+public read pools, operator connections and pool-only rollup wrappers remain
 outside this slice.
 The other `ledger/window.rs` reads take transactions through `Ledger::begin`
 and pass existing connections to range/probe readers; those readers must not
