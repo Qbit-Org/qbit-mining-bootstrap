@@ -28,7 +28,7 @@ Without flags the check is offline and is what required CI runs:
 - the summary table and the per-section counts equal the rows;
 - the needs triage index lists exactly the needs triage rows;
 - every issue link points at this repository's issue of the same number, and
-  an owner arrow is followed by a link rather than a bare number.
+  an owner arrow introducing an issue number is followed by a complete link.
 
 `--check-issues` additionally asks GitHub for the state of every issue the map
 names as the owner of uncovered behaviour and fails if one is closed. An owner
@@ -110,7 +110,9 @@ REFERENCE = re.compile(
     r"^(?P<path>[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?P<ext>rs|py))::(?P<name>[A-Za-z_][A-Za-z0-9_]*)$"
 )
 ISSUE_LINK = re.compile(r"(?P<arrow>(?:→|->)\s*)?\[#(?P<label>[0-9]+)\]\((?P<url>[^)\s]*)\)")
-BARE_OWNER = re.compile(r"(?:→|->)\s*#[0-9]+")
+# Numeric owner claims, including broken brackets; leave the `→ [#N](…)`
+# syntax example and standalone arrows alone.
+OWNER_ARROW = re.compile(r"(?:→|->)\s*(?=[\[\s]*#[0-9]+)")
 SECTION_LIST_ITEM = re.compile(r"^- (?P<name>.+) \((?P<count>[0-9]+)\)$")
 RUST_FN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*[(<]"
@@ -258,13 +260,16 @@ def parse_map(text: str) -> ParsedMap:
             # A blank line may separate the lead from its items; anything after them ends the list.
             in_section_list = False
     for number, line in enumerate(lines, start=1):
+        linked_arrows: set[int] = set()
         for link in ISSUE_LINK.finditer(line):
             parsed.links.append(
                 IssueLink(number, int(link.group("label")), link.group("url"), link.group("arrow") is not None)
             )
-        if BARE_OWNER.search(line):
+            if link.group("arrow") is not None:
+                linked_arrows.add(link.start())
+        if any(arrow.start() not in linked_arrows for arrow in OWNER_ARROW.finditer(line)):
             parsed.errors.append(
-                at(number, "an owner arrow must be followed by an issue link, not a bare number, so its state can be checked")
+                at(number, "an owner arrow must be followed by an issue link with a complete URL, so its state can be checked")
             )
     return parsed
 

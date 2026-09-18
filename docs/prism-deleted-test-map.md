@@ -67,7 +67,7 @@ This map is evidence for the cutover go/no-go (#291), so it is checked, not trus
 - a `path::name` reference names a file that is not in the repository, a function that is not in that file, or a function that is not a test;
 - a table line does not parse, a status is not one the legend defines, a row's text does not lead with its status, a full or partial row cites no test, or an open gap row links no issue;
 - the summary table or the section row counts differ from the rows, or the needs triage index differs from the needs triage rows;
-- an issue link does not point at this repository's issue of the same number, or an owner arrow is followed by a bare `#N` instead of a link.
+- an issue link does not point at this repository's issue of the same number, or an owner arrow introduces an issue number with a bare reference or malformed link.
 
 The offline check imports Python tests for discovery but does not execute fixtures or test bodies. The required Python unit test shards separately require a successful execution of every Python citation assigned to that shard, using the normal unittest run. Module, class, case and async fixture skips, test-body skips and expected failures do not count as successful parity evidence. Uncited optional tests may still skip. A local offline `ok` establishes map consistency; the required test jobs establish execution.
 

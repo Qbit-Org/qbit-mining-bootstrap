@@ -897,6 +897,42 @@ fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /
             with self.subTest(arrow=arrow):
                 self.assert_fails(edited(f"(→ [#7]({ISSUES}/7))", f"({arrow} #7)"), "an owner arrow must be followed by an issue link")
 
+    def test_malformed_owner_links_fail_even_beside_valid_links(self) -> None:
+        for arrow in ("→", "->"):
+            for reference in (
+                "[#7]",
+                "[#7",
+                "[ #7]",
+                "[[#7]]",
+                "[#7][owner]",
+                f"[#7] ({ISSUES}/7)",
+                f"[#7]({ISSUES}/7",
+                f"[#7]( {ISSUES}/7)",
+                f"[#7]({ISSUES}/7 )",
+                f'[#7]({ISSUES}/7 "owner")',
+                f"#7]({ISSUES}/7)",
+            ):
+                with self.subTest(arrow=arrow, reference=reference):
+                    text = edited(f"(→ [#7]({ISSUES}/7))", f"{arrow} {reference}")
+                    self.assert_fails(
+                        text,
+                        f"docs/prism-deleted-test-map.md:{line_of('`tests/test_b.py`')}: an owner arrow must be followed by an issue link",
+                    )
+
+    def test_malformed_owner_links_fail_in_prose_cases_and_triage(self) -> None:
+        for arrow in ("→", "->"):
+            for original in (
+                "prose may link a closed issue as history.",
+                "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block`",
+                "| Stratum | nobody owns it",
+            ):
+                with self.subTest(arrow=arrow, original=original):
+                    text = edited(original, f"{original} {arrow} [#11]")
+                    self.assert_fails(
+                        text,
+                        f"docs/prism-deleted-test-map.md:{line_of(original)}: an owner arrow must be followed by an issue link",
+                    )
+
     def test_summary_lists_counts_and_open_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1054,6 +1090,26 @@ class IssueStateTests(unittest.TestCase):
                 result, _ = self.check({**ALL_OPEN, 11: state("closed")}, text=text)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("#11 is closed", result.stderr)
+
+    def test_each_valid_owner_arrow_is_checked_on_the_same_line(self) -> None:
+        for arrow in ("→", "->"):
+            for spacing in ("", " ", "\t"):
+                with self.subTest(arrow=arrow, spacing=spacing):
+                    text = edited(
+                        f"→ [#7]({ISSUES}/7)",
+                        f"{arrow}{spacing}[#7]({ISSUES}/7), {arrow}{spacing}[#11]({ISSUES}/11)",
+                    )
+                    result, stub = self.check({**ALL_OPEN, 11: state("open")}, text=text)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(sorted(stub.asked()), [6, 7, 8, 9, 11])
+
+    def test_malformed_owner_links_fail_when_known_owners_are_open(self) -> None:
+        for arrow in ("→", "->"):
+            with self.subTest(arrow=arrow):
+                text = edited(f"→ [#7]({ISSUES}/7)", f"→ [#7]({ISSUES}/7), {arrow} [#11]")
+                result, _ = self.check(dict(ALL_OPEN), text=text)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("an owner arrow must be followed by an issue link", result.stderr)
 
     def test_a_link_in_the_needs_triage_index_is_an_owner(self) -> None:
         text = edited("| Stratum | nobody owns it |", f"| Stratum | nobody owns it, [#10]({ISSUES}/10) might |")
