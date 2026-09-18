@@ -591,6 +591,16 @@ def check_issues(
     return closed, unknown
 
 
+def has_uncovered_remainder(row: Row) -> bool:
+    """Read coverage clauses, distinguishing an explicit native-subject none."""
+    for clause in row.text.split(";"):
+        label, _, remainder = clause.strip().partition(":")
+        if label in ("not covered", "not covered, no open issue"):
+            if remainder.strip() != "none with a native subject":
+                return True
+    return False
+
+
 def summary(parsed: ParsedMap) -> str:
     counts = Counter(row.status for row in parsed.file_rows)
     owners_by_line: dict[int, list[int]] = {}
@@ -616,7 +626,7 @@ def summary(parsed: ParsedMap) -> str:
             lines.append(f"- `{row.name}` ({row.status}, owner {owners})")
     unowned = [
         row for row in [*parsed.file_rows, *parsed.case_rows]
-        if row.status == PARTIAL and "not covered" in row.text and row.line not in owners_by_line
+        if row.status == PARTIAL and has_uncovered_remainder(row) and row.line not in owners_by_line
     ]
     if unowned:
         lines += ["", f"Partial rows with an uncovered remainder and no owner issue ({len(unowned)}):"]

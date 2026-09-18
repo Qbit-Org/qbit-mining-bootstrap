@@ -578,6 +578,43 @@ class OfflineTests(unittest.TestCase):
         self.assertNotIn("- `test_case_one`", result.stdout)
         self.assertNotIn("no owner issue", result.stdout)
 
+    def test_summary_excludes_explicitly_empty_native_remainders(self) -> None:
+        for label in ("not covered", "not covered, no open issue"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                text = edited(
+                    f", written when [#6]({ISSUES}/6) landed; not covered: the rest (→ [#7]({ISSUES}/7))",
+                    f"; {label}: none with a native subject; the Python queue mechanics are retired",
+                ).replace(
+                    "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+                    "| `test_case_one` | partial | partial: `crates/demo/tests/ledger.rs::lands_one_block`; "
+                    f"{label}: none with a native subject; the Python epoch fanout is retired |",
+                )
+                root = Path(directory)
+                write_tree(root, text)
+                result = run_check(root, "--summary")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("- `tests/test_b.py`", result.stdout)
+                self.assertNotIn("- `test_case_one`", result.stdout)
+                self.assertNotIn("no owner issue", result.stdout)
+
+    def test_summary_keeps_real_gaps_beside_retired_or_empty_remainders(self) -> None:
+        for remainder in (
+            "not covered: recovery; retired: Python helpers",
+            "not covered: none with a native subject; retired: Python helpers; not covered: recovery",
+        ):
+            with self.subTest(remainder=remainder), tempfile.TemporaryDirectory() as directory:
+                text = edited(
+                    "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+                    "| `test_case_one` | partial | partial: `crates/demo/tests/ledger.rs::lands_one_block`; "
+                    f"{remainder} |",
+                )
+                root = Path(directory)
+                write_tree(root, text)
+                result = run_check(root, "--summary")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Partial rows with an uncovered remainder and no owner issue (1):", result.stdout)
+                self.assertIn("- `test_case_one` (partial, no owner issue)", result.stdout)
+
 
 class IssueStateTests(unittest.TestCase):
     def check(
