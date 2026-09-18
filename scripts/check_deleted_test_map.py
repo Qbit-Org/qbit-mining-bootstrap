@@ -31,8 +31,9 @@ is any issue link inside a table row, or an arrow link (`→ [#N](...)`) anywher
 in the map. A closed issue is history: a row mentions it as plain `#N`, and
 prose may link it without an arrow. Reads `GITHUB_TOKEN` or `GH_TOKEN` when set.
 
-`--summary` prints the row counts and the rows that are still open, for the
-sign-off comment on the qualification issue.
+`--summary` prints the row counts and the rows that are still open, including
+partial rows with a "not covered" remainder but no owner issue, for the sign-off
+comment on the qualification issue.
 
 Exits 0 when the map holds, 1 when it does not, and 2 when `--check-issues`
 could not learn an issue's state (network, rate limit, unexpected reply): an
@@ -569,6 +570,14 @@ def summary(parsed: ParsedMap) -> str:
         for row in owned:
             owners = ", ".join(f"#{number}" for number in owners_by_line[row.line])
             lines.append(f"- `{row.name}` ({row.status}, owner {owners})")
+    unowned = [
+        row for row in [*parsed.file_rows, *parsed.case_rows]
+        if row.status == PARTIAL and "not covered" in row.text and row.line not in owners_by_line
+    ]
+    if unowned:
+        lines += ["", f"Partial rows with an uncovered remainder and no owner issue ({len(unowned)}):"]
+        for row in unowned:
+            lines.append(f"- `{row.name}` (partial, no owner issue)")
     return "\n".join(lines)
 
 

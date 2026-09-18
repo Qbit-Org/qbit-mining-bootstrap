@@ -483,6 +483,37 @@ class OfflineTests(unittest.TestCase):
         self.assertIn("- `tests/test_e.py` (links #9)", result.stdout)
         self.assertIn("- `tests/test_b.py` (partial, owner #6, #7)", result.stdout)
 
+    def test_summary_lists_unowned_partial_file_and_case_gaps(self) -> None:
+        text = edited(
+            f", written when [#6]({ISSUES}/6) landed; not covered: the rest (→ [#7]({ISSUES}/7))",
+            "; not covered, no open issue: the rest (#7 closed)",
+        ).replace(
+            "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+            "| `test_case_one` | partial | partial: `crates/demo/tests/ledger.rs::lands_one_block`; not covered: recovery |",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root, text)
+            result = run_check(root, "--summary")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Partial rows with an uncovered remainder and no owner issue (2):", result.stdout)
+        self.assertIn("- `tests/test_b.py` (partial, no owner issue)", result.stdout)
+        self.assertIn("- `test_case_one` (partial, no owner issue)", result.stdout)
+
+    def test_summary_does_not_report_retired_remainders_or_duplicate_owned_rows(self) -> None:
+        text = edited(
+            "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+            "| `test_case_one` | partial | partial: `crates/demo/tests/ledger.rs::lands_one_block`; retired: Python helpers |",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root, text)
+            result = run_check(root, "--summary")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("- `tests/test_b.py`"), 1)
+        self.assertNotIn("- `test_case_one`", result.stdout)
+        self.assertNotIn("no owner issue", result.stdout)
+
 
 class IssueStateTests(unittest.TestCase):
     def check(
