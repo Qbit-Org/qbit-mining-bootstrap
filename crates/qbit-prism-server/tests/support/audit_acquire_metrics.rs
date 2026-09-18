@@ -62,15 +62,19 @@ enum Caller {
     Import,
     Backfill,
     Reconcile,
+    LandedAudit,
+    RecordLandedBits,
 }
 
 impl Caller {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Audit,
         Self::Source,
         Self::Import,
         Self::Backfill,
         Self::Reconcile,
+        Self::LandedAudit,
+        Self::RecordLandedBits,
     ];
 
     async fn run(self, ledger: &Ledger) -> Result<()> {
@@ -92,6 +96,12 @@ impl Caller {
             ),
             Self::Backfill => assert_eq!(ledger.backfill_ctv(&ledger_public_key()).await?, 0),
             Self::Reconcile => assert!(ledger.pool_blocks_for_reconcile().await?.is_empty()),
+            Self::LandedAudit => assert!(ledger.landed_audit("missing").await?.is_none()),
+            Self::RecordLandedBits => {
+                ledger
+                    .record_landed_audit_bits("missing", "1d00ffff")
+                    .await?
+            }
         }
         Ok(())
     }
@@ -239,6 +249,35 @@ async fn direct_cases(db: &Database, ledger: &Ledger, metrics: &Metrics) -> Resu
             "{caller:?}: SQL recovery"
         );
     }
+    // Also exercise a returned checkout error on a live pool, then reuse its
+    // only connection. A short timeout belongs to this test-only pool.
+    let mut short = ledger.clone();
+    short.pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect(&db.url)
+        .await?;
+    let timed_out = async {
+        for caller in [Caller::LandedAudit, Caller::RecordLandedBits] {
+            let held = short.pool.acquire().await?;
+            let before = counts(metrics);
+            let error = tokio::time::timeout(WAIT, caller.run(&short))
+                .await?
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::PoolTimedOut)
+            ));
+            assert_eq!(counts(metrics), (before.0, before.1 + 1.));
+            drop(held);
+            tokio::time::timeout(WAIT, caller.run(&short)).await??;
+            assert_eq!(counts(metrics), (before.0 + 1., before.1 + 1.));
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    short.pool.close().await;
+    timed_out?;
     side.close().await;
     ledger.pool.close().await;
     for caller in Caller::ALL {
@@ -373,6 +412,36 @@ async fn landing_cases(db: &Database, ledger: &Ledger, metrics: &Metrics) -> Res
     let before = counts(metrics);
     ledger.land_candidate(&claim, &ledger_public_key()).await?;
     assert_eq!(counts(metrics), (before.0 + 2., before.1));
+
+    let before = counts(metrics);
+    let landed = ledger
+        .landed_audit(&claim.candidate.block_hash)
+        .await?
+        .context("landed audit missing")?;
+    assert_eq!(counts(metrics), (before.0 + 1., before.1));
+    qbit_prism_server::ledger::authenticate_landed_audit(&claim.candidate, &landed)?;
+    let bits = landed.found_block_bits.context("landed bits missing")?;
+    // A legacy NULL is filled once; identical and conflicting retries are
+    // successful zero-row writes. Each statement releases the sole pool slot.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=NULL WHERE block_hash=$1")
+        .bind(&claim.candidate.block_hash)
+        .execute(&side)
+        .await?;
+    for proposed in [bits.as_str(), bits.as_str(), "different"] {
+        let before = counts(metrics);
+        tokio::time::timeout(
+            WAIT,
+            ledger.record_landed_audit_bits(&claim.candidate.block_hash, proposed),
+        )
+        .await??;
+        assert_eq!(counts(metrics), (before.0 + 1., before.1));
+        let read = tokio::time::timeout(WAIT, ledger.landed_audit(&claim.candidate.block_hash))
+            .await??
+            .context("landed audit missing after bits write")?;
+        assert_eq!(read.found_block_bits.as_deref(), Some(bits.as_str()));
+        qbit_prism_server::ledger::authenticate_landed_audit(&claim.candidate, &read)?;
+        assert_eq!(counts(metrics), (before.0 + 2., before.1));
+    }
     side.close().await;
     Ok(())
 }
