@@ -28,7 +28,6 @@ mod window_fixture;
 pub const SHARES: u64 = 16;
 pub const MASK: u32 = 0x0000_e000;
 pub const DIFFICULTY: f64 = 1e-12;
-pub const SETTLEMENT_LOCK: i64 = 0x5052_4953_4d00_0003;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub struct Fixture {
@@ -259,11 +258,11 @@ impl Fixture {
         Ok(rows)
     }
 
-    pub async fn wait_for_settlement_waiter(&self) -> Result<()> {
+    pub async fn wait_for_cluster_waiter(&self, blocker: i32) -> Result<()> {
         timeout(Duration::from_secs(5), async {
             loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=$1::bigint::oid AND objid=$2::bigint::oid AND objsubid=1 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
-                    .bind(SETTLEMENT_LOCK >> 32).bind(SETTLEMENT_LOCK & 0xffff_ffff).fetch_one(&self.admin).await?;
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'SELECT config_fingerprint%' AND datname=current_database())")
+                    .bind(blocker).fetch_one(&self.admin).await?;
                 if waiting { return Ok::<_, anyhow::Error>(()); }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

@@ -54,9 +54,10 @@ pub async fn run(config: Config) -> Result<()> {
     // the lead is a precondition of serving, not a background convenience: an
     // instance that cannot maintain its partitions must refuse to start
     // rather than accept shares until the lead runs out.
-    let attached = crate::partitions::ensure(&coordinator.ledger.pool)
-        .await
-        .context("attach the share ledger partition lead at startup")?;
+    let attached =
+        crate::partitions::ensure_with_metrics(&coordinator.ledger.pool, Some(&registry))
+            .await
+            .context("attach the share ledger partition lead at startup")?;
     if attached > 0 {
         tracing::info!(created = attached, "share ledger partitions attached");
     }
@@ -155,10 +156,11 @@ pub async fn run(config: Config) -> Result<()> {
     }
     tasks.spawn(runtime.track(
         TaskKind::SharePartitions,
-        crate::partitions::run(
+        crate::partitions::run_with_metrics(
             coordinator.ledger.pool.clone(),
             partition_settings,
             shutdown_rx.clone(),
+            Some(registry.clone()),
         ),
     ));
     if let Some(listener) = api_listener {

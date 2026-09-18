@@ -7,8 +7,12 @@
 //! APIs; generic job APIs remain available for their existing non-runtime callers.
 //!
 //! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
-//! ORDER_LOCK before inspecting references and deleting blobs. Prepared writers
-//! use the former and candidate balance writers the latter. Retain blobs named
+//! ORDER_LOCK, then the cluster row FOR UPDATE before fresh reference scans and
+//! blob deletion. Compact prepared/issued writers hold cluster FOR SHARE through
+//! commit; candidate balance writers take ORDER before that shared fence.
+//! Stop ALL frontends/collectors for this protocol upgrade: old collectors are
+//! unsafe with new writers, even though the persisted format is unchanged.
+//! Retain blobs named
 //! by live prepared jobs or any candidate still requiring reconstruction; job
 //! expiry or candidate lease expiry alone is not a shared-blob deletion rule.
 use super::*;
@@ -197,16 +201,15 @@ impl Ledger {
         let payload =
             tokio::task::spawn_blocking(move || encode_record(&owned, expires_at_ms)).await??;
         let mut tx = self.begin().await?;
-        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        writable(&mut tx).await?;
-        require_revision(&mut tx, expected_current_revision).await?;
-        // Match the candidate writer's fence: configure/reset uses FOR UPDATE,
-        // so this pin remains valid until the dependent record commits.
+        // Fence ordinary authority UPDATEs and blob GC before ALL authority
+        // checks. No advisory lock may be acquired after this shared row fence.
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
         )
         .fetch_one(&mut *tx)
         .await?;
+        writable(&mut tx).await?;
+        require_revision(&mut tx, expected_current_revision).await?;
         if let Some(pinned) = self.config_fingerprint() {
             ensure!(
                 fingerprint.as_deref() == Some(pinned),

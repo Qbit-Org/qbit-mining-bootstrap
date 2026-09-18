@@ -24,14 +24,19 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+use tokio_util::task::AbortOnDropHandle;
 use tower::ServiceExt;
 
+#[path = "support/ledger_database.rs"]
+#[allow(dead_code)]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
 struct Fixture {
-    admin: PgPool,
+    database: FixtureDatabase,
     pool: PgPool,
-    schema: String,
     rpc: String,
-    node: tokio::task::JoinHandle<()>,
+    node: AbortOnDropHandle<()>,
     network: Arc<Mutex<Value>>,
 }
 impl Fixture {
@@ -39,26 +44,25 @@ impl Fixture {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
-        let schema = format!("api2_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let ledger = Ledger::connect(url.as_str(), "api2-test".into(), 4, true).await?;
         let network = Arc::new(Mutex::new(json!("1234567890123.125")));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let rpc = format!("http://{}/", listener.local_addr()?);
+        // Advisory migration locks are database-wide, so schemas alone do
+        // not isolate concurrent fixture setup.
+        let database = FixtureDatabase::open(&raw, "api2_").await?;
+        let ledger = match Ledger::connect(&database.url, "api2-test".into(), 4, true).await {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
         let app = Router::new()
             .route("/", post(node_reply))
             .with_state(network.clone());
-        let node = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let node = AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
         Ok(Some(Self {
-            admin,
+            database,
             pool: ledger.pool.clone(),
-            schema,
             rpc,
             node,
             network,
@@ -76,14 +80,10 @@ impl Fixture {
             std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
         )
     }
-    async fn close(self) -> Result<()> {
+    async fn close(self, result: Result<()>) -> Result<()> {
         self.node.abort();
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.database.close(result).await
     }
     async fn block(&self, n: u8, height: i64, state: &str, at: i64) -> Result<String> {
         let hash = format!("{n:02x}").repeat(32);
@@ -165,8 +165,7 @@ async fn block_views_markers_and_network_estimate_keep_2x_contracts() -> Result<
         let(_,_,reversed)=get(&app,"/public/v1/blocks?chain_state=reversed").await;ensure!(reversed["pagination"]["total_count"]==1);
         Ok::<_,anyhow::Error>(())
     }.await;
-    f.close().await?;
-    result
+    f.close(result).await
 }
 
 #[tokio::test]
@@ -198,8 +197,7 @@ async fn chart_rollups_match_raw_boundaries_tail_and_missing_progress() -> Resul
         let(status,_,fallback)=get(&app,"/public/v1/hashrate-series?range=1w&bucket=5m&view=both").await;ensure!(status==StatusCode::OK&&fallback["points"]==v2["points"],"pre-schema fallback differs: {fallback}");
         Ok::<_,anyhow::Error>(())
     }.await;
-    f.close().await?;
-    result
+    f.close(result).await
 }
 
 #[tokio::test]
@@ -235,7 +233,7 @@ async fn public_service_is_read_only_and_bounds_http_database_work() -> Result<(
         ensure!(status==StatusCode::SERVICE_UNAVAILABLE&&error["error"]["code"]=="read_timeout","{status}: {error}");
         ensure!(started.elapsed()<Duration::from_secs(2)&&headers["cache-control"]=="no-store");
         tokio::time::sleep(Duration::from_millis(75)).await;
-        let waiting:i64=sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name='prism-public-read' AND state='active' AND wait_event_type='Lock' AND query LIKE '%qbit_pool_blocks%'").fetch_one(&f.admin).await?;
+        let waiting:i64=sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name='prism-public-read' AND state='active' AND wait_event_type='Lock' AND query LIKE '%qbit_pool_blocks%'").fetch_one(&f.database.admin).await?;
         ensure!(waiting==0,"timed-out public SQL remained active on PostgreSQL");lock.rollback().await?;
         ensure!(get(&app,"/public/v1/blocks").await.0==StatusCode::OK);
         let(replica_app,replica)=public_service::router(f.state(false),ServiceConfig{replica_required:true,..Default::default()});
@@ -249,8 +247,7 @@ async fn public_service_is_read_only_and_bounds_http_database_work() -> Result<(
         ensure!(status==StatusCode::OK&&metrics.contains("qbit_prism_public_requests_total")&&metrics.contains("qbit_prism_public_responses_total{status=\"503\"}")&&metrics.contains("qbit_prism_public_cache_total"));
         Ok::<_,anyhow::Error>(())
     }.await;
-    f.close().await?;
-    result
+    f.close(result).await
 }
 
 #[tokio::test]
@@ -274,6 +271,30 @@ async fn content_addressed_bytes_and_legacy_fallback_headers_are_exact() -> Resu
         ensure!(get(&app,&path).await.0==StatusCode::INTERNAL_SERVER_ERROR);
         Ok::<_,anyhow::Error>(())
     }.await;
-    f.close().await?;
-    result
+    f.close(result).await
+}
+
+/// Holding a fixture's migration key must not block another fixture's setup.
+#[tokio::test]
+async fn fixture_migrations_do_not_share_advisory_locks() -> Result<()> {
+    // The ledger's private migration key, as in ledger_postgres's isolation test.
+    const MIGRATION_LOCK: i64 = 0x505249534d000001;
+    let Some(first) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut held = first.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(MIGRATION_LOCK)
+            .execute(&mut *held)
+            .await?;
+        let second = Fixture::open()
+            .await?
+            .expect("integration gate already passed");
+        second.close(Ok(())).await?;
+        held.rollback().await?;
+        Ok(())
+    }
+    .await;
+    first.close(result).await
 }

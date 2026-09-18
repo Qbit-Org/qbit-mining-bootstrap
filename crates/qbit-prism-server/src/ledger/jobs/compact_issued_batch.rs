@@ -191,7 +191,9 @@ impl Ledger {
             .clamp(1, 15_000) as i64;
         sqlx::query("SELECT set_config('statement_timeout',LEAST(COALESCE(NULLIF((SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'),0),15000),$1)::text,true)")
             .bind(remaining).execute(&mut *tx).await?;
-        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        // SHARE fences ordinary authority UPDATEs and the collector's exclusive
+        // cluster fence until commit. Check authority only after acquiring it;
+        // this path must never acquire either advisory lock while holding it.
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
         )

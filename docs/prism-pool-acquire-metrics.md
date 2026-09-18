@@ -12,7 +12,7 @@ records one `result="failure"` observation with its elapsed duration. Creating
 and dropping an acquisition future without polling it records nothing.
 An acquisition still waiting has not yet contributed to `_count`.
 
-Ledger, collector and rollup checkouts use `metrics::time_pool_acquire`, alongside
+Ledger, collector, rollup and partition checkouts use `metrics::time_pool_acquire`, alongside
 the metrics recording hooks, and Tokio's monotonic clock.
 In an unpaused runtime this measures real elapsed time. In a paused test
 runtime it follows the runtime's controlled clock; ledger checkouts now share
@@ -44,6 +44,10 @@ acquisitions, these paths use the shared checkout timer:
 - `WorkLedger::now_ms`, `chain_observation_state`, and `persist_block_only`'s
   initial duplicate probe and credit/disposition polls;
 - the server's rollup loop, once per valid `advance` attempt;
+- partition attachment at server startup, each maintenance tick, and the fresh
+  transaction after an append is refused with SQLSTATE 23514;
+- candidate heartbeat's live-token read after renewal contention and its
+  terminal-state read after work cancellation;
 - `apply_online_migration`'s startup checkout, before the connection is detached.
 
 Each pending online migration records one checkout when metrics are attached.
@@ -136,6 +140,30 @@ be committed: the existing watermark and idempotence semantics reconcile that
 outcome. The public pool-only `rollups::advance` and `rollups::run` wrappers
 remain compatible and record nothing.
 
+Partition maintenance uses the same boundary: checkout completes before
+`BEGIN`, the existing 30-second local statement timeout, the ensure function,
+and `COMMIT`. An intact lead and newly attached partitions both record one
+success. Pool errors and cancellation during checkout record one failure;
+SQL errors, SQL cancellation and shutdown after checkout retain its success
+and duration. The public `partitions::ensure` and `partitions::run` wrappers
+still pass no metrics. The server passes its registry at startup and on each
+tick; an append's SQLSTATE 23514 fallback passes its ledger's metrics handle.
+That fallback records three checkouts: the refused append transaction, the
+partition transaction, and the one retry. It does not double-count
+`Ledger::begin`, restart the enclosing deadline, or change the SQL, rollback,
+retry count or share-credit semantics. As before, failure after sending
+`COMMIT` can have an unknown commit outcome.
+
+The candidate live-token and terminal-state probes each record their own
+checkout inside the original `timeout` future. The first probe still uses
+the remaining lease budget; the second still uses the existing reconciliation
+timeout after dropping work. SQL predicates, token/expiry decisions and
+original renewal errors are unchanged. Acquisition failure or cancellation
+records failure; missing/nonterminal rows and SQL errors after acquisition
+retain checkout success. A failed probe supplies no new evidence of ownership
+or completion. These probes add samples to the same aggregate, without adding
+labels or a second observation to the renewal transaction's `Ledger::begin`.
+
 Polls contribute actual acquisition attempts to the same aggregate histogram
 as the other covered callers. Expanding coverage can change its percentile:
 a pending candidate can produce many fast acquisitions when the pool has spare
@@ -150,36 +178,64 @@ threshold or minimum count.
 Rollup attempts also join this aggregate population, including no-work ticks.
 Their checkout counts describe attempts, not folded shares or completed
 rollups; fast rollup checkouts can lower the aggregate percentile too.
+Partition ticks and fallback attachment attempts join it too, including
+no-work ensures. Their samples count checkouts, not created partitions or
+successful share appends.
 
 Landed-audit reads and bits writes also join this aggregate population,
 including misses and idempotent retries. Their samples describe checkout
 attempts, not newly landed blocks or successful SQL statements.
 
-This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
-Other direct coordinator, candidate and startup queries still acquire without
-this helper. The pool-only public helpers have no attached metrics owner:
-`audit_canonical_bytes`'s representation lookup and its reconstruction, and
-direct public calls to `materialize_audit_row`, still record no observations.
-Public API read pools and the public role's export
-policy require a separate decision. Consequently `_count` is neither a census
-of pool acquisitions nor request throughput.
+## Source census and exclusions
 
-Remaining sites outside this slice include:
+The census for [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352)
+is checked in CI by the existing Python test shards, which automatically
+discover `tests/test_check_prism_pool_acquires.py`. Its baseline test verifies
+the repository inventory alongside the negative controls. Locally,
+`python3 scripts/check_prism_pool_acquires.py` checks the same inventory;
+`--census` prints current call sites and source lines without updating the
+reviewed classifications in `scripts/prism_pool_acquires.json`. Each entry
+has an exact expected occurrence count and a policy with an owner and reason.
+Adding a site, adding another occurrence of an existing site, removing a site,
+or removing/disabling its timer fails the guard until reviewed.
 
-- `ledger/connect.rs`: startup schema/capability/provenance checks. The
-  reservation write uses `Ledger::begin`; releasing an owner's reservations
-  uses `Ledger::acquire` and remains one observation.
-- `ledger/audit.rs`: the pool-only public helper reads described above;
-  startup/migration validation helpers keep their existing
-  connection ownership.
-- `partitions.rs`: startup attachment and background partition maintenance.
+The scanner walks the server crate's production module graph, including its
+binaries and platform branches, and excludes test-only modules. It tokenizes
+comments and SQL strings as opaque text. Direct implicit executors (including
+`raw_sql`), explicit `acquire`/`begin` variants, aliases and calls to typed
+pool/generic executor/reader helpers are inventoried. Mutable SQLx executor
+borrows execute on an existing connection; nested acquisitions remain separate
+sites. `Transaction::begin` on a checkout, migration connection reborrows and
+window/range readers must not be counted again. The report counts source
+syntax, including helper forwarding, rather than runtime attempts; adding its
+categories together does not give a number of pool acquisitions.
 
-Coordinator startup checks, candidate lease/terminal reconciliation,
-public read pools, operator connections and pool-only rollup wrappers remain
-outside this slice.
-The other `ledger/window.rs` reads take transactions through `Ledger::begin`
-and pass existing connections to range/probe readers; those readers must not
-be counted as fresh checkouts.
+This is a conservative source review gate, not Rust type analysis or a
+whole-program proof. New pooling abstractions, type aliases or generated code
+need review of the scanner's coverage as well as classification. Tests mutate
+the real source tree to prove detection of new implicit and explicit pool
+calls, renamed pool handles, generic/helper calls, stale entries and removed
+timers; a borrowed-connection control adds no fresh checkout site.
+Imported pool type aliases and ordinary `type` aliases enroll helper callers;
+`include!` fails closed until the generated Rust source is explicitly supported.
+
+The following exclusions are intentional and remain visible in the inventory:
+
+| Population | Owner and reason |
+| --- | --- |
+| Startup schema, capability, provenance and coordinator session-setting checks | Ledger startup/migrations: gates before serving. Existing timed startup transactions and online migration checkouts still contribute. |
+| Generic migration `Acquire` helpers | Ledger migrations: a pool argument at startup acquires; a borrowed transaction during migration does not. Their callers are inventoried too. |
+| Candidate inventory/recovery reader, fatal-state inspection and self-check | Operator tools: dedicated diagnostic pools or explicit operator calls, outside the frontend work loops. |
+| Public HTTP reads and readiness probes | Public API: isolated read pools; the public role's metric export policy requires a separate decision. |
+| Private audit HTTP endpoints and shared API read-model helpers | Operator API: private routes can retain the run-role pool, while public dispatch substitutes its isolated read pool. These HTTP queries remain excluded even when served by the run process. |
+| Pool-only audit, partition and rollup wrappers, including `lead_rows` | Compatibility APIs: no attached metrics owner. The server uses metrics-aware maintenance; its headroom collector reads within an already timed transaction. |
+
+Pool creation and idle connection replenishment are not acquisition attempts
+observed by this helper. Ledgers created without telemetry record nothing.
+Accordingly the histogram is the aggregate of **observed checkout attempts at
+covered callers**, not all process acquisitions, all use of a database role,
+request throughput or an unbiased sample of every pool operation. The metric
+type, labels, buckets and result semantics have not changed.
 
 ## Adding a caller
 

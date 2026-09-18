@@ -16,7 +16,7 @@ use support::{
     execution::{Fault, FaultPhase},
     run,
     socket::{ordinary_submit, Client, Listener},
-    worker, MASK, SETTLEMENT_LOCK,
+    worker, MASK,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -657,9 +657,11 @@ async fn cancelled_issued_save_releases_sql_resources_without_publishing() -> Re
                 f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
                     .await?;
             let mut lock = f.pool().begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(SETTLEMENT_LOCK)
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
                 .execute(&mut *lock)
+                .await?;
+            let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *lock)
                 .await?;
             let a = f.a.clone();
             let pending_job = job.clone();
@@ -668,7 +670,7 @@ async fn cancelled_issued_save_releases_sql_resources_without_publishing() -> Re
                 a.persist_issued_job(&pending_worker, &pending_job, MASK, Duration::from_secs(2))
                     .await
             });
-            let observed = f.wait_for_settlement_waiter().await;
+            let observed = f.wait_for_cluster_waiter(blocker).await;
             task.abort();
             let cancelled = task.await;
             lock.rollback().await?;
@@ -708,9 +710,11 @@ async fn issued_expiry_during_sql_wait_does_not_publish_or_renew_original_identi
                     .await?;
             let before = f.payload(&job.context.prepared.storage_key).await?;
             let mut lock = f.pool().begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(SETTLEMENT_LOCK)
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
                 .execute(&mut *lock)
+                .await?;
+            let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *lock)
                 .await?;
             let a = f.a.clone();
             let issued = job.clone();
@@ -719,7 +723,7 @@ async fn issued_expiry_during_sql_wait_does_not_publish_or_renew_original_identi
                 a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(1))
                     .await
             });
-            let observed = f.wait_for_settlement_waiter().await;
+            let observed = f.wait_for_cluster_waiter(blocker).await;
             if observed.is_ok() {
                 sleep(Duration::from_millis(1100)).await;
             }

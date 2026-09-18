@@ -284,8 +284,13 @@ async fn gate_insert(db: &Database, child: bool) -> Result<()> {
 
 async fn rollback_fence(db: &Database) -> Result<()> {
     let mut tx = db.ledger.pool.begin().await?;
+    // This fixture also exercises GC: preserve its advisory-release proof,
+    // then fence cancellation of the now advisory-independent compact writers.
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SETTLEMENT_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
         .execute(&mut *tx)
         .await?;
     tx.rollback().await?;
@@ -803,7 +808,7 @@ async fn current_revision_configuration_and_writable_fences_recheck_after_row_wa
 }
 
 #[tokio::test]
-async fn child_deadline_covers_advisory_dependency_and_post_insert_waits() -> Result<()> {
+async fn child_deadline_covers_cluster_dependency_and_post_insert_waits() -> Result<()> {
     for phase in 0..4 {
         run(move |db| {
             Box::pin(async move {
@@ -823,20 +828,19 @@ async fn child_deadline_covers_advisory_dependency_and_post_insert_waits() -> Re
                     .fetch_one(&mut *hold)
                     .await?;
                     "SELECT parent_hash"
+                } else if phase == 0 {
+                    sqlx::query(
+                        "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+                    )
+                    .execute(&mut *hold)
+                    .await?;
+                    "SELECT config_fingerprint"
                 } else {
                     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(if phase == 0 {
-                            SETTLEMENT_LOCK
-                        } else {
-                            TEST_GATE
-                        })
+                        .bind(TEST_GATE)
                         .execute(&mut *hold)
                         .await?;
-                    if phase == 0 {
-                        "SELECT pg_advisory_xact_lock"
-                    } else {
-                        "INSERT INTO qbit_prism_jobs"
-                    }
+                    "INSERT INTO qbit_prism_jobs"
                 };
                 let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
                     .fetch_one(&mut *hold)
@@ -941,6 +945,138 @@ async fn concurrent_repairs_publish_one_dependency_identity_and_fixed_children()
             && stored.expires_at_ms == expiry+60_000);
         Ok(())
     })).await
+}
+
+#[tokio::test]
+async fn direct_prepared_and_single_persistence_finish_before_settlement_stub_release() -> Result<()>
+{
+    for mode in ["prepared", "hot", "repair-survivors", "repair-missing"] {
+        run(move |db| {
+            Box::pin(async move {
+                let original = seed(db, true).await?;
+                let repair = original.repair()?;
+                if mode != "hot" {
+                    delete_dependencies(db, mode == "repair-missing").await?;
+                }
+                let mut stub = db.ledger.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(SETTLEMENT_LOCK)
+                    .execute(&mut *stub)
+                    .await?;
+                let release_at = tokio::time::Instant::now() + Duration::from_secs(3);
+                tokio::time::timeout_at(release_at, async {
+                    if mode == "prepared" {
+                        ensure!(
+                            db.ledger
+                                .save_compact_prepared(
+                                    "prepared",
+                                    &original.record,
+                                    &original.template,
+                                    &original.balances,
+                                    0,
+                                    original.expires
+                                )
+                                .await?
+                        );
+                    } else {
+                        ensure!(
+                            save(
+                                db,
+                                &original,
+                                original.expires,
+                                if mode == "hot" { None } else { Some(&repair) }
+                            )
+                            .await?
+                                == IssuedJobSave::Saved
+                        );
+                        ensure!(db.ledger.job("child").await? == Some(child(original.expires)));
+                    }
+                    let stored = db
+                        .ledger
+                        .compact_prepared("prepared")
+                        .await?
+                        .context("missing durable prepared row or blobs")?;
+                    ensure!(
+                        stored.record == original.record
+                            && stored.original_expires_at_ms == original.expires
+                            && stored.template == template()
+                    );
+                    let mut probe = db.ledger.pool.begin().await?;
+                    let held: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_xact_lock($1)")
+                        .bind(SETTLEMENT_LOCK)
+                        .fetch_one(&mut *probe)
+                        .await?;
+                    ensure!(held, "stub released before exact durable verification");
+                    probe.rollback().await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("direct persistence waited for settlement stub")??;
+                tokio::time::sleep_until(release_at).await;
+                stub.rollback().await?;
+                Ok(())
+            })
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_authority_updates_wait_for_cold_repair_commit() -> Result<()> {
+    for mutation in [
+        "payout_revision=1",
+        "fatal_error='halt'",
+        "config_fingerprint=NULL",
+        "config_fingerprint='rotated'",
+    ] {
+        run(move |db| {
+            Box::pin(async move {
+                let original = seed(db, true).await?;
+                db.ledger
+                    .configure("original", &original.record.signer_keys)
+                    .await?;
+                delete_dependencies(db, false).await?;
+                gate_insert(db, true).await?;
+                let mut gate = db.ledger.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(TEST_GATE)
+                    .execute(&mut *gate)
+                    .await?;
+                let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *gate)
+                    .await?;
+                let mut saving =
+                    spawn_save(db.ledger.clone(), original.repair()?, original.expires);
+                let writer_pid = blocked_query(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
+                let pool = db.ledger.pool.clone();
+                let mut updating = Running(tokio::spawn(async move {
+                    sqlx::query(&format!(
+                        "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
+                    ))
+                    .execute(&pool)
+                    .await
+                }));
+                blocked_query(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+                ensure!(db.ledger.job("child").await?.is_none());
+                gate.rollback().await?;
+                ensure!((&mut saving.0).await?? == IssuedJobSave::Saved);
+                (&mut updating.0).await??;
+                ensure!(db.ledger.job("child").await? == Some(child(original.expires)));
+                let before = snapshot(db).await?;
+                ensure!(
+                    save(db, &original, original.expires, Some(&original.repair()?))
+                        .await
+                        .is_err()
+                );
+                rollback_fence(db).await?;
+                ensure!(snapshot(db).await? == before);
+                Ok(())
+            })
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

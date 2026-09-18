@@ -63,12 +63,66 @@ Groups share the complete original compact dependency identity and the expected
 current revision and parent; each Coordinator is bound to its own ledger/frontend.
 Only small owned child metadata is queued. Prepared reservations, inline/direct
 single-job APIs, and missing-dependency cold repair keep their existing paths.
-Hot batches retain `SETTLEMENT_LOCK`, then cluster `FOR SHARE`, prepared
-`FOR KEY SHARE`, and template/balance `FOR KEY SHARE` locks in that order.
+Compact hot batches and single-child repair take cluster `FOR SHARE`, prepared
+`FOR KEY SHARE`, and template/balance `FOR KEY SHARE` locks in that order when
+those rows exist. Direct compact prepared storage also takes cluster `FOR SHARE`
+before its authority checks and blob writes. These persistence transactions do
+not acquire `SETTLEMENT_LOCK` or `ORDER_LOCK`.
 Shared revision, configuration, writable-state and dependency checks happen
 after the row waits. Children and any retention extension through the largest
 child expiry plus existing headroom commit atomically; original reservation
 identity and each child's absolute expiry never change.
+
+`FOR SHARE` is required: it conflicts with ordinary non-key `UPDATE`s of payout
+revision, fatal state, configuration and the ledger clock. `FOR KEY SHARE` would
+allow those updates and is not an authority fence. Mutable authority is checked
+after acquiring the shared fence and stays fenced until commit. Coordinator
+readiness, publication generation, epoch and lease checks still run before and
+after storage; a durable undelivered row grants no delivery authority.
+
+The blob collector takes `SETTLEMENT_LOCK` → `ORDER_LOCK` → cluster `FOR UPDATE`,
+then starts fresh blob-key and reference scans. The exclusive fence excludes
+compact reservation and repair through commit, including repair that reuses
+surviving orphan blobs whose bytes were already checked. Blob row locks alone
+cannot refresh an earlier cross-table reference snapshot. Every surviving job
+and candidate balance reference retains its blob, even after job/claim expiry.
+Job expiry remains a separate statement with its outer renewal recheck.
+
+| Path | Lock order relevant to compact persistence |
+| --- | --- |
+| Compact prepared / issued / batch | Cluster SHARE → dependency/blob writes or locks → commit; no later advisory acquisition |
+| Blob collector | SETTLEMENT → ORDER → cluster UPDATE → fresh scans/deletes |
+| Candidate enqueue | ORDER → cluster SHARE → balance blob → candidate |
+| Share append with candidate | ORDER → cluster clock UPDATE → balance blob → candidate |
+| Chain observation | SETTLEMENT → cluster UPDATE |
+| Accounting/recovery | SETTLEMENT → ORDER → authority UPDATE (some also take instance/lease table fences) |
+| Configuration | Cluster UPDATE → configuration checks/write |
+
+The collector must acquire ORDER **before** its exclusive row fence: a candidate
+can already hold ORDER while waiting for the cluster row. Compact writers never
+reacquire either advisory lock. Native authority writers do not lock compact job
+or blob rows and then wait for their cluster fence; ordinary ledger-clock updates
+can still cause legitimate row contention. This removes unrelated advisory
+serialization, not contention with actual authority changes.
+
+**Coordinated upgrade required:** stop all frontends and collectors, replace all
+binaries with this protocol, then restart them together. An old collector is
+unsafe with a new unlocked repair writer. The schema and compact format 1 are
+unchanged, but arbitrary mixed-version rolling operation is unsupported. Follow
+the existing migration/candidate-drain requirements when crossing older formats.
+
+The three-second stub acceptance builds work first and proves runtime return and
+exact durable children/dependencies while a transaction still owns only the
+settlement advisory lock. Hot singleton/cohort, cold repair with surviving or
+missing blobs, and one/two frontends are checked; the direct 64-child API also
+proves a single atomic commit. Separate races synchronize on observed database
+waits, not assumed sleep durations. Direct prepared persistence has the same
+stub acceptance, but fresh publication still observes the chain under settlement
+locking. This is neither full-refresh independence nor evidence for the
+one-second/2,000-session budget. Historical measurements remain attributed to
+their original revisions in `tests/perf/b275_persistence_measure.md`. Row waits
+are not settlement advisory time; storage time still includes pool and locks,
+and unmeasured commit time remains unknown.
 
 A conflicting child fails its whole transaction, including renewal. Other
 groups can succeed independently; no SQL failure is silently replayed. Canceled
@@ -981,8 +1035,9 @@ it:
   expired rows as a separate statement, without advisory locks and with the
   configured database timeout. Its outer expiry recheck preserves concurrent
   renewals. Then `prune_unreferenced_blobs` starts a fresh five-second deadline,
-  takes `SETTLEMENT_LOCK` then `ORDER_LOCK`, checks the shared writable fence,
-  and inspects up to 256 template keys and 256 balance keys. References from
+  takes `SETTLEMENT_LOCK`, `ORDER_LOCK`, then cluster `FOR UPDATE`, checks the
+  shared writable fence, and only then inspects up to 256 template keys and
+  256 balance keys with fresh reference scans. References from
   every surviving job and every candidate retain their blobs, regardless of
   job or claim expiry. Per-table cursors advance only after commit, skip live
   prefixes and wrap to find later orphans even when no jobs expire. A halted
