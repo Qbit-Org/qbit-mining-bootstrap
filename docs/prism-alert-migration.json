@@ -187,7 +187,7 @@
       "replacement": [
         "PrismAcceptedBlockWorkPublicationStalled"
       ],
-      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while an accepted block's landed payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
+      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while a landed block's payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-preview-publish-latency-crit",
@@ -197,7 +197,7 @@
       "replacement": [
         "PrismAcceptedBlockWorkPublicationStalled"
       ],
-      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while an accepted block's landed payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
+      "reason": "Migrated to the per-frontend oldest-unpublished gauge: the page fires while a landed block's payout revision is unpublished on a frontend (over 120 seconds for one minute), rather than after the fact from 2.x.x histogram-bucket breach counts. The accepted-block work publication histogram (durable accepted-offer time to this frontend's first publication including the landing) keeps the latency distribution; no rule reads its buckets. Warning and critical collapse into one provisional page; measure in #291."
     },
     {
       "uid": "qbit-prism-preview-publish-degraded",
@@ -207,7 +207,7 @@
       "replacement": [
         "PrismStalePayoutRevisionJobRefusals"
       ],
-      "reason": "Migrated to stale-revision job refusals: native has no degraded publication path, so there is nothing to count as degraded. A frontend that cannot serve the cluster's payout revision refuses the job build, and each refusal is counted and pages."
+      "reason": "Migrated to the stale-revision job refusal warning: native has no degraded publication path, so there is nothing to count as degraded. A frontend whose published payout revision differs from the cluster's refuses the job build, and each refusal is counted; the rule warns and does not page, because refusals also occur routinely between a landing's revision bump and a frontend's next refresh."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts",
@@ -217,7 +217,7 @@
       "replacement": [
         "PrismStalePayoutRevisionJobRefusals"
       ],
-      "reason": "Migrated to stale-revision job refusals: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes pages. Warning and critical collapse into one provisional page; measure in #291."
+      "reason": "Migrated to the stale-revision job refusal warning: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes warns. Warning and critical collapse into one warning that does not page, because refusals also occur routinely between a landing's revision bump and a frontend's next refresh; #291 sets the critical rate."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts-crit",
@@ -227,7 +227,7 @@
       "replacement": [
         "PrismStalePayoutRevisionJobRefusals"
       ],
-      "reason": "Migrated to stale-revision job refusals: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes pages. Warning and critical collapse into one provisional page; measure in #291."
+      "reason": "Migrated to the stale-revision job refusal warning: the counter counts refusals, not waits. Native refuses a stale-revision build immediately where 2.x.x waited for an accepted-parent preview and timed out; any refusal in ten minutes warns. Warning and critical collapse into one warning that does not page, because refusals also occur routinely between a landing's revision bump and a frontend's next refresh; #291 sets the critical rate."
     },
     {
       "uid": "qbit-prism-unresolved-parent-depth",
@@ -800,7 +800,7 @@
       "replacement": [
         "qbit_prism_stale_payout_revision_job_refusals_total"
       ],
-      "reason": "Native stale-payout-revision job refusals: a stale-revision build is refused immediately rather than waited on, so refusals replace wait timeouts."
+      "reason": "Native stale-payout-revision job refusals: a build whose payout revision differs from the cluster's is refused immediately rather than waited on, so refusals replace wait timeouts."
     },
     {
       "name": "qbit_prism_accepted_parent_unresolved_depth_max",

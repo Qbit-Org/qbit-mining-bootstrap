@@ -48,8 +48,8 @@ rendering the startup registry does not create a publication timestamp.
 
 | Family | Type | Labels | Role | Meaning / status | 2.x.x name replaced |
 | --- | --- | --- | --- | --- | --- |
-| `qbit_prism_accepted_block_oldest_unpublished_seconds` | gauge | none | run | Age of the oldest accepted pool block whose landed payout revision this frontend has not yet published; 0 when none, or -1 when unknown. Recomputed from durable outbox rows on every health tick, so a restart mid-hold still reports it: the age, from `offered_at_ms`, of the oldest node-accepted row that is neither abandoned nor orphaned and whose landing this frontend's published work does not yet carry. An accepted row whose landing has not committed counts too, so a second acceptance never resets the age; a landed row is covered once this frontend publishes the cluster's revision. 0 is a successful read with nothing pending. -1 before the first derivation, when the ledger read fails or overruns its one-second budget, or when this frontend's wall clock is behind the offering frontend's; unknown is not healthy. Pages through `PrismAcceptedBlockWorkPublicationStalled`. | none |
-| `qbit_prism_accepted_block_work_publication_seconds` | histogram | `result=published,superseded` | run | Durable accepted offer time of a pool block to this frontend's first publication of work whose payout revision includes its landing, by result; adopted blocks carry no offer time and yield no sample. Default histogram ladder in seconds. One sample per node-accepted pool block per frontend process: from the durable `qbit_block_candidate_outbox.offered_at_ms` (the offering frontend's wall clock immediately before its one `submitblock` call) to this frontend's wall clock when its first publication whose payout revision includes the block's landing returned. A block counts as landed when its outbox row is `submitted` or chain reconciliation has confirmed its pool block. Every frontend samples, including one that did not offer the block, so series are per `instance` and a sample spanning two hosts includes their clock skew; a negative interval is skew and records nothing. `published` is the newest landing the publication carried; `superseded` is an older landing the same publication carried under a dense cadence, a legitimate outcome. No sample for adopted blocks (no offer time), for rows offered before this process started, or from a publication whose revision the cluster has already moved past; each block is sampled at most once per process. Not proof-to-first-offer (`qbit_prism_block_submit_seconds`) and not the load harness's approximation. No firing rule reads its buckets. | `qbit_prism_accepted_block_preview_publication_seconds` |
+| `qbit_prism_accepted_block_oldest_unpublished_seconds` | gauge | none | run | Age since its accepted offer of the oldest landed pool block whose payout revision this frontend has not yet published; 0 when none, or -1 when unknown, including before this frontend first publishes the cluster revision. Recomputed from durable outbox rows on every health tick: the age, from `offered_at_ms`, of the oldest landed block (outbox row `submitted` or pool block confirmed) whose payout revision this frontend's published work does not yet carry. Accepted blocks that have not landed, including a lost race awaiting its orphan proof, are the subject of `qbit_prism_block_candidates_pending` and `qbit_prism_block_candidate_oldest_pending_seconds`, not this gauge; abandoned, orphaned and adopted rows never count. A second landing never resets the age. 0 is a successful read with nothing pending. -1 before this process's first tick at which its published revision equals the cluster revision (that tick covers every landing then retained, so a restart never reports the age of history), when the ledger read fails or overruns its one-second budget, or when this frontend's wall clock is behind the offering frontend's; unknown is not healthy. Pages through `PrismAcceptedBlockWorkPublicationStalled`. | none |
+| `qbit_prism_accepted_block_work_publication_seconds` | histogram | `result=published,superseded` | run | Durable accepted offer time of a pool block to this frontend's first publication of work whose payout revision includes its landing, by result; adopted blocks carry no offer time and yield no sample. Default histogram ladder in seconds. One sample per node-accepted pool block per frontend process: from the durable `qbit_block_candidate_outbox.offered_at_ms` (the offering frontend's wall clock immediately before its one `submitblock` call) to this frontend's wall clock when its first publication whose payout revision includes the block's landing returned. A block counts as landed when its outbox row is `submitted` or chain reconciliation has confirmed its pool block. Every frontend samples, including one that did not offer the block, so series are per `instance` and a sample spanning two hosts includes their clock skew; a negative interval is skew and records nothing. `published` is the newest landing the publication carried; `superseded` is an older landing the same publication carried under a dense cadence, a legitimate outcome. No sample for adopted blocks (no offer time), for rows offered before this process started, or from a publication whose revision the cluster has already moved past; each block is sampled at most once per process. Observations run in publication order, so a sample ends at the instant of the earliest publication carrying its landing; the remembered block sets are pruned to rows the ledger still retains. Not proof-to-first-offer (`qbit_prism_block_submit_seconds`) and not the load harness's approximation. No firing rule reads its buckets. | `qbit_prism_accepted_block_preview_publication_seconds` |
 | `qbit_prism_accepted_shares_total` | counter | none | run | Shares accepted by this instance since process start. Process-local counter; legacy canonical ledger count was persistent. | `qbit_prism_accepted_shares_total` |
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
@@ -104,7 +104,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_share_ack_seconds` | histogram | `result=accepted,rejected` | run | Complete mining.submit frame arrival to completed response write, by outcome. Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines. | `qbit_prism_share_ack_seconds` |
 | `qbit_prism_share_ledger_partition_lead_rows` | gauge | none | run | Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown. max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it. | none |
 | `qbit_prism_stale_job_rejections_total` | counter | `cause=resume_expired,fee_floor,parent_grace,payout_revision` | run | Stale-job share rejections by the internal decision that refused them. Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id="stale-job"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero. | none |
-| `qbit_prism_stale_payout_revision_job_refusals_total` | counter | none | run | Job builds refused because this frontend's published payout revision was behind the cluster's. Counted once at the `build_job` arm that refuses work because this frontend's published payout snapshot is no longer at the cluster's revision; the refusal itself is unchanged. It counts refusals, not waits: native refuses immediately where 2.x.x waited for an accepted-parent preview and timed out, and has no degraded publication path. Distinct from `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`, which counts share rejections. Process-local; starts at zero. Pages through `PrismStalePayoutRevisionJobRefusals`. | `qbit_prism_accepted_parent_preview_wait_timeouts_total` |
+| `qbit_prism_stale_payout_revision_job_refusals_total` | counter | none | run | Job builds refused because this frontend's published payout revision was behind the cluster's. Counted once when `build_job`'s first work admission refuses because this frontend's published payout revision differs from the cluster's; the refusal itself is unchanged. Publication-stamp races, unselectable leases, leased-work mismatches and the same revision check reached outside that admission are not counted. It counts refusals, not waits: native refuses immediately where 2.x.x waited for an accepted-parent preview and timed out, and has no degraded publication path. Distinct from `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`, which counts share rejections. Process-local; starts at zero. Warns, without paging, through `PrismStalePayoutRevisionJobRefusals`. | `qbit_prism_accepted_parent_preview_wait_timeouts_total` |
 | `qbit_prism_stale_shares_total` | counter | none | run | Shares rejected as stale or unknown jobs. | `qbit_prism_stale_shares_total` |
 | `qbit_prism_stratum_connection_limit` | gauge | none | run | Configured global Stratum connection limit, not currently available permits; -1 before a listener starts. Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`. | none |
 | `qbit_prism_stratum_connection_refusals_total` | counter | `reason=global_limit,username_limit` | run | Stratum connections refused by an existing admission limit, by closed reason. `global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. Same-username reauthorization and reuse of a retained username permit never count. Authorization refusals are not share rejections. Process-local; both series start at zero. | none |
@@ -275,7 +275,9 @@ offer) and is a different boundary, as is the load harness's approximated
   recorded in `qbit_block_candidate_outbox.offered_at_ms` — the offering
   frontend's wall clock read before its one `submitblock` call — and ends at
   this frontend's wall clock when its first publication whose payout revision
-  includes the block's landing returned. A block counts as landed when its
+  includes the block's landing returned. Observations are processed in
+  publication order, so the sample carries that first publication's instant
+  even when a later publication's observation would finish sooner. A block counts as landed when its
   outbox row is `submitted` or chain reconciliation has confirmed its pool
   block, whichever comes first. Every frontend observes the block, including
   one that did not offer it, so samples are per `instance` and are not one
@@ -289,29 +291,41 @@ offer) and is a different boundary, as is the load harness's approximated
   nothing and leaves its landings to the publication that catches up. A
   block is sampled at most once per process, and only rows offered since the
   process started are sampled, so a restart loses samples rather than
-  duplicating them.
+  duplicating them (assuming the two hosts' clocks agree). The remembered block
+  sets are pruned to the rows the ledger still retains.
 - `qbit_prism_accepted_block_oldest_unpublished_seconds` (gauge) is recomputed
   from durable rows on every health tick: the age, from `offered_at_ms`, of the
-  oldest node-accepted block whose landing this frontend's published work does
-  not yet carry. A row whose landing has not committed yet counts, so a second
-  acceptance never resets the age; abandoned, orphaned and adopted rows never
-  count. It is 0 after a successful read with nothing pending, and -1 before
-  the first derivation, when the ledger read fails or overruns its one-second
-  budget, or when this frontend's clock is behind the offering frontend's.
-  Unknown is not healthy and never fires the page. Because it reads durable
-  rows, a restart in the middle of a hold still reports the hold. This is the
-  signal that exists *during* a hold, before any histogram sample exists.
+  oldest landed block whose payout revision this frontend's published work does
+  not yet carry. It counts landed rows only; accepted blocks that have not
+  landed, including a lost race awaiting its orphan proof, are the subject of
+  `qbit_prism_block_candidates_pending` and
+  `qbit_prism_block_candidate_oldest_pending_seconds`. Abandoned, orphaned and
+  adopted rows never count, and a second landing never resets the age. It is 0
+  after a successful read with nothing pending, and -1 before this process's
+  first health tick at which its published revision equals the cluster
+  revision, when the ledger read fails or overruns its one-second budget, or
+  when this frontend's clock is behind the offering frontend's. That first
+  current tick covers every landing then retained, so a restart never reports
+  the age of history; a restarted frontend that cannot publish reads -1, which
+  the readiness and coverage alerts own. Unknown is not healthy and never fires
+  the page. This is the signal that exists *during* a hold, before any
+  histogram sample exists.
 - `qbit_prism_stale_payout_revision_job_refusals_total` (counter) counts job
-  builds this frontend refused because its published payout revision was behind
-  the cluster's, once at the refusing build arm. It counts refusals, not waits:
-  there is no native degraded publication path and no preview to wait for. It
-  is not `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`,
+  builds refused at `build_job`'s first work admission because this frontend's
+  published payout revision differs from the cluster's. Publication-stamp
+  races, unselectable leases, leased-work mismatches and the same revision
+  check reached outside that admission are not counted. It counts refusals,
+  not waits: there is no native degraded publication path and no preview to
+  wait for. It is not `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`,
   which counts share rejections.
 
 Two rules read them, both provisional until #291 measures them.
 `PrismAcceptedBlockWorkPublicationStalled` pages while the gauge exceeds 120
 seconds for one minute, excluding the unknown -1;
-`PrismStalePayoutRevisionJobRefusals` pages on any refusal within ten minutes.
+`PrismStalePayoutRevisionJobRefusals` is a warning, not a page, on any
+refusal within ten minutes: a refusal is a miner-visible hiccup that also
+happens routinely on a non-offering frontend between a landing's revision bump
+and its next refresh, so #291 sets the rate at which it becomes critical.
 No rule reads the histogram's buckets: it carries the distribution that #275's
 one-second budget and #447's harness comparison need, not a firing condition.
 The two rules replace the five deployed 2.x.x preview-publication and
@@ -360,8 +374,8 @@ settlement advisory-lock acquisitions record into
 Selected non-transaction ledger queries are timed through `Ledger::acquire`,
 with remaining caller coverage tracked in #352; this is not an acquisition census. The native alert specification
 attaches no firing rule to first-offer or advisory-lock timing, nor to the
-accepted-block work publication histogram; the oldest-unpublished gauge and the
-stale-payout-revision refusal counter each carry a paging rule.
+accepted-block work publication histogram; the oldest-unpublished gauge carries
+a paging rule and the stale-payout-revision refusal counter a warning.
 `PrismDatabasePoolWaitHigh` describes both collector and instrumented ledger
 acquisitions, including cancellation observations from #328 and #345. The collector
 acquires from the same pool as the ledger, so pool exhaustion can fail collection

@@ -632,7 +632,7 @@
         "page": "true"
       },
       "summary": "PrismAcceptedBlockWorkPublicationStalled",
-      "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest node-accepted pool block whose landing this frontend's published work does not yet carry, whether the landing has not committed yet or has committed but is unpublished here, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Adopted blocks and abandoned or orphaned rows are never pending. Zero when none; -1 before the first derivation, when the ledger read fails or overruns its one-second budget, or when this frontend's clock is behind the offering one; unknown never fires. The gauge is recomputed each health tick into the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
+      "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest landed pool block (outbox row submitted or pool block confirmed) whose payout revision this frontend has not yet published, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Accepted blocks that have not landed, including a lost race awaiting its orphan proof, are the subject of qbit_prism_block_candidates_pending and qbit_prism_block_candidate_oldest_pending_seconds, not this gauge. Adopted blocks and abandoned or orphaned rows are never pending. Zero after a successful read with nothing pending; -1 before this process's first health tick at which its published revision equals the cluster revision (so a restarted frontend that cannot publish reads unknown and the readiness and coverage alerts own it), when the ledger read fails or overruns its one-second budget, or when this frontend's clock is behind the offering one; unknown never fires. The gauge is recomputed each health tick into the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
       "basis": "120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
@@ -643,7 +643,7 @@
         "crates/qbit-prism-server/src/metrics/registry.rs#L84",
         "crates/qbit-prism-server/src/metrics/labels.rs#L94",
         "crates/qbit-prism-server/src/metrics.rs#L80",
-        "crates/qbit-prism-server/src/coordinator/accepted_publication.rs#L197",
+        "crates/qbit-prism-server/src/coordinator/accepted_publication.rs#L339",
         "crates/qbit-prism-server/src/server.rs#L359"
       ]
     },
@@ -656,21 +656,22 @@
       "evaluator": "gt",
       "threshold": 0,
       "for": "1m",
-      "severity": "critical",
+      "severity": "warning",
       "service": "qbit-mining-pool",
       "labels": {
-        "alert_class": "prism-runtime",
-        "page": "true"
+        "alert_class": "prism-runtime"
       },
       "summary": "PrismStalePayoutRevisionJobRefusals",
-      "description": "Per frontend: job builds refused because this frontend's published payout revision was behind the cluster's, counted once at the build arm that refuses them; the refusal itself is unchanged. The counter starts at zero and is carried in the cached metrics body. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
+      "description": "Per frontend: job builds refused at build_job's first work admission because this frontend's published payout revision differs from the cluster's; the refusal itself is unchanged. Publication-stamp races, unselectable leases and the same check reached outside that admission are not counted. The counter starts at zero and is carried in the cached metrics body. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision, a miner-visible hiccup; it also happens routinely on a non-offering frontend between a landing's revision bump and its next refresh, so a critical page on any single increase would be noise. Warning only: #291 sets the refusal rate at which it becomes critical. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
+      "basis": "Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision, a miner-visible hiccup; it also happens routinely on a non-offering frontend between a landing's revision bump and its next refresh, so a critical page on any single increase would be noise. Warning only: #291 sets the refusal rate at which it becomes critical. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L93",
         "crates/qbit-prism-server/src/metrics.rs#L66",
-        "crates/qbit-prism-server/src/coordinator.rs#L2460"
+        "crates/qbit-prism-server/src/coordinator/tip_observation.rs#L597",
+        "crates/qbit-prism-server/src/coordinator/accepted_publication.rs#L313",
+        "crates/qbit-prism-server/src/coordinator.rs#L2454"
       ]
     },
     {
