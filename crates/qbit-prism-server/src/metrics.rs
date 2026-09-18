@@ -26,11 +26,48 @@ struct CollectionState {
     version: u64,
 }
 
+/// What one readiness attempt actually learned about the node. An absent field
+/// is unknown to this attempt, never a carried-over or invented observation.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeObservation {
+    /// When this attempt began. It orders concurrent attempts, so a slower
+    /// older one cannot overwrite a newer observation when it finally lands.
+    pub started: Instant,
+    /// `getnetworkinfo.connections`, absent unless that call was made and
+    /// answered with a peer count. A node answering zero peers is a real zero.
+    pub peers: Option<u64>,
+    /// `getblockchaininfo.initialblockdownload` and the instant that call
+    /// answered, absent unless it answered with a boolean.
+    pub chain: Option<(bool, Instant)>,
+}
+
+impl NodeObservation {
+    /// Every field starts unknown; the attempt fills in what it learns.
+    pub fn started() -> Self {
+        Self {
+            started: Instant::now(),
+            peers: None,
+            chain: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct NodeState {
+    /// Start of the attempt whose values are published.
+    observed: Option<Instant>,
+    /// When the latest answered getblockchaininfo returned.
+    answered: Option<Instant>,
+}
+
 pub struct Metrics {
     inner: Mutex<Registry>,
     collections: Mutex<BTreeMap<Collector, CollectionState>>,
     runtime: Arc<runtime::RuntimeMonitor>,
     coverage_gap_since: Mutex<Option<Instant>>,
+    node: Mutex<NodeState>,
+    /// When this frontend's hashrate rollup last left no unfolded share.
+    rollup_caught_up: Mutex<Option<Instant>>,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -75,6 +112,9 @@ impl Metrics {
             Family::PartitionLead,
             Family::Rss,
             Family::ConnectionLimit,
+            Family::NodePeers,
+            Family::NodeIbd,
+            Family::NodeObservationAge,
         ] {
             registry.register(family, vec![], -1.);
         }
@@ -103,7 +143,9 @@ impl Metrics {
             );
         }
         // Owner-dependent hooks are declared without inventing observations.
-        for family in [Family::FirstOffer, Family::LockWait] {
+        // The rollup lag joins them: a disabled rollup publishes no pass, and an
+        // absent sample is not the same claim as a lag of -1.
+        for family in [Family::FirstOffer, Family::LockWait, Family::RollupLag] {
             registry.declare(family);
         }
         for collector in Collector::ALL {
@@ -128,6 +170,8 @@ impl Metrics {
             collections: Mutex::new(BTreeMap::new()),
             runtime,
             coverage_gap_since: Mutex::new(None),
+            node: Mutex::new(NodeState::default()),
+            rollup_caught_up: Mutex::new(None),
         }
     }
     pub fn runtime(&self) -> Arc<runtime::RuntimeMonitor> {
@@ -151,9 +195,10 @@ impl Metrics {
         *body = refreshed;
     }
     fn current_registry(&self) -> Registry {
-        let stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // One coherent read, then derive into the copy. Releasing the registry
+        // before the observation locks keeps their order the same everywhere.
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let collections = self.collections.lock().unwrap_or_else(|e| e.into_inner());
-        let mut registry = stored.clone();
         for collector in Collector::ALL {
             let state = collections.get(collector);
             let age = state
@@ -169,7 +214,24 @@ impl Metrics {
             }
         }
         drop(collections);
-        drop(stored);
+        let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(
+            Family::NodeObservationAge,
+            Labels::Empty,
+            node.answered.map_or(-1., |at| at.elapsed().as_secs_f64()),
+        );
+        drop(node);
+        let caught_up = *self
+            .rollup_caught_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Only a running rollup loop reserved a sample here; a disabled rollup
+        // leaves the family declared and unsampled.
+        registry.refresh(
+            Family::RollupLag,
+            Labels::Empty,
+            caught_up.map_or(-1., |at| at.elapsed().as_secs_f64()),
+        );
         registry
     }
 }

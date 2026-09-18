@@ -134,6 +134,9 @@ pub fn expected(populated: bool) -> Census {
         "metrics_snapshot_stale",
         "metrics_snapshot_age_seconds",
         "stratum_connection_limit",
+        "node_peers",
+        "node_initial_block_download",
+        "node_observation_age_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -210,6 +213,14 @@ pub fn expected(populated: bool) -> Census {
         "histogram",
         if populated { &locks } else { &[] },
         SECONDS,
+    );
+    // A disabled rollup publishes no lag at all, so the family is declared and
+    // unsampled exactly as it is before the loop starts.
+    result.family(
+        "hashrate_rollup_watermark_lag_seconds",
+        "gauge",
+        if populated { &unlabelled } else { &[] },
+        &[],
     );
     result
 }
