@@ -20,6 +20,14 @@ SCRIPT = ROOT / "scripts" / "check_deleted_test_map.py"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 ISSUES = "https://github.com/Qbit-Org/qbit-mining-bootstrap/issues"
 
+FILE_MANIFEST = """# Deleted files, independent of the map under test.
+tests/test_a.py
+tests/test_b.py
+tests/test_c.py
+tests/test_d.py
+tests/test_e.py
+"""
+
 MAP = f"""# Deleted 2.x.x tests and their 3.x.x replacements
 
 Regenerate the file list with:
@@ -94,9 +102,11 @@ class KeptTests:
 """
 
 
-def write_tree(root: Path, text: str = MAP) -> None:
+def write_tree(root: Path, text: str = MAP, *, manifest: str | None = FILE_MANIFEST) -> None:
     (root / "docs").mkdir()
     (root / "docs" / "prism-deleted-test-map.md").write_text(text, encoding="utf-8")
+    if manifest is not None:
+        (root / "docs" / "prism-deleted-test-files.txt").write_text(manifest, encoding="utf-8")
     (root / "crates" / "demo" / "tests").mkdir(parents=True)
     (root / "crates" / "demo" / "tests" / "ledger.rs").write_text(RUST, encoding="utf-8")
     (root / "tests").mkdir()
@@ -182,10 +192,10 @@ ALL_OPEN = {6: state("open"), 7: state("open"), 8: state("open"), 9: state("open
 
 
 class OfflineTests(unittest.TestCase):
-    def check(self, text: str = MAP) -> subprocess.CompletedProcess[str]:
+    def check(self, text: str = MAP, *, manifest: str | None = FILE_MANIFEST) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_tree(root, text)
+            write_tree(root, text, manifest=manifest)
             return run_check(root)
 
     def assert_fails(self, text: str, *expected: str) -> None:
@@ -203,6 +213,48 @@ class OfflineTests(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ok (5 file rows, 1 case rows)", result.stdout)
+
+    def test_a_renamed_file_fails_even_when_counts_are_unchanged(self) -> None:
+        self.assert_fails(
+            edited("`tests/test_c.py`", "`tests/test_c_typo.py`"),
+            f":{line_of('`tests/test_c.py`')}: file `tests/test_c_typo.py` is not in the deleted-file manifest",
+            "deleted file `tests/test_c.py` is missing from the file tables",
+        )
+
+    def test_a_missing_file_fails_even_when_counts_are_reconciled(self) -> None:
+        text = edited("| `tests/test_c.py` | retired | retired — Python only |\n", "")
+        text = text.replace("| 5 | 1 | 1 | 1 | 1 | 1 |", "| 4 | 1 | 1 | 1 | 1 | 0 |")
+        text = text.replace("- Ledger (3)", "- Ledger (2)")
+        self.assert_fails(text, "deleted file `tests/test_c.py` is missing from the file tables")
+
+    def test_an_extra_file_fails_even_when_counts_are_reconciled(self) -> None:
+        text = edited(
+            "| `tests/test_c.py` | retired | retired — Python only |",
+            "| `tests/test_c.py` | retired | retired — Python only |\n| `tests/test_invented.py` | retired | retired — invented |",
+        )
+        text = text.replace("| 5 | 1 | 1 | 1 | 1 | 1 |", "| 6 | 1 | 1 | 1 | 1 | 2 |")
+        text = text.replace("- Ledger (3)", "- Ledger (4)")
+        self.assert_fails(text, "file `tests/test_invented.py` is not in the deleted-file manifest")
+
+    def test_a_case_row_cannot_replace_a_file_row(self) -> None:
+        text = edited("| `tests/test_c.py` | retired | retired — Python only |\n", "")
+        text = text.replace("| 5 | 1 | 1 | 1 | 1 | 1 |", "| 4 | 1 | 1 | 1 | 1 | 0 |")
+        text = text.replace("- Ledger (3)", "- Ledger (2)")
+        text = text.replace("`test_case_one`", "`tests/test_c.py`")
+        self.assert_fails(text, "deleted file `tests/test_c.py` is missing from the file tables")
+
+    def test_an_unavailable_or_empty_manifest_fails_closed(self) -> None:
+        for manifest, message in ((None, "cannot read"), ("# No entries\n\n", "manifest has no deleted files")):
+            with self.subTest(manifest=manifest):
+                result = self.check(manifest=manifest)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("docs/prism-deleted-test-files.txt", result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_duplicate_manifest_entries_fail(self) -> None:
+        result = self.check(manifest=FILE_MANIFEST + "tests/test_c.py\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("duplicate deleted file `tests/test_c.py`", result.stderr)
 
     def test_a_missing_map_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

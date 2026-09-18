@@ -12,6 +12,8 @@ Without flags the check is offline and is what required CI runs:
 
 - every table is one the map defines and every row parses (a line this script
   cannot read is an error, never a skipped row);
+- file-row names exactly match the pinned deletion set recorded in
+  `docs/prism-deleted-test-files.txt`, without needing Git history;
 - every `path::name` reference names a file in the repository and a test
   function in it (`#[test]`-style attribute in Rust, `def test_` in Python);
 - a status is one of the five the legend defines, the row's text leads with
@@ -57,6 +59,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "check-deleted-test-map"
 MAP = Path("docs") / "prism-deleted-test-map.md"
+FILE_MANIFEST = Path("docs") / "prism-deleted-test-files.txt"
 REPOSITORY = "Qbit-Org/qbit-mining-bootstrap"
 DEFAULT_API_URL = "https://api.github.com"
 
@@ -355,6 +358,33 @@ def check_rows(parsed: ParsedMap) -> list[str]:
     return errors
 
 
+def check_file_inventory(parsed: ParsedMap, root: Path) -> list[str]:
+    try:
+        text = (root / FILE_MANIFEST).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{FILE_MANIFEST.as_posix()}: cannot read deleted-file manifest: {error}"]
+
+    errors: list[str] = []
+    expected: set[str] = set()
+    for number, line in enumerate(text.splitlines(), start=1):
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        if name in expected:
+            errors.append(f"{FILE_MANIFEST.as_posix()}:{number}: duplicate deleted file `{name}`")
+        expected.add(name)
+    if not expected:
+        return [f"{FILE_MANIFEST.as_posix()}: manifest has no deleted files"]
+
+    actual = {row.name for row in parsed.file_rows}
+    for name in sorted(expected - actual):
+        errors.append(at(1, f"deleted file `{name}` is missing from the file tables (listed in {FILE_MANIFEST.as_posix()})"))
+    for row in parsed.file_rows:
+        if row.name not in expected:
+            errors.append(at(row.line, f"file `{row.name}` is not in the deleted-file manifest {FILE_MANIFEST.as_posix()}"))
+    return errors
+
+
 def check_triage_index(parsed: ParsedMap) -> list[str]:
     errors: list[str] = []
     rows = {row.name: row for row in parsed.file_rows if row.status == NEEDS_TRIAGE}
@@ -421,6 +451,7 @@ def check_offline(text: str, root: Path, repository: str) -> tuple[ParsedMap, li
     parsed = parse_map(text)
     errors = list(parsed.errors)
     errors += check_rows(parsed)
+    errors += check_file_inventory(parsed, root)
     errors += check_triage_index(parsed)
     errors += check_counts(parsed)
     errors += check_links(parsed, repository)

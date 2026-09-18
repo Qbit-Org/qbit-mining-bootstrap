@@ -10,6 +10,8 @@ git diff --name-status --diff-filter=D 504846c 8dccc74 -- tests/ test/
 
 Both ends are pinned on purpose: `origin/2.x.x` has moved past 504846c and adds test files of its own, and this branch removes eight `test/test-prism-*.sh` wrappers on its own; neither is a cutover deletion and neither is a row here.
 
+The same pinned deletion set is checked in as [prism-deleted-test-files.txt](prism-deleted-test-files.txt), with its generation command in the header. The offline check compares file-row names against this manifest, so it also works in shallow checkouts without either historical commit.
+
 How the rows were derived: each 2.x.x file was read at 504846c (module docstring, test names, test bodies by behaviour cluster), then the native suites were searched and read: `crates/qbit-prism-server/tests/*.rs` (with `support/` and `observability/`), `#[cfg(test)]` modules under `crates/qbit-prism-server/src/`, `crates/qbit-prism/tests/*.rs`, `crates/qbit-prism/src/`, and the Python tests that remain under `tests/`. A native test is cited only where its body asserts the behaviour. Many cited native tests are gated on `PRISM_TEST_DATABASE_URL`, `PRISM_TEST_PG_BIN_DIR` or `QBITD_BIN`; they take those inputs through the shared gate described in [prism-integration-test-gate.md](prism-integration-test-gate.md), and the `prism-native-postgres` job proves from the gate's manifest that each of them executed. The nine PostgreSQL-gated decision-D2 coordinator tests from #316 (`crates/qbit-prism-server/src/coordinator/d2_bootstrap_tests.rs` and `d2_below_target_tests.rs`) are cited where they assert a deleted test's behaviour or its documented 3.x.x replacement rule (`docs/prism-rust-migration.md`, "Payout differences from 2.x.x (decision D2)").
 
 Status values:
@@ -58,6 +60,7 @@ This map is evidence for the cutover go/no-go (#291), so it is checked, not trus
 
 `python3 scripts/check_deleted_test_map.py` runs in the required `Lint, compile, and Compose validation` job, offline, and fails when:
 
+- a deleted file from the pinned manifest has no file row, a file row names a file outside that manifest, or the manifest is unreadable, empty or contains duplicates;
 - a `path::name` reference names a file that is not in the repository, a function that is not in that file, or a function that is not a test;
 - a table line does not parse, a status is not one the legend defines, a row's text does not lead with its status, a full row cites no test, or an open gap row links no issue;
 - the summary table or the section row counts differ from the rows, or the needs triage index differs from the needs triage rows;
