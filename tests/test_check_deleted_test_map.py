@@ -946,6 +946,31 @@ fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /
         self.assertIn("- `tests/test_b.py` (partial, no owner issue)", result.stdout)
         self.assertIn("- `test_case_one` (partial, no owner issue)", result.stdout)
 
+    def test_summary_detects_unowned_remainders_without_semicolon_separators(self) -> None:
+        for separator in ("; ", ", ", ". ", " — ", ": ", " "):
+            for label in ("not covered", "not covered, no open issue", "Not covered"):
+                for remainder, expected in (("recovery", True), ("none with a native subject", False)):
+                    with self.subTest(separator=separator, label=label, remainder=remainder), tempfile.TemporaryDirectory() as directory:
+                        detail = f"{separator}{label}: {remainder}; retired: Python helpers"
+                        text = edited(
+                            f", written when [#6]({ISSUES}/6) landed; not covered: the rest (→ [#7]({ISSUES}/7))",
+                            detail,
+                        ).replace(
+                            "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+                            "| `test_case_one` | partial | partial: `crates/demo/tests/ledger.rs::lands_one_block`"
+                            f"{detail} |",
+                        )
+                        root = Path(directory)
+                        write_tree(root, text)
+                        result = run_check(root, "--summary")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual("- `tests/test_b.py` (partial, no owner issue)" in result.stdout, expected)
+                        self.assertEqual("- `test_case_one` (partial, no owner issue)" in result.stdout, expected)
+                        if expected:
+                            self.assertIn("Partial rows with an uncovered remainder and no owner issue (2):", result.stdout)
+                        else:
+                            self.assertNotIn("no owner issue", result.stdout)
+
     def test_summary_does_not_report_retired_remainders_or_duplicate_owned_rows(self) -> None:
         text = edited(
             "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",

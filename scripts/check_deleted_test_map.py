@@ -690,12 +690,11 @@ def check_issues(
 
 
 def has_uncovered_remainder(row: Row) -> bool:
-    """Read coverage clauses, distinguishing an explicit native-subject none."""
-    for clause in row.text.split(";"):
-        label, _, remainder = clause.strip().partition(":")
-        if label in ("not covered", "not covered, no open issue"):
-            if remainder.strip() != "none with a native subject":
-                return True
+    """Find coverage markers regardless of the punctuation preceding them."""
+    for marker in re.finditer(r"\bnot covered(?:, no open issue)?:", row.text, re.IGNORECASE):
+        remainder = row.text[marker.end():].split(";", 1)[0].strip()
+        if remainder != "none with a native subject":
+            return True
     return False
 
 
