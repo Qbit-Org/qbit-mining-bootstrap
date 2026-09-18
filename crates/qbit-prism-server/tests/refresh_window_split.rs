@@ -202,7 +202,7 @@ async fn new_share_and_payout_revision_each_invalidate_once() -> Result<()> {
             f.node.set_template(Some(churn(first.template.clone(), 1)));
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
-            one_read(f, mark, support::SHARES + 3).await?;
+            one_read(f, mark, 3).await?;
             let next = prepared(&f.a).await?;
             ensure!(
                 next.snapshot.share_seq == latest_share_seq && next.window != first.window,
@@ -226,7 +226,7 @@ async fn new_share_and_payout_revision_each_invalidate_once() -> Result<()> {
             .await?;
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
-            one_read(f, mark, support::SHARES + 3).await?;
+            one_read(f, mark, 0).await?;
             ensure!(
                 prepared(&f.a).await?.snapshot.payout_revision == next.snapshot.payout_revision + 1,
                 "revision was not refreshed"
@@ -281,7 +281,7 @@ async fn transaction_churn_does_not_extend_original_reanchor_interval() -> Resul
                 sleep(Duration::from_millis(850)).await;
                 let mark = f.proxy.mark();
                 c.refresh_once().await?;
-                one_read(f, mark, support::SHARES + 1).await?;
+                one_read(f, mark, 1).await?;
                 ensure!(
                     prepared(&c).await?.window.anchor_ms > first.window.anchor_ms
                         && prepared(&c).await?.snapshot.share_seq == latest_share_seq,
@@ -327,7 +327,7 @@ async fn delayed_snapshot_read_does_not_restart_reanchor_age() -> Result<()> {
                 let first = prepared(&c).await?;
                 let mark = f.proxy.mark();
                 c.refresh_once().await?;
-                one_read(f, mark, support::SHARES).await?;
+                one_read(f, mark, 0).await?;
                 ensure!(prepared(&c).await?.window.anchor_ms > first.window.anchor_ms,
                     "snapshot response wait renewed the original reanchor interval");
                 Ok(())
@@ -372,7 +372,7 @@ async fn shares_after_capture_enter_the_next_window_without_rewriting_the_select
             f.node.set_template(Some(churn(first.template.clone(), 2)));
             let mark = f.proxy.mark();
             f.a.refresh_once().await?;
-            one_read(f, mark, support::SHARES + 1).await?;
+            one_read(f, mark, 1).await?;
             ensure!(
                 prepared(&f.a).await?.snapshot.share_seq == appended.share.share_seq,
                 "the next build did not capture the share committed during reservation"

@@ -65,7 +65,8 @@ pub(super) trait WorkLedger: Send + Sync {
         &self,
         network: u128,
         completion: ReadAdmission,
-    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>>;
+        prior: Option<BlockingDrop<crate::ledger::RetainedShares>>,
+    ) -> BoxFuture<'_, Result<BlockingDrop<crate::ledger::SnapshotCapture>>>;
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>>;
     /// Returns how many blocks the committed reconciliation confirmed
     /// for the first time (`Ledger::reconcile_blocks_at_revision`).
@@ -192,8 +193,11 @@ impl WorkLedger for Ledger {
         &self,
         network: u128,
         completion: ReadAdmission,
-    ) -> BoxFuture<'_, Result<BlockingDrop<Snapshot>>> {
-        Box::pin(Ledger::snapshot_with_admission(self, network, completion))
+        prior: Option<BlockingDrop<crate::ledger::RetainedShares>>,
+    ) -> BoxFuture<'_, Result<BlockingDrop<crate::ledger::SnapshotCapture>>> {
+        Box::pin(Ledger::snapshot_with_admission(
+            self, network, completion, prior,
+        ))
     }
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>> {
         Box::pin(Ledger::pool_blocks_for_reconcile(self))
