@@ -28,6 +28,10 @@ tests/test_d.py
 tests/test_e.py
 """
 
+CASE_MANIFEST = """# Deleted cases, independent of the map under test.
+test_case_one
+"""
+
 MAP = f"""# Deleted 2.x.x tests and their 3.x.x replacements
 
 Regenerate the file list with:
@@ -102,11 +106,15 @@ class KeptTests:
 """
 
 
-def write_tree(root: Path, text: str = MAP, *, manifest: str | None = FILE_MANIFEST) -> None:
+def write_tree(
+    root: Path, text: str = MAP, *, manifest: str | None = FILE_MANIFEST, case_manifest: str | None = CASE_MANIFEST
+) -> None:
     (root / "docs").mkdir()
     (root / "docs" / "prism-deleted-test-map.md").write_text(text, encoding="utf-8")
     if manifest is not None:
         (root / "docs" / "prism-deleted-test-files.txt").write_text(manifest, encoding="utf-8")
+    if case_manifest is not None:
+        (root / "docs" / "prism-deleted-test-cases.txt").write_text(case_manifest, encoding="utf-8")
     (root / "crates" / "demo" / "tests").mkdir(parents=True)
     (root / "crates" / "demo" / "tests" / "ledger.rs").write_text(RUST, encoding="utf-8")
     (root / "tests").mkdir()
@@ -192,10 +200,12 @@ ALL_OPEN = {6: state("open"), 7: state("open"), 8: state("open"), 9: state("open
 
 
 class OfflineTests(unittest.TestCase):
-    def check(self, text: str = MAP, *, manifest: str | None = FILE_MANIFEST) -> subprocess.CompletedProcess[str]:
+    def check(
+        self, text: str = MAP, *, manifest: str | None = FILE_MANIFEST, case_manifest: str | None = CASE_MANIFEST
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_tree(root, text, manifest=manifest)
+            write_tree(root, text, manifest=manifest, case_manifest=case_manifest)
             return run_check(root)
 
     def assert_fails(self, text: str, *expected: str) -> None:
@@ -208,6 +218,7 @@ class OfflineTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(SCRIPT)], cwd=ROOT, text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("142 file rows", result.stdout)
+        self.assertIn("17 case rows", result.stdout)
 
     def test_a_consistent_map_passes_with_escaped_pipes_markers_and_fences(self) -> None:
         result = self.check()
@@ -255,6 +266,58 @@ class OfflineTests(unittest.TestCase):
         result = self.check(manifest=FILE_MANIFEST + "tests/test_c.py\n")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("duplicate deleted file `tests/test_c.py`", result.stderr)
+
+    def test_a_missing_case_fails_even_when_file_counts_are_unchanged(self) -> None:
+        self.assert_fails(
+            edited("| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |\n", ""),
+            "deleted case `test_case_one` is missing from the case tables",
+        )
+
+    def test_a_renamed_case_fails_even_when_counts_are_unchanged(self) -> None:
+        self.assert_fails(
+            edited("`test_case_one`", "`test_case_typo`"),
+            f":{line_of('`test_case_one`')}: case `test_case_typo` is not in the deleted-case manifest",
+            "deleted case `test_case_one` is missing from the case tables",
+        )
+
+    def test_an_extra_case_fails(self) -> None:
+        self.assert_fails(
+            edited(
+                "| `test_case_one` | full |",
+                "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |\n| `test_case_two` | full |",
+            ),
+            "case `test_case_two` is not in the deleted-case manifest",
+        )
+
+    def test_a_file_row_cannot_replace_a_case_row(self) -> None:
+        text = edited("| 2.x.x case |", "| 2.x.x file |")
+        text = text.replace("| 5 | 1 | 1 | 1 | 1 | 1 |", "| 6 | 2 | 1 | 1 | 1 | 1 |")
+        text = text.replace("- Ledger (3)", "- Ledger (4)")
+        result = self.check(text, manifest=FILE_MANIFEST + "test_case_one\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("deleted case `test_case_one` is missing from the case tables", result.stderr)
+
+    def test_an_unavailable_or_empty_case_manifest_fails_closed(self) -> None:
+        for manifest, message in ((None, "cannot read"), ("# No entries\n\n", "manifest has no deleted cases")):
+            with self.subTest(manifest=manifest):
+                result = self.check(case_manifest=manifest)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("docs/prism-deleted-test-cases.txt", result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_duplicate_case_manifest_entries_fail(self) -> None:
+        result = self.check(case_manifest=CASE_MANIFEST + "test_case_one\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("duplicate deleted case `test_case_one`", result.stderr)
+
+    def test_duplicate_case_rows_fail(self) -> None:
+        self.assert_fails(
+            edited(
+                "| `test_case_one` | full |",
+                "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |\n| `test_case_one` | full |",
+            ),
+            f"case `test_case_one` already has a row at line {line_of('`test_case_one`')}",
+        )
 
     def test_a_missing_map_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -321,7 +384,9 @@ class OfflineTests(unittest.TestCase):
 
     def test_case_rows_are_not_counted_as_files(self) -> None:
         text = edited("| `test_case_one` | full |", "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |\n| `test_case_two` | full |")
-        self.assertEqual(self.check(text).returncode, 0)
+        result = self.check(text, case_manifest=CASE_MANIFEST + "test_case_two\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok (5 file rows, 2 case rows)", result.stdout)
 
     def test_section_list_must_match_the_sections(self) -> None:
         self.assert_fails(edited("- Ledger (3)", "- Ledger (4)"), "section list says 4 rows in 'Ledger', the section holds 3")
