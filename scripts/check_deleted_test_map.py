@@ -17,7 +17,8 @@ Without flags the check is offline and is what required CI runs:
 - case-row names exactly match the pinned test-method inventory recorded in
   `docs/prism-deleted-test-cases.txt`;
 - every `path::name` reference names a file in the repository and a test
-  function in it (`#[test]`-style attribute in Rust, `def test_` in Python);
+  function in it (`#[test]`-style attribute in Rust, a Python method included
+  by the repository's unittest discovery);
 - a status is one of the five the legend defines, the row's text leads with
   it, a full or partial row cites a test and an open gap row links its owner issue;
 - the summary table and the per-section counts equal the rows;
@@ -38,6 +39,9 @@ comment on the qualification issue.
 Exits 0 when the map holds, 1 when it does not, and 2 when `--check-issues`
 could not learn an issue's state (network, rate limit, unexpected reply): an
 unknown state is reported as unknown, never as open.
+
+Python citation validation imports test modules and invokes their discovery
+hooks, just as CI's Python runner does; it does not run test bodies or fixtures.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass, field
 import http.client
+import inspect
 import json
 import math
 import os
@@ -54,6 +59,7 @@ import re
 import ssl
 import sys
 import time
+import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -268,15 +274,44 @@ def rust_functions(text: str) -> tuple[set[str], set[str]]:
     return functions, tests
 
 
-def python_functions(text: str) -> tuple[set[str], set[str]]:
-    functions = {found.group("name") for line in text.splitlines() if (found := PYTHON_DEF.match(line))}
-    return functions, {name for name in functions if name.startswith("test_")}
+def discovered_python_tests(root: Path) -> dict[Path, set[str]] | str:
+    """Index the source of methods in CI's suite without executing the suite."""
+    previous_cwd = Path.cwd()
+    previous_path = sys.path[:]
+    loader = unittest.TestLoader()
+    tests: dict[Path, set[str]] = {}
+    try:
+        # Match scripts/run_python_test_shard.py, including imports relative to root.
+        os.chdir(root)
+        sys.path.insert(0, str(root))
+        pending = [loader.discover("tests", pattern="test_*.py")]
+        if loader.errors:
+            return "Python unittest discovery failed:\n" + "\n".join(loader.errors)
+        while pending:
+            test = pending.pop()
+            if isinstance(test, unittest.TestSuite):
+                pending.extend(test)
+                continue
+            method_name = test._testMethodName
+            method = inspect.unwrap(getattr(test, method_name))
+            if not method_name.startswith(loader.testMethodPrefix) or not inspect.isroutine(method):
+                continue
+            source = inspect.getsourcefile(method)
+            if source is not None:
+                tests.setdefault(Path(source).resolve(), set()).add(method_name)
+    except Exception as error:
+        return f"Python unittest discovery failed: {error}"
+    finally:
+        os.chdir(previous_cwd)
+        sys.path[:] = previous_path
+    return tests
 
 
 class References:
     def __init__(self, root: Path) -> None:
-        self.root = root
+        self.root = root.resolve()
         self.cache: dict[str, tuple[set[str], set[str]] | str] = {}
+        self.python_tests: dict[Path, set[str]] | str | None = None
 
     def load(self, path: str, extension: str) -> tuple[set[str], set[str]] | str:
         if path not in self.cache:
@@ -291,7 +326,16 @@ class References:
                 except (OSError, UnicodeDecodeError) as error:
                     self.cache[path] = f"unreadable: {error}"
                 else:
-                    self.cache[path] = rust_functions(text) if extension == "rs" else python_functions(text)
+                    if extension == "rs":
+                        self.cache[path] = rust_functions(text)
+                    else:
+                        if self.python_tests is None:
+                            self.python_tests = discovered_python_tests(self.root)
+                        if isinstance(self.python_tests, str):
+                            self.cache[path] = self.python_tests
+                        else:
+                            functions = {found.group("name") for line in text.splitlines() if (found := PYTHON_DEF.match(line))}
+                            self.cache[path] = functions, self.python_tests.get(target.resolve(), set())
         return self.cache[path]
 
     def problem(self, path: str, extension: str, name: str) -> str | None:
@@ -303,7 +347,7 @@ class References:
         if name not in functions:
             return f"`{path}::{name}`: no `{keyword} {name}` in that file"
         if name not in tests:
-            wanted = "a #[test]-style attribute above it" if extension == "rs" else "a `test_` name"
+            wanted = "a #[test]-style attribute above it" if extension == "rs" else "membership in the discovered unittest suite"
             return f"`{path}::{name}`: `{keyword} {name}` exists but is not a test function ({wanted} is required)"
         return None
 

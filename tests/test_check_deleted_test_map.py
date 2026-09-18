@@ -96,11 +96,14 @@ fn lands_one_block() {}
 async fn lands_two_blocks() {}
 """
 
-PYTHON = """def helper():
+PYTHON = """import unittest
+
+
+def helper():
     pass
 
 
-class KeptTests:
+class KeptTests(unittest.TestCase):
     def test_kept(self):
         pass
 """
@@ -347,6 +350,67 @@ class OfflineTests(unittest.TestCase):
             edited("test_kept.py::test_kept`", "test_kept.py::helper`"),
             "`def helper` exists but is not a test function",
         )
+
+    def test_python_citations_must_be_in_the_discovered_suite(self) -> None:
+        sources = {
+            "plain class": PYTHON.replace("(unittest.TestCase)", ""),
+            "module function": "def test_kept():\n    pass\n",
+            "nested function": "def helper():\n    def test_kept():\n        pass\n",
+            "nested class": "import unittest\nclass Outer:\n    class KeptTests(unittest.TestCase):\n        def test_kept(self):\n            pass\n",
+            "unreachable class": "if False:\n" + "\n".join("    " + line for line in PYTHON.splitlines()),
+            "replaced method": PYTHON + "\nKeptTests.test_kept = None\n",
+            "load_tests filters it out": PYTHON + "\ndef load_tests(loader, tests, pattern):\n    return unittest.TestSuite()\n",
+        }
+        for label, source in sources.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                (root / "tests" / "test_kept.py").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("`def test_kept` exists but is not a test function", result.stderr)
+
+    def test_python_citations_accept_discovered_aliases_and_inherited_methods(self) -> None:
+        sources = (
+            PYTHON.replace("import unittest", "import unittest as ut").replace("unittest.TestCase", "ut.TestCase"),
+            PYTHON.replace("import unittest", "from unittest import TestCase as Case").replace("unittest.TestCase", "Case"),
+            PYTHON.replace("class KeptTests(unittest.TestCase):", "class Mixin:")
+            + "\nclass KeptTests(Mixin, unittest.TestCase):\n    pass\n",
+            PYTHON.replace("unittest.TestCase", "unittest.IsolatedAsyncioTestCase").replace("def test_kept", "async def test_kept"),
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                (root / "tests" / "test_kept.py").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_python_citations_reject_files_outside_the_discovery_pattern(self) -> None:
+        for path in ("tests/kept.py", "tests/nested/test_kept.py", "scripts/test_kept.py"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, edited("`tests/test_kept.py::test_kept`", f"`{path}::test_kept`"))
+                target = root / path
+                target.parent.mkdir(exist_ok=True)
+                target.write_text(PYTHON, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("`def test_kept` exists but is not a test function", result.stderr)
+
+    def test_python_discovery_failures_are_reported_without_running_test_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root)
+            source = PYTHON.replace("        pass", "        raise RuntimeError('test body ran')")
+            (root / "tests" / "test_kept.py").write_text(source, encoding="utf-8")
+            result = run_check(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            (root / "tests" / "test_broken.py").write_text("raise RuntimeError('discovery failed')\n", encoding="utf-8")
+            result = run_check(root)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Python unittest discovery failed", result.stderr)
+            self.assertIn("discovery failed", result.stderr)
 
     def test_a_reference_in_prose_outside_any_table_is_checked_too(self) -> None:
         self.assert_fails(
