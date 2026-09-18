@@ -454,7 +454,8 @@ impl ServiceState {
         view.metrics_freshness.response(body)
     }
 }
-/// Kept equal to the family's meaning in docs/prism-metric-metadata.json.
+/// The first sentence of the family's meaning in
+/// docs/prism-metric-metadata.json, which adds that only this role counts them.
 const AUDIT_ARTIFACT_REFUSALS_HELP: &str =
     "Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight.";
 fn numeric(value: &Value) -> Option<f64> {

@@ -251,7 +251,7 @@
       "type": "counter",
       "labels": "none",
       "role": "public-api",
-      "meaning": "Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight."
+      "meaning": "Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight. Public-api role only: the mining process serves the same route on its operator listener and applies the same cap there, but has no public-service metrics owner, so those refusals are uncounted."
     },
     "qbit_prism_public_degraded_responses_total": {
       "type": "counter",

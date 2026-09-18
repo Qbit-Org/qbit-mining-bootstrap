@@ -890,7 +890,13 @@ sizes, so every distinct request repeats it.
 `PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` (default 1) is how many of those run at
 once, and it is deliberately not derived from `PRISM_POSTGRES_READ_CONCURRENCY`:
 a larger read pool serves more dashboard reads without admitting a second
-window into memory. A request waits for its slot inside its own read deadline
+window into memory *on this route*. The limit does not extend to
+`/public/v1/blocks/<hash>/settlement-artifacts`, which falls back to the
+audit-bundle reader for a block with no CTV fanout set and rebuilds or decodes
+the window under the shared imported-audit decode limit, still sized from
+`PRISM_POSTGRES_READ_CONCURRENCY`; that route admits as many windows as the read
+concurrency allows. Moving it under the artifact limit would change another
+route's behaviour and is left as a follow-up. A request waits for its slot inside its own read deadline
 (`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS`, default 20 s) and answers 503
 `read_timeout` if the deadline runs out first, exactly as a slow query does.
 
