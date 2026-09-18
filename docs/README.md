@@ -61,7 +61,8 @@ This is useful for reviewers and operators who need implementation detail:
   add a gated test.
 - [prism-deleted-test-map.md](prism-deleted-test-map.md): every 2.x.x test
   file absent on 3.x.x, grouped by area, with its native replacement or the
-  open issue that closes the gap.
+  open issue that closes the gap. `scripts/check_deleted_test_map.py` fails CI
+  when a test it cites is gone or its counts drift from its rows.
 
 ## Public-Site Guidance
 
