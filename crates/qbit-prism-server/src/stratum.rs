@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    net::IpAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -180,6 +181,12 @@ pub struct StratumConfig {
     pub initial_job_limit: Arc<Semaphore>,
     pub max_connections_per_username: usize,
     pub username_connections: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+    pub max_connections_per_ip: usize,
+    pub ip_connections: Arc<Mutex<HashMap<IpAddr, Weak<Semaphore>>>>,
+    pub session_budget_interval_seconds: f64,
+    pub max_malformed_frames_per_interval: u32,
+    pub max_unknown_jobs_per_interval: u32,
+    pub max_authorize_attempts_per_interval: u32,
     pub stats: Arc<StratumStats>,
 }
 
@@ -207,6 +214,12 @@ impl Default for StratumConfig {
             initial_job_limit: Arc::new(Semaphore::new(128)),
             max_connections_per_username: 0,
             username_connections: Arc::new(Mutex::new(HashMap::new())),
+            max_connections_per_ip: 0,
+            ip_connections: Arc::new(Mutex::new(HashMap::new())),
+            session_budget_interval_seconds: 60.0,
+            max_malformed_frames_per_interval: 0,
+            max_unknown_jobs_per_interval: 0,
+            max_authorize_attempts_per_interval: 0,
             stats: Arc::new(StratumStats::default()),
         }
     }
@@ -232,6 +245,49 @@ impl ConnectionLimit {
     }
     fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         self.permits.clone().try_acquire_owned().ok()
+    }
+}
+
+/// The largest value any per-session rate budget accepts. Budgets bound a
+/// misbehaving session, not a legitimate one, so the ceiling only has to stay
+/// far above any honest per-interval rate.
+const MAX_SESSION_BUDGET: u32 = 1_000_000;
+
+/// The per-source admission limit was already spent for this address.
+struct IpLimitExceeded;
+
+/// A per-session rate budget over a fixed window. Zero disables it, which is
+/// the default and today's behavior. A budget is a rate, never a session
+/// lifetime total: a whole window's worth of burst is always admitted and the
+/// allowance refills in full at the next window.
+#[derive(Debug)]
+struct SessionBudget {
+    limit: u32,
+    interval: Duration,
+    window_start: Instant,
+    charged: u32,
+}
+
+impl SessionBudget {
+    fn new(limit: u32, interval: Duration) -> Self {
+        Self {
+            limit,
+            interval,
+            window_start: Instant::now(),
+            charged: 0,
+        }
+    }
+    /// Charge exactly one event. False once this window's allowance is spent.
+    fn charge(&mut self) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        if self.window_start.elapsed() >= self.interval {
+            self.window_start = Instant::now();
+            self.charged = 0;
+        }
+        self.charged = self.charged.saturating_add(1);
+        self.charged <= self.limit
     }
 }
 
@@ -526,6 +582,17 @@ impl StratumConfig {
         config.initial_job_limit = Arc::new(Semaphore::new(initial));
         config.max_connections_per_username =
             value("PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME", 0usize)?;
+        config.max_connections_per_ip = value("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", 0usize)?;
+        config.session_budget_interval_seconds = value(
+            "PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS",
+            config.session_budget_interval_seconds,
+        )?;
+        config.max_malformed_frames_per_interval =
+            value("PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL", 0u32)?;
+        config.max_unknown_jobs_per_interval =
+            value("PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL", 0u32)?;
+        config.max_authorize_attempts_per_interval =
+            value("PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL", 0u32)?;
         if let Ok(mask) = std::env::var("PRISM_VERSION_ROLLING_MASK") {
             config.version_rolling_mask = codec::version_mask_from_template(
                 &json!({"versionrollingmask":mask}),
@@ -593,6 +660,35 @@ impl StratumConfig {
             "per-username connection limit exceeds semaphore capacity"
         );
         ensure!(
+            self.max_connections_per_ip <= Semaphore::MAX_PERMITS,
+            "PRISM_STRATUM_MAX_CONNECTIONS_PER_IP exceeds semaphore capacity"
+        );
+        ensure!(
+            self.session_budget_interval_seconds.is_finite()
+                && self.session_budget_interval_seconds > 0.0
+                && self.session_budget_interval_seconds <= 3600.0,
+            "PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS must be finite, positive and at most 3600"
+        );
+        for (name, budget) in [
+            (
+                "PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL",
+                self.max_malformed_frames_per_interval,
+            ),
+            (
+                "PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL",
+                self.max_unknown_jobs_per_interval,
+            ),
+            (
+                "PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL",
+                self.max_authorize_attempts_per_interval,
+            ),
+        ] {
+            ensure!(
+                budget <= MAX_SESSION_BUDGET,
+                "{name} must be at most {MAX_SESSION_BUDGET}"
+            );
+        }
+        ensure!(
             self.startup_difficulty.is_finite() && self.startup_difficulty > 0.0,
             "startup difficulty must be positive"
         );
@@ -640,6 +736,43 @@ impl StratumConfig {
     }
 }
 
+impl StratumConfig {
+    /// Per-source admission for one accepted socket, decided from the address
+    /// this listener observed. `Ok(None)` means the limit is disabled. The
+    /// registry holds weak references; dead keys are dropped only when a new
+    /// key is inserted, so an accept from a known address stays O(1) while the
+    /// map stays bounded by the live connections at the last insertion, not by
+    /// every address observed. Both listeners share one registry, so an
+    /// address spends one budget across the ordinary and high-difficulty ports.
+    fn try_acquire_ip(
+        &self,
+        ip: IpAddr,
+    ) -> std::result::Result<Option<OwnedSemaphorePermit>, IpLimitExceeded> {
+        if self.max_connections_per_ip == 0 {
+            return Ok(None);
+        }
+        let semaphore = {
+            let mut registry = self
+                .ip_connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match registry.get(&ip).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    registry.retain(|_, entry| entry.strong_count() > 0);
+                    let semaphore = Arc::new(Semaphore::new(self.max_connections_per_ip));
+                    registry.insert(ip, Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        semaphore
+            .try_acquire_owned()
+            .map(Some)
+            .map_err(|_| IpLimitExceeded)
+    }
+}
+
 struct IssuedJob<C> {
     job: MiningJob<C>,
     worker: Worker,
@@ -668,10 +801,17 @@ struct Session<C> {
     pending_retarget: Option<(f64, Vardiff)>,
     last_accepted_share: Option<(String, f64)>,
     last_hint: Option<(f64, Instant)>,
+    malformed_frames: SessionBudget,
+    unknown_jobs: SessionBudget,
+    authorize_attempts: SessionBudget,
+    budget_exceeded: Option<crate::metrics::ConnectionRefusalReason>,
 }
 
 impl<C> Session<C> {
     fn new(config: &StratumConfig, observation: SessionObservation) -> Self {
+        // Validation keeps this convertible; a zero-limit budget ignores it.
+        let interval = Duration::try_from_secs_f64(config.session_budget_interval_seconds)
+            .unwrap_or(Duration::from_secs(60));
         Self {
             worker: None,
             extranonce1: None,
@@ -694,7 +834,47 @@ impl<C> Session<C> {
             pending_retarget: None,
             last_accepted_share: None,
             last_hint: None,
+            malformed_frames: SessionBudget::new(
+                config.max_malformed_frames_per_interval,
+                interval,
+            ),
+            unknown_jobs: SessionBudget::new(config.max_unknown_jobs_per_interval, interval),
+            authorize_attempts: SessionBudget::new(
+                config.max_authorize_attempts_per_interval,
+                interval,
+            ),
+            budget_exceeded: None,
         }
+    }
+
+    /// Charge one budgeted event and name the breach for the request loop, the
+    /// refusal counter and the operator's log. A disabled budget never
+    /// breaches, so the default configuration keeps today's behavior.
+    fn charge(
+        &mut self,
+        reason: crate::metrics::ConnectionRefusalReason,
+        metrics: &crate::metrics::Metrics,
+    ) -> bool {
+        use crate::metrics::ConnectionRefusalReason as Reason;
+        let budget = match reason {
+            Reason::MalformedFrameBudget => &mut self.malformed_frames,
+            Reason::UnknownJobBudget => &mut self.unknown_jobs,
+            Reason::AuthorizeBudget => &mut self.authorize_attempts,
+            // Admission limits are decided before a session exists.
+            Reason::GlobalLimit | Reason::UsernameLimit | Reason::IpLimit => return true,
+        };
+        if budget.charge() {
+            return true;
+        }
+        self.budget_exceeded = Some(reason);
+        metrics.record_connection_refusal(reason);
+        tracing::warn!(
+            reason = reason.as_str(),
+            limit = budget.limit,
+            interval_seconds = budget.interval.as_secs_f64(),
+            "Stratum session exceeded a per-session budget"
+        );
+        false
     }
 
     fn apply_requests(&mut self, config: &StratumConfig) {
@@ -1054,6 +1234,20 @@ async fn request<B: MiningBackend>(
             }
             "mining.authorize" => {
                 let username = params.first().and_then(Value::as_str).unwrap_or("");
+                // Charged before the address validation RPC: username cycling
+                // on one connection is what this budget bounds. Re-authorizing
+                // within the budget keeps working.
+                if !session.charge(
+                    crate::metrics::ConnectionRefusalReason::AuthorizeBudget,
+                    metrics,
+                ) {
+                    return Err(StratumError {
+                        code: 20,
+                        message: "too many authorization attempts".into(),
+                        reason_id: None,
+                    }
+                    .into());
+                }
                 let worker = timeout(
                     Duration::from_secs_f64(config.initial_job_timeout_seconds),
                     backend.authorize(username),
@@ -1307,6 +1501,22 @@ async fn request<B: MiningBackend>(
                             version_mask: original_mask,
                             retired_at: Some(tokio::time::Instant::now().into_std()),
                         });
+                    } else {
+                        // Every miss cost one ledger lookup, so every miss is
+                        // charged. A miss is not proof the ID is bogus: honest
+                        // staleness and transient resume races land here too,
+                        // and the next submit must still re-query.
+                        if !session.charge(
+                            crate::metrics::ConnectionRefusalReason::UnknownJobBudget,
+                            metrics,
+                        ) {
+                            return Err(StratumError {
+                                code: 20,
+                                message: "too many unknown job submissions".into(),
+                                reason_id: None,
+                            }
+                            .into());
+                        }
                     }
                 }
                 let issued = session
@@ -1401,8 +1611,17 @@ async fn request<B: MiningBackend>(
                 .fetch_add(1, Ordering::Relaxed);
             share_observation.rejected(error);
         }
+        let malformed = error.reason_id.as_deref() == Some("malformed-submit");
         write_json(writer, error.response(id), config).await?;
         share_observation.acknowledged(crate::metrics::AckResult::Rejected);
+        // Malformed requests were answered and forgotten. One frame is one
+        // charge, whatever it weighs: a junk flood is a frame rate.
+        if malformed {
+            session.charge(
+                crate::metrics::ConnectionRefusalReason::MalformedFrameBudget,
+                metrics,
+            );
+        }
     }
     Ok(())
 }
@@ -1454,9 +1673,20 @@ async fn session<B: MiningBackend>(
                 let frame = std::mem::take(&mut buffer);
                 match serde_json::from_slice::<Value>(&frame) {
                     Ok(value) if value.is_object() => request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics).await?,
-                    _ => write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?,
+                    _ => {
+                        write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?;
+                        session.charge(crate::metrics::ConnectionRefusalReason::MalformedFrameBudget,&metrics);
+                    }
                 }
             }
+        }
+        if let Some(reason) = session.budget_exceeded {
+            // The breach was recorded and answered; close after the response.
+            tracing::warn!(
+                reason = reason.as_str(),
+                "Stratum session disconnected by a per-session budget"
+            );
+            break;
         }
         if session.retry_job {
             if let Err(error) =
@@ -1495,7 +1725,20 @@ pub async fn run_listener<B: MiningBackend>(
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
-                let (stream,_) = accepted?;
+                let (stream,peer) = accepted?;
+                // Decided from the observed peer address at accept, before any
+                // permit, task or allocation, so a refused source costs one
+                // in-memory lookup and never reaches the database.
+                let ip_permit = match config.try_acquire_ip(peer.ip()) {
+                    Ok(permit) => permit,
+                    Err(IpLimitExceeded) => {
+                        metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::IpLimit);
+                        // The address belongs in the log, never in a label.
+                        tracing::warn!(peer = %peer, limit = config.max_connections_per_ip, listener = %config.listener_name, "Stratum connection refused by the per-source limit");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let Some(permit) = config.connection_limit.try_acquire() else {
                     metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::GlobalLimit);
                     drop(stream);
@@ -1506,6 +1749,7 @@ pub async fn run_listener<B: MiningBackend>(
                 let runtime = metrics.runtime();
                 connections.spawn(runtime.track(crate::metrics::TaskKind::StratumSession, async move {
                     let _permit = permit;
+                    let _ip_permit = ip_permit;
                     if let Err(error) = session(stream,backend,config,refresh,shutdown,metrics).await {
                         tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
                     }

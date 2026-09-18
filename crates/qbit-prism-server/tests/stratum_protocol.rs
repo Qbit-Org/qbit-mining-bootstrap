@@ -44,6 +44,8 @@ struct Backend {
     submit_error: Mutex<Option<StratumError>>,
     build_gate: Mutex<Option<Arc<observability::Gate>>>,
     hint_gate: Mutex<Option<Arc<observability::Gate>>>,
+    authorize_calls: AtomicU32,
+    resume_calls: AtomicU32,
 }
 
 impl MiningBackend for Backend {
@@ -104,6 +106,7 @@ impl MiningBackend for Backend {
         Ok((self.sessions.fetch_add(1, Ordering::Relaxed) + 1).into())
     }
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
+        self.authorize_calls.fetch_add(1, Ordering::SeqCst);
         if !username.starts_with("miner") {
             return Err(StratumError::new(
                 20,
@@ -234,6 +237,7 @@ impl MiningBackend for Backend {
         worker: &Worker,
         id: &str,
     ) -> Result<Option<MiningJob<()>>, StratumError> {
+        self.resume_calls.fetch_add(1, Ordering::SeqCst);
         let stored = self.stored.lock().unwrap();
         let Some((job, original, mask, expires)) = stored.get(id) else {
             return Ok(None);
@@ -291,6 +295,36 @@ impl Client {
             self.difficulty = value["params"][0].as_f64().unwrap();
         }
         value
+    }
+    async fn request_health(&mut self, id: u64) -> Value {
+        self.send(json!({"id":id,"method":"mining.get_health","params":[]}))
+            .await;
+        self.response(id).await
+    }
+    /// A well-formed submit for a job this session was never issued.
+    fn unknown_job_submit(&self, id: u64, username: &str, job_id: &str) -> Value {
+        json!({"id":id,"method":"mining.submit","params":[username,job_id,"0".repeat(16),"00000000","00000000"]})
+    }
+    async fn request_submit(&mut self, id: u64, username: &str, job_id: &str) -> Value {
+        let request = self.unknown_job_submit(id, username, job_id);
+        self.send(request).await;
+        self.response(id).await
+    }
+    /// Read every remaining response and require the listener to close. The
+    /// error answer that names a spent budget arrives before the close.
+    async fn expect_closed(&mut self) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let mut line = String::new();
+            let read = timeout(Duration::from_secs(5), self.reader.read_line(&mut line))
+                .await
+                .expect("the listener never closed the connection")
+                .unwrap();
+            if read == 0 {
+                return seen;
+            }
+            seen.push(serde_json::from_str(&line).unwrap());
+        }
     }
     async fn response(&mut self, id: u64) -> Value {
         loop {
@@ -1318,6 +1352,509 @@ async fn admission_timeout_records_failure_and_shutdown_releases_session_stats()
     assert_eq!(snapshot.connections, 0);
     assert_eq!(snapshot.authorized, 0);
     assert_eq!(snapshot.pending_builds, 0);
+}
+
+// --- P2 admission: per-source cap and per-session budgets (#276) -------------
+
+fn refusal_total(metrics: &qbit_prism_server::metrics::Metrics, reason: &str) -> f64 {
+    let key = format!("qbit_prism_stratum_connection_refusals_total{{reason=\"{reason}\"}} ");
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&key))
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(f64::NAN)
+}
+
+fn budget_refusals(metrics: &qbit_prism_server::metrics::Metrics) -> [f64; 3] {
+    [
+        refusal_total(metrics, "malformed_frame_budget"),
+        refusal_total(metrics, "unknown_job_budget"),
+        refusal_total(metrics, "authorize_budget"),
+    ]
+}
+
+async fn wait_for_connections(stats: &Arc<StratumStats>, count: usize) {
+    timeout(Duration::from_secs(5), async {
+        while stats.snapshot(0).connections != count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the session count never reached the expected value");
+}
+
+/// Refusal at accept closes the socket without writing a byte, exactly as the
+/// existing global limit does.
+async fn assert_socket_refused(address: std::net::SocketAddr) {
+    use tokio::io::AsyncReadExt;
+    let mut refused = TcpStream::connect(address).await.unwrap();
+    let mut bytes = Vec::new();
+    match timeout(Duration::from_secs(5), refused.read_to_end(&mut bytes))
+        .await
+        .expect("the refused socket stayed open")
+    {
+        Ok(_) => assert!(bytes.is_empty(), "refused socket received {bytes:?}"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+}
+
+#[tokio::test]
+async fn per_source_cap_refuses_at_accept_without_backend_work_and_frees_the_slot_on_close() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_connections_per_ip: 1,
+        ..Default::default()
+    };
+    let stats = config.stats.clone();
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut held = Client::connect(address).await;
+    held.login("miner.held").await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 0.);
+    let allocated = backend.sessions.load(Ordering::SeqCst);
+
+    assert_socket_refused(address).await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 1.);
+    // The decision is taken at accept: no session identity was allocated and
+    // no other refusal reason was recorded for it.
+    assert_eq!(backend.sessions.load(Ordering::SeqCst), allocated);
+    assert_eq!(backend.authorize_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(refusal_total(&metrics, "global_limit"), 0.);
+    assert_eq!(stats.snapshot(0).connections, 1);
+
+    // The permit is released by the session task, so the slot returns.
+    drop(held);
+    wait_for_connections(&stats, 0).await;
+    let mut replacement = Client::connect(address).await;
+    replacement.login("miner.replacement").await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 1.);
+    drop(replacement);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn per_source_cap_is_one_budget_across_the_default_and_highdiff_listeners() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_connections_per_ip: 2,
+        ..Default::default()
+    };
+    // `highdiff_config` derives its listener by cloning the default config;
+    // derive it the same way so both listeners hold the one registry Arc.
+    let mut highdiff = config.clone();
+    highdiff.listener_name = "highdiff".into();
+    let stats = config.stats.clone();
+    let (address, backend, refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let high_address = listener.local_addr().unwrap();
+    let high_task = tokio::spawn(run_listener(
+        listener,
+        highdiff,
+        backend.clone(),
+        refresh.subscribe(),
+        shutdown.subscribe(),
+        metrics.clone(),
+    ));
+    let mut ordinary = Client::connect(address).await;
+    ordinary.login("miner.ordinary").await;
+    let mut high = Client::connect(high_address).await;
+    high.login("miner.high").await;
+    // Two slots are spent, one on each port: both ports now refuse.
+    assert_socket_refused(high_address).await;
+    assert_socket_refused(address).await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 2.);
+
+    // Closing the highdiff connection frees a slot the default port can use.
+    drop(high);
+    wait_for_connections(&stats, 1).await;
+    let mut replacement = Client::connect(address).await;
+    replacement.login("miner.replacement").await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 2.);
+    drop((ordinary, replacement));
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    high_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn per_source_cap_of_zero_admits_every_connection_from_one_address() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig::default();
+    assert_eq!(config.max_connections_per_ip, 0, "the default must be off");
+    let stats = config.stats.clone();
+    let (address, _backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut clients = Vec::new();
+    for index in 0..8 {
+        let mut client = Client::connect(address).await;
+        client.login(&format!("miner.rig{index}")).await;
+        clients.push(client);
+    }
+    wait_for_connections(&stats, 8).await;
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 0.);
+    drop(clients);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_frame_budget_counts_frames_not_bytes_and_then_disconnects() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_malformed_frames_per_interval: 4,
+        session_budget_interval_seconds: 600.0,
+        ..Default::default()
+    };
+    let (address, _backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.junk").await;
+    // Valid traffic is never charged, so the whole budget is still available.
+    // Each junk frame is far longer than the budget: a byte count would have
+    // disconnected on the first one.
+    for (index, frame) in ["not json at all", "[1,2,3]", "{\"id\":1}", "null"]
+        .into_iter()
+        .enumerate()
+    {
+        client.writer.write_all(frame.as_bytes()).await.unwrap();
+        client.writer.write_all(b"\n").await.unwrap();
+        let error = client.read().await;
+        assert_eq!(
+            error["error"][2]["reason_id"], "malformed-submit",
+            "{index}"
+        );
+    }
+    let health = client.request_health(90).await;
+    assert_eq!(health["result"]["ready"], false, "budget closed early");
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+
+    client
+        .send(json!({"id":91,"method":"mining.nonsense","params":[]}))
+        .await;
+    let closing = client.expect_closed().await;
+    assert_eq!(
+        closing.last().unwrap()["error"][2]["reason_id"],
+        "malformed-submit",
+        "the spent budget must answer before closing"
+    );
+    assert_eq!(budget_refusals(&metrics), [1., 0., 0.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn every_unknown_job_miss_is_requeried_and_charged_until_the_budget_disconnects() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_unknown_jobs_per_interval: 8,
+        session_budget_interval_seconds: 600.0,
+        ..Default::default()
+    };
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.stale").await;
+    // No negative cache: a repeated unknown ID is looked up again every time,
+    // and every lookup that misses is charged.
+    for id in 0..8 {
+        let rejected = client
+            .request_submit(1000 + id, "miner.stale", "repeated-unknown")
+            .await;
+        assert_eq!(rejected["error"][2]["reason_id"], "unknown-job");
+    }
+    assert_eq!(backend.resume_calls.load(Ordering::SeqCst), 8);
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+
+    for id in 0..200 {
+        let request = client.unknown_job_submit(3000 + id, "miner.stale", "repeated-unknown");
+        client.send(request).await;
+    }
+    client.expect_closed().await;
+    let lookups = backend.resume_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        lookups, 9,
+        "200 unknown submits beyond a budget of 8 must cost exactly one more lookup"
+    );
+    assert_eq!(budget_refusals(&metrics), [0., 1., 0.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_transient_resume_miss_recovers_on_the_next_submit_of_the_same_job() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(StratumConfig::default(), metrics.clone()).await;
+    // The job is issued to one connection and submitted on another, so the
+    // second session must resume it from the backend.
+    let mut issuer = Client::connect(address).await;
+    issuer.login("miner.race").await;
+    let job_id = issuer.notify["params"][0].as_str().unwrap().to_string();
+    let mut resumer = Client::connect(address).await;
+    resumer.login("miner.race").await;
+    assert_ne!(resumer.notify["params"][0], issuer.notify["params"][0]);
+
+    // A frontend momentarily behind on the payout revision misses the resume.
+    backend.payout_revision.fetch_add(1, Ordering::SeqCst);
+    let missed = resumer.request_submit(1, "miner.race", &job_id).await;
+    assert_eq!(missed["error"][2]["reason_id"], "unknown-job");
+    backend.payout_revision.fetch_sub(1, Ordering::SeqCst);
+    // The very next submit re-queries and finds the job: nothing remembered
+    // the transient miss.
+    let recovered = resumer.request_submit(2, "miner.race", &job_id).await;
+    assert_ne!(
+        recovered["error"][2]["reason_id"], "unknown-job",
+        "a transient miss must not stick: {recovered}"
+    );
+    assert_eq!(backend.resume_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+    drop((issuer, resumer));
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn authorize_budget_bounds_username_cycling_and_keeps_reauthorization_working() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        max_authorize_attempts_per_interval: 8,
+        session_budget_interval_seconds: 600.0,
+        ..Default::default()
+    };
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.first").await;
+    // Re-authorizing to switch usernames stays supported inside the budget.
+    for id in 0..7 {
+        client
+            .send(json!({"id":500+id,"method":"mining.authorize","params":[format!("miner.rig{id}"),"x"]}))
+            .await;
+        assert_eq!(client.response(500 + id).await["result"], true);
+    }
+    assert_eq!(backend.authorize_calls.load(Ordering::SeqCst), 8);
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+
+    for id in 0..200 {
+        client
+            .send(json!({"id":600+id,"method":"mining.authorize","params":[format!("miner.cycle{id}"),"x"]}))
+            .await;
+    }
+    client.expect_closed().await;
+    let calls = backend.authorize_calls.load(Ordering::SeqCst);
+    assert!(
+        calls <= 8,
+        "{calls} address validations for 200 authorize attempts beyond a budget of 8"
+    );
+    assert_eq!(budget_refusals(&metrics), [0., 0., 1.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn recommended_budgets_admit_a_thousand_valid_submits_and_an_honest_stale_burst() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    // The values docs/prism-b4-stratum-admission.md recommends as a start.
+    let config = StratumConfig {
+        session_budget_interval_seconds: 60.0,
+        max_malformed_frames_per_interval: 64,
+        max_unknown_jobs_per_interval: 256,
+        max_authorize_attempts_per_interval: 32,
+        max_connections_per_ip: 0,
+        ..Default::default()
+    };
+    // Hold the share difficulty still so the control measures budgets only.
+    let mut config = config;
+    config.vardiff.enabled = false;
+    let stats = config.stats.clone();
+    let (address, backend, refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.honest").await;
+    let started = Instant::now();
+    for index in 0..1000u32 {
+        let request =
+            client.solved_submit_version(10_000 + index as u64, "miner.honest", index * 4096, None);
+        client.send(request).await;
+        let accepted = client.response(10_000 + index as u64).await;
+        assert!(
+            accepted["error"].is_null(),
+            "valid submit {index} was refused: {accepted}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the control must stay inside one budget window"
+    );
+    assert_eq!(budget_refusals(&metrics), [0., 0., 0.]);
+    assert_eq!(stats.snapshot(0).connections, 1);
+
+    // An honest staleness burst: a payout revision change retires the work
+    // this session still holds, so its in-flight submits arrive as unknown.
+    let stale: Vec<Value> = (0..64)
+        .map(|index| {
+            client.solved_submit_version(
+                20_000 + index,
+                "miner.honest",
+                900_000 + index as u32 * 4096,
+                None,
+            )
+        })
+        .collect();
+    backend.payout_revision.fetch_add(1, Ordering::SeqCst);
+    backend.generation.fetch_add(1, Ordering::SeqCst);
+    refresh.send(1).unwrap();
+    for (index, request) in stale.into_iter().enumerate() {
+        let id = request["id"].as_u64().unwrap();
+        client.send(request).await;
+        let response = client.response(id).await;
+        assert!(
+            response["error"].is_null()
+                || response["error"][2]["reason_id"] == "unknown-job"
+                || response["error"][2]["reason_id"] == "stale-job",
+            "unexpected answer to stale submit {index}: {response}"
+        );
+    }
+    assert_eq!(
+        budget_refusals(&metrics),
+        [0., 0., 0.],
+        "an honest staleness burst inside the budget must not disconnect"
+    );
+    assert_eq!(stats.snapshot(0).connections, 1);
+
+    // Re-authorizing still works with every budget enabled.
+    client
+        .send(json!({"id":30_000,"method":"mining.authorize","params":["miner.second","x"]}))
+        .await;
+    assert_eq!(client.response(30_000).await["result"], true);
+    drop(client);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_budget_disconnect_releases_the_global_per_source_and_per_username_permits() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        connection_limit: ConnectionLimit::new(1),
+        max_connections_per_ip: 1,
+        max_connections_per_username: 1,
+        max_malformed_frames_per_interval: 1,
+        session_budget_interval_seconds: 600.0,
+        ..Default::default()
+    };
+    let stats = config.stats.clone();
+    let (address, _backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.only").await;
+    for _ in 0..2 {
+        client
+            .send(json!({"id":1,"method":"mining.nonsense","params":[]}))
+            .await;
+    }
+    client.expect_closed().await;
+    drop(client);
+    wait_for_connections(&stats, 0).await;
+    assert_eq!(budget_refusals(&metrics), [1., 0., 0.]);
+    // Every keyed and global permit the disconnected session held is back.
+    let mut replacement = Client::connect(address).await;
+    replacement.login("miner.only").await;
+    assert_eq!(refusal_total(&metrics, "global_limit"), 0.);
+    assert_eq!(refusal_total(&metrics, "ip_limit"), 0.);
+    assert_eq!(refusal_total(&metrics, "username_limit"), 0.);
+    drop(replacement);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// Run the real `check-config` entry point in an isolated process, as
+/// `config_cli.rs` does, so validation sees the same effective value the
+/// runtime reads.
+async fn check_config(settings: &[(&str, &str)]) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    command.arg("check-config").kill_on_drop(true);
+    for (name, _) in std::env::vars().filter(|(name, _)| {
+        name.starts_with("PRISM_") || name.starts_with("QBIT_") || name == "RUST_LOG"
+    }) {
+        command.env_remove(name);
+    }
+    command
+        .env("PRISM_RUNTIME_WORKERS", "2")
+        .env(
+            "PRISM_DATABASE_URL",
+            "postgresql://operator:test-only-password@127.0.0.1:1/offline",
+        )
+        .env("QBIT_RPC_URL", "http://127.0.0.1:1/")
+        .env("QBIT_CHAIN", "regtest")
+        .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1");
+    for (name, value) in settings {
+        command.env(name, value);
+    }
+    timeout(Duration::from_secs(30), command.output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn admission_settings_reject_malformed_and_out_of_range_values_by_name() {
+    let names = [
+        "PRISM_STRATUM_MAX_CONNECTIONS_PER_IP",
+        "PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS",
+        "PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL",
+        "PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL",
+        "PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL",
+    ];
+    // Malformed values fail as `invalid <name>` through the shared parser.
+    for name in names {
+        for value in ["banana", "-1", "1e999999"] {
+            let output = check_config(&[(name, value)]).await;
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(!output.status.success(), "{name}={value} was accepted");
+            assert!(stderr.contains(name), "{name}={value}: {stderr}");
+        }
+    }
+    // Out-of-range values fail with the setting's own named failure.
+    for (name, value) in [
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "3601"),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "0"),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "NaN"),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "inf"),
+        ("PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL", "1000001"),
+        ("PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL", "1000001"),
+        (
+            "PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL",
+            "1000001",
+        ),
+    ] {
+        let output = check_config(&[(name, value)]).await;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!output.status.success(), "{name}={value} was accepted");
+        assert!(stderr.contains(name), "{name}={value}: {stderr}");
+    }
+    // Empty selects the default, and every boundary value is accepted.
+    for (name, value) in [
+        ("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", ""),
+        ("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", "0"),
+        ("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", "1"),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", ""),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "3600"),
+        ("PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS", "0.5"),
+        ("PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL", "1000000"),
+        ("PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL", "0"),
+        ("PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL", "1"),
+    ] {
+        let output = check_config(&[(name, value)]).await;
+        assert!(
+            output.status.success(),
+            "{name}={value} rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[path = "observability/stratum.rs"]

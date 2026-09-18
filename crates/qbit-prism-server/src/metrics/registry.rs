@@ -84,7 +84,7 @@ families! {
     SnapshotStale: Gauge, "metrics_snapshot_stale", "Whether the metrics snapshot is missing or exceeds the health freshness budget.";
     SnapshotAge: Gauge, "metrics_snapshot_age_seconds", "Monotonic age of the metrics snapshot, or -1 before the first publication.";
     LateConfirmed: Counter, "late_confirmed_shares_total", "Shares accepted after the share commit deadline once their in-flight ledger commit was confirmed.";
-    ConnectionRefusals: Counter, "stratum_connection_refusals_total", "Stratum connections refused by an existing admission limit, by closed reason.";
+    ConnectionRefusals: Counter, "stratum_connection_refusals_total", "Stratum connections refused by an admission limit or disconnected by a per-session budget, by closed reason.";
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
