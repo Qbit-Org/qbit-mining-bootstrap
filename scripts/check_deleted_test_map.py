@@ -18,7 +18,8 @@ Without flags the check is offline and is what required CI runs:
   `docs/prism-deleted-test-cases.txt`;
 - every `path::name` reference names a file in the repository and a test
   function in it (`#[test]`-style attribute in Rust source, ignoring comments
-  and literal contents, or a non-skipped Python method included by unittest discovery);
+  and literal contents, or a Python method included by unittest discovery with
+  no effective skip-decorator flag);
   Rust `#[ignore]` tests must be explicitly selected by the CI shard runner;
   Rust functions must also be reachable through enabled modules from a Cargo
   workspace target (unsupported conditional/macro inclusion fails closed);
@@ -45,6 +46,8 @@ unknown state is reported as unknown, never as open.
 
 Python citation validation imports test modules and invokes their discovery
 hooks, just as CI's Python runner does; it does not run test bodies or fixtures.
+The required Python shard runner separately checks actual successful execution
+of cited Python tests, so fixture/body skips cannot satisfy parity evidence.
 """
 
 from __future__ import annotations
