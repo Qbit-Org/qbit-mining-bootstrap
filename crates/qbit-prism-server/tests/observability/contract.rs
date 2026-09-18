@@ -141,7 +141,10 @@ pub fn expected(populated: bool) -> Census {
     result.family(
         "stratum_connection_refusals_total",
         "counter",
-        &labels("reason", "global_limit,username_limit"),
+        &labels(
+            "reason",
+            "global_limit,username_limit,ip_limit,malformed_frame_budget,unknown_job_budget,authorize_budget",
+        ),
         &[],
     );
     result.family(
