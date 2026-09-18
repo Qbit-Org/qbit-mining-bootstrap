@@ -89,7 +89,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_metrics_snapshot_available` | gauge | none | run | Whether a complete metrics snapshot has been published. | `qbit_prism_metrics_snapshot_available` |
 | `qbit_prism_metrics_snapshot_stale` | gauge | none | run | Whether the metrics snapshot is missing or exceeds the health freshness budget. | `qbit_prism_metrics_snapshot_stale` |
 | `qbit_prism_node_initial_block_download` | gauge | none | run | Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown. Recorded whenever the latest getblockchaininfo answered with the boolean, including the 1 that then makes readiness fail. -1 means startup, a failed call, or a field that was not a boolean. | none |
-| `qbit_prism_node_observation_age_seconds` | gauge | none | run | Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable. Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. A slower older attempt landing late cannot roll back a newer observation. | none |
+| `qbit_prism_node_observation_age_seconds` | gauge | none | run | Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable. Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. Peers and the sync flag come from the latest attempt to start, so a slower older attempt landing late cannot roll them back, while the age keeps the latest answer any attempt received. | none |
 | `qbit_prism_node_peers` | gauge | none | run | Node peer connections from the latest node observation, or -1 when unknown. Recorded only when the readiness attempt reached getnetworkinfo and it answered, which is never on regtest, during initial block download, or while blocks and headers disagree; observation adds no RPC call. -1 means the latest attempt did not learn the count, including RPC failure; the gauge never keeps an earlier reading. An answered zero is a real zero, and it is below every configured PRISM_MIN_PEERS floor. | none |
 | `qbit_prism_pending_job_builds` | gauge | none | run | Current local pending job deliveries. Delivery count replaces the operational intent of queue depth, not its implementation. | `qbit_prism_job_delivery_queue_depth` |
 | `qbit_prism_process_resident_memory_bytes` | gauge | none | run | Process resident memory bytes from procfs, or -1 when unknown. | `qbit_prism_process_resident_memory_bytes` |
@@ -651,7 +651,10 @@ that answers but is not ready keeps a small age while an unreachable node's age
 grows without bound. It is monotonic and computed at scrape time. Concurrent
 refresh, block-wait, candidate and broadcaster observations are ordered by the
 instant each attempt began, so a slower older attempt landing late cannot roll
-back a newer observation.
+back a newer observation. That ordering governs the peer count and the sync
+flag, which belong to one attempt; the age instead keeps the latest answer any
+attempt received, so a superseded attempt whose call answered last still proves
+the node was reachable then.
 
 `qbit_prism_hashrate_rollup_watermark_lag_seconds` is not derived from the
 stored watermark: `qbit_hashrate_rollup_progress.last_share_seq` is a share
