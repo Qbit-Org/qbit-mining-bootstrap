@@ -547,6 +547,27 @@ class OfflineTests(unittest.TestCase):
         self.assertIn("- `tests/test_e.py` (links #9)", result.stdout)
         self.assertIn("- `tests/test_b.py` (partial, owner #6, #7)", result.stdout)
 
+    def test_summary_lists_open_case_rows_with_and_without_owners(self) -> None:
+        for status, detail, suffix in (
+            ("open gap", f"open gap → [#10]({ISSUES}/10)", " (links #10)"),
+            ("needs triage", "needs triage — no native test or owner", ""),
+            ("needs triage", f"needs triage — see [#10]({ISSUES}/10)", " (links #10)"),
+        ):
+            with self.subTest(detail=detail), tempfile.TemporaryDirectory() as directory:
+                text = edited(
+                    "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+                    f"| `test_case_one` | {status} | {detail} |",
+                )
+                root = Path(directory)
+                write_tree(root, text)
+                result = run_check(root, "--summary")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                heading = f"{status.capitalize()} (2):\n"
+                self.assertIn(heading, result.stdout)
+                section = result.stdout.split(heading, 1)[1].split("\n\n", 1)[0]
+                self.assertIn(f"- `test_case_one`{suffix}", section)
+                self.assertEqual(result.stdout.count("- `test_case_one`"), 1)
+
     def test_summary_lists_unowned_partial_file_and_case_gaps(self) -> None:
         text = edited(
             f", written when [#6]({ISSUES}/6) landed; not covered: the rest (→ [#7]({ISSUES}/7))",

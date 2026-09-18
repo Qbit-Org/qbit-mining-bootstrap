@@ -612,7 +612,7 @@ def summary(parsed: ParsedMap) -> str:
         f"{counts[OPEN_GAP]} open gap, {counts[NEEDS_TRIAGE]} needs triage.",
     ]
     for status in (OPEN_GAP, NEEDS_TRIAGE):
-        rows = [row for row in parsed.file_rows if row.status == status]
+        rows = [row for row in [*parsed.file_rows, *parsed.case_rows] if row.status == status]
         if rows:
             lines += ["", f"{status.capitalize()} ({len(rows)}):"]
             for row in rows:
