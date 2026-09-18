@@ -17,8 +17,8 @@ Without flags the check is offline and is what required CI runs:
 - case-row names exactly match the pinned test-method inventory recorded in
   `docs/prism-deleted-test-cases.txt`;
 - every `path::name` reference names a file in the repository and a test
-  function in it (`#[test]`-style attribute in Rust, a Python method included
-  by the repository's unittest discovery);
+  function in it (`#[test]`-style attribute in Rust source, ignoring comments
+  and literal contents, or a Python method included by unittest discovery);
 - a status is one of the five the legend defines, the row's text leads with
   it, a full or partial row cites a test and an open gap row links its owner issue;
 - the summary table and the per-section counts equal the rows;
@@ -103,6 +103,13 @@ RUST_FN = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*[(<]"
 )
 RUST_TEST_ATTRIBUTE = re.compile(r"#\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test\b")
+# Match character literals as whole tokens so a quote character cannot start
+# a string. A lifetime or label has no closing apostrophe and remains code.
+RUST_NON_CODE = re.compile(
+    r'//[^\n]*|/\*|\b(?:br|cr|r)(?P<hashes>\#*)"|"|'
+    r"'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|[^\r\n])|[^'\\\r\n\t])'"
+)
+RUST_BLOCK_DELIMITER = re.compile(r"/\*|\*/")
 PYTHON_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 REQUEST_TIMEOUT_SECONDS = 10.0
@@ -248,9 +255,47 @@ def parse_map(text: str) -> ParsedMap:
     return parsed
 
 
+def rust_code(text: str) -> str:
+    """Mask comments and literal tokens, preserving code and line boundaries."""
+    parts: list[str] = []
+    cursor = 0
+    while token := RUST_NON_CODE.search(text, cursor):
+        start, end = token.span()
+        spelling = token.group()
+        if spelling == "/*":
+            depth = 1
+            while depth:
+                delimiter = RUST_BLOCK_DELIMITER.search(text, end)
+                if delimiter is None:
+                    end = len(text)
+                    break
+                depth += 1 if delimiter.group() == "/*" else -1
+                end = delimiter.end()
+        elif token.group("hashes") is not None:
+            closing = '"' + token.group("hashes")
+            close_at = text.find(closing, end)
+            end = len(text) if close_at < 0 else close_at + len(closing)
+        elif spelling == '"':
+            while end < len(text):
+                character = text[end]
+                end += 1
+                if character == "\\":
+                    end = min(end + 1, len(text))
+                elif character == '"':
+                    break
+        parts.append(text[cursor:start])
+        # Comments separate tokens like whitespace. Literals remain opaque
+        # tokens so removing them cannot join code on either side into a fn.
+        replacement = " " if spelling.startswith("/") else "~"
+        parts.append(re.sub(r"[^\r\n]", replacement, text[start:end]))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def rust_functions(text: str) -> tuple[set[str], set[str]]:
-    """Every `fn` name, and the subset whose attribute block marks a test."""
-    lines = text.splitlines()
+    """Every source `fn` name, and the subset whose attribute block marks a test."""
+    lines = rust_code(text).splitlines()
     functions: set[str] = set()
     tests: set[str] = set()
     for index, line in enumerate(lines):
@@ -262,12 +307,9 @@ def rust_functions(text: str) -> tuple[set[str], set[str]]:
         cursor = index - 1
         while cursor >= 0:
             above = lines[cursor].strip()
-            if not above:
+            if above.endswith(("{", "}", ";")):
                 break
-            if not above.startswith("//") and above.endswith(("{", "}", ";")):
-                break
-            if not above.startswith("//"):
-                attributes.append(above)
+            attributes.append(above)
             cursor -= 1
         if RUST_TEST_ATTRIBUTE.search(" ".join(reversed(attributes))):
             tests.add(found.group("name"))

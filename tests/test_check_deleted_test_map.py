@@ -351,6 +351,81 @@ class OfflineTests(unittest.TestCase):
             "`def helper` exists but is not a test function",
         )
 
+    def test_rust_citations_ignore_functions_inside_literals_and_comments(self) -> None:
+        phantom = "\n#[test]\nfn phantom() {}\n"
+        sources = {
+            "block comment": "/*" + phantom + "*/",
+            "nested block comment": "/* outer /* inner */" + phantom + "*/",
+            "doc comment": "/**" + phantom + "*/\nstruct Fixture;",
+            "line comments": "// #[test]\n// fn phantom() {}\n",
+            "string": 'const FIXTURE: &str = "' + phantom + '";',
+            "escaped quote": 'const FIXTURE: &str = "\\\"' + phantom + '";',
+            "byte string": 'const FIXTURE: &[u8] = b"' + phantom + '";',
+            "C string": 'const FIXTURE: &std::ffi::CStr = c"' + phantom + '";',
+            "doc attribute": '#[doc = "' + phantom + '"]\nstruct Fixture;',
+        }
+        for prefix, rust_type in (("r", "str"), ("br", "[u8]"), ("cr", "std::ffi::CStr")):
+            for hashes in ("", "#", "###"):
+                # Quotes and too few hashes do not close the raw string.
+                interior = '"' + hashes[:-1] if hashes else ""
+                sources[f"{prefix} with {len(hashes)} hashes"] = (
+                    f'const FIXTURE: &{rust_type} = {prefix}{hashes}"{interior}{phantom}"{hashes};'
+                )
+        for label, source in sources.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, edited("ledger.rs::lands_two_blocks`", "ledger.rs::phantom`"))
+                (root / "crates/demo/tests/ledger.rs").write_text(RUST + source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("no `fn phantom` in that file", result.stderr)
+
+    def test_rust_citations_ignore_test_attributes_inside_literals_and_comments(self) -> None:
+        for attribute in (
+            "/* #[test] */",
+            "/* outer /* inner */\n#[test]\n*/",
+            '#[doc = "#[test]"]',
+            '#[doc = r###"\n#[test]\n"###]',
+            "// #[test]",
+        ):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, edited("ledger.rs::lands_two_blocks`", "ledger.rs::phantom`"))
+                source = RUST + f"\n{attribute}\nfn phantom() {{}}\n"
+                (root / "crates/demo/tests/ledger.rs").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("`fn phantom` exists but is not a test function", result.stderr)
+
+    def test_rust_citations_preserve_real_tests_around_literals_and_comments(self) -> None:
+        source = r'''
+fn character_and_lifetime_fixture<'a>(value: &'a str) -> &'a str {
+    let _ = ('"', '\'', '\\', '\u{22}', b'"', b'\x22');
+    let _ = ("/*", "//", "\\\"", r###"/* "## //"###);
+    'label: loop { break 'label; }
+    value
+}
+
+#[test]
+/* outer comment
+   /* nested comment */
+   "quotes and // do not end a block comment"
+*/
+
+fn lands_one_block() {}
+
+#[test] // comment after a real attribute
+#[should_panic(expected = "escaped quote: \" /*")]
+/// Documentation between the attribute and the test.
+fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /*"); }
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root)
+            (root / "crates/demo/tests/ledger.rs").write_text(source, encoding="utf-8")
+            result = run_check(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_python_citations_must_be_in_the_discovered_suite(self) -> None:
         sources = {
             "plain class": PYTHON.replace("(unittest.TestCase)", ""),
