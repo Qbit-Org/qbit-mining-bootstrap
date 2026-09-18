@@ -2,7 +2,8 @@
 //! rendering, and test/thread setup. Run with `cargo test --release --locked
 //! -p qbit-prism-server --test metrics_allocation` as well as the debug suite.
 use qbit_prism_server::metrics::{
-    AckResult, ConnectionRefusalReason, LockKind, Metrics, Outcome, RejectReason, StaleJobCause,
+    AckResult, ConnectionRefusalReason, LockKind, Metrics, Outcome, PendingAge, PublicationResult,
+    RejectReason, StaleJobCause,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -72,6 +73,9 @@ fn observe_all(metrics: &Metrics, elapsed: Duration) {
         }
     }
     metrics.observe_first_offer(elapsed);
+    for result in PublicationResult::ALL {
+        metrics.observe_accepted_publication(*result, elapsed);
+    }
 }
 
 fn increment_all(metrics: &Metrics) {
@@ -86,6 +90,14 @@ fn increment_all(metrics: &Metrics) {
         metrics.record_stale_job_rejection(*cause);
     }
     metrics.set_stratum_connection_limit(384);
+    metrics.record_stale_revision_refusal();
+    for age in [
+        PendingAge::Unknown,
+        PendingAge::None,
+        PendingAge::Oldest(Duration::from_millis(125)),
+    ] {
+        metrics.set_accepted_pending_age(age);
+    }
 }
 
 #[test]
@@ -154,9 +166,10 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
     }
     let body = metrics.render();
     let histogram_count = body.lines().filter(|line| line.contains("_count")).count();
-    // Eleven exercised event series plus two eagerly registered, idle CTV
-    // histograms. Broadcaster observations are owned by the runtime suite.
-    assert_eq!(histogram_count, 13);
+    // Thirteen exercised event series (#458 adds the two accepted-publication
+    // results) plus two eagerly registered, idle CTV histograms. Broadcaster
+    // observations are owned by the runtime suite.
+    assert_eq!(histogram_count, 15);
     for line in body.lines().filter(|line| line.contains("_count")) {
         let (key, count) = line.rsplit_once(' ').unwrap();
         if key.starts_with("qbit_prism_ctv_fanout_broadcaster_") {
@@ -248,6 +261,7 @@ fn reserving_lazy_histograms_does_not_invent_observations() {
     for name in [
         "block_submit_seconds",
         "database_advisory_lock_wait_seconds",
+        "accepted_block_work_publication_seconds",
     ] {
         assert!(initial.contains(&format!("# TYPE qbit_prism_{name} histogram\n")));
         assert!(!initial

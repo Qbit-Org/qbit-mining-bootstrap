@@ -89,6 +89,9 @@ labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",
     ParentGrace => "parent_grace", PayoutRevision => "payout_revision"
 });
+// Whether an accepted block's landing reached this frontend's work at the
+// publication that sampled it, or only through a later landing's revision.
+labels!(PublicationResult { Published => "published", Superseded => "superseded" });
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.

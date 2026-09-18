@@ -2,6 +2,16 @@
 use super::*;
 use std::future::Future;
 
+/// What the accepted-publication gauge observed: a failed derivation, a
+/// successful observation that nothing is pending, or the oldest pending
+/// block's age. Unknown is not zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingAge {
+    Unknown,
+    None,
+    Oldest(Duration),
+}
+
 /// Records exactly once, including when the acquisition future is cancelled.
 /// Its lifetime ends before SQL or BEGIN, so only checkout is measured.
 struct PoolAcquireObservation<'a> {
@@ -140,6 +150,44 @@ impl Metrics {
     /// owns timestamp transport and recovery semantics across processes.
     pub fn observe_first_offer(&self, elapsed: Duration) {
         self.observe(Family::FirstOffer, Labels::Empty, elapsed);
+    }
+    /// One sample per accepted pool block, at the publication that first
+    /// carried its landed payout revision. The interval starts at the durable
+    /// `offered_at_ms` the offering frontend recorded immediately before its
+    /// one `submitblock` call and ends at this frontend's wall clock when the
+    /// publication returned: two hosts' wall clocks, so a negative interval is
+    /// skew and the caller records nothing rather than clamping it to zero.
+    /// `superseded` is the same measurement for a landing an earlier revision
+    /// already carried when this publication caught up, never a failure.
+    pub fn observe_accepted_publication(&self, result: PublicationResult, elapsed: Duration) {
+        self.observe(
+            Family::AcceptedPublication,
+            Labels::One(("result", result.as_str())),
+            elapsed,
+        );
+    }
+    /// The oldest accepted block this frontend has not published a landed
+    /// revision for, recomputed from durable rows on every health tick. A
+    /// derivation that could not read the ledger is unknown (-1), never zero:
+    /// zero is the successful observation that nothing is pending.
+    pub fn set_accepted_pending_age(&self, age: PendingAge) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
+            Family::AcceptedPendingAge,
+            Labels::Empty,
+            match age {
+                PendingAge::Unknown => -1.,
+                PendingAge::None => 0.,
+                PendingAge::Oldest(age) => age.as_secs_f64(),
+            },
+        );
+    }
+    /// Exactly once, at the `build_job` arm that refused work because the
+    /// published payout snapshot no longer matches the cluster's revision.
+    pub fn record_stale_revision_refusal(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::StaleRevisionRefusals, Labels::Empty);
     }
     pub fn observe_pool_acquire(&self, result: Outcome, elapsed: Duration) {
         self.observe(

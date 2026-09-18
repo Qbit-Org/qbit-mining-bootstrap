@@ -1,6 +1,6 @@
 use super::*;
 use crate::api::{router, ApiConfig, ApiState};
-use crate::metrics::{LockKind, Metrics, Outcome, BUCKETS};
+use crate::metrics::{LockKind, Metrics, Outcome, PublicationResult, BUCKETS};
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -499,6 +499,9 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
         for outcome in Outcome::ALL {
             metrics.observe_advisory_lock(*lock, *outcome, Duration::from_millis(25));
         }
+    }
+    for result in PublicationResult::ALL {
+        metrics.observe_accepted_publication(*result, Duration::from_millis(125));
     }
     for (age, expected_state) in [
         (None, "unavailable"),

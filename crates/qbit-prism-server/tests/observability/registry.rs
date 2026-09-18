@@ -138,6 +138,7 @@ async fn startup_scrape_renders_registry_without_fabricating_publication() {
         for deferred in [
             "qbit_prism_block_submit_seconds",
             "qbit_prism_database_advisory_lock_wait_seconds",
+            "qbit_prism_accepted_block_work_publication_seconds",
         ] {
             assert!(!body.lines().any(|line| line.starts_with(deferred)));
         }

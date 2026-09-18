@@ -7,6 +7,7 @@ pub mod runtime;
 mod snapshots;
 
 pub(crate) use events::time_pool_acquire;
+pub use events::PendingAge;
 pub use labels::*;
 pub use registry::{descriptors, Descriptor, Kind, BUCKETS};
 use registry::{Family, Registry};
@@ -62,6 +63,7 @@ impl Metrics {
             Family::Grace,
             Family::LateConfirmed,
             Family::CandidatesOrphaned,
+            Family::StaleRevisionRefusals,
         ] {
             registry.register(family, vec![], 0.);
         }
@@ -75,6 +77,7 @@ impl Metrics {
             Family::PartitionLead,
             Family::Rss,
             Family::ConnectionLimit,
+            Family::AcceptedPendingAge,
         ] {
             registry.register(family, vec![], -1.);
         }
@@ -103,7 +106,11 @@ impl Metrics {
             );
         }
         // Owner-dependent hooks are declared without inventing observations.
-        for family in [Family::FirstOffer, Family::LockWait] {
+        for family in [
+            Family::FirstOffer,
+            Family::LockWait,
+            Family::AcceptedPublication,
+        ] {
             registry.declare(family);
         }
         for collector in Collector::ALL {

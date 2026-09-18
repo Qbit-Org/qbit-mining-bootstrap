@@ -6,7 +6,8 @@ use qbit_prism_server::{
     api::router,
     metrics::{
         AckResult, Collector, ConnectionRefusalReason, DatabaseMetrics, DeliveryMetrics, LockKind,
-        Metrics, Outcome, ProcessMetrics, RejectReason, StaleJobCause, TaskKind,
+        Metrics, Outcome, PendingAge, ProcessMetrics, PublicationResult, RejectReason,
+        StaleJobCause, TaskKind,
     },
     stratum::StratumStats,
 };
@@ -19,8 +20,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     let startup = running_scrape(router(state.clone()), &[]).await;
     contract::validate(&startup, false).unwrap();
     let startup_census = contract::census(&startup).unwrap();
-    assert_eq!(startup_census.families.len(), 47);
-    assert_eq!(startup_census.series.len(), 166);
+    assert_eq!(startup_census.families.len(), 50);
+    assert_eq!(startup_census.series.len(), 168);
     assert_eq!(sample(&startup, "qbit_prism_runtime_lag_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_block_candidates_pending"), -1.);
     assert_eq!(
@@ -61,6 +62,15 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
             }
         }
         metrics.observe_first_offer(elapsed);
+        for result in PublicationResult::ALL {
+            metrics.observe_accepted_publication(*result, elapsed);
+        }
+        metrics.set_accepted_pending_age(match iteration % 3 {
+            0 => PendingAge::Unknown,
+            1 => PendingAge::None,
+            _ => PendingAge::Oldest(elapsed),
+        });
+        metrics.record_stale_revision_refusal();
         metrics.record_grace_credit();
         metrics.record_late_confirmation();
         metrics.record_candidate_orphaned();
@@ -98,8 +108,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 47);
-        assert_eq!(populated.series.len(), 264);
+        assert_eq!(populated.families.len(), 50);
+        assert_eq!(populated.series.len(), 294);
         assert_eq!(
             sample(&body, "qbit_prism_block_candidates_pending"),
             if known { iteration as f64 } else { -1. }

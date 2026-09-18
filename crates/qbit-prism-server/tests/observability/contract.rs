@@ -110,6 +110,7 @@ pub fn expected(populated: bool) -> Census {
         "grace_credited_shares_total",
         "late_confirmed_shares_total",
         "block_candidates_orphaned_total",
+        "stale_payout_revision_job_refusals_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -134,6 +135,7 @@ pub fn expected(populated: bool) -> Census {
         "metrics_snapshot_stale",
         "metrics_snapshot_age_seconds",
         "stratum_connection_limit",
+        "accepted_block_oldest_unpublished_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -209,6 +211,13 @@ pub fn expected(populated: bool) -> Census {
         "database_advisory_lock_wait_seconds",
         "histogram",
         if populated { &locks } else { &[] },
+        SECONDS,
+    );
+    let publication = labels("result", "published,superseded");
+    result.family(
+        "accepted_block_work_publication_seconds",
+        "histogram",
+        if populated { &publication } else { &[] },
         SECONDS,
     );
     result

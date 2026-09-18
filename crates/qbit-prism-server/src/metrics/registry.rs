@@ -1,5 +1,5 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
-use super::{Labels, LockKind, Outcome};
+use super::{Labels, LockKind, Outcome, PublicationResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -88,6 +88,9 @@ families! {
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
+    AcceptedPublication: Histogram, "accepted_block_work_publication_seconds", "Durable accepted offer time of a pool block to this frontend's first publication of work whose payout revision includes its landing, by result; adopted blocks carry no offer time and yield no sample.";
+    AcceptedPendingAge: Gauge, "accepted_block_oldest_unpublished_seconds", "Age of the oldest accepted pool block whose landed payout revision this frontend has not yet published; 0 when none, or -1 when unknown.";
+    StaleRevisionRefusals: Counter, "stale_payout_revision_job_refusals_total", "Job builds refused because this frontend's published payout revision was behind the cluster's.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -190,6 +193,14 @@ impl Registry {
                             Sample::Pending,
                         );
                     }
+                }
+            }
+            Family::AcceptedPublication => {
+                for result in PublicationResult::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("result", result.as_str()))),
+                        Sample::Pending,
+                    );
                 }
             }
             _ => {}
