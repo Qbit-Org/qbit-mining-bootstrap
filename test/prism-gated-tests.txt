@@ -43,6 +43,8 @@ qbit-prism-server::candidate_storm::claim_lanes_and_the_dispatch_probe_keep_thei
 qbit-prism-server::candidate_storm::drained_rows_cost_the_same_statements_at_the_baseline_and_storm_cardinalities
 qbit-prism-server::candidate_storm::siblings_behind_a_decided_height_drain_once_each_at_a_constant_node_cost
 qbit-prism-server::candidate_storm_restart::a_held_candidate_lease_costs_the_drain_an_offer_and_never_a_wakeup
+qbit-prism-server::candidate_storm_restart::a_kill_before_the_first_offer_recovers_as_one_known_offer
+qbit-prism-server::candidate_storm_restart::a_relaunched_frontend_recovers_one_row_at_the_same_statement_cost_at_both_cardinalities
 qbit-prism-server::candidate_storm_restart::restart_between_claim_and_terminalization_offers_every_block_exactly_once
 qbit-prism-server::candidate_window_migration::balance_snapshot_writer_is_canonical_idempotent_and_conflict_checked
 qbit-prism-server::candidate_window_migration::configure_retains_the_pinned_cluster_fingerprint
@@ -468,10 +470,14 @@ qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::replacemen
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::transient_decode_database_error_is_not_parked
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::unclassified_decode_error_is_not_parked
 qbit-prism-server::qbit_prism_server::ledger::candidates::park_tests::unknown_persisted_offer_outcome_parks_as_lifecycle
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_competitor_at_the_candidates_height_orphans_only_at_the_threshold
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_failed_block_hash_read_never_abandons_a_block_the_node_already_holds
 qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_failed_or_shifting_chain_observation_leaves_the_drain_recoverable
 qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_landing_acknowledgement_rolls_back_and_the_next_attempt_lands
 qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_renewal_acknowledgement_cancels_only_that_attempt
 qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::a_lost_terminal_commit_acknowledgement_stays_terminal
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::every_post_offer_chain_observation_fault_keeps_one_offer_and_reconciles
+qbit-prism-server::qbit_prism_server::ledger::candidates::storm_fault_tests::every_pre_offer_chain_observation_fault_leaves_the_row_unoffered
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_compact_read_releases_checkout_before_blocking_decode
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_checkouts_start_on_first_poll_and_recover
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::job_tests::postgres_job_sql_wait_errors_and_cancellation_do_not_change_checkout_samples
