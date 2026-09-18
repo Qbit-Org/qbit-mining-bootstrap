@@ -541,7 +541,7 @@ def check_inventory(rows: list[Row], root: Path, manifest: Path, label: str) -> 
 
 def check_triage_index(parsed: ParsedMap) -> list[str]:
     errors: list[str] = []
-    rows = {row.name: row for row in parsed.file_rows if row.status == NEEDS_TRIAGE}
+    rows = {row.name: row for row in [*parsed.file_rows, *parsed.case_rows] if row.status == NEEDS_TRIAGE}
     index: dict[str, TriageRow] = {}
     for entry in parsed.triage_rows:
         if entry.name in index:

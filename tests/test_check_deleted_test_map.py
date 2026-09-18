@@ -888,6 +888,31 @@ fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /
         )
         self.assert_fails(edited("| `tests/test_e.py` | Stratum |", "| `tests/test_e.py` | Ledger |"), "area 'Ledger' is not the section the row sits in, 'Stratum'")
 
+    def test_needs_triage_case_requires_an_index_entry(self) -> None:
+        text = edited(
+            "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+            "| `test_case_one` | needs triage | needs triage — no native test or owner |",
+        )
+        self.assert_fails(
+            text,
+            f":{line_of('`test_case_one`')}: `test_case_one` is needs triage but missing from the needs triage index",
+        )
+
+    def test_needs_triage_case_index_entry_must_be_unique_and_match_its_section(self) -> None:
+        text = edited(
+            "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
+            "| `test_case_one` | needs triage | needs triage — no native test or owner |",
+        )
+        entry = "| `test_case_one` | Ledger | no native test or owner |\n"
+        result = self.check(text + entry)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_fails(
+            text + entry.replace("| Ledger |", "| Stratum |"),
+            "area 'Stratum' is not the section the row sits in, 'Ledger'",
+        )
+        self.assert_fails(text + entry + entry, "`test_case_one` is listed twice in the needs triage index")
+        self.assert_fails(MAP + entry, "`test_case_one` is in the needs triage index but has no needs triage row")
+
     def test_issue_links_must_point_at_the_issue_they_name(self) -> None:
         self.assert_fails(edited(f"[#7]({ISSUES}/7)", f"[#7]({ISSUES}/70)"), f"[#7] links '{ISSUES}/70'")
         self.assert_fails(edited(f"[#7]({ISSUES}/7)", "[#7](https://github.com/other/repo/issues/7)"), "[#7] links")
@@ -955,6 +980,8 @@ fn /* comment between tokens */ lands_two_blocks() { panic!("escaped quote: \" /
                     "| `test_case_one` | full | `crates/demo/tests/ledger.rs::lands_one_block` |",
                     f"| `test_case_one` | {status} | {detail} |",
                 )
+                if status == "needs triage":
+                    text += "| `test_case_one` | Ledger | no native test or owner |\n"
                 root = Path(directory)
                 write_tree(root, text)
                 result = run_check(root, "--summary")
