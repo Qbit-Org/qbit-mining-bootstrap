@@ -615,7 +615,7 @@ impl Ledger {
         if !refused_for_want_of_a_partition(&error) {
             return Err(error);
         }
-        let created = crate::partitions::ensure(&self.pool).await.context(
+        let created = crate::partitions::ensure_with_metrics(&self.pool, self.metrics.as_deref()).await.context(
             "the share ledger has no partition for the next share_seq and attaching the partition lead failed; run qbit_prism_share_partition_ensure() against the primary",
         )?;
         tracing::warn!(

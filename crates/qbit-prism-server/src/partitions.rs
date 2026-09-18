@@ -10,9 +10,10 @@
 //! The call is serialized per schema by the online migration runner's advisory
 //! lock class, so several frontends ticking together create each partition
 //! once, and it creates nothing while the lead is intact.
+use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
-use sqlx::PgPool;
-use std::time::Duration;
+use sqlx::{PgPool, Transaction};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 /// One call cannot be allowed to hold the parent's SHARE UPDATE EXCLUSIVE lock
@@ -43,7 +44,13 @@ pub fn settings_from_env() -> Result<Settings> {
 /// Attach whatever the lead is missing, returning how many partitions were
 /// created. Idempotent, and zero whenever the lead is already intact.
 pub async fn ensure(pool: &PgPool) -> Result<i32> {
-    let mut transaction = pool.begin().await?;
+    ensure_with_metrics(pool, None).await
+}
+
+/// Time only checkout, before BEGIN and the unchanged partition transaction.
+pub(crate) async fn ensure_with_metrics(pool: &PgPool, metrics: Option<&Metrics>) -> Result<i32> {
+    let mut transaction =
+        Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await?;
     sqlx::query(ENSURE_STATEMENT_TIMEOUT)
         .execute(&mut *transaction)
         .await?;
@@ -74,10 +81,15 @@ pub async fn lead_rows(pool: &PgPool) -> Result<Option<i64>> {
 /// tick retries, and the append path runs `ensure` itself if it ever does find
 /// no partition. Ending the task would instead leave the instance serving with
 /// nothing maintaining its partitions.
-pub async fn run(
+pub async fn run(pool: PgPool, settings: Settings, shutdown: watch::Receiver<bool>) -> Result<()> {
+    run_with_metrics(pool, settings, shutdown, None).await
+}
+
+pub(crate) async fn run_with_metrics(
     pool: PgPool,
     settings: Settings,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Option<Arc<Metrics>>,
 ) -> Result<()> {
     let mut tick = tokio::time::interval(settings.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -88,7 +100,7 @@ pub async fn run(
         }
         tokio::select! {
             _ = shutdown.changed() => break,
-            result = ensure(&pool) => match result {
+            result = ensure_with_metrics(&pool, metrics.as_deref()) => match result {
                 // An intact lead is the ordinary outcome, once a minute.
                 Ok(0) => tracing::debug!("share ledger partition lead intact"),
                 Ok(created) => tracing::info!(created, "share ledger partitions attached"),
@@ -98,6 +110,9 @@ pub async fn run(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod acquire_tests;
 
 #[cfg(test)]
 mod tests {

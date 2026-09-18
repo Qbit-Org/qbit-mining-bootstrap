@@ -1442,13 +1442,13 @@ impl Coordinator {
                         let budget = lease
                             .timeout
                             .min(valid_until.saturating_duration_since(observed));
-                        let remaining = tokio::time::timeout(
-                            budget,
+                        let remaining = tokio::time::timeout(budget, async {
                             sqlx::query_scalar::<_, Option<i64>>(&live_token_query)
                                 .bind(&claim.candidate.block_hash)
                                 .bind(&claim.claim_token)
-                                .fetch_optional(&self.ledger.pool),
-                        )
+                                .fetch_optional(&mut *self.ledger.acquire().await?)
+                                .await
+                        })
                         .await;
                         let Ok(Ok(Some(Some(remaining)))) = remaining else {
                             return Err(error);
@@ -1480,9 +1480,11 @@ impl Coordinator {
                 // orphan that committed here was not counted by
                 // `record_candidate_orphaned`: that counter reports completions
                 // this process observed, not every committed settlement.
-                let terminal = tokio::time::timeout(lease.timeout, sqlx::query_scalar::<_, bool>(
-                    &format!("SELECT state NOT IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL)
-                ).bind(&claim.candidate.block_hash).fetch_optional(&self.ledger.pool)).await;
+                let terminal = tokio::time::timeout(lease.timeout, async {
+                    sqlx::query_scalar::<_, bool>(
+                        &format!("SELECT state NOT IN {} FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL)
+                    ).bind(&claim.candidate.block_hash).fetch_optional(&mut *self.ledger.acquire().await?).await
+                }).await;
                 if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
             },
         }
