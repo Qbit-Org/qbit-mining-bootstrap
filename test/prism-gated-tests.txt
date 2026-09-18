@@ -7,6 +7,7 @@ qbit-prism-load::quorum_replication::an_any_1_quorum_standby_on_postgres_16_is_o
 qbit-prism-server::api_2x::block_views_markers_and_network_estimate_keep_2x_contracts
 qbit-prism-server::api_2x::chart_rollups_match_raw_boundaries_tail_and_missing_progress
 qbit-prism-server::api_2x::content_addressed_bytes_and_legacy_fallback_headers_are_exact
+qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
 qbit-prism-server::api_2x::public_service_is_read_only_and_bounds_http_database_work
 qbit-prism-server::api_database::accepted_public_blocks_and_earnings_follow_confirmed_chain_state
 qbit-prism-server::api_database::shared_database_serves_all_contracts_and_global_reward_ranks
