@@ -813,7 +813,7 @@ impl Ledger {
     /// candidate's block with [`authenticate_landed_audit`].
     pub async fn landed_audit(&self, block_hash: &str) -> Result<Option<LandedAudit>> {
         let row = sqlx::query("SELECT coinbase_tx_hex,audit_commitment_leaves_hex,share_snapshot_sha256,found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1")
-            .bind(block_hash).fetch_optional(&self.pool).await?;
+            .bind(block_hash).fetch_optional(&mut *self.acquire().await?).await?;
         row.map(|row| {
             let leaves: Option<Value> = row.try_get("audit_commitment_leaves_hex")?;
             Ok(LandedAudit {
@@ -833,7 +833,7 @@ impl Ledger {
     /// the column, exactly as an idempotent landing does.
     pub async fn record_landed_audit_bits(&self, block_hash: &str, bits: &str) -> Result<()> {
         sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1 AND found_block_bits IS NULL")
-            .bind(block_hash).bind(bits).execute(&self.pool).await?;
+            .bind(block_hash).bind(bits).execute(&mut *self.acquire().await?).await?;
         Ok(())
     }
 

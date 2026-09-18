@@ -34,6 +34,7 @@ acquisitions, these paths use the shared checkout timer:
   reconstruction reads;
 - the existing-audit probe before candidate landing and each page of its
   durable-range proof, released before the page's blocking comparison;
+- `landed_audit` and `record_landed_audit_bits`;
 - the durable-range proof's inline/bootstrap existence probe, newest eligible
   boundary query, and oldest eligible boundary query for partial history;
 - `pool_blocks_for_reconcile`;
@@ -86,6 +87,15 @@ only its existence probe; a non-inline range uses its existing page checkouts
 and the newest boundary query, plus the oldest query only for partial history.
 SQL failures and boundary refusals after checkout retain a success observation.
 These probes add no transaction and do not time the SQL or the proof itself.
+
+Each landed-audit lookup or bits update records one checkout and releases its
+connection at the statement boundary, before decoding the row or returning.
+Found and missing rows, a filled legacy NULL, and zero-row/idempotent updates
+all retain a successful checkout. SQL errors or cancellation after checkout
+do too; cancellation while acquiring records one failure. The read's
+authentication contract and the update's `found_block_bits IS NULL` predicate
+are unchanged. Failure or cancellation after a write is sent can still leave
+its commit outcome unknown; retries retain the same idempotence.
 
 Ledger audit reconstruction records one checkout for the initial representation
 read, one for a native snapshot, and one for a non-inline share range. Native
@@ -141,6 +151,10 @@ Rollup attempts also join this aggregate population, including no-work ticks.
 Their checkout counts describe attempts, not folded shares or completed
 rollups; fast rollup checkouts can lower the aggregate percentile too.
 
+Landed-audit reads and bits writes also join this aggregate population,
+including misses and idempotent retries. Their samples describe checkout
+attempts, not newly landed blocks or successful SQL statements.
+
 This is partial coverage of [#352](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/352).
 Other direct coordinator, candidate and startup queries still acquire without
 this helper. The pool-only public helpers have no attached metrics owner:
@@ -155,7 +169,6 @@ Remaining sites outside this slice include:
 - `ledger/connect.rs`: startup schema/capability/provenance checks. The
   reservation write uses `Ledger::begin`; releasing an owner's reservations
   uses `Ledger::acquire` and remains one observation.
-- `ledger/candidates.rs`: `landed_audit` and `record_landed_audit_bits`.
 - `ledger/audit.rs`: the pool-only public helper reads described above;
   startup/migration validation helpers keep their existing
   connection ownership.
