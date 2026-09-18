@@ -109,6 +109,15 @@ class KeptTests(unittest.TestCase):
 """
 
 
+def write_cargo_package(root: Path, package: str) -> Path:
+    directory = root / "crates" / package
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "Cargo.toml").write_text(
+        f'[package]\nname = "{package}"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    return directory
+
+
 def write_tree(
     root: Path, text: str = MAP, *, manifest: str | None = FILE_MANIFEST, case_manifest: str | None = CASE_MANIFEST
 ) -> None:
@@ -122,6 +131,8 @@ def write_tree(
     (root / "crates" / "demo" / "tests" / "ledger.rs").write_text(RUST, encoding="utf-8")
     (root / "tests").mkdir()
     (root / "tests" / "test_kept.py").write_text(PYTHON, encoding="utf-8")
+    (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n', encoding="utf-8")
+    write_cargo_package(root, "demo")
 
 
 def edited(old: str, new: str) -> str:
@@ -371,6 +382,120 @@ class OfflineTests(unittest.TestCase):
                 self.assertIn("#[ignore]", result.stderr)
                 self.assertIn("scripts/run_rust_test_shard.py", result.stderr)
 
+    def test_rust_citations_require_workspace_target_reachability(self) -> None:
+        for label, workspace, package, source in (
+            ("not a member", '[workspace]\nmembers = []\n', "", RUST),
+            ("excluded member", '[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/demo"]\n', "", RUST),
+            ("autotests disabled", None, "autotests = false\n", RUST),
+            ("custom harness", None, '\n[[test]]\nname = "ledger"\nharness = false\n', RUST),
+            ("renamed custom harness", None, '\n[[test]]\nname = "custom"\npath = "tests/ledger.rs"\nharness = false\n', RUST),
+            ("normalized target path", None, '\n[[test]]\nname = "custom"\npath = "tests/../tests/ledger.rs"\nharness = false\n', RUST),
+            ("missing feature", None, '\n[[test]]\nname = "ledger"\nrequired-features = ["manual"]\n[features]\nmanual = []\n', RUST),
+            ("disabled file", None, "", "#![cfg(any())]\n" + RUST),
+            ("disabled module", None, "", "#[cfg(any())]\nmod disabled {\n" + RUST + "}\n"),
+            ("disabled inline body", None, "", "mod disabled {\n#![cfg(any())]\n" + RUST + "}\n"),
+            ("disabled function", None, "", RUST.replace("#[test]", "#[cfg(any())]\n#[test]")),
+            ("disabled function body", None, "", RUST.replace("fn lands_one_block() {}", "fn lands_one_block() { #![cfg(any())] }")),
+            ("same-line live helper", None, "", RUST.replace("#[test]\nfn lands_one_block() {}", "#[test]\n#[cfg(any())]\nfn lands_one_block() {} fn live_helper() {}")),
+            ("not test", None, "", "#[cfg(not(test))]\nmod disabled {\n" + RUST + "}\n"),
+            ("unknown condition", None, "", "#[cfg(not(unknown_flag))]\nmod maybe {\n" + RUST + "}\n"),
+            ("conditional module rewrite", None, "", "#[cfg_attr(test, cfg(any()))]\nmod disabled {\n" + RUST + "}\n"),
+            ("nested function", None, "", "fn helper() {\n" + RUST + "}\n"),
+            ("macro definition", None, "", "macro_rules! unused { () => {\n" + RUST + "}; }\n"),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                if workspace is not None:
+                    (root / "Cargo.toml").write_text(workspace, encoding="utf-8")
+                with (root / "crates/demo/Cargo.toml").open("a") as manifest:
+                    manifest.write(package)
+                (root / "crates/demo/tests/ledger.rs").write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Cargo target", result.stderr)
+
+    def test_rust_citations_require_real_module_declarations(self) -> None:
+        for declaration, accepted in (
+            ("", False),
+            ("// mod child;", False),
+            ('const TEXT: &str = "mod child;";', False),
+            ("#[cfg(any())]\nmod child;", False),
+            ("mod child;", True),
+            ("#[cfg(test)]\nmod child;", True),
+            ("#[cfg(all(test, not(any()), any(test, all())))]\nmod child;", True),
+            ('#[path = "child.rs"]\nmod renamed;', True),
+            ('#[cfg_attr(test, path = "other.rs")]\nmod child;', False),
+            ('#[path = r"other.rs"]\nmod child;', False),
+        ):
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, MAP.replace("crates/demo/tests/ledger.rs::", "crates/demo/src/child.rs::"))
+                source = root / "crates/demo/src"
+                source.mkdir()
+                (source / "lib.rs").write_text(declaration, encoding="utf-8")
+                (source / "child.rs").write_text(RUST, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+
+    def test_rust_citations_follow_nested_module_paths(self) -> None:
+        cases = (
+            ({"src/lib.rs": "mod outer;", "src/outer.rs": "mod child;"}, "src/outer/child.rs"),
+            ({"src/lib.rs": "mod outer;", "src/outer/mod.rs": "mod child;"}, "src/outer/child.rs"),
+            ({"src/lib.rs": "mod outer { mod child; }"}, "src/outer/child.rs"),
+            ({"src/lib.rs": 'mod outer { #[path = "renamed.rs"] mod child; }'}, "src/outer/renamed.rs"),
+            ({"src/lib.rs": "mod parent;", "src/parent.rs": 'mod outer { #[path = "renamed.rs"] mod child; }'}, "src/parent/outer/renamed.rs"),
+            ({"src/lib.rs": '#[path = "elsewhere/outer.rs"] mod outer;', "src/elsewhere/outer.rs": "mod child;"}, "src/elsewhere/child.rs"),
+            ({"src/lib.rs": '#[path = "elsewhere"] mod outer { mod child; }'}, "src/elsewhere/child.rs"),
+        )
+        for modules, citation in cases:
+            with self.subTest(modules=modules), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root, MAP.replace("crates/demo/tests/ledger.rs::", f"crates/demo/{citation}::"))
+                for path, source in {**modules, citation: RUST}.items():
+                    target = root / "crates/demo" / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(source, encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rust_library_target_override_does_not_keep_the_old_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root, MAP.replace("crates/demo/tests/ledger.rs::", "crates/demo/src/lib.rs::"))
+            (root / "crates/demo/src").mkdir()
+            (root / "crates/demo/src/lib.rs").write_text(RUST, encoding="utf-8")
+            (root / "crates/demo/src/alternate.rs").write_text(RUST, encoding="utf-8")
+            with (root / "crates/demo/Cargo.toml").open("a") as manifest:
+                manifest.write('[lib]\nname = "custom"\npath = "src/alternate.rs"\n')
+            result = run_check(root)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Cargo target", result.stderr)
+
+    def test_rust_cargo_manifests_fail_closed(self) -> None:
+        for manifest in ("", "[broken", "workspace = 42\n", '[workspace]\nmembers = ["crates/*"]\n'):
+            with self.subTest(manifest=manifest), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_tree(root)
+                (root / "Cargo.toml").write_text(manifest, encoding="utf-8")
+                if manifest.startswith("[workspace]"):
+                    (root / "crates/demo/Cargo.toml").rename(root / "crates/demo/unused.toml")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Cargo target", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_rust_citations_accept_explicit_targets_with_autodiscovery_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tree(root)
+            with (root / "crates/demo/Cargo.toml").open("a") as manifest:
+                manifest.write('autotests = false\n[[test]]\nname = "custom"\npath = "tests/ledger.rs"\n')
+            result = run_check(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = run_check(root, env={"PATH": ""})
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rust_ignored_citations_follow_ci_target_and_exact_test_selection(self) -> None:
         exact = "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence"
         cases = (
@@ -391,6 +516,7 @@ class OfflineTests(unittest.TestCase):
                     citation = f"crates/{package}/tests/{target}.rs"
                     # Exercise partial rows as well as the full file/case rows above.
                     write_tree(root, edited("tests/test_kept.py::test_kept", f"{citation}::{name}"))
+                    write_cargo_package(root, package)
                     source = f'#[test]\n#[ignore = "explicit integration run"]\nfn {name}() {{}}\n'
                     if nested:
                         source = "mod nested {\n" + source + "}\n"
@@ -410,6 +536,8 @@ class OfflineTests(unittest.TestCase):
             ("/*" + declaration + "*/", "observability_database", False),
             ('const TEXT: &str = r###"' + declaration + '"###;', "observability_database", False),
             ("#[cfg(any())]\n" + declaration, "observability_database", False),
+            ("#[cfg(test)]\n" + declaration, "observability_database", True),
+            # The path in an inline module resolves under its own directory.
             ("mod nested {\n" + declaration + "}", "observability_database", False),
             (declaration, "stratum_admission_postgres", False),
             ("", "observability_database", False),
@@ -420,6 +548,7 @@ class OfflineTests(unittest.TestCase):
             with self.subTest(source=source, target=target), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_tree(root, edited("tests/test_kept.py::test_kept", f"{citation}::{name}"))
+                write_cargo_package(root, "qbit-prism-server")
                 source_path = root / citation
                 source_path.parent.mkdir(parents=True)
                 source_path.write_text(f"#[test]\n#[ignore]\nfn {name}() {{}}\n", encoding="utf-8")
@@ -427,6 +556,26 @@ class OfflineTests(unittest.TestCase):
                 target_path.write_text(source, encoding="utf-8")
                 result = run_check(root)
                 self.assertEqual(result.returncode, 0 if selected else 1, result.stderr)
+
+    def test_rust_ignored_citations_use_declared_cargo_names(self) -> None:
+        for source_name, target_name, package_name, accepted in (
+            ("observability_database", "manual", "qbit-prism-server", False),
+            ("manual", "observability_database", "qbit-prism-server", True),
+            ("observability_database", "observability_database", "another-package", False),
+        ):
+            with self.subTest(source=source_name, target=target_name, package=package_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                citation = f"crates/qbit-prism-server/tests/{source_name}.rs"
+                write_tree(root, edited("tests/test_kept.py::test_kept", f"{citation}::contract"))
+                package = write_cargo_package(root, "qbit-prism-server")
+                (package / "Cargo.toml").write_text(
+                    f'[package]\nname = "{package_name}"\nversion = "0.1.0"\nedition = "2021"\n'
+                    f'[[test]]\nname = "{target_name}"\npath = "tests/{source_name}.rs"\n', encoding="utf-8"
+                )
+                (package / "tests").mkdir()
+                (root / citation).write_text("#[test]\n#[ignore]\nfn contract() {}\n", encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
 
     def test_rust_ignore_text_does_not_skip_real_tests_or_leak_to_the_next_test(self) -> None:
         for attribute in (

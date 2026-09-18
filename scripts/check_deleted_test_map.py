@@ -20,6 +20,8 @@ Without flags the check is offline and is what required CI runs:
   function in it (`#[test]`-style attribute in Rust source, ignoring comments
   and literal contents, or a non-skipped Python method included by unittest discovery);
   Rust `#[ignore]` tests must be explicitly selected by the CI shard runner;
+  Rust functions must also be reachable through enabled modules from a Cargo
+  workspace target (unsupported conditional/macro inclusion fails closed);
 - a status is one of the five the legend defines, the row's text leads with
   it, a full or partial row cites a test and an open gap row links its owner issue;
 - the summary table and the per-section counts equal the rows;
@@ -67,8 +69,10 @@ import urllib.request
 
 if __package__:
     from .run_rust_test_shard import IGNORED
+    from .rust_test_reachability import RustReachability
 else:
     from run_rust_test_shard import IGNORED
+    from rust_test_reachability import RustReachability
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,11 +114,6 @@ RUST_FN = re.compile(
 )
 RUST_TEST_ATTRIBUTE = re.compile(r"#\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test\b")
 RUST_IGNORE_ATTRIBUTE = re.compile(r"#\s*\[\s*ignore\s*(?:\]|=)")
-RUST_PATH_MODULE = re.compile(
-    r"(?:^|(?<=[;{}]))(?P<attributes>(?:\s*#\s*\[[^\[\]]*\])*)"
-    r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;"
-)
-RUST_PATH_ATTRIBUTE = re.compile(r"\s*#\s*\[\s*path\s*=\s*(?P<literal>~+)\s*\]\s*")
 # Match character literals as whole tokens so a quote character cannot start
 # a string. A lifetime or label has no closing apostrophe and remains code.
 RUST_NON_CODE = re.compile(
@@ -305,44 +304,12 @@ def rust_code(text: str) -> str:
     return "".join(parts)
 
 
-def rust_path_modules(text: str) -> list[str]:
-    """Unconditional top-level #[path] modules used by the ignored CI targets."""
-    code = rust_code(text)
-    paths: list[str] = []
-    for module in RUST_PATH_MODULE.finditer(code):
-        prefix = code[:module.start()]
-        if prefix.count("{") != prefix.count("}"):
+def ignored_rust_test_selected(occurrences: set[tuple[str, str, str, str]]) -> bool:
+    """Match CI against the proven target identity and qualified function name."""
+    for package, kind, target, name in occurrences:
+        arguments = IGNORED.get((package, kind, target))
+        if arguments is None:
             continue
-        attribute = RUST_PATH_ATTRIBUTE.fullmatch(module.group("attributes"))
-        if attribute is None:
-            # Do not treat a conditional or otherwise attributed inclusion as
-            # proof that the target compiles this source file.
-            continue
-        start, end = attribute.span("literal")
-        offset = module.start("attributes")
-        try:
-            path = json.loads(text[offset + start:offset + end])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(path, str):
-            paths.append(path)
-    return paths
-
-
-def ignored_rust_test_selected(root: Path, path: str, name: str, *, top_level: bool) -> bool:
-    """Match the repository's explicit ignored runs without invoking Cargo."""
-    for (package, kind, target), arguments in IGNORED.items():
-        if kind != "test":
-            continue
-        target_path = root / f"crates/{package}/tests/{target}.rs"
-        direct = root / path == target_path
-        if not direct:
-            try:
-                modules = rust_path_modules(target_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError):
-                continue
-            if not any((target_path.parent / module).resolve() == (root / path).resolve() for module in modules):
-                continue
         filters: list[str] = []
         for argument in arguments:
             if argument == "--exact" or re.fullmatch(r"--test-threads=[1-9][0-9]*", argument):
@@ -354,23 +321,17 @@ def ignored_rust_test_selected(root: Path, path: str, name: str, *, top_level: b
             filters.append(argument)
         if not filters:
             return True
-        # A leaf citation cannot prove a qualified module path. In particular,
-        # --exact foo never selects nested::foo, even in the correct target.
-        if not direct or not top_level:
-            return False
-        return any(name == value if "--exact" in arguments else value in name for value in filters)
+        if any(name == value if "--exact" in arguments else value in name for value in filters):
+            return True
     return False
 
 
-def rust_functions(text: str, path: str = "", root: Path = ROOT) -> tuple[set[str], set[str]]:
+def rust_functions(text: str, reachable: dict[int, set[tuple[str, str, str, str]]]) -> tuple[set[str], set[str]]:
     """Every source `fn` name, and the subset eligible for CI test citations."""
     lines = rust_code(text).splitlines()
     functions: set[str] = set()
     tests: set[str] = set()
-    depth = 0
     for index, line in enumerate(lines):
-        top_level = depth == 0
-        depth += line.count("{") - line.count("}")
         found = RUST_FN.match(line)
         if found is None:
             continue
@@ -384,9 +345,10 @@ def rust_functions(text: str, path: str = "", root: Path = ROOT) -> tuple[set[st
             attributes.append(above)
             cursor -= 1
         attribute_block = " ".join(reversed(attributes))
-        if RUST_TEST_ATTRIBUTE.search(attribute_block) and (
+        occurrences = {entry for entry in reachable.get(index + 1, set()) if entry[3].rsplit("::", 1)[-1] == found.group("name")}
+        if occurrences and RUST_TEST_ATTRIBUTE.search(attribute_block) and (
             not RUST_IGNORE_ATTRIBUTE.search(attribute_block)
-            or ignored_rust_test_selected(root, path, found.group("name"), top_level=top_level)
+            or ignored_rust_test_selected(occurrences)
         ):
             tests.add(found.group("name"))
     return functions, tests
@@ -435,6 +397,7 @@ class References:
         self.root = root.resolve()
         self.cache: dict[str, tuple[set[str], set[str]] | str] = {}
         self.python_tests: dict[Path, set[str]] | str | None = None
+        self.rust_reachability: RustReachability | str | None = None
 
     def load(self, path: str, extension: str) -> tuple[set[str], set[str]] | str:
         if path not in self.cache:
@@ -450,7 +413,15 @@ class References:
                     self.cache[path] = f"unreadable: {error}"
                 else:
                     if extension == "rs":
-                        self.cache[path] = rust_functions(text, path, self.root)
+                        if self.rust_reachability is None:
+                            try:
+                                self.rust_reachability = RustReachability(self.root, rust_code)
+                            except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as error:
+                                self.rust_reachability = f"cannot establish Cargo target reachability: {error}"
+                        if isinstance(self.rust_reachability, str):
+                            self.cache[path] = self.rust_reachability
+                        else:
+                            self.cache[path] = rust_functions(text, self.rust_reachability.occurrences(target))
                     else:
                         if self.python_tests is None:
                             self.python_tests = discovered_python_tests(self.root)
@@ -471,7 +442,8 @@ class References:
             return f"`{path}::{name}`: no `{keyword} {name}` in that file"
         if name not in tests:
             wanted = (
-                "a #[test]-style attribute and, for #[ignore], selection by scripts/run_rust_test_shard.py"
+                "an enabled function in a reachable Cargo target, a #[test]-style attribute and, "
+                "for #[ignore], selection by scripts/run_rust_test_shard.py; unsupported cfg/macro inclusion cannot prove reachability"
                 if extension == "rs" else "non-skipped membership in the discovered unittest suite"
             )
             return f"`{path}::{name}`: `{keyword} {name}` exists but is not a test function ({wanted} is required)"
