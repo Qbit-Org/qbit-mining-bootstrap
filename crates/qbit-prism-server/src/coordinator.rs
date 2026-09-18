@@ -1087,17 +1087,25 @@ impl Coordinator {
             false
         };
         if !reuse_window {
-            // Retire cache ownership under admission before reading its
-            // replacement. Any active blocking build keeps its own admission.
+            // Move exclusively owned rows on the blocking executor. A cancelled
+            // build can still own the Arc; in that case keep its admission and
+            // take the full-read path without cloning its window.
             let retired = cached_window.take();
             let cleanup = prepared_storage::compact::CompactOwner::new((retired, permit.clone()));
-            cleanup
+            let prior = cleanup
                 .spawn_blocking(|(retired, permit)| {
-                    let _admission = permit;
-                    drop(retired.map(|window| window.into_inner()));
+                    let admission = crate::ledger::ReadAdmission::shared(permit);
+                    retired.and_then(|window| {
+                        Arc::try_unwrap(window.into_inner())
+                            .ok()
+                            .map(|window| admission.own(window.into_retained()))
+                    })
                 })
                 .await?;
-            *cached_window = Some(self.capture_refresh_window(network, permit.clone()).await?);
+            *cached_window = Some(
+                self.capture_refresh_window(network, permit.clone(), prior)
+                    .await?,
+            );
         }
         // Cached inputs are not publication authority. Keep exactly one owner
         // in the serialized refresh loop even if a later build/save is cancelled.

@@ -443,12 +443,17 @@ impl work_ledger::WorkLedger for MemoryLedger {
         &self,
         _network: u128,
         completion: crate::ledger::ReadAdmission,
-    ) -> BoxFuture<'_, Result<crate::ledger::BlockingDrop<Snapshot>>> {
+        prior: Option<crate::ledger::BlockingDrop<crate::ledger::RetainedShares>>,
+    ) -> BoxFuture<'_, Result<crate::ledger::BlockingDrop<crate::ledger::SnapshotCapture>>> {
         Box::pin(async move {
+            drop(prior);
             let mut snapshot = self.snapshot.lock().unwrap().clone().unwrap();
             snapshot.payout_revision = self.revision.load(Ordering::SeqCst);
             self.snapshots.lock().unwrap().push(snapshot.clone());
-            Ok(completion.own(snapshot))
+            Ok(completion.own(crate::ledger::SnapshotCapture {
+                snapshot,
+                leaf: None,
+            }))
         })
     }
     fn pool_blocks(&self) -> BoxFuture<'_, Result<Vec<PoolBlock>>> {

@@ -221,3 +221,82 @@ async fn cancelled_runtime_snapshot_decoders_retain_build_capacity() -> Result<(
     })
     .await
 }
+
+#[tokio::test]
+async fn cancelled_shared_window_owner_forces_full_snapshot_without_cloning() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    with_coordinator(&raw, |coordinator, worker| {
+        Box::pin(async move {
+            coordinator
+                .ledger
+                .append(
+                    AcceptedShare {
+                        share_seq: 0,
+                        share_id: "shared-window-owner".into(),
+                        miner_id: worker.username.clone(),
+                        order_key: worker.username.clone(),
+                        p2mr_program_hex: worker.p2mr_program_hex.clone(),
+                        share_difficulty: 1_000_000_000,
+                        network_difficulty: 100,
+                        template_height: 100,
+                        job_id: "shared-window-seed".into(),
+                        job_issued_at_ms: 1,
+                        accepted_at_ms: 0,
+                        ntime: 1_800_000_000,
+                        credit_policy: None,
+                    },
+                    None,
+                )
+                .await?;
+            coordinator.refresh_once().await?;
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = reads.clone();
+            *coordinator.ledger.snapshot_decode_hook.lock().unwrap() =
+                Some(Arc::new(move |phase| {
+                    if phase == "shares" {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            coordinator.refresh_once().await?;
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                0,
+                "exclusive control did not advance"
+            );
+            let window = {
+                let cache = coordinator.refresh_lock.lock().await;
+                Arc::clone(cache.cached_window.as_ref().unwrap())
+            };
+            let old = Arc::downgrade(&window);
+            let probe = Release(Arc::new(prepared_storage::RepairProbe::default()));
+            let held = probe.0.clone();
+            let owner = tokio::task::spawn_blocking(move || {
+                held.block();
+                drop(window);
+            });
+            tokio::time::timeout(Duration::from_secs(5), probe.0.entered.notified()).await?;
+            // Aborting the waiter cannot cancel already-running blocking work.
+            owner.abort();
+            coordinator.refresh_once().await?;
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                1,
+                "shared cancelled owner must force full read"
+            );
+            assert_eq!(
+                old.strong_count(),
+                1,
+                "old window must remain owned only by blocking work"
+            );
+            probe.0.release();
+            tokio::time::timeout(Duration::from_secs(5), owner).await??;
+            assert_eq!(old.strong_count(), 0);
+            assert_eq!(coordinator.build_slots.available_permits(), 1);
+            *coordinator.ledger.snapshot_decode_hook.lock().unwrap() = None;
+            Ok(())
+        })
+    })
+    .await
+}

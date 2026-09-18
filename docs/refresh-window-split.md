@@ -5,7 +5,7 @@ The refresh loop retains one immutable, anchored `Snapshot` and its native
 coinbase, and compact prepared record using those same window inputs. It does
 not select the accepted-share window again or recompute its native digest.
 
-The window is invalidated by a changed accepted-share cutoff, payout revision,
+As-is window reuse is invalidated by a changed accepted-share cutoff, payout revision,
 prior-balance digest, network difficulty, or the existing
 `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` interval. The interval starts before the
 snapshot read; rebuilding templates does not renew it. The accepted-cutoff
@@ -55,8 +55,9 @@ Python-compatible `PayoutWindow` digest is not substituted for either.
 ## Issue #274 scope and evidence
 
 This implements the September 10 refresh split. It removes repeated full-window
-SQL reads during template churn; it does not introduce delta SQL, the
-incremental `PayoutWindow` engine, or a new hash recipe. Existing borrowing
+SQL reads during template churn; it does not introduce the
+incremental `PayoutWindow` engine or a new hash recipe. The bounded delta
+acquisition below separately reduces payload reads when reanchoring. Existing borrowing
 builders still fold and hash the captured inputs for each changed template.
 Those remaining costs need the existing 400k/500k harness and the agreed refresh
 budget to determine whether the conditional incremental-engine work is needed.
@@ -83,3 +84,61 @@ compatibility gates. No sub-second one-share-delta result, production timing,
 The original incremental/differential criteria depend on the conditional engine
 work. The 24-hour memory criterion remains unmeasured; bounded cache ownership
 is a structural property, not a soak result.
+
+## Bounded delta acquisition (#275)
+
+A rebuild still captures a fresh anchor, accepted cutoff, payout revision and
+prior balances under the original settlement/ordering locks. When the refresh
+loop exclusively owns the retired window, it moves that window's shares into
+acquisition under build admission. A shared `Arc`, including one still held by
+cancelled blocking work, takes the full-read path. Hashing, reward folding,
+publication authority and the as-is reuse predicate are unchanged.
+
+The candidate reads at most one page of newly appended eligible share payloads,
+then trims the moved vector newest-first using the full reader's saturating
+weight subtraction. The crossing row stays. Trimming precedes appending, and a
+large retirement also releases excess vector capacity. This retains one window
+plus a bounded page, with decoding and destruction on the blocking executor.
+
+Endpoint presence by itself is insufficient: two live endpoints can surround a
+detached interior partition. Acquisition therefore records private evidence that
+the full retained suffix was in one live PostgreSQL leaf, including that leaf's
+`pg_inherits` tuple incarnation. A later advance requires the same live leaf for
+the retained range and new cutoff. Detached, detach-pending, restored or replaced
+leaves invalidate that proof; cross-partition windows use the full scan.
+
+Even an unchanged leaf does not prove an unchanged eligible set. Sequence gaps
+are normal after rollbacks and crash recovery, and immutable history permits an
+INSERT into an unused old sequence. Future timestamps can also become eligible.
+After trimming, one statement checks both the live leaf incarnation and the
+number of currently eligible rows from the proposed first row through the fresh
+cutoff. The retained rows are still immutable members of that leaf; equal count
+proves there are no omitted eligible members in that range. Since this suffix
+already reaches the weight, older rows cannot affect the full reader's answer.
+A changed count falls back to a full scan at the same fresh anchor.
+
+The subset proof depends on the existing immutable-history triggers. An operator
+repair that disables or bypasses those triggers can change payloads without
+changing the count or leaf incarnation. Such a repair requires restarting every
+frontend to discard retained windows before trusting another refresh. Supported
+partition restoration invalidates the acquisition evidence normally.
+
+This check is an **O(window) metadata scan**, not O(delta) database work. It avoids
+transferring and decoding retained payloads but still pays the count cost and
+recomputes every existing digest. The optimization also falls back for empty or
+short history, difficulty changes, decreasing cutoffs or anchors, absent
+acquisition evidence, and deltas spanning more than 4096 sequence slots. Default
+partitions span 16,777,216 sequence slots; a 400k window crosses a boundary for
+roughly 2.4% of uniformly distributed dense positions, an arithmetic illustration
+rather than a measured production eligibility rate. Sparse windows can advance;
+production eligibility and performance still require representative measurement.
+
+Real PostgreSQL differential tests compare serialized snapshots and `WindowRef`
+at the same fresh anchor, including crossing rows, revision/balance changes,
+real post-INSERT rollback gaps, retroactive inserts, future eligibility and
+partition detach/reattach. Coordinator proxy tests distinguish actual payload
+rows from metadata and retain their semantic and as-issued assertions. The
+experiment's performance screen is at least 15% end-to-end improvement over the
+exact base across at least three balanced 400k pairs, with exact durable delivery
+identities and no worse memory bound. This screen is separate from the unchanged
+one-second goal; no subsecond claim follows from a payload-read improvement.
