@@ -107,7 +107,8 @@ impl Metrics {
             registry.increment(family, Labels::Empty);
         }
     }
-    /// Exactly once, at the branch that refused admission under an existing limit.
+    /// Exactly once, at the branch that refused admission under a configured
+    /// limit or ended a session for exceeding a per-session budget.
     pub fn record_connection_refusal(&self, reason: ConnectionRefusalReason) {
         self.inner
             .lock()

@@ -204,7 +204,7 @@
       "labels": {
         "reason": "ConnectionRefusalReason"
       },
-      "status": "`global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. Same-username reauthorization and reuse of a retained username permit never count. Authorization refusals are not share rejections. Process-local; both series start at zero."
+      "status": "`global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`; `ip_limit` counts a newly accepted socket closed at `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP`, before any permit, task or query. `malformed_frame_budget`, `unknown_job_budget` and `authorize_budget` count a session disconnected for exceeding `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL`, `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` or `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL`, once per session. Same-username reauthorization, reuse of a retained username permit and every disabled limit never count. Refusals are not share rejections, and no series carries a peer address. Process-local; every series starts at zero."
     },
     "stratum_connection_limit": {
       "status": "Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`."
