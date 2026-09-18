@@ -372,8 +372,10 @@ async fn failed_rejection_response_counts_the_decision_without_an_ack() {
     task.await.unwrap();
 }
 
-/// `[global_limit, username_limit]`.
-fn refusals(metrics: &Metrics) -> [f64; 2] {
+/// `ConnectionRefusalReason::ALL` in declaration order: `[global_limit,
+/// username_limit, ip_limit, malformed_frame_budget, unknown_job_budget,
+/// authorize_budget]`.
+fn refusals(metrics: &Metrics) -> [f64; 6] {
     ConnectionRefusalReason::ALL
         .iter()
         .map(|reason| {
@@ -465,9 +467,9 @@ async fn global_limit_of_one_refuses_a_second_socket_exactly_once_and_keeps_the_
     let mut held = Client::connect(address).await;
     held.login("miner.held").await;
     assert_eq!(sample(&metrics, "qbit_prism_stratum_connection_limit"), 1.);
-    assert_eq!(refusals(&metrics), [0., 0.]);
+    assert_eq!(refusals(&metrics), [0., 0., 0., 0., 0., 0.]);
     assert_refused_without_response(address).await;
-    assert_eq!(refusals(&metrics), [1., 0.]);
+    assert_eq!(refusals(&metrics), [1., 0., 0., 0., 0., 0.]);
     // The only permit is still held: the gauge is capacity, not free permits.
     assert_eq!(sample(&metrics, "qbit_prism_stratum_connection_limit"), 1.);
     assert_eq!(stats.snapshot(0).connections, 1);
@@ -478,7 +480,7 @@ async fn global_limit_of_one_refuses_a_second_socket_exactly_once_and_keeps_the_
         backend.credited_workers.lock().unwrap().as_slice(),
         ["miner.held"]
     );
-    assert_eq!(refusals(&metrics), [1., 0.]);
+    assert_eq!(refusals(&metrics), [1., 0., 0., 0., 0., 0.]);
     assert_closed_attribution_labels(
         &metrics.render(),
         &["miner.held", "127.0.0.1", &address.to_string()],
@@ -504,7 +506,7 @@ async fn default_listener_reports_configured_capacity_while_connections_hold_per
             384.
         );
     }
-    assert_eq!(refusals(&metrics), [0., 0.]);
+    assert_eq!(refusals(&metrics), [0., 0., 0., 0., 0., 0.]);
     shutdown.send(true).unwrap();
     task.await.unwrap();
 }
@@ -532,7 +534,7 @@ async fn username_limit_refusal_counts_once_while_reauthorization_and_success_do
         first.response(11).await,
         json!({"id":11,"result":true,"error":null})
     );
-    assert_eq!(refusals(&metrics), [0., 0.]);
+    assert_eq!(refusals(&metrics), [0., 0., 0., 0., 0., 0.]);
     let mut second = Client::connect(address).await;
     second.login("miner.two").await;
     second
@@ -542,10 +544,10 @@ async fn username_limit_refusal_counts_once_while_reauthorization_and_success_do
         second.response(9).await,
         json!({"id":9,"result":null,"error":[20,"too many connections for username",null]})
     );
-    assert_eq!(refusals(&metrics), [0., 1.]);
+    assert_eq!(refusals(&metrics), [0., 1., 0., 0., 0., 0.]);
     second.send(second.solved_submit(12, "miner.two", 0)).await;
     assert_eq!(second.response(12).await["result"], true);
-    assert_eq!(refusals(&metrics), [0., 1.]);
+    assert_eq!(refusals(&metrics), [0., 1., 0., 0., 0., 0.]);
     assert_eq!(
         backend.credited_workers.lock().unwrap().as_slice(),
         ["miner.one", "miner.two"]
