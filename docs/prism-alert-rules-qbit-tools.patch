@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 5267e4075a2783689113a378075d1a68814083aa9fdee8db37d0a255ec316f1e
++   Specification SHA-256: 042e18eacb4a2cc62550d73080b013963b2db39452497f8d07a394bdb43dd8dc
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,580 @@
+@@ -118,53 +14,618 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -450,7 +450,7 @@
 +      "page": "true"
 +    },
 +    "summary": "PrismSemanticWorkCoverageLossCritical",
-+    "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
++    "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. PrismAcceptedBlockWorkPublicationStalled now pages during a landed-but-unpublished hold before coverage decays, so this rule is the backstop for the delivery side. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -634,6 +634,44 @@
 +    "description": "RSS cannot establish memory health until process collection succeeds. Process collector expires after 30 seconds or on failure; unsupported platforms are unknown.",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
++  },
++  {
++    "uid": "qbit-prism-accepted-work-publication-stalled",
++    "title": "PrismAcceptedBlockWorkPublicationStalled",
++    "expr": "((qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 120) and on(job, instance, network) (qbit_prism_accepted_block_oldest_unpublished_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "1m",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismAcceptedBlockWorkPublicationStalled",
++    "description": "Per frontend (Prometheus instance), including a frontend that did not offer the block: age of the oldest accepted pool block whose landed payout revision this frontend has not yet published, from the durable accepted-offer time (qbit_block_candidate_outbox.offered_at_ms, the offering frontend's wall clock before its one submitblock call). Zero when none; unknown -1 never fires. The gauge is rendered from the cached metrics body, so stale or missing snapshots and failed scrapes belong to the snapshot and endpoint alerts, not this page. It pages during a landed-but-unpublished hold, before semantic coverage decays. 120 seconds is the first cut: #275's landing budget is 1 second, #444 measured 3.3 to 5.4 seconds, and the #413 incident held for 307 seconds; 30 seconds is the value the #291 rehearsal should consider for a warning tier. The one-minute dwell is deliberately shorter than the five-minute dwell that made the coverage-loss page fire only at recovery in #413 (docs/prism-alert-migration.md:257-260), so this page fires during the hold, not after it. Provisional, measure in #291/#447.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
++    "uid": "qbit-prism-stale-revision-job-refusals",
++    "title": "PrismStalePayoutRevisionJobRefusals",
++    "expr": "(increase(qbit_prism_stale_payout_revision_job_refusals_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[10m]) > bool 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "1m",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismStalePayoutRevisionJobRefusals",
++    "description": "Per frontend: job builds refused because this frontend's published payout revision was behind the cluster's. This counts refusals, not waits: native refuses a stale-revision build immediately where 2.x.x waited for a parent preview and timed out. A failed scrape is not a firing condition. Any refusal means an authorised miner asked for work this frontend could not serve under the cluster's payout revision. Replaces the 2.x.x parent-preview wait-timeout pair and the degraded-publication rule: native has no degraded publication path, and refusals are the peer of timeouts. Ten-minute window and one-minute dwell: provisional, measure in #291.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
 +  }
 +] %}
 +{% set prism_public_read_alert_rules = [
@@ -734,7 +772,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +653,17 @@
+@@ -230,752 +691,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1490,7 +1528,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1142,84 @@
+@@ -1454,5 +1180,84 @@
    }
  ] %}
  {% endif %}
