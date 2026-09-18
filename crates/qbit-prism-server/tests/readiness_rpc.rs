@@ -6,13 +6,17 @@ use qbit_prism_server::{
     config::Config,
     coordinator::Coordinator,
     ledger::{Candidate, CandidateClaim},
+    metrics::{Metrics, NodeObservation},
     readiness,
     rpc::Rpc,
     stratum::MiningBackend,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -42,6 +46,10 @@ struct NodeState {
     submit_calls: usize,
     drop_peers_after: Option<usize>,
     pause_network_after: Option<usize>,
+    /// Answer these methods with an RPC error, as an unreachable or refusing
+    /// node does. A refused call is still counted as received.
+    refuse_chain: bool,
+    refuse_network: bool,
     tip_parent: String,
     network_reply_gate: Arc<NetworkReplyGate>,
 }
@@ -70,6 +78,8 @@ impl Node {
             submit_calls: 0,
             drop_peers_after: None,
             pause_network_after: None,
+            refuse_chain: false,
+            refuse_network: false,
             tip_parent: "cd".repeat(32),
             network_reply_gate: Arc::new(NetworkReplyGate::default()),
         }));
@@ -92,6 +102,9 @@ impl Node {
         })
     }
 }
+fn refused(request: &Value) -> Json<Value> {
+    Json(json!({"id":request["id"],"result":null,"error":{"code":-28,"message":"node refused"}}))
+}
 async fn answer(
     State(state): State<Arc<Mutex<NodeState>>>,
     Json(request): Json<Value>,
@@ -99,7 +112,12 @@ async fn answer(
     let mut state = state.lock().await;
     let mut pause_reply = None;
     let result = match request["method"].as_str().unwrap_or("") {
+        "getblockchaininfo" if state.refuse_chain => return refused(&request),
         "getblockchaininfo" => state.chain.clone(),
+        "getnetworkinfo" if state.refuse_network => {
+            state.network_calls += 1;
+            return refused(&request);
+        }
         "getnetworkinfo" => {
             state.network_calls += 1;
             if state
@@ -181,6 +199,173 @@ async fn public_rpc_readiness_requires_synced_headers_and_configured_peer_floor(
             .await
             .is_err());
     }
+    Ok(())
+}
+
+/// The gauges carry no labels, so one rendered sample answers each family.
+fn gauge(body: &str, suffix: &str) -> f64 {
+    let prefix = format!("qbit_prism_{suffix} ");
+    let values: Vec<_> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    assert_eq!(values.len(), 1, "expected one sample for {prefix}: {body}");
+    values[0].parse().unwrap()
+}
+
+#[tokio::test]
+async fn refused_node_rpcs_read_unknown_instead_of_the_last_observation() -> Result<()> {
+    let node = Node::open().await?;
+    let metrics = Metrics::default();
+    readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics)).await?;
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == 2.);
+    ensure!(gauge(&body, "node_initial_block_download") == 0.);
+    ensure!((0. ..1.).contains(&gauge(&body, "node_observation_age_seconds")));
+
+    // A refused getnetworkinfo makes the peer count unknown; keeping the last
+    // reading would report a peer floor this attempt never confirmed. The
+    // chain call answered, so its flag and the observation age stay fresh.
+    node.state.lock().await.refuse_network = true;
+    ensure!(
+        readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+            .await
+            .is_err()
+    );
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == -1.);
+    ensure!(gauge(&body, "node_initial_block_download") == 0.);
+    ensure!((0. ..1.).contains(&gauge(&body, "node_observation_age_seconds")));
+
+    // A refused getblockchaininfo learns nothing at all, and the age keeps
+    // growing from the last call that did answer.
+    node.state.lock().await.refuse_chain = true;
+    let before = gauge(&metrics.render(), "node_observation_age_seconds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ensure!(
+        readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+            .await
+            .is_err()
+    );
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == -1.);
+    ensure!(gauge(&body, "node_initial_block_download") == -1.);
+    ensure!(gauge(&body, "node_observation_age_seconds") >= before + 0.05);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_peer_count_below_the_floor_is_still_an_answered_count() -> Result<()> {
+    let node = Node::open().await?;
+    let metrics = Metrics::default();
+    // Readiness refuses the node, but the count it refused it for was answered.
+    // Recording -1 here would hide the very shortfall that closed admission,
+    // and a node answering zero peers is a real zero, not an unknown.
+    for peers in [json!(0), json!(1)] {
+        node.state.lock().await.network["connections"] = peers.clone();
+        ensure!(
+            readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+                .await
+                .is_err()
+        );
+        let body = metrics.render();
+        ensure!(gauge(&body, "node_peers") == peers.as_u64().unwrap() as f64);
+        ensure!(gauge(&body, "node_initial_block_download") == 0.);
+        ensure!((0. ..1.).contains(&gauge(&body, "node_observation_age_seconds")));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_circuited_readiness_leaves_peers_unknown_without_asking_the_node() -> Result<()> {
+    let node = Node::open().await?;
+    let metrics = Metrics::default();
+    readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics)).await?;
+    ensure!(gauge(&metrics.render(), "node_peers") == 2.);
+    // Initial block download is known from the call that answered, even though
+    // readiness then refuses the node before it ever asks for peers.
+    node.state.lock().await.chain["initialblockdownload"] = json!(true);
+    ensure!(
+        readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+            .await
+            .is_err()
+    );
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == -1.);
+    ensure!(gauge(&body, "node_initial_block_download") == 1.);
+    // Header lag short-circuits the same way.
+    {
+        let mut state = node.state.lock().await;
+        state.chain["initialblockdownload"] = json!(false);
+        state.chain["headers"] = json!(101);
+    }
+    ensure!(
+        readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics))
+            .await
+            .is_err()
+    );
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == -1.);
+    ensure!(gauge(&body, "node_initial_block_download") == 0.);
+    // Regtest never asks for peers at all.
+    node.state.lock().await.chain["headers"] = Value::Null;
+    readiness::chain_info_with_metrics(&node.rpc, "regtest", 1, Some(&metrics)).await?;
+    ensure!(gauge(&metrics.render(), "node_peers") == -1.);
+    // Observation asked the node nothing beyond the one successful peer call.
+    ensure!(node.state.lock().await.network_calls == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_observation_age_keeps_the_latest_answer_a_superseded_attempt_brought() -> Result<()> {
+    let metrics = Metrics::default();
+    let older = Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let newer = Instant::now();
+    // The newer-started attempt answered first, so it owns the published pair.
+    metrics.record_node_observation(NodeObservation {
+        started: newer,
+        peers: Some(4),
+        chain: Some((false, Instant::now())),
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // The older-started attempt answered later. Its values stay superseded, but
+    // the node demonstrably answered then, so the age must not report it stale.
+    metrics.record_node_observation(NodeObservation {
+        started: older,
+        peers: Some(9),
+        chain: Some((false, Instant::now())),
+    });
+    let body = metrics.render();
+    ensure!(gauge(&body, "node_peers") == 4.);
+    ensure!(gauge(&body, "node_observation_age_seconds") < 0.05);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_node_observation_cannot_overwrite_a_newer_one() -> Result<()> {
+    let node = Node::open().await?;
+    let metrics = Arc::new(Metrics::default());
+    let gate = {
+        let mut state = node.state.lock().await;
+        state.network["connections"] = json!(5);
+        state.pause_network_after = Some(0);
+        state.network_reply_gate.clone()
+    };
+    let slow = {
+        let (rpc, metrics) = (node.rpc.clone(), metrics.clone());
+        tokio::spawn(async move {
+            readiness::chain_info_with_metrics(&rpc, "mainnet", 2, Some(&metrics)).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate.paused.notified()).await?;
+    node.state.lock().await.network["connections"] = json!(3);
+    readiness::chain_info_with_metrics(&node.rpc, "mainnet", 2, Some(&metrics)).await?;
+    ensure!(gauge(&metrics.render(), "node_peers") == 3.);
+    gate.release.notify_one();
+    slow.await??;
+    // The older attempt answered last; it must not roll back the newer view.
+    ensure!(gauge(&metrics.render(), "node_peers") == 3.);
     Ok(())
 }
 

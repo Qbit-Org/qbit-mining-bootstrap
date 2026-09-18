@@ -88,6 +88,10 @@ families! {
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
+    NodePeers: Gauge, "node_peers", "Node peer connections from the latest node observation, or -1 when unknown.";
+    NodeIbd: Gauge, "node_initial_block_download", "Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown.";
+    NodeObservationAge: Gauge, "node_observation_age_seconds", "Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable.";
+    RollupLag: Gauge, "hashrate_rollup_watermark_lag_seconds", "Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -116,7 +120,15 @@ impl Family {
     }
 
     pub(super) fn is_live(self) -> bool {
-        self.is_collection() || self == Self::PoolAcquire
+        self.is_collection()
+            || matches!(
+                self,
+                Self::PoolAcquire
+                    | Self::NodePeers
+                    | Self::NodeIbd
+                    | Self::NodeObservationAge
+                    | Self::RollupLag
+            )
     }
 
     pub(super) fn is_collection(self) -> bool {
@@ -175,7 +187,7 @@ impl Registry {
         // These owner-dependent families have no samples at startup. Reserve
         // their closed keys now so even the first event needs no allocation.
         match family {
-            Family::FirstOffer => {
+            Family::FirstOffer | Family::RollupLag => {
                 self.samples
                     .insert((family, Labels::Empty), Sample::Pending);
             }
@@ -227,6 +239,14 @@ impl Registry {
         self.declare(family);
         self.samples
             .insert((family, labels.into()), Sample::Scalar(value));
+    }
+    /// Refresh a live sample without publishing one where its owner never did.
+    /// A reserved (pending) key stays absent, as when the rollup is disabled.
+    pub(super) fn refresh(&mut self, family: Family, labels: impl Into<Labels>, value: f64) {
+        assert!(value.is_finite());
+        if let Some(Sample::Scalar(sample)) = self.samples.get_mut(&(family, labels.into())) {
+            *sample = value;
+        }
     }
     pub(super) fn increment(&mut self, family: Family, labels: impl Into<Labels>) {
         assert_eq!(

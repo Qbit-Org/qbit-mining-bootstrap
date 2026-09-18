@@ -7,10 +7,13 @@ generated from registry descriptors or the inventory document. The census
 compares every family name and type, requires one HELP and TYPE per family, and
 compares every sample name and complete label tuple. Duplicate samples fail.
 
-The current bound is **47 families and 264 series**, including histogram
-`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **166 series**:
+The current bound is **51 families and 268 series**, including histogram
+`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **169 series**:
 first-offer and advisory-lock metadata exist, but their 98 derived series remain
-absent until observations occur. All 14 rejection reasons, two ACK outcomes,
+absent until observations occur, and the hashrate rollup lag declares metadata
+without a sample until its loop starts, which it never does while
+`PRISM_HASHRATE_ROLLUP_ENABLED=0`. The three node gauges are registered unknown
+at startup and carry no labels. All 14 rejection reasons, two ACK outcomes,
 two pool outcomes, six lock/outcome pairs, two collectors, ten task kinds, two
 connection refusal reasons and four stale-job causes are covered. Bucket bounds
 are independently pinned, including ACK's 15/20-second buckets and CTV chunk
@@ -20,7 +23,9 @@ rows' one-row bucket.
 drives every public enum variant and repeats varied values, missing and arbitrary
 reasons, successful zero observations, failed collections and cancelled
 collections. Neither observation values nor failure states may introduce names
-or labels. Unknown remains -1, distinct from a fresh successful zero. This is a
+or labels. Unknown remains -1, distinct from a fresh successful zero; the node
+gauges are driven through every combination a readiness attempt can report,
+including the answered zero peer count. This is a
 run-role qualification; public-api family and label contracts are unchanged.
 
 Privacy checks cover two producer-to-render paths:
@@ -66,8 +71,11 @@ samples, textual identifiers and numeric height attribution.
 The issue's combined legacy health checkbox must be split when recording
 acceptance: the native failure/freshness criteria have evidence; the obsolete
 exact-shape clause is an intentional difference. This qualification does not add
-per-worker/node/rollup families, change readiness, alter acquisition deadlines,
-or expand the separate SQL acquisition coverage work.
+per-worker families, change readiness, alter acquisition deadlines, or expand
+the separate SQL acquisition coverage work. The node and rollup-lag families
+added by the #278 hardening remainder are label-less and carry no per-worker,
+thread, file-descriptor or alert-rule additions; they are documented in
+[the native inventory](prism-native-metrics.md).
 
 ## Running the focused checks
 
