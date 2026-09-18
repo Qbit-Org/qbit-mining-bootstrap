@@ -319,19 +319,22 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
     let canonical: Option<String> = sqlx::query_scalar("SELECT canonical_json FROM (SELECT manifest_set_json AS canonical_json FROM qbit_ctv_fanout_sets WHERE manifest_set_sha256=$1 UNION ALL SELECT manifest_json FROM qbit_ctv_fanout_artifacts WHERE manifest_sha256=$1) rows LIMIT 1")
         .bind(hash).fetch_optional(&state.pool).await?;
     if let Some(canonical) = canonical {
+        // A manifest is small, and nothing has digested it yet, so it is
+        // hashed here and served under the address that proved it.
         if hex::encode(Sha256::digest(canonical.as_bytes())) != hash {
             return Err(ApiError::internal());
         }
-        return Ok(Payload::raw(canonical.into_bytes()));
+        return Ok(Payload::addressed(canonical.into_bytes(), hash));
     }
-    let block_hash: Option<String> = sqlx::query_scalar(
-        "SELECT block_hash FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1",
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT block_hash,audit_bundle_sha256 FROM qbit_pool_audit_bundles \
+         WHERE audit_bundle_sha256=$1 LIMIT 1",
     )
     .bind(hash)
     .fetch_optional(&state.pool)
     .await?;
-    let block_hash =
-        block_hash.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
+    let (block_hash, advertised) =
+        row.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
     // Only audit artifacts are admitted here: the manifests above are served
     // from their stored JSON and never wait behind a rebuild. Past the cap a
     // request is refused at once, after the two point lookups above and
@@ -366,10 +369,15 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
             .await
             .map_err(audit_read_error)?;
     if let Some(canonical) = canonical {
-        if hex::encode(Sha256::digest(&canonical)) != hash {
+        // The bytes were digested against `audit_bundle_sha256` inside the
+        // blocking job, under the permit, and that is the column this row was
+        // found by: an audit artifact is never hashed a second time on a
+        // runtime thread, where a window-sized pass would stall every other
+        // task. What remains is that the row answers the address asked for.
+        if advertised != hash {
             return Err(ApiError::internal());
         }
-        return Ok(Payload::raw(canonical));
+        return Ok(Payload::addressed(canonical, hash));
     }
     let mut payload = Payload::json(
         bundle(state, &block_hash, false)

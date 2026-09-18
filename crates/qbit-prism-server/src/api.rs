@@ -329,18 +329,31 @@ pub struct ApiState {
 struct Payload {
     bytes: Bytes,
     canonical_fallback: Option<String>,
+    /// The SHA-256 these bytes are already known to hash to, for a body that
+    /// was served by its content address. The ETag is that hash, so carrying
+    /// it keeps a second pass over a window-sized body off the runtime.
+    content_address: Option<String>,
 }
 impl Payload {
     fn json(value: Value) -> Self {
         Self {
             bytes: Bytes::from(serde_json::to_vec(&value).expect("JSON value")),
             canonical_fallback: None,
+            content_address: None,
         }
     }
     fn raw(bytes: Vec<u8>) -> Self {
         Self {
             bytes: bytes.into(),
             canonical_fallback: None,
+            content_address: None,
+        }
+    }
+    /// Bytes whose SHA-256 is `address`, proved before this call.
+    fn addressed(bytes: Vec<u8>, address: &str) -> Self {
+        Self {
+            content_address: Some(address.to_owned()),
+            ..Self::raw(bytes)
         }
     }
 }
@@ -683,7 +696,12 @@ async fn handle_inner(
     }
     let response = match result {
         Ok(payload) => {
-            let etag = format!("\"{}\"", hex::encode(Sha256::digest(&payload.bytes)));
+            // A content-addressed body carries the hash the ETag is made of;
+            // only a body without one is hashed here.
+            let etag = match &payload.content_address {
+                Some(address) => format!("\"{address}\""),
+                None => format!("\"{}\"", hex::encode(Sha256::digest(&payload.bytes))),
+            };
             let matched = headers
                 .get("if-none-match")
                 .and_then(|v| v.to_str().ok())
