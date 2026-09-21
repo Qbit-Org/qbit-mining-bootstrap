@@ -289,3 +289,24 @@ async fn first_confirmation_wins_even_when_its_observer_started_second() {
     assert_eq!(age(&m), 0.);
     assert_eq!(count(&m, "published"), 1.);
 }
+
+#[tokio::test(start_paused = true)]
+async fn proven_orphan_closes_without_delivery_and_keeps_its_deduplication_horizon() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    let obsolete = m.revision_work_settlement(&hash);
+    tick().await;
+    m.revision_work_orphaned(&hash);
+    drop(obsolete);
+    m.revision_work_orphaned(&hash);
+    m.accepted_block(&hash, 1);
+    m.landed_block(&hash, 1);
+    m.revision_work_delivered(1);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(m.landing.lock().unwrap().blocks.len(), 1);
+    m.revision_work_matured(1);
+    m.accepted_block(&hash, 1);
+    assert!(m.landing.lock().unwrap().blocks.is_empty());
+}

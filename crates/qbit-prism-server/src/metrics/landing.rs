@@ -15,7 +15,7 @@ struct Acceptance {
     at: Instant,
     height: u64,
     revision: Option<i64>,
-    delivered: bool,
+    closed: bool,
     degraded: Option<Instant>,
     awaiting_settlement: bool,
     unknown_revision: bool,
@@ -62,7 +62,7 @@ impl Landing {
         }
         self.blocks
             .values()
-            .filter(|block| !block.delivered)
+            .filter(|block| !block.closed)
             .map(|block| block.at)
             .min()
             .map_or(if self.failed { -1. } else { 0. }, |at| {
@@ -97,7 +97,7 @@ impl Landing {
             );
             newer_at = newer_at.into_iter().chain(event.first()).min();
         }
-        for block in self.blocks.values_mut().filter(|block| !block.delivered) {
+        for block in self.blocks.values_mut().filter(|block| !block.closed) {
             if block.unknown_revision {
                 continue;
             }
@@ -129,8 +129,8 @@ impl Landing {
             }
             // An obsolete write after supersession cannot settle pending age.
             // Replacement work must reach a socket.
-            block.delivered = delivery.is_some();
-            self.pending_count -= usize::from(block.delivered);
+            block.closed = delivery.is_some();
+            self.pending_count -= usize::from(block.closed);
         }
         if !self.pending() {
             self.revisions.clear();
@@ -158,6 +158,30 @@ impl Metrics {
         self.accept_block(hash, height, true);
     }
 
+    /// A committed proven orphan has no delivery target. Close its wait without
+    /// a delivery sample, retaining its identity through the mature watermark.
+    pub(crate) fn revision_work_orphaned(&self, hash: &str) {
+        self.landing_event(|state, _| {
+            let mut identity = [0; 32];
+            if hex::decode_to_slice(hash, &mut identity).is_ok() {
+                if let Some(block) = state
+                    .blocks
+                    .get_mut(&identity)
+                    .filter(|block| !block.closed)
+                {
+                    block.closed = true;
+                    block.unknown_revision = false;
+                    block.awaiting_settlement = false;
+                    state.pending_count -= 1;
+                }
+            }
+            if !state.pending() {
+                state.revisions.clear();
+                state.delivery_count = 0;
+            }
+        });
+    }
+
     fn accept_block(&self, hash: &str, height: u64, existing_revision: bool) {
         self.landing_event(|state, _| {
             let mut identity = [0; 32];
@@ -181,7 +205,7 @@ impl Metrics {
                     at: Instant::now(),
                     height,
                     revision: None,
-                    delivered: false,
+                    closed: false,
                     degraded: None,
                     awaiting_settlement: false,
                     unknown_revision: false,
@@ -211,7 +235,11 @@ impl Metrics {
             if hex::decode_to_slice(hash, &mut identity).is_err() {
                 return;
             }
-            if let Some(block) = state.blocks.get_mut(&identity) {
+            if let Some(block) = state
+                .blocks
+                .get_mut(&identity)
+                .filter(|block| !block.closed)
+            {
                 if settled && !first && block.revision.is_none() && !block.existing_revision {
                     block.unknown_revision = true;
                 }
@@ -255,7 +283,7 @@ impl Metrics {
         let floor = state.retired_height;
         state
             .blocks
-            .retain(|_, block| !block.delivered || block.height > floor);
+            .retain(|_, block| !block.closed || block.height > floor);
     }
 
     /// Called immediately after write_all of the complete mining.notify frame
@@ -356,7 +384,7 @@ impl Drop for Settlement<'_> {
             if hex::decode_to_slice(self.hash, &mut identity).is_ok() {
                 if let Some(block) = state.blocks.get_mut(&identity) {
                     block.awaiting_settlement = false;
-                    if block.revision.is_none() {
+                    if !block.closed && block.revision.is_none() {
                         block.unknown_revision = true;
                     }
                 }
@@ -382,7 +410,7 @@ impl Build<'_> {
             for block in state
                 .blocks
                 .values_mut()
-                .filter(|block| !block.delivered && block.at <= self.at)
+                .filter(|block| !block.closed && block.at <= self.at)
             {
                 block.degraded.get_or_insert_with(Instant::now);
             }

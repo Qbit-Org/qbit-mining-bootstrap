@@ -2137,6 +2137,7 @@ impl Coordinator {
             self.ledger
                 .orphan_candidate_at_revision(claim, &reason, observation.revision)
                 .await?;
+            self.metrics.revision_work_orphaned(block);
             self.metrics.record_candidate_orphaned();
             tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
             return Ok(());

@@ -782,6 +782,21 @@ async fn orphan_disposition(fixture: &Fixture) -> Result<()> {
     ensure!(
         rendered
             .lines()
+            .any(|line| line == "qbit_prism_accepted_block_revision_work_pending_seconds 0"),
+        "a terminal orphan retained an impossible revision-work wait"
+    );
+    for result in ["published", "degraded", "superseded"] {
+        ensure!(
+            rendered.lines().any(|line| line
+                == format!(
+            "qbit_prism_accepted_block_to_revision_work_seconds_count{{result=\"{result}\"}} 0"
+        )),
+            "orphan retirement fabricated a successful delivery"
+        );
+    }
+    ensure!(
+        rendered
+            .lines()
             .any(|line| line == "qbit_prism_block_candidates_orphaned_total 1"),
         "the orphan settlement was not counted once:\n{}",
         rendered
