@@ -12,7 +12,12 @@ pub(crate) struct RetainedShares {
 }
 
 /// Runtime-only acquisition evidence, never serialized or persisted.
-pub(crate) type LeafWitness = (i64, String);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeafWitness {
+    tableoid: i64,
+    inherits_xmin: String,
+    timeline: String,
+}
 
 #[derive(Clone)]
 pub(crate) struct SnapshotCapture {
@@ -58,6 +63,10 @@ impl RetainedShares {
 /// endpoints in different leaves cannot rule out an interior partition hole.
 /// pg_inherits is authoritative, including the first phase of concurrent
 /// detach; its tuple incarnation also detects detach/reattach during the read.
+/// The insertion timeline distinguishes successive writers under the existing
+/// single-standby D3 promotion/rejoin policy. It is shared across pooled SQL
+/// sessions, but is not a globally unique identity for sibling physical copies.
+/// D5 isolated recovery already stops frontends, discarding retained evidence.
 pub(super) async fn leaf_witness(
     tx: &mut Transaction<'_, Postgres>,
     first: i64,
@@ -65,8 +74,10 @@ pub(super) async fn leaf_witness(
     anchor: i64,
     expected_count: Option<i64>,
 ) -> Result<Option<LeafWitness>> {
-    Ok(sqlx::query_as(
-        "SELECT a.tableoid::bigint,i.xmin::text FROM qbit_share_ledger a \
+    let row = sqlx::query(
+        "SELECT a.tableoid::bigint AS tableoid,i.xmin::text AS inherits_xmin, \
+         left(pg_walfile_name(pg_current_wal_lsn()),8) AS timeline \
+         FROM qbit_share_ledger a \
          JOIN qbit_share_ledger b ON b.share_seq=$2 AND b.tableoid=a.tableoid \
          JOIN pg_inherits i ON i.inhrelid=a.tableoid \
            AND i.inhparent='qbit_share_ledger'::regclass AND NOT i.inhdetachpending \
@@ -85,7 +96,15 @@ pub(super) async fn leaf_witness(
     .bind(anchor)
     .bind(expected_count)
     .fetch_optional(&mut **tx)
-    .await?)
+    .await?;
+    row.map(|row| {
+        Ok(LeafWitness {
+            tableoid: row.try_get("tableoid")?,
+            inherits_xmin: row.try_get("inherits_xmin")?,
+            timeline: row.try_get("timeline")?,
+        })
+    })
+    .transpose()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -178,8 +197,9 @@ pub(super) async fn advance(
         })
         .await?;
     // Same statement/snapshot checks both the live incarnation and complete
-    // eligible membership after trimming. Immutability makes our retained rows
-    // a subset; equal cardinality proves equality, even with sequence gaps or
+    // eligible membership after trimming. Within the same writer timeline,
+    // immutability makes retained rows a subset; equal cardinality proves equality,
+    // even with sequence gaps or
     // retroactive INSERTs and newly eligible timestamps. This is intentionally
     // an O(window) metadata scan, not a claim of O(delta) database work.
     let first = i64::try_from(

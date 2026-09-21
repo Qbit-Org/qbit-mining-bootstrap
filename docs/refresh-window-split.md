@@ -103,17 +103,18 @@ plus a bounded page, with decoding and destruction on the blocking executor.
 Endpoint presence by itself is insufficient: two live endpoints can surround a
 detached interior partition. Acquisition therefore records private evidence that
 the full retained suffix was in one live PostgreSQL leaf, including that leaf's
-`pg_inherits` tuple incarnation. A later advance requires the same live leaf for
-the retained range and new cutoff. Detached, detach-pending, restored or replaced
-leaves invalidate that proof; cross-partition windows use the full scan.
+`pg_inherits` tuple incarnation and current WAL insertion timeline. A later
+advance requires the same timeline and live leaf for the retained range and new
+cutoff. Detached, detach-pending, restored or replaced leaves invalidate that
+proof; cross-partition windows use the full scan.
 
 Even an unchanged leaf does not prove an unchanged eligible set. Sequence gaps
 are normal after rollbacks and crash recovery, and immutable history permits an
 INSERT into an unused old sequence. Future timestamps can also become eligible.
 After trimming, one statement checks both the live leaf incarnation and the
 number of currently eligible rows from the proposed first row through the fresh
-cutoff. The retained rows are still immutable members of that leaf; equal count
-proves there are no omitted eligible members in that range. Since this suffix
+cutoff. Within that writer history, retained rows are still immutable members of
+that leaf; equal count proves there are no omitted eligible members in that range. Since this suffix
 already reaches the weight, older rows cannot affect the full reader's answer.
 A changed count falls back to a full scan at the same fresh anchor.
 
@@ -122,6 +123,26 @@ repair that disables or bypasses those triggers can change payloads without
 changing the count or leaf incarnation. Such a repair requires restarting every
 frontend to discard retained windows before trusting another refresh. Supported
 partition restoration invalidates the acquisition evidence normally.
+
+Both leaf checks also read the current WAL insertion timeline in the same
+transaction as share acquisition. A supported asynchronous promotion can lose
+acknowledged rows and replace their sequence values while preserving leaf OID,
+catalog incarnation and count, including an interior row whose newest neighbor
+survives. The changed timeline rejects that retained vector and takes the full
+read. Ordinary pool rotation or reconnection to the same history keeps the
+evidence usable. Query errors remain errors; they never authorize reuse.
+
+This history proof uses the existing [D3 promotion and rejoin
+contract](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint):
+one eligible standby, positive fencing of the old writer, and verified rewind or
+a fresh base backup before rejoining the former primary. Its later promotion
+advances the timeline again. Timeline numbers are not globally unique:
+independently promoted sibling copies can choose the same number, but D3 does
+not permit them as competing or replacement writers. Isolated restore and PITR
+follow the existing [D5 stopped-frontend recovery
+boundary](prism-rust-migration.md#recovery-and-rollback), which discards this
+process-local evidence. These are existing deployment boundaries; no additional
+frontend restart or privilege grant is required for D3 failover.
 
 This check is an **O(window) metadata scan**, not O(delta) database work. It avoids
 transferring and decoding retained payloads but still pays the count cost and

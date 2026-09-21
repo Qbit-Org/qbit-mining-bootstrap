@@ -8,7 +8,7 @@ pub(super) struct RefreshWindow {
     pub snapshot: Snapshot,
     pub reference: WindowRef,
     network: u128,
-    leaf: Option<(i64, String)>,
+    leaf: Option<crate::ledger::LeafWitness>,
     anchored: Instant,
 }
 

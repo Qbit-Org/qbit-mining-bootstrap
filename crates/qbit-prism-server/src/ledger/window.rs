@@ -6,7 +6,7 @@ pub(crate) use payout_state::RefreshProbe;
 pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 mod snapshot_delta;
-pub(crate) use snapshot_delta::{RetainedShares, SnapshotCapture};
+pub(crate) use snapshot_delta::{LeafWitness, RetainedShares, SnapshotCapture};
 
 const ACCEPTED_CUTOFF_SQL: &str =
     "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";

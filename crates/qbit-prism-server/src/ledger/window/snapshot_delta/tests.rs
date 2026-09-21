@@ -314,3 +314,64 @@ async fn concurrent_detach_pending_cannot_authorize_retained_rows() -> Result<()
         Ok(())
     })).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthy_pool_rotation_and_reconnect_preserve_history_evidence() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            for index in 1..=8 {
+                ledger.append(share(index, 1), None).await?;
+            }
+            let prior = capture(ledger, 1).await?;
+            let mut transactions = Vec::new();
+            let mut backends = std::collections::BTreeSet::new();
+            for _ in 0..4 {
+                let mut tx = ledger.begin().await?;
+                backends.insert(
+                    sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *tx)
+                        .await?,
+                );
+                // No new privilege is needed for the timeline expression. Exercise
+                // the entire witness as a standard non-superuser read-only role.
+                sqlx::query("SET LOCAL ROLE pg_read_all_data")
+                    .execute(&mut *tx)
+                    .await?;
+                assert!(
+                    !sqlx::query_scalar::<_, bool>(
+                        "SELECT rolsuper FROM pg_roles WHERE rolname=current_user"
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?
+                );
+                assert_eq!(
+                    leaf_witness(&mut tx, 1, 8, prior.anchor_ms, Some(8)).await?,
+                    prior.leaf
+                );
+                transactions.push(tx);
+            }
+            assert_eq!(backends.len(), 4);
+            for tx in transactions {
+                tx.rollback().await?;
+            }
+            let rotated = differential(ledger, retained(prior, 1), 1, true).await?;
+            let mut connections = Vec::new();
+            for _ in 0..4 {
+                connections.push(ledger.pool.acquire().await?);
+            }
+            for connection in connections {
+                connection.close().await?;
+            }
+            let fresh_backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&ledger.pool)
+                .await?;
+            assert!(!backends.contains(&fresh_backend));
+            let reconnected = differential(ledger, retained(rotated.clone(), 1), 1, true).await?;
+            assert_eq!(reconnected.leaf, rotated.leaf);
+            Ok(())
+        })
+    })
+    .await
+}
+
+mod physical_failover;
