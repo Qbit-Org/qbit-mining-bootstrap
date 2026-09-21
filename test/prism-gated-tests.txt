@@ -430,6 +430,7 @@ qbit-prism-server::qbit_prism_server::coordinator::commit_reconcile_tests::commi
 qbit-prism-server::qbit_prism_server::coordinator::commit_reconcile_tests::commit_reconcile_ledger_hook_refusal_sends_no_commit
 qbit-prism-server::qbit_prism_server::coordinator::compact_decode_tests::cancelled_and_expired_runtime_metadata_decoders_retain_capacity
 qbit-prism-server::qbit_prism_server::coordinator::compact_decode_tests::cancelled_runtime_snapshot_decoders_retain_build_capacity
+qbit-prism-server::qbit_prism_server::coordinator::compact_decode_tests::cancelled_shared_window_owner_forces_full_snapshot_without_cloning
 qbit-prism-server::qbit_prism_server::coordinator::d2_below_target_tests::block_only_credit_survives_a_reorg_that_disconnects_its_block
 qbit-prism-server::qbit_prism_server::coordinator::d2_below_target_tests::block_only_proof_is_credited_network_work_only_once_the_block_is_active
 qbit-prism-server::qbit_prism_server::coordinator::d2_below_target_tests::block_only_proof_the_node_rejects_fails_the_submission_without_credit
@@ -507,6 +508,16 @@ qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::one_c
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_control
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::same_revision_balance_identity_and_accepted_cutoff_are_fresh
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::unavailable_read_only_and_invalid_values_are_errors
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::bulk_fixture_retroactive_insert_and_future_eligibility_are_not_delta_safe
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::concurrent_detach_pending_cannot_authorize_retained_rows
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::deferred_confirmation_credit_is_an_idempotent_delta
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::delta_crossing_revision_and_balance_match_full_at_same_anchor
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::healthy_pool_rotation_and_reconnect_preserve_history_evidence
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::partition_crossing_interior_detach_and_restore_fall_back
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::physical_failover::physical_async_failover_replaced_history_matches_full_read
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::physical_failover::physical_async_failover_with_retroactive_fixture_matches_full_read
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::same_leaf_detach_and_reattach_invalidate_acquisition_proof
+qbit-prism-server::qbit_prism_server::ledger::window::snapshot_delta::tests::short_history_retarget_regressions_fall_back_but_rollback_gaps_advance
 qbit-prism-server::qbit_prism_server::partitions::acquire_tests::postgres_checkout_wait_error_cancel_and_reuse
 qbit-prism-server::qbit_prism_server::partitions::acquire_tests::postgres_real_23514_fallback_counts_three_checkouts_and_one_effect
 qbit-prism-server::qbit_prism_server::partitions::acquire_tests::postgres_sql_wait_error_cancel_and_shutdown_keep_checkout_success

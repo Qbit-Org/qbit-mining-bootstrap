@@ -5,6 +5,8 @@ pub use payout_state::PayoutState;
 pub(crate) use payout_state::RefreshProbe;
 pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
+mod snapshot_delta;
+pub(crate) use snapshot_delta::{LeafWitness, RetainedShares, SnapshotCapture};
 
 const ACCEPTED_CUTOFF_SQL: &str =
     "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";
@@ -798,9 +800,10 @@ impl Ledger {
     /// the existing public audit format without relying on host clock sync.
     pub async fn snapshot(&self, network_difficulty: u128) -> Result<Snapshot> {
         Ok(self
-            .snapshot_with_admission(network_difficulty, ReadAdmission::default())
+            .snapshot_with_admission(network_difficulty, ReadAdmission::default(), None)
             .await?
-            .into_inner())
+            .into_inner()
+            .snapshot)
     }
 
     /// Carry runtime build admission through balance/page decoding and cleanup.
@@ -809,7 +812,8 @@ impl Ledger {
         &self,
         network_difficulty: u128,
         completion: ReadAdmission,
-    ) -> Result<BlockingDrop<Snapshot>> {
+        prior: Option<BlockingDrop<RetainedShares>>,
+    ) -> Result<BlockingDrop<SnapshotCapture>> {
         let weight = network_difficulty
             .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
             .context("window difficulty overflow")?;
@@ -843,6 +847,41 @@ impl Ledger {
         // before scanning a potentially large payout window.
         let mut tx = self.begin().await?;
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
+        if let Some(prior) = prior {
+            if let Some((shares, leaf)) = snapshot_delta::advance(
+                &mut tx,
+                prior,
+                network_difficulty,
+                weight,
+                anchor_ms,
+                cutoff,
+                &completion,
+            )
+            .await?
+            {
+                let snapshot = shares
+                    .map_anyhow(move |shares| {
+                        Ok(Snapshot {
+                            anchor_ms,
+                            share_seq: u64::try_from(cutoff)?,
+                            payout_revision,
+                            shares,
+                            prior_balances: prior_balances.into_inner(),
+                        })
+                    })
+                    .await?;
+                tx.commit().await?;
+                return snapshot
+                    .map_anyhow(move |snapshot| {
+                        Ok(SnapshotCapture {
+                            snapshot,
+                            leaf: Some(leaf),
+                        })
+                    })
+                    .await;
+            }
+        }
+        let before = snapshot_delta::leaf_witness(&mut tx, cutoff, cutoff, anchor_ms, None).await?;
         let mut scan = completion.own((Vec::<AcceptedShare>::new(), weight, cursor));
         while scan.1 > 0 {
             let rows = sqlx::query(&format!(
@@ -891,8 +930,23 @@ impl Ledger {
                 })
             })
             .await?;
+        let after = if let Some(first) = snapshot.shares.first() {
+            snapshot_delta::leaf_witness(
+                &mut tx,
+                i64::try_from(first.share_seq)?,
+                cutoff,
+                anchor_ms,
+                Some(i64::try_from(snapshot.shares.len())?),
+            )
+            .await?
+        } else {
+            None
+        };
+        let leaf = after.filter(|witness| before.as_ref() == Some(witness));
         tx.commit().await?;
-        Ok(snapshot)
+        snapshot
+            .map_anyhow(move |snapshot| Ok(SnapshotCapture { snapshot, leaf }))
+            .await
     }
 }
 

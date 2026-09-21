@@ -96,6 +96,8 @@ impl Fixture {
                     &fixture.node,
                     &format!("b275-{index}"),
                 )?;
+                // Match the deployed default rather than the small unit-test pool.
+                config.database_connections = 16;
                 config.template_max_age = Duration::from_secs(600);
                 config.submit_tip_max_age = Duration::from_secs(600);
                 config.snapshot_interval = Duration::from_secs(600);
