@@ -210,12 +210,20 @@ class DaemonShareWindowMirrorTests(unittest.TestCase):
                 self.assertEqual(sequence[-1], expected[-1])
                 self.assertEqual(sequence[3:7], tuple(expected[3:7]))
                 self.assertEqual(len(sequence), len(expected))
-                # The parse ran exactly once and was published whole.
-                self.assertIs(sequence._records(), sequence._parsed)
-                # Keys are shared across records like a whole-array
-                # json.loads shares them: one string object per key.
-                key_ids = {id(key) for record in sequence for key in record}
-                self.assertLessEqual(len(key_ids), 13)
+                # Each read above parsed for its own duration and released:
+                # the tuple is never an owning cache of the sequence (#332).
+                self.assertIsNone(sequence._parsed)
+                # A pinned scope parses once, shares the tuple with every
+                # read inside it, and releases it on exit.
+                with sequence.retained() as records:
+                    self.assertIs(records, sequence._parsed)
+                    self.assertIs(sequence._records().records, records)
+                    self.assertIs(sequence[0], records[0])
+                    # Keys are shared across records like a whole-array
+                    # json.loads shares them: one string object per key.
+                    key_ids = {id(key) for record in sequence for key in record}
+                    self.assertLessEqual(len(key_ids), 13)
+                self.assertIsNone(sequence._parsed)
                 self.assertEqual(
                     share_ledger_module._canonical_items_layout(items),
                     (len(expected), False),

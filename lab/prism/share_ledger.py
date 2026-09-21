@@ -18,6 +18,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -844,6 +845,37 @@ def _canonical_items_record_count(
     return count
 
 
+class _ParsedWindowRecords:
+    """The parsed tuple of one window, alive only while a consumer holds it.
+
+    :class:`DaemonShareJsonSequence` keeps a *weak* reference to this holder
+    and a strong one only inside :meth:`DaemonShareJsonSequence.retained`.
+    A consumer that iterates, indexes or pins the sequence therefore owns
+    the parsed dicts for exactly the span of its use, and the population the
+    collector traverses returns to zero when the last consumer finishes,
+    however long the sequence itself outlives it (#332, defect 4).
+    """
+
+    __slots__ = ("records", "__weakref__")
+
+    def __init__(self, records: tuple[dict[str, object], ...]) -> None:
+        self.records = records
+
+
+def _iter_parsed_records(
+    holder: _ParsedWindowRecords,
+    *,
+    reverse: bool = False,
+) -> Iterator[dict[str, object]]:
+    # The generator frame is what keeps the holder (and so the parsed
+    # tuple) alive for the duration of the walk; abandoning the iterator
+    # releases both.
+    records = holder.records
+    for record in (reversed(records) if reverse else records):
+        yield record
+    del holder
+
+
 class DaemonShareJsonSequence(Sequence):
     """Lazy, byte-backed twin of :class:`IncrementalShareJsonSequence`.
 
@@ -858,27 +890,55 @@ class DaemonShareJsonSequence(Sequence):
     sequence by construction: both stream the same fragments in the same
     order, and the digest framing is invariant to page layout.
 
+    The parsed tuple is never an owning cache of this object: it lives in a
+    :class:`_ParsedWindowRecords` holder that the sequence references only
+    weakly, so it is shared by concurrent consumers while any of them holds
+    it and released as soon as the last one finishes. A consumer that reads
+    the same window several times inside one operation pins it once with
+    :meth:`retained` instead of parsing per read. ``_parsed`` exposes the
+    tuple while some consumer holds it and ``None`` otherwise.
+
     The count check below is a floor, not the contract: a sequence handed
     out by :class:`DaemonShareWindowMirror` had its count reconciled with
     its bytes at construction, so no consumer of a mirror can be the first
     to learn of a divergence.
     """
 
-    __slots__ = ("canonical_items", "record_count", "_parse_lock", "_parsed", "__weakref__")
+    __slots__ = (
+        "canonical_items", "record_count", "_parse_lock", "_parsed_ref",
+        "_pinned", "_pins", "__weakref__",
+    )
 
-    def __init__(self, canonical_items: bytes, record_count: int) -> None:
+    def __init__(self, canonical_items: bytes, record_count: int, *,
+                 site: str | None = None) -> None:
         self.canonical_items = bytes(canonical_items)
         self.record_count = int(record_count)
         self._parse_lock = Lock()
-        self._parsed: tuple[dict[str, object], ...] | None = None
-        track_window(self, self.canonical_items, kind="sequence")
+        # Weak slot for the holder of the last parse; strong only while
+        # pinned. Neither the weakref nor its callback references this
+        # sequence strongly, so no cycle is created (release is refcount).
+        self._parsed_ref: weakref.ref[_ParsedWindowRecords] | None = None
+        self._pinned: _ParsedWindowRecords | None = None
+        self._pins = 0
+        track_window(self, self.canonical_items, kind="sequence", site=site)
 
     def __len__(self) -> int:
         return self.record_count
 
-    def _records(self) -> tuple[dict[str, object], ...]:
+    @property
+    def _parsed(self) -> tuple[dict[str, object], ...] | None:
+        """The parsed tuple while a consumer holds it; never an owning cache."""
+        holder = self._pinned
+        if holder is None and self._parsed_ref is not None:
+            holder = self._parsed_ref()
+        return None if holder is None else holder.records
+
+    def _records(self) -> _ParsedWindowRecords:
         with self._parse_lock:
-            if self._parsed is None:
+            holder = self._pinned
+            if holder is None and self._parsed_ref is not None:
+                holder = self._parsed_ref()
+            if holder is None:
                 # Record at a time through the same strict walker that
                 # reconciled the mirror's count at construction: one
                 # ``raw_decode`` per record and one bounded UTF-8 decode per
@@ -903,18 +963,58 @@ class DaemonShareJsonSequence(Sequence):
                         f"{len(parsed)} records where {self.record_count}"
                         " were declared"
                     )
-                self._parsed = tuple(parsed)
-                note_parsed_window(self, len(self._parsed))
-            return self._parsed
+                holder = _ParsedWindowRecords(tuple(parsed))
+                del parsed
+                owner_ref = weakref.ref(self)
+
+                def released(reference: Any) -> None:
+                    # The holder died: its dicts are gone unless a newer
+                    # parse has already replaced the slot, whose own note
+                    # then stands. Attribute reads are atomic under the
+                    # GIL, and the slot is installed before the note below,
+                    # so both orders of this callback and a concurrent
+                    # re-parse leave the count matching what is alive.
+                    owner = owner_ref()
+                    if owner is not None and owner._parsed_ref is reference:
+                        note_parsed_window(owner, 0)
+
+                self._parsed_ref = weakref.ref(holder, released)
+                note_parsed_window(self, len(holder.records))
+            return holder
+
+    @contextmanager
+    def retained(self) -> Iterator[tuple[dict[str, object], ...]]:
+        """Pin the parsed tuple for one operation that reads the window repeatedly.
+
+        Nested and concurrent pins share one parse; the strong reference is
+        dropped when the last pin exits, outside the parse lock, so the
+        holder's release callback can never run inside it.
+        """
+        holder = self._records()
+        with self._parse_lock:
+            self._pins += 1
+            self._pinned = holder
+        try:
+            yield holder.records
+        finally:
+            with self._parse_lock:
+                self._pins -= 1
+                if self._pins == 0:
+                    self._pinned = None
+            del holder
 
     def __iter__(self) -> Iterator[dict[str, object]]:
-        return iter(self._records())
+        return _iter_parsed_records(self._records())
+
+    def __reversed__(self) -> Iterator[dict[str, object]]:
+        # ``Sequence.__reversed__`` would index every record separately.
+        return _iter_parsed_records(self._records(), reverse=True)
 
     def __getitem__(
         self,
         index: int | slice,
     ) -> dict[str, object] | tuple[dict[str, object], ...]:
-        return self._records()[index]
+        return self._records().records[index]
 
     def canonical_json_sha256(self) -> str:
         digest = hashlib.sha256()
@@ -1101,10 +1201,16 @@ class DaemonShareWindowMirror:
             share_snapshot_sha256=share_snapshot_sha256,
         )
 
-    def json_records(self) -> DaemonShareJsonSequence:
+    def json_records(self, *, site: str | None = None) -> DaemonShareJsonSequence:
+        """A fresh byte-sharing sequence; ``site`` labels its ownership entry.
+
+        The default label is the calling function, so every minted sequence
+        is attributable to one of the call sites in the ownership export.
+        """
         return DaemonShareJsonSequence(
             canonical_items=self.canonical_items,
             record_count=self.record_count,
+            site=site,
         )
 
 

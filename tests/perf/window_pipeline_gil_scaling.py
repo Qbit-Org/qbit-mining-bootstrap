@@ -1870,7 +1870,7 @@ def _probe_one_size(
         )[1],
     )
     def parse_stream() -> int:
-        state["parsed_stream"] = DaemonShareJsonSequence(items, count)._records()
+        state["parsed_stream"] = DaemonShareJsonSequence(items, count)._records().records
         return len(items)
 
     measure(
