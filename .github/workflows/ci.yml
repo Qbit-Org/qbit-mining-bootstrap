@@ -72,6 +72,9 @@ jobs:
       - name: Check PRISM setting inventories and retired-setting guidance
         run: python3 scripts/check_prism_settings.py
 
+      - name: Check that the deleted-test map cites real tests and counts its own rows
+        run: python3 scripts/check_deleted_test_map.py
+
       - name: Test the pinned-tool installer's outage and integrity guards
         run: bash .github/scripts/test-install-pinned-tool.sh
 
@@ -285,6 +288,30 @@ jobs:
         run: |
           echo "$RESULTS"
           echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
+  deleted-test-map-owner-issues:
+    # Deliberately not in `checks`: an issue closing must not block unrelated
+    # pull requests. A red job here is how a stale owner link gets noticed, so
+    # it must stay able to fail (no continue-on-error).
+    name: Deleted-test map names only open issues as gap owners (advisory)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      issues: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Check that no uncovered behaviour is owned by a closed issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_deleted_test_map.py --check-issues
 
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
