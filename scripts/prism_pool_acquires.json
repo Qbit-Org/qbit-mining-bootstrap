@@ -117,7 +117,7 @@
     "coordinator.rs::with_candidate_heartbeat#1::self . ledger .acquire()": [2,"ledger"],
     "coordinator/issued_batcher.rs::with_dwell#1::run(ledger , receiver , shutdown . clone ( ) , dwell)": [1,"non-database"],
     "coordinator/miner_submit.rs::persist_block_only#1::self . ledger .acquire()": [2,"ledger"],
-    "coordinator/refresh_window.rs::capture_refresh_window#1::prepare(std :: mem :: take ( & mut snapshot . prior_balances ) , & admission ,)": [1,"non-database"],
+    "coordinator/refresh_window.rs::capture_refresh_window#1::prepare(std :: mem :: take ( & mut snapshot . snapshot . prior_balances ) , & admission ,)": [1,"non-database"],
     "coordinator/work_ledger.rs::now_ms#1::self .acquire()": [1,"ledger"],
     "ledger/archive.rs::lifecycle_guard#1::ledger .acquire()": [1,"ledger"],
     "ledger/archive.rs::plan#1::ledger .begin()": [1,"ledger"],

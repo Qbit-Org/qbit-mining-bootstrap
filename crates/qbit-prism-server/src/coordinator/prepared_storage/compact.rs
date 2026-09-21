@@ -13,6 +13,8 @@ use crate::coordinator::tip_observation::PreparedIdentity;
 use crate::ledger::{CompactPrepared, PreparedAuditHashes, PreparedTemplate};
 
 #[cfg(test)]
+mod refresh_tests;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 pub(in crate::coordinator) use test_support::{
@@ -273,11 +275,65 @@ pub(in crate::coordinator) fn assemble_captured(
     })
 }
 
+/// Pure template-specific work, independent of the native WindowRef digest.
+/// Its counted-share digest and audit framing still use the existing builders.
+pub(in crate::coordinator) struct RefreshBody {
+    body: Option<qbit_prism::AuditBundleBody>,
+    hashes: Option<PreparedAuditHashes>,
+    base_wire: Option<codec::Job>,
+}
+
+pub(in crate::coordinator) type CapturedRefreshBody =
+    CompactOwner<(Result<RefreshBody>, Arc<tokio::sync::OwnedSemaphorePermit>)>;
+
+pub(in crate::coordinator) fn prepare_refresh_body(
+    config: &Config,
+    snapshot: &Snapshot,
+    template: &Value,
+    suffix: String,
+    inputs: BundleInputs,
+) -> Result<RefreshBody> {
+    // WindowRef::from_snapshot uses precisely this condition for shares: Some.
+    // The native digest remains mandatory before any compact record is assembled.
+    let body = if snapshot.shares.is_empty() {
+        None
+    } else {
+        Some(bundle_build::build_body(config, snapshot, template, None, suffix, inputs)?.0)
+    };
+    let hashes = body
+        .as_ref()
+        .map(|body| {
+            Ok::<_, anyhow::Error>(PreparedAuditHashes {
+                audit_bundle_sha256: audit_parts_sha256(body, &snapshot.shares)?,
+                coinbase_manifest_sha256: canonical_json_sha256(
+                    &body.signed_coinbase_manifest.manifest,
+                )?,
+            })
+        })
+        .transpose()?;
+    let base_wire = body
+        .as_ref()
+        .map(|body| {
+            bundle_build::shared_base_wire(
+                template,
+                &body.signed_coinbase_manifest.manifest,
+                config.extranonce2_size,
+            )
+        })
+        .transpose()?;
+    Ok(RefreshBody {
+        body,
+        hashes,
+        base_wire,
+    })
+}
+
 pub(in crate::coordinator) struct RefreshBuild {
     pub proof: CompactBuildProof,
     pub key: String,
     pub template: Value,
     pub window: refresh_window::CachedWindow,
+    pub body: Option<CapturedRefreshBody>,
     pub inputs: BundleInputs,
     pub fee: Option<FanoutFeeRatePolicy>,
     pub fingerprint: String,
@@ -306,42 +362,20 @@ impl Coordinator {
                 let source = inputs;
                 let snapshot = &source.window.snapshot;
                 let window = source.window.reference;
-                let body = if window.shares.is_some() {
-                    Some(
-                        bundle_build::build_body(
-                            &config,
-                            snapshot,
-                            &source.template,
-                            None,
-                            source.suffix.clone(),
-                            source.inputs.clone(),
-                        )?
-                        .0,
-                    )
-                } else {
-                    None
+                let RefreshBody {
+                    body,
+                    hashes,
+                    base_wire,
+                } = match source.body {
+                    Some(body) => body.into_inner().0?,
+                    None => prepare_refresh_body(
+                        &config,
+                        snapshot,
+                        &source.template,
+                        source.suffix.clone(),
+                        source.inputs.clone(),
+                    )?,
                 };
-                let hashes = body
-                    .as_ref()
-                    .map(|body| {
-                        Ok::<_, anyhow::Error>(PreparedAuditHashes {
-                            audit_bundle_sha256: audit_parts_sha256(body, &snapshot.shares)?,
-                            coinbase_manifest_sha256: canonical_json_sha256(
-                                &body.signed_coinbase_manifest.manifest,
-                            )?,
-                        })
-                    })
-                    .transpose()?;
-                let base_wire = body
-                    .as_ref()
-                    .map(|body| {
-                        bundle_build::shared_base_wire(
-                            &source.template,
-                            &body.signed_coinbase_manifest.manifest,
-                            config.extranonce2_size,
-                        )
-                    })
-                    .transpose()?;
                 let template = PreparedTemplate::encode(&source.template)?;
                 let record = CompactPrepared {
                     format_version: CompactPrepared::FORMAT_VERSION,

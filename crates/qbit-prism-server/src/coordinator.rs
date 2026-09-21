@@ -1116,6 +1116,12 @@ impl Coordinator {
         } else {
             false
         };
+        let suffix = format!(
+            "{}{}",
+            hex::encode(&self.config.coinbase_tag),
+            "00".repeat(4 + self.config.extranonce2_size)
+        );
+        let mut body = None;
         if !reuse_window {
             // Move exclusively owned rows on the blocking executor. A cancelled
             // build can still own the Arc; in that case keep its admission and
@@ -1132,10 +1138,24 @@ impl Coordinator {
                     })
                 })
                 .await?;
-            *cached_window = Some(
-                self.capture_refresh_window(network, permit.clone(), prior)
-                    .await?,
-            );
+            let captured = self
+                .capture_refresh_window(
+                    network,
+                    permit.clone(),
+                    prior,
+                    template.clone(),
+                    suffix.clone(),
+                    inputs.clone(),
+                )
+                .await?;
+            // Install the cache and rewrap its companion synchronously. Until
+            // here one cleanup owner keeps both large outputs under admission.
+            let (window, prepared_body, admission) = captured.into_inner();
+            *cached_window = Some(prepared_storage::compact::CompactOwner::new(window));
+            body = Some(prepared_storage::compact::CompactOwner::new((
+                prepared_body,
+                admission,
+            )));
         }
         // Cached inputs are not publication authority. Keep exactly one owner
         // in the serialized refresh loop even if a later build/save is cancelled.
@@ -1168,16 +1188,13 @@ impl Coordinator {
             key: storage_key,
             template,
             window,
+            body,
             inputs,
             fee,
             fingerprint,
             generation,
             parent_of_tip,
-            suffix: format!(
-                "{}{}",
-                hex::encode(&self.config.coinbase_tag),
-                "00".repeat(4 + self.config.extranonce2_size)
-            ),
+            suffix,
             original_expires_at_ms,
         };
         let captured = self
