@@ -851,6 +851,7 @@ async fn deliver_job<B: MiningBackend>(
     session: &mut Session<B::Context>,
     writer: &mut OwnedWriteHalf,
     config: &StratumConfig,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
     let Some(extranonce1) = session.extranonce1.as_deref() else {
         return Ok(());
@@ -875,6 +876,7 @@ async fn deliver_job<B: MiningBackend>(
             )
             .await
     };
+    let revision_build = metrics.revision_work_build();
     let mut job = match timeout(
         Duration::from_secs_f64(config.initial_job_timeout_seconds),
         build,
@@ -887,6 +889,7 @@ async fn deliver_job<B: MiningBackend>(
             return Err(error.into());
         }
         Err(_) => {
+            revision_build.deadline_hit();
             session.retry_job = true;
             return Err(StratumError::backend("initial job delivery timed out").into());
         }
@@ -938,6 +941,7 @@ async fn deliver_job<B: MiningBackend>(
     )
     .await?;
     write_json(writer, job.wire.notify(), config).await?;
+    metrics.revision_work_delivered(job.wire.payout_revision);
     session.observation.delivered(job.wire.refresh_generation);
     let hint = session.pending_retarget.take().map(|(previous, _)| {
         let difficulty = job.wire.share_difficulty;
@@ -1459,8 +1463,14 @@ async fn session<B: MiningBackend>(
             }
         }
         if session.retry_job {
-            if let Err(error) =
-                deliver_job(backend.as_ref(), &mut session, &mut writer, &config).await
+            if let Err(error) = deliver_job(
+                backend.as_ref(),
+                &mut session,
+                &mut writer,
+                &config,
+                &metrics,
+            )
+            .await
             {
                 session.restore_retarget();
                 if error.downcast_ref::<StratumError>().is_none() {

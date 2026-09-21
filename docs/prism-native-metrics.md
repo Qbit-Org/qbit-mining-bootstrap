@@ -48,6 +48,9 @@ rendering the startup registry does not create a publication timestamp.
 
 | Family | Type | Labels | Role | Meaning / status | 2.x.x name replaced |
 | --- | --- | --- | --- | --- | --- |
+| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. | none |
+| `qbit_prism_accepted_block_revision_work_tracking_unknown` | gauge | none | run | Whether any local landing observation is unknown or incomplete; independent of known pending delivery age. Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels. | none |
+| `qbit_prism_accepted_block_to_revision_work_seconds` | histogram | `result=published,degraded,superseded` | run | Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds. Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds. | `qbit_prism_accepted_block_preview_publication_seconds` |
 | `qbit_prism_accepted_shares_total` | counter | none | run | Shares accepted by this instance since process start. Process-local counter; legacy canonical ledger count was persistent. | `qbit_prism_accepted_shares_total` |
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
@@ -94,6 +97,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_public_staleness_refusals_total` | counter | none | public-api | Responses refused for exceeding an endpoint cache-age budget. | `qbit_prism_public_staleness_refusals_total` |
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
 | `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised` | run | Share rejections by canonical bounded reason ID. Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. | `qbit_prism_rejections_total` |
+| `qbit_prism_revision_work_build_timeouts_total` | counter | none | run | Existing build deadlines actually hit while accepted-block revision work is pending on this frontend. Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. | `qbit_prism_accepted_parent_preview_wait_timeouts_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
 | `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
 | `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Oldest active operation time since progress; zero when idle. | none |
@@ -254,11 +258,144 @@ The coordinator adds the three health compatibility aliases whose native sources
 are known; the fixture deliberately identifies unmapped legacy fields: `ready_miner_count` (accepted-share participants) and `max_blocks` (the 2.x accepted-block pool-close cap) have no native health equivalents.
 
 No new configuration setting is introduced. Worker slots, per-worker series,
-node gauges, rollup-lag series, payout build and landing-phase instrumentation
-remain outside the trimmed metrics scope. The subsequent
+node gauges, rollup-lag series and payout-build duration remain outside the
+trimmed metrics scope. #458 adds the landing observation contract below. The subsequent
 [#278 cardinality/privacy qualification](prism-metrics-cardinality-privacy.md)
 pins the complete run-role wire census and tests identifier-bearing inputs
 through Stratum and the candidate collector without expanding the family set.
+
+## Accepted block to delivered revision work (#458)
+
+`qbit_prism_accepted_block_to_revision_work_seconds` begins when this frontend
+classifies its actual `submitblock` reply as definitive acceptance, or first
+obtains a coherent active-chain proof for the block. A recovered unknown offer
+starts at that proof, never at an invented earlier acceptance time. A peer
+frontend starts at its own proof during reconciliation; these frontend-local
+intervals must not be presented as a shared node-acceptance clock. Mature
+historical blocks do not start new observations.
+
+`published` ends after `write_all` successfully writes the complete first
+`mining.notify` frame whose job carries the associated post-landing revision.
+This is socket-write completion, not an acknowledgement from mining hardware.
+Prepared publication, job construction, issuance persistence, first node offer
+and a failed socket write are not completion. The local settlement observer
+uses the revision from the same committed transaction, including a no-op
+confirmation or reactivation. A peer proof associates the first revision this
+frontend can prove includes that block; it does not reconstruct an unseen
+original confirmation revision. An in-flight local settlement cannot be
+replaced by this peer-proof association. If its reply is delayed, actual write
+and revision-observation clocks are retained so later association preserves
+which event happened first.
+
+`superseded` means a later revision was observed before delivery of the target
+revision. Its histogram interval still ends at actual replacement-work delivery,
+never at the revision observation. The pending gauge retains the original
+acceptance age through supersession and a second accepted block, until a
+successful write of compatible current replacement work. A late write of an
+already superseded revision cannot clear that wait. Thus stalls are visible
+before the first completed histogram sample. The gauge is computed from a
+monotonic clock at render time and overlaid on cached metric bodies.
+With no connected miners there is no qualifying notify delivery: pending age
+continues to rise and alerts can fire even when prepared work is ready. The
+metric does not reinterpret an empty listener as successful miner delivery.
+
+`qbit_prism_revision_work_build_timeouts_total` increments only in the existing
+Stratum job-build timeout branch, once for that operation when accepted work
+was pending at its start. Its budget includes the existing admission wait.
+Success, ordinary errors, cancellation, node-offer timeouts and issuance or
+socket-write deadlines are not counted as job-build timeouts. A subsequent
+qualifying delivery is `degraded` if an applicable build deadline was hit before
+that write. A timeout of an older operation cannot degrade a later acceptance.
+Native refresh currently has no overall deadline and this instrumentation adds
+none; no refresh deadline or fallback-delivery policy is inferred from elapsed
+time. The histogram differs from both proof-to-first-offer and the #275/#444
+harness approximation, which do not observe this actual socket boundary.
+
+Tracking is process-local and bounded to 4,096 accepted block identities,
+4,096 revisions and 4,096 delivery timestamps while delivery remains unresolved.
+Repeated writes at the same revision share a timestamp until another acceptance
+arrives, preserving the first eligible write for each acceptance. Completed identities
+are retained as deduplication tombstones until a coherent mature accounting
+checkpoint retires their height. A monotonic height watermark then rejects
+delayed proofs even after the identity is released; unresolved intervals are
+never retired by that checkpoint. Revision events are released when all known
+deliveries resolve. Nothing is evicted to make a duplicate look new.
+Exceeding a bound sets `accepted_block_revision_work_tracking_unknown` to
+**1 until restart**. Missing identities have no fabricated observations; known
+pending ages remain visible after identity-only saturation. Lost revision or
+delivery history additionally sets pending age to -1 and suppresses terminal
+samples because supersession or the first delivery can no longer be proven.
+Within this horizon,
+a tracked block has at most one terminal sample, and exactly one once its
+revision and qualifying delivery are both known. Process restart loses
+unresolved intervals and deduplication history, and begins new local proof
+clocks rather than replaying peer timestamps. If a local settlement commits but
+its exact-revision reply is lost or cancelled, tracking is unknown and the interval
+stays unresolved: a current-revision proof cannot safely reconstruct that
+original revision. A later proven first confirmation can recover an attempt
+that did not commit; an already-confirmed replay cannot invent the lost fact.
+The same unknown boundary applies when a peer confirms a locally accepted
+block during audit landing, before the local settlement observer starts. Only
+a newly observed already-confirmed peer block may begin at its current local
+proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
+Universal exactly-once reporting beyond these knowledge/capacity boundaries
+requires durable observation metadata and is not claimed here.
+
+Unknown tracking is independent of known pending age: an unknown interval A
+cannot hide a measured interval B crossing the critical threshold. Pending age
+is -1 when no known interval remains but tracking is unknown, and zero only
+when the observed empty state is known. The separate unknown gauge stays one
+even while a known interval's positive age is reported. A rejected transaction
+before COMMIT does not invent a lost outcome. Operator recovery uses the same
+committed revision evidence as ordinary settlement, and a proven first
+confirmation remains authoritative regardless of observer arrival order.
+
+A successfully committed proven orphan closes its delivery wait without a
+histogram sample: it has no eligible delivery target. Its identity remains a
+deduplication tombstone through the same mature watermark, including if later
+chain reconciliation reactivates it; this does not change payout credit or
+block-confirmation counting. The shared ledger observer arms uncertainty only
+at the existing orphan COMMIT boundary, so a rejected precommit verdict leaves
+the measured wait intact. An in-flight, lost or cancelled orphan COMMIT cannot
+be relabeled as successful delivery or upgraded by a later revision proof.
+
+Each frontend discovers peer-settled orphans through the existing ten-second
+metrics collector cadence. One extra read-only lookup checks at most 4,096
+locally unresolved hashes against the terminal outbox state; it is skipped
+when that set is empty and shares the existing three-second total collection
+deadline and read-only snapshot. No background loop, accounting lock, schema,
+write, or work-publication dependency is added. Positive durable orphan
+evidence closes only a still-tracked identity, even if its original COMMIT
+reply was lost; negative evidence never guesses the original outcome.
+A failed or cancelled terminal read preserves pending state and exposes
+tracking uncertainty, and an older completion cannot erase a newer failure.
+Before the next successful collection, the accepting frontend still reports
+its locally known wait; this is a local knowledge boundary, not the peer's
+orphan commit time.
+
+A failed or cancelled refresh preserves known pending age. If no unresolved
+acceptance is known, that failed observation yields -1 rather than a fabricated
+healthy zero; a later successful refresh restores the known empty zero. An
+older cancelled refresh cannot overwrite a newer completed observation. No
+block, job, worker, frontend or height label is emitted.
+
+There are **three concrete alert rules**: `PrismAcceptedRevisionWorkPending`
+warns above one second (and for unknown or missing observations),
+`PrismAcceptedRevisionWorkPendingCritical` uses the provisional 307-second
+incident-duration floor, and `PrismRevisionWorkBuildTimeouts` warns on a
+five-minute increase. All have zero additional dwell. The one-second warning
+is a budget target; 307 seconds is not evidence of early detection. Scrape and
+evaluation intervals still add delay. Thresholds must be measured in #291;
+this repository change neither applies the generated external patch nor
+claims operational deployment. Five historical definitions consolidate into
+these three native rules, with the two timeout severities sharing one warning.
+
+The required PostgreSQL/fake-node/socket tests are in
+`crates/qbit-prism-server/tests/landing_metrics.rs`; state ordering, saturation,
+unknown measurements and live cached-body overlays are in
+`crates/qbit-prism-server/src/metrics/landing/tests.rs`. The independent census
+is 51 run-role families, 214 startup series and 312 populated series on this
+base, with exactly these four new families relative to #450.
 
 ## Diagnosing Stratum admission saturation
 

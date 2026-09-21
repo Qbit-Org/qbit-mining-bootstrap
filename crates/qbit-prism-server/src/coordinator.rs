@@ -869,6 +869,8 @@ impl Coordinator {
             false
         };
         let mut observations = Vec::with_capacity(blocks.len());
+        let mut landing_targets = Vec::new();
+        let mut mature_height = 0;
         for block in blocks {
             ensure!(
                 block.maturity_state != "mature" || block.height <= tip_height,
@@ -893,6 +895,16 @@ impl Coordinator {
                     }
                 }
             };
+            if active && block.maturity_state == "mature" {
+                mature_height = mature_height.max(block.height);
+            }
+            if active && block.maturity_state != "mature" {
+                landing_targets.push((
+                    block.block_hash.clone(),
+                    block.height,
+                    block.chain_state == "confirmed",
+                ));
+            }
             observations.push(BlockObservation {
                 block_hash: block.block_hash,
                 active,
@@ -903,12 +915,20 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
+        for (hash, height, confirmed) in &landing_targets {
+            if *confirmed {
+                self.metrics.accepted_landed_block(hash, *height);
+            } else {
+                self.metrics.accepted_block(hash, *height);
+            }
+        }
         // Reconciliation and settlement both count the block's durable first
         // confirmation, regardless of the outbox state at that moment.
         let first_confirmations = self
             .work_ledger
             .reconcile(&observations, tip_height, revision)
             .await?;
+        self.metrics.revision_work_matured(mature_height);
         self.blocks
             .fetch_add(first_confirmations, Ordering::Relaxed);
         *cache = Some(ChainCache {
@@ -923,6 +943,15 @@ impl Coordinator {
     }
 
     pub async fn refresh_once(&self) -> Result<()> {
+        let observation = self.metrics.revision_work_refresh();
+        let result = self.refresh_once_inner().await;
+        if result.is_ok() {
+            observation.succeeded();
+        }
+        result
+    }
+
+    async fn refresh_once_inner(&self) -> Result<()> {
         let mut refresh = self.refresh_lock.lock().await;
         let RefreshState {
             observation,
@@ -996,6 +1025,7 @@ impl Coordinator {
             .refresh_probe(crate::ledger::ReadAdmission::default())
             .await?;
         let state = probe.payout_state;
+        self.metrics.revision_work_observed(state.payout_revision);
         let share_seq = probe.accepted_share_seq;
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
@@ -1374,6 +1404,10 @@ impl Coordinator {
         );
         self.ready_tip(&tip).await?;
         let active = at_height.as_deref() == Some(claim.candidate.block_hash.as_str());
+        if active {
+            self.metrics
+                .accepted_block(&claim.candidate.block_hash, height);
+        }
         Ok(CandidateObservation {
             active,
             revision,
@@ -1995,6 +2029,10 @@ impl Coordinator {
         // sample is ever emitted for a call that never began.
         self.observe_first_offer(claim, offered_at_ms);
         let (outcome, reply) = classify_offer(&result);
+        if outcome == OfferOutcome::Accepted {
+            self.metrics
+                .accepted_block(&candidate.block_hash, candidate.found_block.block_height);
+        }
         self.ledger
             .record_offer(claim, offered_at_ms, outcome, reply.as_deref())
             .await?;
@@ -2093,7 +2131,7 @@ impl Coordinator {
         // now, at a revision proven now, advances the shared payout state.
         let observation = self.observe_candidate(claim).await?;
         if observation.active {
-            let first_confirmation = self
+            let (first_confirmation, _) = self
                 .ledger
                 .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
                 .await?;

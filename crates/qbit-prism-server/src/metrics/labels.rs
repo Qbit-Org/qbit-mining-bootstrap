@@ -64,6 +64,9 @@ macro_rules! labels {
 
 labels!(AckResult { Accepted => "accepted", Rejected => "rejected" });
 labels!(Outcome { Success => "success", Failure => "failure" });
+labels!(RevisionWorkResult {
+    Published => "published", Degraded => "degraded", Superseded => "superseded"
+});
 labels!(LockKind { Migration => "migration", Order => "order", Settlement => "settlement" });
 labels!(Collector { Database => "database", Process => "process" });
 labels!(TaskKind {

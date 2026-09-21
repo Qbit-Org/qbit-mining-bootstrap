@@ -214,6 +214,27 @@
         "cause": "StaleJobCause"
       },
       "status": "Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id=\"stale-job\"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero."
+    },
+    "accepted_block_to_revision_work_seconds": {
+      "labels": {
+        "result": "RevisionWorkResult"
+      },
+      "replaces": [
+        "qbit_prism_accepted_block_preview_publication_seconds"
+      ],
+      "status": "Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds."
+    },
+    "accepted_block_revision_work_pending_seconds": {
+      "status": "Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown."
+    },
+    "accepted_block_revision_work_tracking_unknown": {
+      "status": "Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels."
+    },
+    "revision_work_build_timeouts_total": {
+      "replaces": [
+        "qbit_prism_accepted_parent_preview_wait_timeouts_total"
+      ],
+      "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced."
     }
   },
   "public": {

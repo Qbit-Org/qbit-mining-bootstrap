@@ -42,6 +42,8 @@ struct NodeState {
     replies: HashMap<String, Value>,
     pauses: HashMap<String, PauseRequest>,
     next_pause: u64,
+    accept_blocks: bool,
+    accepted: HashMap<u64, String>,
 }
 
 struct PauseRequest {
@@ -106,6 +108,8 @@ impl FakeNode {
             replies: HashMap::new(),
             pauses: HashMap::new(),
             next_pause: 0,
+            accept_blocks: false,
+            accepted: HashMap::new(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/", listener.local_addr()?);
@@ -124,6 +128,11 @@ impl FakeNode {
         state.tip_parent = parent.into();
         state.height = height;
         state.chainwork = chainwork.into();
+    }
+
+    /// Opt-in real offer-path fixture: null acceptance advances this fake chain.
+    pub fn accept_blocks(&self) {
+        self.state.lock().expect("fake node state").accept_blocks = true;
     }
 
     /// Exact response for deterministic template/large-transaction fixtures.
@@ -213,7 +222,18 @@ async fn answer(
                 "error":{"code":-8,"message":"Block height out of range"}
             }))
         }
-        "getblockhash" => json!(state.tip),
+        "getblockhash" => json!(state.accepted.get(&request["params"][0].as_u64().unwrap()).unwrap_or(&state.tip)),
+        "submitblock" if state.accept_blocks => {
+            let block = hex::decode(request["params"][0].as_str().unwrap()).unwrap();
+            let hash = qbit_prism_server::codec::hash_display(&qbit_prism_server::codec::double_sha256(&block[..80]));
+            state.tip_parent = state.tip.clone();
+            state.tip = hash.clone();
+            state.height += 1;
+            state.chainwork = format!("{:x}", u64::from_str_radix(&state.chainwork, 16).unwrap() + 1);
+            let height = state.height;
+            state.accepted.insert(height, hash);
+            Value::Null
+        }
         "getblockheader" => json!({"previousblockhash": state.tip_parent}),
         "validateaddress" => {
             json!({"isvalid":true,"scriptPubKey":format!("5220{}","11".repeat(32))})

@@ -18,6 +18,15 @@ pub struct PoolBlock {
     pub maturity_state: String,
 }
 
+/// Observation metadata from the existing reconciliation transaction, not
+/// another database observation. Maturity can add a second revision bump.
+#[derive(Default)]
+pub(super) struct ReconcileEffects {
+    first_confirmations: std::collections::HashSet<String>,
+    confirmed: std::collections::HashSet<String>,
+    revision_bumps: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct FanoutClaim {
     pub fanout_txid: String,
@@ -253,15 +262,16 @@ impl Ledger {
             .map(|_| ())
     }
 
-    /// Reports whether this committed settlement confirmed the block for the
-    /// first time. Reconciliation uses the same durable publication marker.
+    /// Reports first confirmation and the revision of this committed
+    /// settlement. Both describe the same transaction, including a no-op
+    /// confirmation or a reactivation; telemetry must not guess its revision.
     pub(crate) async fn finish_candidate_counted_at_revision(
         &self,
         claim: &CandidateClaim,
         submitted: bool,
         error: Option<&str>,
         expected_revision: i64,
-    ) -> Result<bool> {
+    ) -> Result<(bool, i64)> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
@@ -269,6 +279,7 @@ impl Ledger {
         require_revision(&mut tx, expected_revision).await?;
         let state = require_claim(&mut tx, claim).await?;
         let mut first_confirmation = false;
+        let mut committed_revision = expected_revision;
         if submitted {
             first_confirmation = sqlx::query_scalar::<_, bool>(
                 "SELECT audit_publication_sequence IS NULL FROM qbit_pool_blocks WHERE block_hash=$1 FOR UPDATE",
@@ -287,6 +298,7 @@ impl Ledger {
                 .await?;
             if changed > 0 {
                 bump_revision(&mut tx).await?;
+                committed_revision += 1;
             }
         } else {
             ensure!(
@@ -298,6 +310,7 @@ impl Ledger {
             ensure!(!mature, "cannot abandon a mature candidate");
             if deactivate_pool_block(&mut tx, &claim.candidate.block_hash).await? {
                 bump_revision(&mut tx).await?;
+                committed_revision += 1;
             }
         }
         // The terminal row is "no window": the six window columns, the block
@@ -309,8 +322,18 @@ impl Ledger {
         // offer.
         sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2"))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
+        // Shared by ordinary processing and operator recovery. Arm only at the
+        // actual COMMIT attempt, after all proven precommit failures are past.
+        let landing = self
+            .metrics
+            .as_ref()
+            .filter(|_| submitted)
+            .map(|metrics| metrics.revision_work_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
-        Ok(first_confirmation)
+        if let Some(landing) = landing {
+            landing.committed(first_confirmation, committed_revision);
+        }
+        Ok((first_confirmation, committed_revision))
     }
 
     /// The terminal orphan disposition (#415): settle an offered row this
@@ -395,7 +418,14 @@ impl Ledger {
         let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(ORPHANED_STATE).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(settled == 1, CandidateState::OFFERED_CLAIM_LOST);
+        let orphan = self
+            .metrics
+            .as_ref()
+            .map(|metrics| metrics.revision_work_orphan_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
+        if let Some(orphan) = orphan {
+            orphan.committed();
+        }
         Ok(())
     }
 
@@ -441,14 +471,38 @@ impl Ledger {
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_revision).await?;
-        let (fatal, first_confirmations) = self
+        let (fatal, effects) = self
             .reconcile_blocks_in(&mut tx, observations, tip_height)
             .await?;
+        // Only a COMMIT attempt can lose its outcome. Rejected revisions or
+        // rolled-back transactional work must not poison an observed target.
+        let landing: Vec<_> = self.metrics.as_ref().map_or_else(Vec::new, |metrics| {
+            observations
+                .iter()
+                .filter(|observation| effects.confirmed.contains(&observation.block_hash))
+                .map(|observation| {
+                    (
+                        &observation.block_hash,
+                        metrics.revision_work_settlement(&observation.block_hash),
+                    )
+                })
+                .collect()
+        });
         tx.commit().await?;
+        for (hash, observation) in landing {
+            let first = effects.first_confirmations.contains(hash);
+            // A fatal early return can commit a first confirmation before the
+            // usual revision bump. It proves no eligible post-landing revision:
+            // retain unknown instead of matching pre-existing work at this R.
+            if first && effects.revision_bumps == 0 {
+                continue;
+            }
+            observation.committed(first, expected_revision + effects.revision_bumps);
+        }
         if let Some(message) = fatal {
             bail!(message);
         }
-        Ok(first_confirmations)
+        Ok(effects.first_confirmations.len() as u64)
     }
 
     // The caller owns settlement/order locks and decides whether a fatal result
@@ -458,9 +512,9 @@ impl Ledger {
         tx: &mut Transaction<'_, Postgres>,
         observations: &[BlockObservation],
         tip_height: u64,
-    ) -> Result<(Option<String>, u64)> {
+    ) -> Result<(Option<String>, ReconcileEffects)> {
         let mut changed = false;
-        let mut first_confirmations = 0;
+        let mut effects = ReconcileEffects::default();
         let observed: std::collections::HashMap<&str, bool> = observations
             .iter()
             .map(|o| (o.block_hash.as_str(), o.active))
@@ -483,14 +537,14 @@ impl Ledger {
                     "mature pool block disconnected: {hash}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>"
                 );
                 sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut **tx).await?;
-                return Ok((Some(message), first_confirmations));
+                return Ok((Some(message), effects));
             }
             if active && state != "confirmed" {
                 if row
                     .try_get::<Option<i64>, _>("audit_publication_sequence")?
                     .is_none()
                 {
-                    first_confirmations += 1;
+                    effects.first_confirmations.insert(hash.clone());
                 }
                 sqlx::query(
                     "UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1",
@@ -508,9 +562,13 @@ impl Ledger {
                 // Immature here: a mature block returned the fatal above.
                 changed |= deactivate_pool_block(tx, &hash).await?;
             }
+            if active {
+                effects.confirmed.insert(hash);
+            }
         }
         if changed {
             bump_revision(tx).await?;
+            effects.revision_bumps += 1;
         }
         let matured: i32 = sqlx::query_scalar("SELECT qbit_mark_mature_pool_payouts($1)")
             .bind(i64::try_from(tip_height)?)
@@ -518,8 +576,9 @@ impl Ledger {
             .await?;
         if matured > 0 {
             bump_revision(tx).await?;
+            effects.revision_bumps += 1;
         }
-        Ok((None, first_confirmations))
+        Ok((None, effects))
     }
 
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
