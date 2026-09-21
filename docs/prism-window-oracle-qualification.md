@@ -129,8 +129,11 @@ and a count the bytes refute still raises with nothing published.
 **Attribution.** Every owner registers with its `kind` (`mirror`, `sequence`,
 `page`) and a bounded creation-site label, `module.function` of the first
 frame outside the constructor passthroughs (`json_records`, `advanced`,
-`from_full_items`, dataclass `__init__`/`replace`). Sites are capped at 64
-labels; overflow folds into `other`. The registry keeps insertion order, so
+`from_full_items`, dataclass `__init__`/`replace`). Admission is capped at 64
+labels ever seen, not labels concurrently live: a retired site keeps its
+admission, so an unseen label folds into `other` once the cap is reached and
+the series population Prometheus retains is bounded. The registry keeps
+insertion order, so
 each kind's oldest owner is its first entry. Exported beside the scalar
 family:
 

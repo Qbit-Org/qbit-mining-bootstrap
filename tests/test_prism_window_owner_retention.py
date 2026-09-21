@@ -360,22 +360,40 @@ class OwnershipAttributionTests(NoGCTestCase):
             self.assertNotIn("sequence", window_ownership_breakdown()["oldest_owner_age_seconds"])
             del first
 
-    def test_site_cap_folds_new_sites_into_other(self) -> None:
+    def test_site_cap_bounds_labels_ever_admitted_not_labels_live(self) -> None:
         class Owner:
             pass
 
-        owners = []
-        with mock.patch.object(ownership, "MAX_TRACKED_WINDOW_SITES", len(ownership._SITES) + 2):
-            for index in range(4):
-                owner = Owner()
-                ownership.track_window(owner, b"x" * (index + 1), kind="probe", site=f"probe-site-{index}")
-                owners.append(owner)
-            by_site = self.owners_by_site()
-            self.assertEqual(by_site[("probe", "probe-site-0")], 1)
-            self.assertEqual(by_site[("probe", "probe-site-1")], 1)
-            self.assertEqual(by_site[("probe", ownership.OTHER_WINDOW_SITE)], 2)
-            del owners[:], owner
-            self.assertFalse([key for key in self.owners_by_site() if key[0] == "probe"])
+        def track(index: int) -> Owner:
+            owner = Owner()
+            ownership.track_window(owner, b"x" * (index + 1), kind="probe", site=f"probe-site-{index}")
+            return owner
+
+        admitted = set(ownership._ADMITTED_SITES)
+        try:
+            with mock.patch.object(ownership, "MAX_TRACKED_WINDOW_SITES", len(admitted) + 2):
+                owners = [track(index) for index in range(4)]
+                by_site = self.owners_by_site()
+                self.assertEqual(by_site[("probe", "probe-site-0")], 1)
+                self.assertEqual(by_site[("probe", "probe-site-1")], 1)
+                self.assertEqual(by_site[("probe", ownership.OTHER_WINDOW_SITE)], 2)
+                # Retirement clears the live rows but not the admission: a
+                # retired label's slot is never handed to an unseen label,
+                # so the series population Prometheus keeps stays bounded.
+                del owners[:]
+                self.assertFalse([key for key in self.owners_by_site() if key[0] == "probe"])
+                owners = [track(index) for index in range(4, 8)]
+                by_site = self.owners_by_site()
+                self.assertEqual([key for key in by_site if key[0] == "probe"], [("probe", ownership.OTHER_WINDOW_SITE)])
+                self.assertEqual(by_site[("probe", ownership.OTHER_WINDOW_SITE)], 4)
+                # An admitted label keeps its own row when it recurs.
+                owners.append(track(0))
+                self.assertEqual(self.owners_by_site()[("probe", "probe-site-0")], 1)
+                del owners[:]
+        finally:
+            ownership._ADMITTED_SITES.difference_update(
+                key for key in tuple(ownership._ADMITTED_SITES) if key[0] == "probe"
+            )
 
     def test_breakdown_holds_no_owner_and_survives_retirement_reentry(self) -> None:
         class Owner:
@@ -383,6 +401,7 @@ class OwnershipAttributionTests(NoGCTestCase):
 
         owner = Owner()
         ownership.track_window(owner, b"bytes", kind="probe", site="reentry")
+        self.addCleanup(ownership._ADMITTED_SITES.discard, ("probe", "reentry"))
         reference = weakref.ref(owner)
         breakdown = window_ownership_breakdown()
         self.assertEqual(breakdown["owners"][("probe", "reentry")], 1)

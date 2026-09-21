@@ -19,7 +19,10 @@ from typing import Any
 
 MAX_TRACKED_WINDOW_OWNERS = 16384
 # Creation sites are function names, so the population is small and fixed
-# by the source; the cap only guards the export against a runaway label set.
+# by the source; the cap guards the export against a runaway label set. It
+# bounds the labels ever admitted, not the labels concurrently live: a site
+# admitted once stays admitted after its owners retire, so the series
+# population Prometheus retains can never exceed the cap plus ``other``.
 MAX_TRACKED_WINDOW_SITES = 64
 OTHER_WINDOW_SITE = "other"
 # Frames that construct an owner on the owner's behalf rather than on the
@@ -39,8 +42,10 @@ _OWNERS: dict[int, list[Any]] = {}
 _BUFFERS: dict[int, list[int]] = {}
 _COUNTS = dict(owners=0, canonical_buffers=0, canonical_bytes=0,
                page_records=0, parsed_records=0, observations_dropped_total=0)
-# (kind, site) -> [owners, parsed_records]
+# (kind, site) -> [owners, parsed_records] for sites with live owners.
 _SITES: dict[tuple[str, str], list[int]] = {}
+# Every (kind, site) label ever admitted to the export; never shrinks.
+_ADMITTED_SITES: set[tuple[str, str]] = set()
 # Seam for deterministic ages in render-parity tests.
 _clock = time.monotonic
 
@@ -92,14 +97,14 @@ def track_window(owner: Any, data: bytes, *, kind: str, records: int = 0,
         if len(_OWNERS) >= MAX_TRACKED_WINDOW_OWNERS:
             _COUNTS["observations_dropped_total"] += 1
             return
+        if (kind, site) not in _ADMITTED_SITES:
+            if len(_ADMITTED_SITES) >= MAX_TRACKED_WINDOW_SITES:
+                site = OTHER_WINDOW_SITE
+            _ADMITTED_SITES.add((kind, site))
         site_entry = _SITES.get((kind, site))
         if site_entry is None:
-            if len(_SITES) >= MAX_TRACKED_WINDOW_SITES:
-                site = OTHER_WINDOW_SITE
-                site_entry = _SITES.get((kind, site))
-            if site_entry is None:
-                site_entry = [0, 0]
-                _SITES[(kind, site)] = site_entry
+            site_entry = [0, 0]
+            _SITES[(kind, site)] = site_entry
         _OWNERS[key] = [weakref.ref(owner, retired), buffer_key, kind, records, 0,
                         site, _clock()]
         buffer = _BUFFERS.get(buffer_key)
