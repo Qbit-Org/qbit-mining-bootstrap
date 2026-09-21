@@ -9,8 +9,9 @@ and the consumers that force a parse (durable candidate intent, audit compact
 walks). GC stays enabled and is never forced.
 
 After every cycle the weak ownership registry is read. The run fails if
-owners, distinct canonical buffers or parsed records do not plateau within
-the declared bound, and it prints the kind, creation site, age and referrer
+owners or distinct canonical buffers exceed the declared bound, or if any
+parsed records remain live once the cycle's synchronous consumers returned,
+and it prints the kind, creation site, age and referrer
 chain of every owner that outlives its mirror by more than ``--grace``
 cycles, so a holder is attributable offline without a heap census in
 production. This is a local replay, not production qualification: it has no
@@ -53,6 +54,9 @@ from tests.test_prism_candidate_codec import intent_for  # noqa: E402
 # (retention + prune interval) / cycle pacing, plus slack for the in-flight
 # bundle and the armed artifact.
 LIVE_OWNERS = 3
+# Parsed rows may live only inside a consumer; none is in flight between
+# cycles, so the bound after each cycle is exactly zero.
+PARSED_RECORDS_BOUND = 0
 
 
 def declared_bounds(retention_seconds: float, cycle_seconds: float) -> tuple[int, int]:
@@ -224,6 +228,11 @@ def run(cycles: int, clients: int, grace: int, report: int, *,
                 peak[name] = max(peak[name], counts[name])
             if counts["owners"] > owner_bound or counts["canonical_buffers"] > buffer_bound:
                 failures.append(f"cycle {cycle}: owners={counts['owners']} buffers={counts['canonical_buffers']} exceed the declared bound")
+            if counts["parsed_records"] != PARSED_RECORDS_BOUND:
+                # Every parse-forcing consumer in this workload is synchronous
+                # and finished before this read, so any live parsed rows are
+                # a retained holder, whatever the owner count says.
+                failures.append(f"cycle {cycle}: parsed_records={counts['parsed_records']} remain live after every consumer returned")
             if cycle % report == 0 or cycle == cycles - 1:
                 breakdown = window_ownership.window_ownership_breakdown()
                 oldest = {kind: round(age, 1) for kind, age in breakdown["oldest_owner_age_seconds"].items()}
