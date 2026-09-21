@@ -399,6 +399,17 @@ impl Coordinator {
         readiness_epoch: u64,
         expires_at_ms: Option<i64>,
     ) -> Result<Option<IssuanceAuthority>> {
+        self.begin_issuance_authority_at(identity, readiness_epoch, expires_at_ms, None)
+            .await
+    }
+
+    pub(super) async fn begin_issuance_authority_at(
+        &self,
+        identity: PreparedIdentity,
+        readiness_epoch: u64,
+        expires_at_ms: Option<i64>,
+        boundary: Option<revision_observer::Boundary>,
+    ) -> Result<Option<IssuanceAuthority>> {
         let view = self.authority_view().await;
         ensure!(
             view.readiness.generation == readiness_epoch,
@@ -415,7 +426,7 @@ impl Coordinator {
             expires_at_ms,
         };
         Ok(self
-            .revalidate_issuance_authority(&mut proof, expires_at_ms)
+            .revalidate_issuance_authority_at(&mut proof, expires_at_ms, boundary)
             .await?
             .map(|_| proof))
     }
@@ -427,12 +438,27 @@ impl Coordinator {
         proof: &mut IssuanceAuthority,
         expires_at_ms: Option<i64>,
     ) -> Result<Option<i64>> {
+        self.revalidate_issuance_authority_at(proof, expires_at_ms, None)
+            .await
+    }
+
+    pub(super) async fn revalidate_issuance_authority_at(
+        &self,
+        proof: &mut IssuanceAuthority,
+        expires_at_ms: Option<i64>,
+        boundary: Option<revision_observer::Boundary>,
+    ) -> Result<Option<i64>> {
         let expires_at_ms = match (proof.expires_at_ms, expires_at_ms) {
             (Some(original), Some(next)) => Some(original.min(next)),
             (original, next) => original.or(next),
         };
         let Some(current) = self
-            .work_authority_in_epoch(&proof.identity, expires_at_ms, proof.readiness_epoch)
+            .work_authority_observing(
+                &proof.identity,
+                expires_at_ms,
+                proof.readiness_epoch,
+                boundary.map(|boundary| (boundary, &*proof)),
+            )
             .await?
         else {
             return Ok(None);
@@ -501,11 +527,23 @@ impl Coordinator {
             .map(|authority| authority.revision))
     }
 
+    #[cfg(test)]
     pub(super) async fn work_authority_in_epoch(
         &self,
         identity: &PreparedIdentity,
         expires_at_ms: Option<i64>,
         readiness_epoch: u64,
+    ) -> Result<Option<WorkAuthority>> {
+        self.work_authority_observing(identity, expires_at_ms, readiness_epoch, None)
+            .await
+    }
+
+    async fn work_authority_observing(
+        &self,
+        identity: &PreparedIdentity,
+        expires_at_ms: Option<i64>,
+        readiness_epoch: u64,
+        observation: Option<(revision_observer::Boundary, &IssuanceAuthority)>,
     ) -> Result<Option<WorkAuthority>> {
         let clock = if let Some(expires) = expires_at_ms {
             let requested_at = MonotonicInstant::now();
@@ -520,7 +558,18 @@ impl Coordinator {
         };
         // Preserve the existing database-first failure priority, even when a
         // later coherent lease proof will supply the transaction revision.
-        let revision = self.work_ledger.payout_revision().await?;
+        let revision = if let Some((boundary, proof)) = observation {
+            self.revision_observer
+                .observe(
+                    boundary,
+                    proof.identity.clone(),
+                    proof.readiness_epoch,
+                    proof.published_tip.clone(),
+                )
+                .await?
+        } else {
+            self.work_ledger.payout_revision().await?
+        };
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
         let view = self.authority_view().await;

@@ -43,6 +43,9 @@ pub(crate) struct Gate {
 #[derive(Default)]
 pub(crate) struct MemoryLedger {
     pub revision: AtomicI64,
+    pub revision_calls: AtomicUsize,
+    pub revision_canceled: AtomicUsize,
+    pub clock_calls: AtomicUsize,
     pub chain_epoch: AtomicI64,
     pub records: StdMutex<Vec<(AcceptedShare, Option<Candidate>, i64)>>,
     pub revision_gate: StdMutex<Option<Arc<Gate>>>,
@@ -332,6 +335,7 @@ impl Fixture {
             submit_ledger: store.clone(),
             work_ledger: store.clone(),
             issued_batcher: issued_batcher::IssuedBatcher::without_dwell_for_tests(store.clone()),
+            revision_observer: revision_observer::RevisionObserver::new(store.clone()),
             prepared: Arc::new(RwLock::new(None)),
             refresh,
             wake: Notify::new(),

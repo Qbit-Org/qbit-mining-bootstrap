@@ -116,7 +116,13 @@ impl work_ledger::WorkLedger for MemoryLedger {
         self.compact.drop_probe.lock().unwrap().take()
     }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
-        submit_ledger::SubmitLedger::payout_revision(self)
+        self.revision_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let mut probe = CancelProbe(&self.revision_canceled, false);
+            let result = submit_ledger::SubmitLedger::payout_revision(self).await;
+            probe.1 = true;
+            result
+        })
     }
     fn chain_observation_state(
         &self,
@@ -775,6 +781,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
         })
     }
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>> {
+        self.clock_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             let gate = self.compact.clock_gate.lock().unwrap().take();
             if let Some(gate) = gate {

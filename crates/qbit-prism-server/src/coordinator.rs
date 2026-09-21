@@ -39,6 +39,7 @@ mod miner_submit;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
+mod revision_observer;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
@@ -231,6 +232,7 @@ pub struct Coordinator {
     submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     issued_batcher: issued_batcher::IssuedBatcher,
+    revision_observer: revision_observer::RevisionObserver,
     pub last_error: RwLock<Option<String>>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
@@ -735,6 +737,7 @@ impl Coordinator {
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
             issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
+            revision_observer: revision_observer::RevisionObserver::new(ledger.clone()),
             ledger,
             rpc,
             refresh,
@@ -2435,10 +2438,11 @@ impl MiningBackend for Coordinator {
                 .context("no current template")?;
             drop(initial);
             let mut issuance_authority = self
-                .begin_issuance_authority(
+                .begin_issuance_authority_at(
                     tip_observation::PreparedIdentity::of(&prepared),
                     readiness_epoch,
                     None,
+                    Some(revision_observer::Boundary::BuildEntry),
                 )
                 .await?
                 .context("payout snapshot stale")?;
@@ -2462,9 +2466,13 @@ impl MiningBackend for Coordinator {
             let mut wire = base.reassign(id, extranonce1, difficulty, minimum_difficulty)?;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
-            self.revalidate_issuance_authority(&mut issuance_authority, None)
-                .await?
-                .context("payout snapshot stale")?;
+            self.revalidate_issuance_authority_at(
+                &mut issuance_authority,
+                None,
+                Some(revision_observer::Boundary::PostMaterialization),
+            )
+            .await?
+            .context("payout snapshot stale")?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {

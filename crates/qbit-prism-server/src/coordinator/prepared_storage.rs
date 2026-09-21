@@ -120,7 +120,9 @@ impl Coordinator {
         issued: &mut IssuedPersistence<'_>,
         repair: Option<&CompactRepair>,
     ) -> Result<IssuedJobSave> {
-        let revision = self.revalidate_issued(issued).await?;
+        let revision = self
+            .revalidate_issued(issued, revision_observer::Boundary::PrePersistence)
+            .await?;
         let prepared = &issued.job.context.prepared;
         let saved = if repair.is_none() {
             self.issued_batcher
@@ -150,14 +152,23 @@ impl Coordinator {
         if saved == IssuedJobSave::Saved {
             // A transaction may leave an immutable row after revocation, but
             // that row must never be delivered with the old admission proof.
-            self.revalidate_issued(issued).await?;
+            self.revalidate_issued(issued, revision_observer::Boundary::PostPersistence)
+                .await?;
         }
         Ok(saved)
     }
 
-    async fn revalidate_issued(&self, issued: &mut IssuedPersistence<'_>) -> Result<i64> {
+    async fn revalidate_issued(
+        &self,
+        issued: &mut IssuedPersistence<'_>,
+        boundary: revision_observer::Boundary,
+    ) -> Result<i64> {
         let revision = self
-            .revalidate_issuance_authority(&mut issued.authority, Some(issued.expires_at_ms))
+            .revalidate_issuance_authority_at(
+                &mut issued.authority,
+                Some(issued.expires_at_ms),
+                Some(boundary),
+            )
             .await?
             .context("payout snapshot stale")?;
         // No later database clock read or repair retry renews this deadline.

@@ -116,6 +116,7 @@
     "coordinator.rs::connect#1::fetch_one(& ledger . pool)": [2,"startup"],
     "coordinator.rs::with_candidate_heartbeat#1::self . ledger .acquire()": [2,"ledger"],
     "coordinator/issued_batcher.rs::with_dwell#1::run(ledger , receiver , shutdown . clone ( ) , dwell)": [1,"non-database"],
+    "coordinator/revision_observer.rs::new#1::run(ledger . clone ( ) , receiver)": [1,"non-database"],
     "coordinator/miner_submit.rs::persist_block_only#1::self . ledger .acquire()": [2,"ledger"],
     "coordinator/refresh_window.rs::capture_refresh_window#1::prepare(std :: mem :: take ( & mut snapshot . prior_balances ) , & admission ,)": [1,"non-database"],
     "coordinator/work_ledger.rs::now_ms#1::self .acquire()": [1,"ledger"],
