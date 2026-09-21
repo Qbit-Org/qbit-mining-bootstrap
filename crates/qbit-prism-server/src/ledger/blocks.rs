@@ -23,6 +23,7 @@ pub struct PoolBlock {
 #[derive(Default)]
 pub(super) struct ReconcileEffects {
     first_confirmations: std::collections::HashSet<String>,
+    confirmed: std::collections::HashSet<String>,
     revision_bumps: i64,
 }
 
@@ -321,7 +322,17 @@ impl Ledger {
         // offer.
         sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2"))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
+        // Shared by ordinary processing and operator recovery. Arm only at the
+        // actual COMMIT attempt, after all proven precommit failures are past.
+        let landing = self
+            .metrics
+            .as_ref()
+            .filter(|_| submitted)
+            .map(|metrics| metrics.revision_work_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
+        if let Some(landing) = landing {
+            landing.committed(first_confirmation, committed_revision);
+        }
         Ok((first_confirmation, committed_revision))
     }
 
@@ -448,18 +459,6 @@ impl Ledger {
         tip_height: u64,
         expected_revision: i64,
     ) -> Result<u64> {
-        let landing: Vec<_> = self.metrics.as_ref().map_or_else(Vec::new, |metrics| {
-            observations
-                .iter()
-                .filter(|observation| observation.active)
-                .map(|observation| {
-                    (
-                        &observation.block_hash,
-                        metrics.revision_work_settlement(&observation.block_hash),
-                    )
-                })
-                .collect()
-        });
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
@@ -468,15 +467,33 @@ impl Ledger {
         let (fatal, effects) = self
             .reconcile_blocks_in(&mut tx, observations, tip_height)
             .await?;
+        // Only a COMMIT attempt can lose its outcome. Rejected revisions or
+        // rolled-back transactional work must not poison an observed target.
+        let landing: Vec<_> = self.metrics.as_ref().map_or_else(Vec::new, |metrics| {
+            observations
+                .iter()
+                .filter(|observation| effects.confirmed.contains(&observation.block_hash))
+                .map(|observation| {
+                    (
+                        &observation.block_hash,
+                        metrics.revision_work_settlement(&observation.block_hash),
+                    )
+                })
+                .collect()
+        });
         tx.commit().await?;
+        for (hash, observation) in landing {
+            let first = effects.first_confirmations.contains(hash);
+            // A fatal early return can commit a first confirmation before the
+            // usual revision bump. It proves no eligible post-landing revision:
+            // retain unknown instead of matching pre-existing work at this R.
+            if first && effects.revision_bumps == 0 {
+                continue;
+            }
+            observation.committed(first, expected_revision + effects.revision_bumps);
+        }
         if let Some(message) = fatal {
             bail!(message);
-        }
-        for (hash, observation) in landing {
-            observation.committed(
-                effects.first_confirmations.contains(hash),
-                expected_revision + effects.revision_bumps,
-            );
         }
         Ok(effects.first_confirmations.len() as u64)
     }
@@ -537,6 +554,9 @@ impl Ledger {
             } else if !active && state == "confirmed" {
                 // Immature here: a mature block returned the fatal above.
                 changed |= deactivate_pool_block(tx, &hash).await?;
+            }
+            if active {
+                effects.confirmed.insert(hash);
             }
         }
         if changed {

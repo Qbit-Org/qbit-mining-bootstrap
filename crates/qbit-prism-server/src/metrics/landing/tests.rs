@@ -275,3 +275,17 @@ async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmatio
         assert_eq!(count(&m, "published"), f64::from(first));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn first_confirmation_wins_even_when_its_observer_started_second() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    let reconciliation = m.revision_work_settlement(&hash);
+    m.revision_work_settlement(&hash).committed(true, 7);
+    drop(reconciliation);
+    tick().await;
+    m.revision_work_delivered(7);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(count(&m, "published"), 1.);
+}

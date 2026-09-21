@@ -336,7 +336,9 @@ pub(crate) struct Settlement<'a> {
 }
 impl Settlement<'_> {
     pub(crate) fn committed(mut self, first: bool, revision: i64) {
-        if self.owns {
+        // Arrival order is not commit order: a competing transaction can
+        // prove the first confirmation while the owning observer is delayed.
+        if self.owns || first {
             self.metrics.bind_landing(self.hash, revision, true, first);
         } else {
             self.metrics.revision_work_observed(revision);

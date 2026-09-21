@@ -2114,12 +2114,10 @@ impl Coordinator {
         // now, at a revision proven now, advances the shared payout state.
         let observation = self.observe_candidate(claim).await?;
         if observation.active {
-            let settlement = self.metrics.revision_work_settlement(block);
-            let (first_confirmation, landed_revision) = self
+            let (first_confirmation, _) = self
                 .ledger
                 .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
                 .await?;
-            settlement.committed(first_confirmation, landed_revision);
             self.blocks
                 .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
             self.wake.notify_one();

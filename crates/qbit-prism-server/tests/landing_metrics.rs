@@ -21,6 +21,115 @@ use support::{
 const PENDING: &str = "qbit_prism_accepted_block_revision_work_pending_seconds";
 const TIMEOUTS: &str = "qbit_prism_revision_work_build_timeouts_total";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_fatal_reconcile_preserves_processed_peer_revision() -> Result<()> {
+    run(gate::site!(), |f| Box::pin(async move {
+        f.refresh(true).await?;
+        land(f).await?;
+        f.a.refresh_once().await?;
+        let disconnected = land(f).await?;
+        let height: i64 = sqlx::query_scalar("SELECT block_height FROM qbit_pool_blocks WHERE block_hash=$1")
+            .bind(&disconnected).fetch_one(f.pool()).await?;
+        sqlx::query("UPDATE qbit_pool_blocks SET maturity_state='mature',matured_at=clock_timestamp() WHERE block_hash=$1")
+            .bind(&disconnected).execute(f.pool()).await?;
+        let replacement = "77".repeat(32);
+        f.node.set_tip(&replacement, &"88".repeat(32), height as u64, "ffff");
+        f.node.set_reply("getblockhash", serde_json::json!([height]), serde_json::json!(replacement));
+        let revision = f.b.ledger.payout_revision().await?;
+        let error = f.b.reconcile(&replacement, height as u64, revision).await.unwrap_err();
+        ensure!(format!("{error:#}").contains("mature pool block disconnected"));
+        let fatal: Option<String> = sqlx::query_scalar("SELECT fatal_error FROM qbit_prism_cluster WHERE singleton")
+            .fetch_one(f.pool()).await?;
+        ensure!(fatal.is_some(), "fatal transaction did not commit");
+        ensure!(sample(&f.b.metrics, PENDING) > 0., "postcommit fatal discarded a processed peer target");
+        ensure!(count(&f.b.metrics, "published") == 0.);
+        ensure!(sample(&f.b.metrics, TIMEOUTS) == 0.);
+        Ok(())
+    })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_reconcile_before_commit_does_not_poison_peer_landing() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let stale_revision = f.b.ledger.payout_revision().await?;
+            let hash = land(f).await?;
+            let height: i64 =
+                sqlx::query_scalar("SELECT block_height FROM qbit_pool_blocks WHERE block_hash=$1")
+                    .bind(&hash)
+                    .fetch_one(f.pool())
+                    .await?;
+            // A peer confirmed after this frontend read its revision, before
+            // its coherent active-chain proof reaches revision validation.
+            let error = f.b.reconcile(&hash, height as u64, stale_revision).await;
+            ensure!(
+                error.is_err(),
+                "stale reconciliation unexpectedly committed"
+            );
+            ensure!(
+                sample(&f.b.metrics, PENDING) > 0.,
+                "refused transaction invented a lost commit"
+            );
+            f.b.refresh_once().await?;
+            deliver(&f.b).await?;
+            ensure!(sample(&f.b.metrics, PENDING) == 0.);
+            ensure!(count(&f.b.metrics, "published") == 1.);
+            ensure!(sample(&f.b.metrics, TIMEOUTS) == 0.);
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_recovery_binds_first_confirmation_until_real_delivery() -> Result<()> {
+    run(gate::site!(), |f| Box::pin(async move {
+        f.refresh(true).await?;
+        f.node.accept_blocks();
+        let claim = queue_block(&f.a).await?;
+        let hash = claim.candidate.block_hash.clone();
+        sqlx::raw_sql("CREATE FUNCTION landing_insert_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_pool_blocks INSERT'; RETURN NEW; END $$; CREATE TRIGGER landing_insert_marker AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION landing_insert_marker();")
+            .execute(f.pool()).await?;
+        let reply = f.proxy.pause_after_commit("qbit_pool_blocks", "INSERT")?;
+        let frontend = f.a.clone();
+        let owned_claim = claim.clone();
+        let processing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            frontend.process_candidate(&owned_claim).await
+        }));
+        timeout(Duration::from_secs(5), reply.entered()).await?;
+        processing.abort();
+        ensure!(processing.await.unwrap_err().is_cancelled());
+        reply.release();
+        ensure!(f.a.ledger.release_recovery_claim(&claim, "interrupted before confirmation").await?);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let qbit_prism_server::ledger::RecoveryClaim::Claimed(recovery) =
+            f.a.claim_candidate_for_recovery(&hash, deadline).await? else {
+                anyhow::bail!("operator recovery claim refused")
+            };
+        let parent: Vec<_> = recovery.candidate.block_bytes[4..36].iter().rev().copied().collect();
+        f.node.set_reply("getblockheader", serde_json::json!([hash]), serde_json::json!({
+            "height": recovery.candidate.found_block.block_height,
+            "previousblockhash": hex::encode(parent),
+        }));
+        let stale_revision = f.a.ledger.payout_revision().await? - 1;
+        ensure!(f.a.ledger.finish_candidate_at_revision(&recovery, true, None, stale_revision).await.is_err());
+        ensure!(sample(&f.a.metrics, PENDING) > 0., "refused settlement invented an unknown commit");
+        f.a.recover_candidate(&recovery, deadline).await?;
+        ensure!(count(&f.a.metrics, "published") == 0., "recovery completion is not delivery");
+        ensure!(sample(&f.a.metrics, PENDING) > 0.);
+        f.a.refresh_once().await?;
+        deliver(&f.a).await?;
+        ensure!(sample(&f.a.metrics, PENDING) == 0., "recovery discarded its confirmation revision");
+        ensure!(count(&f.a.metrics, "published") == 1.);
+        ensure!(sample(&f.a.metrics, TIMEOUTS) == 0.);
+        f.a.refresh_once().await?;
+        deliver(&f.a).await?;
+        ensure!(count(&f.a.metrics, "published") == 1.);
+        Ok(())
+    })).await
+}
+
 fn sample(metrics: &Metrics, name: &str) -> f64 {
     metrics
         .render()
