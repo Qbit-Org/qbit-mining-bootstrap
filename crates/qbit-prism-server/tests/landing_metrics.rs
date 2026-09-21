@@ -40,7 +40,6 @@ async fn cancelled_and_failed_terminal_collection_preserves_wait_until_durable_r
             sqlx::query("LOCK TABLE qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE")
                 .execute(&mut *blocker)
                 .await?;
-            let mark = f.proxy.mark();
             let pool = f.a.ledger.pool.clone();
             let metrics = f.a.metrics.clone();
             let collection = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {

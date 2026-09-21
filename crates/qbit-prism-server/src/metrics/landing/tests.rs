@@ -390,9 +390,10 @@ async fn uncertain_orphan_cannot_be_rebound_or_delivered_without_terminal_proof(
     m.accepted_block(&hash, 1);
     m.landed_block(&hash, 7);
     tick().await;
-    let orphan = m.revision_work_orphan_settlement(&hash);
-    assert_eq!(age(&m), -1.);
-    drop(orphan); // Lost/cancelled COMMIT acknowledgement.
+    {
+        let _orphan = m.revision_work_orphan_settlement(&hash);
+        assert_eq!(age(&m), -1.);
+    } // Lost/cancelled COMMIT acknowledgement.
     m.landed_block(&hash, 8);
     m.revision_work_delivered(8);
     m.revision_work_terminal_probe().succeeded(&[]);
