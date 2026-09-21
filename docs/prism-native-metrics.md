@@ -354,7 +354,24 @@ A successfully committed proven orphan closes its delivery wait without a
 histogram sample: it has no eligible delivery target. Its identity remains a
 deduplication tombstone through the same mature watermark, including if later
 chain reconciliation reactivates it; this does not change payout credit or
-block-confirmation counting. A lost orphan commit reply is not guessed.
+block-confirmation counting. The shared ledger observer arms uncertainty only
+at the existing orphan COMMIT boundary, so a rejected precommit verdict leaves
+the measured wait intact. An in-flight, lost or cancelled orphan COMMIT cannot
+be relabeled as successful delivery or upgraded by a later revision proof.
+
+Each frontend discovers peer-settled orphans through the existing ten-second
+metrics collector cadence. One extra read-only lookup checks at most 4,096
+locally unresolved hashes against the terminal outbox state; it is skipped
+when that set is empty and shares the existing three-second total collection
+deadline and read-only snapshot. No background loop, accounting lock, schema,
+write, or work-publication dependency is added. Positive durable orphan
+evidence closes only a still-tracked identity, even if its original COMMIT
+reply was lost; negative evidence never guesses the original outcome.
+A failed or cancelled terminal read preserves pending state and exposes
+tracking uncertainty, and an older completion cannot erase a newer failure.
+Before the next successful collection, the accepting frontend still reports
+its locally known wait; this is a local knowledge boundary, not the peer's
+orphan commit time.
 
 A failed or cancelled refresh preserves known pending age. If no unresolved
 acceptance is known, that failed observation yields -1 rather than a fabricated

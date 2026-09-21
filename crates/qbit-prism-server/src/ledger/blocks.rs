@@ -418,7 +418,14 @@ impl Ledger {
         let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(ORPHANED_STATE).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(settled == 1, CandidateState::OFFERED_CLAIM_LOST);
+        let orphan = self
+            .metrics
+            .as_ref()
+            .map(|metrics| metrics.revision_work_orphan_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
+        if let Some(orphan) = orphan {
+            orphan.committed();
+        }
         Ok(())
     }
 

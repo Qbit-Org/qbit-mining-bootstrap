@@ -21,6 +21,274 @@ use support::{
 const PENDING: &str = "qbit_prism_accepted_block_revision_work_pending_seconds";
 const TIMEOUTS: &str = "qbit_prism_revision_work_build_timeouts_total";
 
+const UNKNOWN: &str = "qbit_prism_accepted_block_revision_work_tracking_unknown";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_and_failed_terminal_collection_preserves_wait_until_durable_read() -> Result<()>
+{
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let hash = offered_without_active_proof(f).await?;
+            let claim =
+                f.b.ledger
+                    .claim_candidate(60)
+                    .await?
+                    .context("peer orphan claim")?;
+            f.b.process_candidate(&claim).await?;
+            durable_orphan(f, &hash).await?;
+            let mut blocker = f.b.ledger.pool.begin().await?;
+            sqlx::query("LOCK TABLE qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker)
+                .await?;
+            let mark = f.proxy.mark();
+            let pool = f.a.ledger.pool.clone();
+            let metrics = f.a.metrics.clone();
+            let collection = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                qbit_prism_server::metrics::collectors::database(&pool, &metrics).await
+            }));
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    // PostgreSQL may wait for the relation lock during Parse,
+                // before the wire proxy can observe an Execute record.
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%SELECT count(*)%' AND pid<>pg_backend_pid())")
+                    .fetch_one(f.pool()).await?;
+                if waiting {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            collection.abort();
+            ensure!(matches!(collection.await, Err(error) if error.is_cancelled()));
+            blocker.rollback().await?;
+            ensure!(
+                sample(&f.a.metrics, PENDING) > 0.,
+                "cancelled read fabricated empty state"
+            );
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            let closed = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy_with(f.pool().connect_options().as_ref().clone());
+            closed.close().await;
+            ensure!(
+                qbit_prism_server::metrics::collectors::database(&closed, &f.a.metrics)
+                    .await
+                    .is_err()
+            );
+            ensure!(sample(&f.a.metrics, PENDING) > 0.);
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            no_delivery(&f.a.metrics)?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+async fn offered_without_active_proof(f: &Fixture) -> Result<String> {
+    f.refresh(true).await?;
+    let claim = queue_block(&f.a).await?;
+    let hash = claim.candidate.block_hash.clone();
+    // A definitive null reply can accept a side-chain block. No active proof
+    // is fabricated: the fake node still reports the original tip.
+    f.node.set_reply(
+        "submitblock",
+        serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+        serde_json::Value::Null,
+    );
+    f.a.process_candidate(&claim).await?;
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+    ensure!(state == "reconciliation");
+    ensure!(sample(&f.a.metrics, PENDING) > 0.);
+    ensure!(sample(&f.b.metrics, PENDING) == 0.);
+    // A successful read without terminal evidence must preserve the wait.
+    qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+    ensure!(sample(&f.a.metrics, PENDING) > 0.);
+    let height = claim.candidate.found_block.block_height;
+    let competitor = "66".repeat(32);
+    f.node
+        .set_tip(&competitor, &"77".repeat(32), height + 5, "9999");
+    f.node.set_reply(
+        "getblockhash",
+        serde_json::json!([height]),
+        serde_json::json!(competitor),
+    );
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+        .bind(&hash).execute(f.pool()).await?;
+    Ok(hash)
+}
+
+async fn orphan_marker(f: &Fixture) -> Result<()> {
+    sqlx::raw_sql("CREATE FUNCTION orphan_reply_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_block_candidate_outbox UPDATE'; RETURN NEW; END $$; CREATE TRIGGER orphan_reply_marker AFTER UPDATE ON qbit_block_candidate_outbox FOR EACH ROW WHEN (NEW.state='orphaned' AND OLD.state<>'orphaned') EXECUTE FUNCTION orphan_reply_marker();")
+        .execute(f.pool()).await?;
+    Ok(())
+}
+
+async fn durable_orphan(f: &Fixture, hash: &str) -> Result<()> {
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(hash)
+            .fetch_one(f.pool())
+            .await?;
+    ensure!(state == "orphaned", "orphan did not commit: {state}");
+    ensure!(
+        f.b.ledger.claim_candidate(60).await?.is_none(),
+        "terminal outbox was retried"
+    );
+    Ok(())
+}
+
+fn no_delivery(metrics: &Metrics) -> Result<()> {
+    for result in ["published", "degraded", "superseded"] {
+        ensure!(
+            count(metrics, result) == 0.,
+            "orphan invented {result} delivery"
+        );
+    }
+    ensure!(sample(metrics, TIMEOUTS) == 0.);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_orphan_evidence_closes_the_accepting_frontend_without_delivery() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let hash = offered_without_active_proof(f).await?;
+            let claim =
+                f.b.ledger
+                    .claim_candidate(60)
+                    .await?
+                    .context("peer orphan claim")?;
+            f.b.process_candidate(&claim).await?;
+            durable_orphan(f, &hash).await?;
+            ensure!(
+                sample(&f.a.metrics, PENDING) > 0.,
+                "peer invented local knowledge"
+            );
+            for _ in 0..2 {
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+                ensure!(
+                    sample(&f.a.metrics, PENDING) == 0.,
+                    "peer terminal evidence left a permanent wait"
+                );
+                ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+                no_delivery(&f.a.metrics)?;
+                no_delivery(&f.b.metrics)?;
+            }
+            // Later genuine active-chain proof may still credit the block, but
+            // the retired local acceptance must never reopen or emit a sample.
+            let height = claim.candidate.found_block.block_height;
+            f.node.set_tip(&"88".repeat(32), &hash, height + 6, "ffff");
+            f.node.set_reply(
+                "getblockhash",
+                serde_json::json!([height]),
+                serde_json::json!(hash),
+            );
+            f.a.refresh_once().await?;
+            deliver(&f.a).await?;
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            no_delivery(&f.a.metrics)?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_orphan_commit_reply_is_unknown_until_terminal_evidence() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let hash = offered_without_active_proof(f).await?;
+            let claim =
+                f.a.ledger
+                    .claim_candidate(60)
+                    .await?
+                    .context("orphan claim")?;
+            let revision = f.a.ledger.payout_revision().await?;
+            ensure!(f
+                .a
+                .ledger
+                .orphan_candidate_at_revision(&claim, "stale proof", revision - 1)
+                .await
+                .is_err());
+            ensure!(sample(&f.a.metrics, PENDING) > 0.);
+            ensure!(
+                sample(&f.a.metrics, UNKNOWN) == 0.,
+                "precommit rejection invented uncertainty"
+            );
+            orphan_marker(f).await?;
+            f.proxy.plan(support::execution::Fault {
+                table: "qbit_block_candidate_outbox".into(),
+                op: "UPDATE".into(),
+                phase: support::execution::FaultPhase::AfterCommit,
+            });
+            ensure!(
+                timeout(Duration::from_secs(5), f.a.process_candidate(&claim))
+                    .await?
+                    .is_err()
+            );
+            ensure!(f.proxy.fired().is_some(), "lost-reply fault did not fire");
+            durable_orphan(f, &hash).await?;
+            ensure!(
+                sample(&f.a.metrics, PENDING) == -1.,
+                "lost orphan outcome remained a known wait"
+            );
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            no_delivery(&f.a.metrics)?;
+            qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            no_delivery(&f.a.metrics)?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_orphan_commit_reply_reconciles_without_reopening_tombstone() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let hash = offered_without_active_proof(f).await?;
+            let claim =
+                f.a.ledger
+                    .claim_candidate(60)
+                    .await?
+                    .context("orphan claim")?;
+            orphan_marker(f).await?;
+            let reply = f
+                .proxy
+                .pause_after_commit("qbit_block_candidate_outbox", "UPDATE")?;
+            let frontend = f.a.clone();
+            let processing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                frontend.process_candidate(&claim).await
+            }));
+            timeout(Duration::from_secs(5), reply.entered()).await?;
+            durable_orphan(f, &hash).await?;
+            processing.abort();
+            ensure!(processing.await.unwrap_err().is_cancelled());
+            ensure!(
+                sample(&f.a.metrics, PENDING) == -1.,
+                "cancelled orphan outcome remained a known wait"
+            );
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            reply.release();
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            no_delivery(&f.a.metrics)?;
+            Ok(())
+        })
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_fatal_reconcile_preserves_processed_peer_revision() -> Result<()> {
     run(gate::site!(), |f| Box::pin(async move {

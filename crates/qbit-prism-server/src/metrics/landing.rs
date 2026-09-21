@@ -19,6 +19,7 @@ struct Acceptance {
     degraded: Option<Instant>,
     awaiting_settlement: bool,
     unknown_revision: bool,
+    orphan_uncertain: bool,
     existing_revision: bool,
 }
 
@@ -50,6 +51,9 @@ pub(super) struct Landing {
     retired_height: u64,
     acceptance_epoch: u64,
     delivery_count: usize,
+    terminal_observation: u64,
+    terminal_completed: u64,
+    terminal_failed: bool,
 }
 
 impl Landing {
@@ -63,7 +67,7 @@ impl Landing {
         }
         self.blocks
             .values()
-            .filter(|block| !block.closed && !block.unknown_revision)
+            .filter(|block| !block.closed && !block.unknown_revision && !block.orphan_uncertain)
             .map(|block| block.at)
             .min()
             .map_or(if self.unknown() { -1. } else { 0. }, |at| {
@@ -72,7 +76,30 @@ impl Landing {
     }
 
     pub(super) fn unknown(&self) -> bool {
-        self.saturated || self.failed || self.blocks.values().any(|block| block.unknown_revision)
+        self.saturated
+            || self.failed
+            || (self.pending() && self.terminal_failed)
+            || self
+                .blocks
+                .values()
+                .any(|block| block.unknown_revision || block.orphan_uncertain)
+    }
+
+    fn orphaned(&mut self, hash: &str) {
+        let mut identity = [0; 32];
+        if hex::decode_to_slice(hash, &mut identity).is_ok() {
+            if let Some(block) = self.blocks.get_mut(&identity).filter(|block| !block.closed) {
+                block.closed = true;
+                block.unknown_revision = false;
+                block.orphan_uncertain = false;
+                block.awaiting_settlement = false;
+                self.pending_count -= 1;
+            }
+        }
+        if !self.pending() {
+            self.revisions.clear();
+            self.delivery_count = 0;
+        }
     }
 
     fn revision(&mut self, revision: i64) -> Option<&mut Revision> {
@@ -104,7 +131,7 @@ impl Landing {
             newer_at = newer_at.into_iter().chain(event.first()).min();
         }
         for block in self.blocks.values_mut().filter(|block| !block.closed) {
-            if block.unknown_revision {
+            if block.unknown_revision || block.orphan_uncertain {
                 continue;
             }
             let Some(target) = block.revision else {
@@ -167,6 +194,15 @@ impl Metrics {
     /// A committed proven orphan has no delivery target. Close its wait without
     /// a delivery sample, retaining its identity through the mature watermark.
     pub(crate) fn revision_work_orphaned(&self, hash: &str) {
+        self.landing_event(|state, _| state.orphaned(hash));
+    }
+
+    /// Arm only at the existing COMMIT boundary. Until its acknowledgement or
+    /// durable terminal evidence, no delivery can guess this orphan outcome.
+    pub(crate) fn revision_work_orphan_settlement<'a>(
+        &'a self,
+        hash: &'a str,
+    ) -> OrphanSettlement<'a> {
         self.landing_event(|state, _| {
             let mut identity = [0; 32];
             if hex::decode_to_slice(hash, &mut identity).is_ok() {
@@ -175,17 +211,35 @@ impl Metrics {
                     .get_mut(&identity)
                     .filter(|block| !block.closed)
                 {
-                    block.closed = true;
-                    block.unknown_revision = false;
-                    block.awaiting_settlement = false;
-                    state.pending_count -= 1;
+                    block.orphan_uncertain = true;
                 }
             }
-            if !state.pending() {
-                state.revisions.clear();
-                state.delivery_count = 0;
-            }
         });
+        OrphanSettlement {
+            metrics: self,
+            hash,
+        }
+    }
+
+    /// Only locally unresolved identities, bounded by LIMIT. The collector
+    /// owns the existing cadence and deadline; rendering performs no I/O.
+    pub(crate) fn revision_work_terminal_probe(&self) -> TerminalProbe<'_> {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        state.terminal_observation = state
+            .terminal_observation
+            .checked_add(1)
+            .expect("terminal observation sequence exhausted");
+        TerminalProbe {
+            metrics: self,
+            observation: state.terminal_observation,
+            hashes: state
+                .blocks
+                .iter()
+                .filter(|(_, block)| !block.closed)
+                .map(|(hash, _)| hex::encode(hash))
+                .collect(),
+            succeeded: false,
+        }
     }
 
     fn accept_block(&self, hash: &str, height: u64, existing_revision: bool) {
@@ -215,6 +269,7 @@ impl Metrics {
                     degraded: None,
                     awaiting_settlement: false,
                     unknown_revision: false,
+                    orphan_uncertain: false,
                     existing_revision,
                 },
             );
@@ -356,6 +411,58 @@ impl Metrics {
             hash,
             completed: false,
             owns,
+        }
+    }
+}
+
+/// Uncertainty is armed before COMMIT. Dropping on cancellation or a lost reply
+/// leaves it armed; a later durable orphan proof closes the interval.
+pub(crate) struct OrphanSettlement<'a> {
+    metrics: &'a Metrics,
+    hash: &'a str,
+}
+impl OrphanSettlement<'_> {
+    pub(crate) fn committed(self) {
+        self.metrics.revision_work_orphaned(self.hash);
+    }
+}
+
+pub(crate) struct TerminalProbe<'a> {
+    metrics: &'a Metrics,
+    observation: u64,
+    pub(crate) hashes: Vec<String>,
+    succeeded: bool,
+}
+impl TerminalProbe<'_> {
+    pub(crate) fn succeeded(mut self, orphaned: &[String]) {
+        self.metrics.landing_event(|state, _| {
+            // Orphaned is a monotonic processing disposition, including after
+            // reactivation for credit. Revalidate each still-owned identity;
+            // late evidence cannot reopen a tombstone or emit a sample.
+            for hash in orphaned {
+                state.orphaned(hash);
+            }
+            if self.observation >= state.terminal_completed {
+                state.terminal_completed = self.observation;
+                state.terminal_failed = false;
+            }
+        });
+        self.succeeded = true;
+    }
+}
+impl Drop for TerminalProbe<'_> {
+    fn drop(&mut self) {
+        if self.succeeded {
+            return;
+        }
+        let mut state = self
+            .metrics
+            .landing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.observation >= state.terminal_completed {
+            state.terminal_completed = self.observation;
+            state.terminal_failed = !self.hashes.is_empty();
         }
     }
 }

@@ -382,3 +382,73 @@ async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmatio
         assert_eq!(count(&m, "published"), f64::from(first));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn uncertain_orphan_cannot_be_rebound_or_delivered_without_terminal_proof() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    m.landed_block(&hash, 7);
+    tick().await;
+    let orphan = m.revision_work_orphan_settlement(&hash);
+    assert_eq!(age(&m), -1.);
+    drop(orphan); // Lost/cancelled COMMIT acknowledgement.
+    m.landed_block(&hash, 8);
+    m.revision_work_delivered(8);
+    m.revision_work_terminal_probe().succeeded(&[]);
+    assert_eq!(age(&m), -1.);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(count(&m, "superseded"), 0.);
+    m.revision_work_terminal_probe()
+        .succeeded(std::slice::from_ref(&hash));
+    assert_eq!(age(&m), 0.);
+    m.accepted_block(&hash, 1);
+    m.landed_block(&hash, 9);
+    m.revision_work_delivered(9);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(count(&m, "superseded"), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_probe_versions_preserve_newer_failure_and_monotonic_orphan_evidence() {
+    let m = Metrics::default();
+    let a = "11".repeat(32);
+    let b = "22".repeat(32);
+    m.accepted_block(&a, 1);
+    m.accepted_block(&b, 2);
+    tick().await;
+    let older = m.revision_work_terminal_probe();
+    drop(m.revision_work_terminal_probe());
+    older.succeeded(std::slice::from_ref(&a));
+    {
+        let state = m.landing.lock().unwrap();
+        assert!(state.terminal_failed, "old success hid a newer failed read");
+        assert_eq!(state.pending_count, 1);
+        assert!(state.unknown());
+    }
+    assert_eq!(age(&m), 1., "unknown evidence hid known B's wait");
+    let cancelled_old = m.revision_work_terminal_probe();
+    m.revision_work_terminal_probe().succeeded(&[]);
+    drop(cancelled_old);
+    assert!(!m.landing.lock().unwrap().unknown());
+    m.revision_work_terminal_probe().succeeded(&[a, b]);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(count(&m, "published"), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_probe_identity_payload_is_bounded_and_skips_closed_tombstones() {
+    let m = Metrics::default();
+    for n in 1..=LIMIT + 1 {
+        m.accepted_block(&format!("{n:064x}"), 1);
+    }
+    let first = m.revision_work_terminal_probe();
+    assert_eq!(first.hashes.len(), LIMIT);
+    let closed = first.hashes[0].clone();
+    first.succeeded(std::slice::from_ref(&closed));
+    let second = m.revision_work_terminal_probe();
+    assert_eq!(second.hashes.len(), LIMIT - 1);
+    assert!(!second.hashes.contains(&closed));
+    assert!(m.landing.lock().unwrap().saturated);
+}
