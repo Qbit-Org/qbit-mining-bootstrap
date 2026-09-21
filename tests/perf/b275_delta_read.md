@@ -1,5 +1,77 @@
 # Bounded delta acquisition qualification (#275)
 
+## Timeline repair: 2026-09-21, pool 16
+
+The timeline-fenced candidate passes the predeclared usefulness gate: median
+paired last-client improvement **937.311ms (34.66%)**, exceeding both **100ms
+and 5%** and the observed A/A noise. **Every 400k case still misses one second;
+#275 remains open.** This supersedes the original candidate's performance and
+correctness claim below. The original leaf/count proof had a confirmed physical
+failover defect; its 30.11% result is not evidence for this repaired binary.
+
+The repair reads current WAL insertion timeline in both existing leaf witnesses.
+Real PostgreSQL 16 tests retain the same frontend pool through suffix and interior
+history replacement, then verify rewind or base-backup rejoin and re-promotion.
+They authenticate full-fallback Snapshot bytes and WindowRef against the full
+reader. Healthy pooled sessions and reconnects retain eligibility, including the
+witness query under a non-superuser read role. The 10 focused tests and 27 existing
+coordinator tests pass without weakening old assertions. The existing
+[D3/D5 boundaries and timeline limitation](../../docs/refresh-window-split.md#bounded-delta-acquisition-275)
+remain explicit; this does not claim a globally unique identity for sibling copies.
+
+Both binaries were newly built from frozen source with the same measurement
+harness, changed only to use the normal **16 database connections** per frontend
+instead of the test helper's 4. Runtime base is
+`d78659de608ad30645ba630f15eb8be998b3e42a`; candidate is `230e536` plus this timeline
+repair. Release optimization 3, thin LTO, one codegen unit and no debug assertions
+were verified. ELF SHA-256:
+
+- Base: `71916e14d14d2a67db856c15e76df816c10bccbc7348ad3ddfce1353aefeb2cc`
+- Candidate: `8d7c48b7c6386de48964de6fcd0785469cd637f15f9af547fb136839038e2930`
+
+An initial candidate build reused the base executable from the shared Cargo
+cache. Equal ELF hashes exposed it before measurement; it was rejected, the
+server release package was cleaned, and the candidate rebuilt. Both accepted
+artifacts report fresh compilation; the timeline SQL exists only in the candidate.
+
+Each case used one frontend, 2000 actual sessions, exactly 2 Tokio workers and a
+fresh 400000-share realistic WindowPlan schema on durable local PostgreSQL 16.
+The timing boundary and reconciliation below are unchanged. Heavy work serialized
+under one host lock. Small 16-share and 400k warm AB pairs preceded two A/A controls
+using the same base executable, then four matched AB/BA/AB/BA pairs.
+
+| Pair, order | Base last client, s | Candidate last client, s | Gain, ms | Paired reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 1, AB | 2.691942386 | 1.775046123 | 916.896 | 34.06% |
+| 2, BA | 2.736155785 | 1.781973938 | 954.182 | 34.87% |
+| 3, AB | 2.710566999 | 1.767791274 | 942.776 | 34.78% |
+| 4, BA | 2.697804295 | 1.765957482 | 931.847 | 34.54% |
+
+The separate base/candidate last-client medians are **2.704185647s** and
+**1.771418699s**. The median of the four within-pair gains is 937.311ms and the
+median of their percentage reductions is 34.66%. A/A pairs measured
+2.718429582/2.704936774s and 2.730774289/2.698644977s; maximum within-pair variation
+was **32.129ms (1.18%)**. The acceptance gate requires both absolute and relative
+improvement beyond that observed noise, in addition to 100ms/5%.
+
+All 16 cases reconcile 32000 received identities with durable children, with
+exact receipt quantiles, no unmatched rows, no delivery errors, no supervisor
+stops and no residual schemas. Small 16-share results are 0.552970908/0.551639463s;
+excluded 400k warm results are 2.772694633/1.787759003s. Measured primary-pair process
+peak RSS ranges 809115648–809922560 bytes for base and 804626432–805101568 for
+candidate, excluding PostgreSQL. Minimum available memory across the 16 cases
+was 31060910080 bytes, with no additional swap; sampled process-envelope aggregate
+CPU idle was above 92.5% for the 400k cases, which cannot exclude brief interference.
+
+This is one local synthetic-node frontend, not a production eligibility estimate,
+500k or two-frontend qualification, real-network result, or a 24-hour memory soak.
+The timeline candidate's fallback correctness is tested; its fallback latency
+was not separately requalified. The historical split-leaf control below belongs
+to the original binary. Raw receipts, source manifests and failed-build evidence
+remain private verification artifacts. Independent delta review remains required.
+
+## Historical original candidate: 2026-09-18, pool4 (superseded)
+
 The candidate passed its predeclared **15% median improvement screen**, with
 **30.11%** lower end-to-end last-client latency across four balanced 400k pairs.
 **Every 400k case still missed one second.** This is a bounded acquisition
@@ -9,7 +81,7 @@ explain its deliberately restricted applicability.
 ## Source and method
 
 Exact base: `d78659de608ad30645ba630f15eb8be998b3e42a`. The candidate is the
-production implementation accompanying this report. Production source hashes
+original implementation at `782caf2aa24bf9dbc1ce7673b9f3a6d23a2817a8`. Production source hashes
 were frozen before building and remained unchanged through qualification;
 subsequent edits extended tests and documentation only. Both used Rust 1.98.1,
 x86_64 Linux, release optimization 3, thin LTO and one codegen unit, with at most
