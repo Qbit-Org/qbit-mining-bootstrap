@@ -276,6 +276,11 @@ class MetricsPort(Protocol):
     def vardiff_idle_metrics_lines(self) -> Any: ...
 
 
+def _escape_label(value: str) -> str:
+    """Escape one Prometheus label value (backslash, quote, newline)."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 class MetricsRenderer:
     """Collect and format one complete metrics generation."""
 
@@ -1110,7 +1115,10 @@ class MetricsRenderer:
         ]
 
     def window_ownership_metrics_lines(self) -> list[str]:
-        from lab.prism.window_ownership import window_ownership_snapshot
+        from lab.prism.window_ownership import (
+            window_ownership_breakdown,
+            window_ownership_snapshot,
+        )
 
         lines = []
         for name, value in window_ownership_snapshot().items():
@@ -1121,6 +1129,30 @@ class MetricsRenderer:
                 f"# TYPE {metric} {kind}",
                 f"{metric} {value}",
             ))
+        # Issue #332, defect 4: a retained owner must be attributable from
+        # metrics alone. Owners and live parsed records split by owner kind
+        # and bounded creation site, and the age of each kind's oldest owner,
+        # so a leaking call site and a holder that never retires show up as
+        # one growing series rather than as an undifferentiated total.
+        breakdown = window_ownership_breakdown()
+        labelled = (
+            ("owners_by_site", "gauge", "Weakly tracked window owners by owner kind and bounded creation site; site \"other\" once the site cap is reached.", breakdown["owners"]),
+            ("parsed_records_by_site", "gauge", "Parsed records currently held by weakly tracked window owners, by owner kind and bounded creation site.", breakdown["parsed_records"]),
+        )
+        for name, kind, help_text, series in labelled:
+            metric = f"qbit_prism_window_ownership_{name}"
+            lines.extend((f"# HELP {metric} {help_text}", f"# TYPE {metric} {kind}"))
+            for (owner_kind, site), value in sorted(series.items()):
+                lines.append(
+                    f'{metric}{{kind="{owner_kind}",site="{_escape_label(site)}"}} {value}'
+                )
+        metric = "qbit_prism_window_ownership_oldest_owner_age_seconds"
+        lines.extend((
+            f"# HELP {metric} Age of the oldest weakly tracked window owner of each kind; a value that keeps growing across window advances is a retained owner.",
+            f"# TYPE {metric} gauge",
+        ))
+        for owner_kind, age in sorted(breakdown["oldest_owner_age_seconds"].items()):
+            lines.append(f'{metric}{{kind="{owner_kind}"}} {age:.6f}')
         return lines
 
     def component_cardinality_metrics_lines(self) -> list[str]:
