@@ -16,6 +16,7 @@ from __future__ import annotations
 import gc
 import json
 import threading
+import time
 import unittest
 import weakref
 from types import SimpleNamespace
@@ -173,6 +174,61 @@ class ParsedRepresentationTests(NoGCTestCase):
             release.set()
             thread.join(10)
         self.assertEqual(seen[1], 39)
+        self.assertEqual(self.parsed_delta(), 0)
+
+    def test_delayed_release_callback_cannot_zero_a_newer_parse(self) -> None:
+        # Codex review on #489: the old holder's release callback used to
+        # check the slot outside the registry lock, so a callback delayed
+        # behind that lock could erase the rows a newer parse noted first.
+        sequence = self.sequence
+        holder = sequence._records()
+        stale_reference = sequence._parsed_ref
+        self.assertEqual(self.parsed_delta(), 40)
+        # A newer parse installed its own slot and noted its rows before the
+        # stale callback ran: the guarded note must stand down.
+        sequence._parsed_ref = weakref.ref(holder)
+        ownership.note_parsed_window(sequence, 0, guard=lambda: sequence._parsed_ref is stale_reference)
+        self.assertEqual(self.parsed_delta(), 40, "the newer slot's note must stand")
+        # A callback whose holder is still the published one zeroes as before.
+        current_reference = sequence._parsed_ref
+        ownership.note_parsed_window(sequence, 0, guard=lambda: sequence._parsed_ref is current_reference)
+        self.assertEqual(self.parsed_delta(), 0)
+        ownership.note_parsed_window(sequence, 40)
+        sequence._parsed_ref = stale_reference
+        del holder
+        self.assertEqual(self.parsed_delta(), 0)
+
+    def test_release_race_with_concurrent_reparse_keeps_live_count(self) -> None:
+        sequence = self.sequence
+        rounds = 0
+        for _ in range(50):
+            holder = sequence._records()
+            walked = threading.Event()
+            published = threading.Event()
+
+            def reparse() -> None:
+                # Wait for the old holder to be dropped while the registry
+                # lock is held: its callback is queued behind the lock.
+                walked.wait(10)
+                latest = sequence._records()
+                published.set()
+                walked.clear()
+                walked.wait(10)
+                del latest
+
+            worker = threading.Thread(target=reparse)
+            worker.start()
+            with ownership._LOCK:
+                del holder
+                walked.set()
+                time.sleep(0.001)
+            published.wait(10)
+            with sequence.retained():
+                self.assertEqual(self.parsed_delta(), 40)
+            walked.set()
+            worker.join(10)
+            rounds += 1
+        self.assertEqual(rounds, 50)
         self.assertEqual(self.parsed_delta(), 0)
 
     def test_parse_failure_publishes_nothing(self) -> None:

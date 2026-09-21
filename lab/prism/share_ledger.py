@@ -970,13 +970,18 @@ class DaemonShareJsonSequence(Sequence):
                 def released(reference: Any) -> None:
                     # The holder died: its dicts are gone unless a newer
                     # parse has already replaced the slot, whose own note
-                    # then stands. Attribute reads are atomic under the
-                    # GIL, and the slot is installed before the note below,
-                    # so both orders of this callback and a concurrent
-                    # re-parse leave the count matching what is alive.
+                    # then stands. The slot check runs under the registry
+                    # lock, the same lock the newer parse notes under, and
+                    # that parse installs its slot before noting; so a
+                    # callback delayed behind the lock sees the newer slot
+                    # and stands down, and one that wins the lock zeroes a
+                    # count the newer parse then sets. Either order leaves
+                    # the count matching what is alive.
                     owner = owner_ref()
-                    if owner is not None and owner._parsed_ref is reference:
-                        note_parsed_window(owner, 0)
+                    if owner is not None:
+                        note_parsed_window(
+                            owner, 0, guard=lambda: owner._parsed_ref is reference,
+                        )
 
                 self._parsed_ref = weakref.ref(holder, released)
                 note_parsed_window(self, len(holder.records))

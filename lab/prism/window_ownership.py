@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import weakref
-from typing import Any
+from typing import Any, Callable
 
 
 MAX_TRACKED_WINDOW_OWNERS = 16384
@@ -120,9 +120,18 @@ def track_window(owner: Any, data: bytes, *, kind: str, records: int = 0,
             _COUNTS["canonical_bytes"] += buffer[1]
 
 
-def note_parsed_window(owner: Any, records: int) -> None:
-    """Record that ``owner`` currently holds ``records`` parsed dicts (0: none)."""
+def note_parsed_window(owner: Any, records: int, *,
+                       guard: Callable[[], bool] | None = None) -> None:
+    """Record that ``owner`` currently holds ``records`` parsed dicts (0: none).
+
+    ``guard`` is evaluated under the registry lock and the note is skipped
+    when it returns False: a release callback passes the check that its
+    holder is still the published one, so a callback delayed behind this
+    lock cannot zero a newer holder's rows that were noted meanwhile.
+    """
     with _LOCK:
+        if guard is not None and not guard():
+            return
         entry = _OWNERS.get(id(owner))
         if entry is not None:
             previous = entry[4]
