@@ -110,6 +110,7 @@ pub fn expected(populated: bool) -> Census {
         "grace_credited_shares_total",
         "late_confirmed_shares_total",
         "block_candidates_orphaned_total",
+        "revision_work_build_timeouts_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -134,10 +135,19 @@ pub fn expected(populated: bool) -> Census {
         "metrics_snapshot_stale",
         "metrics_snapshot_age_seconds",
         "stratum_connection_limit",
+        "accepted_block_revision_work_pending_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
     result.family("rejections_total", "counter", &labels("reason_id", "stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised"), &[]);
+    result.family(
+        "accepted_block_to_revision_work_seconds",
+        "histogram",
+        &labels("result", "published,degraded,superseded"),
+        &[
+            "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "307", "600", "+Inf",
+        ],
+    );
     result.family(
         "stratum_connection_refusals_total",
         "counter",

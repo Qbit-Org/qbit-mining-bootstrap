@@ -97,7 +97,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 62
+            assert len(before) == 78 and len(after) == 65
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -119,7 +119,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 62 proposed rules; 34 external definitions preserved; "
+          "78 original / 65 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 
