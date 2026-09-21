@@ -7,7 +7,7 @@
 //! outcome still unknown at the deadline is answered `ledger-outcome-unknown`,
 //! never as a failure. Block-only proofs wait for their candidate's
 //! disposition up to `block_only_ack_timeout` instead.
-use super::submit_ledger::{CommitGate, GateState};
+use super::submit_ledger::{CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
 use crate::metrics::StaleJobCause;
@@ -23,6 +23,8 @@ mod acquire_tests;
 pub(super) enum SaveOutcome {
     Accepted,
     Duplicate,
+    /// The original lease expired or was replaced before COMMIT: `stale-job`.
+    Stale,
     /// The ledger did not record the share: `ledger-confirmation-failed`.
     Failed(anyhow::Error),
     /// Not known by the acknowledgement deadline; the share may still be
@@ -466,12 +468,16 @@ impl Coordinator {
                 Ok(())
             }
             SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
+            SaveOutcome::Stale => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(protocol_error("stale-job", "stale job"))
+            }
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 if error.downcast_ref::<CommitGateClosed>().is_some() {
                     // A refused local gate proves COMMIT was never sent. It
-                    // can mean revoked authority or lock contention, so do not
-                    // label it a stale job or a database failure.
+                    // has no proven stale cause: contention/unavailable
+                    // authority and legacy unspecified refusals remain strict.
                     tracing::info!(%error, "share commit gate refused before COMMIT");
                     return Err(protocol_error(
                         "ledger-confirmation-failed",
@@ -587,6 +593,15 @@ impl Coordinator {
         };
         let outcome =
             classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout);
+        let outcome = match outcome {
+            SaveOutcome::Failed(error)
+                if error.downcast_ref::<CommitGateClosed>().is_some()
+                    && gate.closure() == Some(GateClosure::StaleAuthority) =>
+            {
+                SaveOutcome::Stale
+            }
+            outcome => outcome,
+        };
         // Count the confirmation from when the append finished. Classifying
         // here can happen arbitrarily later, and an on-time confirmation must
         // not be reported as a late one.

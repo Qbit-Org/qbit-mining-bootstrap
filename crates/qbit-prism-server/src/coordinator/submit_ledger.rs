@@ -2,14 +2,23 @@
 //!
 //! Tests replace I/O here, not Coordinator's classification/accounting logic.
 //! Production appends retain the transaction-scoped payout revision check.
-use super::publication_authority::LeaseCommitFence;
+use super::publication_authority::{LeaseCommitFence, LeaseCommitRefusal};
 use super::*;
 use futures_util::future::BoxFuture;
 use std::sync::{atomic::AtomicU8, OnceLock};
 
 const OPEN: u8 = 0;
 const COMMITTING: u8 = 1;
-const CLOSED: u8 = 2;
+
+/// Stored atomically with closure: later observations cannot change why the
+/// first refusal won, or replace an already-started COMMIT with staleness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum GateClosure {
+    DeadlineOrCancelled = 2,
+    AuthorityUnavailable = 3,
+    StaleAuthority = 4,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GateState {
@@ -40,11 +49,16 @@ impl CommitGate {
     /// when it started.
     pub(super) fn begin_commit(&self) -> bool {
         if let Some(lease) = &self.lease {
-            let won = lease.with_authority(|| self.begin_authorized_commit());
-            if !won {
-                self.close();
-            }
-            return won;
+            return match lease.with_authority(|| self.begin_authorized_commit()) {
+                Ok(won) => won,
+                Err(refusal) => {
+                    self.close_for(match refusal {
+                        LeaseCommitRefusal::Stale => GateClosure::StaleAuthority,
+                        LeaseCommitRefusal::Unavailable => GateClosure::AuthorityUnavailable,
+                    });
+                    false
+                }
+            };
         }
         self.begin_authorized_commit()
     }
@@ -64,12 +78,25 @@ impl CommitGate {
     /// The acknowledgement deadline. `true` means COMMIT was not sent and never
     /// will be; `false` means the gate was already `Committing`.
     pub(super) fn close(&self) -> bool {
+        self.close_for(GateClosure::DeadlineOrCancelled)
+    }
+
+    fn close_for(&self, reason: GateClosure) -> bool {
         match self
             .state
-            .compare_exchange(OPEN, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(OPEN, reason as u8, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => true,
-            Err(current) => current == CLOSED,
+            Err(current) => current != COMMITTING,
+        }
+    }
+
+    pub(super) fn closure(&self) -> Option<GateClosure> {
+        match self.state.load(Ordering::Acquire) {
+            2 => Some(GateClosure::DeadlineOrCancelled),
+            3 => Some(GateClosure::AuthorityUnavailable),
+            4 => Some(GateClosure::StaleAuthority),
+            _ => None,
         }
     }
 
@@ -150,5 +177,36 @@ impl SubmitLedger for Ledger {
             .await?
             .inserted)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_gate_closure_wins_and_cannot_replace_commit() {
+        let causes = [
+            GateClosure::DeadlineOrCancelled,
+            GateClosure::AuthorityUnavailable,
+            GateClosure::StaleAuthority,
+        ];
+        for first in causes {
+            for later in causes {
+                let gate = CommitGate::default();
+                assert!(gate.close_for(first));
+                assert!(gate.close_for(later));
+                assert!(gate.close());
+                assert!(!gate.begin_commit());
+                assert_eq!(gate.closure(), Some(first));
+                assert_eq!(gate.state(), GateState::Closed);
+                assert!(gate.committing_since().is_none());
+            }
+            let gate = CommitGate::default();
+            assert!(gate.begin_commit());
+            assert!(!gate.close_for(first));
+            assert_eq!(gate.closure(), None);
+            assert_eq!(gate.state(), GateState::Committing);
+        }
     }
 }

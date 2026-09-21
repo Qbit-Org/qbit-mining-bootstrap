@@ -9,7 +9,7 @@ share-rejection label set.
 
 | Reason ID | Meaning |
 | --- | --- |
-| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template outside the stale-grace credit window. |
+| `stale-job` | The submitted share or block candidate no longer has valid job authority, including an obsolete tip/template outside stale grace or an expired/replaced publication lease refused before COMMIT. |
 | `duplicate-share` | The same miner submitted a share with an already-seen header. |
 | `low-difficulty` | The submitted share did not satisfy the miner's assigned share target. |
 | `malformed-submit` | The `mining.submit` payload could not be parsed or assembled. |
@@ -107,6 +107,49 @@ divergence (later detected tips do not renew it). If refresh or reconciliation
 stalls beyond that budget, submits fall back to the live RPC read instead of
 accepting shares against a frozen snapshot.
 
+## Commit-gate refusals
+
+A share admitted under the published-work replacement lease must still hold
+that original authority immediately before COMMIT. If its publication has
+been replaced or its fixed lease/resume deadline expired, a completed typed
+gate refusal produces the existing `stale-job` response:
+numeric code **21**, message **`stale job`**. This is the same authority check
+used before persistence, performed again after database waits. It changes
+classification, not payout eligibility, stale grace, candidate authority or
+the share acknowledgement deadline. No new credit is recorded for this refusal.
+
+Gate closure alone does **not** prove stale work. Unavailable authority locks,
+unhealthy/unknown readiness and a share acknowledgement deadline that closes
+before COMMIT remain `ledger-confirmation-failed` (code **20**). The winning
+closure cause is fixed atomically: a subsequent tip change cannot turn a
+timeout or backend refusal into an expected stale race. Once COMMIT has
+started, later lease changes cannot change its result: confirmed credit stays
+accepted, a definite rollback stays failed, and an unresolved outcome stays
+`ledger-outcome-unknown`. An identical share already durably credited retains
+its duplicate outcome even if a later gate refuses.
+
+If the append has not returned by the acknowledgement deadline, the existing
+timeout/unknown handling still applies; gate state alone does not replace a
+completed ledger result, including its immutable-row duplicate check.
+
+The load harness follows the stable reason ID, including for mixed producer
+versions and saved reports:
+
+| Wire reason | Harness class before and after this change |
+| --- | --- |
+| `stale-job` | Expected race; excluded from `rejected_valid_shares`, never counted as accepted credit. |
+| `ledger-confirmation-failed` | Backend refusal; remains in `rejected_valid_shares`, including the historical message `share was not committed because its commit gate closed`. |
+| `ledger-outcome-unknown` | Backend/uncertain outcome; remains in `rejected_valid_shares` and reconciliation. |
+| Missing or unrecognised gate reason | Unknown; no stale exemption from the message alone. |
+
+Older producers used the generic gate-closed message for both stale authority
+and backend causes. Neither that message nor proximity to a tip change can
+retroactively distinguish them. The raw #447 matrix reports are unavailable
+for this change, so no historical verdict recomputation is claimed; the
+recorded verdicts and D1 rule remain unchanged. Any future comparison must
+name its source reports and show the old/new policy explicitly, preserving
+ambiguous failures unless independent causal evidence resolves them.
+
 Rejections are counted, never logged per share or written to the ledger.
 Diagnose reject spikes from `qbit_prism_rejections_total{reason_id}` and
 `qbit_prism_share_ack_seconds{result="rejected"}`, then use the stale-job
@@ -120,11 +163,12 @@ round trips never return to the delivery path.
 ## Stale-job causes
 
 Every `stale-job` rejection keeps its wire reason, numeric code 21 and message.
-`qbit_prism_stale_job_rejections_total{cause}` also records which existing
-decision refused the share, once, at that decision. The share observation still
-counts the same rejection once as `reason_id="stale-job"`, so over one process
-lifetime the four cause series sum to that reason, apart from submissions still
-in flight. `unknown-job` has no cause series. Stale-grace credit is an accepted
+`qbit_prism_stale_job_rejections_total{cause}` records which of the four
+decisions below refused the share, once, at that decision. The share observation
+counts the same rejection once as `reason_id="stale-job"`. Lease admission,
+lease revalidation and commit-gate refusals use that coarse reason without a
+label in this four-cause series; its sum is not a total of all stale responses.
+`unknown-job` has no cause series. Stale-grace credit is an accepted
 share, counted by `qbit_prism_grace_credited_shares_total`, not a cause.
 
 The decisions run in this order, and a share that would fail several is

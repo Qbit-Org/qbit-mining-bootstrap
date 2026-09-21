@@ -129,6 +129,15 @@ async fn late_lease_append_and_issued_save_recheck_publication_and_epoch() {
                 changed == "unchanged",
                 "{operation}/{changed}"
             );
+            if operation == "append" && changed == "publication" {
+                stale_causes::assert_stale_wire(result.unwrap_err(), "stale job");
+            } else if operation == "append" && changed == "epoch" {
+                assert_error(
+                    result.unwrap_err(),
+                    "ledger-confirmation-failed",
+                    "share was not committed because its commit gate closed",
+                );
+            }
             let records = f.store.records.lock().unwrap();
             assert_eq!(
                 records.len(),
@@ -796,12 +805,71 @@ async fn lease_or_resumed_wire_expiry_before_commit_refuses_without_records() {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_eq!(
-            error.response(json!(41))["error"][2]["reason_id"],
-            "ledger-confirmation-failed",
-            "{expired}: an append refused before COMMIT has a definite outcome"
-        );
+        stale_causes::assert_stale_wire(error, "stale job");
         assert!(f.store.records.lock().unwrap().is_empty(), "{expired}");
+    }
+}
+
+#[tokio::test]
+async fn commit_gate_contention_or_unknown_readiness_is_not_stale() {
+    for changed in [
+        "prepared-lock",
+        "readiness-lock",
+        "tip-lock",
+        "readiness-unknown",
+    ] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        f.coordinator.refresh_once().await.unwrap();
+        let job = issued(&f).await;
+        prepare_replacement_lease(&f).await;
+        let gate = Arc::new(Gate::default());
+        *f.store.append_gate.lock().unwrap() = Some(gate.clone());
+        let proof = f.proof(&job, 0);
+        let coordinator = f.coordinator.clone();
+        let pending = tokio::spawn(async move {
+            coordinator
+                .submit(&job.context.worker, &job, proof, false.into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        if changed == "readiness-unknown" {
+            f.coordinator.invalidate_readiness().await;
+        }
+        let prepared = if changed == "prepared-lock" {
+            Some(f.coordinator.prepared.write().await)
+        } else {
+            None
+        };
+        let readiness = if changed == "readiness-lock" {
+            Some(f.coordinator.readiness.write().await)
+        } else {
+            None
+        };
+        let tip = if changed == "tip-lock" {
+            Some(f.coordinator.observed_tip.write().await)
+        } else {
+            None
+        };
+        gate.release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        drop((prepared, readiness, tip));
+        assert_error(
+            error,
+            "ledger-confirmation-failed",
+            "share was not committed because its commit gate closed",
+        );
+        assert!(f.store.records.lock().unwrap().is_empty(), "{changed}");
+        assert_eq!(
+            f.coordinator.accepted.load(Ordering::SeqCst),
+            0,
+            "{changed}"
+        );
     }
 }
 

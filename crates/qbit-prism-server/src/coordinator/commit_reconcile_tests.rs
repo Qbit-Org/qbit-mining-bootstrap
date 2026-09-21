@@ -708,6 +708,99 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
                 && calls.load(Ordering::SeqCst) == 3,
             "payload mismatch was reclassified as a known identical duplicate"
         );
+
+        // The production adapter must preserve the private gate's actual
+        // winning cause through a real SQL rollback. The public bool hook
+        // and CommitGateClosed error intentionally carry no inferred cause.
+        use super::submit_ledger::{CommitGate, GateClosure, SubmitLedger};
+        for (index, expected) in [
+            GateClosure::StaleAuthority,
+            GateClosure::AuthorityUnavailable,
+            GateClosure::DeadlineOrCancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            {
+                let mut tip = fixture.coordinator.observed_tip.write().await;
+                let sequence = tip.reserve();
+                tip.observe(&"bb".repeat(32), sequence, true);
+            }
+            let admission = fixture
+                .coordinator
+                .submit_admission()
+                .await
+                .map_err(|error| anyhow::anyhow!("lease admission: {}", error.message))?;
+            let lease = admission.lease.context("replacement lease missing")?;
+            let gate = Arc::new(CommitGate::with_lease(Some(
+                fixture.coordinator.lease_commit_fence(lease, None),
+            )));
+            if expected == GateClosure::DeadlineOrCancelled {
+                ensure!(gate.close(), "the original deadline must win");
+            }
+            // Publish a new generation after admission, before the SQL hook.
+            // The unavailable case holds the publication lock instead: a
+            // failed try_read cannot prove whether any work became stale.
+            let contended = if expected == GateClosure::AuthorityUnavailable {
+                Some(fixture.coordinator.prepared.write().await)
+            } else {
+                let mut tip = fixture.coordinator.observed_tip.write().await;
+                let sequence = tip.reserve();
+                tip.observe(&"aa".repeat(32), sequence, true);
+                tip.publish(&"aa".repeat(32))?;
+                None
+            };
+            let mut refused = share.clone();
+            refused.share_id = format!("miner:{}", format!("{:02x}", index + 0x61).repeat(32));
+            let error = SubmitLedger::append_at_revision(
+                ledger.as_ref(),
+                refused.clone(),
+                None,
+                revision,
+                gate.clone(),
+            )
+            .await
+            .expect_err("a closed gate must roll back the new share");
+            ensure!(
+                error
+                    .downcast_ref::<crate::ledger::CommitGateClosed>()
+                    .is_some(),
+                "expected a typed gate refusal: {error:#}"
+            );
+            ensure!(
+                gate.closure() == Some(expected),
+                "wrong closure: {:?}",
+                gate.closure()
+            );
+            ensure!(
+                fixture.rows(&refused.share_id).await? == 0,
+                "refused share committed"
+            );
+            // A closed stale gate cannot erase a credit already confirmed by
+            // the immutable-row match, nor turn that duplicate into stale.
+            let duplicate = SubmitLedger::append_at_revision(
+                ledger.as_ref(),
+                share.clone(),
+                None,
+                revision,
+                gate,
+            )
+            .await?;
+            ensure!(!duplicate, "closed gate changed a confirmed duplicate");
+            drop(contended);
+            // Rollback also released ORDER_LOCK for a subsequent valid append.
+            ensure!(
+                ledger
+                    .append_at_revision(refused.clone(), None, revision)
+                    .await?
+                    .inserted,
+                "a refused transaction retained its lock or row"
+            );
+            ensure!(
+                fixture.rows(&refused.share_id).await? == 1,
+                "expected one later credit"
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;

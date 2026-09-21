@@ -3107,9 +3107,62 @@ fn the_rejection_classifier_separates_harness_bugs_from_expected_races() {
 }
 
 #[test]
-fn only_a_confirmation_failure_can_be_followed_by_a_commit() {
-    // This is the one refusal the append can lose a race with: the commit
-    // deadline answers the miner while PostgreSQL still commits the append.
+fn commit_gate_classification_requires_the_producers_proven_stale_reason() {
+    // The reason carries the typed producer decision. Message matching must
+    // not exempt a legacy gate refusal or an unknown/backend outcome from D1.
+    for (reason, code, message, expected) in [
+        (Some("stale-job"), 21, "stale job", RejectionClass::Expected),
+        (
+            Some("ledger-confirmation-failed"),
+            20,
+            "share was not committed because its commit gate closed",
+            RejectionClass::Backend,
+        ),
+        (
+            Some("ledger-confirmation-failed"),
+            20,
+            "share was not confirmed by the database",
+            RejectionClass::Backend,
+        ),
+        (
+            Some("ledger-outcome-unknown"),
+            20,
+            "share outcome is not yet known",
+            RejectionClass::Backend,
+        ),
+        (
+            Some("backend-rpc-unavailable"),
+            20,
+            "current chain state is unavailable",
+            RejectionClass::Backend,
+        ),
+        (
+            None,
+            20,
+            "share was not committed because its commit gate closed",
+            RejectionClass::Unknown,
+        ),
+        (
+            Some("future-gate-reason"),
+            20,
+            "stale job",
+            RejectionClass::Unknown,
+        ),
+    ] {
+        let rejection = rejection(code, reason, message);
+        assert_eq!(classify::classify(&rejection), expected, "{rejection:?}");
+        if expected == RejectionClass::Expected {
+            assert!(!classify::is_confirmation_failure(&rejection));
+            assert!(!classify::is_outcome_unknown(&rejection));
+        }
+    }
+}
+
+#[test]
+fn confirmation_failure_reconciliation_preserves_older_producers() {
+    // Older producers could answer this while PostgreSQL still committed.
+    // Keep those historical reports reconcilable; current uncertain COMMITs
+    // use ledger-outcome-unknown, tested separately below.
     let failure = rejection(
         20,
         Some(classify::LEDGER_CONFIRMATION_FAILED),

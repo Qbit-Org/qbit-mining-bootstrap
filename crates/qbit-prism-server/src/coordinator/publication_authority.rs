@@ -137,23 +137,38 @@ pub(super) struct LeaseCommitFence {
     expires_at: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LeaseCommitRefusal {
+    /// The original publication/expiry no longer authorizes this append.
+    Stale,
+    /// Lock contention or unknown/unhealthy readiness proves no staleness.
+    Unavailable,
+}
+
 impl LeaseCommitFence {
     /// The synchronous pre-COMMIT hook never waits for a lock. A contended or
     /// revoked authority refuses before COMMIT; the guards only span the gate
     /// transition and are released before any database I/O or blocking work.
-    pub(super) fn with_authority(&self, commit: impl FnOnce() -> bool) -> bool {
+    pub(super) fn with_authority(
+        &self,
+        commit: impl FnOnce() -> bool,
+    ) -> std::result::Result<bool, LeaseCommitRefusal> {
         let Some(view) = AuthorityView::try_read(&self.prepared, &self.readiness, &self.tip) else {
-            return false;
+            return Err(LeaseCommitRefusal::Unavailable);
         };
         if self
             .expires_at
             .is_some_and(|at| MonotonicInstant::now().into_std() >= at)
-            || !matches!(self.lease.select(&view, &self.config), Ok(Some(_)))
         {
-            return false;
+            return Err(LeaseCommitRefusal::Stale);
+        }
+        match self.lease.select(&view, &self.config) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(LeaseCommitRefusal::Stale),
+            Err(_) => return Err(LeaseCommitRefusal::Unavailable),
         }
         let won = commit();
         drop(view);
-        won
+        Ok(won)
     }
 }
