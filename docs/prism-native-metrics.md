@@ -294,6 +294,9 @@ successful write of compatible current replacement work. A late write of an
 already superseded revision cannot clear that wait. Thus stalls are visible
 before the first completed histogram sample. The gauge is computed from a
 monotonic clock at render time and overlaid on cached metric bodies.
+With no connected miners there is no qualifying notify delivery: pending age
+continues to rise and alerts can fire even when prepared work is ready. The
+metric does not reinterpret an empty listener as successful miner delivery.
 
 `qbit_prism_revision_work_build_timeouts_total` increments only in the existing
 Stratum job-build timeout branch, once for that operation when accepted work

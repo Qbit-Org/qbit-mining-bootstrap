@@ -306,7 +306,9 @@ async fn delayed_settlement_reply_cannot_publish_an_older_acceptance_at_a_newer_
 async fn active_proof_confirmation_and_maturity_bind_the_same_committed_revision() -> Result<()> {
     run(gate::site!(), |f| {
         Box::pin(async move {
-            f.refresh(true).await?;
+            // Bootstrap pays the solver immediately, so maturity updates a real
+            // payout row and takes the existing second revision-bump branch.
+            f.refresh(false).await?;
             f.node.accept_blocks();
             let claim = queue_block(&f.a).await?;
             let hash = claim.candidate.block_hash.clone();
