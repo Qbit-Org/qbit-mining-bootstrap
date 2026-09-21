@@ -32,11 +32,14 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 /// every row the offer lifecycle (migration 011) has not finished, pending
 /// and offered-but-not-landed alike, using `CandidateState::UNFINISHED_SQL`
 /// so terminal submitted, abandoned and orphaned rows are excluded. The same
-/// snapshot reads attached share ledger partition headroom (#144). Both reads
-/// are catalog-sized: no share-table scan, candidate JSON decode, or accounting
-/// lock. A failure of either leaves every sample of this collector unknown.
+/// snapshot reads attached share ledger partition headroom (#144) and terminal
+/// orphan evidence for at most 4,096 locally unresolved block identities. There
+/// is no share-table scan, candidate JSON decode, or accounting lock. A failed
+/// read leaves the database collection unavailable and landing evidence unknown.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let terminal = metrics.revision_work_terminal_probe();
+    tokio::time::timeout_at(deadline, async {
         let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
         let mut tx = connection.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -50,7 +53,17 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
             "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"
         ).fetch_one(&mut *tx).await?;
         let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, partition_lead_rows };
+        // One bounded identity lookup in this same read-only snapshot. Terminal
+        // processing state stays orphaned even if a later reorg credits it.
+        // Never load retained history or add I/O to work publication/scrapes.
+        let orphaned: Vec<String> = if terminal.hashes.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=ANY($1::text[]) AND state='orphaned'")
+                .bind(&terminal.hashes).fetch_all(&mut *tx).await?
+        };
         tx.commit().await?;
+        terminal.succeeded(&orphaned);
         Ok::<_, anyhow::Error>(snapshot)
     }).await.context("metrics database collection deadline exceeded")?
 }

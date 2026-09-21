@@ -687,6 +687,82 @@
         "crates/qbit-prism-server/src/api/public_service.rs#L309",
         "crates/qbit-prism-server/src/api/public_service.rs#L320"
       ]
+    },
+    {
+      "uid": "qbit-prism-revision-work-pending",
+      "title": "PrismAcceptedRevisionWorkPending",
+      "role": "run",
+      "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)), 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "0s",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismAcceptedRevisionWorkPending",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum.rs"
+      ]
+    },
+    {
+      "uid": "qbit-prism-revision-work-pending-critical",
+      "title": "PrismAcceptedRevisionWorkPendingCritical",
+      "role": "run",
+      "expr": "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 307",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "0s",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismAcceptedRevisionWorkPendingCritical",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum.rs"
+      ]
+    },
+    {
+      "uid": "qbit-prism-revision-work-timeouts",
+      "title": "PrismRevisionWorkBuildTimeouts",
+      "role": "run",
+      "expr": "increase(qbit_prism_revision_work_build_timeouts_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]) > bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "0s",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismRevisionWorkBuildTimeouts",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum.rs"
+      ]
     }
   ]
 }

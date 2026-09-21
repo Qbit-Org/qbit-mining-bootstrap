@@ -78,7 +78,7 @@ def migration_tables():
     migration = load("docs/prism-alert-migration.json")
     lines = [START, "<!-- Run: python3 scripts/generate_prism_alerts.py -->", "",
              "## Every deployed alert", "",
-             "78 definitions: **22 migrated, 34 unchanged external, 22 with no replacement**.",
+             "78 definitions: **27 migrated, 34 unchanged external, 17 with no replacement**.",
              "This includes definitions behind deployment Jinja flags; the snapshot does not record their effective values.", "",
              "| Deployed UID | Deployed alert | Native rule / disposition | Reason |",
              "| --- | --- | --- | --- |"]

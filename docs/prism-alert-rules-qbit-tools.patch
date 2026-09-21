@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 4485a082c7a0c5a771f5e90fb5ac64bbaeb8cbb1f826df787983aa38e6326f51
++   Specification SHA-256: f73f6626c9e94af8a548c3a91bb4474d108efbce9cd34b4b662a40a65f8586d0
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,580 @@
+@@ -118,53 +14,635 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -634,6 +634,61 @@
 +    "description": "RSS cannot establish memory health until process collection succeeds. Process collector expires after 30 seconds or on failure; unsupported platforms are unknown.",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
++  },
++  {
++    "uid": "qbit-prism-revision-work-pending",
++    "title": "PrismAcceptedRevisionWorkPending",
++    "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)), 1)",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "0s",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismAcceptedRevisionWorkPending",
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
++    "no_data_state": "Alerting",
++    "exec_err_state": "Alerting"
++  },
++  {
++    "uid": "qbit-prism-revision-work-pending-critical",
++    "title": "PrismAcceptedRevisionWorkPendingCritical",
++    "expr": "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 307",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "0s",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismAcceptedRevisionWorkPendingCritical",
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
++    "no_data_state": "Alerting",
++    "exec_err_state": "Alerting"
++  },
++  {
++    "uid": "qbit-prism-revision-work-timeouts",
++    "title": "PrismRevisionWorkBuildTimeouts",
++    "expr": "increase(qbit_prism_revision_work_build_timeouts_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]) > bool 0",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "0s",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismRevisionWorkBuildTimeouts",
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
++    "no_data_state": "Alerting",
++    "exec_err_state": "Alerting"
 +  }
 +] %}
 +{% set prism_public_read_alert_rules = [
@@ -734,7 +789,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +653,17 @@
+@@ -230,752 +708,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1490,7 +1545,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1142,84 @@
+@@ -1454,5 +1197,84 @@
    }
  ] %}
  {% endif %}

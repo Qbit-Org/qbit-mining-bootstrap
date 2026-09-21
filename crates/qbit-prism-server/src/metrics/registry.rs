@@ -67,6 +67,10 @@ families! {
     CoverageGap: Gauge, "stratum_current_tip_coverage_gap_seconds", "Continuous age of native current-generation coverage below 95 percent, or -1 before observation.";
     Coverage: Gauge, "stratum_semantic_current_work_ratio", "Fraction of authorized connections with current semantic work; one when no clients are authorized.";
     FirstOffer: Histogram, "block_submit_seconds", "Locally validated block proof to first node offer; requires the offer owner's timestamp boundary.";
+    RevisionWork: Histogram, "accepted_block_to_revision_work_seconds", "Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds.";
+    RevisionWorkPending: Gauge, "accepted_block_revision_work_pending_seconds", "Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none.";
+    RevisionWorkUnknown: Gauge, "accepted_block_revision_work_tracking_unknown", "Whether any local landing observation is unknown or incomplete; independent of known pending delivery age.";
+    RevisionWorkTimeouts: Counter, "revision_work_build_timeouts_total", "Existing build deadlines actually hit while accepted-block revision work is pending on this frontend.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
@@ -97,11 +101,15 @@ families! {
 const SHARE_ACK_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 15., 20., 30.,
 ];
+const REVISION_WORK_BUCKETS: &[f64] = &[
+    0.25, 0.5, 1., 2.5, 5., 10., 30., 60., 120., 300., 307., 600.,
+];
 // Fixed storage keeps event recording allocation-free. Guard every ladder so
 // future changes cannot silently truncate observation or rendering via zip.
 const _: () = {
     assert!(BUCKETS.len() <= BUCKET_COUNT);
     assert!(SHARE_ACK_BUCKETS.len() <= BUCKET_COUNT);
+    assert!(REVISION_WORK_BUCKETS.len() <= BUCKET_COUNT);
 };
 
 impl Family {
@@ -111,12 +119,21 @@ impl Family {
             // docs/prism-metrics-histogram-consumers.md before changing this.
             Self::CtvChunkRows => &[1.],
             Self::ShareAck => SHARE_ACK_BUCKETS,
+            Self::RevisionWork => REVISION_WORK_BUCKETS,
             _ => BUCKETS,
         }
     }
 
     pub(super) fn is_live(self) -> bool {
-        self.is_collection() || self == Self::PoolAcquire
+        self.is_collection()
+            || matches!(
+                self,
+                Self::PoolAcquire
+                    | Self::RevisionWork
+                    | Self::RevisionWorkPending
+                    | Self::RevisionWorkUnknown
+                    | Self::RevisionWorkTimeouts
+            )
     }
 
     pub(super) fn is_collection(self) -> bool {

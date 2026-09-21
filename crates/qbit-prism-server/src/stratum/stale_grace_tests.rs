@@ -178,6 +178,7 @@ impl Connection {
             &mut self.session,
             &mut self.writer,
             &self.config,
+            &crate::metrics::Metrics::default(),
         )
         .await
         .unwrap();
@@ -237,7 +238,8 @@ async fn failed_replacement_keeps_retired_job_until_actual_delivery_then_expires
         &client.backend,
         &mut client.session,
         &mut client.writer,
-        &client.config
+        &client.config,
+        &crate::metrics::Metrics::default(),
     )
     .await
     .is_err());

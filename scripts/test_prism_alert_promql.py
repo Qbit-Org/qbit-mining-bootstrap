@@ -71,7 +71,8 @@ def main():
         if "alerts" in scenario:
             tests[-1]["alert_rule_test"] = [{
                 "eval_time": scenario.get("eval_time", "6m"), "alertname": name,
-                "exp_alerts": [{"exp_labels": {}, "exp_annotations": {}}] if active else [],
+                "exp_alerts": [{"exp_labels": labels, "exp_annotations": {}}
+                               for labels in (active if isinstance(active, list) else ([{}] if active else []))],
             } for name, active in scenario["alerts"].items()]
     with tempfile.TemporaryDirectory(prefix="prism-alert-promql-") as directory:
         path = Path(directory)
@@ -80,7 +81,9 @@ def main():
                          for name, expr in expressions.items()]
         checked_rules.append(pool_alert)
         tests.extend(pool_tests)
-        for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
+        for rule in rules:
+            if not (rule["uid"].startswith("qbit-prism-revision-work-") or rule in load("docs/prism-postgres-alert-rules.json")["rules"]):
+                continue
             assert rule["evaluator"] == "gt" and rule["threshold"] == 0
             checked_rules.append({"alert": rule["title"], "expr": f"({expressions[rule['title']]}) > 0",
                                   "for": rule["for"]})

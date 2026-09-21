@@ -2,6 +2,7 @@
 pub mod collectors;
 mod events;
 mod labels;
+mod landing;
 mod registry;
 pub mod runtime;
 mod snapshots;
@@ -31,6 +32,7 @@ pub struct Metrics {
     collections: Mutex<BTreeMap<Collector, CollectionState>>,
     runtime: Arc<runtime::RuntimeMonitor>,
     coverage_gap_since: Mutex<Option<Instant>>,
+    landing: Mutex<landing::Landing>,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -62,6 +64,9 @@ impl Metrics {
             Family::Grace,
             Family::LateConfirmed,
             Family::CandidatesOrphaned,
+            Family::RevisionWorkPending,
+            Family::RevisionWorkUnknown,
+            Family::RevisionWorkTimeouts,
         ] {
             registry.register(family, vec![], 0.);
         }
@@ -80,6 +85,9 @@ impl Metrics {
         }
         for value in AckResult::ALL {
             registry.register(Family::ShareAck, label("result", value.as_str()), 0.);
+        }
+        for value in RevisionWorkResult::ALL {
+            registry.register(Family::RevisionWork, label("result", value.as_str()), 0.);
         }
         for value in RejectReason::ALL {
             registry.register(Family::Rejections, label("reason_id", value.as_str()), 0.);
@@ -128,6 +136,7 @@ impl Metrics {
             collections: Mutex::new(BTreeMap::new()),
             runtime,
             coverage_gap_since: Mutex::new(None),
+            landing: Mutex::new(landing::Landing::default()),
         }
     }
     pub fn runtime(&self) -> Arc<runtime::RuntimeMonitor> {
@@ -151,9 +160,16 @@ impl Metrics {
         *body = refreshed;
     }
     fn current_registry(&self) -> Registry {
+        let landing = self.landing.lock().unwrap_or_else(|e| e.into_inner());
         let stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let collections = self.collections.lock().unwrap_or_else(|e| e.into_inner());
         let mut registry = stored.clone();
+        registry.set(Family::RevisionWorkPending, Labels::Empty, landing.age());
+        registry.set(
+            Family::RevisionWorkUnknown,
+            Labels::Empty,
+            f64::from(landing.unknown()),
+        );
         for collector in Collector::ALL {
             let state = collections.get(collector);
             let age = state

@@ -307,7 +307,7 @@ fn migration_covers_every_deployed_alert_and_all_46_historical_names() {
             other => panic!("unrecognized disposition: {other}"),
         }
     }
-    assert_eq!(counts, [22, 34, 22]);
+    assert_eq!(counts, [27, 34, 17]);
     let historical = metric_tokens(include_str!("../../../../docs/prism-overload-alerts.md"));
     assert_eq!(historical.len(), 46);
     let retired = migration["retired_names"].as_array().unwrap();

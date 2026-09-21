@@ -183,41 +183,52 @@
       "uid": "qbit-prism-preview-publish-latency",
       "title": "PrismAcceptedPreviewPublicationLatencyHigh",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismAcceptedRevisionWorkPending"
+      ],
+      "reason": "Native pending age and build deadlines cover delayed/degraded delivery; histogram result labels preserve completed-path attribution. This is a frontend-local acceptance-to-mining.notify boundary, not the retired preview publication boundary."
     },
     {
       "uid": "qbit-prism-preview-publish-latency-crit",
       "title": "PrismAcceptedPreviewPublicationLatencyCritical",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismAcceptedRevisionWorkPendingCritical"
+      ],
+      "reason": "Native pending age covers the acceptance-to-delivered-revision-work stall before a latency sample exists; the provisional 307-second critical floor is incident duration, not early-warning evidence."
     },
     {
       "uid": "qbit-prism-preview-publish-degraded",
       "title": "PrismAcceptedPreviewPublicationDegraded",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismAcceptedRevisionWorkPending",
+        "PrismRevisionWorkBuildTimeouts"
+      ],
+      "reason": "Native pending age and build deadlines cover delayed/degraded delivery; histogram result labels preserve completed-path attribution. This is a frontend-local acceptance-to-mining.notify boundary, not the retired preview publication boundary."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts",
       "title": "PrismAcceptedParentPreviewWaitTimeouts",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismRevisionWorkBuildTimeouts"
+      ],
+      "reason": "Native build-deadline events replace preview-wait timeouts; the two historical severities consolidate into one warning rule, with pending age providing sustained-stall critical severity."
     },
     {
       "uid": "qbit-prism-parent-preview-timeouts-crit",
       "title": "PrismAcceptedParentPreviewWaitTimeoutsCritical",
       "external": false,
-      "disposition": "no-replacement",
-      "replacement": [],
-      "reason": "No replacement: native accepted-preview/landing-phase instrumentation is absent; proof-to-first-offer is a different boundary and is declared, rule deferred to A/#266."
+      "disposition": "migrated",
+      "replacement": [
+        "PrismRevisionWorkBuildTimeouts"
+      ],
+      "reason": "Native build-deadline events replace preview-wait timeouts; the two historical severities consolidate into one warning rule, with pending age providing sustained-stall critical severity."
     },
     {
       "uid": "qbit-prism-unresolved-parent-depth",
@@ -765,23 +776,31 @@
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_to_revision_work_seconds"
+      ],
+      "reason": "New frontend-local acceptance-to-successful-mining.notify boundary; closed result labels, different bucket ladder and restart/observation horizon are documented in prism-native-metrics.md."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_bucket",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_to_revision_work_seconds"
+      ],
+      "reason": "New frontend-local acceptance-to-successful-mining.notify boundary; closed result labels, different bucket ladder and restart/observation horizon are documented in prism-native-metrics.md."
     },
     {
       "name": "qbit_prism_accepted_block_preview_publication_seconds_count",
-      "replacement": [],
-      "reason": "No replacement: accepted landing/preview publication is not proof-to-first-node-offer; landing phases are outside trimmed #278. First-offer timing is declared, rule deferred to A/#266."
+      "replacement": [
+        "qbit_prism_accepted_block_to_revision_work_seconds"
+      ],
+      "reason": "New frontend-local acceptance-to-successful-mining.notify boundary; closed result labels, different bucket ladder and restart/observation horizon are documented in prism-native-metrics.md."
     },
     {
       "name": "qbit_prism_accepted_parent_preview_wait_timeouts_total",
-      "replacement": [],
-      "reason": "No replacement: Python unresolved-parent/preview-wait state machine is absent; pending candidate rows are a different contract."
+      "replacement": [
+        "qbit_prism_revision_work_build_timeouts_total"
+      ],
+      "reason": "Existing native build-deadline hits while accepted revision work awaits delivery; no new preview-wait mechanism or deadline is introduced."
     },
     {
       "name": "qbit_prism_accepted_parent_unresolved_depth_max",
