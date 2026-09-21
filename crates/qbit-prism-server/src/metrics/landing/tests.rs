@@ -310,3 +310,42 @@ async fn proven_orphan_closes_without_delivery_and_keeps_its_deduplication_horiz
     m.accepted_block(&hash, 1);
     assert!(m.landing.lock().unwrap().blocks.is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_revision_history_cannot_publish_an_obsolete_write() {
+    for overflow in [false, true] {
+        let m = Metrics::default();
+        let hash = "11".repeat(32);
+        m.accepted_block(&hash, 1);
+        m.landed_block(&hash, 1);
+        for revision in 2..=LIMIT as i64 {
+            m.revision_work_observed(revision);
+        }
+        if overflow {
+            m.revision_work_observed(LIMIT as i64 + 1);
+        }
+        tick().await;
+        m.revision_work_delivered(LIMIT as i64);
+        assert_eq!(count(&m, "superseded"), f64::from(!overflow));
+        assert_eq!(age(&m), if overflow { -1. } else { 0. });
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_delivery_history_blocks_late_binding_without_losing_safe_samples() {
+    let m = Metrics::default();
+    for id in 0..LIMIT {
+        m.accepted_block(&format!("{id:064x}"), 1);
+        tick().await;
+        m.revision_work_delivered(7);
+    }
+    m.landed_block(&format!("{:064x}", LIMIT - 1), 7);
+    assert_eq!(count(&m, "published"), 1.);
+    m.revision_work_delivered(8);
+    m.landed_block(&format!("{:064x}", 0), 7);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(age(&m), -1.);
+    let state = m.landing.lock().unwrap();
+    assert_eq!(state.delivery_count, LIMIT);
+    assert!(state.ordering_lost);
+}

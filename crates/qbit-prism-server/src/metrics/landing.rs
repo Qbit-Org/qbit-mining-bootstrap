@@ -42,6 +42,7 @@ pub(super) struct Landing {
     blocks: HashMap<[u8; 32], Acceptance>,
     revisions: BTreeMap<i64, Revision>,
     saturated: bool,
+    ordering_lost: bool,
     observation: u64,
     completed: u64,
     failed: bool,
@@ -73,13 +74,14 @@ impl Landing {
     fn revision(&mut self, revision: i64) -> Option<&mut Revision> {
         if self.revisions.len() == LIMIT && !self.revisions.contains_key(&revision) {
             self.saturated = true;
+            self.ordering_lost = true;
             return None;
         }
         Some(self.revisions.entry(revision).or_default())
     }
 
     fn resolve(&mut self, registry: &mut Registry) {
-        if !self.pending() {
+        if !self.pending() || self.ordering_lost {
             return;
         }
         // Compute eligible writes once, newest revision first. A delayed write
@@ -303,6 +305,7 @@ impl Metrics {
                 }
                 if state.delivery_count == LIMIT {
                     state.saturated = true;
+                    state.ordering_lost = true;
                 } else if let Some(event) = state.revision(revision) {
                     event.deliveries.push((epoch, Instant::now()));
                     state.delivery_count += 1;
