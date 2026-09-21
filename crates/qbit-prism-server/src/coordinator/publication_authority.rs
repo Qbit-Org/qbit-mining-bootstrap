@@ -1,5 +1,5 @@
 //! Ordered local authority guards and fixed database-derived deadlines.
-use super::tip_observation::PublishedLease;
+use super::tip_observation::{LeaseSelection, PublishedLease};
 use super::*;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 use tokio::time::Instant as MonotonicInstant;
@@ -141,7 +141,7 @@ pub(super) struct LeaseCommitFence {
 pub(super) enum LeaseCommitRefusal {
     /// The original publication/expiry no longer authorizes this append.
     Stale,
-    /// Lock contention or unknown/unhealthy readiness proves no staleness.
+    /// Unavailable locks, readiness or tip observations prove no staleness.
     Unavailable,
 }
 
@@ -162,10 +162,12 @@ impl LeaseCommitFence {
         {
             return Err(LeaseCommitRefusal::Stale);
         }
-        match self.lease.select(&view, &self.config) {
-            Ok(Some(_)) => {}
-            Ok(None) => return Err(LeaseCommitRefusal::Stale),
-            Err(_) => return Err(LeaseCommitRefusal::Unavailable),
+        match self.lease.select_with_cause(&view, &self.config) {
+            Ok(LeaseSelection::Selected(..)) => {}
+            Ok(LeaseSelection::Stale) => return Err(LeaseCommitRefusal::Stale),
+            Ok(LeaseSelection::Unavailable) | Err(_) => {
+                return Err(LeaseCommitRefusal::Unavailable)
+            }
         }
         let won = commit();
         drop(view);

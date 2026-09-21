@@ -119,8 +119,12 @@ classification, not payout eligibility, stale grace, candidate authority or
 the share acknowledgement deadline. No new credit is recorded for this refusal.
 
 Gate closure alone does **not** prove stale work. Unavailable authority locks,
-unhealthy/unknown readiness and a share acknowledgement deadline that closes
-before COMMIT remain `ledger-confirmation-failed` (code **20**). The winning
+unhealthy/unknown readiness, an unavailable tip observation and a share
+acknowledgement deadline that closes before COMMIT remain
+`ledger-confirmation-failed` (code **20**). For example, a non-refresh probe
+may observe a return to the published parent while its cached observation
+has aged out: that does not prove the unchanged publication or original
+lease expired, and the refused append remains a backend failure. The winning
 closure cause is fixed atomically: a subsequent tip change cannot turn a
 timeout or backend refusal into an expected stale race. Once COMMIT has
 started, later lease changes cannot change its result: confirmed credit stays
