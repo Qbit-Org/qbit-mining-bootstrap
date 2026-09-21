@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 5260ac4576584f7680c4e8d46e02e73d9225dea3c2a81280176a2e32782eb4de
++   Specification SHA-256: f73f6626c9e94af8a548c3a91bb4474d108efbce9cd34b4b662a40a65f8586d0
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -638,7 +638,7 @@
 +  {
 +    "uid": "qbit-prism-revision-work-pending",
 +    "title": "PrismAcceptedRevisionWorkPending",
-+    "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0), 1)",
++    "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)), 1)",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -649,7 +649,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismAcceptedRevisionWorkPending",
-+    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn.",
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
 +  },

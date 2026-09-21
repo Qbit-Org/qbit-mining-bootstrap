@@ -692,7 +692,7 @@
       "uid": "qbit-prism-revision-work-pending",
       "title": "PrismAcceptedRevisionWorkPending",
       "role": "run",
-      "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0), 1)",
+      "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)), 1)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -703,10 +703,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismAcceptedRevisionWorkPending",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
-      "basis": "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn.",
+      "basis": "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",

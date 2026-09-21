@@ -68,7 +68,8 @@ families! {
     Coverage: Gauge, "stratum_semantic_current_work_ratio", "Fraction of authorized connections with current semantic work; one when no clients are authorized.";
     FirstOffer: Histogram, "block_submit_seconds", "Locally validated block proof to first node offer; requires the offer owner's timestamp boundary.";
     RevisionWork: Histogram, "accepted_block_to_revision_work_seconds", "Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds.";
-    RevisionWorkPending: Gauge, "accepted_block_revision_work_pending_seconds", "Monotonic age of the oldest locally observed acceptance still awaiting revision work delivery; zero when none, -1 when tracking is unknown.";
+    RevisionWorkPending: Gauge, "accepted_block_revision_work_pending_seconds", "Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none.";
+    RevisionWorkUnknown: Gauge, "accepted_block_revision_work_tracking_unknown", "Whether any local landing observation is unknown or incomplete; independent of known pending delivery age.";
     RevisionWorkTimeouts: Counter, "revision_work_build_timeouts_total", "Existing build deadlines actually hit while accepted-block revision work is pending on this frontend.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
@@ -130,6 +131,7 @@ impl Family {
                 Self::PoolAcquire
                     | Self::RevisionWork
                     | Self::RevisionWorkPending
+                    | Self::RevisionWorkUnknown
                     | Self::RevisionWorkTimeouts
             )
     }

@@ -48,7 +48,8 @@ rendering the startup registry does not create a publication timestamp.
 
 | Family | Type | Labels | Role | Meaning / status | 2.x.x name replaced |
 | --- | --- | --- | --- | --- | --- |
-| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest locally observed acceptance still awaiting revision work delivery; zero when none, -1 when tracking is unknown. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest unresolved delivery wait; a failed build does not clear it. | none |
+| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. | none |
+| `qbit_prism_accepted_block_revision_work_tracking_unknown` | gauge | none | run | Whether any local landing observation is unknown or incomplete; independent of known pending delivery age. Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels. | none |
 | `qbit_prism_accepted_block_to_revision_work_seconds` | histogram | `result=published,degraded,superseded` | run | Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds. Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds. | `qbit_prism_accepted_block_preview_publication_seconds` |
 | `qbit_prism_accepted_shares_total` | counter | none | run | Shares accepted by this instance since process start. Process-local counter; legacy canonical ledger count was persistent. | `qbit_prism_accepted_shares_total` |
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
@@ -319,13 +320,17 @@ checkpoint retires their height. A monotonic height watermark then rejects
 delayed proofs even after the identity is released; unresolved intervals are
 never retired by that checkpoint. Revision events are released when all known
 deliveries resolve. Nothing is evicted to make a duplicate look new.
-Exceeding either bound sets the pending gauge to **-1 until restart**; missing
-identities then have no fabricated histogram observations. Within this horizon,
+Exceeding a bound sets `accepted_block_revision_work_tracking_unknown` to
+**1 until restart**. Missing identities have no fabricated observations; known
+pending ages remain visible after identity-only saturation. Lost revision or
+delivery history additionally sets pending age to -1 and suppresses terminal
+samples because supersession or the first delivery can no longer be proven.
+Within this horizon,
 a tracked block has at most one terminal sample, and exactly one once its
 revision and qualifying delivery are both known. Process restart loses
 unresolved intervals and deduplication history, and begins new local proof
 clocks rather than replaying peer timestamps. If a local settlement commits but
-its exact-revision reply is lost or cancelled, the gauge is -1 and the interval
+its exact-revision reply is lost or cancelled, tracking is unknown and the interval
 stays unresolved: a current-revision proof cannot safely reconstruct that
 original revision. A later proven first confirmation can recover an attempt
 that did not commit; an already-confirmed replay cannot invent the lost fact.
@@ -335,6 +340,21 @@ a newly observed already-confirmed peer block may begin at its current local
 proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries
 requires durable observation metadata and is not claimed here.
+
+Unknown tracking is independent of known pending age: an unknown interval A
+cannot hide a measured interval B crossing the critical threshold. Pending age
+is -1 when no known interval remains but tracking is unknown, and zero only
+when the observed empty state is known. The separate unknown gauge stays one
+even while a known interval's positive age is reported. A rejected transaction
+before COMMIT does not invent a lost outcome. Operator recovery uses the same
+committed revision evidence as ordinary settlement, and a proven first
+confirmation remains authoritative regardless of observer arrival order.
+
+A successfully committed proven orphan closes its delivery wait without a
+histogram sample: it has no eligible delivery target. Its identity remains a
+deduplication tombstone through the same mature watermark, including if later
+chain reconciliation reactivates it; this does not change payout credit or
+block-confirmation counting. A lost orphan commit reply is not guessed.
 
 A failed or cancelled refresh preserves known pending age. If no unresolved
 acceptance is known, that failed observation yields -1 rather than a fabricated
@@ -357,8 +377,8 @@ The required PostgreSQL/fake-node/socket tests are in
 `crates/qbit-prism-server/tests/landing_metrics.rs`; state ordering, saturation,
 unknown measurements and live cached-body overlays are in
 `crates/qbit-prism-server/src/metrics/landing/tests.rs`. The independent census
-is 50 run-role families, 213 startup series and 311 populated series on this
-base, with exactly these three new families relative to #450.
+is 51 run-role families, 214 startup series and 312 populated series on this
+base, with exactly these four new families relative to #450.
 
 ## Diagnosing Stratum admission saturation
 

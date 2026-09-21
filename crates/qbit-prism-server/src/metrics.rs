@@ -65,6 +65,7 @@ impl Metrics {
             Family::LateConfirmed,
             Family::CandidatesOrphaned,
             Family::RevisionWorkPending,
+            Family::RevisionWorkUnknown,
             Family::RevisionWorkTimeouts,
         ] {
             registry.register(family, vec![], 0.);
@@ -164,6 +165,11 @@ impl Metrics {
         let collections = self.collections.lock().unwrap_or_else(|e| e.into_inner());
         let mut registry = stored.clone();
         registry.set(Family::RevisionWorkPending, Labels::Empty, landing.age());
+        registry.set(
+            Family::RevisionWorkUnknown,
+            Labels::Empty,
+            f64::from(landing.unknown()),
+        );
         for collector in Collector::ALL {
             let state = collections.get(collector);
             let age = state

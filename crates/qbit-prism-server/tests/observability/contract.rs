@@ -136,6 +136,7 @@ pub fn expected(populated: bool) -> Census {
         "metrics_snapshot_age_seconds",
         "stratum_connection_limit",
         "accepted_block_revision_work_pending_seconds",
+        "accepted_block_revision_work_tracking_unknown",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }

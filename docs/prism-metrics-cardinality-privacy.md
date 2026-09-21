@@ -7,8 +7,8 @@ generated from registry descriptors or the inventory document. The census
 compares every family name and type, requires one HELP and TYPE per family, and
 compares every sample name and complete label tuple. Duplicate samples fail.
 
-The current bound is **50 families and 311 series**, including histogram
-`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **213 series**:
+The current bound is **51 families and 312 series**, including histogram
+`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **214 series**:
 first-offer and advisory-lock metadata exist, but their 98 derived series remain
 absent until observations occur. All 14 rejection reasons, two ACK outcomes,
 two pool outcomes, six lock/outcome pairs, two collectors, ten task kinds, two
@@ -16,9 +16,9 @@ connection refusal reasons, four stale-job causes and three revision-work result
 are independently pinned, including ACK's 15/20-second buckets and CTV chunk
 rows' one-row bucket and the landing ladder from 0.25 through 600 seconds.
 
-#458 adds exactly three families and 47 startup/populated series: 45 histogram
-series for `result=published|degraded|superseded`, one pending gauge and one
-timeout counter. Block identities remain inside the bounded observation state;
+#458 adds exactly four families and 48 startup/populated series: 45 histogram
+series for `result=published|degraded|superseded`, a pending gauge, a separate
+unlabeled tracking-unknown gauge and one timeout counter. Block identities remain inside the bounded observation state;
 there is no frontend, worker, block, height or job label. The real offer/delivery
 privacy assertion is `landing_metrics::lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout`.
 Adjacent node/rollup additions are outside this branch's census and must be
@@ -28,7 +28,8 @@ combined explicitly when integrating another metrics change.
 drives every public enum variant and repeats varied values, missing and arbitrary
 reasons, successful zero observations, failed collections and cancelled
 collections. Neither observation values nor failure states may introduce names
-or labels. Unknown remains -1, distinct from a fresh successful zero. This is a
+or labels. Unknown-only landing age remains -1; its separate boolean unknown
+gauge can coexist with a known pending age, distinct from a fresh successful zero. This is a
 run-role qualification; public-api family and label contracts are unchanged.
 
 Privacy checks cover two producer-to-render paths:

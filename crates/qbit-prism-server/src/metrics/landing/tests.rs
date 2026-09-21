@@ -196,9 +196,11 @@ async fn long_stall_saturation_is_bounded_unknown_and_never_recounts_evicted_ids
     tick().await;
     assert_eq!(age(&m), 1.);
     m.accepted_block(&format!("{:064x}", LIMIT), 1);
-    assert_eq!(age(&m), -1.);
+    assert_eq!(age(&m), 1.);
+    assert!(m.landing.lock().unwrap().unknown());
     m.revision_work_refresh().succeeded();
-    assert_eq!(age(&m), -1.);
+    assert_eq!(age(&m), 1.);
+    assert!(m.landing.lock().unwrap().unknown());
     let state = m.landing.lock().unwrap();
     assert_eq!(state.blocks.len(), LIMIT);
     drop(state);
@@ -207,7 +209,8 @@ async fn long_stall_saturation_is_bounded_unknown_and_never_recounts_evicted_ids
     m.revision_work_delivered(1);
     m.accepted_block(&format!("{:064x}", 0), 1);
     assert_eq!(count(&m, "published"), 1.);
-    assert_eq!(age(&m), -1.);
+    assert_eq!(age(&m), 1.);
+    assert!(m.landing.lock().unwrap().unknown());
     // Freeing completed history cannot restart a previously missed acceptance
     // clock after saturation. Only a process restart opens a new horizon.
     m.revision_work_matured(1);
@@ -259,24 +262,6 @@ async fn concurrent_reconciliation_cannot_steal_inflight_settlement_identity() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmation_recovers() {
-    for first in [true, false] {
-        let m = Metrics::default();
-        let hash = "11".repeat(32);
-        m.accepted_block(&hash, 1);
-        drop(m.revision_work_settlement(&hash));
-        assert_eq!(age(&m), -1.);
-        m.observed_landed_block(&hash, 3);
-        m.revision_work_delivered(3);
-        assert_eq!(age(&m), -1.);
-        assert_eq!(count(&m, "published"), 0.);
-        m.revision_work_settlement(&hash).committed(first, 3);
-        assert_eq!(age(&m), if first { 0. } else { -1. });
-        assert_eq!(count(&m, "published"), f64::from(first));
-    }
-}
-
-#[tokio::test(start_paused = true)]
 async fn first_confirmation_wins_even_when_its_observer_started_second() {
     let m = Metrics::default();
     let hash = "11".repeat(32);
@@ -288,6 +273,75 @@ async fn first_confirmation_wins_even_when_its_observer_started_second() {
     m.revision_work_delivered(7);
     assert_eq!(age(&m), 0.);
     assert_eq!(count(&m, "published"), 1.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_revision_history_cannot_publish_an_obsolete_write() {
+    for overflow in [false, true] {
+        let m = Metrics::default();
+        let hash = "11".repeat(32);
+        m.accepted_block(&hash, 1);
+        m.landed_block(&hash, 1);
+        for revision in 2..=LIMIT as i64 {
+            m.revision_work_observed(revision);
+        }
+        if overflow {
+            m.revision_work_observed(LIMIT as i64 + 1);
+        }
+        tick().await;
+        m.revision_work_delivered(LIMIT as i64);
+        assert_eq!(count(&m, "superseded"), f64::from(!overflow));
+        assert_eq!(age(&m), if overflow { -1. } else { 0. });
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_revision_cannot_hide_a_separate_known_stall() {
+    let m = Metrics::default();
+    let unknown = "11".repeat(32);
+    m.accepted_block(&unknown, 1);
+    drop(m.revision_work_settlement(&unknown));
+    let known = "22".repeat(32);
+    m.accepted_block(&known, 2);
+    m.landed_block(&known, 7);
+    tokio::time::advance(Duration::from_secs(308)).await;
+    assert_eq!(age(&m), 308.);
+    assert_eq!(
+        sample(
+            &m.render(),
+            "qbit_prism_accepted_block_revision_work_tracking_unknown"
+        ),
+        1.
+    );
+    m.revision_work_delivered(7);
+    assert_eq!(age(&m), -1.);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(
+        sample(
+            &m.render(),
+            "qbit_prism_accepted_block_revision_work_tracking_unknown"
+        ),
+        1.
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_delivery_history_blocks_late_binding_without_losing_safe_samples() {
+    let m = Metrics::default();
+    for id in 0..LIMIT {
+        m.accepted_block(&format!("{id:064x}"), 1);
+        tick().await;
+        m.revision_work_delivered(7);
+    }
+    m.landed_block(&format!("{:064x}", LIMIT - 1), 7);
+    assert_eq!(count(&m, "published"), 1.);
+    m.revision_work_delivered(8);
+    m.landed_block(&format!("{:064x}", 0), 7);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(age(&m), -1.);
+    let state = m.landing.lock().unwrap();
+    assert_eq!(state.delivery_count, LIMIT);
+    assert!(state.ordering_lost);
 }
 
 #[tokio::test(start_paused = true)]
@@ -312,40 +366,19 @@ async fn proven_orphan_closes_without_delivery_and_keeps_its_deduplication_horiz
 }
 
 #[tokio::test(start_paused = true)]
-async fn exhausted_revision_history_cannot_publish_an_obsolete_write() {
-    for overflow in [false, true] {
+async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmation_recovers() {
+    for first in [true, false] {
         let m = Metrics::default();
         let hash = "11".repeat(32);
         m.accepted_block(&hash, 1);
-        m.landed_block(&hash, 1);
-        for revision in 2..=LIMIT as i64 {
-            m.revision_work_observed(revision);
-        }
-        if overflow {
-            m.revision_work_observed(LIMIT as i64 + 1);
-        }
-        tick().await;
-        m.revision_work_delivered(LIMIT as i64);
-        assert_eq!(count(&m, "superseded"), f64::from(!overflow));
-        assert_eq!(age(&m), if overflow { -1. } else { 0. });
+        drop(m.revision_work_settlement(&hash));
+        assert_eq!(age(&m), -1.);
+        m.observed_landed_block(&hash, 3);
+        m.revision_work_delivered(3);
+        assert_eq!(age(&m), -1.);
+        assert_eq!(count(&m, "published"), 0.);
+        m.revision_work_settlement(&hash).committed(first, 3);
+        assert_eq!(age(&m), if first { 0. } else { -1. });
+        assert_eq!(count(&m, "published"), f64::from(first));
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn exhausted_delivery_history_blocks_late_binding_without_losing_safe_samples() {
-    let m = Metrics::default();
-    for id in 0..LIMIT {
-        m.accepted_block(&format!("{id:064x}"), 1);
-        tick().await;
-        m.revision_work_delivered(7);
-    }
-    m.landed_block(&format!("{:064x}", LIMIT - 1), 7);
-    assert_eq!(count(&m, "published"), 1.);
-    m.revision_work_delivered(8);
-    m.landed_block(&format!("{:064x}", 0), 7);
-    assert_eq!(count(&m, "published"), 1.);
-    assert_eq!(age(&m), -1.);
-    let state = m.landing.lock().unwrap();
-    assert_eq!(state.delivery_count, LIMIT);
-    assert!(state.ordering_lost);
 }

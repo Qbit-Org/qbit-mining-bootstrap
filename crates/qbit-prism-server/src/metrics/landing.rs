@@ -58,17 +58,21 @@ impl Landing {
     }
 
     pub(super) fn age(&self) -> f64 {
-        if self.saturated || self.blocks.values().any(|block| block.unknown_revision) {
+        if self.ordering_lost {
             return -1.;
         }
         self.blocks
             .values()
-            .filter(|block| !block.closed)
+            .filter(|block| !block.closed && !block.unknown_revision)
             .map(|block| block.at)
             .min()
-            .map_or(if self.failed { -1. } else { 0. }, |at| {
+            .map_or(if self.unknown() { -1. } else { 0. }, |at| {
                 at.elapsed().as_secs_f64()
             })
+    }
+
+    pub(super) fn unknown(&self) -> bool {
+        self.saturated || self.failed || self.blocks.values().any(|block| block.unknown_revision)
     }
 
     fn revision(&mut self, revision: i64) -> Option<&mut Revision> {
