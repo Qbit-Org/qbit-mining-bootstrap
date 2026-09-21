@@ -129,6 +129,15 @@ async fn late_lease_append_and_issued_save_recheck_publication_and_epoch() {
                 changed == "unchanged",
                 "{operation}/{changed}"
             );
+            if operation == "append" && changed == "publication" {
+                stale_causes::assert_stale_wire(result.unwrap_err(), "stale job");
+            } else if operation == "append" && changed == "epoch" {
+                assert_error(
+                    result.unwrap_err(),
+                    "ledger-confirmation-failed",
+                    "share was not committed because its commit gate closed",
+                );
+            }
             let records = f.store.records.lock().unwrap();
             assert_eq!(
                 records.len(),
@@ -757,6 +766,15 @@ async fn lease_or_resumed_wire_expiry_before_commit_refuses_without_records() {
             .await
             .unwrap();
         let revision = prepare_replacement_lease(&f).await;
+        if expired == "lease" {
+            // Capture the original proof with about one second remaining;
+            // changing only the shared tip later would not expire that proof.
+            f.coordinator
+                .observed_tip
+                .write()
+                .await
+                .expire_lease_for_test(Duration::from_secs(119));
+        }
         let resumed = f
             .coordinator
             .resume_job(&job.context.worker, &job.wire.job_id)
@@ -777,11 +795,17 @@ async fn lease_or_resumed_wire_expiry_before_commit_refuses_without_records() {
             .await
             .unwrap();
         if expired == "lease" {
-            f.coordinator
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(f
+                .coordinator
                 .observed_tip
-                .write()
+                .read()
                 .await
-                .expire_lease_for_test(Duration::from_secs(121));
+                .authority(
+                    f.coordinator.config.submit_tip_max_age,
+                    f.coordinator.config.template_refresh_failure_exit,
+                )
+                .is_none());
         } else {
             // Use the real monotonic deadline produced by resume, with the
             // database clock unchanged. A fresh scalar DB read cannot extend it.
@@ -796,12 +820,153 @@ async fn lease_or_resumed_wire_expiry_before_commit_refuses_without_records() {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_eq!(
-            error.response(json!(41))["error"][2]["reason_id"],
-            "ledger-confirmation-failed",
-            "{expired}: an append refused before COMMIT has a definite outcome"
-        );
+        stale_causes::assert_stale_wire(error, "stale job");
         assert!(f.store.records.lock().unwrap().is_empty(), "{expired}");
+    }
+}
+
+#[tokio::test]
+async fn aged_tip_observation_after_return_is_not_a_proven_stale_commit() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f).await;
+    f.coordinator
+        .observed_tip
+        .write()
+        .await
+        .age_for_test(Duration::from_secs(30));
+    f.detect(2).await;
+    let (publication, departure) = {
+        let tip = f.coordinator.observed_tip.read().await;
+        (tip.publication_stamp(), tip.divergence_for_test().unwrap())
+    };
+    let revision = f.store.revision.load(Ordering::SeqCst);
+    let gate = Arc::new(Gate::default());
+    *f.store.append_gate.lock().unwrap() = Some(gate.clone());
+    let proof = f.proof(&job, 0);
+    let coordinator = f.coordinator.clone();
+    let pending_job = job.clone();
+    let pending = tokio::spawn(async move {
+        coordinator
+            .submit(
+                &pending_job.context.worker,
+                &pending_job,
+                proof,
+                false.into(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+
+    // A candidate probe observes a return without refreshing the published
+    // tip's age. The original replacement interval and publication are live.
+    f.node.lock().unwrap().tip = hash(1);
+    f.coordinator.observe_chain_info(false).await.unwrap();
+    {
+        let tip = f.coordinator.observed_tip.read().await;
+        assert_eq!(tip.as_deref(), Some(hash(1).as_str()));
+        assert_eq!(tip.publication_stamp(), publication);
+        assert_eq!(tip.divergence_for_test(), Some(departure));
+        assert!(departure.elapsed() < f.coordinator.config.template_refresh_failure_exit);
+        assert!(tip
+            .authority(
+                f.coordinator.config.submit_tip_max_age,
+                f.coordinator.config.template_refresh_failure_exit,
+            )
+            .is_none());
+    }
+    assert_eq!(f.store.revision.load(Ordering::SeqCst), revision);
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &job.context.prepared
+    ));
+    gate.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_error(
+        error,
+        "ledger-confirmation-failed",
+        "share was not committed because its commit gate closed",
+    );
+    assert!(f.store.records.lock().unwrap().is_empty());
+    assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 0);
+
+    // The job is still current: a new admission can obtain ordinary authority
+    // from the existing live-RPC fallback without a replacement publication.
+    f.submit(&job, false).await.unwrap();
+    assert_eq!(f.store.records.lock().unwrap().len(), 1);
+    assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.coordinator.observed_tip.read().await.publication_stamp(),
+        publication
+    );
+}
+
+#[tokio::test]
+async fn commit_gate_contention_or_unknown_readiness_is_not_stale() {
+    for changed in [
+        "prepared-lock",
+        "readiness-lock",
+        "tip-lock",
+        "readiness-unknown",
+    ] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        f.coordinator.refresh_once().await.unwrap();
+        let job = issued(&f).await;
+        prepare_replacement_lease(&f).await;
+        let gate = Arc::new(Gate::default());
+        *f.store.append_gate.lock().unwrap() = Some(gate.clone());
+        let proof = f.proof(&job, 0);
+        let coordinator = f.coordinator.clone();
+        let pending = tokio::spawn(async move {
+            coordinator
+                .submit(&job.context.worker, &job, proof, false.into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        if changed == "readiness-unknown" {
+            f.coordinator.invalidate_readiness().await;
+        }
+        let prepared = if changed == "prepared-lock" {
+            Some(f.coordinator.prepared.write().await)
+        } else {
+            None
+        };
+        let readiness = if changed == "readiness-lock" {
+            Some(f.coordinator.readiness.write().await)
+        } else {
+            None
+        };
+        let tip = if changed == "tip-lock" {
+            Some(f.coordinator.observed_tip.write().await)
+        } else {
+            None
+        };
+        gate.release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        drop((prepared, readiness, tip));
+        assert_error(
+            error,
+            "ledger-confirmation-failed",
+            "share was not committed because its commit gate closed",
+        );
+        assert!(f.store.records.lock().unwrap().is_empty(), "{changed}");
+        assert_eq!(
+            f.coordinator.accepted.load(Ordering::SeqCst),
+            0,
+            "{changed}"
+        );
     }
 }
 

@@ -25,6 +25,13 @@ pub(super) struct PublishedLease {
     deadline: MonotonicInstant,
 }
 
+/// A missing observation cannot by itself prove that the original work expired.
+pub(super) enum LeaseSelection {
+    Selected(Arc<Prepared>, TipView),
+    Stale,
+    Unavailable,
+}
+
 pub(super) struct WorkAuthority {
     pub revision: i64,
     pub lease: Option<PublishedLease>,
@@ -65,28 +72,55 @@ impl PublishedLease {
         view: &AuthorityView<'_>,
         config: &Config,
     ) -> Result<Option<(Arc<Prepared>, TipView)>> {
+        // Preserve the existing admission/revalidation contract. The commit
+        // fence additionally needs the cause of a refused selection.
+        Ok(match self.select_with_cause(view, config)? {
+            LeaseSelection::Selected(current, tip) => Some((current, tip)),
+            LeaseSelection::Stale | LeaseSelection::Unavailable => None,
+        })
+    }
+
+    pub(super) fn select_with_cause(
+        &self,
+        view: &AuthorityView<'_>,
+        config: &Config,
+    ) -> Result<LeaseSelection> {
         ensure!(
             view.readiness.generation == self.readiness_epoch && view.readiness.last_poll.is_some(),
             "node readiness changed during replacement lease admission"
         );
         let Some(current) = view.prepared.as_ref().filter(|p| self.identity.matches(p)) else {
-            return Ok(None);
+            return Ok(LeaseSelection::Stale);
         };
         if view.tip.publication_stamp() != self.published_tip {
-            return Ok(None);
+            return Ok(LeaseSelection::Stale);
         }
-        let tip = view
-            .tip
-            .authority(
-                config.submit_tip_max_age,
-                config.template_refresh_failure_exit,
-            )
-            .filter(|tip| {
-                Some(tip.hash.as_str()) == self.identity.parent.as_deref()
-                    && ((tip.share_lease && MonotonicInstant::now() <= self.deadline)
-                        || (view.tip.as_deref() == self.identity.parent.as_deref()
-                            && self.current_revision == self.identity.revision))
-            });
+        let tip = view.tip.authority(
+            config.submit_tip_max_age,
+            config.template_refresh_failure_exit,
+        );
+        if tip.is_none() {
+            // A non-refresh probe can observe a return to the published parent
+            // without renewing its cached observation. No new publication or
+            // original lease expiry is proven by that loss of ordinary proof.
+            // An expired original bound while still diverged is positive stale
+            // evidence even when the cached observation is also unavailable.
+            return Ok(
+                if view.tip.as_deref() != self.identity.parent.as_deref()
+                    && MonotonicInstant::now() > self.deadline
+                {
+                    LeaseSelection::Stale
+                } else {
+                    LeaseSelection::Unavailable
+                },
+            );
+        }
+        let tip = tip.filter(|tip| {
+            Some(tip.hash.as_str()) == self.identity.parent.as_deref()
+                && ((tip.share_lease && MonotonicInstant::now() <= self.deadline)
+                    || (view.tip.as_deref() == self.identity.parent.as_deref()
+                        && self.current_revision == self.identity.revision))
+        });
         if tip.as_ref().is_some_and(|tip| !tip.share_lease) {
             // Returning to the published parent grants only ordinary authority:
             // the original current revision and a fresh poll are still required.
@@ -97,7 +131,10 @@ impl PublishedLease {
                 "tip polling stale"
             );
         }
-        Ok(tip.map(|tip| (current.clone(), tip)))
+        Ok(match tip {
+            Some(tip) => LeaseSelection::Selected(current.clone(), tip),
+            None => LeaseSelection::Stale,
+        })
     }
 }
 

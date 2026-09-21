@@ -72,10 +72,15 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
         "stale-job" => {
             // Every `stale-job` is a race the server is entitled to lose: the
             // tip moved, the payout revision moved, or the job aged past
-            // retention. None of them persist a share.
+            // retention. This includes a typed pre-COMMIT refusal proving
+            // the original publication lease expired or was replaced.
+            // None of them persist a share.
             RejectionClass::Expected
         }
         "unknown-job" | "pool-closed" => RejectionClass::Expected,
+        // Older producers used ledger-confirmation-failed for every closed
+        // gate. Neither that reason nor its generic gate-closed message
+        // proves stale work: deadline, lock and readiness failures stay here.
         "backend-rpc-unavailable"
         | "ledger-confirmation-failed"
         | "ledger-outcome-unknown"
@@ -93,14 +98,12 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
     }
 }
 
-/// The rejection the coordinator returns when the share-commit path did not
-/// confirm inside `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, or when the append
-/// failed for another reason.
+/// A definite failure to record credit on current producers, including a
+/// deadline that won before COMMIT, or a gate with no proven stale cause.
 ///
-/// It is the only refusal that can be followed by the share appearing in
-/// PostgreSQL anyway: `coordinator.rs` wraps the append in
-/// `tokio::time::timeout(share_commit_timeout, save)`, and when that fires the
-/// sqlx future is dropped mid-COMMIT, which PostgreSQL may still complete.
+/// Historical producers could answer this while COMMIT was still in flight.
+/// Keep the reconciliation predicate for those reports; current uncertain
+/// COMMIT outcomes use `ledger-outcome-unknown` instead.
 pub const LEDGER_CONFIRMATION_FAILED: &str = "ledger-confirmation-failed";
 pub const NOT_CONFIRMED_BY_DATABASE: &str = "share was not confirmed by the database";
 
