@@ -19,6 +19,7 @@ struct Acceptance {
     degraded: Option<Instant>,
     awaiting_settlement: bool,
     unknown_revision: bool,
+    existing_revision: bool,
 }
 
 #[derive(Default)]
@@ -148,6 +149,16 @@ impl Metrics {
     }
 
     pub(crate) fn accepted_block(&self, hash: &str, height: u64) {
+        self.accept_block(hash, height, false);
+    }
+
+    /// First local proof of an already-confirmed block may associate the
+    /// coherent current revision. It cannot upgrade an earlier acceptance.
+    pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64) {
+        self.accept_block(hash, height, true);
+    }
+
+    fn accept_block(&self, hash: &str, height: u64, existing_revision: bool) {
         self.landing_event(|state, _| {
             let mut identity = [0; 32];
             if hex::decode_to_slice(hash, &mut identity).is_err() {
@@ -174,6 +185,7 @@ impl Metrics {
                     degraded: None,
                     awaiting_settlement: false,
                     unknown_revision: false,
+                    existing_revision,
                 },
             );
             state.pending_count += 1;
@@ -185,7 +197,7 @@ impl Metrics {
     /// proof cannot move the original target or restart its acceptance clock.
     #[cfg(test)]
     pub(crate) fn landed_block(&self, hash: &str, revision: i64) {
-        self.bind_landing(hash, revision, true, false);
+        self.bind_landing(hash, revision, true, true);
     }
 
     #[cfg(test)]
@@ -200,6 +212,9 @@ impl Metrics {
                 return;
             }
             if let Some(block) = state.blocks.get_mut(&identity) {
+                if settled && !first && block.revision.is_none() && !block.existing_revision {
+                    block.unknown_revision = true;
+                }
                 if first && block.unknown_revision {
                     block.unknown_revision = false;
                     block.revision = None;

@@ -899,7 +899,11 @@ impl Coordinator {
                 mature_height = mature_height.max(block.height);
             }
             if active && block.maturity_state != "mature" {
-                landing_targets.push((block.block_hash.clone(), block.height));
+                landing_targets.push((
+                    block.block_hash.clone(),
+                    block.height,
+                    block.chain_state == "confirmed",
+                ));
             }
             observations.push(BlockObservation {
                 block_hash: block.block_hash,
@@ -911,8 +915,12 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
-        for (hash, height) in &landing_targets {
-            self.metrics.accepted_block(hash, *height);
+        for (hash, height, confirmed) in &landing_targets {
+            if *confirmed {
+                self.metrics.accepted_landed_block(hash, *height);
+            } else {
+                self.metrics.accepted_block(hash, *height);
+            }
         }
         // Reconciliation and settlement both count the block's durable first
         // confirmation, regardless of the outbox state at that moment.

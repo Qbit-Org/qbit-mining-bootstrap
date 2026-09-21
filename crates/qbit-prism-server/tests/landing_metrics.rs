@@ -303,6 +303,35 @@ async fn delayed_settlement_reply_cannot_publish_an_older_acceptance_at_a_newer_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_confirmation_during_audit_reply_wait_cannot_invent_the_original_target() -> Result<()>
+{
+    run(gate::site!(), |f| Box::pin(async move {
+        f.refresh(true).await?;
+        f.node.accept_blocks();
+        let claim = queue_block(&f.a).await?;
+        sqlx::raw_sql("CREATE FUNCTION landing_insert_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_pool_blocks INSERT'; RETURN NEW; END $$; CREATE TRIGGER landing_insert_marker AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION landing_insert_marker();")
+            .execute(f.pool()).await?;
+        let reply = f.proxy.pause_after_commit("qbit_pool_blocks", "INSERT")?;
+        let frontend = f.a.clone();
+        let processing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move { frontend.process_candidate(&claim).await }));
+        timeout(Duration::from_secs(5), reply.entered()).await?;
+        f.b.refresh_once().await?;
+        land_from(f, &f.b).await?;
+        f.a.refresh_once().await?;
+        deliver(&f.a).await?;
+        ensure!(sample(&f.a.metrics, PENDING) == -1.);
+        ensure!(count(&f.a.metrics, "published") == 1., "later proof fabricated an original target");
+        ensure!(count(&f.a.metrics, "superseded") == 0., "unknown original revision was guessed");
+        reply.release();
+        timeout(Duration::from_secs(5), processing).await???;
+        ensure!(sample(&f.a.metrics, PENDING) == -1.);
+        ensure!(count(&f.a.metrics, "published") == 1.);
+        ensure!(count(&f.a.metrics, "superseded") == 0.);
+        Ok(())
+    })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_proof_confirmation_and_maturity_bind_the_same_committed_revision() -> Result<()> {
     run(gate::site!(), |f| {
         Box::pin(async move {

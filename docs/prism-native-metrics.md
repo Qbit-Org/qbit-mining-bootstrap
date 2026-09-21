@@ -329,6 +329,10 @@ its exact-revision reply is lost or cancelled, the gauge is -1 and the interval
 stays unresolved: a current-revision proof cannot safely reconstruct that
 original revision. A later proven first confirmation can recover an attempt
 that did not commit; an already-confirmed replay cannot invent the lost fact.
+The same unknown boundary applies when a peer confirms a locally accepted
+block during audit landing, before the local settlement observer starts. Only
+a newly observed already-confirmed peer block may begin at its current local
+proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries
 requires durable observation metadata and is not claimed here.
 
