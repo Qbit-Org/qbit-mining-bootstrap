@@ -1,8 +1,17 @@
 //! One anchored window per refresh loop, never retained by issued work.
 use super::*;
-use prepared_storage::compact::{CanonicalCompactBalances, CompactOwner};
+use prepared_storage::compact::{
+    prepare_refresh_body, CanonicalCompactBalances, CompactOwner, RefreshBody,
+};
+
+mod compute;
 
 pub(super) type CachedWindow = Arc<RefreshWindow>;
+type CapturedWindow = CompactOwner<(
+    CachedWindow,
+    Result<RefreshBody>,
+    Arc<tokio::sync::OwnedSemaphorePermit>,
+)>;
 
 pub(super) struct RefreshWindow {
     pub snapshot: Snapshot,
@@ -48,7 +57,10 @@ impl Coordinator {
         network: u128,
         permit: Arc<tokio::sync::OwnedSemaphorePermit>,
         prior: Option<crate::ledger::BlockingDrop<crate::ledger::RetainedShares>>,
-    ) -> Result<CompactOwner<CachedWindow>> {
+        template: Value,
+        suffix: String,
+        inputs: BundleInputs,
+    ) -> Result<CapturedWindow> {
         // The interval starts before the read, not after each template build.
         let anchored = Instant::now();
         let snapshot = self
@@ -59,36 +71,46 @@ impl Coordinator {
                 prior,
             )
             .await?;
-        let source = CompactOwner::new((snapshot, permit));
-        let result = source
+        let source = CompactOwner::new((snapshot, permit))
             .spawn_blocking(move |(snapshot, permit)| {
                 let admission = permit;
-                let crate::ledger::SnapshotCapture { mut snapshot, leaf } = snapshot.into_inner();
-                snapshot.prior_balances = CanonicalCompactBalances::prepare(
-                    std::mem::take(&mut snapshot.prior_balances),
+                let mut snapshot = snapshot.into_inner();
+                snapshot.snapshot.prior_balances = CanonicalCompactBalances::prepare(
+                    std::mem::take(&mut snapshot.snapshot.prior_balances),
                     &admission,
                 )
                 .into_original_build();
-                let reference = WindowRef::from_snapshot(&snapshot)?;
-                // Only this cache retains the full snapshot between refreshes.
-                // No idle build permit, share clone, or new digest format is needed.
-                // Full folds remain bounded by the existing builder; an incremental
-                // engine needs separate refresh-budget evidence before adoption.
-                Ok::<_, anyhow::Error>(CompactOwner::new((
-                    Arc::new(RefreshWindow {
-                        snapshot,
-                        reference,
-                        network,
-                        leaf,
-                        anchored,
-                    }),
-                    admission,
-                )))
+                CompactOwner::new((Arc::new(snapshot), admission))
             })
-            .await??;
-        let (window, permit) = result.into_inner();
-        let window = CompactOwner::new(window);
-        drop(permit);
-        Ok(window)
+            .await?;
+        let config = self.config.clone();
+        let computed = compute::pair(
+            source,
+            |capture| WindowRef::from_snapshot(&capture.snapshot),
+            move |capture| {
+                prepare_refresh_body(&config, &capture.snapshot, &template, suffix, inputs)
+            },
+        )
+        .await?;
+        computed
+            .spawn_blocking(move |computed| {
+                let admission = computed.3;
+                let (capture, reference, body, _) = computed;
+                let crate::ledger::SnapshotCapture { snapshot, leaf } = Arc::try_unwrap(capture)
+                    .ok()
+                    .expect("both borrowed computations have finished");
+                let reference = reference?;
+                let window = Arc::new(RefreshWindow {
+                    snapshot,
+                    reference,
+                    network,
+                    leaf,
+                    anchored,
+                });
+                // Keep the original cache behavior even when body preparation failed.
+                // That error is propagated by capture_refresh before reservation.
+                Ok(CompactOwner::new((window, body, admission)))
+            })
+            .await?
     }
 }

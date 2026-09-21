@@ -1,6 +1,121 @@
 use super::*;
 
 #[tokio::test]
+async fn overlapped_refresh_matches_serial_native_and_audit_bytes() {
+    for ctv in [false, true] {
+        for count in [0, 1, 512] {
+            let f = Fixture::build(
+                Duration::from_secs(10),
+                |config| {
+                    config.ctv_enabled = ctv;
+                    config.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 12000));
+                },
+                None,
+            )
+            .await;
+            {
+                let mut slot = f.store.snapshot.lock().unwrap();
+                let snapshot = slot.as_mut().unwrap();
+                let seed = snapshot.shares[0].clone();
+                snapshot.shares = (1..=count)
+                    .map(|seq| {
+                        let mut share = seed.clone();
+                        share.share_seq = seq;
+                        share.share_id = format!("overlap-{seq}");
+                        share
+                    })
+                    .collect();
+                snapshot.share_seq = count;
+                snapshot.prior_balances = vec![
+                    qbit_prism::CarryForwardBalance {
+                        recipient_id: "a".into(),
+                        order_key: "a".into(),
+                        p2mr_program_hex: hash(0x12),
+                        balance_sats: 123,
+                    },
+                    qbit_prism::CarryForwardBalance {
+                        recipient_id: "B".into(),
+                        order_key: "B".into(),
+                        p2mr_program_hex: hash(0x34),
+                        balance_sats: 456,
+                    },
+                ];
+            }
+            // First iteration uses both workers. Changing only the template
+            // uses the cached window and the serial preparation path.
+            for cached in [false, true] {
+                if cached {
+                    let mut template = f
+                        .coordinator
+                        .prepared
+                        .read()
+                        .await
+                        .as_ref()
+                        .unwrap()
+                        .template
+                        .clone();
+                    template["coinbasevalue"] = json!(500_000_001);
+                    f.node.lock().unwrap().template = Some(template);
+                }
+                f.coordinator.refresh_once().await.unwrap();
+                let prepared = f.coordinator.prepared.read().await.clone().unwrap();
+                let original = f.original(&prepared);
+                assert_eq!(
+                    prepared.window,
+                    WindowRef::from_snapshot(&original.snapshot).unwrap()
+                );
+                if let Some(range) = prepared.window.shares {
+                    let bytes = serde_json::to_vec(&original.snapshot.shares).unwrap();
+                    assert_eq!(
+                        range.snapshot_sha256,
+                        <[u8; 32]>::from(Sha256::digest(bytes))
+                    );
+                    let bundle = original.bundle.as_ref().unwrap();
+                    let bytes = qbit_prism::canonical_audit_bundle_bytes(bundle).unwrap();
+                    let hashes = prepared.reservation.record.audit_hashes.as_ref().unwrap();
+                    assert_eq!(
+                        hashes.audit_bundle_sha256,
+                        hex::encode(Sha256::digest(bytes))
+                    );
+                    assert_eq!(
+                        hashes.coinbase_manifest_sha256,
+                        hex::encode(Sha256::digest(
+                            serde_json::to_vec(&bundle.signed_coinbase_manifest.manifest).unwrap()
+                        ))
+                    );
+                } else {
+                    assert!(prepared.reservation.record.audit_hashes.is_none());
+                    assert!(prepared.bundle.is_none());
+                }
+                assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn simultaneous_refreshes_finish_with_one_build_slot_and_one_blocking_thread() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (first, second) =
+                tokio::join!(f.coordinator.refresh_once(), f.coordinator.refresh_once());
+            first.unwrap();
+            second.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(f.store.snapshots.lock().unwrap().len(), 1);
+        assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+    });
+}
+
+#[tokio::test]
 async fn economic_drift_during_fee_probe_defers_until_next_refresh() {
     let f = Fixture::build(
         Duration::from_secs(10),
