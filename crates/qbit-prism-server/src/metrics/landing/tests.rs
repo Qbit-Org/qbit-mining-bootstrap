@@ -208,6 +208,15 @@ async fn long_stall_saturation_is_bounded_unknown_and_never_recounts_evicted_ids
     m.accepted_block(&format!("{:064x}", 0), 1);
     assert_eq!(count(&m, "published"), 1.);
     assert_eq!(age(&m), -1.);
+    // Freeing completed history cannot restart a previously missed acceptance
+    // clock after saturation. Only a process restart opens a new horizon.
+    m.revision_work_matured(1);
+    let missed = format!("{:064x}", LIMIT);
+    m.accepted_block(&missed, 2);
+    m.landed_block(&missed, 1);
+    m.revision_work_delivered(1);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(m.landing.lock().unwrap().blocks.len(), LIMIT - 1);
 }
 
 #[tokio::test(start_paused = true)]

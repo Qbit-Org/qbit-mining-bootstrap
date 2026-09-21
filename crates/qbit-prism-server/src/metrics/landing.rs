@@ -157,7 +157,7 @@ impl Metrics {
             if state.blocks.contains_key(&identity) {
                 return;
             }
-            if height <= state.retired_height {
+            if state.saturated || height <= state.retired_height {
                 return;
             }
             if state.blocks.len() == LIMIT {

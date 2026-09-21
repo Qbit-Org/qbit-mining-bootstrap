@@ -312,17 +312,19 @@ async fn active_proof_confirmation_and_maturity_bind_the_same_committed_revision
             f.node.accept_blocks();
             let claim = queue_block(&f.a).await?;
             let hash = claim.candidate.block_hash.clone();
-            let mut reply = f.node.pause_next("submitblock")?;
+            sqlx::raw_sql("CREATE FUNCTION landing_insert_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_pool_blocks INSERT'; RETURN NEW; END $$; CREATE TRIGGER landing_insert_marker AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION landing_insert_marker();")
+                .execute(f.pool()).await?;
+            let reply = f.proxy.pause_after_commit("qbit_pool_blocks", "INSERT")?;
             let frontend = f.a.clone();
             let processing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 frontend.process_candidate(&claim).await
             }));
-            timeout(Duration::from_secs(5), reply.entered()).await??;
+            timeout(Duration::from_secs(5), reply.entered()).await?;
             processing.abort();
             ensure!(processing.await.unwrap_err().is_cancelled());
             reply.release();
-            // The node accepted the real offered proof, but neither frontend has
-            // observed acceptance yet. First proof now confirms and matures it.
+            // The real offer and audit landing committed, but confirmation has
+            // not run. This frontend's first proof now confirms and matures it.
             f.node.set_tip(&"66".repeat(32), &hash, 1101, "9999");
             let before = f.b.ledger.payout_revision().await?;
             f.b.refresh_once().await?;
