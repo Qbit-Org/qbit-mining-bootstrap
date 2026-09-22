@@ -14,6 +14,17 @@ mode and an error when `QBIT_PRODUCTION=1`, `QBIT_TOOLS_PRODUCTION=1`, or
 to Compose or a replica bootstrap script should be passed to those tools,
 not exported into the native server process.
 
+Starting the coordinator runs the same check: `qbit-prism-server` with no
+subcommand (the `run` serve path) refuses to start in production, naming each
+unsupported variable, and warns in lab mode. The check runs before the
+process parses its configuration or contacts the node, so a 2.x.x environment
+is reported instead of a downstream startup failure. Unset the reported names
+in the unit or Compose environment, or move them to the tool that reads them;
+a name that belongs to no tool should be removed. `check-config` remains the
+preflight, because it reports every invalid setting it covers without
+starting a frontend; the public reader's own database settings are checked
+separately by `check-public-database-config`.
+
 The supported names live in
 [`native-settings.txt`](../crates/qbit-prism-server/src/config/native-settings.txt).
 The retired 2.x.x names live in
