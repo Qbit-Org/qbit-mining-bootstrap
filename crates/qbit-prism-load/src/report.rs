@@ -57,6 +57,36 @@ pub fn honest_value_notes() -> Value {
                      its response line was read, on the client's monotonic clock. The server's \
                      own qbit_prism_share_ack_seconds histogram measures a different, narrower \
                      boundary and is reported separately as bucket deltas."
+        },
+        {
+            "field": "phases.*.order_lock, phases.*.settlement_lock",
+            "note": "max_waiters, samples_with_waiters, episodes_at_least, \
+                     foreign_waiter_samples and foreign_holder_samples are null, beside \
+                     unavailable_reason, when no poll fell inside the phase: the sampler saw no \
+                     queue, which is not the same as seeing an empty one. A window the sampler \
+                     polled and found quiet reports 0. samples is a count either way."
+        },
+        {
+            "field": "validator.worst_artifact_phase_ack_p99_milliseconds",
+            "note": "null, with worst_artifact_phase_ack_p99_unavailable_reason naming the \
+                     phase, when any artifact phase acknowledged no shares: that phase's p99 \
+                     is unknown, so the worst over the others would be a floor presented as \
+                     the worst. The artifact itself is withheld for the same phase, never \
+                     written with a 0.000 percentile."
+        },
+        {
+            "field": "phases.*.achieved_rate_shares_per_second",
+            "note": "The reconciled acknowledged count over the phase's duration. null, with \
+                     achieved_rate_unavailable_reason, when the phase has no reconciliation, \
+                     because its acknowledged count is then unknown; a reconciliation that \
+                     acknowledged nothing is a measured 0."
+        },
+        {
+            "field": "time_to_usable_work.tips.*.all_sessions_milliseconds",
+            "note": "The slowest session's time to usable work, stated only when every session \
+                     got usable work while the tip was the tip. Otherwise null with \
+                     all_sessions_unavailable_reason saying how many sessions were not served; \
+                     the slowest served session is latency_milliseconds.max either way."
         }
     ])
 }

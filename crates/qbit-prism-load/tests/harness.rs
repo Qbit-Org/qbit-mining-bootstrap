@@ -2485,8 +2485,8 @@ fn sample_inputs() -> ArtifactInputs {
             unexpected: 0,
             acknowledged_digest: digest::share_id_digest([*name]),
             committed_digest: digest::share_id_digest([*name]),
-            ack_p50_millis: 4.5,
-            ack_p99_millis: 42.25,
+            ack_p50_millis: Some(4.5),
+            ack_p99_millis: Some(42.25),
             reconnect_events: (*name == "reconnect").then_some(12),
             database_delay_millis: (*name == "slow_database").then_some(10.0),
         })
@@ -2500,8 +2500,8 @@ fn sample_inputs() -> ArtifactInputs {
         configuration,
         forecast_peak_shares_per_second: "20".to_owned(),
         ack_p99_limit_milliseconds: "1000".to_owned(),
-        overall_ack_p50_millis: 4.5,
-        overall_ack_p99_millis: 42.25,
+        overall_ack_p50_millis: Some(4.5),
+        overall_ack_p99_millis: Some(42.25),
         overall_acknowledged_digest: digest::share_id_digest(["overall"]),
         overall_committed_digest: digest::share_id_digest(["overall"]),
         phases,
@@ -8451,10 +8451,9 @@ fn usable_work_is_never_credited_after_the_tip_was_replaced() {
     assert_eq!(first["sessions_without_work_before_replacement"], json!(1));
     assert_eq!(first["latency_milliseconds"]["samples"], json!(1));
     assert_eq!(first["latency_milliseconds"]["max"], json!(300.0));
-    assert_eq!(
-        first["all_sessions_milliseconds"],
-        json!(300.0),
-        "the all-sessions figure is over the sessions that got work in the reign"
+    assert!(
+        first["all_sessions_milliseconds"].is_null(),
+        "one session was never served on tip 104, so no figure covers every session"
     );
 
     // Tip 105 was never replaced: both sessions, the late one at 900 ms.
@@ -8463,6 +8462,7 @@ fn usable_work_is_never_credited_after_the_tip_was_replaced() {
     assert_eq!(second["sessions_with_work"], json!(2));
     assert_eq!(second["sessions_without_work_before_replacement"], json!(0));
     assert_eq!(second["all_sessions_milliseconds"], json!(900.0));
+    assert!(second["all_sessions_unavailable_reason"].is_null());
     assert!(document["definition"]
         .as_str()
         .expect("a definition")
@@ -8794,6 +8794,363 @@ fn a_phase_that_acknowledged_nothing_has_no_ack_latency_to_state() {
         !run::has_no_ack_latency(&measured),
         "a phase with acknowledgements states its latency"
     );
+}
+
+// --- unknown is never zero (#483) -----------------------------------------
+//
+// Four places in the report wrote a plain zero where the measurement was
+// unknown. Each case below pairs the unknown with the real zero or partial
+// measurement it was indistinguishable from, so the fix cannot be a blanket
+// null.
+
+fn sample_phase_evidence(name: &str, p50: Option<f64>, p99: Option<f64>) -> PhaseEvidence {
+    PhaseEvidence {
+        name: name.to_owned(),
+        duration_millis: 60_000,
+        offered: 10,
+        acknowledged: 10,
+        committed: 10,
+        rejected_valid: 0,
+        missing: 0,
+        unexpected: 0,
+        acknowledged_digest: digest::share_id_digest([name]),
+        committed_digest: digest::share_id_digest([name]),
+        ack_p50_millis: p50,
+        ack_p99_millis: p99,
+        reconnect_events: (name == "reconnect").then_some(1),
+        database_delay_millis: (name == "slow_database").then_some(10.0),
+    }
+}
+
+/// Case 1: a lock summary over an empty sampling window used to carry
+/// `max_waiters: 0`, `samples_with_waiters: 0`, `episodes_at_least: 0` and
+/// the foreign sample counts as plain integers beside `mean_waiters: null`.
+/// The sampler saw no queue, which is not the same as an empty one.
+#[test]
+fn a_lock_window_with_no_samples_reports_no_waiter_counts() {
+    let frontends = vec!["load-fe-0".to_owned()];
+    let summary = measure::summarize_lock_window(
+        measure::ORDER_LOCK,
+        &[],
+        None,
+        &frontends,
+        "application_name",
+        std::time::Duration::from_millis(10),
+    );
+    assert_eq!(
+        summary.samples, 0,
+        "the sample count is the one measured zero"
+    );
+    assert_eq!(summary.max_waiters, None);
+    assert_eq!(summary.samples_with_waiters, None);
+    assert_eq!(summary.episodes_at_least, None);
+    assert_eq!(summary.foreign_waiter_samples, None);
+    assert_eq!(summary.foreign_holder_samples, None);
+    assert_eq!(summary.mean_waiters, None);
+    assert_eq!(summary.foreign_contention_observed, None);
+    assert_eq!(
+        summary.unavailable_reason.as_deref(),
+        Some("no samples fell inside the phase")
+    );
+    let json = serde_json::to_value(&summary).unwrap();
+    for field in [
+        "max_waiters",
+        "samples_with_waiters",
+        "episodes_at_least",
+        "foreign_waiter_samples",
+        "foreign_holder_samples",
+    ] {
+        assert!(json[field].is_null(), "{field} must be null, not 0: {json}");
+    }
+
+    // A sampler failure keeps its own reason rather than the generic one.
+    let failed = measure::summarize_lock_window(
+        measure::ORDER_LOCK,
+        &[],
+        Some("connection refused".to_owned()),
+        &frontends,
+        "application_name",
+        std::time::Duration::from_millis(10),
+    );
+    assert_eq!(
+        failed.unavailable_reason.as_deref(),
+        Some("connection refused")
+    );
+    assert_eq!(failed.max_waiters, None);
+}
+
+/// Case 1 control: a window the sampler did poll and found nothing waiting is
+/// a measured zero, and says so with 0 rather than null.
+#[test]
+fn a_lock_window_the_sampler_polled_and_found_quiet_reports_measured_zeros() {
+    let base = std::time::Instant::now();
+    let frontends = vec!["load-fe-0".to_owned()];
+    let holding = measure::LockRow {
+        pid: 41,
+        objid: measure::ORDER_LOCK_OBJID,
+        granted: true,
+        waitstart: None,
+        application_name: "load-fe-0".to_owned(),
+        activity_visible: true,
+    };
+    let window: Vec<measure::LockSample> = (0..3)
+        .map(|i| measure::LockSample {
+            monotonic: base + std::time::Duration::from_millis(10 * i),
+            server_time: chrono::Utc::now(),
+            // A frontend holding the lock is the normal case and is not a
+            // waiter; the other polls found no row at all.
+            rows: if i == 1 {
+                vec![holding.clone()]
+            } else {
+                Vec::new()
+            },
+            query_millis: 0.5,
+        })
+        .collect();
+    let summary = measure::summarize_lock_window(
+        measure::ORDER_LOCK,
+        &window,
+        None,
+        &frontends,
+        "application_name",
+        std::time::Duration::from_millis(10),
+    );
+    assert_eq!(summary.samples, 3);
+    assert_eq!(summary.max_waiters, Some(0));
+    assert_eq!(summary.samples_with_waiters, Some(0));
+    assert_eq!(summary.episodes_at_least, Some(0));
+    assert_eq!(summary.foreign_waiter_samples, Some(0));
+    assert_eq!(summary.foreign_holder_samples, Some(0));
+    assert_eq!(summary.mean_waiters, Some(0.0));
+    assert_eq!(summary.waiter_seconds_estimate, Some(0.0));
+    assert_eq!(summary.foreign_contention_observed, Some(false));
+    assert!(summary.unavailable_reason.is_none());
+
+    // And a window with a waiter counts it, so the Some(0) above is not a
+    // constant.
+    let mut waiting = holding.clone();
+    waiting.granted = false;
+    waiting.pid = 42;
+    let mut busy = window.clone();
+    busy[2].rows.push(waiting);
+    let summary = measure::summarize_lock_window(
+        measure::ORDER_LOCK,
+        &busy,
+        None,
+        &frontends,
+        "application_name",
+        std::time::Duration::from_millis(10),
+    );
+    assert_eq!(summary.max_waiters, Some(1));
+    assert_eq!(summary.samples_with_waiters, Some(1));
+    assert_eq!(summary.episodes_at_least, Some(1));
+}
+
+/// Case 2: the artifact builder refuses a phase, or a run, with no ACK
+/// percentiles rather than writing 0.000, and the side report's validator
+/// summary folds no 0.0 into its worst-p99 figure.
+#[test]
+fn missing_ack_percentiles_reach_neither_the_artifact_nor_the_validator_summary() {
+    // The artifact: one phase with no acknowledgements.
+    let mut inputs = sample_inputs();
+    inputs.phases[1].ack_p50_millis = None;
+    inputs.phases[1].ack_p99_millis = None;
+    let error = artifact::build(&inputs).expect_err("a phase without percentiles is refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&inputs.phases[1].name) && message.contains("no ACK latency"),
+        "{message}"
+    );
+    // The overall figure, with every phase measured.
+    let mut inputs = sample_inputs();
+    inputs.overall_ack_p50_millis = None;
+    inputs.overall_ack_p99_millis = None;
+    let error = artifact::build(&inputs).expect_err("a run without percentiles is refused");
+    assert!(format!("{error:#}").contains("no ACK latency"));
+
+    // The validator summary's worst p99: an unmeasured phase makes it
+    // unknown, with the phase named, rather than a 0.0 that the measured
+    // phases then out-rank.
+    let phases = vec![
+        sample_phase_evidence("baseline", Some(4.0), Some(30.0)),
+        sample_phase_evidence("reconnect", None, None),
+        sample_phase_evidence("slow_database", Some(8.0), Some(900.0)),
+    ];
+    let worst = run::worst_ack_p99(&phases);
+    assert_eq!(worst.milliseconds, None);
+    let reason = worst.unavailable_reason.expect("a reason");
+    assert!(
+        reason.starts_with("reconnect acknowledged no shares"),
+        "{reason}"
+    );
+    assert!(!reason.contains("baseline"), "{reason}");
+}
+
+/// Case 2 control: with every phase measured the worst p99 is the largest
+/// measured value, including a phase whose p99 really is 0.0.
+#[test]
+fn a_measured_worst_ack_p99_is_the_largest_measured_value() {
+    let phases = vec![
+        sample_phase_evidence("baseline", Some(4.0), Some(30.0)),
+        sample_phase_evidence("reconnect", Some(5.0), Some(45.5)),
+        sample_phase_evidence("slow_database", Some(8.0), Some(900.0)),
+    ];
+    let worst = run::worst_ack_p99(&phases);
+    assert_eq!(worst.milliseconds, Some(900.0));
+    assert_eq!(worst.unavailable_reason, None);
+
+    // A phase that measured a zero is a measurement, and beats nothing.
+    let zero = vec![sample_phase_evidence("baseline", Some(0.0), Some(0.0))];
+    let worst = run::worst_ack_p99(&zero);
+    assert_eq!(worst.milliseconds, Some(0.0));
+    assert_eq!(worst.unavailable_reason, None);
+
+    // No artifact phases at all is unknown, not 0.
+    let worst = run::worst_ack_p99(&[]);
+    assert_eq!(worst.milliseconds, None);
+    assert!(worst.unavailable_reason.is_some());
+}
+
+/// Case 3: `all_sessions_milliseconds` said in its definition that it is null
+/// unless every session got usable work while the tip was the tip, and then
+/// reported the slowest *served* session whenever at least one was served.
+#[test]
+fn all_sessions_milliseconds_is_null_unless_every_session_was_served() {
+    let base = std::time::Instant::now();
+    let changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 1_000)),
+        pool_tip(HASH_ONE, 105, at(base, 11_000)),
+    ];
+    let mut collected = run::Collected::default();
+    let sighting = |session: usize, tip: &str, millis: u64| client::TipSighting {
+        session,
+        frontend: 0,
+        tip: tip.to_owned(),
+        at: at(base, millis),
+    };
+    // Three sessions. On tip 104 two are served (300 ms and 700 ms) and the
+    // third never sees it; on tip 105 all three are served, the slowest at
+    // 1.2 s.
+    collected.apply(client::Event::Tip(sighting(0, HASH_ZERO, 1_300)));
+    collected.apply(client::Event::Tip(sighting(1, HASH_ZERO, 1_700)));
+    collected.apply(client::Event::Tip(sighting(0, HASH_ONE, 11_200)));
+    collected.apply(client::Event::Tip(sighting(1, HASH_ONE, 11_400)));
+    collected.apply(client::Event::Tip(sighting(2, HASH_ONE, 12_200)));
+
+    let document = run::time_to_usable_work(&changes, &changes, &collected, 3);
+    let partial = &document["tips"][0];
+    assert_eq!(partial["sessions_with_work"], json!(2));
+    assert_eq!(partial["sessions_total"], json!(3));
+    assert!(
+        partial["all_sessions_milliseconds"].is_null(),
+        "two of three served is not a figure for all three: {partial}"
+    );
+    assert_eq!(
+        partial["all_sessions_unavailable_reason"],
+        json!(
+            "1 of 3 sessions got no usable work while the tip was the tip, so no figure \
+             covers every session"
+        )
+    );
+    // The slowest served session is not lost: it is the latency block's max.
+    assert_eq!(partial["latency_milliseconds"]["max"], json!(700.0));
+
+    // Control: every session served gives the figure, with no reason.
+    let full = &document["tips"][1];
+    assert_eq!(full["sessions_with_work"], json!(3));
+    assert_eq!(full["all_sessions_milliseconds"], json!(1_200.0));
+    assert!(full["all_sessions_unavailable_reason"].is_null());
+
+    // And the definition describes what is emitted.
+    let definition = document["definition"].as_str().expect("a definition");
+    assert!(
+        definition.contains("all_sessions_unavailable_reason"),
+        "{definition}"
+    );
+
+    // A run with no sessions has no all-sessions figure either: the vacuous
+    // "every session was served" would otherwise yield null with no reason.
+    let none = run::time_to_usable_work(&changes, &changes, &run::Collected::default(), 0);
+    let tip = &none["tips"][0];
+    assert!(tip["all_sessions_milliseconds"].is_null());
+    assert_eq!(
+        tip["all_sessions_unavailable_reason"],
+        json!("the run had no sessions")
+    );
+}
+
+/// Case 4: a phase without a reconciliation reported
+/// `achieved_rate_shares_per_second: 0` as if measured; the rate is unknown
+/// because the acknowledged count is. A reconciliation that acknowledged
+/// nothing is the measured zero it was indistinguishable from.
+#[test]
+fn a_phase_without_a_reconciliation_has_no_achieved_rate() {
+    let unknown = run::achieved_rate(None, 60.0);
+    assert_eq!(unknown.shares_per_second, None);
+    assert_eq!(
+        unknown.unavailable_reason.as_deref(),
+        Some("the phase has no reconciliation, so its acknowledged count is unknown")
+    );
+
+    let empty = digest::Reconciliation {
+        offered: Default::default(),
+        acknowledged: Default::default(),
+        committed: Default::default(),
+        missing: Default::default(),
+        unexpected: Default::default(),
+    };
+    let zero = run::achieved_rate(Some(&empty), 60.0);
+    assert_eq!(
+        zero.shares_per_second,
+        Some(0.0),
+        "nothing acknowledged is a measured zero"
+    );
+    assert_eq!(zero.unavailable_reason, None);
+
+    let mut some = empty.clone();
+    some.acknowledged.extend(["a", "b", "c"].map(str::to_owned));
+    let measured = run::achieved_rate(Some(&some), 60.0);
+    assert_eq!(measured.shares_per_second, Some(0.05));
+    assert_eq!(measured.unavailable_reason, None);
+
+    // A zero-length phase divides by the smallest positive duration rather
+    // than by zero, as before.
+    let instant = run::achieved_rate(Some(&some), 0.0);
+    assert!(instant.shares_per_second.is_some_and(f64::is_finite));
+}
+
+/// The printed summary line prints an unknown rate and unknown waiter counts
+/// as None, like the percentiles beside them, never as 0.
+#[test]
+fn the_summary_line_prints_unknown_as_none_not_zero() {
+    let report = json!({
+        "phases": [{
+            "name": "baseline",
+            "duration_seconds": 60.0,
+            "target_rate_shares_per_second": 20.0,
+            "dispatched": 0,
+            "reconciliation": Value::Null,
+            "achieved_rate_shares_per_second": Value::Null,
+            "achieved_rate_unavailable_reason": "the phase has no reconciliation",
+            "client_ack_latency": {"p50": Value::Null, "p99": Value::Null},
+            "order_lock": {"max_waiters": Value::Null},
+            "settlement_lock": {"max_waiters": Some(0)},
+            "shortfall": 0,
+            "offer_accounting": {"client_failures": 0, "unaccounted": 0},
+        }],
+    });
+    let withheld = artifact::Evidence::Withheld {
+        reason: "cut short".to_owned(),
+        stale_artifact_removed: false,
+    };
+    let text = run::summary_text(&report, &withheld, &[]);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("phase baseline"))
+        .expect("a phase line");
+    assert!(line.contains("rate=None/s"), "{line}");
+    assert!(line.contains("order_waiters_max=None"), "{line}");
+    assert!(line.contains("settlement_waiters_max=Some(0)"), "{line}");
 }
 
 #[test]

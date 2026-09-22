@@ -482,21 +482,28 @@ pub struct LockSummary {
     pub attribution: String,
     /// Frontends whose connections the sampler recognised.
     pub attributed_application_names: Vec<String>,
+    /// Polls that fell inside the phase. This is the one count that is a
+    /// measurement even at zero: it says how much the sampler saw.
     pub samples: usize,
-    pub samples_with_waiters: usize,
-    pub max_waiters: usize,
+    /// Every count below is `None` when `samples` is 0: with no poll inside
+    /// the phase the sampler saw no queue, which is not the same as seeing
+    /// an empty one, and a plain 0 beside `unavailable_reason` read as a
+    /// measured zero (#483). A phase the sampler did poll and found nothing
+    /// waiting reports `Some(0)`, a real measured zero.
+    pub samples_with_waiters: Option<usize>,
+    pub max_waiters: Option<usize>,
     pub mean_waiters: Option<f64>,
     /// A PRISM advisory lock is database-wide, so anything else holding or
     /// waiting on it in the same database would distort every number here.
     /// These are the waiters that were not this run's frontends.
-    pub foreign_waiter_samples: usize,
+    pub foreign_waiter_samples: Option<usize>,
     pub foreign_application_names: Vec<String>,
     pub foreign_waiter_seconds_estimate: Option<f64>,
     /// A foreign *holder* is what a foreign stall looks like from here: it
     /// blocks every frontend, and the frontends then queue up as waiters that
     /// are correctly this run's own. Without these three, that stall would be
     /// billed to them.
-    pub foreign_holder_samples: usize,
+    pub foreign_holder_samples: Option<usize>,
     pub foreign_holder_application_names: Vec<String>,
     pub foreign_holder_seconds_estimate: Option<f64>,
     /// One answer for a reader who should not have to notice a zero in the
@@ -507,8 +514,9 @@ pub struct LockSummary {
     /// waiter-seconds. Waits shorter than the sampling interval can be missed
     /// entirely, so this is a lower bound.
     pub waiter_seconds_estimate: Option<f64>,
-    /// Distinct `(pid, waitstart)` pairs seen. Reported as "at least".
-    pub episodes_at_least: usize,
+    /// Distinct `(pid, waitstart)` pairs seen. Reported as "at least";
+    /// `None` when there were no samples to see them in.
+    pub episodes_at_least: Option<usize>,
     pub longest_observed_wait_seconds: Option<f64>,
     /// The sampler's own cost, so its perturbation of the thing it measures is
     /// visible.
@@ -768,120 +776,152 @@ impl LockSampler {
         window: &[LockSample],
         failure: Option<String>,
     ) -> LockSummary {
-        let attributing = !self.frontends.is_empty();
-        let mut summary = LockSummary {
-            lock: lock.lock,
-            key: lock.key,
-            classid: PRISM_LOCK_CLASSID,
-            objid: lock.objid,
-            key_note: lock.key_note,
-            taken_by: lock.taken_by,
-            sample_interval_milliseconds: self.interval.as_secs_f64() * 1000.0,
-            attribution: self.attribution.clone(),
-            attributed_application_names: self.frontends.clone(),
-            samples: window.len(),
-            samples_with_waiters: 0,
-            max_waiters: 0,
-            mean_waiters: None,
-            foreign_waiter_samples: 0,
-            foreign_application_names: Vec::new(),
-            foreign_waiter_seconds_estimate: None,
-            foreign_holder_samples: 0,
-            foreign_holder_application_names: Vec::new(),
-            foreign_holder_seconds_estimate: None,
-            foreign_contention_observed: None,
-            waiter_seconds_estimate: None,
-            episodes_at_least: 0,
-            longest_observed_wait_seconds: None,
-            sampler_query_millis_mean: None,
-            sampler_query_millis_max: None,
-            unavailable_reason: failure,
-            advisory_lock_statement: None,
-        };
-        if window.is_empty() {
-            summary
-                .unavailable_reason
-                .get_or_insert_with(|| "no samples fell inside the phase".into());
-            return summary;
-        }
-        let mut episodes: HashMap<
-            (i32, String),
-            (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-        > = HashMap::new();
-        let mut waiter_seconds = 0.0f64;
-        let mut foreign_seconds = 0.0f64;
-        let mut foreign_holder_seconds = 0.0f64;
-        let mut foreign_names: BTreeMap<String, usize> = BTreeMap::new();
-        let mut foreign_holder_names: BTreeMap<String, usize> = BTreeMap::new();
-        let mut total_waiters = 0usize;
-        let mut previous: Option<Instant> = None;
-        let mut query_millis = Vec::with_capacity(window.len());
-        for sample in window {
-            query_millis.push(sample.query_millis);
-            let split = split_lock_rows_for(&sample.rows, lock.objid, &self.frontends);
-            // Every waiter number stays over ungranted rows belonging to this
-            // run, exactly as before; the granted rows are new information
-            // beside them, never folded into them.
-            let foreign = split.foreign_waiting.len();
-            let foreign_holding = split.foreign_holding.len();
-            let count = split.own_waiting.len();
-            total_waiters += count;
-            summary.max_waiters = summary.max_waiters.max(count);
-            if count > 0 {
-                summary.samples_with_waiters += 1;
-            }
-            if foreign > 0 {
-                summary.foreign_waiter_samples += 1;
-                for row in &split.foreign_waiting {
-                    *foreign_names.entry(row_label(row)).or_insert(0) += 1;
-                }
-            }
-            if foreign_holding > 0 {
-                summary.foreign_holder_samples += 1;
-                for row in &split.foreign_holding {
-                    *foreign_holder_names.entry(row_label(row)).or_insert(0) += 1;
-                }
-            }
-            if let Some(last) = previous {
-                let delta = sample
-                    .monotonic
-                    .saturating_duration_since(last)
-                    .as_secs_f64();
-                waiter_seconds += count as f64 * delta;
-                foreign_seconds += foreign as f64 * delta;
-                foreign_holder_seconds += foreign_holding as f64 * delta;
-            }
-            previous = Some(sample.monotonic);
-            for waiter in split.own_waiting {
-                let key = (
-                    waiter.pid,
-                    waiter.waitstart.map(|w| w.to_rfc3339()).unwrap_or_default(),
-                );
-                let entry = episodes.entry(key).or_insert((
-                    waiter.waitstart.unwrap_or(sample.server_time),
-                    sample.server_time,
-                ));
-                entry.1 = sample.server_time;
-            }
-        }
-        summary.mean_waiters = Some(total_waiters as f64 / window.len() as f64);
-        summary.waiter_seconds_estimate = Some(waiter_seconds);
-        summary.foreign_waiter_seconds_estimate = Some(foreign_seconds);
-        summary.foreign_application_names = foreign_names.into_keys().collect();
-        summary.foreign_holder_seconds_estimate = Some(foreign_holder_seconds);
-        summary.foreign_holder_application_names = foreign_holder_names.into_keys().collect();
-        summary.foreign_contention_observed = attributing
-            .then_some(summary.foreign_waiter_samples > 0 || summary.foreign_holder_samples > 0);
-        summary.episodes_at_least = episodes.len();
-        summary.longest_observed_wait_seconds = episodes
-            .values()
-            .map(|(start, last)| (*last - *start).num_milliseconds() as f64 / 1000.0)
-            .max_by(f64::total_cmp);
-        summary.sampler_query_millis_mean =
-            Some(query_millis.iter().sum::<f64>() / query_millis.len() as f64);
-        summary.sampler_query_millis_max = query_millis.iter().copied().max_by(f64::total_cmp);
-        summary
+        summarize_lock_window(
+            lock,
+            window,
+            failure,
+            &self.frontends,
+            &self.attribution,
+            self.interval,
+        )
     }
+}
+
+/// One lock's summary over `window`, the polls that fell inside a phase.
+///
+/// Pure, so the empty-window and real-zero cases are testable without a
+/// database. An empty window is unknown, not quiet: every waiter count is
+/// `None` and `unavailable_reason` says why. A window with polls and no
+/// waiters is a measured zero and says so with `Some(0)` (EP-OBSERVABILITY).
+pub fn summarize_lock_window(
+    lock: SampledLock,
+    window: &[LockSample],
+    failure: Option<String>,
+    frontends: &[String],
+    attribution: &str,
+    interval: Duration,
+) -> LockSummary {
+    let attributing = !frontends.is_empty();
+    let mut summary = LockSummary {
+        lock: lock.lock,
+        key: lock.key,
+        classid: PRISM_LOCK_CLASSID,
+        objid: lock.objid,
+        key_note: lock.key_note,
+        taken_by: lock.taken_by,
+        sample_interval_milliseconds: interval.as_secs_f64() * 1000.0,
+        attribution: attribution.to_owned(),
+        attributed_application_names: frontends.to_vec(),
+        samples: window.len(),
+        samples_with_waiters: None,
+        max_waiters: None,
+        mean_waiters: None,
+        foreign_waiter_samples: None,
+        foreign_application_names: Vec::new(),
+        foreign_waiter_seconds_estimate: None,
+        foreign_holder_samples: None,
+        foreign_holder_application_names: Vec::new(),
+        foreign_holder_seconds_estimate: None,
+        foreign_contention_observed: None,
+        waiter_seconds_estimate: None,
+        episodes_at_least: None,
+        longest_observed_wait_seconds: None,
+        sampler_query_millis_mean: None,
+        sampler_query_millis_max: None,
+        unavailable_reason: failure,
+        advisory_lock_statement: None,
+    };
+    if window.is_empty() {
+        summary
+            .unavailable_reason
+            .get_or_insert_with(|| "no samples fell inside the phase".into());
+        return summary;
+    }
+    let mut episodes: HashMap<
+        (i32, String),
+        (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    > = HashMap::new();
+    let mut waiter_seconds = 0.0f64;
+    let mut foreign_seconds = 0.0f64;
+    let mut foreign_holder_seconds = 0.0f64;
+    let mut foreign_names: BTreeMap<String, usize> = BTreeMap::new();
+    let mut foreign_holder_names: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total_waiters = 0usize;
+    let mut samples_with_waiters = 0usize;
+    let mut max_waiters = 0usize;
+    let mut foreign_waiter_samples = 0usize;
+    let mut foreign_holder_samples = 0usize;
+    let mut previous: Option<Instant> = None;
+    let mut query_millis = Vec::with_capacity(window.len());
+    for sample in window {
+        query_millis.push(sample.query_millis);
+        let split = split_lock_rows_for(&sample.rows, lock.objid, frontends);
+        // Every waiter number stays over ungranted rows belonging to this
+        // run, exactly as before; the granted rows are new information
+        // beside them, never folded into them.
+        let foreign = split.foreign_waiting.len();
+        let foreign_holding = split.foreign_holding.len();
+        let count = split.own_waiting.len();
+        total_waiters += count;
+        max_waiters = max_waiters.max(count);
+        if count > 0 {
+            samples_with_waiters += 1;
+        }
+        if foreign > 0 {
+            foreign_waiter_samples += 1;
+            for row in &split.foreign_waiting {
+                *foreign_names.entry(row_label(row)).or_insert(0) += 1;
+            }
+        }
+        if foreign_holding > 0 {
+            foreign_holder_samples += 1;
+            for row in &split.foreign_holding {
+                *foreign_holder_names.entry(row_label(row)).or_insert(0) += 1;
+            }
+        }
+        if let Some(last) = previous {
+            let delta = sample
+                .monotonic
+                .saturating_duration_since(last)
+                .as_secs_f64();
+            waiter_seconds += count as f64 * delta;
+            foreign_seconds += foreign as f64 * delta;
+            foreign_holder_seconds += foreign_holding as f64 * delta;
+        }
+        previous = Some(sample.monotonic);
+        for waiter in split.own_waiting {
+            let key = (
+                waiter.pid,
+                waiter.waitstart.map(|w| w.to_rfc3339()).unwrap_or_default(),
+            );
+            let entry = episodes.entry(key).or_insert((
+                waiter.waitstart.unwrap_or(sample.server_time),
+                sample.server_time,
+            ));
+            entry.1 = sample.server_time;
+        }
+    }
+    summary.samples_with_waiters = Some(samples_with_waiters);
+    summary.max_waiters = Some(max_waiters);
+    summary.mean_waiters = Some(total_waiters as f64 / window.len() as f64);
+    summary.waiter_seconds_estimate = Some(waiter_seconds);
+    summary.foreign_waiter_samples = Some(foreign_waiter_samples);
+    summary.foreign_waiter_seconds_estimate = Some(foreign_seconds);
+    summary.foreign_application_names = foreign_names.into_keys().collect();
+    summary.foreign_holder_samples = Some(foreign_holder_samples);
+    summary.foreign_holder_seconds_estimate = Some(foreign_holder_seconds);
+    summary.foreign_holder_application_names = foreign_holder_names.into_keys().collect();
+    summary.foreign_contention_observed =
+        attributing.then_some(foreign_waiter_samples > 0 || foreign_holder_samples > 0);
+    summary.episodes_at_least = Some(episodes.len());
+    summary.longest_observed_wait_seconds = episodes
+        .values()
+        .map(|(start, last)| (*last - *start).num_milliseconds() as f64 / 1000.0)
+        .max_by(f64::total_cmp);
+    summary.sampler_query_millis_mean =
+        Some(query_millis.iter().sum::<f64>() / query_millis.len() as f64);
+    summary.sampler_query_millis_max = query_millis.iter().copied().max_by(f64::total_cmp);
+    summary
 }
 
 /// Reset `pg_stat_statements`, if it is loaded.

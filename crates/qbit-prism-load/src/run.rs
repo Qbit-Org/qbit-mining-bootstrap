@@ -1562,8 +1562,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             unexpected: *unexpected_by_phase.get(&phase.plan.name).unwrap_or(&0) as u64,
             acknowledged_digest: reconciliation.acknowledged_digest(),
             committed_digest: reconciliation.committed_digest(),
-            ack_p50_millis: latency.p50.unwrap_or(0.0),
-            ack_p99_millis: latency.p99.unwrap_or(0.0),
+            ack_p50_millis: latency.p50,
+            ack_p99_millis: latency.p99,
             reconnect_events: (phase.plan.name == "reconnect").then_some(reconnects),
             database_delay_millis: (phase.plan.name == "slow_database")
                 .then_some(slow_delay_observed),
@@ -1618,8 +1618,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         configuration: configuration.clone(),
         forecast_peak_shares_per_second: format!("{}", args.forecast_peak_shares_per_second),
         ack_p99_limit_milliseconds: format!("{}", args.ack_p99_limit_ms),
-        overall_ack_p50_millis: overall_latency.p50.unwrap_or(0.0),
-        overall_ack_p99_millis: overall_latency.p99.unwrap_or(0.0),
+        overall_ack_p50_millis: overall_latency.p50,
+        overall_ack_p99_millis: overall_latency.p99,
         overall_acknowledged_digest: digest::share_id_digest(union_ack.iter().map(String::as_str)),
         overall_committed_digest: digest::share_id_digest(
             union_committed.iter().map(String::as_str),
@@ -1657,10 +1657,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 / (phase.duration_millis as f64 / 1000.0).max(f64::MIN_POSITIVE)
         })
         .fold(f64::INFINITY, f64::min);
-    let worst_p99 = phase_evidence
-        .iter()
-        .map(|phase| phase.ack_p99_millis)
-        .max_by(f64::total_cmp);
+    let worst_p99 = worst_ack_p99(&phase_evidence);
     let harness_bugs: Vec<&SubmitRecord> = collected
         .submits
         .iter()
@@ -1884,7 +1881,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "waited_seconds": drained_seconds,
             "submits_outstanding_at_stop": undrained,
         },
-        "validator": validator_block(&evidence, args, slowest_rate, worst_p99, &unrecognised),
+        "validator": validator_block(&evidence, args, slowest_rate, &worst_p99, &unrecognised),
         "stale_outputs_removed": ctx.stale_outputs_removed,
     });
     let report_path = args.out.join("load-harness-report.json");
@@ -2929,10 +2926,30 @@ pub fn time_to_usable_work(
                 .values()
                 .map(|at| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0)
                 .collect();
-            let all_seen = first
-                .values()
-                .max()
-                .map(|at| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0);
+            // The slowest served session is a figure for every session only
+            // when every session was served. With some unserved, the value
+            // used to be emitted anyway, as if it covered them, while the
+            // definition below said it would not (#483). The slowest served
+            // session is still available as latency_milliseconds.max.
+            let unserved = sessions.saturating_sub(first.len());
+            let all_sessions_unavailable_reason = if sessions == 0 {
+                Some("the run had no sessions".to_owned())
+            } else if unserved > 0 {
+                Some(format!(
+                    "{unserved} of {sessions} sessions got no usable work while the tip was \
+                     the tip, so no figure covers every session"
+                ))
+            } else {
+                None
+            };
+            let all_seen = if all_sessions_unavailable_reason.is_some() {
+                None
+            } else {
+                first
+                    .values()
+                    .max()
+                    .map(|at| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0)
+            };
             json!({
                 "tip": tip.hash,
                 "height": tip.height,
@@ -2950,6 +2967,7 @@ pub fn time_to_usable_work(
                     "client monotonic against the node's tip stamp",
                 ),
                 "all_sessions_milliseconds": all_seen,
+                "all_sessions_unavailable_reason": all_sessions_unavailable_reason,
             })
         })
         .collect();
@@ -2960,7 +2978,10 @@ pub fn time_to_usable_work(
                        was never replaced). A notify for the tip after it was replaced is a \
                        late job for a replaced tip and is not counted, so sessions_with_work \
                        is the number of sessions that got usable work while the tip was the \
-                       tip, and all_sessions_milliseconds is null unless every session did.",
+                       tip. all_sessions_milliseconds is the slowest session's t1 - t0 when \
+                       every session got usable work, and null with \
+                       all_sessions_unavailable_reason otherwise; the slowest served session \
+                       is latency_milliseconds.max either way.",
         "tips": entries,
     })
 }
@@ -3118,6 +3139,39 @@ pub fn offer_accounting(phase: &str, dispatched: u64, collected: &Collected) -> 
     })
 }
 
+/// A phase's achieved rate: its reconciled acknowledged count over its
+/// duration.
+///
+/// Without a reconciliation the acknowledged count is unknown, so the rate
+/// is `None` with the reason; it used to be 0, a rate the phase never
+/// achieved, with `completed: false` on the phase the only tell (#483). A
+/// reconciliation that acknowledged nothing is a measured zero and reports
+/// `Some(0.0)`.
+pub fn achieved_rate(
+    reconciliation: Option<&digest::Reconciliation>,
+    seconds: f64,
+) -> AchievedRate {
+    match reconciliation {
+        Some(rec) => AchievedRate {
+            shares_per_second: Some(rec.acknowledged.len() as f64 / seconds.max(f64::MIN_POSITIVE)),
+            unavailable_reason: None,
+        },
+        None => AchievedRate {
+            shares_per_second: None,
+            unavailable_reason: Some(
+                "the phase has no reconciliation, so its acknowledged count is unknown".to_owned(),
+            ),
+        },
+    }
+}
+
+/// See [`achieved_rate`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AchievedRate {
+    pub shares_per_second: Option<f64>,
+    pub unavailable_reason: Option<String>,
+}
+
 fn phase_report(
     phase: &PhaseRun,
     collected: &Collected,
@@ -3130,9 +3184,7 @@ fn phase_report(
         .map(|(_, rec)| rec);
     let latency = phase_latency(&collected.submits, &phase.plan.name);
     let seconds = phase.duration_millis as f64 / 1000.0;
-    let acknowledged = reconciliation
-        .map(|rec| rec.acknowledged.len())
-        .unwrap_or(0);
+    let achieved = achieved_rate(reconciliation, seconds);
     json!({
         "name": phase.plan.name,
         "in_artifact": phase.plan.in_artifact,
@@ -3145,7 +3197,8 @@ fn phase_report(
         "dispatched": phase.dispatched,
         "shortfall": phase.shortfall,
         "offer_accounting": offer_accounting(&phase.plan.name, phase.dispatched, collected),
-        "achieved_rate_shares_per_second": acknowledged as f64 / seconds.max(f64::MIN_POSITIVE),
+        "achieved_rate_shares_per_second": achieved.shares_per_second,
+        "achieved_rate_unavailable_reason": achieved.unavailable_reason,
         "offered_rate_shares_per_second": phase.dispatched as f64 / seconds.max(f64::MIN_POSITIVE),
         "client_ack_latency": latency,
         "client_ack_latency_definition": "accepted shares only, from writing the submit line to \
@@ -3581,11 +3634,53 @@ pub fn name_unrecognised_reasons(
     }
 }
 
+/// The worst client ACK p99 over the artifact phases, for the side report's
+/// `validator` suggestions.
+///
+/// `None` with the reason when any artifact phase acknowledged nothing: that
+/// phase's p99 is unknown, and the worst over the others would be a floor
+/// presented as the worst. The old fold took such a phase as 0.0, which put
+/// the same unknown-as-zero the artifact refuses into the side report's
+/// summary of it (#483).
+pub fn worst_ack_p99(phases: &[PhaseEvidence]) -> WorstAckP99 {
+    let unmeasured: Vec<&str> = phases
+        .iter()
+        .filter(|phase| phase.ack_p99_millis.is_none())
+        .map(|phase| phase.name.as_str())
+        .collect();
+    if !unmeasured.is_empty() {
+        return WorstAckP99 {
+            milliseconds: None,
+            unavailable_reason: Some(format!(
+                "{} acknowledged no shares, so the worst ACK p99 over the artifact phases is \
+                 unknown",
+                unmeasured.join(", ")
+            )),
+        };
+    }
+    WorstAckP99 {
+        milliseconds: phases
+            .iter()
+            .filter_map(|phase| phase.ack_p99_millis)
+            .max_by(f64::total_cmp),
+        unavailable_reason: phases
+            .is_empty()
+            .then(|| "the run has no artifact phases".to_owned()),
+    }
+}
+
+/// See [`worst_ack_p99`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorstAckP99 {
+    pub milliseconds: Option<f64>,
+    pub unavailable_reason: Option<String>,
+}
+
 fn validator_block(
     evidence: &artifact::Evidence,
     args: &Args,
     slowest_rate: f64,
-    worst_p99: Option<f64>,
+    worst_p99: &WorstAckP99,
     unrecognised: &[UnrecognisedReason],
 ) -> Value {
     let mut block = match evidence {
@@ -3622,8 +3717,9 @@ fn validator_block(
         "slowest_artifact_phase_rate_shares_per_second": slowest_rate,
         "suggested_forecast_for_a_valid_artifact": (slowest_rate / 2.0).max(0.0),
         "ack_p99_limit_used_milliseconds": args.ack_p99_limit_ms,
-        "worst_artifact_phase_ack_p99_milliseconds": worst_p99,
-        "suggested_ack_p99_limit_milliseconds": worst_p99.map(|p99| {
+        "worst_artifact_phase_ack_p99_milliseconds": worst_p99.milliseconds,
+        "worst_artifact_phase_ack_p99_unavailable_reason": worst_p99.unavailable_reason,
+        "suggested_ack_p99_limit_milliseconds": worst_p99.milliseconds.map(|p99| {
             // Round up to the next 100 ms, and never above the commit
             // timeout the consumer checks against.
             ((p99 / 100.0).ceil() * 100.0).min(args.share_commit_timeout_seconds * 1000.0)
@@ -3647,8 +3743,8 @@ pub fn summary_text(
     text.push_str("=== qbit-prism-load ===\n");
     for phase in report["phases"].as_array().into_iter().flatten() {
         text.push_str(&format!(
-            "phase {:<16} {:>8.1}s target={:<8} offered={:<8} acked={:<8} rate={:.1}/s \
-             ack p50={:?} p99={:?} order_waiters_max={} settlement_waiters_max={} \
+            "phase {:<16} {:>8.1}s target={:<8} offered={:<8} acked={:<8} rate={:?}/s \
+             ack p50={:?} p99={:?} order_waiters_max={:?} settlement_waiters_max={:?} \
              shortfall={}\n",
             phase["name"].as_str().unwrap_or_default(),
             phase["duration_seconds"].as_f64().unwrap_or_default(),
@@ -3659,17 +3755,13 @@ pub fn summary_text(
             phase["reconciliation"]["acknowledged"]
                 .as_u64()
                 .unwrap_or_default(),
-            phase["achieved_rate_shares_per_second"]
-                .as_f64()
-                .unwrap_or_default(),
+            // Unknown is printed as None, like the percentiles beside it,
+            // never as a zero the phase did not measure.
+            phase["achieved_rate_shares_per_second"].as_f64(),
             phase["client_ack_latency"]["p50"].as_f64(),
             phase["client_ack_latency"]["p99"].as_f64(),
-            phase["order_lock"]["max_waiters"]
-                .as_u64()
-                .unwrap_or_default(),
-            phase["settlement_lock"]["max_waiters"]
-                .as_u64()
-                .unwrap_or_default(),
+            phase["order_lock"]["max_waiters"].as_u64(),
+            phase["settlement_lock"]["max_waiters"].as_u64(),
             phase["shortfall"].as_u64().unwrap_or_default(),
         ));
         // The offer accounting is presented on this line as offered=; when
