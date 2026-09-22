@@ -9337,6 +9337,7 @@ fn env_echoing_stand_in_server(dir: &std::path::Path) -> std::path::PathBuf {
         "#!/bin/sh\n\
          echo \"ADMISSION=${PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS-unset}\" >&2\n\
          echo \"CONNECTIONS=${PRISM_STRATUM_MAX_CONNECTIONS-unset}\" >&2\n\
+         echo \"INHERITED=${CARGO_MANIFEST_DIR-unset}\" >&2\n\
          echo READY >&2\n\
          exec sleep 60\n",
     )
@@ -9349,8 +9350,11 @@ fn env_echoing_stand_in_server(dir: &std::path::Path) -> std::path::PathBuf {
 /// environment to the process that reads it: the same launch path the run
 /// uses, against a stand-in that echoes what it was given. A value the
 /// harness's own environment carries is not a second reader -- the child's
-/// environment is cleared -- so the flag and its default are the only two
-/// sources, and the side report's block says which one applied (EP-CONFIG).
+/// environment is cleared, shown here on a variable the test process really
+/// inherits from Cargo rather than one set for the purpose, because
+/// `set_var` in a threaded test binary races libc's `getenv` -- so the flag
+/// and its default are the only two sources, and the side report's block
+/// says which one applied (EP-CONFIG).
 #[tokio::test]
 async fn the_initial_job_admission_reaches_a_launched_frontend_as_the_flag_or_its_default(
 ) -> Result<()> {
@@ -9361,9 +9365,10 @@ async fn the_initial_job_admission_reaches_a_launched_frontend_as_the_flag_or_it
     let server = env_echoing_stand_in_server(dir.path());
     let log_dir = dir.path().join("logs");
     std::fs::create_dir_all(&log_dir)?;
-    // A value in the harness's own environment must not reach the child: the
-    // run's admission has exactly one reader, the flag.
-    std::env::set_var("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS", "7");
+    // Cargo sets this in the test process; the run's own process would carry
+    // whatever its shell did. Neither may reach a frontend: the child's
+    // environment is cleared, so the admission has exactly one reader.
+    let inherited = std::env::var("CARGO_MANIFEST_DIR").is_ok();
 
     let cases: [(Vec<&str>, u64, &str, u64); 3] = [
         (vec![], 128, "default", 4064),
@@ -9410,6 +9415,11 @@ async fn the_initial_job_admission_reaches_a_launched_frontend_as_the_flag_or_it
             text.contains(&format!("CONNECTIONS={connections}\n")),
             "case {index}: {text:?}"
         );
+        assert!(
+            text.contains("INHERITED=unset\n"),
+            "case {index}: the child's environment is cleared, but it saw an inherited \
+             variable (test process had it: {inherited}): {text:?}"
+        );
         // What the side report records for this process, read back from the
         // environment it was launched with.
         let block = run::stratum_admission_block(&child.environment, &args);
@@ -9424,7 +9434,6 @@ async fn the_initial_job_admission_reaches_a_launched_frontend_as_the_flag_or_it
         assert!(!configuration.contains_key("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"));
         assert_eq!(configuration.len(), CONFIGURATION_KEYS.len());
     }
-    std::env::remove_var("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS");
     Ok(())
 }
 

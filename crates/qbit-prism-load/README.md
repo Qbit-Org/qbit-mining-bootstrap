@@ -573,8 +573,15 @@ The side report repeats all of this under `honest_value_notes`.
   passing the old value, and compared with a default run only with that
   difference stated. With 128 permits the other 1,872 sessions of a 2,000-
   session frontend queue inside the server, not at the socket: they are all
-  connected and authorized, each waits behind at most 128 builds, and the
-  run still requires every session to hold work before the first phase.
+  connected and authorized, each waits its turn behind every earlier waiter
+  (the permit queue is first-in, first-out, so the last session waits for
+  about fifteen rounds of 128 builds), and every wait has to fit inside the
+  server's 30 s `PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS`, after which it
+  drops the session to reconnect. At real-process build latencies that is
+  a few seconds in total; a slow database or a far larger `--sessions` can
+  make tail sessions time out, which the side report shows as reconnects
+  during setup. The run still requires every session to hold work before
+  the first phase.
 - **A tail the measurement window cut off is reported, not counted as a
   divergence.** A submit still outstanding when the teardown drain expires had
   its window end underneath it: the server is still allowed to answer, and in
