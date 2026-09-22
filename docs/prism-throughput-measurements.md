@@ -76,7 +76,7 @@ Every table in this document comes from this one host. No table mixes hosts.
 | PostgreSQL | 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1), managed by the harness: one primary and one standby per run |
 | Durability | `fsync=on`, `full_page_writes=on`, `synchronous_commit=on`, read back from the primary for every run |
 | Build | release profile for both `qbit-prism-server` and `qbit-prism-load`, built from `5d0042f629f3271ef6743ec9d859cb0c35018f31` with Rust 1.98.1 stable |
-| Frontend settings | harness defaults: `PRISM_RUNTIME_WORKERS=2`, `PRISM_DATABASE_MAX_CONNECTIONS=16`, `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS=15`, `PRISM_BLOCKPOLL_SECONDS=2` |
+| Frontend settings | harness defaults: `PRISM_RUNTIME_WORKERS=2`, `PRISM_DATABASE_MAX_CONNECTIONS=16`, `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS=15`, `PRISM_BLOCKPOLL_SECONDS=2`. `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` was the harness's then-fixed `sessions_per_frontend + 16` (2,016 for one frontend, 1,016 for two, 516 for four), not the server default of 128 the harness has launched since `--stratum-max-pending-initial-jobs` was added; reproducing a row needs that value passed explicitly, and each side report's `frontend_environment[].environment` carries the value its run used |
 
 **The host was shared.** Other users' agent sessions, their `git` processes
 and two unrelated PostgreSQL containers ran on it throughout. For each run the

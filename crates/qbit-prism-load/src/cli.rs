@@ -33,6 +33,48 @@ impl Plan {
     }
 }
 
+/// The native server's default for `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS`
+/// (`crates/qbit-prism-server/src/stratum.rs`): the admission a production
+/// frontend runs unless its deployment says otherwise, and so the admission a
+/// measurement runs unless the run says otherwise.
+pub const PRODUCTION_MAX_PENDING_INITIAL_JOBS: usize = 128;
+
+/// Where a run's initial-job admission came from, recorded so a reader of the
+/// side report can tell a deliberate override from the default without
+/// consulting the command line the run was started with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionSource {
+    /// `--stratum-max-pending-initial-jobs` was omitted: the production
+    /// default.
+    Default,
+    /// `--stratum-max-pending-initial-jobs` was given.
+    Flag,
+}
+
+impl AdmissionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Flag => "--stratum-max-pending-initial-jobs",
+        }
+    }
+}
+
+/// The Stratum listener limits derived from the run's shape, identical for
+/// every frontend. See [`Args::stratum_limits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StratumLimits {
+    /// `--sessions` spread over `--frontends`, rounded up.
+    pub sessions_per_frontend: usize,
+    /// `PRISM_STRATUM_MAX_CONNECTIONS`: room for every session on the
+    /// frontend to be reconnecting while its old socket is still closing,
+    /// and never below the server's own default of 384.
+    pub max_connections: usize,
+    /// `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS`.
+    pub max_pending_initial_jobs: usize,
+    pub admission_source: AdmissionSource,
+}
+
 #[derive(Parser, Clone, Debug)]
 #[command(
     name = "qbit-prism-load",
@@ -161,6 +203,17 @@ pub struct Args {
     /// `PRISM_RUNTIME_WORKERS` for every frontend.
     #[arg(long, default_value_t = 2)]
     pub runtime_workers: usize,
+    /// `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` for every frontend: how many
+    /// authorized sessions may build their first job at once; the rest wait
+    /// in the server's queue. Defaults to the server's own default, 128, so
+    /// the measurement runs the admission production runs. Positive, and at
+    /// most the connection cap the harness derives from `--sessions` and
+    /// `--frontends`. Evidence taken before this flag existed ran
+    /// `sessions_per_frontend + 16` (128 at least); pass that value to
+    /// reproduce it, and see `frontend_environment[].stratum_admission` in
+    /// its side report for what a run actually used.
+    #[arg(long)]
+    pub stratum_max_pending_initial_jobs: Option<usize>,
     /// `PRISM_BLOCKPOLL_SECONDS` for every frontend.
     #[arg(long, default_value_t = 2.0)]
     pub blockpoll_seconds: f64,
@@ -265,6 +318,23 @@ impl Args {
             (1..=1024).contains(&self.runtime_workers),
             "--runtime-workers must be 1..1024"
         );
+        // The server refuses to start with more initial-job permits than
+        // connections, so the harness refuses the same pair here, against the
+        // connection cap it will in fact set (EP-VALIDATION).
+        let limits = self.stratum_limits();
+        ensure!(
+            limits.max_pending_initial_jobs >= 1,
+            "--stratum-max-pending-initial-jobs must be positive"
+        );
+        ensure!(
+            limits.max_pending_initial_jobs <= limits.max_connections,
+            "--stratum-max-pending-initial-jobs ({}) cannot exceed the frontends' connection cap \
+             ({}, PRISM_STRATUM_MAX_CONNECTIONS for {} sessions per frontend), as the server \
+             would refuse to start",
+            limits.max_pending_initial_jobs,
+            limits.max_connections,
+            limits.sessions_per_frontend
+        );
         ensure!(
             self.blockpoll_seconds.is_finite() && self.blockpoll_seconds > 0.0,
             "--blockpoll-seconds must be finite and positive"
@@ -303,6 +373,28 @@ impl Args {
             crate::cadence::validate(&self.cadence_gaps, self.cadence_seconds)?;
         }
         Ok(())
+    }
+
+    /// The Stratum listener limits every frontend is launched with. This is
+    /// the only place they are derived, so the value validated at entry, the
+    /// one exported to the child and the one the side report records are the
+    /// same value (EP-CONFIG).
+    pub fn stratum_limits(&self) -> StratumLimits {
+        let sessions_per_frontend = self.sessions.div_ceil(self.frontends.max(1));
+        let (max_pending_initial_jobs, admission_source) =
+            match self.stratum_max_pending_initial_jobs {
+                Some(value) => (value, AdmissionSource::Flag),
+                None => (
+                    PRODUCTION_MAX_PENDING_INITIAL_JOBS,
+                    AdmissionSource::Default,
+                ),
+            };
+        StratumLimits {
+            sessions_per_frontend,
+            max_connections: (sessions_per_frontend * 2 + 64).max(384),
+            max_pending_initial_jobs,
+            admission_source,
+        }
     }
 
     pub fn cadence(&self) -> Result<crate::cadence::Cadence> {

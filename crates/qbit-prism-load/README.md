@@ -121,6 +121,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--ack-p99-limit-ms` | 1000 | Must be at most `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` × 1000 |
 | `--db-max-connections` | 16 | `PRISM_DATABASE_MAX_CONNECTIONS` per frontend |
 | `--runtime-workers` | 2 | `PRISM_RUNTIME_WORKERS` per frontend |
+| `--stratum-max-pending-initial-jobs` | 128 | `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` per frontend: how many authorized sessions build their first job at once, the rest queueing in the server behind its 30 s initial-job timeout. The default is the server's own default, so a measurement runs the admission production runs. Must be positive and at most the connection cap the harness derives (`PRISM_STRATUM_MAX_CONNECTIONS` = `2 × sessions_per_frontend + 64`, at least 384), because the server refuses to start otherwise. Before this flag existed every run used `sessions_per_frontend + 16` (at least 128), which lets every session build at once and is a deliberate overload of the build path rather than production's shape: pass that value to reproduce such a run, and read `frontend_environment[].stratum_admission` in a side report to see which admission it ran |
 | `--blockpoll-seconds` | 2 | `PRISM_BLOCKPOLL_SECONDS` per frontend |
 | `--share-commit-timeout-seconds` | 15 | `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` per frontend |
 | `--lock-sample-interval-ms` | 10 | PRISM advisory-lock sampling cadence, 1..1000 ms. One poll covers both sampled locks |
@@ -558,6 +559,22 @@ The side report repeats all of this under `honest_value_notes`.
   really used and annotated them as unread (#288); the server has since answered
   that question, so leaving them out is now the honest answer rather than the
   lossy one.
+- **The initial-job admission is production's unless the run says
+  otherwise.** Every frontend is launched with
+  `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS=128`, the server's default, unless
+  `--stratum-max-pending-initial-jobs` names another value; the side report's
+  `frontend_environment[].stratum_admission` records the value each process
+  was launched with, whether it was the default or the flag, and what a run of
+  the same shape used before the flag existed (`sessions_per_frontend + 16`,
+  at least 128: 2,016 for 2,000 sessions on one frontend). That older sizing
+  let every session build its first job at once, and on the real process it
+  inflated the post-publish delivery tail by 50–190 ms against the default
+  (#275). Evidence taken under it is still what it was; it is reproduced by
+  passing the old value, and compared with a default run only with that
+  difference stated. With 128 permits the other 1,872 sessions of a 2,000-
+  session frontend queue inside the server, not at the socket: they are all
+  connected and authorized, each waits behind at most 128 builds, and the
+  run still requires every session to hold work before the first phase.
 - **A tail the measurement window cut off is reported, not counted as a
   divergence.** A submit still outstanding when the teardown drain expires had
   its window end underneath it: the server is still allowed to answer, and in
@@ -973,7 +990,9 @@ deferred`).
 building and share-identifier derivation against the server's own `codec`,
 digest canonicalisation, the window arithmetic, the fake node's chainwork,
 height map, `submitblock` parent check and `waitfornewblock` wake-up, that the
-frontend environment carries all 16 configuration keys, that the artifact
+frontend environment carries all 16 configuration keys, that the initial-job
+admission reaches a launched process as the flag or its default and is refused
+at entry when it is zero or above the connection cap, that the artifact
 builder's output passes `validate_capacity_evidence` and fails once one
 required field or one phase is removed, the rejection classifier, the
 blocked-log classifier against the real refusal message, the dense-cadence gap
