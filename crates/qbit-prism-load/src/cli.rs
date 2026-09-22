@@ -75,6 +75,17 @@ pub struct StratumLimits {
     pub admission_source: AdmissionSource,
 }
 
+impl StratumLimits {
+    /// The admission every run of this shape used before
+    /// `--stratum-max-pending-initial-jobs` existed: enough permits for
+    /// every session on the frontend to build its first job at once, and
+    /// never below the production default. Recorded beside the launched
+    /// value so older evidence can be reproduced and compared honestly.
+    pub fn pre_flag_max_pending_initial_jobs(&self) -> usize {
+        (self.sessions_per_frontend + 16).max(PRODUCTION_MAX_PENDING_INITIAL_JOBS)
+    }
+}
+
 #[derive(Parser, Clone, Debug)]
 #[command(
     name = "qbit-prism-load",
@@ -380,6 +391,8 @@ impl Args {
     /// one exported to the child and the one the side report records are the
     /// same value (EP-CONFIG).
     pub fn stratum_limits(&self) -> StratumLimits {
+        // `validate` refuses zero frontends; the guard only keeps this
+        // derivation total for a caller that asks before validating.
         let sessions_per_frontend = self.sessions.div_ceil(self.frontends.max(1));
         let (max_pending_initial_jobs, admission_source) =
             match self.stratum_max_pending_initial_jobs {

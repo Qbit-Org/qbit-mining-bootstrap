@@ -674,7 +674,7 @@ pub fn stratum_admission_block(environment: &BTreeMap<String, String>, args: &Ar
         "max_connections": launched("PRISM_STRATUM_MAX_CONNECTIONS"),
         "source": limits.admission_source.as_str(),
         "production_default": crate::cli::PRODUCTION_MAX_PENDING_INITIAL_JOBS,
-        "pre_flag_harness_value": (limits.sessions_per_frontend + 16).max(128),
+        "pre_flag_harness_value": limits.pre_flag_max_pending_initial_jobs(),
         "note": "max_pending_initial_jobs is PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS as the \
                  frontend was launched with it: how many authorized sessions build their first \
                  job at once, the rest queueing in the server behind \
@@ -1780,9 +1780,6 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "frontends": args.frontends,
             "sessions": args.sessions,
             "sessions_per_frontend": per_frontend,
-            "stratum_max_pending_initial_jobs": limits.max_pending_initial_jobs,
-            "stratum_max_pending_initial_jobs_source": limits.admission_source.as_str(),
-            "stratum_max_connections": limits.max_connections,
             "max_outstanding_per_session": args.max_outstanding_per_session,
             "plan": args.plan,
             "payout_address": ctx.payout_address,
