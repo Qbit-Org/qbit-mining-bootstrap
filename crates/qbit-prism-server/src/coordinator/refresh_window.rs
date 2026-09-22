@@ -1,7 +1,8 @@
 //! One anchored window per refresh loop, never retained by issued work.
 use super::*;
 use prepared_storage::compact::{
-    prepare_refresh_body, CanonicalCompactBalances, CompactOwner, RefreshBody,
+    finish_refresh_body, prepare_refresh_body_unhashed, CanonicalCompactBalances, CompactOwner,
+    RefreshBody,
 };
 
 mod compute;
@@ -84,12 +85,18 @@ impl Coordinator {
             })
             .await?;
         let config = self.config.clone();
-        let computed = compute::pair(
+        let computed = compute::pipeline(
             source,
+            |capture| {
+                Ok(qbit_prism::CanonicalAuditHashPrefix::new(
+                    &capture.snapshot.shares,
+                )?)
+            },
             |capture| WindowRef::from_snapshot(&capture.snapshot),
             move |capture| {
-                prepare_refresh_body(&config, &capture.snapshot, &template, suffix, inputs)
+                prepare_refresh_body_unhashed(&config, &capture.snapshot, &template, suffix, inputs)
             },
+            finish_refresh_body,
         )
         .await?;
         computed
