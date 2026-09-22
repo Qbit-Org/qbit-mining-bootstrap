@@ -3,7 +3,7 @@
 mod proxy;
 #[path = "support/stratum_admission.rs"]
 mod support;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use proxy::ExecutionProxy;
 use qbit_prism_server::{ledger::Ledger, stratum::StratumConfig};
 use qbit_prism_test_gate as gate;
@@ -271,11 +271,24 @@ async fn unknown_job_budget_bounds_ledger_queries_and_a_capped_source_runs_none(
         "qbit_prism_jobs lookups for 1,000 unknown submits at a budget of {budget}"
     );
     assert_eq!(refusal_total(&metrics, "unknown_job_budget"), 1.);
-    // The disconnected session released its reservation guard.
-    let reservations: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
-            .fetch_one(&ledger.pool)
-            .await?;
+    // The disconnected session released its reservation guard. The release
+    // is the session task's own cleanup after the socket closed, so it lands
+    // shortly after `expect_closed` rather than before it; wait for it the
+    // way the wrap-exhaustion test does instead of reading the table once.
+    let reservations = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reservations: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
+                    .fetch_one(&ledger.pool)
+                    .await?;
+            if reservations == 0 {
+                return anyhow::Ok(reservations);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("a budget disconnect must release the guard within five seconds")??;
     assert_eq!(
         reservations, 0,
         "a budget disconnect must release the guard"
