@@ -85,8 +85,12 @@ labels!(RejectReason {
     LedgerConfirmationFailed => "ledger-confirmation-failed",
     LedgerOutcomeUnknown => "ledger-outcome-unknown", Unrecognised => "unrecognised"
 });
-// Existing admission limits only; never a peer address or username.
-labels!(ConnectionRefusalReason { GlobalLimit => "global_limit", UsernameLimit => "username_limit" });
+// Admission limits and per-session budgets only; never a peer address or username.
+labels!(ConnectionRefusalReason {
+    GlobalLimit => "global_limit", UsernameLimit => "username_limit", IpLimit => "ip_limit",
+    MalformedFrameBudget => "malformed_frame_budget", UnknownJobBudget => "unknown_job_budget",
+    AuthorizeBudget => "authorize_budget"
+});
 // The stale-job decision that refused a share. The wire reason stays `stale-job`.
 labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",

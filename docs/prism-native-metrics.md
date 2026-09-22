@@ -110,7 +110,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_stale_job_rejections_total` | counter | `cause=resume_expired,fee_floor,parent_grace,payout_revision` | run | Stale-job share rejections by the internal decision that refused them. Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id="stale-job"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero. | none |
 | `qbit_prism_stale_shares_total` | counter | none | run | Shares rejected as stale or unknown jobs. | `qbit_prism_stale_shares_total` |
 | `qbit_prism_stratum_connection_limit` | gauge | none | run | Configured global Stratum connection limit, not currently available permits; -1 before a listener starts. Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`. | none |
-| `qbit_prism_stratum_connection_refusals_total` | counter | `reason=global_limit,username_limit` | run | Stratum connections refused by an existing admission limit, by closed reason. `global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`. Same-username reauthorization and reuse of a retained username permit never count. Authorization refusals are not share rejections. Process-local; both series start at zero. | none |
+| `qbit_prism_stratum_connection_refusals_total` | counter | `reason=global_limit,username_limit,ip_limit,malformed_frame_budget,unknown_job_budget,authorize_budget` | run | Stratum connections refused by an admission limit or disconnected by a per-session budget, by closed reason. `global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`; `ip_limit` counts a newly accepted socket closed at `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP`, before any permit, task or query. `malformed_frame_budget`, `unknown_job_budget` and `authorize_budget` count a session disconnected for exceeding `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL`, `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` or `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL`, once per session. Same-username reauthorization, reuse of a retained username permit and every disabled limit never count. Refusals are not share rejections, and no series carries a peer address. Process-local; every series starts at zero. | none |
 | `qbit_prism_stratum_current_tip_coverage_gap_seconds` | gauge | none | run | Continuous age of native current-generation coverage below 95 percent, or -1 before observation. | `qbit_prism_stratum_current_tip_coverage_gap_seconds` |
 | `qbit_prism_stratum_oldest_pending_initial_job_seconds` | gauge | none | run | Oldest first usable work wait, or -1 before observation. | `qbit_prism_stratum_oldest_pending_initial_job_seconds` |
 | `qbit_prism_stratum_pending_initial_jobs` | gauge | none | run | Authorized clients awaiting first usable work, or -1 before observation. | `qbit_prism_stratum_pending_initial_jobs` |
@@ -418,6 +418,23 @@ readiness.
   keeps any earlier authorization. Work still retained for that username keeps
   its slot until it expires, so a quick reconnect can be refused briefly.
   Same-username reauthorization is never counted.
+- `reason="ip_limit"` increases when a newly accepted socket is closed at
+  `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP`. Like `global_limit` the miner sees an
+  accepted connection closed with no JSON-RPC response, and the decision is
+  taken at accept, before any permit, session task or database query. The label
+  never names the address; the matching structured tracing event carries
+  `peer`, so search the log when this rises. Both listeners share one budget
+  per address. See
+  [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) before
+  raising the cap.
+- `reason="malformed_frame_budget"`, `"unknown_job_budget"` and
+  `"authorize_budget"` increase once per session, when a per-session rate
+  budget disconnects it. The session receives its error response first, then
+  the close. A rise with no operator change means either a misbehaving client
+  or a budget set below an honest rate: an unknown-job burst is normal
+  immediately after a tip or payout-revision change, so compare it with
+  `qbit_prism_rejections_total{reason_id="unknown-job"}` before lowering
+  anything.
 - Reconnects with no refusal increase, and connections below the limit, point
   to the transport path or the miner rather than server admission.
 - Readiness (`qbit_prism_health_state`, `mining.get_health`) says whether this
