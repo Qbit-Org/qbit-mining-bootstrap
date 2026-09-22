@@ -881,6 +881,42 @@ under the same retention plan as the database backups. The procedure is
 [below](#share-ledger-partitions-and-retention); the decision behind it is
 decision D6 in [the design record](prism-share-ledger-partitioning.md).
 
+### Public audit artifact admission
+
+An artifact read of a native block is window-sized work: an unsealed block is
+rebuilt from its share range, a sealed one has its stored bytes digested and
+parsed, and neither result fits the public response cache at production window
+sizes, so every distinct request repeats it.
+`PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` (default 1) is how many of those run at
+once, and it is deliberately not derived from `PRISM_POSTGRES_READ_CONCURRENCY`:
+a larger read pool serves more dashboard reads without admitting a second
+window into memory *on this route*. The limit does not extend to
+`/public/v1/blocks/<hash>/settlement-artifacts`, which falls back to the
+audit-bundle reader for a block with no CTV fanout set and rebuilds or decodes
+the window under the shared imported-audit decode limit, still sized from
+`PRISM_POSTGRES_READ_CONCURRENCY`; that route admits as many windows as the read
+concurrency allows. Moving it under the artifact limit would change another
+route's behaviour and is left as a follow-up. A request waits for its slot inside its own read deadline
+(`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS`, default 20 s) and answers 503
+`read_timeout` if the deadline runs out first, exactly as a slow query does.
+
+`PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT` (default 32) caps how many audit
+artifact requests may run or queue at once. Past the cap a request is refused
+immediately, after the route's two indexed point lookups and before any audit
+read, with HTTP 503, the error code `audit_artifact_busy` and `Retry-After: 5`
+— the only `Retry-After` the server sends. The refusal is never cached
+(`Cache-Control: no-store`) and is counted in
+`qbit_prism_public_audit_artifact_refusals_total` on the public service's
+`/metrics`. CTV fanout manifests, which the same route serves from stored JSON,
+are neither counted nor refused. With the response cache enabled (the default),
+identical concurrent requests for one artifact collapse into a single
+computation and occupy one place under the cap, so the cap bounds distinct
+artifacts, not clients. A sustained stream of refusals means
+either an unusually wide fan-out of distinct blocks or a rebuild concurrency
+too low for the traffic; raise the cap only after checking that the memory bound
+in [prism-storage-sizing.md](prism-storage-sizing.md#memory-bound-on-artifact-reads)
+still holds.
+
 Imported historical external audits retain their verified canonical bytes;
 they are not silently rewritten into references to potentially incomplete
 legacy share history. Import preserves their published canonical SHA. Legacy

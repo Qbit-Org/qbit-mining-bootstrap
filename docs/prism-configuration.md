@@ -91,6 +91,30 @@ as the snapshot and `self-check` heartbeat staleness budgets, both
 from 1 through 86400 seconds (default 2).
 The public API remains a separate process and does not need signing seeds.
 
+## Public audit artifact admission
+
+`/public/v1/artifacts/<sha256>` serves a block's audit by digesting and parsing
+its sealed canonical bytes or, for an unsealed native block, by rebuilding the
+share window; both hold the whole window in memory and outlive the read
+connection. `PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` bounds how many run at
+once in one process, a whole number from 1 through 64 (default 1). It is
+independent of `PRISM_POSTGRES_READ_CONCURRENCY`, so a larger read pool admits
+no more rebuilds. A request waits for a rebuild slot within its own
+`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS` deadline and gets 503
+`read_timeout` when that runs out.
+
+`PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT` caps the audit artifact requests
+running or waiting for a slot, a whole number from 1 through 4096 (default 32).
+With the response cache enabled (the default), identical concurrent requests
+share one computation and one place under the cap. A request past the cap is refused at once with 503
+`audit_artifact_busy` and `Retry-After: 5`, after two indexed point lookups and
+before any audit read. CTV manifests served from the same route are never
+counted or refused. Both settings apply to the public service and to the
+operator listener's copy of the public routes; a value outside its range stops
+startup with `<NAME> must be <min>..<max>`. See
+[prism-ledger-ops.md](prism-ledger-ops.md#public-audit-artifact-admission) and
+[prism-storage-sizing.md](prism-storage-sizing.md#native-audit-body-size).
+
 ## Share ledger partition maintenance
 
 `qbit_share_ledger` is partitioned by `share_seq` and has no DEFAULT

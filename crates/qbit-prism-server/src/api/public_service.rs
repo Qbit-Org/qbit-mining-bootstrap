@@ -210,6 +210,7 @@ struct ServiceMetrics {
     staleness_refusals: u64,
     replica_refusals: u64,
     degraded_responses: u64,
+    audit_artifact_refusals: u64,
     outage_refusals: u64,
 }
 pub struct ServiceState {
@@ -396,6 +397,12 @@ impl ServiceState {
     ) {
         let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         *metrics.cache.entry(state.into()).or_default() += 1;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == AUDIT_ARTIFACT_BUSY)
+        {
+            metrics.audit_artifact_refusals += 1;
+        }
         if reads_database(path) && view.replica_error.is_some() {
             metrics.replica_refusals += 1;
         } else if staleness_budget(path).is_some_and(|budget| age > budget) {
@@ -412,6 +419,10 @@ impl ServiceState {
         let view = self.view();
         let metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         let mut body=format!("qbit_prism_public_requests_total {}\nqbit_prism_public_ledger_ready {}\nqbit_prism_public_ledger_probe_age_seconds {}\nqbit_prism_public_staleness_refusals_total {}\nqbit_prism_public_replica_refusals_total {}\nqbit_prism_public_degraded_responses_total {}\nqbit_prism_public_database_outage_refusals_total {}\n",self.requests.load(Ordering::Relaxed),u8::from(view.database_ready),view.payload["probe_age_seconds"],metrics.staleness_refusals,metrics.replica_refusals,metrics.degraded_responses,metrics.outage_refusals);
+        body.push_str(&format!(
+            "# HELP qbit_prism_public_audit_artifact_refusals_total {AUDIT_ARTIFACT_REFUSALS_HELP}\n# TYPE qbit_prism_public_audit_artifact_refusals_total counter\nqbit_prism_public_audit_artifact_refusals_total {}\n",
+            metrics.audit_artifact_refusals
+        ));
         for (status, count) in &metrics.responses {
             body.push_str(&format!(
                 "qbit_prism_public_responses_total{{status=\"{status}\"}} {count}\n"
@@ -443,6 +454,10 @@ impl ServiceState {
         view.metrics_freshness.response(body)
     }
 }
+/// The first sentence of the family's meaning in
+/// docs/prism-metric-metadata.json, which adds that only this role counts them.
+const AUDIT_ARTIFACT_REFUSALS_HELP: &str =
+    "Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight.";
 fn numeric(value: &Value) -> Option<f64> {
     value
         .as_f64()
