@@ -234,7 +234,17 @@ fn native_rules_reference_only_inventory_families_for_their_role() {
                 rule["title"]
             );
             assert!(!name.starts_with("qbit_prism_block_submit_seconds"));
-            assert!(!name.starts_with("qbit_prism_database_advisory_lock_wait_seconds"));
+            if name.starts_with("qbit_prism_database_advisory_lock_wait_seconds") {
+                assert!(
+                    matches!(
+                        rule["uid"].as_str().unwrap(),
+                        "qbit-prism-database-advisory-lock-wait"
+                            | "qbit-prism-database-advisory-lock-failures-critical"
+                    ),
+                    "rule {} may not read {name}",
+                    rule["title"]
+                );
+            }
             assert_ne!(
                 name, "qbit_prism_public_requests_total",
                 "routed probes are not public request rate"

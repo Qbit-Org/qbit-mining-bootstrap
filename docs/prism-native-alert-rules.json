@@ -536,6 +536,61 @@
       ]
     },
     {
+      "uid": "qbit-prism-database-advisory-lock-wait",
+      "title": "PrismDatabaseAdvisoryLockWaitHigh",
+      "role": "run",
+      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, lock, le) (rate(qbit_prism_database_advisory_lock_wait_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\",lock=~\"order|settlement\"}[5m]))) > bool 1) and on(job, instance, network, lock) (sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\",lock=~\"order|settlement\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismDatabaseAdvisoryLockWaitHigh",
+      "description": "Order and settlement advisory transaction lock waits, combining success and failure. The timer covers the pg_advisory_xact_lock statement alone, including one database round trip; the surrounding transaction work is outside it. lock=\"migration\" is excluded because the migration advisory lock is taken only when a coordinator initializes the schema, where waiting behind another frontend for the whole online 013/016/017 migration window is the designed behaviour rather than a fault. Each lock is judged on its own waits; neither lock supplies the other's sample minimum. This family is rendered from the cached snapshot body and is not read live at scrape time, so an unpublished or stale body suppresses the rule instead of repeating an old percentile. Order and settlement advisory-lock p99 >1 second, combining success and failure, from at least ten observed waits for that lock in five minutes; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends without any native wait percentile, and PRISM_DATABASE_LOCK_TIMEOUT_MS bounds a single wait at five seconds by default; provisional, measure in #291/#447.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Order and settlement advisory-lock p99 >1 second, combining success and failure, from at least ten observed waits for that lock in five minutes; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends without any native wait percentile, and PRISM_DATABASE_LOCK_TIMEOUT_MS bounds a single wait at five seconds by default; provisional, measure in #291/#447.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L74",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L66",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L67",
+        "crates/qbit-prism-server/src/ledger/connect.rs#L506",
+        "crates/qbit-prism-server/src/ledger/connect.rs#L549"
+      ]
+    },
+    {
+      "uid": "qbit-prism-database-advisory-lock-failures-critical",
+      "title": "PrismDatabaseAdvisoryLockFailuresCritical",
+      "role": "run",
+      "expr": "((sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\",lock=~\"order|settlement\",result=\"failure\"}[5m])) / sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\",lock=~\"order|settlement\"}[5m])) > bool 0.05) and on(job, instance, network, lock) (sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\",lock=~\"order|settlement\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismDatabaseAdvisoryLockFailuresCritical",
+      "description": "Share of order or settlement advisory-lock waits that ended without a held lock. result=\"failure\" covers lock timeout (PRISM_DATABASE_LOCK_TIMEOUT_MS, five seconds by default), statement timeout, deadlock and connection error, and also cancellation of the waiting future: a dropped future such as a cancelled share append records failure from the wait guard rather than vanishing. The failure series does not exist until the first failure, so on a healthy coordinator the ratio is absent rather than zero and no-data stays OK instead of paging. Each series appears at its first observation, so the first failure after a restart is invisible to increase() and the ratio only rises once a later failure lands in the window. lock=\"migration\" is excluded for the same reason as the wait percentile: that lock is taken only at schema initialization. This family is rendered from the cached snapshot body, so an unpublished or stale body suppresses the rule. Order and settlement advisory-lock failures >5% of that lock's waits over five minutes, from at least ten observed waits for that lock; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends and no native failure rate, and the default five-second PRISM_DATABASE_LOCK_TIMEOUT_MS turns a sustained wait into a failure; provisional, measure in #291/#447.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Order and settlement advisory-lock failures >5% of that lock's waits over five minutes, from at least ten observed waits for that lock; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends and no native failure rate, and the default five-second PRISM_DATABASE_LOCK_TIMEOUT_MS turns a sustained wait into a failure; provisional, measure in #291/#447.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L74",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L66",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L67",
+        "crates/qbit-prism-server/src/ledger/connect.rs#L506",
+        "crates/qbit-prism-server/src/ledger/connect.rs#L549"
+      ]
+    },
+    {
       "uid": "qbit-prism-lease-monitor-wake",
       "title": "PrismRuntimeLagHigh",
       "role": "run",
