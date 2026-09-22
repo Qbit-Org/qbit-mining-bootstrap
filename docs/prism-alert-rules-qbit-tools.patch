@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 6d433c23a07275f8aef370c1688d9733cbbab41e80a144362fd84724f78c939f
++   Specification SHA-256: a0051e3f05811d00c744dd050c4997625f45f10212895121d62e63a14ad91a53
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,635 @@
+@@ -118,53 +14,672 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -582,6 +582,43 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
++    "uid": "qbit-prism-database-advisory-lock-wait",
++    "title": "PrismDatabaseAdvisoryLockWaitHigh",
++    "expr": "((histogram_quantile(0.99, sum by (job, instance, network, lock, le) (rate(qbit_prism_database_advisory_lock_wait_seconds_bucket{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m]))) > bool 1) and on(job, instance, network, lock) (sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "3m",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismDatabaseAdvisoryLockWaitHigh",
++    "description": "Order and settlement advisory transaction lock waits, combining success and failure. The timer covers the pg_advisory_xact_lock statement alone, including one database round trip; the surrounding transaction work is outside it. lock=\"migration\" is excluded because the migration advisory lock is taken only when a coordinator initializes the schema, where waiting behind another frontend for the whole online 013/016/017 migration window is the designed behaviour rather than a fault. Each lock is judged on its own waits; neither lock supplies the other's sample minimum. This family is rendered from the cached snapshot body and is not read live at scrape time, so an unpublished or stale body suppresses the rule instead of repeating an old percentile. Order and settlement advisory-lock p99 >1 second, combining success and failure, from at least ten observed waits for that lock in five minutes; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends without any native wait percentile, and PRISM_DATABASE_LOCK_TIMEOUT_MS bounds a single wait at five seconds by default; provisional, measure in #291/#447.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
++    "uid": "qbit-prism-database-advisory-lock-failures-critical",
++    "title": "PrismDatabaseAdvisoryLockFailuresCritical",
++    "expr": "((sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\",result=\"failure\"}[5m])) / sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m])) > bool 0.05) and on(job, instance, network, lock) (sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "3m",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismDatabaseAdvisoryLockFailuresCritical",
++    "description": "Share of order or settlement advisory-lock waits that ended without a held lock. result=\"failure\" covers lock timeout (PRISM_DATABASE_LOCK_TIMEOUT_MS, five seconds by default), statement timeout, deadlock and connection error, and also cancellation of the waiting future: a dropped future such as a cancelled share append records failure from the wait guard rather than vanishing. The failure series does not exist until the first failure, so on a healthy coordinator the ratio is absent rather than zero and no-data stays OK instead of paging. Each series appears at its first observation, so the first failure after a restart is invisible to increase() and the ratio only rises once a later failure lands in the window. lock=\"migration\" is excluded for the same reason as the wait percentile: that lock is taken only at schema initialization. This family is rendered from the cached snapshot body, so an unpublished or stale body suppresses the rule. Order and settlement advisory-lock failures >5% of that lock's waits over five minutes, from at least ten observed waits for that lock; #271 measured 15, 31 and 63 steady ORDER_LOCK waiters at one, two and four frontends and no native failure rate, and the default five-second PRISM_DATABASE_LOCK_TIMEOUT_MS turns a sustained wait into a failure; provisional, measure in #291/#447.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
 +    "uid": "qbit-prism-lease-monitor-wake",
 +    "title": "PrismRuntimeLagHigh",
 +    "expr": "(max_over_time(qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]) > bool 2) + on(job, instance, network) (max by (job, instance, network) (max_over_time(qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) > bool 2) + on(job, instance, network) (max by (job, instance, network) (qbit_prism_runtime_task_stalled{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}) > bool 0) + on(job, instance, network) (qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0)",
@@ -789,7 +826,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +708,17 @@
+@@ -230,752 +745,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1545,7 +1582,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1197,84 @@
+@@ -1454,5 +1234,84 @@
    }
  ] %}
  {% endif %}

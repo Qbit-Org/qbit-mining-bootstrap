@@ -319,27 +319,65 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
     let canonical: Option<String> = sqlx::query_scalar("SELECT canonical_json FROM (SELECT manifest_set_json AS canonical_json FROM qbit_ctv_fanout_sets WHERE manifest_set_sha256=$1 UNION ALL SELECT manifest_json FROM qbit_ctv_fanout_artifacts WHERE manifest_sha256=$1) rows LIMIT 1")
         .bind(hash).fetch_optional(&state.pool).await?;
     if let Some(canonical) = canonical {
+        // A manifest is small, and nothing has digested it yet, so it is
+        // hashed here and served under the address that proved it.
         if hex::encode(Sha256::digest(canonical.as_bytes())) != hash {
             return Err(ApiError::internal());
         }
-        return Ok(Payload::raw(canonical.into_bytes()));
+        return Ok(Payload::addressed(canonical.into_bytes(), hash));
     }
-    let block_hash: Option<String> = sqlx::query_scalar(
-        "SELECT block_hash FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1",
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT block_hash,audit_bundle_sha256 FROM qbit_pool_audit_bundles \
+         WHERE audit_bundle_sha256=$1 LIMIT 1",
     )
     .bind(hash)
     .fetch_optional(&state.pool)
     .await?;
-    let block_hash =
-        block_hash.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
-    let canonical = crate::ledger::audit_canonical_bytes(&state.pool, &block_hash)
+    let (block_hash, advertised) =
+        row.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
+    // Only audit artifacts are admitted here: the manifests above are served
+    // from their stored JSON and never wait behind a rebuild. Past the cap a
+    // request is refused at once, after the two point lookups above and
+    // before any audit read, instead of spending its deadline in the queue.
+    // The admission lives in the computation, not in the request, so with the
+    // response cache on, identical requests collapse into one computation and
+    // one place under the cap, and it ends with that computation.
+    let _admitted =
+        state
+            .audit_artifacts
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => ApiError::audit_artifact_busy(),
+                tokio::sync::TryAcquireError::Closed => ApiError::internal(),
+            })?;
+    // Stored bytes are digested and parsed, and a native row is rebuilt from
+    // its window, all proportional to the window and all outliving the read
+    // connection. Their own limit bounds them, never the read concurrency.
+    // The permit is taken before the row read, so it also spans a rebuild's
+    // snapshot lookup and window read, and it moves into the blocking job: a
+    // dropped request cannot free it before that job ends. Waiting for it
+    // spends the request's own deadline.
+    let permit = state
+        .audit_rebuilds
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(audit_read_error)?;
+        .map_err(|_| ApiError::internal())?;
+    let canonical =
+        crate::ledger::audit_canonical_bytes_admitted(&state.pool, &block_hash, Some(permit))
+            .await
+            .map_err(audit_read_error)?;
     if let Some(canonical) = canonical {
-        if hex::encode(Sha256::digest(&canonical)) != hash {
+        // The bytes were digested against `audit_bundle_sha256` inside the
+        // blocking job, under the permit, and that is the column this row was
+        // found by: an audit artifact is never hashed a second time on a
+        // runtime thread, where a window-sized pass would stall every other
+        // task. What remains is that the row answers the address asked for.
+        if advertised != hash {
             return Err(ApiError::internal());
         }
-        return Ok(Payload::raw(canonical));
+        return Ok(Payload::addressed(canonical, hash));
     }
     let mut payload = Payload::json(
         bundle(state, &block_hash, false)
