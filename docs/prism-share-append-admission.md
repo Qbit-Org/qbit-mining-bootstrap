@@ -26,7 +26,21 @@ not started SQL. After checkout, the transaction borrows a connection guard that
 keeps admission until SQLx has returned or closed that connection. Dropping a
 transaction only queues rollback, so releasing admission at caller cancellation
 would be too early. The same rule covers an uncertain COMMIT reply; admission
-does not classify that outcome, retry it, or suppress cleanup warnings.
+does not classify that outcome, retry it, or suppress cleanup warnings. An
+aborted append keeps its server-side `ORDER_LOCK` queue position until the lock
+is granted and the queued rollback runs, exactly as before; abort does not free
+the slot promptly. The guard spawns that cleanup on the runtime handle captured
+at admission, so a future dropped from a thread outside the runtime context
+still cleans up without panicking while the runtime lives; on a shut-down
+runtime the cleanup is cancelled and the floated connection and permit are
+released by ownership.
+
+One failure mode changes: the pool's `acquire_timeout` used to fail an append
+with `PoolTimedOut` when every connection was busy. Admission now waits for a
+permit with no bound of its own, so an append that its caller follows rather
+than refuses at the acknowledgement deadline (a candidate-bearing share) waits
+for its turn instead of failing after that timeout. Checkout after admission is
+still bounded by `acquire_timeout`.
 
 The missing-partition retry releases the first attempt through that cleanup,
 attaches the partition lead outside append admission, and reacquires for its
@@ -36,14 +50,13 @@ Miner rejection identifiers and successful-credit deduplication are unchanged.
 
 `append_admission` integration tests hold the actual advisory key on durable
 PostgreSQL and queue more appends than the frontend pool can hold. They check
-control-read progress, cancellation, shared-pool handles, revision/gate changes,
-lost COMMIT replies, durable replay and missing-partition recovery. Pool checkout
-telemetry continues to measure actual checkout; it does not include the new
-admission wait.
+control-read progress, cancellation on and off the runtime, shared-pool handles,
+revision/gate changes, lost COMMIT replies, durable replay and missing-partition
+recovery. Pool checkout telemetry continues to measure actual checkout; it does
+not include the new admission wait, so checkout saturation under-reports append
+queueing.
 
-External-tip latency is a separate measurement: node tip observation through
-automatic refresh, issuance, persistence and the client's first matching decoded
-notification before replacement. Warm-up and steady-state observations, partial
-coverage, unknown delivery and ACK/row reconciliation must remain separate. The
-explicit-refresh delivery benchmark does not measure that full boundary under
-concurrent share load.
+External-tip latency (node tip observation through automatic refresh, issuance,
+persistence and first client delivery under concurrent share load) is a separate
+measurement with its own warm-up, coverage and reconciliation rules; it is not
+the explicit-refresh delivery benchmark.

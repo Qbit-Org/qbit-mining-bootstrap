@@ -13,6 +13,9 @@ struct PoolAdmission {
 // at the same pool. Key by the shared pool itself, not Ledger or URL (two
 // independently sized pools may use the same URL). Only outstanding appends
 // and their cleanup own entries; the registry never keeps an idle pool alive.
+// Ceiling: one scan of this list per append under a std mutex, and the list
+// holds one entry per pool with an outstanding append, which is a handful.
+// If Ledger::pool ever becomes private, replace this with a per-ledger field.
 static POOLS: Mutex<Vec<Weak<PoolAdmission>>> = Mutex::new(Vec::new());
 
 fn shared(pool: &PgPool) -> Arc<PoolAdmission> {
@@ -45,6 +48,10 @@ fn shared(pool: &PgPool) -> Arc<PoolAdmission> {
 pub(super) struct Admission {
     _pool: Arc<PoolAdmission>,
     _permit: OwnedSemaphorePermit,
+    // The runtime that polled this append. Cancellation can drop the guard
+    // below from a thread without an entered runtime context, where an
+    // ambient tokio::spawn panics; the captured handle cannot.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Admission {
@@ -62,6 +69,8 @@ impl Admission {
         Ok(Self {
             _pool: admission,
             _permit: permit,
+            // Always polled on a runtime, so this cannot panic here.
+            runtime: tokio::runtime::Handle::current(),
         })
     }
 
@@ -88,8 +97,17 @@ impl Drop for AppendConnection {
         // COMMIT reply, before releasing/closing the connection. Keep the
         // permit until that same cleanup finishes, even if the caller was
         // cancelled. Do not alter its errors, warnings or transaction state.
+        //
+        // `return_to_pool` is SQLx's own drop path made callable (0.8.x,
+        // `#[doc(hidden)]`): it floats the connection out of the pool
+        // handle synchronously, so a cleanup future that is never polled
+        // (runtime already shut down) still releases the pool slot and, by
+        // ownership, the permit. Re-check this on any SQLx upgrade. SQLx's
+        // own PoolConnection::drop then sees no live connection and spawns
+        // nothing for the ledger pool, which sets no min_connections.
         let cleanup = self.connection.return_to_pool();
-        tokio::spawn(async move {
+        let runtime = admission.runtime.clone();
+        runtime.spawn(async move {
             cleanup.await;
             drop(admission);
         });

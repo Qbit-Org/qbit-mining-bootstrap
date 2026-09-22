@@ -1,5 +1,5 @@
 //! Share appenders must queue before consuming refresh's pool headroom.
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::ledger::{CommitGateClosed, Ledger};
 use qbit_prism_test_gate as gate;
@@ -234,8 +234,10 @@ async fn shared_pool_queue_uses_original_deadline_and_cancels_without_sql() -> R
         blocker.rollback().await?;
         ensure!(timeout(WAIT, &mut first.0).await???.inserted);
         ensure!(
-            alias.append(share(3), None).await?.inserted,
-            "cancelled waiter leaked admission"
+            timeout(WAIT, alias.append(share(3), None))
+                .await
+                .context("cancelled waiter leaked admission")??
+                .inserted
         );
         ensure!(h.ids().await? == vec![share(1).share_id, share(3).share_id]);
         Ok(())
@@ -324,6 +326,128 @@ async fn cancelled_transaction_keeps_admission_until_connection_cleanup() -> Res
             h.ids().await? == vec![share(2).share_id],
             "cancelled transaction left credit"
         );
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}
+
+/// Cancellation can drop an in-flight append from a thread that never
+/// entered the runtime. The guard must not panic there, and its permit must
+/// still outlive the queued rollback and the connection's return to the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_dropped_outside_runtime_context_keeps_admission_until_cleanup() -> Result<()> {
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let blocker = h.hold_order().await?;
+        let ledger = h.ledger.clone();
+        let mut first = Box::pin(async move { ledger.append(share(1), None).await });
+        // Poll the append on the runtime until it holds a connection and is
+        // waiting for ORDER_LOCK, then hand the pending future to a plain
+        // thread with no runtime context and drop it there.
+        tokio::select! {
+            result = &mut first => bail!("append finished under a held ORDER_LOCK: {result:?}"),
+            waited = h.wait_for_appends(1) => waited?,
+        }
+        let mark = h.proxy.mark();
+        let dropper = std::thread::spawn(move || drop(first));
+        let joined = tokio::task::spawn_blocking(move || dropper.join()).await?;
+        ensure!(
+            joined.is_ok(),
+            "guard dropped outside runtime context panicked"
+        );
+        let mut next = append(&h.ledger, 2);
+        ensure!(timeout(Duration::from_millis(150), &mut next.0)
+            .await
+            .is_err());
+        ensure!(
+            h.proxy
+                .executions_since(mark)?
+                .iter()
+                .all(|e| e.sql != "BEGIN"),
+            "permit released before rollback cleanup"
+        );
+        ensure!(
+            timeout(Duration::from_millis(500), h.ledger.payout_revision())
+                .await?
+                .is_ok()
+        );
+        blocker.rollback().await?;
+        ensure!(timeout(WAIT, &mut next.0).await???.inserted);
+        ensure!(
+            h.ids().await? == vec![share(2).share_id],
+            "dropped transaction left credit"
+        );
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}
+
+/// A caller-supplied pool with `min_connections > 0` still reaches SQLx's own
+/// off-context spawn after the guard has queued its cleanup. SQLx panics once
+/// there, exactly as it did before admission existed; the guard must not add
+/// a second panic during that unwind, which would abort the process, and its
+/// cleanup must still finish on the captured runtime. The one SQLx panic
+/// message on stderr is expected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn min_connections_pool_dropped_outside_runtime_panics_once_like_sqlx_and_still_cleans_up(
+) -> Result<()> {
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut ledger = Ledger::connect(&h.db.url, "min-connections".into(), 2, false).await?;
+        ledger.pool.close().await;
+        ledger.pool = PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(1)
+            .connect(&h.proxy.rewrite_url(&h.db.url)?)
+            .await?;
+        let blocker = h.hold_order().await?;
+        let appender = ledger.clone();
+        let mut first = Box::pin(async move { appender.append(share(1), None).await });
+        tokio::select! {
+            result = &mut first => bail!("append finished under a held ORDER_LOCK: {result:?}"),
+            waited = h.wait_for_appends(1) => waited?,
+        }
+        let mark = h.proxy.mark();
+        let dropper = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)))
+        });
+        let outcome = tokio::task::spawn_blocking(move || dropper.join()).await?;
+        let Ok(Err(panic)) = outcome else {
+            bail!("expected exactly SQLx's off-context panic, got a clean drop or thread failure");
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        ensure!(
+            message.contains("Tokio context"),
+            "panic did not come from SQLx's own drop: {message}"
+        );
+        let mut next = append(&ledger, 2);
+        ensure!(timeout(Duration::from_millis(150), &mut next.0)
+            .await
+            .is_err());
+        ensure!(
+            h.proxy
+                .executions_since(mark)?
+                .iter()
+                .all(|e| e.sql != "BEGIN"),
+            "permit released before rollback cleanup"
+        );
+        blocker.rollback().await?;
+        ensure!(timeout(WAIT, &mut next.0).await???.inserted);
+        ensure!(
+            h.ids().await? == vec![share(2).share_id],
+            "dropped transaction left credit"
+        );
+        ledger.pool.close().await;
         Ok(())
     }
     .await;
@@ -530,8 +654,10 @@ async fn missing_partition_retry_reacquires_admission_and_preserves_gate_deadlin
         );
         ensure!(h.ids().await? == vec![share(1).share_id]);
         ensure!(
-            h.ledger.append(share(3), None).await?.inserted,
-            "retry leaked admission"
+            timeout(WAIT, h.ledger.append(share(3), None))
+                .await
+                .context("retry leaked admission")??
+                .inserted
         );
         Ok(())
     }
