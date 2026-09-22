@@ -772,12 +772,16 @@ The side report repeats all of this under `honest_value_notes`.
   withheld rather than written with `0.000`, and the side report's
   `validator.worst_artifact_phase_ack_p99_milliseconds` is `null` with
   `worst_artifact_phase_ack_p99_unavailable_reason` naming the phase
-  rather than a `0.0` the measured phases out-rank; a phase with no
-  reconciliation reports `achieved_rate_shares_per_second: null` with
-  `achieved_rate_unavailable_reason`, and a reconciliation that
-  acknowledged nothing reports `0`; and `all_sessions_milliseconds` is
-  below. The printed summary prints each of these as `None`, like the
-  percentiles beside them.
+  rather than a `0.0` the measured phases out-rank; a phase that was not
+  reconciled reports `achieved_rate_shares_per_second: null` with
+  `achieved_rate_unavailable_reason` -- a guard, since every reported
+  phase is reconciled, so the old `0` there was as unreachable as the
+  `null` is now -- and a reconciliation that acknowledged nothing reports
+  `0`; and `all_sessions_milliseconds` is below. On the printed summary's
+  phase line, the acknowledged count, the rate and the two waiter maxima
+  print as `Some(value)` when measured and `None` when the report has
+  `null` there, like the percentiles beside them; the all-sessions figure
+  and the validator's worst p99 are not on that line.
 - **Time to reconnect is the outage, not the last handshake.** The
   `reconnects` block's `time_to_reconnect_milliseconds` runs from the moment a
   session's connection went -- the socket closing, or the deliberate close

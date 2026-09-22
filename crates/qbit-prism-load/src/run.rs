@@ -3142,11 +3142,12 @@ pub fn offer_accounting(phase: &str, dispatched: u64, collected: &Collected) -> 
 /// A phase's achieved rate: its reconciled acknowledged count over its
 /// duration.
 ///
-/// Without a reconciliation the acknowledged count is unknown, so the rate
-/// is `None` with the reason; it used to be 0, a rate the phase never
-/// achieved, with `completed: false` on the phase the only tell (#483). A
-/// reconciliation that acknowledged nothing is a measured zero and reports
-/// `Some(0.0)`.
+/// Without a reconciliation there is no reconciled count to rate, so the
+/// rate is `None` with the reason; it used to be 0, a rate the phase never
+/// achieved (#483). This arm is a guard: `run_inner` reconciles every phase
+/// it reports, so a real run does not reach it, and the old 0 was equally
+/// unreachable. A reconciliation that acknowledged nothing is a measured
+/// zero and reports `Some(0.0)`.
 pub fn achieved_rate(
     reconciliation: Option<&digest::Reconciliation>,
     seconds: f64,
@@ -3159,7 +3160,7 @@ pub fn achieved_rate(
         None => AchievedRate {
             shares_per_second: None,
             unavailable_reason: Some(
-                "the phase has no reconciliation, so its acknowledged count is unknown".to_owned(),
+                "the phase was not reconciled, so it has no acknowledged count to rate".to_owned(),
             ),
         },
     }
@@ -3743,7 +3744,7 @@ pub fn summary_text(
     text.push_str("=== qbit-prism-load ===\n");
     for phase in report["phases"].as_array().into_iter().flatten() {
         text.push_str(&format!(
-            "phase {:<16} {:>8.1}s target={:<8} offered={:<8} acked={:<8} rate={:?}/s \
+            "phase {:<16} {:>8.1}s target={:<8} offered={:<8} acked={:?} rate={:?}/s \
              ack p50={:?} p99={:?} order_waiters_max={:?} settlement_waiters_max={:?} \
              shortfall={}\n",
             phase["name"].as_str().unwrap_or_default(),
@@ -3752,11 +3753,12 @@ pub fn summary_text(
                 .as_f64()
                 .unwrap_or_default(),
             phase["dispatched"].as_u64().unwrap_or_default(),
-            phase["reconciliation"]["acknowledged"]
-                .as_u64()
-                .unwrap_or_default(),
-            // Unknown is printed as None, like the percentiles beside it,
-            // never as a zero the phase did not measure.
+            // The acknowledged count, the rate and the two waiter maxima
+            // print as Some(value) when measured and None when the report
+            // has null there, like the percentiles beside them: never a
+            // zero the phase did not measure. The count and the rate come
+            // from the same reconciliation, so they are unknown together.
+            phase["reconciliation"]["acknowledged"].as_u64(),
             phase["achieved_rate_shares_per_second"].as_f64(),
             phase["client_ack_latency"]["p50"].as_f64(),
             phase["client_ack_latency"]["p99"].as_f64(),

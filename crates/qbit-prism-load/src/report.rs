@@ -77,8 +77,9 @@ pub fn honest_value_notes() -> Value {
         {
             "field": "phases.*.achieved_rate_shares_per_second",
             "note": "The reconciled acknowledged count over the phase's duration. null, with \
-                     achieved_rate_unavailable_reason, when the phase has no reconciliation, \
-                     because its acknowledged count is then unknown; a reconciliation that \
+                     achieved_rate_unavailable_reason, for a phase that was not reconciled: a \
+                     guard, since every reported phase is reconciled, kept so that path can \
+                     never print a rate the phase did not achieve. A reconciliation that \
                      acknowledged nothing is a measured 0."
         },
         {

@@ -9080,16 +9080,18 @@ fn all_sessions_milliseconds_is_null_unless_every_session_was_served() {
 }
 
 /// Case 4: a phase without a reconciliation reported
-/// `achieved_rate_shares_per_second: 0` as if measured; the rate is unknown
-/// because the acknowledged count is. A reconciliation that acknowledged
-/// nothing is the measured zero it was indistinguishable from.
+/// `achieved_rate_shares_per_second: 0` as if measured. The run reconciles
+/// every phase it reports, so this arm is a guard rather than a state a
+/// report has carried; the guard still has to answer honestly, and a
+/// reconciliation that acknowledged nothing is the measured zero it was
+/// indistinguishable from.
 #[test]
 fn a_phase_without_a_reconciliation_has_no_achieved_rate() {
     let unknown = run::achieved_rate(None, 60.0);
     assert_eq!(unknown.shares_per_second, None);
     assert_eq!(
         unknown.unavailable_reason.as_deref(),
-        Some("the phase has no reconciliation, so its acknowledged count is unknown")
+        Some("the phase was not reconciled, so it has no acknowledged count to rate")
     );
 
     let empty = digest::Reconciliation {
@@ -9119,38 +9121,70 @@ fn a_phase_without_a_reconciliation_has_no_achieved_rate() {
     assert!(instant.shares_per_second.is_some_and(f64::is_finite));
 }
 
-/// The printed summary line prints an unknown rate and unknown waiter counts
-/// as None, like the percentiles beside them, never as 0.
+/// The printed summary line prints an unknown acknowledged count, rate and
+/// waiter maximum as None, like the percentiles beside them, never as 0;
+/// and a measured zero as Some(0), so the two cannot be confused two
+/// columns apart.
 #[test]
 fn the_summary_line_prints_unknown_as_none_not_zero() {
-    let report = json!({
-        "phases": [{
-            "name": "baseline",
+    let phase = |name: &str, reconciliation: Value, rate: Value, order_max: Value| {
+        json!({
+            "name": name,
             "duration_seconds": 60.0,
             "target_rate_shares_per_second": 20.0,
             "dispatched": 0,
-            "reconciliation": Value::Null,
-            "achieved_rate_shares_per_second": Value::Null,
-            "achieved_rate_unavailable_reason": "the phase has no reconciliation",
+            "reconciliation": reconciliation,
+            "achieved_rate_shares_per_second": rate,
             "client_ack_latency": {"p50": Value::Null, "p99": Value::Null},
-            "order_lock": {"max_waiters": Value::Null},
+            "order_lock": {"max_waiters": order_max},
             "settlement_lock": {"max_waiters": Some(0)},
             "shortfall": 0,
             "offer_accounting": {"client_failures": 0, "unaccounted": 0},
-        }],
+        })
+    };
+    let report = json!({
+        "phases": [
+            // Not reconciled: count and rate unknown, order lock unsampled.
+            phase("unknown", Value::Null, Value::Null, Value::Null),
+            // Reconciled with nothing acknowledged, order lock polled and
+            // quiet: three measured zeros.
+            phase("quiet", json!({"acknowledged": 0}), json!(0.0), json!(0)),
+            // Reconciled with three acknowledged: measured values.
+            phase("measured", json!({"acknowledged": 3}), json!(0.05), json!(2)),
+        ],
     });
     let withheld = artifact::Evidence::Withheld {
         reason: "cut short".to_owned(),
         stale_artifact_removed: false,
     };
     let text = run::summary_text(&report, &withheld, &[]);
-    let line = text
-        .lines()
-        .find(|line| line.starts_with("phase baseline"))
-        .expect("a phase line");
-    assert!(line.contains("rate=None/s"), "{line}");
-    assert!(line.contains("order_waiters_max=None"), "{line}");
-    assert!(line.contains("settlement_waiters_max=Some(0)"), "{line}");
+    let line = |name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(&format!("phase {name}")))
+            .unwrap_or_else(|| panic!("a phase line for {name}"))
+            .to_owned()
+    };
+
+    let unknown = line("unknown");
+    assert!(unknown.contains("acked=None rate=None/s"), "{unknown}");
+    assert!(unknown.contains("order_waiters_max=None"), "{unknown}");
+    assert!(
+        unknown.contains("settlement_waiters_max=Some(0)"),
+        "{unknown}"
+    );
+    // offered= and shortfall= are counts the harness always has, so their 0
+    // is real; the unknown columns are the ones asserted above.
+
+    let quiet = line("quiet");
+    assert!(quiet.contains("acked=Some(0) rate=Some(0.0)/s"), "{quiet}");
+    assert!(quiet.contains("order_waiters_max=Some(0)"), "{quiet}");
+
+    let measured = line("measured");
+    assert!(
+        measured.contains("acked=Some(3) rate=Some(0.05)/s"),
+        "{measured}"
+    );
+    assert!(measured.contains("order_waiters_max=Some(2)"), "{measured}");
 }
 
 #[test]
