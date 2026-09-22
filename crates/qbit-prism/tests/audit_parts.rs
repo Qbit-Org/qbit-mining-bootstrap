@@ -22,8 +22,214 @@ use qbit_prism::{
 };
 use sha2::{Digest, Sha256};
 
+// Frozen derived serializer from base 2e81ca3c, independent of the production
+// manual serializer and split framing. Do not update it with the implementation.
+mod legacy {
+    use super::*;
+    use qbit_pool_builder::SignedPayoutManifest;
+    use qbit_prism::{
+        CtvFanoutManifestSet, LedgerWindowAttestation, PayoutPolicyManifest, PrismRewardManifest,
+        SettlementModeDecision,
+    };
+    use serde::Serialize;
+    #[derive(Clone, Copy, Serialize)]
+    #[serde(rename = "AuditBundle")]
+    pub(super) struct AuditBundleRef<'a> {
+        schema: &'a String,
+        shares: &'a [AcceptedShare],
+        found_block: &'a FoundBlock,
+        prior_balances: &'a Vec<CarryForwardBalance>,
+        payout_policy: &'a PayoutPolicy,
+        #[serde(skip_serializing_if = "ref_option_is_none")]
+        coinbase_script_sig_suffix_hex: &'a Option<String>,
+        #[serde(skip_serializing_if = "ref_vec_is_empty")]
+        witness_merkle_leaves_hex: &'a Vec<String>,
+        #[serde(skip_serializing_if = "ref_vec_is_empty")]
+        audit_commitment_leaves_hex: &'a Vec<String>,
+        #[serde(skip_serializing_if = "ref_option_is_none")]
+        audit_commitment_root_hex: &'a Option<String>,
+        ledger_window_attestation: &'a LedgerWindowAttestation,
+        reward_manifest: &'a PrismRewardManifest,
+        payout_policy_manifest: &'a PayoutPolicyManifest,
+        #[serde(skip_serializing_if = "ref_option_is_none")]
+        settlement_mode_decision: &'a Option<SettlementModeDecision>,
+        #[serde(skip_serializing_if = "ref_option_is_none")]
+        ctv_fanout_fee_policy: &'a Option<FanoutFeeRatePolicy>,
+        #[serde(skip_serializing_if = "ref_option_is_none")]
+        ctv_fanout_manifest_set: &'a Option<CtvFanoutManifestSet>,
+        signed_coinbase_manifest: &'a SignedPayoutManifest,
+    }
+
+    impl<'a> AuditBundleRef<'a> {
+        pub(super) fn from_parts(body: &'a AuditBundleBody, shares: &'a [AcceptedShare]) -> Self {
+            let AuditBundleBody {
+                schema,
+                found_block,
+                prior_balances,
+                payout_policy,
+                coinbase_script_sig_suffix_hex,
+                witness_merkle_leaves_hex,
+                audit_commitment_leaves_hex,
+                audit_commitment_root_hex,
+                ledger_window_attestation,
+                reward_manifest,
+                payout_policy_manifest,
+                settlement_mode_decision,
+                ctv_fanout_fee_policy,
+                ctv_fanout_manifest_set,
+                signed_coinbase_manifest,
+            } = body;
+            Self {
+                schema,
+                shares,
+                found_block,
+                prior_balances,
+                payout_policy,
+                coinbase_script_sig_suffix_hex,
+                witness_merkle_leaves_hex,
+                audit_commitment_leaves_hex,
+                audit_commitment_root_hex,
+                ledger_window_attestation,
+                reward_manifest,
+                payout_policy_manifest,
+                settlement_mode_decision,
+                ctv_fanout_fee_policy,
+                ctv_fanout_manifest_set,
+                signed_coinbase_manifest,
+            }
+        }
+
+        fn write_canonical<W: std::io::Write>(&self, writer: W) -> Result<(), serde_json::Error> {
+            serde_json::to_writer(writer, self)
+        }
+
+        pub(super) fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+            let mut bytes = Vec::new();
+            self.write_canonical(&mut bytes)?;
+            Ok(bytes)
+        }
+    }
+
+    fn ref_option_is_none<T>(value: &&Option<T>) -> bool {
+        value.is_none()
+    }
+
+    fn ref_vec_is_empty<T>(value: &&Vec<T>) -> bool {
+        value.is_empty()
+    }
+}
+
 const WINDOW_SHARES: u64 = 400;
 const MINERS: u64 = 7;
+
+/// Compare the emitted bytes without keeping a second large canonical Vec.
+struct CompareBytes<'a>(&'a [u8]);
+impl std::io::Write for CompareBytes<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        assert_eq!(&self.0[..bytes.len()], bytes);
+        self.0 = &self.0[bytes.len()..];
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_large_canonical_window(count: usize, credit: bool) {
+    let seed = window_shares(None).remove(1);
+    let shares: Vec<_> = (0..count)
+        .map(|index| {
+            let mut share = seed.clone();
+            share.share_seq = index as u64 + 1;
+            share.share_id = format!("share-\"\\\n\té-{index}");
+            share.job_id = "job-\"\\\r\té".into();
+            share.share_difficulty = if index == 0 {
+                u128::from(u64::MAX) + 12_345
+            } else {
+                20
+            };
+            share.network_difficulty = u128::MAX;
+            share.credit_policy = credit.then(|| "stale-grace".into());
+            share
+        })
+        .collect();
+    let mut block = found_block();
+    block.network_difficulty = (count.max(1) as u128 * 20) / 8;
+    // Empty-window serialization is defined even though the builder correctly
+    // rejects an empty payout. Runtime refresh represents that case with None.
+    let one = [seed];
+    let body = build_audit_bundle_body(
+        if shares.is_empty() { &one } else { &shares },
+        block,
+        prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    if count > 0 {
+        assert_eq!(body.reward_manifest.shares.len(), count);
+        assert!(
+            body.reward_manifest
+                .shares
+                .last()
+                .unwrap()
+                .counted_difficulty
+                < shares[0].share_difficulty
+        );
+    }
+    let expected = legacy::AuditBundleRef::from_parts(&body, &shares)
+        .canonical_bytes()
+        .unwrap();
+    let mut compare = CompareBytes(&expected);
+    write_canonical_audit_bundle_from_parts(&mut compare, &body, &shares).unwrap();
+    assert!(compare.0.is_empty());
+    assert_eq!(
+        qbit_prism::CanonicalAuditHashPrefix::new(&shares)
+            .unwrap()
+            .finish(&body)
+            .unwrap(),
+        sha256_hex(&expected)
+    );
+    drop(expected);
+
+    // Independent original leaf recipe: tagged concatenation of the two
+    // SHA256 digests over the legacy owned canonical byte APIs.
+    let mut leaf = Sha256::new();
+    leaf.update(qbit_prism::PRISM_AUDIT_COMMITMENT_LEAF_TAG.as_bytes());
+    leaf.update(Sha256::digest(
+        qbit_prism::canonical_reward_manifest_bytes(&body.reward_manifest).unwrap(),
+    ));
+    leaf.update(Sha256::digest(
+        qbit_prism::canonical_payout_policy_manifest_bytes(&body.payout_policy_manifest).unwrap(),
+    ));
+    assert_eq!(
+        qbit_prism::prism_audit_commitment_leaf_hex(
+            &body.reward_manifest,
+            &body.payout_policy_manifest
+        )
+        .unwrap(),
+        hex::encode(leaf.finalize())
+    );
+}
+
+#[test]
+fn pipeline_matches_frozen_serializer_empty_one_and_multiple_pages() {
+    check_large_canonical_window(0, false);
+    for count in [1, 8193] {
+        for credit in [false, true] {
+            check_large_canonical_window(count, credit);
+        }
+    }
+}
+
+#[test]
+#[ignore = "400k canonical byte and commitment proof; run under the heavy test lock"]
+fn pipeline_matches_frozen_serializer_400k() {
+    for credit in [false, true] {
+        check_large_canonical_window(400_000, credit);
+    }
+}
 
 /// sha256 and length of each case's canonical bytes, recorded from the owned
 /// builders at 3.x.x 1398bbc1 (before the parts API existed). Both paths must
@@ -445,10 +651,25 @@ fn parts_path_matches_owned_path_byte_for_byte() {
 
         let body = build_borrowed(&case, &case.shares);
         let parts_bytes = canonical_audit_bundle_bytes_from_parts(&body, &case.shares).unwrap();
+        let legacy_bytes = legacy::AuditBundleRef::from_parts(&body, &case.shares)
+            .canonical_bytes()
+            .unwrap();
+        assert_eq!(
+            parts_bytes, legacy_bytes,
+            "{name}: frozen base serializer differs"
+        );
         assert_eq!(parts_bytes, owned_bytes, "{name}: parts bytes differ");
         let mut streamed = Vec::new();
         write_canonical_audit_bundle_from_parts(&mut streamed, &body, &case.shares).unwrap();
         assert_eq!(streamed, owned_bytes, "{name}: streamed bytes differ");
+        assert_eq!(
+            qbit_prism::CanonicalAuditHashPrefix::new(&case.shares)
+                .unwrap()
+                .finish(&body)
+                .unwrap(),
+            base_sha256,
+            "{name}: split audit hash differs from pre-parts legacy digest"
+        );
 
         let (split_body, split_shares) = owned.clone().into_parts();
         assert_eq!(split_body, body, "{name}");
@@ -610,6 +831,19 @@ fn all_optional_fields_absent_matches_base() {
     }
 
     let (body, shares) = bundle.clone().into_parts();
+    assert_eq!(
+        qbit_prism::CanonicalAuditHashPrefix::new(&shares)
+            .unwrap()
+            .finish(&body)
+            .unwrap(),
+        base_sha256,
+    );
+    assert_eq!(
+        legacy::AuditBundleRef::from_parts(&body, &shares)
+            .canonical_bytes()
+            .unwrap(),
+        bytes
+    );
     assert_eq!(
         canonical_audit_bundle_bytes_from_parts(&body, &shares).unwrap(),
         bytes

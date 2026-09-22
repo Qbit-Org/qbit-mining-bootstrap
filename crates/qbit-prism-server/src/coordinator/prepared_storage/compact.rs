@@ -293,6 +293,27 @@ pub(in crate::coordinator) fn prepare_refresh_body(
     suffix: String,
     inputs: BundleInputs,
 ) -> Result<RefreshBody> {
+    let prepared = prepare_refresh_body_unhashed(config, snapshot, template, suffix, inputs)?;
+    finish_refresh_body(
+        qbit_prism::CanonicalAuditHashPrefix::new(&snapshot.shares)?,
+        prepared,
+    )
+}
+
+/// The body worker returns before audit encoding, so its continuation can
+/// consume the independently computed prefix without blocking this worker.
+pub(in crate::coordinator) struct UnhashedRefreshBody {
+    body: Option<qbit_prism::AuditBundleBody>,
+    base_wire: Option<codec::Job>,
+}
+
+pub(in crate::coordinator) fn prepare_refresh_body_unhashed(
+    config: &Config,
+    snapshot: &Snapshot,
+    template: &Value,
+    suffix: String,
+    inputs: BundleInputs,
+) -> Result<UnhashedRefreshBody> {
     // WindowRef::from_snapshot uses precisely this condition for shares: Some.
     // The native digest remains mandatory before any compact record is assembled.
     let body = if snapshot.shares.is_empty() {
@@ -300,17 +321,6 @@ pub(in crate::coordinator) fn prepare_refresh_body(
     } else {
         Some(bundle_build::build_body(config, snapshot, template, None, suffix, inputs)?.0)
     };
-    let hashes = body
-        .as_ref()
-        .map(|body| {
-            Ok::<_, anyhow::Error>(PreparedAuditHashes {
-                audit_bundle_sha256: audit_parts_sha256(body, &snapshot.shares)?,
-                coinbase_manifest_sha256: canonical_json_sha256(
-                    &body.signed_coinbase_manifest.manifest,
-                )?,
-            })
-        })
-        .transpose()?;
     let base_wire = body
         .as_ref()
         .map(|body| {
@@ -319,6 +329,25 @@ pub(in crate::coordinator) fn prepare_refresh_body(
                 &body.signed_coinbase_manifest.manifest,
                 config.extranonce2_size,
             )
+        })
+        .transpose()?;
+    Ok(UnhashedRefreshBody { body, base_wire })
+}
+
+pub(in crate::coordinator) fn finish_refresh_body(
+    prefix: qbit_prism::CanonicalAuditHashPrefix,
+    prepared: UnhashedRefreshBody,
+) -> Result<RefreshBody> {
+    let UnhashedRefreshBody { body, base_wire } = prepared;
+    let hashes = body
+        .as_ref()
+        .map(|body| {
+            Ok::<_, anyhow::Error>(PreparedAuditHashes {
+                audit_bundle_sha256: prefix.finish(body)?,
+                coinbase_manifest_sha256: canonical_json_sha256(
+                    &body.signed_coinbase_manifest.manifest,
+                )?,
+            })
         })
         .transpose()?;
     Ok(RefreshBody {

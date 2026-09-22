@@ -77,6 +77,9 @@ pub use ctv::*;
 mod broadcast;
 pub use broadcast::*;
 
+mod audit_hash;
+pub use audit_hash::CanonicalAuditHashPrefix;
+
 mod audit_body_ref;
 pub use audit_body_ref::*;
 
@@ -580,30 +583,22 @@ impl AuditBundleBody {
 /// Never `#[serde(flatten)]` a body into this struct: flatten would move
 /// `shares` out of second position and buffer through serde's `Content`,
 /// which cannot carry `arbitrary_precision` `u128` values.
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename = "AuditBundle")]
+#[derive(Clone, Copy)]
 struct AuditBundleRef<'a> {
     schema: &'a String,
     shares: &'a [AcceptedShare],
     found_block: &'a FoundBlock,
     prior_balances: &'a Vec<CarryForwardBalance>,
     payout_policy: &'a PayoutPolicy,
-    #[serde(skip_serializing_if = "ref_option_is_none")]
     coinbase_script_sig_suffix_hex: &'a Option<String>,
-    #[serde(skip_serializing_if = "ref_vec_is_empty")]
     witness_merkle_leaves_hex: &'a Vec<String>,
-    #[serde(skip_serializing_if = "ref_vec_is_empty")]
     audit_commitment_leaves_hex: &'a Vec<String>,
-    #[serde(skip_serializing_if = "ref_option_is_none")]
     audit_commitment_root_hex: &'a Option<String>,
     ledger_window_attestation: &'a LedgerWindowAttestation,
     reward_manifest: &'a PrismRewardManifest,
     payout_policy_manifest: &'a PayoutPolicyManifest,
-    #[serde(skip_serializing_if = "ref_option_is_none")]
     settlement_mode_decision: &'a Option<SettlementModeDecision>,
-    #[serde(skip_serializing_if = "ref_option_is_none")]
     ctv_fanout_fee_policy: &'a Option<FanoutFeeRatePolicy>,
-    #[serde(skip_serializing_if = "ref_option_is_none")]
     ctv_fanout_manifest_set: &'a Option<CtvFanoutManifestSet>,
     signed_coinbase_manifest: &'a SignedPayoutManifest,
 }
@@ -695,14 +690,6 @@ impl<'a> AuditBundleRef<'a> {
         self.write_canonical(&mut bytes)?;
         Ok(bytes)
     }
-}
-
-fn ref_option_is_none<T>(value: &&Option<T>) -> bool {
-    value.is_none()
-}
-
-fn ref_vec_is_empty<T>(value: &&Vec<T>) -> bool {
-    value.is_empty()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1110,7 +1097,9 @@ pub fn prism_audit_commitment_leaf_hex(
     reward_manifest: &PrismRewardManifest,
     payout_policy_manifest: &PayoutPolicyManifest,
 ) -> Result<String, PrismError> {
-    let reward_manifest_hash = Sha256::digest(canonical_reward_manifest_bytes(reward_manifest)?);
+    let mut reward_writer = audit_hash::DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut reward_writer, reward_manifest)?;
+    let reward_manifest_hash = reward_writer.0.finalize();
     let payout_policy_manifest_hash = Sha256::digest(canonical_payout_policy_manifest_bytes(
         payout_policy_manifest,
     )?);
