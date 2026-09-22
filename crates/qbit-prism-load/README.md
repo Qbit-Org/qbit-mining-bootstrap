@@ -581,7 +581,13 @@ The side report repeats all of this under `honest_value_notes`.
   a few seconds in total; a slow database or a far larger `--sessions` can
   make tail sessions time out, which the side report shows as reconnects
   during setup. The run still requires every session to hold work before
-  the first phase.
+  the first phase. The same queue governs the `reconnect` phase's drained
+  restart, where a whole frontend's sessions reconnect at once and each
+  first job again waits its turn behind 128 permits rather than being
+  built immediately: reconnect p50 and max in a side report taken at the
+  default are not comparable with a report taken at the pre-flag sizing,
+  any more than the delivery tail is, and a comparison across that
+  boundary has to say which admission each side ran.
 - **A tail the measurement window cut off is reported, not counted as a
   divergence.** A submit still outstanding when the teardown drain expires had
   its window end underneath it: the server is still allowed to answer, and in
@@ -997,7 +1003,7 @@ deferred`).
 building and share-identifier derivation against the server's own `codec`,
 digest canonicalisation, the window arithmetic, the fake node's chainwork,
 height map, `submitblock` parent check and `waitfornewblock` wake-up, that the
-frontend environment carries all 16 configuration keys, that the initial-job
+frontend environment carries all 17 configuration keys, that the initial-job
 admission reaches a launched process as the flag or its default and is refused
 at entry when it is zero or above the connection cap, that the artifact
 builder's output passes `validate_capacity_evidence` and fails once one
