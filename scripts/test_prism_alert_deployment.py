@@ -103,6 +103,10 @@ def main():
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
             assert after["qbit-prism-semantic-coverage-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-semantic-coverage-critical"]["labels"].get("page") == "true"
+            # #493: the paging landing rule must not fire on no data or evaluation errors.
+            paging = after["qbit-prism-revision-work-pending-critical"]
+            assert paging["labels"].get("page") == "true" and paging["for"] == "1m"
+            assert paging["noDataState"] == paging["execErrState"] == "OK"
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:

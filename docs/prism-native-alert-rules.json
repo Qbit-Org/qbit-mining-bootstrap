@@ -717,11 +717,11 @@
       "uid": "qbit-prism-revision-work-pending-critical",
       "title": "PrismAcceptedRevisionWorkPendingCritical",
       "role": "run",
-      "expr": "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 307",
+      "expr": "((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 307) and on(job, instance, network) (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"__NETWORK__\"} > 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
-      "for": "0s",
+      "for": "1m",
       "severity": "critical",
       "service": "qbit-mining-pool",
       "labels": {
@@ -729,10 +729,10 @@
         "page": "true"
       },
       "summary": "PrismAcceptedRevisionWorkPendingCritical",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
-      "no_data_state": "Alerting",
-      "exec_err_state": "Alerting",
-      "basis": "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gated like the other paging rules (#493): the age must be known (not -1), the metrics snapshot available and not stale, the target scraped, and at least one authorized miner connected, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. A frontend whose miners all disconnect during a stall stops paging here and is covered by the connected-clients and coverage rules. One-minute dwell: the gauge is monotonic during a stall, so the dwell only suppresses single-scrape gate flaps (four 15-second scrapes) and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rule owns missing or unknown measurements. A lost race on the offering frontend still pages until its orphan proof; that is a metric-semantics question tracked separately. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gated like the other paging rules (#493): the age must be known (not -1), the metrics snapshot available and not stale, the target scraped, and at least one authorized miner connected, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. A frontend whose miners all disconnect during a stall stops paging here and is covered by the connected-clients and coverage rules. One-minute dwell: the gauge is monotonic during a stall, so the dwell only suppresses single-scrape gate flaps (four 15-second scrapes) and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rule owns missing or unknown measurements. A lost race on the offering frontend still pages until its orphan proof; that is a metric-semantics question tracked separately. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",

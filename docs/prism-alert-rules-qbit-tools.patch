@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: f73f6626c9e94af8a548c3a91bb4474d108efbce9cd34b4b662a40a65f8586d0
++   Specification SHA-256: 904be442d3b613ef5b01ad49ba0f9a6285923c3218e654cbd98b672d0b13bb13
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -656,11 +656,11 @@
 +  {
 +    "uid": "qbit-prism-revision-work-pending-critical",
 +    "title": "PrismAcceptedRevisionWorkPendingCritical",
-+    "expr": "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 307",
++    "expr": "((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 307) and on(job, instance, network) (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
-+    "for": "0s",
++    "for": "1m",
 +    "severity": "critical",
 +    "service": "qbit-mining-pool",
 +    "labels": {
@@ -668,9 +668,9 @@
 +      "page": "true"
 +    },
 +    "summary": "PrismAcceptedRevisionWorkPendingCritical",
-+    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result; no additional dwell. The warning is the earlier signal. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
-+    "no_data_state": "Alerting",
-+    "exec_err_state": "Alerting"
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gated like the other paging rules (#493): the age must be known (not -1), the metrics snapshot available and not stale, the target scraped, and at least one authorized miner connected, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. A frontend whose miners all disconnect during a stall stops paging here and is covered by the connected-clients and coverage rules. One-minute dwell: the gauge is monotonic during a stall, so the dwell only suppresses single-scrape gate flaps (four 15-second scrapes) and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rule owns missing or unknown measurements. A lost race on the offering frontend still pages until its orphan proof; that is a metric-semantics question tracked separately. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
 +  },
 +  {
 +    "uid": "qbit-prism-revision-work-timeouts",
