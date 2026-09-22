@@ -761,6 +761,27 @@ The side report repeats all of this under `honest_value_notes`.
   carried its name"; and a re-offer or scheduled block that reached a
   session while it had no connection is a `client.failures` entry of its
   kind, rather than a silent drop that read the same as an unanswered one.
+  Four places in the report once broke this rule with a plain zero (#483),
+  and each now reports `null` with a reason, while the measured zero it was
+  indistinguishable from keeps its `0`: a lock block whose sampling window
+  had no polls carries `max_waiters`, `samples_with_waiters`,
+  `episodes_at_least`, `foreign_waiter_samples` and
+  `foreign_holder_samples` as `null` beside its `unavailable_reason`, and a
+  window the sampler polled and found quiet carries `0`; a phase that
+  acknowledged nothing has no ACK percentile to state, so the artifact is
+  withheld rather than written with `0.000`, and the side report's
+  `validator.worst_artifact_phase_ack_p99_milliseconds` is `null` with
+  `worst_artifact_phase_ack_p99_unavailable_reason` naming the phase
+  rather than a `0.0` the measured phases out-rank; a phase that was not
+  reconciled reports `achieved_rate_shares_per_second: null` with
+  `achieved_rate_unavailable_reason` -- a guard, since every reported
+  phase is reconciled, so the old `0` there was as unreachable as the
+  `null` is now -- and a reconciliation that acknowledged nothing reports
+  `0`; and `all_sessions_milliseconds` is below. On the printed summary's
+  phase line, the acknowledged count, the rate and the two waiter maxima
+  print as `Some(value)` when measured and `None` when the report has
+  `null` there, like the percentiles beside them; the all-sessions figure
+  and the validator's worst p99 are not on that line.
 - **Time to reconnect is the outage, not the last handshake.** The
   `reconnects` block's `time_to_reconnect_milliseconds` runs from the moment a
   session's connection went -- the socket closing, or the deliberate close
@@ -777,7 +798,13 @@ The side report repeats all of this under `honest_value_notes`.
   moved on is a late job for a replaced tip, and counting it credited the
   tip with a session whose work really arrived under the next one. The
   dense section's per-frontend `time_to_new_tip_work` stops at the
-  landing's span for the same reason.
+  landing's span for the same reason. Each entry's
+  `all_sessions_milliseconds` is the slowest session's figure only when
+  every session got usable work while the tip was the tip; with any session
+  unserved it is `null` with `all_sessions_unavailable_reason` saying how
+  many, where it used to report the slowest *served* session under a
+  definition that said it would not (#483). The slowest served session is
+  `latency_milliseconds.max` either way.
 - **The share difficulty is a premise, and a frontend that disagrees with it
   ends the run.** Every session checks each `mining.set_difficulty` against
   the configured share difficulty. A disagreement is not a finding to note

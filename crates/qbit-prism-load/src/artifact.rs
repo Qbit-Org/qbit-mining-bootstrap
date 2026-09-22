@@ -41,8 +41,11 @@ pub struct PhaseEvidence {
     pub unexpected: u64,
     pub acknowledged_digest: String,
     pub committed_digest: String,
-    pub ack_p50_millis: f64,
-    pub ack_p99_millis: f64,
+    /// Client ACK percentiles over the phase's accepted shares. `None` when
+    /// the phase acknowledged nothing: it then has no latency to state, and
+    /// [`build`] refuses rather than writing 0.000 (#483).
+    pub ack_p50_millis: Option<f64>,
+    pub ack_p99_millis: Option<f64>,
     /// Completed reconnects; required on the `reconnect` phase.
     pub reconnect_events: Option<u64>,
     /// The observed one-way proxy delay; required on `slow_database`.
@@ -60,14 +63,32 @@ pub struct ArtifactInputs {
     pub configuration: BTreeMap<String, String>,
     pub forecast_peak_shares_per_second: String,
     pub ack_p99_limit_milliseconds: String,
-    pub overall_ack_p50_millis: f64,
-    pub overall_ack_p99_millis: f64,
+    /// Over every artifact phase's accepted shares; `None` when there were
+    /// none, which [`build`] refuses for the same reason as the phase values.
+    pub overall_ack_p50_millis: Option<f64>,
+    pub overall_ack_p99_millis: Option<f64>,
     pub overall_acknowledged_digest: String,
     pub overall_committed_digest: String,
     pub phases: Vec<PhaseEvidence>,
 }
 
-fn phase_object(phase: &PhaseEvidence) -> Value {
+/// The measured percentiles of one phase, or why it has none.
+///
+/// The artifact schema requires both, and the consumer reads them as
+/// measurements: a phase with no accepted share has neither, and writing
+/// 0.000 for it would put a number in the evidence that was never taken
+/// (EP-OBSERVABILITY).
+fn ack_percentiles(name: &str, p50: Option<f64>, p99: Option<f64>) -> Result<(f64, f64)> {
+    match (p50, p99) {
+        (Some(p50), Some(p99)) => Ok((p50, p99)),
+        _ => anyhow::bail!(
+            "{name} acknowledged no shares, so the artifact has no ACK latency to state for it"
+        ),
+    }
+}
+
+fn phase_object(phase: &PhaseEvidence) -> Result<Value> {
+    let (p50, p99) = ack_percentiles(&phase.name, phase.ack_p50_millis, phase.ack_p99_millis)?;
     let mut object = Map::new();
     object.insert("completed".into(), json!(true));
     object.insert(
@@ -100,8 +121,8 @@ fn phase_object(phase: &PhaseEvidence) -> Value {
     object.insert(
         "ack_latency_milliseconds".into(),
         json!({
-            "p50": millis_as_millis(phase.ack_p50_millis),
-            "p99": millis_as_millis(phase.ack_p99_millis),
+            "p50": millis_as_millis(p50),
+            "p99": millis_as_millis(p99),
         }),
     );
     if let Some(events) = phase.reconnect_events {
@@ -113,7 +134,7 @@ fn phase_object(phase: &PhaseEvidence) -> Value {
             json!(millis_as_millis(delay)),
         );
     }
-    Value::Object(object)
+    Ok(Value::Object(object))
 }
 
 /// Build the artifact document.
@@ -144,8 +165,13 @@ pub fn build(inputs: &ArtifactInputs) -> Result<Value> {
             .iter()
             .find(|p| p.name == *name)
             .with_context(|| format!("phase {name} is missing"))?;
-        phases.insert((*name).to_owned(), phase_object(phase));
+        phases.insert((*name).to_owned(), phase_object(phase)?);
     }
+    let (overall_p50, overall_p99) = ack_percentiles(
+        "the run as a whole",
+        inputs.overall_ack_p50_millis,
+        inputs.overall_ack_p99_millis,
+    )?;
     let total_millis: u64 = inputs.phases.iter().map(|p| p.duration_millis).sum();
     let sum = |pick: fn(&PhaseEvidence) -> u64| -> u64 { inputs.phases.iter().map(pick).sum() };
     let document = json!({
@@ -168,8 +194,8 @@ pub fn build(inputs: &ArtifactInputs) -> Result<Value> {
         "acknowledged_share_ids_sha256": inputs.overall_acknowledged_digest,
         "postgres_share_ids_sha256": inputs.overall_committed_digest,
         "ack_latency_milliseconds": {
-            "p50": millis_as_millis(inputs.overall_ack_p50_millis),
-            "p99": millis_as_millis(inputs.overall_ack_p99_millis),
+            "p50": millis_as_millis(overall_p50),
+            "p99": millis_as_millis(overall_p99),
         },
         "ack_p99_limit_milliseconds": inputs.ack_p99_limit_milliseconds,
         "phases": Value::Object(phases),
