@@ -26,8 +26,9 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// ledgers apply 013 and 017 online (`ONLINE_MIGRATIONS`) and record each
 /// after its last change, so a start refuses the database until that has
 /// completed.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] =
-    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -2134,6 +2135,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         18,
         include_str!("../../migrations/018_chain_observation_epoch.sql"),
     ),
+    (
+        19,
+        include_str!("../../migrations/019_signing_transitions.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3105,6 +3110,16 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(18)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&19) {
+        // Additive journal only: no capability and no shutdown proof. A
+        // binary that does not know the table never reads or writes it.
+        sqlx::raw_sql(native_migration(19))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(19)")
             .execute(&mut **tx)
             .await?;
     }

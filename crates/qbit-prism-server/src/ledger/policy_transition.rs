@@ -115,7 +115,7 @@ fn validate_change(previous: &Value, target: &Value) -> Result<()> {
 }
 
 // Match the normal startup's address resolution before hashing either policy.
-async fn resolved_policy(config: &Config, check_fee: bool) -> Result<(Config, String)> {
+pub(super) async fn resolved_policy(config: &Config, check_fee: bool) -> Result<(Config, String)> {
     let rpc = Rpc::new(
         config.rpc_url.clone(),
         config.rpc_user.clone(),

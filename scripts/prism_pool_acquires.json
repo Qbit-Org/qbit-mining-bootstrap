@@ -245,6 +245,7 @@
     "ledger/migration/online.rs::verify_declared#1::describe(name)": [2,"non-database"],
     "ledger/migration/partition.rs::apply#1::connection .begin()": [1,"transaction"],
     "ledger/policy_transition.rs::transition_policy_in#1::self .begin()": [1,"ledger"],
+    "ledger/signing_transition.rs::transition_signing_in#1::self .begin()": [1,"ledger"],
     "ledger/window.rs::read_window_owned#1::self .begin()": [1,"ledger"],
     "ledger/window.rs::chain_observation_state#1::self .acquire()": [1,"ledger"],
     "ledger/window.rs::observe_chain_view_checked#1::self .begin()": [1,"ledger"],
