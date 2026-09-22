@@ -82,6 +82,7 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_DATABASE_MAX_CONNECTIONS` | 16 | Per-instance pool size, minimum 4 |
 | `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` | 15000 | PostgreSQL statement timeout |
 | `PRISM_DATABASE_LOCK_TIMEOUT_MS` | 5000 | PostgreSQL lock wait timeout |
+| `PRISM_DATABASE_ACQUIRE_PROBE_IDLE_MS` | 100 | Idle gap after which a pool checkout probes the connection first; `0` probes every checkout |
 | `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` | 60 | Periodic reward snapshot renewal |
 | `PRISM_BLOCKPOLL_SECONDS` | 2 | Template polling interval |
 | `PRISM_RPC_TIMEOUT_SECONDS` | 15 | General node and wallet RPC deadline |

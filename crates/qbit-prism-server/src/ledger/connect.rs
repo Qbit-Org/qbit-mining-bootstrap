@@ -282,9 +282,16 @@ impl Ledger {
         };
         let statement_timeout = timeout_setting("PRISM_DATABASE_STATEMENT_TIMEOUT_MS", 15_000)?;
         let lock_timeout = timeout_setting("PRISM_DATABASE_LOCK_TIMEOUT_MS", 5_000)?;
+        let probe_idle = acquire::probe_idle_setting()?;
         let pool = PgPoolOptions::new()
             .max_connections(max_connections.max(2))
             .acquire_timeout(std::time::Duration::from_secs(15))
+            // The liveness probe on checkout is gated on the idle gap instead
+            // of running on every acquire; see `acquire::probe_before_acquire`.
+            .test_before_acquire(false)
+            .before_acquire(move |connection, metadata| {
+                acquire::probe_before_acquire(connection, metadata, probe_idle)
+            })
             .after_connect(move |connection,_| {
                 let statement_timeout = statement_timeout.clone();
                 let lock_timeout = lock_timeout.clone();
