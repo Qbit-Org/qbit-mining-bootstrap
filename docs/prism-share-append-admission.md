@@ -30,10 +30,14 @@ does not classify that outcome, retry it, or suppress cleanup warnings. An
 aborted append keeps its server-side `ORDER_LOCK` queue position until the lock
 is granted and the queued rollback runs, exactly as before; abort does not free
 the slot promptly. The guard spawns that cleanup on the runtime handle captured
-at admission, so a future dropped from a thread outside the runtime context
-still cleans up without panicking while the runtime lives; on a shut-down
-runtime the cleanup is cancelled and the floated connection and permit are
-released by ownership.
+at admission, so with the ledger's own pool (no `min_connections`, the
+default) a future dropped from a thread outside the runtime context still
+cleans up without panicking while the runtime lives; on a shut-down runtime
+the cleanup is cancelled and the floated connection and permit are released by
+ownership. A caller-supplied pool with `min_connections > 0` still reaches
+SQLx's own off-context spawn after the cleanup is queued and panics there
+exactly once, as it did before admission existed; that cleanup still finishes.
+Off-runtime drops of SQLx guards are not supported in general.
 
 One failure mode changes: the pool's `acquire_timeout` used to fail an append
 with `PoolTimedOut` when every connection was busy. Admission now waits for a
