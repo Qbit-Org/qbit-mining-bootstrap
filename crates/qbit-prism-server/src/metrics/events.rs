@@ -159,6 +159,13 @@ impl Metrics {
     /// IBD flag go to -1 when this attempt did not learn them, so a failed or
     /// short-circuited observation never leaves a stale reading in place.
     pub fn record_node_observation(&self, observation: NodeObservation) {
+        // Registry first, then the observation state: `render` takes them in
+        // that order, and taking them the other way here deadlocks a scrape
+        // that races an observation. The ordering check below still runs
+        // under the observation guard, and the publish happens before either
+        // lock is released, so two attempts cannot pass the check and then
+        // write out of order.
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
         // The age asks when the node last answered, not which attempt owns the
         // published pair, so a superseded attempt still contributes its answer.
@@ -173,9 +180,6 @@ impl Metrics {
             return;
         }
         node.observed = Some(observation.started);
-        // Publish under the same guard that authorised it, so two attempts
-        // cannot pass the ordering check and then write out of order.
-        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.set(
             Family::NodePeers,
             Labels::Empty,
