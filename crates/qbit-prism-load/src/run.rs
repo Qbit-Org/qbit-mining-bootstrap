@@ -625,6 +625,67 @@ struct DensePhase {
     frontend_health: Vec<FrontendHealth>,
 }
 
+/// The environment shared by every frontend, from the run's arguments. The
+/// Stratum limits are taken from [`Args::stratum_limits`], the derivation
+/// `validate` checked at entry, so the value a child reads from
+/// `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` is the validated one and no
+/// second reader or default exists between the flag and the process
+/// (EP-CONFIG).
+pub fn shared_environment(
+    args: &Args,
+    rpc_url: String,
+    rpc_password: String,
+    share_difficulty: String,
+) -> SharedEnvironment {
+    let limits = args.stratum_limits();
+    SharedEnvironment {
+        rpc_url,
+        rpc_user: "qbit".into(),
+        rpc_password,
+        share_difficulty,
+        max_difficulty: "1024".into(),
+        database_max_connections: args.db_max_connections,
+        runtime_workers: args.runtime_workers,
+        stratum_max_connections: limits.max_connections,
+        stratum_max_pending_initial_jobs: limits.max_pending_initial_jobs,
+        share_commit_timeout_seconds: format!("{}", args.share_commit_timeout_seconds),
+        blockpoll_seconds: format!("{}", args.blockpoll_seconds),
+        rust_log: "info".into(),
+    }
+}
+
+/// The side report's record of one frontend's initial-job admission: the
+/// value the process was launched with, read back from its own environment
+/// rather than from the arguments, with where it came from and what
+/// production would run. A reader comparing runs can then tell an override
+/// -- `sessions_per_frontend + 16`, which every run before the flag existed
+/// used and which overloads the build path deliberately -- from the
+/// production default without the command line (EP-OBSERVABILITY).
+pub fn stratum_admission_block(environment: &BTreeMap<String, String>, args: &Args) -> Value {
+    let limits = args.stratum_limits();
+    let launched = |key: &str| -> Value {
+        environment
+            .get(key)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Value::Null, Value::from)
+    };
+    json!({
+        "max_pending_initial_jobs": launched("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"),
+        "max_connections": launched("PRISM_STRATUM_MAX_CONNECTIONS"),
+        "source": limits.admission_source.as_str(),
+        "production_default": crate::cli::PRODUCTION_MAX_PENDING_INITIAL_JOBS,
+        "pre_flag_harness_value": limits.pre_flag_max_pending_initial_jobs(),
+        "note": "max_pending_initial_jobs is PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS as the \
+                 frontend was launched with it: how many authorized sessions build their first \
+                 job at once, the rest queueing in the server behind \
+                 PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS. source is default when \
+                 --stratum-max-pending-initial-jobs was omitted (the production default) and \
+                 the flag when it was given. pre_flag_harness_value is what a run of this \
+                 shape used before the flag existed (sessions_per_frontend + 16, at least \
+                 128); evidence from then was taken at that admission, not the default.",
+    })
+}
+
 pub async fn execute(args: Args) -> Result<i32> {
     args.validate()?;
     // The managed cluster's binaries are resolved and checked before anything
@@ -907,21 +968,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     check_delay_observed(args.slow_db_delay_ms, proxied_rtt_delayed)?;
 
     // --- frontends --------------------------------------------------------
-    let per_frontend = args.sessions.div_ceil(args.frontends);
-    let shared_env = SharedEnvironment {
-        rpc_url: ctx.node_url.clone(),
-        rpc_user: "qbit".into(),
-        rpc_password: format!("load-{}", ctx.run_tag),
-        share_difficulty: format!("{}", solution.share_difficulty),
-        max_difficulty: "1024".into(),
-        database_max_connections: args.db_max_connections,
-        runtime_workers: args.runtime_workers,
-        stratum_max_connections: (per_frontend * 2 + 64).max(384),
-        stratum_max_pending_initial_jobs: (per_frontend + 16).max(128),
-        share_commit_timeout_seconds: format!("{}", args.share_commit_timeout_seconds),
-        blockpoll_seconds: format!("{}", args.blockpoll_seconds),
-        rust_log: "info".into(),
-    };
+    // The listener limits come from the one derivation `validate` already
+    // checked, so what the child reads is what was validated (EP-CONFIG).
+    let limits = args.stratum_limits();
+    let per_frontend = limits.sessions_per_frontend;
+    let shared_env = shared_environment(
+        args,
+        ctx.node_url.clone(),
+        format!("load-{}", ctx.run_tag),
+        format!("{}", solution.share_difficulty),
+    );
     let mut frontends: Vec<Frontend> = Vec::new();
     let mut blocked: Vec<BlockedLog> = Vec::new();
     for index in 0..args.frontends {
@@ -1737,6 +1793,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "restarts": child.restarts,
             "stdout_log": child.stdout_path.display().to_string(),
             "stderr_log": child.stderr_path.display().to_string(),
+            "stratum_admission": stratum_admission_block(&child.environment, args),
             "environment": frontend::redacted(&child.environment),
         })).collect::<Vec<_>>(),
         "retired_configuration_keys": frontend::RETIRED_CONFIGURATION_KEYS,
@@ -3538,6 +3595,7 @@ async fn finish_early(
         "frontend_environment": frontends.iter().map(|child| json!({
             "instance_id": child.spec.instance_id,
             "stderr_log": child.stderr_path.display().to_string(),
+            "stratum_admission": stratum_admission_block(&child.environment, args),
             "environment": frontend::redacted(&child.environment),
         })).collect::<Vec<_>>(),
         "host": measure::host_facts(),

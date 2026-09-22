@@ -9225,3 +9225,236 @@ fn a_tail_the_measurement_window_cut_off_is_not_a_divergence() {
     };
     assert_eq!(mid_run.exit_code(), run::EXIT_ACK_COMMIT_DIVERGENCE);
 }
+
+// --- initial-job admission (#275) -----------------------------------------
+
+/// `--stratum-max-pending-initial-jobs` defaults to the server's production
+/// default and is bounded at entry against the connection cap the harness
+/// will set, because the server refuses to start with more initial-job
+/// permits than connections. Every earlier run's `sessions_per_frontend + 16`
+/// stays reachable as an explicit value, so old evidence keeps a reproducing
+/// command line.
+#[test]
+fn the_initial_job_admission_defaults_to_production_and_is_bounded_at_entry() -> Result<()> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{AdmissionSource, Args, PRODUCTION_MAX_PENDING_INITIAL_JOBS};
+
+    // Omitted: the production default, whatever the run's shape.
+    let omitted = Args::parse_from(["qbit-prism-load", "--sessions", "2000"]);
+    omitted.validate()?;
+    let limits = omitted.stratum_limits();
+    assert_eq!(limits.max_pending_initial_jobs, 128);
+    assert_eq!(
+        limits.max_pending_initial_jobs,
+        PRODUCTION_MAX_PENDING_INITIAL_JOBS
+    );
+    assert_eq!(limits.admission_source, AdmissionSource::Default);
+    assert_eq!(limits.sessions_per_frontend, 2000);
+    assert_eq!(limits.max_connections, 4064, "2 x 2000 + 64");
+    let small = Args::parse_from(["qbit-prism-load", "--sessions", "1"]);
+    small.validate()?;
+    assert_eq!(
+        small.stratum_limits().max_connections,
+        384,
+        "never below the server default"
+    );
+    assert_eq!(small.stratum_limits().max_pending_initial_jobs, 128);
+
+    // The pre-flag sizing, given explicitly: reproduces the old evidence.
+    let old = Args::parse_from([
+        "qbit-prism-load",
+        "--sessions",
+        "2000",
+        "--stratum-max-pending-initial-jobs",
+        "2016",
+    ]);
+    old.validate()?;
+    let limits = old.stratum_limits();
+    assert_eq!(limits.max_pending_initial_jobs, 2016);
+    assert_eq!(limits.admission_source, AdmissionSource::Flag);
+    assert_eq!(
+        limits.admission_source.as_str(),
+        "--stratum-max-pending-initial-jobs"
+    );
+
+    // Bounded above by the cap the harness derives for this shape: four
+    // frontends of 500 sessions get a 1,064-connection cap, so the one-
+    // frontend value 2,016 is refused with the cap named, and the four-
+    // frontend pre-flag value 516 is accepted.
+    let four = |value: &str| {
+        Args::parse_from([
+            "qbit-prism-load",
+            "--frontends",
+            "4",
+            "--sessions",
+            "2000",
+            "--stratum-max-pending-initial-jobs",
+            value,
+        ])
+    };
+    let error = four("2016")
+        .validate()
+        .expect_err("more permits than connections is refused at entry")
+        .to_string();
+    assert!(error.contains("1064"), "the message names the cap: {error}");
+    assert!(error.contains("500 sessions per frontend"), "{error}");
+    assert!(
+        error.contains("--stratum-max-pending-initial-jobs"),
+        "{error}"
+    );
+    four("516").validate()?;
+    four("1064").validate()?;
+    assert_eq!(four("516").stratum_limits().max_pending_initial_jobs, 516);
+
+    // Bounded below: zero permits would make every first job wait forever,
+    // and the server refuses it too.
+    let error = four("0")
+        .validate()
+        .expect_err("zero is refused")
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+    four("1").validate()?;
+
+    // Not a count at all: refused by the parser, before validation.
+    for bad in ["-1", "abc", "1.5", ""] {
+        assert!(
+            Args::try_parse_from(["qbit-prism-load", "--stratum-max-pending-initial-jobs", bad])
+                .is_err(),
+            "{bad:?} is not an admission size"
+        );
+    }
+    Ok(())
+}
+
+/// A stand-in that prints the two listener limits it was launched with, so
+/// the value asserted is the one a real child process read from its own
+/// environment, not the one the harness meant to send.
+fn env_echoing_stand_in_server(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("env-echoing-stand-in-server");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         echo \"ADMISSION=${PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS-unset}\" >&2\n\
+         echo \"CONNECTIONS=${PRISM_STRATUM_MAX_CONNECTIONS-unset}\" >&2\n\
+         echo \"INHERITED=${CARGO_MANIFEST_DIR-unset}\" >&2\n\
+         echo READY >&2\n\
+         exec sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The admission is traced from the flag (or its absence) through the shared
+/// environment to the process that reads it: the same launch path the run
+/// uses, against a stand-in that echoes what it was given. A value the
+/// harness's own environment carries is not a second reader -- the child's
+/// environment is cleared, shown here on a variable the test process really
+/// inherits from Cargo rather than one set for the purpose, because
+/// `set_var` in a threaded test binary races libc's `getenv` -- so the flag
+/// and its default are the only two sources, and the side report's block
+/// says which one applied (EP-CONFIG).
+#[tokio::test]
+async fn the_initial_job_admission_reaches_a_launched_frontend_as_the_flag_or_its_default(
+) -> Result<()> {
+    use clap::Parser;
+    use qbit_prism_load::cli::Args;
+
+    let dir = ScratchDir::new("admission-launch");
+    let server = env_echoing_stand_in_server(dir.path());
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    // Cargo sets this in the test process; the run's own process would carry
+    // whatever its shell did. Neither may reach a frontend: the child's
+    // environment is cleared, so the admission has exactly one reader.
+    let inherited = std::env::var("CARGO_MANIFEST_DIR").is_ok();
+
+    let cases: [(Vec<&str>, u64, &str, u64); 3] = [
+        (vec![], 128, "default", 4064),
+        (
+            vec!["--stratum-max-pending-initial-jobs", "2016"],
+            2016,
+            "--stratum-max-pending-initial-jobs",
+            4064,
+        ),
+        (
+            vec!["--stratum-max-pending-initial-jobs", "1"],
+            1,
+            "--stratum-max-pending-initial-jobs",
+            4064,
+        ),
+    ];
+    for (index, (extra, expected, source, connections)) in cases.iter().enumerate() {
+        let mut argv = vec!["qbit-prism-load", "--sessions", "2000"];
+        argv.extend(extra.iter().copied());
+        let args = Args::parse_from(argv);
+        args.validate()?;
+        let shared = run::shared_environment(
+            &args,
+            "http://127.0.0.1:1/".into(),
+            "secret".into(),
+            "0.0000000122070312".into(),
+        );
+        let spec = FrontendSpec {
+            index,
+            instance_id: format!("load-fe-{index}"),
+            stratum_port: 1,
+            audit_port: 1,
+            database_url: "postgresql://u@127.0.0.1:1/x".into(),
+        };
+        let environment = frontend::frontend_environment(&shared, &spec);
+        let mut child = frontend::Frontend::launch(server.clone(), spec, environment, &log_dir)?;
+        let text = wait_for_log(&child.stderr_path, "READY", 1);
+        child.kill();
+        assert!(
+            text.contains(&format!("ADMISSION={expected}\n")),
+            "case {index}: the child read {expected}, but logged {text:?}"
+        );
+        assert!(
+            text.contains(&format!("CONNECTIONS={connections}\n")),
+            "case {index}: {text:?}"
+        );
+        assert!(
+            text.contains("INHERITED=unset\n"),
+            "case {index}: the child's environment is cleared, but it saw an inherited \
+             variable (test process had it: {inherited}): {text:?}"
+        );
+        // What the side report records for this process, read back from the
+        // environment it was launched with.
+        let block = run::stratum_admission_block(&child.environment, &args);
+        assert_eq!(block["max_pending_initial_jobs"], json!(expected));
+        assert_eq!(block["max_connections"], json!(connections));
+        assert_eq!(block["source"], json!(source));
+        assert_eq!(block["production_default"], json!(128));
+        assert_eq!(block["pre_flag_harness_value"], json!(2016));
+        // The evidence configuration block is untouched by the flag: the
+        // validator's 16 keys do not include the admission (EP-COMPAT).
+        let configuration = frontend::configuration_block(&child.environment)?;
+        assert!(!configuration.contains_key("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"));
+        assert_eq!(configuration.len(), CONFIGURATION_KEYS.len());
+    }
+    Ok(())
+}
+
+/// A frontend whose launch environment cannot state the admission gets a
+/// null, not a zero, in the side report: zero permits is a value the server
+/// refuses, and an absent one is unknown (EP-OBSERVABILITY).
+#[test]
+fn an_admission_the_launch_environment_cannot_state_is_null_not_zero() {
+    use clap::Parser;
+    let args = qbit_prism_load::cli::Args::parse_from(["qbit-prism-load"]);
+    let block = run::stratum_admission_block(&BTreeMap::new(), &args);
+    assert_eq!(block["max_pending_initial_jobs"], Value::Null);
+    assert_eq!(block["max_connections"], Value::Null);
+    assert_eq!(block["source"], json!("default"));
+    let mut garbled = BTreeMap::new();
+    garbled.insert(
+        "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS".to_owned(),
+        "many".to_owned(),
+    );
+    let block = run::stratum_admission_block(&garbled, &args);
+    assert_eq!(block["max_pending_initial_jobs"], Value::Null);
+    // 100 sessions on one frontend: the pre-flag sizing was floored at 128.
+    assert_eq!(block["pre_flag_harness_value"], json!(128));
+}

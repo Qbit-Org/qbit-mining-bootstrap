@@ -46,6 +46,18 @@ pub fn honest_value_notes() -> Value {
                      counted, reported and left to the reader as a capacity finding."
         },
         {
+            "field": "frontend_environment.*.stratum_admission",
+            "note": "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS as each frontend was launched with \
+                     it. The harness launches the server's production default, 128, unless \
+                     --stratum-max-pending-initial-jobs says otherwise; the block records the \
+                     launched value, its source (default or the flag) and the value a run of \
+                     this shape used before the flag existed (sessions_per_frontend + 16, at \
+                     least 128). Evidence from before the flag was taken at that larger \
+                     admission, which lets every session build its first job at once and \
+                     inflates the post-publish delivery tail; it is reproduced by passing that \
+                     value, and compared with a default run only with that difference stated."
+        },
+        {
             "field": "phases.slow_database.database_delay_milliseconds",
             "note": "The observed one-way per-chunk proxy delay. A database round trip pays it \
                      twice. The configured value and the measured added round-trip time are both \
