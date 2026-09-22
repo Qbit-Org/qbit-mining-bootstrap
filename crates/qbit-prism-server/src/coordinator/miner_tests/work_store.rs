@@ -118,6 +118,18 @@ impl work_ledger::WorkLedger for MemoryLedger {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         submit_ledger::SubmitLedger::payout_revision(self)
     }
+    fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<work_ledger::ClockedRevision>> {
+        // Keep the clock gate and revision hooks the tests drive, in the
+        // order the two separate reads had.
+        Box::pin(async move {
+            let now_ms = work_ledger::WorkLedger::now_ms(self).await?;
+            let payout_revision = work_ledger::WorkLedger::payout_revision(self).await?;
+            Ok(work_ledger::ClockedRevision {
+                now_ms,
+                payout_revision,
+            })
+        })
+    }
     fn chain_observation_state(
         &self,
     ) -> BoxFuture<'_, Result<crate::ledger::ChainObservationState>> {

@@ -2854,6 +2854,9 @@ mod d2_below_target_tests;
 mod commit_reconcile_tests;
 
 #[cfg(test)]
+mod clocked_revision_tests;
+
+#[cfg(test)]
 mod d2_bootstrap_tests;
 
 #[cfg(test)]

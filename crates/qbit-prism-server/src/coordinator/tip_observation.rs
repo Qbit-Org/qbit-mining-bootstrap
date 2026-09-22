@@ -544,20 +544,20 @@ impl Coordinator {
         expires_at_ms: Option<i64>,
         readiness_epoch: u64,
     ) -> Result<Option<WorkAuthority>> {
-        let clock = if let Some(expires) = expires_at_ms {
+        // The clock and the revision come from one statement when both are
+        // needed: the expired-clock branch still returns before the revision
+        // is used, and a database failure still precedes every local check.
+        let (clock, revision) = if let Some(expires) = expires_at_ms {
             let requested_at = MonotonicInstant::now();
-            let now = self.work_ledger.now_ms().await?;
-            let clock = AbsoluteDeadline::from_database(now, requested_at, expires)?;
+            let read = self.work_ledger.clocked_payout_revision().await?;
+            let clock = AbsoluteDeadline::from_database(read.now_ms, requested_at, expires)?;
             if !clock.live() {
                 return Ok(None);
             }
-            Some(clock)
+            (Some(clock), read.payout_revision)
         } else {
-            None
+            (None, self.work_ledger.payout_revision().await?)
         };
-        // Preserve the existing database-first failure priority, even when a
-        // later coherent lease proof will supply the transaction revision.
-        let revision = self.work_ledger.payout_revision().await?;
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
         let view = self.authority_view().await;
