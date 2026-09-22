@@ -66,12 +66,6 @@ pub async fn run(config: Config) -> Result<()> {
     // the lead is a precondition of serving, not a background convenience: an
     // instance that cannot maintain its partitions must refuse to start
     // rather than accept shares until the lead runs out.
-    let attached = crate::partitions::ensure(&coordinator.ledger.pool)
-        .await
-        .context("attach the share ledger partition lead at startup")?;
-    if attached > 0 {
-        tracing::info!(created = attached, "share ledger partitions attached");
-    }
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
     api_config.rpc_url = config.rpc_url.clone();
