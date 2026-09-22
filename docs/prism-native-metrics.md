@@ -49,9 +49,9 @@ rendering the startup registry does not create a publication timestamp.
 
 | Family | Type | Labels | Role | Meaning / status | 2.x.x name replaced |
 | --- | --- | --- | --- | --- | --- |
-| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. | none |
+| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none; each frontend tracks every block it observes, and a frontend with no connected miners keeps waiting. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. | none |
 | `qbit_prism_accepted_block_revision_work_tracking_unknown` | gauge | none | run | Whether any local landing observation is unknown or incomplete; independent of known pending delivery age. Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels. | none |
-| `qbit_prism_accepted_block_to_revision_work_seconds` | histogram | `result=published,degraded,superseded` | run | Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds. Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds. | `qbit_prism_accepted_block_preview_publication_seconds` |
+| `qbit_prism_accepted_block_to_revision_work_seconds` | histogram | `result=published,degraded,superseded` | run | Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds; each frontend samples every block from its own observation, so a sum across instances counts one block once per frontend. Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds. | `qbit_prism_accepted_block_preview_publication_seconds` |
 | `qbit_prism_accepted_shares_total` | counter | none | run | Shares accepted by this instance since process start. Process-local counter; legacy canonical ledger count was persistent. | `qbit_prism_accepted_shares_total` |
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
@@ -298,8 +298,12 @@ already superseded revision cannot clear that wait. Thus stalls are visible
 before the first completed histogram sample. The gauge is computed from a
 monotonic clock at render time and overlaid on cached metric bodies.
 With no connected miners there is no qualifying notify delivery: pending age
-continues to rise and alerts can fire even when prepared work is ready. The
-metric does not reinterpret an empty listener as successful miner delivery.
+continues to rise even when prepared work is ready, and the warning rule
+reports it. The metric does not reinterpret an empty listener as successful
+miner delivery. Every frontend observes every active immature block from its
+own reconcile proof, so each frontend carries its own wait for the same block
+and a sum across instances counts one block once per frontend; the paging rule
+therefore requires an authorized miner on the reporting frontend (#493).
 
 `qbit_prism_revision_work_build_timeouts_total` increments only in the existing
 Stratum job-build timeout branch, once for that operation when accepted work
@@ -385,7 +389,24 @@ There are **three concrete alert rules**: `PrismAcceptedRevisionWorkPending`
 warns above one second (and for unknown or missing observations),
 `PrismAcceptedRevisionWorkPendingCritical` uses the provisional 307-second
 incident-duration floor, and `PrismRevisionWorkBuildTimeouts` warns on a
-five-minute increase. All have zero additional dwell. The one-second warning
+five-minute increase. The two warnings have zero additional dwell and alert on
+no data, so a missing or unknown measurement is always visible. The paging
+critical is gated (#493): the age must be known, the target scraped and at
+least one miner authorized on that frontend, with a one-minute dwell and
+no-data and evaluation errors treated as OK. It is deliberately not gated on
+the metrics snapshot: the pending gauge is a live overlay rendered on every
+scrape, and a database-pool stall that also stalls the health publisher must
+still page. The miner count is a snapshot family, so while the snapshot is
+stale the gate uses a count a few refresh intervals old; a false page on a
+frontend whose miners left inside that window is accepted over a missed
+stall. The dwell only absorbs a brief gate gap on a gauge that is monotonic
+during a stall and stays well under the five-minute hold that delayed #413.
+If every miner leaves a frontend during a stall, this page resolves and
+nothing else pages for that frontend: the coverage rules cannot fire with
+zero authorized clients and the connected-clients rule is a cluster-wide
+non-paging warning, so only the pending warning keeps reporting the age until
+a miner reconnects and receives work. A lost race on the offering frontend
+still pages until its orphan proof. The one-second warning
 is a budget target; 307 seconds is not evidence of early detection. Scrape and
 evaluation intervals still add delay. Thresholds must be measured in #291;
 this repository change neither applies the generated external patch nor
