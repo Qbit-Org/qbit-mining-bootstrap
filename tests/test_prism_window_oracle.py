@@ -518,8 +518,13 @@ class WindowOwnershipTests(unittest.TestCase):
             current = window_ownership_snapshot()
             self.assertEqual(current["canonical_buffers"] - before["canonical_buffers"], 1)
             self.assertEqual(current["canonical_bytes"] - before["canonical_bytes"], len(shares.canonical_items))
+            # A finished walk releases its parse; the sequence itself never
+            # owns the tuple (#332, defect 4).
             list(shares)
-            self.assertEqual(window_ownership_snapshot()["parsed_records"] - before["parsed_records"], 1)
+            self.assertEqual(window_ownership_snapshot()["parsed_records"], before["parsed_records"])
+            with shares.retained():
+                self.assertEqual(window_ownership_snapshot()["parsed_records"] - before["parsed_records"], 1)
+            self.assertEqual(window_ownership_snapshot()["parsed_records"], before["parsed_records"])
             del result
             self.assertIsNotNone(retained())
             del shares

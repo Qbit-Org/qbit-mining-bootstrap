@@ -14,7 +14,17 @@ WAIT = 10
 
 
 class Window(DaemonShareJsonSequence):
-    """Weak-referenceable on the pre-#335 base too; same bytes/parse methods."""
+    """Weak-referenceable on the pre-#335 base too; same bytes/parse methods.
+
+    ``parsed=True`` pins the parsed tuple for the fixture's own lifetime,
+    modelling a consumer that holds the rows as long as the window itself:
+    the rows must then die with the window, never later.
+    """
+
+    def hold_parsed(self):
+        # The holder references only the parsed tuple, never this window,
+        # so it dies by reference count exactly when the window does.
+        self._held_parse = self._records()
 
 
 class Ownership:
@@ -30,7 +40,7 @@ class Ownership:
         row = b'{"blob":"' + b'x' * 600 + b'","weight":1}'
         value = self.watch("window", Window(b','.join([row] * rows), rows))
         if parsed:
-            value[0]
+            value.hold_parsed()
         return value
 
     def counts(self):

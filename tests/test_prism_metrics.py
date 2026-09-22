@@ -102,6 +102,7 @@ from lab.prism.writer_lease_timing import (
     LEASE_MONITOR_WAKE_DELAY_BUCKETS,
 )
 from lab.prism.background_services import PRISM_GC_PAUSE_SECONDS_BUCKETS
+from lab.prism import window_ownership
 from tests import prism_vardiff_test_support as support
 
 
@@ -1798,6 +1799,11 @@ class MetricsRenderParityTests(unittest.TestCase):
         self.addCleanup(cleanup)
         # Pin the /proc-derived gauges: RSS moves between the two renders.
         server.process_resource_metrics = lambda: (123_456_789, 42)
+        # Pin the window-ownership clock the same way: the oldest owner's
+        # age (#332) would otherwise move between the two renders.
+        clock_patch = mock.patch.object(window_ownership, "_clock", lambda: 1_000.0)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         # Pin issue #226's heap collector the same way: allocation and GC
         # counters move between the reference and the actual render. The
         # pinned renderer is the one metrics_payload() resolves.

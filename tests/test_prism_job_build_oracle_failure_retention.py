@@ -60,9 +60,16 @@ def configure_oracle_failure(case, *, mode="compiler", records=1024,
         references["canonical_sequence"] = weakref.ref(shares)
         measured["payload_bytes"] = len(shares.canonical_items)
         if mode == "parsed_compiler":
-            shares[0]  # A consumer that legitimately materializes the rows.
-        measured["parsed_records"] = 0 if shares._parsed is None else len(shares._parsed)
-        measured["at_failure"] = {k: v - baseline[k] for k, v in window_ownership_snapshot().items()}
+            # A consumer that legitimately materializes the rows holds them
+            # for its own span only; the sequence never owns the parse.
+            with shares.retained() as rows:
+                rows[0]
+                measured["parsed_records"] = len(shares._parsed)
+                measured["at_failure"] = {k: v - baseline[k] for k, v in window_ownership_snapshot().items()}
+            measured["after_consumer"] = window_ownership_snapshot()["parsed_records"] - baseline["parsed_records"]
+        else:
+            measured["parsed_records"] = 0 if shares._parsed is None else len(shares._parsed)
+            measured["at_failure"] = {k: v - baseline[k] for k, v in window_ownership_snapshot().items()}
         pause()
         raise ValueError("injected compiler failure after isolated oracle")
 
@@ -100,6 +107,9 @@ class JobBuildOracleFailureRetentionTests(unittest.TestCase):
             if "compiler" in mode:
                 self.assertEqual(measured["payload_bytes"], 336646)
                 self.assertEqual(measured["parsed_records"], 1024 if mode == "parsed_compiler" else 0)
+                self.assertEqual(measured["at_failure"]["parsed_records"], measured["parsed_records"])
+                if mode == "parsed_compiler":
+                    self.assertEqual(measured["after_consumer"], 0)
                 self.assertEqual(measured["at_failure"]["canonical_buffers"], 1)
         finally:
             case.tearDown()
