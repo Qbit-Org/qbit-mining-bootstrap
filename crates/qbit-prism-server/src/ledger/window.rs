@@ -645,7 +645,9 @@ impl Ledger {
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
-        let mut tx = self.begin().await?;
+        let admission = super::append_admission::Admission::acquire(&self.pool).await?;
+        let mut connection = admission.attach(self.acquire().await?);
+        let mut tx = Transaction::begin(&mut *connection.connection, None).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {

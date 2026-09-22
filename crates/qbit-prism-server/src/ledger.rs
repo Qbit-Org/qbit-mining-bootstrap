@@ -16,6 +16,7 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+mod append_admission;
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 /// Share ledger retention: the operator commands behind `share-archive`.
