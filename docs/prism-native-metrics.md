@@ -301,7 +301,7 @@ reports it. The metric does not reinterpret an empty listener as successful
 miner delivery. Every frontend observes every active immature block from its
 own reconcile proof, so each frontend carries its own wait for the same block
 and a sum across instances counts one block once per frontend; the paging rule
-therefore requires a connected miner on the reporting frontend (#493).
+therefore requires an authorized miner on the reporting frontend (#493).
 
 `qbit_prism_revision_work_build_timeouts_total` increments only in the existing
 Stratum job-build timeout branch, once for that operation when accepted work
@@ -389,14 +389,21 @@ warns above one second (and for unknown or missing observations),
 incident-duration floor, and `PrismRevisionWorkBuildTimeouts` warns on a
 five-minute increase. The two warnings have zero additional dwell and alert on
 no data, so a missing or unknown measurement is always visible. The paging
-critical is gated like the other paging rules (#493): the age must be known,
-the metrics snapshot available and not stale, the target scraped and at least
-one miner authorized on that frontend, with a one-minute dwell and no-data and
-evaluation errors treated as OK. The dwell suppresses single-scrape gate flaps
-on a gauge that is monotonic during a stall; it stays well under the
-five-minute hold that delayed #413. The miner gate means a frontend whose
-miners all disconnect during a stall stops paging here and is covered by the
-connected-clients and coverage rules; a lost race on the offering frontend
+critical is gated (#493): the age must be known, the target scraped and at
+least one miner authorized on that frontend, with a one-minute dwell and
+no-data and evaluation errors treated as OK. It is deliberately not gated on
+the metrics snapshot: the pending gauge is a live overlay rendered on every
+scrape, and a database-pool stall that also stalls the health publisher must
+still page. The miner count is a snapshot family, so while the snapshot is
+stale the gate uses a count a few refresh intervals old; a false page on a
+frontend whose miners left inside that window is accepted over a missed
+stall. The dwell only absorbs a brief gate gap on a gauge that is monotonic
+during a stall and stays well under the five-minute hold that delayed #413.
+If every miner leaves a frontend during a stall, this page resolves and
+nothing else pages for that frontend: the coverage rules cannot fire with
+zero authorized clients and the connected-clients rule is a cluster-wide
+non-paging warning, so only the pending warning keeps reporting the age until
+a miner reconnects and receives work. A lost race on the offering frontend
 still pages until its orphan proof. The one-second warning
 is a budget target; 307 seconds is not evidence of early detection. Scrape and
 evaluation intervals still add delay. Thresholds must be measured in #291;

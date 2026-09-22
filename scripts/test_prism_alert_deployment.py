@@ -103,10 +103,24 @@ def main():
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
             assert after["qbit-prism-semantic-coverage-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-semantic-coverage-critical"]["labels"].get("page") == "true"
-            # #493: the paging landing rule must not fire on no data or evaluation errors.
-            paging = after["qbit-prism-revision-work-pending-critical"]
-            assert paging["labels"].get("page") == "true" and paging["for"] == "1m"
-            assert paging["noDataState"] == paging["execErrState"] == "OK"
+            # #493: every native paging rule dwells, stays quiet on no data or
+            # evaluation errors, and conjoins an availability gate on its own
+            # target. External (sidecar) paging rules keep their own producers.
+            paging = {uid: rule for uid, rule in after.items()
+                      if uid in native_uids and rule["labels"].get("page") == "true"}
+            assert set(paging) == {"qbit-prism-candidate-oldest-critical",
+                                   "qbit-prism-semantic-coverage-critical",
+                                   "qbit-prism-revision-work-pending-critical"}
+            for uid, rule in paging.items():
+                assert rule["for"] != "0s", uid
+                assert rule["noDataState"] == "OK", uid
+                assert rule["execErrState"] == "OK", uid
+                expr = json.dumps(rule)
+                assert " and on(job, instance, network) " in expr, uid
+                fresh = "qbit_prism_metrics_snapshot_available{" in expr and "qbit_prism_metrics_snapshot_stale{" in expr
+                scraped = "up{" in expr and "== 1" in expr
+                assert fresh or scraped, uid
+            assert paging["qbit-prism-revision-work-pending-critical"]["for"] == "1m"
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
