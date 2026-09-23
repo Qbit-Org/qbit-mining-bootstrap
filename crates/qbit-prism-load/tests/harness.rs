@@ -9458,3 +9458,66 @@ fn an_admission_the_launch_environment_cannot_state_is_null_not_zero() {
     // 100 sessions on one frontend: the pre-flag sizing was floored at 128.
     assert_eq!(block["pre_flag_harness_value"], json!(128));
 }
+
+// --- process CPU time -----------------------------------------------------
+
+/// `proc_pid_rusage` reports CPU in Mach absolute-time ticks. On Apple silicon
+/// one tick is 125/3 ns; the harness read ticks as nanoseconds and reported a
+/// quarter of a second of CPU as six milliseconds (#447). On Intel the
+/// timebase is 1/1 and the two readings agree, which is how it went unseen.
+#[test]
+fn mach_ticks_are_scaled_by_the_timebase_not_read_as_nanoseconds() {
+    // The pair measured on an M5 Max: 0.2500 s of CPU was a raw delta of 6,000,505.
+    let apple_silicon = measure::mach_ticks_to_seconds(6_000_505, 125, 3);
+    assert!((apple_silicon - 0.2500).abs() < 0.0001, "{apple_silicon}");
+    let intel = measure::mach_ticks_to_seconds(250_000_000, 1, 1);
+    assert!((intel - 0.25).abs() < 1e-12, "{intel}");
+    // A tick count past u64's product range must not overflow on the way.
+    assert!(measure::mach_ticks_to_seconds(u64::MAX, 125, 3).is_finite());
+}
+
+/// The unit error above survived because nothing compared the harness's CPU
+/// reading with CPU actually spent. This burns a known amount on the calling
+/// thread, measured on the thread's own CPU clock so a preempted test cannot
+/// fall short, and requires the process figure to cover it. Other test threads
+/// only add to the process figure, so the bound that matters is the lower one;
+/// the 42-fold under-report gave 0.024 of the burn.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn process_cpu_seconds_covers_cpu_the_process_really_spent() {
+    fn thread_cpu_seconds() -> f64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let code = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(code, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    }
+
+    const BURN_SECONDS: f64 = 0.2;
+    let pid = std::process::id();
+    let wall = std::time::Instant::now();
+    let before = measure::process_cpu_seconds(pid).expect("own CPU time is readable");
+    let burn_from = thread_cpu_seconds();
+    let mut sink = 0u64;
+    while thread_cpu_seconds() - burn_from < BURN_SECONDS {
+        for i in 0..10_000u64 {
+            sink = std::hint::black_box(sink.wrapping_mul(31).wrapping_add(i));
+        }
+    }
+    let after = measure::process_cpu_seconds(pid).expect("own CPU time is readable");
+    let spent = after - before;
+
+    // Linux counts in clock ticks (10 ms), so allow a tick either side.
+    assert!(
+        spent >= BURN_SECONDS * 0.8,
+        "process CPU rose by {spent} s while this thread alone burned {BURN_SECONDS} s"
+    );
+    let cores = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
+    let ceiling = (wall.elapsed().as_secs_f64() + 0.05) * cores;
+    assert!(
+        spent <= ceiling,
+        "process CPU rose by {spent} s, more than {cores} cores could spend in the time ({ceiling} s)"
+    );
+}

@@ -264,10 +264,44 @@ fn rusage(pid: u32) -> Option<RusageInfoV2> {
     }
 }
 
-/// `ri_user_time` and `ri_system_time` are nanoseconds.
+/// Declared here for the same reason `RusageInfoV2` is.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+}
+
+/// The Mach timebase as `(numer, denom)`: one tick is `numer / denom`
+/// nanoseconds. `None` when the kernel would not say, or said a zero
+/// denominator; a CPU figure is then unknown rather than wrong.
+#[cfg(target_os = "macos")]
+fn mach_timebase() -> Option<(u32, u32)> {
+    let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+    let code = unsafe { mach_timebase_info(&mut info) };
+    (code == 0 && info.numer != 0 && info.denom != 0).then_some((info.numer, info.denom))
+}
+
+/// Mach absolute-time ticks to seconds. Not gated on the platform, so the
+/// arithmetic is tested wherever the tests run.
+pub fn mach_ticks_to_seconds(ticks: u64, numer: u32, denom: u32) -> f64 {
+    ticks as f64 * f64::from(numer) / f64::from(denom) / 1e9
+}
+
+/// `ri_user_time` and `ri_system_time` are Mach absolute-time ticks, not
+/// nanoseconds. The two coincide on Intel, where the timebase is 1/1. On Apple
+/// silicon it is 125/3, and reading ticks as nanoseconds under-reported every
+/// frontend's CPU by about 42 times (#447).
 #[cfg(target_os = "macos")]
 pub fn process_cpu_seconds(pid: u32) -> Option<f64> {
-    rusage(pid).map(|info| (info.ri_user_time + info.ri_system_time) as f64 / 1e9)
+    let (numer, denom) = mach_timebase()?;
+    rusage(pid)
+        .map(|info| mach_ticks_to_seconds(info.ri_user_time + info.ri_system_time, numer, denom))
 }
 
 #[cfg(target_os = "macos")]
