@@ -976,10 +976,39 @@ async fn drain_the_storm(storm: &Storm, candidates: usize) -> Result<()> {
 /// sequence and a dependence on N fail with different messages.
 const STATEMENTS_PER_DRAINED_ROW: usize = 26;
 
-/// Rows drained before anything is counted, so the ledger pool has reached its
-/// steady state: a connection opened inside a measured window would charge its
-/// `after_connect` session settings to whichever row happened to open it.
+/// Rows drained before anything is counted, once [`saturate_ledger_pool`] has
+/// opened every pool slot, so whatever the drain path pays only on its first
+/// passes (the dispatch sequence's first slot, statement preparation on each
+/// pooled connection) is paid before a measured window opens.
 const POOL_WARMUP_ROWS: usize = 4;
+
+/// Open every slot of the ledger pool before any measured window, so no
+/// measured row can be the one that opens a connection: a connection opened
+/// inside a measured window would charge its `after_connect` session settings
+/// to whichever row happened to open it.
+///
+/// The pool returns a dropped connection asynchronously. sqlx spawns a task
+/// that pings the server first and only then puts the connection back on the
+/// idle queue, so the drain's next acquire can run before that task has,
+/// find the idle queue empty and, while the pool is below its maximum, open a
+/// new connection rather than wait. On a loaded runner the return task lags
+/// long enough for this to happen with two or more connections already open,
+/// so draining rows first does not settle the pool: only its maximum does.
+/// At the maximum, the same acquire waits for the return instead.
+async fn saturate_ledger_pool(pool: &PgPool) -> Result<()> {
+    let max = pool.options().get_max_connections();
+    let mut held = Vec::with_capacity(max as usize);
+    for _ in 0..max {
+        held.push(pool.acquire().await?);
+    }
+    ensure!(
+        pool.size() == max,
+        "the ledger pool holds {} connections with all {max} of its slots acquired",
+        pool.size()
+    );
+    drop(held);
+    Ok(())
+}
 
 /// Per-row drain cost in statements is the same at the baseline cardinality
 /// and at the run's own, measured in one process against one schema with
@@ -993,7 +1022,9 @@ const POOL_WARMUP_ROWS: usize = 4;
 ///
 /// Each window is enqueued only once the previous one is drained, so both
 /// lanes agree on which set is due and the set a measured window finishes is
-/// exactly the set it was given. The chain is held still, so the equal-work
+/// exactly the set it was given. The ledger pool is at its maximum before the
+/// first window opens ([`saturate_ledger_pool`]), so no measured row opens a
+/// connection. The chain is held still, so the equal-work
 /// branch of `Ledger::observe_chain_view` runs for every row: nothing here is
 /// admitted, offered or landed, because this is a measurement of what a
 /// *storm* row costs.
@@ -1016,6 +1047,7 @@ async fn count_statements(storm: &Storm, candidates: usize) -> Result<()> {
     let ledger = storm.ledger();
     let snapshot = ledger.snapshot(100).await?;
     storm.decide_against_siblings(&snapshot, 0).await?;
+    saturate_ledger_pool(&ledger.pool).await?;
 
     let warmup = storm
         .enqueue_siblings(&snapshot, POOL_WARMUP_ROWS, 1_000_000)
@@ -1075,13 +1107,25 @@ struct DrainCost {
 }
 
 /// Drain exactly `expected`, one row at a time, and return the statements each
-/// row cost when `measured`. Fails when the rows do not all cost the same.
+/// row cost when `measured`. Fails when the rows do not all cost the same, and
+/// when a measured window opens on a pool that is no longer at its maximum, so
+/// a connection closed since [`saturate_ledger_pool`] is reported as that
+/// rather than as the row that had to reopen it.
 async fn drain_set(
     storm: &Storm,
     proxy: &ExecutionProxy,
     expected: &BTreeSet<String>,
     measured: bool,
 ) -> Result<DrainCost> {
+    if measured {
+        let pool = &storm.ledger().pool;
+        let max = pool.options().get_max_connections();
+        ensure!(
+            pool.size() == max,
+            "the ledger pool is at {} of its {max} connections before a measured window; a connection closed since the pool was saturated",
+            pool.size()
+        );
+    }
     let connections = proxy.connections();
     let mut costs: BTreeSet<usize> = BTreeSet::new();
     let mut drained: BTreeSet<String> = BTreeSet::new();

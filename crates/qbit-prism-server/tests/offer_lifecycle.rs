@@ -171,6 +171,36 @@ impl Database {
     }
 }
 
+/// Expire a row's claim lease and make it due again through the fixture pool,
+/// as an abandoned lease looks to the next claim.
+///
+/// The row lock is taken first. A ledger call these tests expect to be
+/// refused drops its transaction on the error path, and sqlx only queues that
+/// transaction's `ROLLBACK`: it is sent when the pooled connection is
+/// returned, from a task of its own, so for a moment after the refusal has
+/// returned the transaction can still hold its row lock (`FOR NO KEY UPDATE`
+/// from the reservation and outcome writes, `FOR KEY SHARE` from the claim
+/// fence of an abandonment). A claim lane selects `FOR UPDATE SKIP LOCKED`
+/// and passes over the row while that lock stands, and the plain `UPDATE`
+/// alone would not wait for a `FOR KEY SHARE` lock. `FOR UPDATE` conflicts
+/// with every row lock, so this commits only once no earlier transaction on
+/// the row is open, and the claim that follows finds nothing to skip.
+async fn expire_lease(pool: &PgPool, hash: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR UPDATE",
+    )
+    .bind(hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn run(
     body: impl for<'a> FnOnce(&'a Database) -> LocalBoxFuture<'a, Result<()>>,
 ) -> Result<()> {
@@ -1388,14 +1418,6 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
             let hash = candidate.block_hash.clone();
             ensure!(ledger.enqueue_candidate_observed(candidate.clone(), Some(PROOF_MS)).await?);
             let metrics = Metrics::default();
-            let expire = |hash: String| {
-                let pool = db.pool.clone();
-                async move {
-                    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-                        .bind(hash).execute(&pool).await?;
-                    Ok::<_, anyhow::Error>(())
-                }
-            };
             let live_rows = || async {
                 let (retained, gauge): (i64, i64) = sqlx::query_as(
                     "SELECT (SELECT count(*) FROM qbit_block_candidate_outbox WHERE window_anchor_ms IS NOT NULL),(SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN ('pending','offer_reserved','offered','reconciliation'))",
@@ -1421,7 +1443,7 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
             ensure!(row["state"] == "offer_reserved" && row["offer_reserved_by"] == "lifecycle", "{row}");
             ensure!(ledger.finish_candidate(&claim, false, Some("superseded")).await.is_err(), "a reserved row was abandoned");
             ensure!(live_rows().await? == (1, 1, 1));
-            expire(hash.clone()).await?;
+            expire_lease(&db.pool, &hash).await?;
             let claim = ledger.claim_candidate(60).await?.context("reserved not claimable")?;
             ensure!(claim.lifecycle.state == CandidateState::OfferReserved);
             ensure!(claim.lifecycle.offer.reserved_by.as_deref() == Some("lifecycle"));
@@ -1432,7 +1454,7 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
             ledger.record_offer(&claim, OFFERED_MS, OfferOutcome::Rejected, Some("duplicate")).await?;
             ensure!(ledger.record_offer(&claim, 2, OfferOutcome::Accepted, None).await.is_err(), "the outcome was recorded twice");
             ensure!(ledger.finish_candidate(&claim, false, Some("superseded")).await.is_err(), "an offered row was abandoned");
-            expire(hash.clone()).await?;
+            expire_lease(&db.pool, &hash).await?;
             let claim = ledger.claim_candidate(60).await?.context("offered not claimable")?;
             ensure!(claim.lifecycle.state == CandidateState::Offered);
             ensure!(claim.lifecycle.offer.outcome == Some(OfferOutcome::Rejected));
@@ -1454,7 +1476,7 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
             ensure!(attempts == 3, "{attempts}");
             ensure!(backoff > 25.0 && backoff <= 30.0, "reconciliation backoff was {backoff} s, not 10 * {attempts}");
             ensure!(live_rows().await? == (1, 1, 1));
-            expire(hash.clone()).await?;
+            expire_lease(&db.pool, &hash).await?;
             let claim = ledger.claim_candidate(60).await?.context("reconciliation not claimable")?;
             ensure!(claim.lifecycle.state == CandidateState::Reconciliation);
             ensure!(ledger.finish_candidate(&claim, false, Some("superseded")).await.is_err(), "a reconciliation row was abandoned");
@@ -1465,7 +1487,7 @@ async fn every_unfinished_state_is_claimable_retained_and_reserved_only_once() -
             ensure!(attempts == 4 && backoff > 35.0 && backoff <= 40.0, "retry backoff {backoff} s at attempt {attempts}");
 
             // submitted, keeping the offer record and dropping the payload
-            expire(hash.clone()).await?;
+            expire_lease(&db.pool, &hash).await?;
             let claim = ledger.claim_candidate(60).await?.context("not claimable")?.with_bundle(bundle);
             let revision = ledger.payout_revision().await?;
             ledger.land_candidate_at_revision(&claim, &keys().1.public_key_hex(), revision).await?;
@@ -2034,44 +2056,80 @@ async fn signer_rotation_is_refused_at_every_unfinished_state_alone_and_accepted
             ledger.append(appended_share(1), None).await?;
             let snapshot = ledger.snapshot(100).await?;
             let key = keys().1.public_key_hex();
-            let expire = |hash: String| {
-                let pool = db.pool.clone();
-                async move {
-                    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-                        .bind(hash).execute(&pool).await?;
-                    Ok::<_, anyhow::Error>(())
-                }
-            };
 
             // Row A, through the offer states to its landing.
             let (candidate, bundle) = candidate_for(&snapshot, 40)?;
             let hash = candidate.block_hash.clone();
-            ensure!(ledger.enqueue_candidate_observed(candidate, Some(PROOF_MS)).await?);
+            ensure!(
+                ledger
+                    .enqueue_candidate_observed(candidate, Some(PROOF_MS))
+                    .await?
+            );
             rotation_refused(&ledger, &db.pool, "pending", "pending", &hash).await?;
-            let claim = ledger.claim_candidate(60).await?.context("pending not claimable")?;
+            let claim = ledger
+                .claim_candidate(60)
+                .await?
+                .context("pending not claimable")?;
             ledger.reserve_offer(&claim).await?;
             rotation_refused(&ledger, &db.pool, "offer_reserved", "offer_reserved", &hash).await?;
-            ledger.record_offer(&claim, OFFERED_MS, OfferOutcome::Accepted, None).await?;
+            ledger
+                .record_offer(&claim, OFFERED_MS, OfferOutcome::Accepted, None)
+                .await?;
             rotation_refused(&ledger, &db.pool, "offered", "offered", &hash).await?;
-            ledger.reconcile_candidate(&claim, "landing failed after acceptance").await?;
+            ledger
+                .reconcile_candidate(&claim, "landing failed after acceptance")
+                .await?;
             rotation_refused(&ledger, &db.pool, "reconciliation", "reconciliation", &hash).await?;
-            expire(hash.clone()).await?;
-            let claim = ledger.claim_candidate(60).await?.context("reconciliation not claimable")?.with_bundle(bundle);
+            expire_lease(&db.pool, &hash).await?;
+            let claim = ledger
+                .claim_candidate(60)
+                .await?
+                .context("reconciliation not claimable")?
+                .with_bundle(bundle);
             let revision = ledger.payout_revision().await?;
-            ledger.land_candidate_at_revision(&claim, &key, revision).await?;
-            ledger.finish_candidate_at_revision(&claim, true, None, revision).await?;
+            ledger
+                .land_candidate_at_revision(&claim, &key, revision)
+                .await?;
+            ledger
+                .finish_candidate_at_revision(&claim, true, None, revision)
+                .await?;
             ensure!(db.row(&hash).await?["state"] == "submitted");
 
             // Row B, adopted from pending into reconciliation without an offer.
             let (candidate, bundle) = candidate_for(&snapshot, 41)?;
             let hash = candidate.block_hash.clone();
-            ensure!(ledger.enqueue_candidate_observed(candidate, Some(PROOF_MS)).await?);
-            let claim = ledger.claim_candidate(60).await?.context("pending not claimable")?.with_bundle(bundle);
-            ledger.adopt_active_candidate(&claim, "node: block active at height 101", "already on the active chain before any offer").await?;
-            rotation_refused(&ledger, &db.pool, "adopted reconciliation", "reconciliation", &hash).await?;
+            ensure!(
+                ledger
+                    .enqueue_candidate_observed(candidate, Some(PROOF_MS))
+                    .await?
+            );
+            let claim = ledger
+                .claim_candidate(60)
+                .await?
+                .context("pending not claimable")?
+                .with_bundle(bundle);
+            ledger
+                .adopt_active_candidate(
+                    &claim,
+                    "node: block active at height 101",
+                    "already on the active chain before any offer",
+                )
+                .await?;
+            rotation_refused(
+                &ledger,
+                &db.pool,
+                "adopted reconciliation",
+                "reconciliation",
+                &hash,
+            )
+            .await?;
             let revision = ledger.payout_revision().await?;
-            ledger.land_candidate_at_revision(&claim, &key, revision).await?;
-            ledger.finish_candidate_at_revision(&claim, true, None, revision).await?;
+            ledger
+                .land_candidate_at_revision(&claim, &key, revision)
+                .await?;
+            ledger
+                .finish_candidate_at_revision(&claim, true, None, revision)
+                .await?;
             ensure!(db.row(&hash).await?["state"] == "submitted");
 
             // The control: every row terminal, the same rotation is accepted.
@@ -2079,10 +2137,11 @@ async fn signer_rotation_is_refused_at_every_unfinished_state_alone_and_accepted
                 .configure("rotated", &other_signer_keys())
                 .await
                 .context("rotation refused with every row terminal")?;
-            let pinned: Option<String> =
-                sqlx::query_scalar("SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton")
-                    .fetch_one(&db.pool)
-                    .await?;
+            let pinned: Option<String> = sqlx::query_scalar(
+                "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&db.pool)
+            .await?;
             ensure!(pinned.as_deref() == Some("rotated"), "{pinned:?}");
             Ok(())
         })
