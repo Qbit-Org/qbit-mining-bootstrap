@@ -7,14 +7,22 @@ generated from registry descriptors or the inventory document. The census
 compares every family name and type, requires one HELP and TYPE per family, and
 compares every sample name and complete label tuple. Duplicate samples fail.
 
-The current bound is **51 families and 316 series**, including histogram
-`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **218 series**:
-first-offer and advisory-lock metadata exist, but their 98 derived series remain
-absent until observations occur. All 14 rejection reasons, two ACK outcomes,
+The current bound is **53 families and 666 series**, including histogram
+`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **232 series**:
+first-offer, advisory-lock and refresh metadata exist, but their 434 derived
+series remain absent until observations occur. All 14 rejection reasons, two ACK outcomes,
 two pool outcomes, six lock/outcome pairs, two collectors, ten task kinds, six
 connection refusal reasons, four stale-job causes and three revision-work results are covered. Bucket bounds
 are independently pinned, including ACK's 15/20-second buckets and CTV chunk
 rows' one-row bucket and the landing ladder from 0.25 through 600 seconds.
+
+#275's refresh-path accounting adds two families: fourteen
+`qbit_prism_refresh_window_acquisitions_total{outcome}` counters, present at
+zero from startup, and the `qbit_prism_refresh_seconds{trigger,acquisition}`
+histogram, whose 24 closed label pairs (eight triggers by three acquisitions)
+are reserved at startup and render 336 series once every pair has been
+observed. Both label sets are closed enums; no tip hash, height, job or miner
+enters them.
 
 #458 adds exactly four families and 48 startup/populated series: 45 histogram
 series for `result=published|degraded|superseded`, a pending gauge, a separate

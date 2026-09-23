@@ -769,7 +769,9 @@ pub async fn execute(args: Args) -> Result<i32> {
     let (fd_before, fd_after) = measure::raise_file_descriptor_limit(needed)?;
 
     // --- fake node --------------------------------------------------------
-    let node = FakeNode::open(window::TEMPLATE_BITS, &address_prefix).await?;
+    let node =
+        FakeNode::open_with_retarget(window::TEMPLATE_BITS, &address_prefix, args.retarget_bits)
+            .await?;
     let node_state = node.state.clone();
 
     // --- PostgreSQL -------------------------------------------------------
@@ -898,7 +900,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let bits = qbit_prism_server::codec::parse_u32_hex(window::TEMPLATE_BITS)?;
     let solution = window::solve_window(bits, args.window_shares)?;
     let seed = window::SeedPlan::new(
-        args.window_shares,
+        args.seed_share_count(),
         solution.scaled_share_difficulty,
         solution.scaled_network_difficulty,
         args.seed_share_bytes,
@@ -1805,6 +1807,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "scaled_share_difficulty": solution.scaled_share_difficulty.to_string(),
             "requested_window_shares": solution.requested_window,
             "computed_window_shares": solution.computed_window,
+            "seeded_history_rows_below_window": args.seed_share_count() - args.window_shares,
             "ledger_window_shares_at_start": window_at_start,
             "ledger_window_shares_at_end": window_at_end,
             "expected_hashes_per_share": solution.hashes_per_share,
@@ -1851,10 +1854,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "node": {
             "url": ctx.node_url,
             "template_bits": window::TEMPLATE_BITS,
+            "retarget_bits": ctx.node_state.retargets(),
+            "background_shares_per_second": args.background_shares_per_second,
             "submissions": node_submissions,
             "tip_changes": tip_changes.iter().map(|change| json!({
                 "hash": change.hash, "height": change.height,
                 "origin": change.origin, "wall": change.wall.to_rfc3339(),
+                "next_template_bits": ctx.node_state.template_bits(change.height + 1),
             })).collect::<Vec<_>>(),
             "rpc_call_counts": ctx.node_state.rpc_call_counts(),
         },
@@ -2968,7 +2974,7 @@ pub fn time_to_usable_work(
                 .filter(|change| change.monotonic > tip.monotonic)
                 .map(|change| change.monotonic)
                 .min();
-            let mut first: HashMap<usize, Instant> = HashMap::new();
+            let mut first: HashMap<usize, (Instant, usize)> = HashMap::new();
             for sighting in &collected.tips {
                 if sighting.tip != tip.hash || sighting.at < tip.monotonic {
                     continue;
@@ -2976,12 +2982,35 @@ pub fn time_to_usable_work(
                 if replaced_at.is_some_and(|end| sighting.at >= end) {
                     continue;
                 }
-                let slot = first.entry(sighting.session).or_insert(sighting.at);
-                *slot = (*slot).min(sighting.at);
+                let slot = first
+                    .entry(sighting.session)
+                    .or_insert((sighting.at, sighting.frontend));
+                if sighting.at < slot.0 {
+                    *slot = (sighting.at, sighting.frontend);
+                }
             }
-            let deltas: Vec<f64> = first
-                .values()
-                .map(|at| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0)
+            let millis =
+                |at: &Instant| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0;
+            let deltas: Vec<f64> = first.values().map(|(at, _)| millis(at)).collect();
+            // The same figures per frontend, by the frontend that served the
+            // session's first usable job, so a two-frontend run can be read
+            // against each frontend's own refresh.
+            let mut by_frontend: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+            for (at, frontend) in first.values() {
+                by_frontend.entry(*frontend).or_default().push(millis(at));
+            }
+            let by_frontend: Vec<Value> = by_frontend
+                .into_iter()
+                .map(|(frontend, deltas)| {
+                    json!({
+                        "frontend": frontend,
+                        "latency_milliseconds": measure::summarize(
+                            deltas,
+                            measure::MILLISECONDS,
+                            "client monotonic against the node's tip stamp",
+                        ),
+                    })
+                })
                 .collect();
             // The slowest served session is a figure for every session only
             // when every session was served. With some unserved, the value
@@ -3002,10 +3031,7 @@ pub fn time_to_usable_work(
             let all_seen = if all_sessions_unavailable_reason.is_some() {
                 None
             } else {
-                first
-                    .values()
-                    .max()
-                    .map(|at| at.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0)
+                first.values().map(|(at, _)| at).max().map(millis)
             };
             json!({
                 "tip": tip.hash,
@@ -3025,6 +3051,7 @@ pub fn time_to_usable_work(
                 ),
                 "all_sessions_milliseconds": all_seen,
                 "all_sessions_unavailable_reason": all_sessions_unavailable_reason,
+                "by_frontend": by_frontend,
             })
         })
         .collect();

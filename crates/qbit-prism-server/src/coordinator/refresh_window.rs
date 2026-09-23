@@ -17,6 +17,9 @@ type CapturedWindow = CompactOwner<(
 pub(super) struct RefreshWindow {
     pub snapshot: Snapshot,
     pub reference: WindowRef,
+    /// How the ledger acquired `snapshot` and what it cost: logged and
+    /// counted by the refresh that captured it, never a reuse input.
+    pub acquisition: crate::ledger::AcquisitionReport,
     network: u128,
     leaf: Option<crate::ledger::LeafWitness>,
     anchored: Instant,
@@ -103,13 +106,18 @@ impl Coordinator {
             .spawn_blocking(move |computed| {
                 let admission = computed.3;
                 let (capture, reference, body, _) = computed;
-                let crate::ledger::SnapshotCapture { snapshot, leaf } = Arc::try_unwrap(capture)
+                let crate::ledger::SnapshotCapture {
+                    snapshot,
+                    leaf,
+                    acquisition,
+                } = Arc::try_unwrap(capture)
                     .ok()
                     .expect("both borrowed computations have finished");
                 let reference = reference?;
                 let window = Arc::new(RefreshWindow {
                     snapshot,
                     reference,
+                    acquisition,
                     network,
                     leaf,
                     anchored,

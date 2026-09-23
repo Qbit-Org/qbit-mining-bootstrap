@@ -149,6 +149,36 @@ impl Metrics {
             elapsed,
         );
     }
+    /// Exactly once per refresh snapshot, at the ledger's acquisition
+    /// decision: the delta path advanced, or the full scan ran for the named
+    /// reason. Zero samples make the first event visible to `increase()`.
+    pub fn record_window_acquisition(&self, outcome: WindowAcquisition) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::WindowAcquisitions,
+                Labels::One(("outcome", outcome.as_str())),
+            );
+    }
+    /// Exactly once per refresh that published rebuilt work, from the
+    /// refresh's entry to its publication. A refresh that reused the
+    /// published work unchanged, or failed, records nothing.
+    pub fn observe_refresh(
+        &self,
+        trigger: RefreshTrigger,
+        acquisition: RefreshAcquisition,
+        elapsed: Duration,
+    ) {
+        self.observe(
+            Family::RefreshSeconds,
+            Labels::Two(
+                ("trigger", trigger.as_str()),
+                ("acquisition", acquisition.as_str()),
+            ),
+            elapsed,
+        );
+    }
     pub fn observe_advisory_lock(&self, lock: LockKind, result: Outcome, elapsed: Duration) {
         self.observe(
             Family::LockWait,

@@ -1,5 +1,5 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
-use super::{Labels, LockKind, Outcome};
+use super::{Labels, LockKind, Outcome, RefreshAcquisition, RefreshTrigger};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -92,6 +92,8 @@ families! {
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
+    WindowAcquisitions: Counter, "refresh_window_acquisitions_total", "Refresh payout-window snapshots by acquisition outcome: advanced by the delta path, or the reason the full scan ran.";
+    RefreshSeconds: Histogram, "refresh_seconds", "Template refresh from entry to published work, in seconds, by what triggered the rebuild and how its window was acquired.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -203,6 +205,22 @@ impl Registry {
                             (
                                 family,
                                 Labels::Two(("lock", lock.as_str()), ("result", result.as_str())),
+                            ),
+                            Sample::Pending,
+                        );
+                    }
+                }
+            }
+            Family::RefreshSeconds => {
+                for trigger in RefreshTrigger::ALL {
+                    for acquisition in RefreshAcquisition::ALL {
+                        self.samples.insert(
+                            (
+                                family,
+                                Labels::Two(
+                                    ("trigger", trigger.as_str()),
+                                    ("acquisition", acquisition.as_str()),
+                                ),
                             ),
                             Sample::Pending,
                         );

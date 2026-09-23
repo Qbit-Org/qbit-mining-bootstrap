@@ -91,6 +91,25 @@ labels!(ConnectionRefusalReason {
     MalformedFrameBudget => "malformed_frame_budget", UnknownJobBudget => "unknown_job_budget",
     AuthorizeBudget => "authorize_budget"
 });
+// How a refresh snapshot acquired its payout window: the delta path advanced
+// the retired window, or the reason the newest-first full scan ran instead.
+labels!(WindowAcquisition {
+    Advanced => "advanced", NoPrior => "no_prior", EmptyPrior => "empty_prior",
+    TailMismatch => "tail_mismatch", AnchorRegressed => "anchor_regressed",
+    CutoffRegressed => "cutoff_regressed", DeltaTooLarge => "delta_too_large",
+    NoEvidence => "no_evidence", LeafChanged => "leaf_changed",
+    MarginTooLarge => "margin_too_large", Partial => "partial",
+    WitnessChanged => "witness_changed", CountMismatch => "count_mismatch",
+    Invariant => "invariant"
+});
+// What invalidated the published work and made a refresh rebuild it.
+labels!(RefreshTrigger {
+    Initial => "initial", Tip => "tip", Revision => "revision", Balances => "balances",
+    Reanchor => "reanchor", Shares => "shares", Template => "template", Fee => "fee"
+});
+// Where the rebuilt work's window came from: the delta path, the full scan,
+// or the cached window the previous refresh captured.
+labels!(RefreshAcquisition { Delta => "delta", Full => "full", Cached => "cached" });
 // The stale-job decision that refused a share. The wire reason stays `stale-job`.
 labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",

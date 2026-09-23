@@ -1,6 +1,8 @@
 use super::*;
 use crate::api::{router, ApiConfig, ApiState};
-use crate::metrics::{LockKind, Metrics, Outcome, BUCKETS};
+use crate::metrics::{
+    LockKind, Metrics, Outcome, RefreshAcquisition, RefreshTrigger, WindowAcquisition, BUCKETS,
+};
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -498,6 +500,16 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
     for lock in LockKind::ALL {
         for outcome in Outcome::ALL {
             metrics.observe_advisory_lock(*lock, *outcome, Duration::from_millis(25));
+        }
+    }
+    // The refresh families are the other owner-dependent series: every closed
+    // pair observed once, so the populated census covers them too.
+    for outcome in WindowAcquisition::ALL {
+        metrics.record_window_acquisition(*outcome);
+    }
+    for trigger in RefreshTrigger::ALL {
+        for acquisition in RefreshAcquisition::ALL {
+            metrics.observe_refresh(*trigger, *acquisition, Duration::from_millis(40));
         }
     }
     for (age, expected_state) in [

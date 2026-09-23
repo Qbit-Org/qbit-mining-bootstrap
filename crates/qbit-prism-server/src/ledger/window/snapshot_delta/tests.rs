@@ -46,7 +46,7 @@ async fn capture(ledger: &Ledger, network: u128) -> Result<SnapshotCapture> {
 }
 
 fn retained(capture: SnapshotCapture, network: u128) -> RetainedShares {
-    let SnapshotCapture { snapshot, leaf } = capture;
+    let SnapshotCapture { snapshot, leaf, .. } = capture;
     RetainedShares {
         network,
         leaf,
@@ -64,37 +64,82 @@ async fn differential(
     network: u128,
     advanced: bool,
 ) -> Result<SnapshotCapture> {
+    let (full, _) = differential_report(ledger, prior, network, advanced).await?;
+    Ok(full)
+}
+
+/// [`differential`], also returning the delta path's own account of itself.
+async fn differential_report(
+    ledger: &Ledger,
+    prior: RetainedShares,
+    network: u128,
+    advanced: bool,
+) -> Result<(SnapshotCapture, AcquisitionReport)> {
     let full = capture(ledger, network).await?;
     let completion = ReadAdmission::default();
     let mut tx = ledger.begin().await?;
     let result = advance(
         &mut tx,
         completion.own(prior),
-        network,
         network * 8,
         full.anchor_ms,
         i64::try_from(full.share_seq)?,
         &completion,
     )
     .await?;
-    assert_eq!(result.is_some(), advanced, "unexpected acquisition path");
-    if let Some((shares, _)) = result {
-        assert!(shares.capacity() <= shares.len().saturating_mul(2).max(4));
-        let candidate = Snapshot {
-            shares: shares.into_inner(),
-            ..full.snapshot.clone()
-        };
-        assert_eq!(
-            serde_json::to_vec(&candidate)?,
-            serde_json::to_vec(&full.snapshot)?
-        );
-        assert_eq!(
-            WindowRef::from_snapshot(&candidate)?,
-            WindowRef::from_snapshot(&full)?
-        );
-    }
+    let report = match result {
+        Advance::Advanced {
+            shares,
+            leaf,
+            report,
+        } => {
+            assert!(advanced, "unexpected delta acquisition: {report:?}");
+            assert_eq!(report.outcome, WindowAcquisition::Advanced);
+            assert_eq!(Some(&leaf), full.leaf.as_ref());
+            assert!(shares.capacity() <= shares.len().saturating_mul(2).max(4));
+            assert_eq!(report.window_rows, shares.len());
+            let candidate = Snapshot {
+                shares: shares.into_inner(),
+                ..full.snapshot.clone()
+            };
+            assert_eq!(
+                serde_json::to_vec(&candidate)?,
+                serde_json::to_vec(&full.snapshot)?
+            );
+            assert_eq!(
+                WindowRef::from_snapshot(&candidate)?,
+                WindowRef::from_snapshot(&full)?
+            );
+            report
+        }
+        Advance::Rejected(report) => {
+            assert!(!advanced, "unexpected full-scan fallback: {report:?}");
+            assert_ne!(report.outcome, WindowAcquisition::Advanced);
+            report
+        }
+    };
     tx.commit().await?;
-    Ok(full)
+    Ok((full, report))
+}
+
+/// Bulk rows for size-driven cases: one leaf, fixed difficulty, eligible at
+/// any anchor, `share_id` derived from the sequence. Native appends stay the
+/// path for the behaviour-driven cases; a case never mixes the two.
+async fn bulk_rows(ledger: &Ledger, from: i64, to: i64, difficulty: u128) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch)
+        SELECT i,'bulk:'||i::text,'miner','miner',decode(repeat('11',32),'hex'),$3::text::numeric,1,1,'job',to_timestamp(1),1,to_timestamp(2),true,'fixture',0
+        FROM generate_series($1::bigint,$2::bigint) i")
+        .bind(from).bind(to).bind(difficulty.to_string()).execute(&ledger.pool).await?;
+    Ok(())
+}
+
+/// Whether the full reader's window at this target crosses (reaches the
+/// weight) rather than running out of history: the delta path advances
+/// exactly the crossing windows it can prove.
+fn crosses(capture: &SnapshotCapture, network: u128) -> bool {
+    capture.shares.iter().fold(network * 8, |left, share| {
+        left.saturating_sub(share.share_difficulty)
+    }) == 0
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -374,4 +419,278 @@ async fn healthy_pool_rotation_and_reconnect_preserve_history_evidence() -> Resu
     .await
 }
 
+/// Retargets in both directions advance from the retained rows: a lighter
+/// target retires rows from the old end, a heavier one reads a bounded margin
+/// below the retained first row, and appended shares extend above the
+/// cutoff, all within one exact window the full reader agrees with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retargets_up_and_down_advance_with_exact_windows() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            for index in 1..=40 {
+                ledger
+                    .append(share(index, u128::from(1 + index % 3)), None)
+                    .await?;
+            }
+            let mut retained_network: u128 = 4;
+            let mut prior = capture(ledger, retained_network).await?;
+            assert!(crosses(&prior, retained_network));
+            let plan: [(u128, u64); 7] = [(5, 0), (3, 0), (6, 2), (2, 1), (7, 0), (7, 5), (4, 0)];
+            let mut next_index = 41;
+            for (network, appended) in plan {
+                for _ in 0..appended {
+                    ledger
+                        .append(share(next_index, u128::from(1 + next_index % 3)), None)
+                        .await?;
+                    next_index += 1;
+                }
+                let (next, report) =
+                    differential_report(ledger, retained(prior, retained_network), network, true)
+                        .await?;
+                assert_eq!(report.delta_rows, usize::try_from(appended)?, "{report:?}");
+                if network > retained_network && appended == 0 {
+                    assert!(report.margin_rows > 0, "{report:?}");
+                    assert_eq!(report.retired_rows, 0, "{report:?}");
+                }
+                if network < retained_network && appended == 0 {
+                    assert!(report.retired_rows > 0, "{report:?}");
+                    assert_eq!(report.margin_rows, 0, "{report:?}");
+                }
+                // Kept retained rows mean no delta row was dropped.
+                if report.retired_rows < report.prior_rows {
+                    assert_eq!(
+                        report.window_rows,
+                        report.prior_rows - report.retired_rows
+                            + report.margin_rows
+                            + report.delta_rows,
+                        "{report:?}"
+                    );
+                }
+                prior = next;
+                retained_network = network;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Deltas and margins span several pages; the assembled window is byte for
+/// byte the full reader's, and the report counts every page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_page_delta_and_margin_match_full_reader() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            bulk_rows(ledger, 1, 20_000, 1).await?;
+            // Weight 8000: the newest 8000 rows.
+            let prior = capture(ledger, 1000).await?;
+            assert_eq!(prior.shares.len(), 8000);
+            assert_eq!(prior.shares[0].share_seq, 12_001);
+            // Heavier by 8000 rows: a two-page margin below the retained first row.
+            let (heavier, report) =
+                differential_report(ledger, retained(prior.clone(), 1000), 2000, true).await?;
+            assert_eq!(report.margin_rows, 8000);
+            assert_eq!(report.pages, 2);
+            assert_eq!(heavier.shares[0].share_seq, 4001);
+            // A three-page delta above the cutoff at the lighter target: the
+            // retained rows are mostly retired and the delta mostly kept.
+            bulk_rows(ledger, 20_001, 29_000, 1).await?;
+            let (extended, report) =
+                differential_report(ledger, retained(heavier, 2000), 1000, true).await?;
+            assert_eq!(report.delta_rows, 9000);
+            assert_eq!(report.pages, 3);
+            assert_eq!(report.margin_rows, 0);
+            assert_eq!(report.retired_rows, 16_000);
+            assert_eq!(extended.shares.len(), 8000);
+            assert_eq!(extended.shares[0].share_seq, 21_001);
+            // A delta that alone outweighs the target retires the whole
+            // retained window without reading below it.
+            bulk_rows(ledger, 29_001, 38_000, 1).await?;
+            let (replaced, report) =
+                differential_report(ledger, retained(extended, 1000), 1000, true).await?;
+            assert_eq!(report.retired_rows, 8000);
+            assert_eq!(replaced.shares[0].share_seq, 30_001);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The size bounds refuse before reading payload: a delta spanning more than
+/// `MAX_DELTA_SLOTS` sequence slots, and a heavier target whose margin would
+/// need more than `MAX_MARGIN_PAGES` pages, both take the full scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_delta_and_margin_take_the_full_scan() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            for index in 1..=8 {
+                ledger.append(share(index, 1), None).await?;
+            }
+            let prior = capture(ledger, 1).await?;
+            let mut stale = retained(prior.clone(), 1);
+            // The cutoff regression check runs first; move the retained
+            // cutoff back so the fresh cutoff is far ahead of it.
+            let far = MAX_DELTA_SLOTS + 2;
+            bulk_rows(ledger, 9, i64::try_from(far + 8)?, 1).await?;
+            stale.cutoff = 8;
+            let (_, report) = differential_report(ledger, stale, 1, false).await?;
+            assert_eq!(report.outcome, WindowAcquisition::DeltaTooLarge);
+            // Now a window whose heavier target needs more margin pages than
+            // the bound allows: weight 8 retained, then 8 + the bound + 1.
+            let light = capture(ledger, 1).await?;
+            assert_eq!(light.shares.len(), 8);
+            let too_heavy = u128::try_from(MAX_MARGIN_PAGES * 4096 + 9)?.div_ceil(8);
+            let (_, report) =
+                differential_report(ledger, retained(light.clone(), 1), too_heavy, false).await?;
+            assert_eq!(report.outcome, WindowAcquisition::MarginTooLarge);
+            // One page fewer is within the bound and advances.
+            let heavy = u128::try_from(MAX_MARGIN_PAGES * 4096)?.div_ceil(8);
+            let (_, report) = differential_report(ledger, retained(light, 1), heavy, true).await?;
+            assert_eq!(report.margin_rows, MAX_MARGIN_PAGES * 4096 - 8);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Seeded random walks over target, appended shares and difficulties: every
+/// crossing window the full reader produces is what the delta path produces,
+/// and every window that runs out of history is refused as partial. Exact
+/// crossings (the fold reaching zero on the crossing row precisely) are
+/// forced by choosing difficulties from a small set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn random_retargets_and_inserts_match_full_reader() -> Result<()> {
+    use rand::{Rng, SeedableRng};
+    for seed in [7u64, 1975, 402_000] {
+        run(gate::site!(), |ledger| {
+            Box::pin(async move {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let mut next_index = 1u64;
+                for _ in 0..12 {
+                    ledger
+                        .append(share(next_index, rng.gen_range(1..=4)), None)
+                        .await?;
+                    next_index += 1;
+                }
+                let mut network: u128 = 3;
+                let mut prior = capture(ledger, network).await?;
+                let mut advanced = 0;
+                let mut refused = 0;
+                for step in 0..40 {
+                    let appended = if step % 4 == 3 {
+                        0
+                    } else {
+                        rng.gen_range(0..=6)
+                    };
+                    for _ in 0..appended {
+                        ledger
+                            .append(share(next_index, rng.gen_range(1..=4)), None)
+                            .await?;
+                        next_index += 1;
+                    }
+                    let previous = network;
+                    network = match rng.gen_range(0..5) {
+                        0 => network.saturating_sub(1).max(1),
+                        1 => network + 1,
+                        2 => network * 2,
+                        3 => (network / 2).max(1),
+                        _ => network,
+                    };
+                    let expected = capture(ledger, network).await?;
+                    let expect_advance = crosses(&expected, network);
+                    let (next, report) = differential_report(
+                        ledger,
+                        retained(prior.clone(), previous),
+                        network,
+                        expect_advance,
+                    )
+                    .await?;
+                    if expect_advance {
+                        advanced += 1;
+                    } else {
+                        assert_eq!(report.outcome, WindowAcquisition::Partial, "{report:?}");
+                        refused += 1;
+                    }
+                    assert_eq!(next.shares, expected.shares);
+                    prior = next;
+                }
+                assert!(
+                    advanced > 0 && refused > 0,
+                    "seed {seed}: {advanced} advanced, {refused} refused"
+                );
+                Ok(())
+            })
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// A window the delta path assembled after a retarget lands: the landing
+/// re-derivation accepts exactly that range and rejects a superset and an
+/// under-covering subset of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_windows_pass_landing_rederivation_and_neighbours_fail() -> Result<()> {
+    use super::super::super::audit::{
+        persist_audit_snapshot, verify_durable_range, AuditSnapshotWrite,
+    };
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            for index in 1..=30 {
+                ledger
+                    .append(share(index, u128::from(1 + index % 4)), None)
+                    .await?;
+            }
+            let prior = capture(ledger, 3).await?;
+            for index in 31..=36 {
+                ledger.append(share(index, 2), None).await?;
+            }
+            // Heavier target with appended shares: margin below, delta above.
+            let (window, report) = differential_report(ledger, retained(prior, 3), 5, true).await?;
+            assert!(
+                report.margin_rows > 0 && report.delta_rows == 6,
+                "{report:?}"
+            );
+            let write = |shares: Vec<AcceptedShare>| -> Result<AuditSnapshotWrite> {
+                Ok(AuditSnapshotWrite {
+                    digest: hex::encode(Sha256::digest(serde_json::to_vec(&shares)?)),
+                    first_share_seq: i64::try_from(shares[0].share_seq)?,
+                    last_share_seq: i64::try_from(shares[shares.len() - 1].share_seq)?,
+                    anchor_ms: window.anchor_ms,
+                    network_difficulty: 5,
+                    share_count: i64::try_from(shares.len())?,
+                    inline: None,
+                    shares: std::sync::Arc::new(shares),
+                })
+            };
+            let exact = write(window.shares.clone())?;
+            verify_durable_range(&ledger.pool, &exact, None).await?;
+            let mut tx = ledger.begin().await?;
+            persist_audit_snapshot(&mut tx, &exact).await?;
+            tx.rollback().await?;
+            // A superset: one margin row too many leaks past the crossing row.
+            let older = capture(ledger, 6).await?;
+            assert!(older.shares.len() > window.shares.len());
+            let superset =
+                write(older.shares[older.shares.len() - window.shares.len() - 1..].to_vec())?;
+            assert!(verify_durable_range(&ledger.pool, &superset, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("extends past canonical oldest share"));
+            // Under-coverage: the crossing row is missing, so the window is
+            // partial while older canonical shares exist.
+            let subset = write(window.shares[1..].to_vec())?;
+            assert!(verify_durable_range(&ledger.pool, &subset, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("omits oldest canonical shares"));
+            Ok(())
+        })
+    })
+    .await
+}
+
+mod adversarial;
 mod physical_failover;
