@@ -55,6 +55,15 @@ impl IssuanceAuthority {
         self.expires_at_ms
     }
 
+    /// Record an absolute expiry the caller already fixed, without a clock
+    /// read; an earlier recorded expiry is never extended.
+    pub(super) fn note_expiry(&mut self, expires_at_ms: i64) {
+        self.expires_at_ms = Some(
+            self.expires_at_ms
+                .map_or(expires_at_ms, |original| original.min(expires_at_ms)),
+        );
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.deadline.map(|deadline| deadline.instant())
     }
@@ -430,6 +439,21 @@ impl TipState {
 }
 
 impl Coordinator {
+    /// The database clock and payout revision from a read that started no
+    /// earlier than `requested_at`, shared with every concurrent caller whose
+    /// request also preceded it (`clocked_flight`).
+    pub(super) async fn clocked_revision_since(
+        &self,
+        requested_at: MonotonicInstant,
+    ) -> Result<work_ledger::ClockedRevision> {
+        let ledger = self.work_ledger.clone();
+        self.clocked_flights
+            .read(requested_at, move || async move {
+                ledger.clocked_payout_revision().await
+            })
+            .await
+    }
+
     pub(super) async fn begin_issuance_authority(
         &self,
         identity: PreparedIdentity,
@@ -544,20 +568,23 @@ impl Coordinator {
         expires_at_ms: Option<i64>,
         readiness_epoch: u64,
     ) -> Result<Option<WorkAuthority>> {
-        let clock = if let Some(expires) = expires_at_ms {
-            let requested_at = MonotonicInstant::now();
-            let now = self.work_ledger.now_ms().await?;
-            let clock = AbsoluteDeadline::from_database(now, requested_at, expires)?;
-            if !clock.live() {
-                return Ok(None);
+        // One shared read, started after this request, supplies both the
+        // clock and the revision: the expired-clock branch still returns
+        // before the revision is used, and a database failure still precedes
+        // every local check.
+        let requested_at = MonotonicInstant::now();
+        let read = self.clocked_revision_since(requested_at).await?;
+        let clock = match expires_at_ms {
+            Some(expires) => {
+                let clock = AbsoluteDeadline::from_database(read.now_ms, requested_at, expires)?;
+                if !clock.live() {
+                    return Ok(None);
+                }
+                Some(clock)
             }
-            Some(clock)
-        } else {
-            None
+            None => None,
         };
-        // Preserve the existing database-first failure priority, even when a
-        // later coherent lease proof will supply the transaction revision.
-        let revision = self.work_ledger.payout_revision().await?;
+        let revision = read.payout_revision;
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
         let view = self.authority_view().await;

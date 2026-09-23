@@ -32,6 +32,7 @@ use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod bundle_build;
 mod chain_observation;
+mod clocked_flight;
 mod compact_resume;
 mod compact_runtime;
 mod issued_batcher;
@@ -246,6 +247,8 @@ pub struct Coordinator {
     // retiring cached inputs must not reset a consumed node transition.
     refresh_lock: Mutex<RefreshState>,
     resume_flights: compact_resume::ResumeFlights,
+    /// One shared clock+revision read per fan-out burst; see `clocked_flight`.
+    clocked_flights: clocked_flight::ClockedFlights,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
     /// The ledger sessions' effective `statement_timeout`, `None` when
@@ -727,6 +730,7 @@ impl Coordinator {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
             resume_flights: compact_resume::ResumeFlights::new(config.build_workers),
+            clocked_flights: clocked_flight::ClockedFlights::default(),
             window_reads: Arc::new(Semaphore::new(window_read_permits(
                 config.database_connections,
                 config.build_workers,
@@ -2852,6 +2856,9 @@ mod d2_below_target_tests;
 
 #[cfg(test)]
 mod commit_reconcile_tests;
+
+#[cfg(test)]
+mod clocked_revision_tests;
 
 #[cfg(test)]
 mod d2_bootstrap_tests;

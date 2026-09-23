@@ -7,13 +7,24 @@ use crate::ledger::{
 };
 use futures_util::future::BoxFuture;
 
+/// One statement's view of the database clock and the current payout revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ClockedRevision {
+    pub now_ms: i64,
+    pub payout_revision: i64,
+}
+
 pub(super) trait WorkLedger: Send + Sync {
     // Instrument the real coordinator-owned cleanup, not the fake reader's drop.
     #[cfg(test)]
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         None
     }
-    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    /// The database clock and the payout revision from one statement on one
+    /// checkout. Issuance revalidation needs both at every boundary that has
+    /// an absolute expiry; reading them separately cost two checkouts and six
+    /// PostgreSQL round trips per boundary for two values of one snapshot.
+    fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<ClockedRevision>>;
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>>;
     fn refresh_probe(
         &self,
@@ -115,8 +126,20 @@ impl WorkLedger for Ledger {
     ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
         Box::pin(Ledger::refresh_probe(self, completion))
     }
-    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
-        Box::pin(Ledger::payout_revision(self))
+    fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<ClockedRevision>> {
+        Box::pin(async move {
+            // Same row guards as `Ledger::payout_revision`: a halted, recovering
+            // or read-only cluster yields no row and fails the same way.
+            let (now_ms, payout_revision): (i64, i64) = sqlx::query_as(
+                "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint, payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'",
+            )
+            .fetch_one(&mut *self.acquire().await?)
+            .await?;
+            Ok(ClockedRevision {
+                now_ms,
+                payout_revision,
+            })
+        })
     }
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>> {
         Box::pin(Ledger::chain_observation_state(self))
