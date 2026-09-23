@@ -789,6 +789,76 @@ async fn cancelled_commit_reply_keeps_unknown_without_fabricated_histogram() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_commit_reply_timeouts_are_not_revision_work_failures() -> Result<()> {
+    run(gate::site!(), |f| Box::pin(async move {
+        f.refresh(true).await?;
+        f.node.accept_blocks();
+        let claim = queue_block(&f.a).await?;
+        sqlx::raw_sql("CREATE FUNCTION landing_reply_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_block_candidate_outbox UPDATE'; RETURN NEW; END $$; CREATE TRIGGER landing_reply_marker AFTER UPDATE ON qbit_block_candidate_outbox FOR EACH ROW WHEN (NEW.state='submitted' AND OLD.state<>'submitted') EXECUTE FUNCTION landing_reply_marker();")
+            .execute(f.pool()).await?;
+        let reply = f.proxy.pause_after_commit("qbit_block_candidate_outbox", "UPDATE")?;
+        let frontend = f.a.clone();
+        let processing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move { frontend.process_candidate(&claim).await }));
+        timeout(Duration::from_secs(5), reply.entered()).await?;
+        processing.abort();
+        ensure!(processing.await.unwrap_err().is_cancelled());
+        reply.release();
+        ensure!(sample(&f.a.metrics, PENDING) == -1.);
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+        f.a.refresh_once().await?;
+        // A real initial-job build held at admission until its deadline, while
+        // only the lost settlement's unknown tracking remains on this frontend.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let limit = Arc::new(Semaphore::new(0));
+        let config = qbit_prism_server::stratum::StratumConfig {
+            startup_difficulty: DIFFICULTY,
+            vardiff: qbit_prism_server::vardiff::VardiffConfig { enabled: false, minimum: DIFFICULTY, ..Default::default() },
+            initial_job_limit: limit.clone(),
+            initial_job_timeout_seconds: 0.05,
+            ..Default::default()
+        };
+        let stats = config.stats.clone();
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(qbit_prism_server::stratum::run_listener(
+            listener, config, f.a.clone(), f.a.refresh.subscribe(), receiver, f.a.metrics.clone(),
+        )));
+        let mut client = Client::connect(address).await?;
+        client.send(serde_json::json!({"id":1,"method":"mining.subscribe","params":[]})).await?;
+        client.response(1).await?;
+        client.send(serde_json::json!({"id":2,"method":"mining.authorize","params":["deadline.rig","x"]})).await?;
+        ensure!(client.response(2).await?["result"] == true);
+        timeout(Duration::from_secs(5), async {
+            while stats.snapshot(0).job_delivery_failures == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("the held build never hit its deadline")?;
+        ensure!(
+            sample(&f.a.metrics, TIMEOUTS) == 0.,
+            "a deadline hit while only unknown tracking remained was counted as a revision-work failure"
+        );
+        ensure!(sample(&f.a.metrics, PENDING) == -1., "unknown tracking was reported as zero");
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+        limit.add_permits(1);
+        client.send(serde_json::json!({"id":3,"method":"mining.get_health","params":[]})).await?;
+        loop {
+            if client.read().await?["method"] == "mining.notify" { break; }
+        }
+        ensure!(sample(&f.a.metrics, PENDING) == -1., "current revision guessed the lost committed revision");
+        for result in ["published", "degraded", "superseded"] {
+            ensure!(count(&f.a.metrics, result) == 0., "unknown tracking fabricated a {result} delivery");
+        }
+        ensure!(sample(&f.a.metrics, TIMEOUTS) == 0.);
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(5), task).await???;
+        Ok(())
+    })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout() -> Result<()> {
     run(gate::site!(), |f| {
         Box::pin(async move {

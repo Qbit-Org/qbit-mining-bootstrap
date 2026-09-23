@@ -70,7 +70,7 @@ families! {
     RevisionWork: Histogram, "accepted_block_to_revision_work_seconds", "Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds; each frontend samples every block from its own observation, so a sum across instances counts one block once per frontend.";
     RevisionWorkPending: Gauge, "accepted_block_revision_work_pending_seconds", "Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none; each frontend tracks every block it observes, and a frontend with no connected miners keeps waiting.";
     RevisionWorkUnknown: Gauge, "accepted_block_revision_work_tracking_unknown", "Whether any local landing observation is unknown or incomplete; independent of known pending delivery age.";
-    RevisionWorkTimeouts: Counter, "revision_work_build_timeouts_total", "Existing build deadlines actually hit while accepted-block revision work is pending on this frontend.";
+    RevisionWorkTimeouts: Counter, "revision_work_build_timeouts_total", "Existing build deadlines actually hit while a known accepted-block revision work wait is open on this frontend; deadlines hit while only unknown tracking remains are not counted.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";

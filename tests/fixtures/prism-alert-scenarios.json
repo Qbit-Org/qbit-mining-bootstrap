@@ -1052,6 +1052,72 @@
     }
   },
   {
+    "name": "landing lost commit reply stays unknown with no timeout",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_revision_work_build_timeouts_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+0x360"
+    },
+    "eval_time": "2m",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkPendingCritical": null,
+      "PrismRevisionWorkBuildTimeouts": 0
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismRevisionWorkBuildTimeouts": []
+    }
+  },
+  {
+    "name": "landing lost commit reply beside a known stall and a real timeout",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 308,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_revision_work_build_timeouts_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+0x60 1+0x299"
+    },
+    "eval_time": "2m",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkPendingCritical": 1,
+      "PrismRevisionWorkBuildTimeouts": 1
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPendingCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismRevisionWorkBuildTimeouts": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
     "name": "landing increasing age at 1s",
     "series": {
       "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",

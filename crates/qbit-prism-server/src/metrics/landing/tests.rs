@@ -20,6 +20,18 @@ fn age(metrics: &Metrics) -> f64 {
         "qbit_prism_accepted_block_revision_work_pending_seconds",
     )
 }
+fn unknown(metrics: &Metrics) -> f64 {
+    sample(
+        &metrics.render(),
+        "qbit_prism_accepted_block_revision_work_tracking_unknown",
+    )
+}
+fn timeouts(metrics: &Metrics) -> f64 {
+    sample(
+        &metrics.render(),
+        "qbit_prism_revision_work_build_timeouts_total",
+    )
+}
 async fn tick() {
     tokio::time::advance(Duration::from_secs(1)).await;
 }
@@ -452,4 +464,98 @@ async fn terminal_probe_identity_payload_is_bounded_and_skips_closed_tombstones(
     assert_eq!(second.hashes.len(), LIMIT - 1);
     assert!(!second.hashes.contains(&closed));
     assert!(m.landing.lock().unwrap().saturated);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_settlement_reply_does_not_attribute_later_timeouts_to_revision_work() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    drop(m.revision_work_settlement(&hash)); // Lost/cancelled COMMIT reply.
+    assert_eq!(age(&m), -1.);
+    assert_eq!(unknown(&m), 1.);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(
+        timeouts(&m),
+        0.,
+        "a deadline hit while only unknown tracking remained was counted as a revision-work failure"
+    );
+    assert_eq!(age(&m), -1., "unknown tracking was reported as zero");
+    assert_eq!(unknown(&m), 1.);
+    // A proven first confirmation recovers the attempt. The timed-out build
+    // never knew this wait, so the recovered delivery is not degraded either.
+    m.revision_work_settlement(&hash).committed(true, 3);
+    assert_eq!(age(&m), 1.);
+    tick().await;
+    m.revision_work_delivered(3);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(count(&m, "degraded"), 0.);
+    assert_eq!(timeouts(&m), 0.);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(unknown(&m), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn known_wait_beside_unknown_tracking_still_attributes_the_timeout() {
+    let m = Metrics::default();
+    let lost = "11".repeat(32);
+    m.accepted_block(&lost, 1);
+    drop(m.revision_work_settlement(&lost));
+    let known = "22".repeat(32);
+    m.accepted_block(&known, 2);
+    m.landed_block(&known, 7);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 1.);
+    m.revision_work_delivered(7);
+    assert_eq!(count(&m, "degraded"), 1.);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(age(&m), -1.);
+    assert_eq!(unknown(&m), 1.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsettled_orphan_saturation_and_lost_ordering_do_not_attribute_timeouts() {
+    let hash = "11".repeat(32);
+    let m = Metrics::default();
+    m.accepted_block(&hash, 1);
+    m.landed_block(&hash, 7);
+    {
+        let _orphan = m.revision_work_orphan_settlement(&hash);
+    } // Lost/cancelled orphan COMMIT reply.
+    assert_eq!(age(&m), -1.);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 0.);
+    m.revision_work_terminal_probe()
+        .succeeded(std::slice::from_ref(&hash));
+    assert_eq!(age(&m), 0.);
+    assert_eq!(unknown(&m), 0.);
+    assert_eq!(count(&m, "degraded"), 0.);
+    // An identity that could not be tracked: no known wait remains.
+    let m = Metrics::default();
+    m.accepted_block("not a block hash", 1);
+    assert_eq!(unknown(&m), 1.);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 0.);
+    assert_eq!(age(&m), -1.);
+    // Lost ordering history: the known wait can no longer be resolved.
+    let m = Metrics::default();
+    m.accepted_block(&hash, 1);
+    m.landed_block(&hash, 1);
+    for revision in 2..=LIMIT as i64 + 1 {
+        m.revision_work_observed(revision);
+    }
+    assert_eq!(age(&m), -1.);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 0.);
+    assert_eq!(unknown(&m), 1.);
 }
