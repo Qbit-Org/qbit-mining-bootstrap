@@ -809,10 +809,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismRevisionWorkBuildTimeouts",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the pending warning reports the unknown state instead.",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
-      "basis": "Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
+      "basis": "Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the pending warning reports the unknown state instead.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",

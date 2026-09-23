@@ -61,13 +61,27 @@ impl Landing {
         self.pending_count > 0
     }
 
+    /// Open waits whose delivery target is still knowable: not closed, and
+    /// neither a lost settlement reply nor an unsettled orphan verdict.
+    fn known_waits(&self) -> impl Iterator<Item = &Acceptance> {
+        self.blocks
+            .values()
+            .filter(|block| !block.closed && !block.unknown_revision && !block.orphan_uncertain)
+    }
+
+    /// Whether a known wait is open, which is the only state that attributes
+    /// a build deadline to accepted-block revision work. Unknown tracking (a
+    /// lost COMMIT reply, an unsettled orphan, saturation, lost ordering) is
+    /// reported by `unknown()`; it is never counted as a delivery failure.
+    fn known_pending(&self) -> bool {
+        !self.ordering_lost && self.known_waits().next().is_some()
+    }
+
     pub(super) fn age(&self) -> f64 {
         if self.ordering_lost {
             return -1.;
         }
-        self.blocks
-            .values()
-            .filter(|block| !block.closed && !block.unknown_revision && !block.orphan_uncertain)
+        self.known_waits()
             .map(|block| block.at)
             .min()
             .map_or(if self.unknown() { -1. } else { 0. }, |at| {
@@ -379,7 +393,7 @@ impl Metrics {
         Build {
             metrics: self,
             at: Instant::now(),
-            pending: state.pending() || state.saturated,
+            pending: state.known_pending(),
         }
     }
 
@@ -509,6 +523,10 @@ impl Drop for Settlement<'_> {
 
 /// Consumption gives each actual timeout branch one event. Drop (including
 /// cancellation and successful builds) deliberately records no timeout.
+/// `pending` is the known-wait state at the build's start; the deadline also
+/// looks at the state when it fires. A deadline hit while only unknown
+/// tracking remained at both instants is an ordinary job-delivery failure,
+/// not a revision-work failure, and leaves that tracking unknown (#493).
 pub(crate) struct Build<'a> {
     metrics: &'a Metrics,
     at: Instant,
@@ -516,10 +534,16 @@ pub(crate) struct Build<'a> {
 }
 impl Build<'_> {
     pub(crate) fn deadline_hit(self) {
-        if !self.pending {
-            return;
-        }
         self.metrics.landing_event(|state, registry| {
+            // Attributed if a known wait was open at the build's start, or if
+            // one accepted before the build is open now: a wait that recovered
+            // from unknown mid-build would have received this build's work.
+            // Unknown-only tracking at both instants stays unknown (#493).
+            let attributed = self.pending
+                || (!state.ordering_lost && state.known_waits().any(|block| block.at <= self.at));
+            if !attributed {
+                return;
+            }
             registry.increment(Family::RevisionWorkTimeouts, Labels::Empty);
             for block in state
                 .blocks

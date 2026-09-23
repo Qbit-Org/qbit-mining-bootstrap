@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: a0051e3f05811d00c744dd050c4997625f45f10212895121d62e63a14ad91a53
++   Specification SHA-256: 07fc919cca2bb70c0095877f36b5da48c0752939cc1af1b04c060128e3a07907
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -723,7 +723,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismRevisionWorkBuildTimeouts",
-+    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter.",
++    "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the pending warning reports the unknown state instead.",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
 +  }

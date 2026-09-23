@@ -247,7 +247,7 @@
       "replaces": [
         "qbit_prism_accepted_parent_preview_wait_timeouts_total"
       ],
-      "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced."
+      "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a wait recovered after the deadline degraded; a wait recovered before the deadline counts and is degraded as usual."
     }
   },
   "public": {
