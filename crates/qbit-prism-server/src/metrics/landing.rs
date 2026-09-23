@@ -523,8 +523,9 @@ impl Drop for Settlement<'_> {
 
 /// Consumption gives each actual timeout branch one event. Drop (including
 /// cancellation and successful builds) deliberately records no timeout.
-/// `pending` is the known-wait state at the build's start: a deadline hit
-/// while only unknown tracking remained is an ordinary job-delivery failure,
+/// `pending` is the known-wait state at the build's start; the deadline also
+/// looks at the state when it fires. A deadline hit while only unknown
+/// tracking remained at both instants is an ordinary job-delivery failure,
 /// not a revision-work failure, and leaves that tracking unknown (#493).
 pub(crate) struct Build<'a> {
     metrics: &'a Metrics,
@@ -533,10 +534,16 @@ pub(crate) struct Build<'a> {
 }
 impl Build<'_> {
     pub(crate) fn deadline_hit(self) {
-        if !self.pending {
-            return;
-        }
         self.metrics.landing_event(|state, registry| {
+            // Attributed if a known wait was open at the build's start, or if
+            // one accepted before the build is open now: a wait that recovered
+            // from unknown mid-build would have received this build's work.
+            // Unknown-only tracking at both instants stays unknown (#493).
+            let attributed = self.pending
+                || (!state.ordering_lost && state.known_waits().any(|block| block.at <= self.at));
+            if !attributed {
+                return;
+            }
             registry.increment(Family::RevisionWorkTimeouts, Labels::Empty);
             for block in state
                 .blocks

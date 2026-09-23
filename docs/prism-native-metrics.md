@@ -99,7 +99,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_public_staleness_refusals_total` | counter | none | public-api | Responses refused for exceeding an endpoint cache-age budget. | `qbit_prism_public_staleness_refusals_total` |
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
 | `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised` | run | Share rejections by canonical bounded reason ID. Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. | `qbit_prism_rejections_total` |
-| `qbit_prism_revision_work_build_timeouts_total` | counter | none | run | Existing build deadlines actually hit while a known accepted-block revision work wait is open on this frontend; deadlines hit while only unknown tracking remains are not counted. Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a later recovered delivery degraded. | `qbit_prism_accepted_parent_preview_wait_timeouts_total` |
+| `qbit_prism_revision_work_build_timeouts_total` | counter | none | run | Existing build deadlines actually hit while a known accepted-block revision work wait is open on this frontend; deadlines hit while only unknown tracking remains are not counted. Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a wait recovered after the deadline degraded; a wait recovered before the deadline counts and is degraded as usual. | `qbit_prism_accepted_parent_preview_wait_timeouts_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
 | `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
 | `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector,share_partitions` | run | Oldest active operation time since progress; zero when idle. | none |
@@ -307,14 +307,17 @@ therefore requires an authorized miner on the reporting frontend (#493).
 
 `qbit_prism_revision_work_build_timeouts_total` increments only in the existing
 Stratum job-build timeout branch, once for that operation when a known
-accepted-block wait was open at its start. Its budget includes the existing
-admission wait. Only known waits attribute a deadline (#493): while this
-frontend's tracking is unknown and no known wait remains (a lost or cancelled
-settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking
-saturation or lost ordering history), a build deadline is an ordinary
+accepted-block wait accepted before the build was open at its start or when
+the deadline fired. Its budget includes the existing admission wait. Only
+known waits attribute a deadline (#493): while this frontend's tracking is
+unknown and no known wait remains (a lost or cancelled settlement COMMIT
+reply, an unsettled orphan verdict, bounded-tracking saturation or lost
+ordering history), a build deadline is an ordinary
 `qbit_prism_job_delivery_failures_total` event; the tracking-unknown gauge
 reports the unknown state, the pending gauge stays -1, and the deadline is
-neither counted here nor stamps a later recovered delivery `degraded`.
+neither counted here nor stamps a wait recovered after it `degraded`. A wait
+recovered by a proven first confirmation before the deadline is counted and
+`degraded` as usual.
 Success, ordinary errors, cancellation, node-offer timeouts and issuance or
 socket-write deadlines are not counted as job-build timeouts. A subsequent
 qualifying delivery is `degraded` if an applicable build deadline was hit before

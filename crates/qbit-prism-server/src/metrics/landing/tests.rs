@@ -559,3 +559,32 @@ async fn unsettled_orphan_saturation_and_lost_ordering_do_not_attribute_timeouts
     assert_eq!(timeouts(&m), 0.);
     assert_eq!(unknown(&m), 1.);
 }
+
+#[tokio::test(start_paused = true)]
+async fn recovery_from_unknown_before_the_deadline_attributes_the_timeout() {
+    // Reviewer case (PR #500, F1): the wait is unknown at the build's start
+    // and a proven first confirmation recovers it before the deadline fires.
+    // A known wait accepted before the build is open at that instant, and the
+    // build's job would have carried the recovered revision.
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    drop(m.revision_work_settlement(&hash)); // Lost reply.
+    assert_eq!(age(&m), -1.);
+    let build = m.revision_work_build(); // Only unknown tracking at the start.
+    tick().await;
+    m.revision_work_settlement(&hash).committed(true, 3); // Recovery mid-build.
+    assert_eq!(age(&m), 1., "wait is known and open again");
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(
+        timeouts(&m),
+        1.,
+        "deadline hit while a known wait accepted before the build was open"
+    );
+    tick().await;
+    m.revision_work_delivered(3);
+    assert_eq!(count(&m, "degraded"), 1.);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(age(&m), 0.);
+}
