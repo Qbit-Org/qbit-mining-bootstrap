@@ -9458,3 +9458,122 @@ fn an_admission_the_launch_environment_cannot_state_is_null_not_zero() {
     // 100 sessions on one frontend: the pre-flag sizing was floored at 128.
     assert_eq!(block["pre_flag_harness_value"], json!(128));
 }
+
+#[test]
+fn retarget_bits_change_on_every_height_and_stay_encodable() -> Result<()> {
+    use qbit_prism_load::window::{scaled_network_difficulty, TEMPLATE_BITS};
+    let base = codec::parse_u32_hex(TEMPLATE_BITS)?;
+    let base_difficulty = scaled_network_difficulty(base)?;
+    let mut previous: Option<u128> = None;
+    for height in 0..64u64 {
+        let bits = node::retarget_bits(TEMPLATE_BITS, height)?;
+        let parsed = codec::parse_u32_hex(&bits)?;
+        // Same exponent, a normalized mantissa: what a real header carries.
+        assert_eq!(parsed >> 24, base >> 24, "height {height}: {bits}");
+        assert!((0x8000..=0x007f_ffff).contains(&(parsed & 0x00ff_ffff)));
+        let difficulty = scaled_network_difficulty(parsed)?;
+        // Never easier than the base, never more than about 6.7% harder, and
+        // always different from the height before.
+        assert!(difficulty >= base_difficulty, "height {height}");
+        assert!(difficulty * 100 <= base_difficulty * 107, "height {height}");
+        if let Some(previous) = previous {
+            assert_ne!(
+                difficulty, previous,
+                "height {height} repeats its predecessor"
+            );
+        }
+        previous = Some(difficulty);
+    }
+    // Period 16: the walk returns to the base and repeats.
+    assert_eq!(node::retarget_bits(TEMPLATE_BITS, 0)?, TEMPLATE_BITS);
+    assert_eq!(node::retarget_bits(TEMPLATE_BITS, 16)?, TEMPLATE_BITS);
+    assert_eq!(
+        node::retarget_bits(TEMPLATE_BITS, 3)?,
+        node::retarget_bits(TEMPLATE_BITS, 13)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_node_serves_constant_bits_by_default_and_retargets_only_when_asked() -> Result<()> {
+    let plain = NodeState::new("1e7fffff", "tb1");
+    let retargeting = NodeState::with_retarget("1e7fffff", "tb1", true);
+    for _ in 0..3 {
+        let template = plain
+            .handle(&json!({"id": 1, "method": "getblocktemplate", "params": [{}]}))
+            .await;
+        assert_eq!(template["result"]["bits"], "1e7fffff");
+        plain.mint_external_block();
+        let (_, height) = retargeting.tip();
+        let template = retargeting
+            .handle(&json!({"id": 1, "method": "getblocktemplate", "params": [{}]}))
+            .await;
+        assert_eq!(
+            template["result"]["bits"],
+            node::retarget_bits("1e7fffff", height + 1)?
+        );
+        assert_eq!(
+            template["result"]["bits"],
+            retargeting.template_bits(height + 1)
+        );
+        retargeting.mint_external_block();
+    }
+    assert!(!plain.retargets() && retargeting.retargets());
+    Ok(())
+}
+
+#[test]
+fn background_share_rate_changes_only_the_warm_up_phase() -> Result<()> {
+    use clap::Parser;
+    let plain = qbit_prism_load::cli::Args::parse_from(["qbit-prism-load", "--rate", "7"]);
+    let with_background = qbit_prism_load::cli::Args::parse_from([
+        "qbit-prism-load",
+        "--rate",
+        "7",
+        "--background-shares-per-second",
+        "133",
+    ]);
+    plain.validate()?;
+    with_background.validate()?;
+    let before = qbit_prism_load::cli::phases(&plain)?;
+    let after = qbit_prism_load::cli::phases(&with_background)?;
+    assert_eq!(before.len(), after.len());
+    for (before, after) in before.iter().zip(&after) {
+        assert_eq!(before.name, after.name);
+        if before.name == "warm_up" {
+            assert_eq!((before.rate, after.rate), (7.0, 133.0));
+        } else {
+            assert_eq!(before.rate, after.rate, "{}", before.name);
+        }
+        assert_eq!(before.seconds, after.seconds);
+        assert_eq!(before.in_artifact, after.in_artifact);
+    }
+    let mut bad = with_background.clone();
+    bad.background_shares_per_second = Some(0.0);
+    assert!(bad.validate().is_err());
+    bad.background_shares_per_second = Some(f64::NAN);
+    assert!(bad.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn retarget_mode_seeds_a_tenth_more_history_below_the_window() {
+    use clap::Parser;
+    let plain =
+        qbit_prism_load::cli::Args::parse_from(["qbit-prism-load", "--window-shares", "400000"]);
+    let retargeting = qbit_prism_load::cli::Args::parse_from([
+        "qbit-prism-load",
+        "--window-shares",
+        "400000",
+        "--retarget-bits",
+    ]);
+    assert_eq!(plain.seed_share_count(), 400_000);
+    assert_eq!(retargeting.seed_share_count(), 440_000);
+    let odd = qbit_prism_load::cli::Args::parse_from([
+        "qbit-prism-load",
+        "--window-shares",
+        "15",
+        "--retarget-bits",
+    ]);
+    assert_eq!(odd.seed_share_count(), 17);
+}

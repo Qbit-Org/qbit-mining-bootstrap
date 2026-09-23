@@ -167,6 +167,15 @@ pub fn expected(populated: bool) -> Census {
         ),
         &[],
     );
+    result.family(
+        "refresh_window_acquisitions_total",
+        "counter",
+        &labels(
+            "outcome",
+            "advanced,no_prior,empty_prior,tail_mismatch,anchor_regressed,cutoff_regressed,delta_too_large,no_evidence,leaf_changed,margin_too_large,partial,witness_changed,count_mismatch,invariant",
+        ),
+        &[],
+    );
     for name in [
         "collector_available",
         "collector_success",
@@ -223,6 +232,21 @@ pub fn expected(populated: bool) -> Census {
         "database_advisory_lock_wait_seconds",
         "histogram",
         if populated { &locks } else { &[] },
+        SECONDS,
+    );
+    let refreshes: Vec<_> = [
+        "initial", "tip", "revision", "balances", "reanchor", "shares", "template", "fee",
+    ]
+    .into_iter()
+    .flat_map(|trigger| {
+        ["delta", "full", "cached"]
+            .map(|acquisition| format!("trigger=\"{trigger}\",acquisition=\"{acquisition}\""))
+    })
+    .collect();
+    result.family(
+        "refresh_seconds",
+        "histogram",
+        if populated { &refreshes } else { &[] },
         SECONDS,
     );
     result

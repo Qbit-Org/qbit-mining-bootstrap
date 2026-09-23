@@ -6,7 +6,9 @@ pub(crate) use payout_state::RefreshProbe;
 pub(super) mod blocking_drop;
 use blocking_drop::{BlockingDrop, ReadAdmission};
 mod snapshot_delta;
-pub(crate) use snapshot_delta::{LeafWitness, RetainedShares, SnapshotCapture};
+pub(crate) use snapshot_delta::{
+    AcquisitionReport, Advance, LeafWitness, RetainedShares, SnapshotCapture, WindowAcquisition,
+};
 
 const ACCEPTED_CUTOFF_SQL: &str =
     "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";
@@ -816,6 +818,7 @@ impl Ledger {
         completion: ReadAdmission,
         prior: Option<BlockingDrop<RetainedShares>>,
     ) -> Result<BlockingDrop<SnapshotCapture>> {
+        let started = std::time::Instant::now();
         let weight = network_difficulty
             .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
             .context("window difficulty overflow")?;
@@ -849,38 +852,46 @@ impl Ledger {
         // before scanning a potentially large payout window.
         let mut tx = self.begin().await?;
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
+        // Without a retired window there is nothing to advance from; the
+        // report still says so, because how often that happens is part of
+        // what the refresh path costs.
+        let mut report = AcquisitionReport::full(WindowAcquisition::NoPrior);
         if let Some(prior) = prior {
-            if let Some((shares, leaf)) = snapshot_delta::advance(
-                &mut tx,
-                prior,
-                network_difficulty,
-                weight,
-                anchor_ms,
-                cutoff,
-                &completion,
-            )
-            .await?
+            match snapshot_delta::advance(&mut tx, prior, weight, anchor_ms, cutoff, &completion)
+                .await?
             {
-                let snapshot = shares
-                    .map_anyhow(move |shares| {
-                        Ok(Snapshot {
-                            anchor_ms,
-                            share_seq: u64::try_from(cutoff)?,
-                            payout_revision,
-                            shares,
-                            prior_balances: prior_balances.into_inner(),
+                Advance::Advanced {
+                    shares,
+                    leaf,
+                    mut report,
+                } => {
+                    let snapshot = shares
+                        .map_anyhow(move |shares| {
+                            Ok(Snapshot {
+                                anchor_ms,
+                                share_seq: u64::try_from(cutoff)?,
+                                payout_revision,
+                                shares,
+                                prior_balances: prior_balances.into_inner(),
+                            })
                         })
-                    })
-                    .await?;
-                tx.commit().await?;
-                return snapshot
-                    .map_anyhow(move |snapshot| {
-                        Ok(SnapshotCapture {
-                            snapshot,
-                            leaf: Some(leaf),
+                        .await?;
+                    tx.commit().await?;
+                    report.elapsed = started.elapsed();
+                    if let Some(metrics) = self.metrics.as_deref() {
+                        metrics.record_window_acquisition(report.outcome);
+                    }
+                    return snapshot
+                        .map_anyhow(move |snapshot| {
+                            Ok(SnapshotCapture {
+                                snapshot,
+                                leaf: Some(leaf),
+                                acquisition: report,
+                            })
                         })
-                    })
-                    .await;
+                        .await;
+                }
+                Advance::Rejected(rejected) => report = rejected,
             }
         }
         let before = snapshot_delta::leaf_witness(&mut tx, cutoff, cutoff, anchor_ms, None).await?;
@@ -897,6 +908,7 @@ impl Ledger {
             if rows.is_empty() {
                 break;
             }
+            report.pages += 1;
             #[cfg(test)]
             let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
             scan = completion
@@ -946,8 +958,19 @@ impl Ledger {
         };
         let leaf = after.filter(|witness| before.as_ref() == Some(witness));
         tx.commit().await?;
+        report.window_rows = snapshot.shares.len();
+        report.elapsed = started.elapsed();
+        if let Some(metrics) = self.metrics.as_deref() {
+            metrics.record_window_acquisition(report.outcome);
+        }
         snapshot
-            .map_anyhow(move |snapshot| Ok(SnapshotCapture { snapshot, leaf }))
+            .map_anyhow(move |snapshot| {
+                Ok(SnapshotCapture {
+                    snapshot,
+                    leaf,
+                    acquisition: report,
+                })
+            })
             .await
     }
 }

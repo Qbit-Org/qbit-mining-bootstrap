@@ -148,6 +148,8 @@ struct Chain {
     submissions: usize,
     /// When the first `submitblock` was adopted.
     adopted_at: Option<Instant>,
+    /// Template bits served by `getblocktemplate`; a retarget changes them.
+    bits: String,
 }
 
 impl Chain {
@@ -185,6 +187,7 @@ impl FakeNode {
             chainwork: 1,
             submissions: 0,
             adopted_at: None,
+            bits: TEMPLATE_BITS.to_owned(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/", listener.local_addr()?);
@@ -195,6 +198,11 @@ impl FakeNode {
             let _ = axum::serve(listener, app).await;
         });
         Ok(Self { url, chain, task })
+    }
+
+    /// Serve `bits` from now on, as a per-block retarget does.
+    async fn retarget(&self, bits: &str) {
+        self.chain.lock().await.bits = bits.to_owned();
     }
 }
 
@@ -214,7 +222,7 @@ async fn answer(State(chain): State<Arc<Mutex<Chain>>>, Json(request): Json<Valu
             .map_or(Value::Null, |hash| json!(hash)),
         "getblockheader" => json!({"previousblockhash":"cd".repeat(32)}),
         "getblocktemplate" => json!({"height":height+1,"coinbasevalue":5_000_000_000u64,
-            "previousblockhash":chain.tip(),"version":0x2000_0000u32,"bits":TEMPLATE_BITS,
+            "previousblockhash":chain.tip(),"version":0x2000_0000u32,"bits":chain.bits,
             "curtime":now,"mintime":now-1,"transactions":[]}),
         "submitblock" => {
             let block = request["params"][0]
@@ -1258,4 +1266,235 @@ fn nearest_rank_percentiles_and_the_latency_bound() {
         latency_bound(Duration::from_millis(150)),
         Duration::from_millis(350)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Landing on a delta-built window
+// ---------------------------------------------------------------------------
+
+/// Bits 0.78% harder than the stock `207fffff`: the same exponent with the
+/// mantissa lowered by one step of the harness's retarget walk.
+const RETARGET_BITS: &str = "207f0000";
+
+/// The value of one `qbit_prism_refresh_window_acquisitions_total` outcome
+/// in the coordinator's own registry.
+fn acquisitions(metrics: &qbit_prism_server::metrics::Metrics, outcome: &str) -> f64 {
+    let key = format!("qbit_prism_refresh_window_acquisitions_total{{outcome=\"{outcome}\"}} ");
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&key))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(f64::NAN)
+}
+
+/// Append `count` fixture-shaped rows above the ledger's current top, with
+/// the plan's share difficulty, so they extend the window like live shares.
+async fn append_fixture_rows(pool: &PgPool, plan: &WindowPlan, count: i64) -> Result<(i64, i64)> {
+    let top: i64 = sqlx::query_scalar("SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger")
+        .fetch_one(pool)
+        .await?;
+    let (first, last) = (top + 1, top + count);
+    sqlx::query(
+        "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,\
+         p2mr_program,share_difficulty,network_difficulty,template_height,job_id,\
+         job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
+         SELECT i,'extra:'||i::text,'m0','k',decode(repeat('aa',32),'hex'),\
+         $3::text::numeric,1000,100,'seed-job',\
+         to_timestamp((1700000000000+i)::double precision/1000),1700000000,\
+         to_timestamp((1700000000001+i)::double precision/1000),NULL,true,'delta-land',0 \
+         FROM generate_series($1::bigint,$2::bigint) AS g(i)",
+    )
+    .bind(first)
+    .bind(last)
+    .bind(plan.share_difficulty().to_string())
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) \
+         SELECT encode(sha256(convert_to(share_id,'UTF8')),'hex'),share_id \
+         FROM qbit_share_ledger WHERE share_seq BETWEEN $1 AND $2 ON CONFLICT DO NOTHING",
+    )
+    .bind(first)
+    .bind(last)
+    .execute(pool)
+    .await?;
+    sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
+        .bind(last)
+        .execute(pool)
+        .await?;
+    Ok((first, last))
+}
+
+async fn delta_built_window_lands_body(
+    node: &FakeNode,
+    frontend: &Arc<Coordinator>,
+    metrics: &qbit_prism_server::metrics::Metrics,
+) -> Result<()> {
+    // A seeded window plus a tenth more newer rows: the window at the stock
+    // bits is the newest 2,000 rows, with 200 older rows below it for a
+    // harder target to reach into.
+    let n = 2_000u64;
+    let plan = WindowPlan::new(n)?;
+    let pool = &frontend.ledger.pool;
+    plan.load(pool, "delta-land").await?;
+    append_fixture_rows(pool, &plan, 200).await?;
+    frontend.refresh_once().await?;
+    let first_work = frontend
+        .prepared
+        .read()
+        .await
+        .clone()
+        .context("the first refresh published no work")?;
+    let first_range = first_work
+        .window
+        .shares
+        .context("the first window is empty")?;
+    ensure!(
+        first_range.share_count == n && first_range.first_share_seq == 201,
+        "the first refresh published {}..={} ({} rows), expected the newest {n}",
+        first_range.first_share_seq,
+        first_range.last_share_seq,
+        first_range.share_count
+    );
+    ensure!(
+        acquisitions(metrics, "no_prior") == 1.0 && acquisitions(metrics, "advanced") == 0.0,
+        "the first refresh was not the full scan with no retired window: {}",
+        metrics.render()
+    );
+
+    // The node retargets harder and ten more shares arrive; the refresh must
+    // advance the retained window by the delta path: a margin below for the
+    // heavier target, a delta above for the new shares.
+    node.retarget(RETARGET_BITS).await;
+    let (delta_first, delta_last) = append_fixture_rows(pool, &plan, 10).await?;
+    frontend.refresh_once().await?;
+    let work = frontend
+        .prepared
+        .read()
+        .await
+        .clone()
+        .context("the second refresh published no work")?;
+    let range = work.window.shares.context("the second window is empty")?;
+    ensure!(
+        acquisitions(metrics, "advanced") == 1.0,
+        "the retargeted refresh did not advance by the delta path: {}",
+        metrics.render()
+    );
+    ensure!(
+        range.last_share_seq == u64::try_from(delta_last)?
+            && range.first_share_seq < first_range.first_share_seq
+            && range.share_count > n,
+        "the advanced window is {}..={} ({} rows); expected a margin below {} and the delta {}..={} above",
+        range.first_share_seq,
+        range.last_share_seq,
+        range.share_count,
+        first_range.first_share_seq,
+        delta_first,
+        delta_last
+    );
+    ensure!(
+        work.template["bits"].as_str() == Some(RETARGET_BITS),
+        "the published work does not carry the retargeted bits"
+    );
+
+    // A block found on that work is claimed, offered, rebuilt and landed
+    // through the coordinator's own submit loop, against exactly that window.
+    let miner = Frontend::open(frontend, "delta-land", "00000001").await?;
+    let solving = miner.mine(3, 1, true).await?.remove(0);
+    let (shutdown, receiver) = watch::channel(false);
+    let submit_loop = tokio::spawn(frontend.clone().submit_loop(receiver));
+    let outcome = async {
+        miner
+            .submit(solving.clone())
+            .await
+            .map_err(|error| anyhow!("the block-solving share was not acknowledged: {error}"))?;
+        let ceiling = Instant::now() + Duration::from_secs(120);
+        loop {
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&solving.block_hash_hex)
+            .fetch_optional(pool)
+            .await?;
+            let state = row.as_ref().map(|row| row.0.as_str());
+            if state == Some("submitted") {
+                break;
+            }
+            ensure!(
+                matches!(
+                    state,
+                    Some("pending" | "offer_reserved" | "offered" | "reconciliation")
+                ) && Instant::now() < ceiling
+                    && !submit_loop.is_finished(),
+                "the block did not land and submit within 120 s; outbox row: {row:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let _ = shutdown.send(true);
+    let stopped = tokio::time::timeout(Duration::from_secs(30), submit_loop).await;
+    outcome?;
+    stopped.context("the submit loop did not stop within 30 s")??;
+
+    let (rows, landed): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM qbit_block_candidate_outbox),\
+         (SELECT count(*) FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
+    )
+    .bind(&solving.block_hash_hex)
+    .fetch_one(pool)
+    .await?;
+    ensure!(
+        rows == 1 && landed == 1,
+        "outbox rows {rows}, landed audits {landed}; expected 1 and 1"
+    );
+    ensure!(
+        node.chain.lock().await.submissions == 1,
+        "the block was not submitted exactly once"
+    );
+    // The landed audit's share snapshot is the delta-built window, re-derived
+    // by landing at the retargeted difficulty: same range, same count.
+    let (snapshot_first, snapshot_last, snapshot_count): (i64, i64, i64) = sqlx::query_as(
+        "SELECT first_share_seq,last_share_seq,share_count FROM qbit_prism_audit_snapshots \
+         WHERE snapshot_sha256=$1",
+    )
+    .bind(hex::encode(range.snapshot_sha256))
+    .fetch_one(pool)
+    .await?;
+    ensure!(
+        (snapshot_first, snapshot_last, snapshot_count)
+            == (
+                i64::try_from(range.first_share_seq)?,
+                i64::try_from(range.last_share_seq)?,
+                i64::try_from(range.share_count)?
+            ),
+        "the landed snapshot {snapshot_first}..={snapshot_last} ({snapshot_count} rows) is not the published window"
+    );
+    Ok(())
+}
+
+/// A found block lands through the coordinator on a window the delta path
+/// built after a retarget. The first refresh full-scans a seeded window with
+/// older history below it; the node then serves harder bits and new shares
+/// arrive, so the second refresh advances the retained window (a margin
+/// below, a delta above) instead of scanning; the block found on that work is
+/// claimed, offered, rebuilt and landed against exactly that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_found_on_a_delta_built_window_after_a_retarget_lands() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let db = Database::open(&raw).await?;
+    let node = FakeNode::open().await?;
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let frontend = Coordinator::new(
+        frontend_config(&db.url, &node, "delta-land")?,
+        metrics.clone(),
+    )
+    .await?;
+    let outcome = delta_built_window_lands_body(&node, &frontend, &metrics).await;
+    settle(outcome, db.close(&[&frontend]).await)
 }

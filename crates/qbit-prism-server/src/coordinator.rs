@@ -7,6 +7,7 @@ use crate::{
         HeartbeatHealth, Ledger, OfferOutcome, RecoveryClaim, SignerKeys, Snapshot, Window,
         WindowError, WindowRef, ORPHANED_STATE,
     },
+    metrics::{RefreshAcquisition, RefreshTrigger},
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
 };
@@ -956,6 +957,13 @@ impl Coordinator {
     }
 
     async fn refresh_once_inner(&self) -> Result<()> {
+        // Entry, on both clocks: the monotonic one times the refresh, the
+        // wall one lets a log reader place its start against the node's tip.
+        let refresh_started = Instant::now();
+        let refresh_started_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis())
+            .unwrap_or_default();
         let mut refresh = self.refresh_lock.lock().await;
         let RefreshState {
             observation,
@@ -988,6 +996,9 @@ impl Coordinator {
         let parent = template["previousblockhash"]
             .as_str()
             .context("template parent missing")?;
+        // Owned for the refresh log below, which outlives the template's move
+        // into the build.
+        let parent_hash = parent.to_owned();
         let height = template["height"]
             .as_u64()
             .context("template height missing")?;
@@ -1034,7 +1045,20 @@ impl Coordinator {
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
-        if let Some(current) = self.prepared.read().await.as_ref() {
+        let current_prepared = self.prepared.read().await;
+        // Named before the reuse test below decides, from the same inputs, so
+        // the refresh metric and log say what invalidated the published work.
+        let trigger = refresh_trigger(
+            current_prepared.as_deref(),
+            parent,
+            &state,
+            share_seq,
+            cached_window.as_ref().is_some_and(|window| {
+                window.within_reanchor_interval(self.config.snapshot_interval)
+            }),
+            &fee,
+        );
+        if let Some(current) = current_prepared.as_ref() {
             // A new share invalidates build inputs, but does not itself replace
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
@@ -1072,6 +1096,7 @@ impl Coordinator {
                 return Ok(());
             }
         }
+        drop(current_prepared);
         // Keep the original publication proof captured before node observation.
         let inputs = BundleInputs::capture(&self.config, fee)?;
         let retention =
@@ -1126,6 +1151,7 @@ impl Coordinator {
             "00".repeat(4 + self.config.extranonce2_size)
         );
         let mut body = None;
+        let mut acquisition = None;
         if !reuse_window {
             // Move exclusively owned rows on the blocking executor. A cancelled
             // build can still own the Arc; in that case keep its admission and
@@ -1155,6 +1181,7 @@ impl Coordinator {
             // Install the cache and rewrap its companion synchronously. Until
             // here one cleanup owner keeps both large outputs under admission.
             let (window, prepared_body, admission) = captured.into_inner();
+            acquisition = Some(window.acquisition.clone());
             *cached_window = Some(prepared_storage::compact::CompactOwner::new(window));
             body = Some(prepared_storage::compact::CompactOwner::new((
                 prepared_body,
@@ -1208,6 +1235,36 @@ impl Coordinator {
             .await?;
         let reserved = self.reserve_fresh_compact(&captured).await?;
         self.lock_compact_publication(reserved).await?.publish()?;
+        // One observation and one line per published rebuild, after the
+        // publication it times. A reused cached window is `cached`; a fresh
+        // capture is the ledger's own account of its acquisition.
+        let refresh_elapsed = refresh_started.elapsed();
+        let how = match &acquisition {
+            None => RefreshAcquisition::Cached,
+            Some(report) if report.advanced() => RefreshAcquisition::Delta,
+            Some(_) => RefreshAcquisition::Full,
+        };
+        self.metrics.observe_refresh(trigger, how, refresh_elapsed);
+        let report = acquisition.as_ref();
+        tracing::info!(
+            target: "prism::refresh",
+            trigger = trigger.as_str(),
+            acquisition = how.as_str(),
+            outcome = report.map(|report| report.outcome.as_str()),
+            parent = parent_hash.as_str(),
+            height,
+            share_seq,
+            window_rows = report.map(|report| report.window_rows),
+            prior_rows = report.map(|report| report.prior_rows),
+            delta_rows = report.map(|report| report.delta_rows),
+            margin_rows = report.map(|report| report.margin_rows),
+            retired_rows = report.map(|report| report.retired_rows),
+            pages = report.map(|report| report.pages),
+            snapshot_ms = report.map(|report| report.elapsed.as_millis()),
+            refresh_ms = refresh_elapsed.as_millis(),
+            started_unix_ms = refresh_started_unix_ms,
+            "refresh published"
+        );
         Ok(())
     }
 
@@ -2879,3 +2936,39 @@ mod window_incident_tests;
 
 #[cfg(test)]
 mod storm_evidence_tests;
+
+/// What invalidated the published work, from the same inputs the reuse test
+/// in `refresh_once_inner` reads, ranked by this function's own precedence
+/// (tip, revision, balances, reanchor, shares, fee, then template) when
+/// several changed on one poll; the reuse test checks them in another order.
+/// A missing cached window with published work is labelled `reanchor`. A
+/// label for the refresh metric and log, never a decision input.
+fn refresh_trigger(
+    current: Option<&Prepared>,
+    parent: &str,
+    state: &crate::ledger::PayoutState,
+    share_seq: u64,
+    window_within_reanchor: bool,
+    fee: &Option<FanoutFeeRatePolicy>,
+) -> RefreshTrigger {
+    let Some(current) = current else {
+        return RefreshTrigger::Initial;
+    };
+    if current.template["previousblockhash"].as_str() != Some(parent) {
+        RefreshTrigger::Tip
+    } else if current.snapshot.payout_revision != state.payout_revision {
+        RefreshTrigger::Revision
+    } else if current.window.prior_balances_digest != state.prior_balances_digest {
+        RefreshTrigger::Balances
+    } else if !window_within_reanchor {
+        RefreshTrigger::Reanchor
+    } else if current.bundle.is_none() && current.snapshot.share_seq != share_seq {
+        RefreshTrigger::Shares
+    } else if current.fee != *fee {
+        RefreshTrigger::Fee
+    } else {
+        // A changed fingerprint, an aged template, or a cached window that
+        // no longer matches the published reference.
+        RefreshTrigger::Template
+    }
+}

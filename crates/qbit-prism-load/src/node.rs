@@ -76,8 +76,39 @@ pub struct NodeState {
     submissions: std::sync::Mutex<Vec<SubmissionRecord>>,
     tip_notify: Notify,
     bits: String,
+    /// Serve [`retarget_bits`] instead of `bits` for every template.
+    retarget: bool,
     address_prefix: String,
     rpc_calls: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+/// Steps of the per-block walk, each about 0.8 percent of the mantissa.
+const RETARGET_STEPS: u32 = 8;
+const RETARGET_STEP_DIVISOR: u32 = 128;
+
+/// The template bits a retargeting node serves for `height`: the base
+/// mantissa lowered by a triangle wave of period 16 heights, so consecutive
+/// heights always differ, the difficulty walks up for eight blocks and back
+/// down for eight, and the whole walk stays within about 6.7 percent above
+/// the base difficulty. Per-block retargets in production are small and in
+/// both directions; what matters to the refresh path is that the scaled
+/// network difficulty differs on every tip, and this guarantees it.
+pub fn retarget_bits(base: &str, height: u64) -> Result<String> {
+    let bits = codec::parse_u32_hex(base)?;
+    let exponent = bits >> 24;
+    let mantissa = bits & 0x00ff_ffff;
+    let phase = u32::try_from(height % u64::from(2 * RETARGET_STEPS))?;
+    let step = if phase <= RETARGET_STEPS {
+        phase
+    } else {
+        2 * RETARGET_STEPS - phase
+    };
+    let lowered = mantissa - step * (mantissa / RETARGET_STEP_DIVISOR);
+    anyhow::ensure!(
+        (0x8000..=0x007f_ffff).contains(&lowered),
+        "retarget mantissa {lowered:#x} leaves the compact encoding"
+    );
+    Ok(format!("{:08x}", (exponent << 24) | lowered))
 }
 
 fn synthetic_hash(seed: &str) -> String {
@@ -86,6 +117,10 @@ fn synthetic_hash(seed: &str) -> String {
 
 impl NodeState {
     pub fn new(bits: &str, address_prefix: &str) -> Self {
+        Self::with_retarget(bits, address_prefix, false)
+    }
+
+    pub fn with_retarget(bits: &str, address_prefix: &str, retarget: bool) -> Self {
         let mut heights = vec![GENESIS.to_owned()];
         let mut parents = HashMap::new();
         let mut previous = GENESIS.to_owned();
@@ -118,9 +153,23 @@ impl NodeState {
             submissions: std::sync::Mutex::new(Vec::new()),
             tip_notify: Notify::new(),
             bits: bits.to_owned(),
+            retarget,
             address_prefix: address_prefix.to_owned(),
             rpc_calls: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The bits `getblocktemplate` serves for a template at `height`.
+    pub fn template_bits(&self, height: u64) -> String {
+        if self.retarget {
+            retarget_bits(&self.bits, height).expect("base bits validated at start")
+        } else {
+            self.bits.clone()
+        }
+    }
+
+    pub fn retargets(&self) -> bool {
+        self.retarget
     }
 
     pub fn tip(&self) -> (String, u64) {
@@ -274,7 +323,7 @@ impl NodeState {
                 "coinbasevalue": 5_000_000_000u64,
                 "previousblockhash": tip,
                 "version": 0x2000_0000u32,
-                "bits": self.bits,
+                "bits": self.template_bits(height + 1),
                 "curtime": now,
                 "mintime": now - 1,
                 "transactions": [],
@@ -346,7 +395,22 @@ impl Drop for FakeNode {
 
 impl FakeNode {
     pub async fn open(bits: &str, address_prefix: &str) -> Result<Self> {
-        let state = Arc::new(NodeState::new(bits, address_prefix));
+        Self::open_with_retarget(bits, address_prefix, false).await
+    }
+
+    /// [`FakeNode::open`], serving per-height [`retarget_bits`] when asked.
+    /// The base bits are checked against the walk before anything listens.
+    pub async fn open_with_retarget(
+        bits: &str,
+        address_prefix: &str,
+        retarget: bool,
+    ) -> Result<Self> {
+        if retarget {
+            for height in 0..2 * u64::from(RETARGET_STEPS) {
+                retarget_bits(bits, height)?;
+            }
+        }
+        let state = Arc::new(NodeState::with_retarget(bits, address_prefix, retarget));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind fake node listener")?;

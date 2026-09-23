@@ -67,8 +67,8 @@ pub use window::{
 };
 use window::{read_prior_balances, share_from_row};
 pub(crate) use window::{
-    ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe, RetainedShares,
-    SnapshotCapture,
+    AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
+    RetainedShares, SnapshotCapture,
 };
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;

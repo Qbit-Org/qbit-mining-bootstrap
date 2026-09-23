@@ -256,7 +256,7 @@
     "ledger/window.rs::append_prepared#1::self .acquire()": [1,"ledger"],
     "ledger/window.rs::append_prepared#1::begin(& mut * connection . connection , None)": [1,"transaction"],
     "ledger/window.rs::snapshot_with_admission#1::self .begin()": [2,"ledger"],
-    "ledger/window.rs::snapshot_with_admission#1::advance(& mut tx , prior , network_difficulty , weight , anchor_ms , cutoff , & completion ,)": [1,"transaction"],
+    "ledger/window.rs::snapshot_with_admission#1::advance(& mut tx , prior , weight , anchor_ms , cutoff , & completion)": [1,"transaction"],
     "ledger/window/payout_state.rs::payout_state#1::self .begin()": [1,"ledger"],
     "ledger/window/payout_state.rs::refresh_probe#1::self .begin()": [1,"ledger"],
     "main.rs::main#1::prepare()": [1,"non-database"],

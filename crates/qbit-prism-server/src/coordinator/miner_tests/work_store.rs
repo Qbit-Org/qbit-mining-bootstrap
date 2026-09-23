@@ -462,6 +462,9 @@ impl work_ledger::WorkLedger for MemoryLedger {
             Ok(completion.own(crate::ledger::SnapshotCapture {
                 snapshot,
                 leaf: None,
+                acquisition: crate::ledger::AcquisitionReport::full(
+                    crate::metrics::WindowAcquisition::NoPrior,
+                ),
             }))
         })
     }

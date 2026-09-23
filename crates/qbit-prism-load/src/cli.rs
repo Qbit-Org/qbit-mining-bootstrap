@@ -183,6 +183,17 @@ pub struct Args {
     /// External tips minted during warm-up, for time to usable work.
     #[arg(long, default_value_t = 3)]
     pub external_tips: usize,
+    /// Serve different template bits on every tip, as a per-block retarget
+    /// does: a deterministic walk of about 0.8 percent per block around the
+    /// stock bits, so no two consecutive tips share a network difficulty.
+    /// Off by default; every existing comparison is against constant bits.
+    #[arg(long)]
+    pub retarget_bits: bool,
+    /// Offered shares per second during warm-up, the phase the external tips
+    /// are minted in, so the tips' refreshes run over a ledger that is still
+    /// receiving shares. Defaults to the steady-state rate, as before.
+    #[arg(long)]
+    pub background_shares_per_second: Option<f64>,
 
     /// `none`, or `dense` for the #271 dense-cadence side phase: own blocks
     /// about 9 s apart and in 18-20 s pairs, measuring what each
@@ -278,6 +289,10 @@ impl Args {
             ("--steady-state-rate", self.steady_state_rate),
             ("--burst-rate", self.burst_rate),
             ("--cadence-rate", self.cadence_rate),
+            (
+                "--background-shares-per-second",
+                self.background_shares_per_second,
+            ),
         ] {
             if let Some(value) = value {
                 ensure!(
@@ -410,6 +425,21 @@ impl Args {
         }
     }
 
+    /// Rows the run seeds. Constant bits seed exactly the window, as every
+    /// run before `--retarget-bits` did. A retargeting node also seeds a
+    /// tenth more, older history below the window, so a tip whose target is
+    /// harder than the last has older rows to reach into, as it always has
+    /// in production; without them the harder window runs out of history
+    /// and the refresh path measures a partial window that production never
+    /// builds.
+    pub fn seed_share_count(&self) -> u64 {
+        if self.retarget_bits {
+            self.window_shares + self.window_shares.div_ceil(10)
+        } else {
+            self.window_shares
+        }
+    }
+
     pub fn cadence(&self) -> Result<crate::cadence::Cadence> {
         crate::cadence::Cadence::parse(&self.cadence)
     }
@@ -470,7 +500,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         plans.push(PhasePlan {
             name: "warm_up".into(),
             seconds: args.warmup_seconds,
-            rate: steady_rate,
+            rate: args.background_shares_per_second.unwrap_or(steady_rate),
             in_artifact: false,
             reconnects: false,
             database_delay_ms: 0,

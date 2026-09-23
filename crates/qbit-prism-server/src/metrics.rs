@@ -110,8 +110,15 @@ impl Metrics {
                 0.,
             );
         }
+        for outcome in WindowAcquisition::ALL {
+            registry.register(
+                Family::WindowAcquisitions,
+                label("outcome", outcome.as_str()),
+                0.,
+            );
+        }
         // Owner-dependent hooks are declared without inventing observations.
-        for family in [Family::FirstOffer, Family::LockWait] {
+        for family in [Family::FirstOffer, Family::LockWait, Family::RefreshSeconds] {
             registry.declare(family);
         }
         for collector in Collector::ALL {
