@@ -27,7 +27,13 @@ impl Coordinator {
     ) -> Result<()> {
         let readiness_epoch = self.readiness.read().await.generation;
         let requested_at = tokio::time::Instant::now();
-        let now_ms = self.work_ledger.now_ms().await?;
+        // The shared clock+revision read started after this request fixes
+        // the one original deadline. Every later revalidation reads the
+        // clock and the revision again through the shared flight (so the
+        // fan-out shares reads instead of repeating them) and can only
+        // shorten the deadline, never renew it; the batch transaction also
+        // re-checks liveness on the database clock before COMMIT.
+        let now_ms = self.clocked_revision_since(requested_at).await?.now_ms;
         let seconds = ttl
             .as_secs()
             .checked_add(u64::from(ttl.subsec_nanos() != 0))
@@ -156,8 +162,14 @@ impl Coordinator {
     }
 
     async fn revalidate_issued(&self, issued: &mut IssuedPersistence<'_>) -> Result<i64> {
+        // The clock and the revision are read again through the shared
+        // flight (the recorded expiry makes the authority evaluate the
+        // clock against it), the result can only shorten the deadline fixed
+        // from the first read, and `require_live` re-checks the expiry on the
+        // database clock inside the batch transaction.
+        issued.authority.note_expiry(issued.expires_at_ms);
         let revision = self
-            .revalidate_issuance_authority(&mut issued.authority, Some(issued.expires_at_ms))
+            .revalidate_issuance_authority(&mut issued.authority, None)
             .await?
             .context("payout snapshot stale")?;
         // No later database clock read or repair retry renews this deadline.

@@ -14,7 +14,10 @@ async fn clocked_read_matches_the_separate_clock_and_revision_reads() -> Result<
     let before = WorkLedger::now_ms(&ledger).await?;
     let read = WorkLedger::clocked_payout_revision(&ledger).await?;
     let after = WorkLedger::now_ms(&ledger).await?;
-    let revision = WorkLedger::payout_revision(&ledger).await?;
+    let revision: i64 =
+        sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
+            .fetch_one(&ledger.pool)
+            .await?;
     ensure!(
         before <= read.now_ms && read.now_ms <= after,
         "clock {} outside [{before}, {after}]",

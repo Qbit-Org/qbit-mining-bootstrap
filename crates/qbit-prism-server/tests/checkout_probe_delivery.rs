@@ -47,9 +47,9 @@ async fn a_build_on_a_connection_killed_inside_the_probe_window_fails_once_then_
             .as_str()
             .context("prepared work has no parent")?
             .to_owned();
-        let worker = MiningBackend::authorize(&coordinator, "probe.worker").await?;
+        let worker = MiningBackend::authorize(&*coordinator, "probe.worker").await?;
         // A build proves the path works and leaves its connections idle.
-        let first = MiningBackend::build_job(&coordinator, &worker, "00000001", 1e-12, 0.0).await?;
+        let first = MiningBackend::build_job(&*coordinator, &worker, "00000001", 1e-12, 0.0).await?;
         ensure!(first.wire.previousblockhash == tip);
 
         // Terminate every idle backend of this fixture database from a
@@ -68,7 +68,7 @@ async fn a_build_on_a_connection_killed_inside_the_probe_window_fails_once_then_
         // Each dead connection can fail at most one attempt before the pool
         // discards it, so the bound is the pool size plus one.
         for attempt in 0..=2usize {
-            match MiningBackend::build_job(&coordinator, &worker, "00000002", 1e-12, 0.0).await {
+            match MiningBackend::build_job(&*coordinator, &worker, "00000002", 1e-12, 0.0).await {
                 Ok(job) => {
                     served = Some((attempt, job));
                     break;

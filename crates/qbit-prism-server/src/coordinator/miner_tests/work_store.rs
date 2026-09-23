@@ -115,15 +115,12 @@ impl work_ledger::WorkLedger for MemoryLedger {
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         self.compact.drop_probe.lock().unwrap().take()
     }
-    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
-        submit_ledger::SubmitLedger::payout_revision(self)
-    }
     fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<work_ledger::ClockedRevision>> {
         // Keep the clock gate and revision hooks the tests drive, in the
         // order the two separate reads had.
         Box::pin(async move {
             let now_ms = work_ledger::WorkLedger::now_ms(self).await?;
-            let payout_revision = work_ledger::WorkLedger::payout_revision(self).await?;
+            let payout_revision = submit_ledger::SubmitLedger::payout_revision(self).await?;
             Ok(work_ledger::ClockedRevision {
                 now_ms,
                 payout_revision,

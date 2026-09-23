@@ -20,7 +20,6 @@ pub(super) trait WorkLedger: Send + Sync {
     fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
         None
     }
-    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     /// The database clock and the payout revision from one statement on one
     /// checkout. Issuance revalidation needs both at every boundary that has
     /// an absolute expiry; reading them separately cost two checkouts and six
@@ -126,9 +125,6 @@ impl WorkLedger for Ledger {
         completion: ReadAdmission,
     ) -> BoxFuture<'_, Result<RefreshProbe, WindowError>> {
         Box::pin(Ledger::refresh_probe(self, completion))
-    }
-    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
-        Box::pin(Ledger::payout_revision(self))
     }
     fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<ClockedRevision>> {
         Box::pin(async move {
