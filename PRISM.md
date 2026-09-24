@@ -262,7 +262,12 @@ in the [server README](crates/qbit-prism-server/README.md).
 
 Tune `PRISM_RUNTIME_WORKERS`, `PRISM_JOB_BUILD_EXECUTOR_WORKERS`, and
 `PRISM_DATABASE_MAX_CONNECTIONS` against measured load. Size database connections
-across all instances. The former Python batch-writer, writer-lease, subprocess,
+across all instances. `PRISM_REFRESH_BUILD_THREADS` sizes the refresh builder's
+worker pool per frontend process (default: three quarters of the cores, at most
+4, which is where the refresh stops getting faster and retained memory is
+lowest; `0` runs the builder serially; up to 64); a refresh adds two lane
+threads and two digest threads to that while it builds, and every frontend on
+a host has its own pool. The former Python batch-writer, writer-lease, subprocess,
 and incremental-refresh scheduler settings no longer configure the runtime.
 
 ## Validation and further reading

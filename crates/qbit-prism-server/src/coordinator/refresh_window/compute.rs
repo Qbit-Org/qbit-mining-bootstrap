@@ -4,16 +4,20 @@ use super::*;
 type Admission = Arc<tokio::sync::OwnedSemaphorePermit>;
 type Pair<T, L, R> = CompactOwner<(Arc<T>, Result<L>, Result<R>, Admission)>;
 
-pub(super) async fn pipeline<T, P, L, R, O>(
+/// `prefix` runs first on the left lane and hands `X`, a by-product of its
+/// pass over the source, to `left` on the same thread; a failed prefix hands
+/// `left` its error instead. `P` goes to `finish` without waiting for `left`.
+pub(super) async fn pipeline<T, P, X, L, R, O>(
     source: CompactOwner<(Arc<T>, Admission)>,
-    prefix: impl FnOnce(&T) -> Result<P> + Send + 'static,
-    left: impl FnOnce(&T) -> Result<L> + Send + 'static,
+    prefix: impl FnOnce(&T) -> Result<(P, X)> + Send + 'static,
+    left: impl FnOnce(&T, Result<X>) -> Result<L> + Send + 'static,
     right: impl FnOnce(&T) -> Result<R> + Send + 'static,
     finish: impl FnOnce(P, R) -> Result<O> + Send + 'static,
 ) -> Result<Pair<T, L, O>>
 where
     T: Send + Sync + 'static,
     P: Send + 'static,
+    X: Send + 'static,
     L: Send + 'static,
     R: Send + 'static,
     O: Send + 'static,
@@ -22,11 +26,20 @@ where
     let left_source = CompactOwner::new((source.0.clone(), source.1.clone()));
     let right_source = CompactOwner::new((source.0.clone(), source.1.clone()));
     let left = left_source.spawn_blocking(move |owned| {
-        let prefix = prefix(&owned.0);
+        let (prefix, handoff) = match prefix(&owned.0) {
+            Ok((prefix, handoff)) => (Ok(prefix), Ok(handoff)),
+            Err(error) => {
+                let message = format!("{error:#}");
+                (
+                    Err(error),
+                    Err(anyhow::anyhow!("audit prefix failed: {message}")),
+                )
+            }
+        };
         // Sending never waits for the body or its continuation. On cancellation
         // the rejected output still owns admission through off-runtime cleanup.
         let _ = send_prefix.send(CompactOwner::new((prefix, owned.1.clone())));
-        let result = left(&owned.0);
+        let result = left(&owned.0, handoff);
         let (source, admission) = owned;
         drop(source);
         CompactOwner::new((result, admission))
@@ -84,7 +97,14 @@ where
     L: Send + 'static,
     R: Send + 'static,
 {
-    pipeline(source, |_| Ok(()), left, right, |(), right| Ok(right)).await
+    pipeline(
+        source,
+        |_| Ok(((), ())),
+        move |source, _| left(source),
+        right,
+        |(), right| Ok(right),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -145,8 +165,8 @@ mod tests {
         let (finished, suffix) = oneshot::channel();
         let task = tokio::spawn(pipeline(
             source,
-            |_| Ok(7),
-            move |_| {
+            |_| Ok((7, ())),
+            move |_, _| {
                 entered.send(()).unwrap();
                 wait.recv_timeout(Duration::from_secs(5)).unwrap();
                 Ok(11)
@@ -189,9 +209,9 @@ mod tests {
                         panic!("injected prefix panic");
                     }
                     anyhow::ensure!(outcome != "prefix_error", "injected prefix error");
-                    Ok(())
+                    Ok(((), ()))
                 },
-                |_| Ok(()),
+                |_, handoff| handoff,
                 |_| Ok(()),
                 move |(), ()| -> Result<()> {
                     if outcome == "suffix_panic" {
@@ -212,6 +232,13 @@ mod tests {
                         "suffix error"
                     }
                 ));
+                // The left lane receives the prefix outcome: its handoff fails
+                // with the prefix error and succeeds otherwise.
+                assert_eq!(
+                    result.1.as_ref().err().map(|error| error.to_string()),
+                    (outcome == "prefix_error")
+                        .then(|| "audit prefix failed: injected prefix error".to_string())
+                );
                 assert_eq!(slots.available_permits(), 0);
                 drop(result);
             }
@@ -234,9 +261,9 @@ mod tests {
             move |_| {
                 entered.send(()).unwrap();
                 wait.recv_timeout(Duration::from_secs(5)).unwrap();
-                Ok(())
+                Ok(((), ()))
             },
-            |_| Ok(()),
+            |_, _| Ok(()),
             move |_| {
                 body_done.send(()).unwrap();
                 Ok(Cleanup {
@@ -267,8 +294,8 @@ mod tests {
         let output_slots = slots.clone();
         let task = tokio::spawn(pipeline(
             source,
-            |_| Ok(()),
-            |_| Ok(()),
+            |_| Ok(((), ())),
+            |_, _| Ok(()),
             |_| Ok(()),
             move |(), ()| {
                 entered.send(()).unwrap();

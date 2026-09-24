@@ -130,14 +130,19 @@ fn write_prefix(
     schema: &str,
     shares: &[AcceptedShare],
 ) -> Result<(), serde_json::Error> {
+    write_prefix_header(&mut writer, schema)?;
+    serde_json::to_writer(writer, shares)
+}
+
+/// The bytes before the share array: `{"schema":...,"shares":`.
+fn write_prefix_header(mut writer: impl Write, schema: &str) -> Result<(), serde_json::Error> {
     writer
         .write_all(b"{\"schema\":")
         .map_err(serde_json::Error::io)?;
     serde_json::to_writer(&mut writer, schema)?;
     writer
         .write_all(b",\"shares\":")
-        .map_err(serde_json::Error::io)?;
-    serde_json::to_writer(writer, shares)
+        .map_err(serde_json::Error::io)
 }
 
 fn write_suffix(writer: impl Write, body: &AuditBundleBody) -> Result<(), serde_json::Error> {
@@ -148,6 +153,42 @@ fn write_suffix(writer: impl Write, body: &AuditBundleBody) -> Result<(), serde_
         },
         &Suffix(AuditBundleRef::from_parts(body, &[])),
     )
+}
+
+/// [`write_suffix`] for the builder: the same `serialize_suffix` field list,
+/// with the `reward_manifest` value's share array produced in ordered chunks.
+fn write_suffix_with<W: Write>(
+    writer: &mut W,
+    body: &AuditBundleBody,
+    parallelism: Parallelism,
+) -> Result<(), serde_json::Error> {
+    if parallelism.is_serial() {
+        return write_suffix(writer, body);
+    }
+    Suffix(AuditBundleRef::from_parts(body, &[])).serialize(parallel::StructSplice::continuing(
+        writer,
+        "reward_manifest",
+        |writer| write_reward_manifest(writer, &body.reward_manifest, parallelism),
+    ))
+}
+
+/// Every byte reaches both digests: the prefix state after its header, and
+/// the bare share-array digest.
+struct Tee<'a> {
+    prefix: &'a mut Sha256,
+    array: &'a mut Sha256,
+}
+
+impl Write for Tee<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.prefix.update(bytes);
+        self.array.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A single build's canonical SHA256 state after `schema` and accepted `shares`.
@@ -167,14 +208,68 @@ impl CanonicalAuditHashPrefix {
         Ok(Self { writer, schema })
     }
 
+    /// [`CanonicalAuditHashPrefix::new`] for the builder, which also returns
+    /// `sha256(serde_json::to_vec(shares))`, the bare share-array digest a
+    /// ledger `WindowRef` carries, from the same single serialization of the
+    /// window: every array byte updates both states. Both results are those
+    /// of the two separate serial computations.
+    pub fn new_with_share_digest(
+        shares: &[AcceptedShare],
+        parallelism: Parallelism,
+    ) -> Result<(Self, [u8; 32]), serde_json::Error> {
+        let schema = audit_bundle_schema_for_shares(shares);
+        let mut writer = DigestWriter(Sha256::new());
+        write_prefix_header(&mut writer, schema)?;
+        let array = if parallelism.is_serial() {
+            let mut array = Sha256::new();
+            parallel::write_array(
+                &mut Tee {
+                    prefix: &mut writer.0,
+                    array: &mut array,
+                },
+                shares,
+                parallelism,
+            )?;
+            array
+        } else {
+            // Each ordered frame updates the prefix here, then moves to the
+            // bare digest's thread, so the two SHA states run concurrently
+            // over the same buffers; the pool hands them back to the workers.
+            let pool = parallel::BufferPool::new();
+            std::thread::scope(|scope| {
+                let (send, hasher) = parallel::spawn_hasher(scope, &pool, 4);
+                let written = parallel::write_array_frames(shares, parallelism, &pool, |frame| {
+                    writer.0.update(&frame);
+                    send.send(frame)
+                        .map_err(|_| parallel::stopped("share-array digest"))
+                });
+                drop(send);
+                let array = hasher.join().expect("share-array digest thread");
+                written.map(|()| array)
+            })?
+        };
+        Ok((Self { writer, schema }, array.finalize().into()))
+    }
+
     /// Finish with the body built from the exact same immutable share window.
     /// As with `AuditBundleBody::into_bundle`, the caller owns that association;
     /// this performs no membership verification and grants no publication right.
-    pub fn finish(mut self, body: &AuditBundleBody) -> Result<String, PrismError> {
+    pub fn finish(self, body: &AuditBundleBody) -> Result<String, PrismError> {
+        self.finish_with(body, Parallelism::serial())
+    }
+
+    /// [`CanonicalAuditHashPrefix::finish`] for the builder: the suffix's
+    /// counted-share array is serialized in ordered chunks on `parallelism`
+    /// worker threads; the digest is the serial one.
+    pub fn finish_with(
+        mut self,
+        body: &AuditBundleBody,
+        parallelism: Parallelism,
+    ) -> Result<String, PrismError> {
         if body.schema != self.schema {
             return Err(PrismError::AuditMismatch { artifact: "schema" });
         }
-        write_suffix(&mut self.writer, body)?;
+        write_suffix_with(&mut self.writer, body, parallelism)?;
         Ok(hex::encode(self.writer.0.finalize()))
     }
 }

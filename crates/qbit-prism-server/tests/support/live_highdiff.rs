@@ -398,6 +398,7 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,
+        refresh_build_threads: None,
         runtime_workers: 2,
         snapshot_interval: Duration::from_secs(30),
         health_timeout: Duration::from_secs(15),

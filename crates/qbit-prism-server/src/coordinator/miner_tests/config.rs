@@ -19,6 +19,7 @@ pub(super) fn test_config() -> Config {
         poll_interval: Duration::from_secs(2),
         blockwait: true,
         build_workers: 2,
+        refresh_build_threads: None,
         runtime_workers: 2,
         snapshot_interval: Duration::from_secs(60),
         health_timeout: Duration::from_secs(15),

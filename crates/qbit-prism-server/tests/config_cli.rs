@@ -116,6 +116,8 @@ async fn large_resource_budgets_fail_instead_of_truncating_or_panicking() {
         ("PRISM_DATABASE_MAX_CONNECTIONS", "3"),
         ("PRISM_JOB_BUILD_EXECUTOR_WORKERS", "18446744073709551615"),
         ("PRISM_JOB_BUILD_EXECUTOR_WORKERS", "11"), // runtime permits 2 + 8 blocking threads
+        ("PRISM_REFRESH_BUILD_THREADS", "65"),
+        ("PRISM_REFRESH_BUILD_THREADS", "18446744073709551616"),
         ("PRISM_RUNTIME_WORKERS", "1025"),
         ("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", "1e100"),
         ("PRISM_STRATUM_EXTRANONCE2_SIZE", "4294967304"),

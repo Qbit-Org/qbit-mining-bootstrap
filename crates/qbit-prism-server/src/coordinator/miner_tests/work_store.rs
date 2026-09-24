@@ -28,6 +28,8 @@ pub(crate) struct CompactStore {
     pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
     pub state_gate: StdMutex<Option<Arc<Gate>>>,
     pub state_calls: AtomicUsize,
+    /// Refresh probes alone; `state_calls` also counts lease proofs and fences.
+    pub probe_calls: AtomicUsize,
     pub save_gate: StdMutex<Option<Arc<Gate>>>,
     pub windows: StdMutex<VecDeque<Result<Window, WindowError>>>,
     pub window_calls: StdMutex<Vec<(WindowRef, BalanceSource)>>,
@@ -84,6 +86,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
         Box::pin(async move {
             let _completion = completion;
             self.compact.state_calls.fetch_add(1, Ordering::SeqCst);
+            self.compact.probe_calls.fetch_add(1, Ordering::SeqCst);
             let scripted = self.compact.states.lock().unwrap().pop_front();
             let result = {
                 let snapshot = self.snapshot.lock().unwrap();

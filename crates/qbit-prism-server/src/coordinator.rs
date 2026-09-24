@@ -633,6 +633,10 @@ impl Coordinator {
         metrics: Arc<crate::metrics::Metrics>,
         register_frontend: bool,
     ) -> Result<Arc<Self>> {
+        if let Some(threads) = config.refresh_build_threads {
+            qbit_prism::parallel::configure_builder_threads(threads)
+                .context("PRISM_REFRESH_BUILD_THREADS")?;
+        }
         let rpc = Rpc::new(
             config.rpc_url.clone(),
             config.rpc_user.clone(),
@@ -1024,6 +1028,11 @@ impl Coordinator {
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
+        // The landing metric's "revision observed" instant stays here, where
+        // the ledger probe used to feed it: the chain-observation write
+        // returned the current revision. A bump after this point is recorded
+        // again, idempotently, from the anchor transaction and at selection.
+        self.metrics.revision_work_observed(observed_revision);
         let bits =
             codec::parse_u32_hex(template["bits"].as_str().context("template bits missing")?)?;
         let network = codec::scaled_target_difficulty(&codec::target_from_compact(bits)?)?;
@@ -1035,30 +1044,58 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let probe = self
-            .work_ledger
-            .refresh_probe(crate::ledger::ReadAdmission::default())
-            .await?;
-        let state = probe.payout_state;
-        self.metrics.revision_work_observed(state.payout_revision);
-        let share_seq = probe.accepted_share_seq;
+        // The ledger probe only matters when it can keep the published work.
+        // The fingerprint carries previousblockhash, so a new tip replaces
+        // the work whatever the probe would show; that refresh reads its
+        // revision from the anchor transaction instead. On the same template
+        // the probe still precedes the fee read, as it always has.
+        let same_template = self
+            .prepared
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.fingerprint == fingerprint);
+        let probe = if same_template {
+            let probe = self
+                .work_ledger
+                .refresh_probe(crate::ledger::ReadAdmission::default())
+                .await?;
+            self.metrics
+                .revision_work_observed(probe.payout_state.payout_revision);
+            Some(probe)
+        } else {
+            None
+        };
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         let current_prepared = self.prepared.read().await;
         // Named before the reuse test below decides, from the same inputs, so
         // the refresh metric and log say what invalidated the published work.
-        let trigger = refresh_trigger(
-            current_prepared.as_deref(),
-            parent,
-            &state,
-            share_seq,
-            cached_window.as_ref().is_some_and(|window| {
-                window.within_reanchor_interval(self.config.snapshot_interval)
-            }),
-            &fee,
-        );
-        if let Some(current) = current_prepared.as_ref() {
+        // Without a probe the template already differs from the published
+        // work: a new tip, or a new template on the same tip.
+        let trigger = match &probe {
+            Some(probe) => refresh_trigger(
+                current_prepared.as_deref(),
+                parent,
+                &probe.payout_state,
+                probe.accepted_share_seq,
+                cached_window.as_ref().is_some_and(|window| {
+                    window.within_reanchor_interval(self.config.snapshot_interval)
+                }),
+                &fee,
+            ),
+            None => match current_prepared.as_deref() {
+                None => RefreshTrigger::Initial,
+                Some(current) if current.template["previousblockhash"].as_str() != Some(parent) => {
+                    RefreshTrigger::Tip
+                }
+                Some(_) => RefreshTrigger::Template,
+            },
+        };
+        if let (Some(probe), Some(current)) = (probe, current_prepared.as_ref()) {
+            let state = probe.payout_state;
+            let share_seq = probe.accepted_share_seq;
             // A new share invalidates build inputs, but does not itself replace
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
@@ -1131,7 +1168,13 @@ impl Coordinator {
         // Select valid inputs after that wait, at the same boundary where a
         // fresh snapshot would be read. Later shares belong to the next window;
         // the selected WindowRef remains immutable through build/publication.
-        let reuse_window = if let Some(window) = cached_window.as_ref() {
+        // Every payout revision write is an increment, so a window anchored
+        // below the revision this refresh's chain observation returned can
+        // never satisfy `reusable`: its probe is skipped and it is rebuilt.
+        let reuse_window = if let Some(window) = cached_window
+            .as_ref()
+            .filter(|window| window.snapshot.payout_revision >= observed_revision)
+        {
             let probe = self
                 .work_ledger
                 .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
@@ -1193,6 +1236,12 @@ impl Coordinator {
         // This lets build admission end after actual build cleanup, so existing
         // lease holders can resume while a replacement reservation waits.
         let window = Arc::clone(cached_window.as_ref().expect("captured refresh window"));
+        // The revision this work carries is the one its anchor transaction
+        // returned, whether the window was just captured or reused; the
+        // published-refresh log below names the cutoff the same way.
+        self.metrics
+            .revision_work_observed(window.snapshot.payout_revision);
+        let share_seq = window.snapshot.share_seq;
         let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
