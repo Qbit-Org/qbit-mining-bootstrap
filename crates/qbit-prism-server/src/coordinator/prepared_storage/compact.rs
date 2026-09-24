@@ -287,7 +287,10 @@ pub(in crate::coordinator) type CapturedRefreshBody =
     CompactOwner<(Result<RefreshBody>, Arc<tokio::sync::OwnedSemaphorePermit>)>;
 
 /// The reused-window rebuild (a new template on the same window): the same
-/// chunked fold, leaf, prefix and suffix as the pipelined refresh, on one lane.
+/// chunked fold, leaf, prefix and suffix as the pipelined refresh, on one
+/// lane. The window's `WindowRef` already carries its share-array digest, so
+/// the prefix alone is hashed: no second pass over the shares, no digest
+/// thread.
 pub(in crate::coordinator) fn prepare_refresh_body_with(
     config: &Config,
     snapshot: &Snapshot,
@@ -304,8 +307,7 @@ pub(in crate::coordinator) fn prepare_refresh_body_with(
         inputs,
         parallelism,
     )?;
-    let (prefix, _share_digest) =
-        qbit_prism::CanonicalAuditHashPrefix::new_with_share_digest(&snapshot.shares, parallelism)?;
+    let prefix = qbit_prism::CanonicalAuditHashPrefix::new_with(&snapshot.shares, parallelism)?;
     finish_refresh_body_with(prefix, prepared, parallelism)
 }
 

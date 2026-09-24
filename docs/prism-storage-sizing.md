@@ -176,6 +176,31 @@ shared database before relying on another frontend to serve old audits. Preserve
 all referenced bodies and segments in the migration backup. A small live-evidence
 envelope or a stored SHA cannot replace missing artifact bytes.
 
+### Refresh build memory per frontend
+
+Since #502 the refresh build serializes the share array and folds the counted
+shares in chunks on the frontend's builder pool (`PRISM_REFRESH_BUILD_THREADS`,
+default three quarters of the host's cores clamped to 1..4, `0` for the serial
+build, at most 64), and it holds more memory per frontend process than the
+serial build did. The trade is accepted. #502's own confirmation pair on its
+merge base measured per-frontend RSS after the tips at 328-342 MiB before and
+568-608 MiB after, and peak RSS at 557 MiB before and 669 MiB after; an
+independent 400,000-share probe measured 251-254 MiB retained after the drop
+with the serial build against 284-330 MiB with eight workers. Budget roughly
+0.5 GiB more retained memory on a two-frontend host.
+
+Two things hold that memory. The pool's threads keep the counted-share strings
+and chunk buffers in their own allocator arenas, one per thread, so the retained
+part grows with the thread count (at 400,000 shares, sixteen threads retained
+about 130 MiB more per frontend than four for the same refresh time); the
+thread count is the knob that bounds it, and on a memory-tight host
+`MALLOC_ARENA_MAX` (for example `MALLOC_ARENA_MAX=2` in the frontend's
+environment) caps glibc's arenas whatever the thread count. And the build slot
+(`PRISM_JOB_BUILD_EXECUTOR_WORKERS`) is released before the previous refresh's counted-share
+body is freed, so the slot count no longer bounds the number of live
+counted-share bodies exactly: expect one extra body per slot, transiently, on
+top of the bound the slot gives.
+
 ## Estimate from measured ingest
 
 Estimate share growth from accepted share rate, not miner hashrate alone:
