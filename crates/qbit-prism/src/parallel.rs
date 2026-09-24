@@ -270,22 +270,56 @@ impl<C, E> State<C, E> {
 /// job may still be inside that unlock (its futex wake) after the caller
 /// has seen zero and returned; nothing on the caller's frame is involved.
 /// Only `produce` stays borrowed, and its last use is inside a job's
-/// `catch_unwind`, before the decrement.
+/// `catch_unwind`, before the decrement. [`Drain`] empties the state on the
+/// calling thread once the jobs are done, so a clone that outlives the call
+/// owns only empty containers.
 struct Shared<C, E> {
     state: Mutex<State<C, E>>,
     signal: Condvar,
 }
 
-/// Waits for every submitted job to finish, also while unwinding: no job may
-/// outlive the borrowed `produce` it was given.
+/// Waits for every submitted job to finish, also while unwinding, and takes
+/// everything the jobs left behind: no job may outlive the borrowed
+/// `produce` it was given, and the chunks and error they produced, which may
+/// borrow from the caller too, are dropped or returned on the calling
+/// thread. The last clone of the shared state, which a finished job may
+/// still hold, then owns nothing the caller lent.
 struct Drain<'a, C, E>(&'a Shared<C, E>);
+
+/// What the jobs left once the last of them finished.
+type Settled<C, E> = (
+    Option<Box<dyn std::any::Any + Send>>,
+    Option<E>,
+    BTreeMap<usize, C>,
+);
+
+impl<C, E> Drain<'_, C, E> {
+    fn settle(shared: &Shared<C, E>) -> Settled<C, E> {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.outstanding > 0 {
+            state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        (
+            state.panicked.take(),
+            state.failed.take(),
+            std::mem::take(&mut state.ready),
+        )
+    }
+
+    /// The first panic and the first error the jobs or the consumer
+    /// reported, once every job has finished. Chunks the consumer never
+    /// took are dropped here.
+    fn finish(self) -> (Option<Box<dyn std::any::Any + Send>>, Option<E>) {
+        let shared = self.0;
+        std::mem::forget(self);
+        let (panicked, failed, _untaken) = Self::settle(shared);
+        (panicked, failed)
+    }
+}
 
 impl<C, E> Drop for Drain<'_, C, E> {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        while state.outstanding > 0 {
-            state = self.0.signal.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+        drop(Self::settle(self.0));
     }
 }
 
@@ -404,11 +438,7 @@ where
             break;
         }
     }
-    drop(drain);
-    let (panicked, failed) = {
-        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        (state.panicked.take(), state.failed.take())
-    };
+    let (panicked, failed) = drain.finish();
     if let Some(panic) = panicked {
         std::panic::resume_unwind(panic);
     }
