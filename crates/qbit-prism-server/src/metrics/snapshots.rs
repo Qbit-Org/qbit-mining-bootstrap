@@ -14,6 +14,17 @@ pub struct ProcessMetrics {
 pub struct DatabaseMetrics {
     pub candidates: u64,
     pub candidate_oldest: Duration,
+    /// Oldest age among the unfinished rows the node has not accepted (#493):
+    /// `pending` and `offer_reserved` rows, offered rows whose one
+    /// `submitblock` outcome is unknown (not a row adopted on the node's own
+    /// active-chain evidence), and rows the node rejected unless the reply
+    /// names a side-chain block. Zero when every unfinished row was accepted,
+    /// as a node-accepted lost race awaiting its orphan proof is.
+    pub candidate_oldest_unacknowledged: Duration,
+    /// Oldest age, since the offer reservation, among the reconciliation
+    /// rows whose audit landing has not committed (no pool-block row) or
+    /// whose last error names a landing refusal (#493); zero when none.
+    pub candidate_oldest_landing_failed: Duration,
     /// Rows of attached share ledger partition headroom above the next
     /// `share_seq`, or `None` where the ledger is not partitioned yet. An
     /// absent lead is not a zero lead: the sample is left at its unknown
@@ -169,6 +180,16 @@ impl Collection<'_> {
                         snapshot.candidate_oldest.as_secs_f64(),
                     );
                     registry.set(
+                        Family::CandidateUnacknowledgedAge,
+                        vec![],
+                        snapshot.candidate_oldest_unacknowledged.as_secs_f64(),
+                    );
+                    registry.set(
+                        Family::CandidateLandingFailedAge,
+                        vec![],
+                        snapshot.candidate_oldest_landing_failed.as_secs_f64(),
+                    );
+                    registry.set(
                         Family::PartitionLead,
                         vec![],
                         snapshot.partition_lead_rows.map_or(-1., |rows| rows as f64),
@@ -230,6 +251,8 @@ pub(super) fn invalidate(registry: &mut Registry, collector: Collector) {
         Collector::Database => &[
             Family::Candidates,
             Family::CandidateAge,
+            Family::CandidateUnacknowledgedAge,
+            Family::CandidateLandingFailedAge,
             Family::PartitionLead,
         ],
         Collector::Process => &[Family::Rss],
@@ -311,6 +334,8 @@ mod tests {
         newer.publish_database(Some(DatabaseMetrics {
             candidates: 2,
             candidate_oldest: Duration::from_secs(7),
+            candidate_oldest_unacknowledged: Duration::from_secs(3),
+            candidate_oldest_landing_failed: Duration::from_secs(1),
             partition_lead_rows: Some(64),
         }));
         old.publish_database(Some(DatabaseMetrics::default()));

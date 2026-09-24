@@ -68,6 +68,7 @@ impl Metrics {
             Family::DivergentOverpay,
             Family::RevisionWorkPending,
             Family::RevisionWorkUnknown,
+            Family::AcceptedUnlanded,
             Family::RevisionWorkTimeouts,
         ] {
             registry.register(family, vec![], 0.);
@@ -79,6 +80,8 @@ impl Metrics {
             Family::Coverage,
             Family::Candidates,
             Family::CandidateAge,
+            Family::CandidateUnacknowledgedAge,
+            Family::CandidateLandingFailedAge,
             Family::PartitionLead,
             Family::Rss,
             Family::ConnectionLimit,
@@ -186,6 +189,11 @@ impl Metrics {
             Family::RevisionWorkUnknown,
             Labels::Empty,
             f64::from(landing.unknown()),
+        );
+        registry.set(
+            Family::AcceptedUnlanded,
+            Labels::Empty,
+            landing.unlanded_age(),
         );
         for collector in Collector::ALL {
             let state = collections.get(collector);

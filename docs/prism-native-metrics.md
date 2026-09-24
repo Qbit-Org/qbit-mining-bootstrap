@@ -49,16 +49,19 @@ rendering the startup registry does not create a publication timestamp.
 
 | Family | Type | Labels | Role | Meaning / status | 2.x.x name replaced |
 | --- | --- | --- | --- | --- | --- |
-| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none; each frontend tracks every block it observes, and a frontend with no connected miners keeps waiting. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. | none |
+| `qbit_prism_accepted_block_revision_work_pending_seconds` | gauge | none | run | Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none; each frontend tracks every block it observes, and a frontend with no connected miners keeps waiting. Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. An offer the node accepted without an active-chain observation is an unlanded acceptance (#493): excluded here and reported by accepted_block_unlanded_seconds until an active-chain observation lands it on its original acceptance clock or a proven orphan closes it. | none |
 | `qbit_prism_accepted_block_revision_work_tracking_unknown` | gauge | none | run | Whether any local landing observation is unknown or incomplete; independent of known pending delivery age. Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels. | none |
 | `qbit_prism_accepted_block_to_revision_work_seconds` | histogram | `result=published,degraded,superseded` | run | Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds; each frontend samples every block from its own observation, so a sum across instances counts one block once per frontend. Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds. | `qbit_prism_accepted_block_preview_publication_seconds` |
+| `qbit_prism_accepted_block_unlanded_seconds` | gauge | none | run | Monotonic age of the oldest definitive submitblock acceptance this frontend has not yet observed on the node's active chain, such as a lost tip race until its orphan proof; never part of the known pending delivery age; zero when none, -1 when none is tracked and identity tracking is saturated; while the terminal probe that carries peer orphan evidence fails, the pending gauge reads -1 and the tracking-unknown gauge one even if only unlanded acceptances are open. Computed at scrape time and overlaid on cached metric bodies (#493). Set by the offering frontend at a definitive null submitblock reply; an active-chain observation (the post-offer landing observation, a reconcile proof or a settlement) lands the block, which then joins accepted_block_revision_work_pending_seconds on its original acceptance clock; a committed proven orphan closes it without a histogram sample. An unlanded acceptance never contributes to the known pending age, never attributes a build deadline and is not unknown tracking: a lost tip race is a known state. -1 only when none is tracked and identity tracking is saturated, so an unlanded acceptance may be untracked; a tracked unlanded age stays visible beside saturation, and the tracking-unknown gauge is one either way. While the terminal probe (the ten-second collector read that carries peer orphan evidence) fails or is cancelled, an unlanded-only frontend reads tracking unknown and a -1 pending age, because the lost race's orphan evidence is unreadable; this gauge keeps its age, and the next successful read restores the known state. Warned by PrismAcceptedBlockUnlanded at 30 minutes, never paged. | none |
 | `qbit_prism_accepted_shares_total` | counter | none | run | Shares accepted by this instance since process start. Process-local counter; legacy canonical ledger count was persistent. | `qbit_prism_accepted_shares_total` |
 | `qbit_prism_authorized_clients` | gauge | none | run | Current local authorized Stratum connections. | `qbit_prism_stratum_authorized_connections` |
 | `qbit_prism_authorized_missing_current_work` | gauge | none | run | Authorized connections missing the current semantic work generation. | none |
 | `qbit_prism_authorized_with_current_work` | gauge | none | run | Authorized connections holding the current semantic work generation. | `qbit_prism_stratum_clients_with_current_tip_jobs` |
-| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidate_oldest_pending_seconds` |
+| `qbit_prism_block_candidate_oldest_landing_failed_seconds` | gauge | none | run | Oldest cluster-wide time since the offer reservation of a reconciliation row whose audit landing has not committed (no pool-block row) or whose last error names a landing refusal; zero when none, or -1 when unknown. Read in the same database snapshot as the other candidate gauges (#493 review M1): the oldest reconciliation row whose landing has not committed (the landing transaction is the only writer of the block's qbit_pool_blocks row, so its absence is the durable fact) or whose last_error carries the landing-failed prefix the coordinator and the collector share (a landed row that no longer authenticates): a row the node accepted or rejected whose audit rebuild, verification or ledger landing keeps refusing and is retried at the reconciliation backoff. A retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but not the missing pool-block row, so the age never reads zero while nothing has landed. Measured from offer_reserved_at, the start of the post-offer lifecycle, so pre-offer retry backoff never counts toward it. Zero for a lost race (not-active reason) and for a rejection (its reply). PrismBlockCandidateLandingFailed warns at 60 s for 3 m and PrismBlockCandidateLandingFailedCritical pages at 307 s for 1 m, the same floor and dwell the revision-work critical applies when the landing fails after the frontend's own active-chain observation, so a won block whose landing keeps failing is never silent. -1 with the other candidate gauges when the collector fails. | none |
+| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge | none | run | Oldest cluster-wide pending candidate age, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. Since #493 the paging rule reads block_candidate_oldest_unacknowledged_seconds instead, so an acknowledged lost race in reconciliation warns but never pages; this gauge keeps its all-unfinished meaning and feeds the 15-second warning and the 30-minute stuck warning. | `qbit_prism_block_candidate_oldest_pending_seconds` |
+| `qbit_prism_block_candidate_oldest_unacknowledged_seconds` | gauge | none | run | Oldest cluster-wide candidate age the node has not accepted: pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (not a row adopted on the node's active-chain evidence), and rows the node rejected unless the reply names a side-chain block; zero when every unfinished row was accepted, or -1 when unknown. Read in the same database snapshot as the two all-unfinished gauges (#493): the unfinished rows the node has not accepted are pending and offer_reserved rows, offered or reconciliation rows whose one submitblock outcome is unknown (a transport failure or timeout, or a reservation whose call was lost with its frontend; a row adopted on the node's own evidence that its block is active carries the adoption reply and is excluded), and rows the node definitively rejected unless the reply names a side-chain block (inconclusive, duplicate, duplicate-inconclusive: a lost tip race). A node-accepted lost race awaiting its orphan proof and a landing that keeps failing after acceptance are unfinished but accepted, so they age only block_candidate_oldest_pending_seconds (and the landing-failed gauge). PrismBlockCandidateOldestPendingCritical pages on this gauge, falling back to the all-unfinished age on a target that does not export it yet; PrismBlockCandidateStuck warns on the all-unfinished age at 30 minutes. -1 with the other candidate gauges when the collector fails. | none |
 | `qbit_prism_block_candidates_orphaned_total` | counter | none | run | Offered block candidates this instance settled as proven orphans since process start. Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule. | none |
-| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. | `qbit_prism_block_candidates_pending` |
+| `qbit_prism_block_candidates_pending` | gauge | none | run | Cluster-wide nonterminal candidate count, or -1 when unknown. Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. Since #493 the paging rule reads block_candidate_oldest_unacknowledged_seconds instead, so an acknowledged lost race in reconciliation warns but never pages; this gauge keeps its all-unfinished meaning and feeds the 15-second warning and the 30-minute stuck warning. | `qbit_prism_block_candidates_pending` |
 | `qbit_prism_block_submit_seconds` | histogram | none | run | Locally validated block proof to first node offer; requires the offer owner's timestamp boundary. Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule. | `qbit_prism_block_submit_seconds` |
 | `qbit_prism_blocks_total` | counter | none | run | Blocks confirmed by this instance since process start. Native confirmed-block process counter; not the legacy node-acceptance accounting boundary. | `qbit_prism_blocks_accepted_total` |
 | `qbit_prism_capture_offer_decisions_total` | counter | `decision=offered,abandoned_ceiling,abandoned_disabled` | run | Offer decisions this instance made for pending blocks on the current tip whose payout revision was superseded (#478 block capture), by decision. #478 block capture. `offered`: the block's positive as-issued float (the most debt its confirmation can create, in any order) was within `PRISM_CAPTURE_OVERPAY_CEILING_BPS` of the coinbase value, and the block was reserved for its one offer, decided in the reservation's transaction. `abandoned_ceiling`: the float exceeded the ceiling and the pending block was abandoned; the WARN log names the bound and the ceiling, and `qbit_prism_payout_divergences` keeps both. `abandoned_disabled`: the ceiling is 0, so the block was abandoned as before #478 (recorded as decision `disabled`). The miner of an abandoned capture is answered `stale-job`, never `ledger-confirmation-failed`. A bound that cannot be computed abandons nothing: the offer fails and is retried. Process-local; every series starts at zero. No firing rule. | none |
@@ -251,6 +254,39 @@ the counter. Rows a frontend cannot land (a rebuild refused for good, a missing
 balance snapshot) are not orphans and stay in the pending set with their reason
 in `last_error`; that backlog is operator work.
 
+The paging rule does not read that all-unfinished age (#493). The same
+snapshot also reports `qbit_prism_block_candidate_oldest_unacknowledged_seconds`,
+the oldest age among unfinished rows the node has not accepted: `pending` and
+`offer_reserved` rows, offered rows whose one `submitblock` outcome is
+`unknown` (a row adopted on the node's own active-chain evidence carries the
+adoption reply and is excluded), and rows the node definitively rejected
+unless the reply names a side-chain block (`inconclusive`, `duplicate`,
+`duplicate-inconclusive`, a lost tip race). `PrismBlockCandidateOldestPendingCritical`
+pages on it at 60 seconds, so a found block that is not reaching the node and
+a block the node refused (`bad-*`, `high-hash`, `duplicate-invalid`: the pool
+built an invalid block) still page exactly as before, and an unknown outcome
+keeps paging because receipt is unproven and the block is never offered
+again. A node-accepted lost race is unfinished but accepted: it ages only the
+all-unfinished gauge, which the 15-second warning still reports and
+`PrismBlockCandidateStuck` warns on at 30 minutes without paging. A landing
+that keeps failing after the offer is reported by its own gauge,
+`qbit_prism_block_candidate_oldest_landing_failed_seconds`, the time since
+the offer reservation of the oldest reconciliation row whose landing has not committed (the landing transaction
+is the only writer of the block's `qbit_pool_blocks` row, so its absence is
+the durable fact, and a transient retry failure or a refused operator
+recovery that overwrites `last_error` cannot zero it) or whose `last_error`
+carries the landing-failed prefix the coordinator and the collector share (a
+landed row that no longer authenticates): `PrismBlockCandidateLandingFailed` warns
+at 60 seconds for three minutes and `PrismBlockCandidateLandingFailedCritical`
+pages at 307 seconds for one minute, the floor and dwell the revision-work
+critical applies when the landing fails after the frontend's own active-chain
+observation, so a won block whose ledger landing keeps failing is never
+silent whichever step refused; a lost race and a rejection leave that gauge
+at zero. All four gauges read -1 together when the collector fails. Rollout
+order: frontends first, then rules; until a target exports the unacknowledged
+series the paging expression falls back to its all-unfinished age, so the
+base behaviour (its lost-race page included) persists on that target.
+
 The existing coordinator families retain their names and types; their complete
 contracts appear in the generated table above. The #277 `metrics_snapshot_available`,
 `metrics_snapshot_stale`, and `metrics_snapshot_age_seconds` names, labels,
@@ -294,6 +330,26 @@ original confirmation revision. An in-flight local settlement cannot be
 replaced by this peer-proof association. If its reply is delayed, actual write
 and revision-observation clocks are retained so later association preserves
 which event happened first.
+
+A definitive `submitblock` acceptance is not an active-chain observation: the
+block may have lost a tip race (#493). Such an acceptance is tracked as
+**unlanded**, reported by `qbit_prism_accepted_block_unlanded_seconds` (the
+age of the oldest one; zero when none; -1 only when none is tracked and
+identity tracking is saturated) and never part of the known pending age or of build-deadline
+attribution, because it has no revision work to deliver. The post-offer
+landing observation, a reconcile proof or a settlement observation lands it:
+the same identity then joins the known pending age on its original
+acceptance clock, so the histogram still measures from the definitive
+acceptance. A committed proven orphan closes it without a sample. Only the
+offering frontend ever holds an unlanded acceptance; a peer starts at its own
+active-chain proof. An unlanded acceptance is a known state, not unknown
+tracking, with one deliberate exception: while the terminal probe that
+carries peer orphan evidence fails or is cancelled, an unlanded-only
+frontend reads tracking unknown and a -1 pending age, because the lost
+race's orphan evidence is unreadable; the unlanded gauge keeps the age and
+the next successful read restores the known state. A build deadline
+attributed through another known wait never marks an unlanded block
+degraded: it has no revision work yet.
 
 `superseded` means a later revision was observed before delivery of the target
 revision. Its histogram interval still ends at actual replacement-work delivery,
@@ -401,12 +457,21 @@ healthy zero; a later successful refresh restores the known empty zero. An
 older cancelled refresh cannot overwrite a newer completed observation. No
 block, job, worker, frontend or height label is emitted.
 
-There are **three concrete alert rules**: `PrismAcceptedRevisionWorkPending`
-warns above one second (and for unknown or missing observations),
-`PrismAcceptedRevisionWorkPendingCritical` uses the provisional 307-second
-incident-duration floor, and `PrismRevisionWorkBuildTimeouts` warns on a
-five-minute increase. The two warnings have zero additional dwell and alert on
-no data, so a missing or unknown measurement is always visible. The paging
+There are **five concrete alert rules**: `PrismAcceptedRevisionWorkPending`
+warns above one second and for a missing pending series or a failed scrape,
+`PrismAcceptedRevisionWorkTrackingUnknown` warns for unknown tracking (a -1
+age, the tracking-unknown gauge or a missing unknown gauge) after a two-minute
+dwell, `PrismAcceptedRevisionWorkPendingCritical` uses the provisional
+307-second incident-duration floor, `PrismRevisionWorkBuildTimeouts` warns on
+a five-minute increase, and `PrismAcceptedBlockUnlanded` warns when an
+unlanded acceptance is 30 minutes old for three minutes. The budget and
+timeout warnings have zero additional dwell and alert on no data, so a
+missing measurement is always visible. The unknown warning dwells (#493
+point 7): a failed template refresh marks tracking unknown only until the
+next successful refresh, one poll interval later, so a single transient
+refresh error never spans the eight consecutive 15-second scrapes the dwell
+requires, while a lost settlement reply, an unsettled orphan verdict,
+saturation or lost ordering persist and still warn. The paging
 critical is gated (#493): the age must be known, the target scraped and at
 least one miner authorized on that frontend, with a one-minute dwell and
 no-data and evaluation errors treated as OK. It is deliberately not gated on
@@ -422,19 +487,27 @@ nothing else pages for that frontend: the coverage rules cannot fire with
 zero authorized clients and the connected-clients rule is a cluster-wide
 non-paging warning, so only the pending warning keeps reporting the age until
 a miner reconnects and receives work. A lost race on the offering frontend
-still pages until its orphan proof. The one-second warning
+never pages (#493 point 1): its acceptance is unlanded, outside the known
+age, until an active-chain observation lands it or its orphan is proven. A
+routine lost race is proven within a few block intervals (six competitor
+confirmations at the 60-second target spacing plus the reconciliation retry
+backoff), well inside the 30-minute unlanded warning; past that the row is
+not being reconciled, the node is not advancing or the orphan verdict keeps
+failing, which is warned operator work, never a page. The one-second warning
 is a budget target; 307 seconds is not evidence of early detection. Scrape and
 evaluation intervals still add delay. Thresholds must be measured in #291;
 this repository change neither applies the generated external patch nor
 claims operational deployment. Five historical definitions consolidate into
-these three native rules, with the two timeout severities sharing one warning.
+these native rules, with the two timeout severities sharing one warning.
 
 The required PostgreSQL/fake-node/socket tests are in
 `crates/qbit-prism-server/tests/landing_metrics.rs`; state ordering, saturation,
 unknown measurements and live cached-body overlays are in
 `crates/qbit-prism-server/src/metrics/landing/tests.rs`. The independent census
 is 51 run-role families, 214 startup series and 312 populated series on this
-base, with exactly these four new families relative to #450.
+base, with exactly these four new families relative to #450; #493 adds the
+unlabeled unlanded gauge and the unlabeled unacknowledged and landing-failed
+candidate ages.
 
 ## Diagnosing Stratum admission saturation
 

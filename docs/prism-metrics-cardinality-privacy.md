@@ -7,8 +7,8 @@ generated from registry descriptors or the inventory document. The census
 compares every family name and type, requires one HELP and TYPE per family, and
 compares every sample name and complete label tuple. Duplicate samples fail.
 
-The current bound is **53 families and 666 series**, including histogram
-`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **232 series**:
+The current bound is **56 families and 669 series**, including histogram
+`_bucket`, `_sum`, `_count` and `le="+Inf"` series. Startup has **235 series**:
 first-offer, advisory-lock and refresh metadata exist, but their 434 derived
 series remain absent until observations occur. All 14 rejection reasons, two ACK outcomes,
 two pool outcomes, six lock/outcome pairs, two collectors, ten task kinds, six
@@ -26,7 +26,10 @@ enters them.
 
 #458 adds exactly four families and 48 startup/populated series: 45 histogram
 series for `result=published|degraded|superseded`, a pending gauge, a separate
-unlabeled tracking-unknown gauge and one timeout counter. Block identities remain inside the bounded observation state;
+unlabeled tracking-unknown gauge and one timeout counter. #493 adds three
+unlabeled gauges present from startup, `qbit_prism_accepted_block_unlanded_seconds`
+and the database collector's `qbit_prism_block_candidate_oldest_unacknowledged_seconds`
+and `qbit_prism_block_candidate_oldest_landing_failed_seconds`. Block identities remain inside the bounded observation state;
 there is no frontend, worker, block, height or job label. The real offer/delivery
 privacy assertion is `landing_metrics::lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout`.
 Adjacent node/rollup additions are outside this branch's census and must be

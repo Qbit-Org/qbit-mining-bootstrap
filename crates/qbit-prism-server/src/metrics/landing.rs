@@ -1,7 +1,9 @@
 //! Frontend-local landing observations, never publication authority.
 //!
-//! The process retains at most LIMIT block identities and LIMIT revision
-//! observations. Completed identities retire only behind the existing mature
+//! A definitive `submitblock` acceptance opens an identity as unlanded until
+//! an active-chain observation lands it or a proven orphan closes it; only
+//! landed identities are known delivery waits (#493). The process retains at
+//! most LIMIT block identities and LIMIT revision observations. Completed identities retire only behind the existing mature
 //! checkpoint; a watermark rejects late proofs. Saturation is unknown until
 //! restart, rather than silently recounting a delayed duplicate. A restart
 //! begins a new local knowledge horizon; no peer acceptance clock is inferred.
@@ -21,6 +23,39 @@ struct Acceptance {
     unknown_revision: bool,
     orphan_uncertain: bool,
     existing_revision: bool,
+    /// Accepted by the node's `submitblock` reply with no active-chain
+    /// observation on this frontend yet: a lost tip race until its orphan
+    /// proof, or a winning offer until its first active-chain observation
+    /// (#493). Never a known wait: an unlanded block has no revision to
+    /// deliver. An active-chain observation lands it on this same acceptance
+    /// clock; a proven orphan closes it. Reported by `unlanded_age`.
+    unlanded: bool,
+}
+
+impl Acceptance {
+    /// A known wait: open, landed on the active chain, and neither a lost
+    /// settlement reply nor an unsettled orphan verdict. Only known waits
+    /// carry a pending age, resolve against deliveries and attribute build
+    /// deadlines; an unlanded block never has a revision to resolve.
+    fn known(&self) -> bool {
+        !self.closed && !self.unlanded && !self.unknown_revision && !self.orphan_uncertain
+    }
+}
+
+/// What the caller observed about a block when it opened or revisited its
+/// identity (#493).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    /// A definitive `submitblock` acceptance with no active-chain observation
+    /// yet: tracked as unlanded until an observation lands it or a proven
+    /// orphan closes it.
+    Unlanded,
+    /// A coherent active-chain observation of a block that is not yet
+    /// confirmed; on an unlanded identity it lands the original acceptance.
+    Active,
+    /// First local proof of an already-confirmed block: it may associate the
+    /// coherent current revision, but cannot upgrade an earlier acceptance.
+    Confirmed,
 }
 
 #[derive(Default)]
@@ -61,18 +96,33 @@ impl Landing {
         self.pending_count > 0
     }
 
-    /// Open waits whose delivery target is still knowable: not closed, and
-    /// neither a lost settlement reply nor an unsettled orphan verdict.
+    /// Open waits whose delivery target is still knowable, see
+    /// [`Acceptance::known`].
     fn known_waits(&self) -> impl Iterator<Item = &Acceptance> {
+        self.blocks.values().filter(|block| block.known())
+    }
+
+    /// Age of the oldest open acceptance the node accepted but this frontend
+    /// has not observed on its active chain (#493). Zero when none; -1 when
+    /// tracking is saturated, because an unlanded acceptance may then be
+    /// untracked. Independent of `age()`, which never includes these, and of
+    /// `unknown()`: an unlanded block is a known state, not lost knowledge.
+    pub(super) fn unlanded_age(&self) -> f64 {
         self.blocks
             .values()
-            .filter(|block| !block.closed && !block.unknown_revision && !block.orphan_uncertain)
+            .filter(|block| !block.closed && block.unlanded)
+            .map(|block| block.at)
+            .min()
+            .map_or(if self.saturated { -1. } else { 0. }, |at| {
+                at.elapsed().as_secs_f64()
+            })
     }
 
     /// Whether a known wait is open, which is the only state that attributes
     /// a build deadline to accepted-block revision work. Unknown tracking (a
     /// lost COMMIT reply, an unsettled orphan, saturation, lost ordering) is
-    /// reported by `unknown()`; it is never counted as a delivery failure.
+    /// reported by `unknown()` and an unlanded acceptance by `unlanded_age()`;
+    /// neither is counted as a delivery failure.
     fn known_pending(&self) -> bool {
         !self.ordering_lost && self.known_waits().next().is_some()
     }
@@ -144,10 +194,7 @@ impl Landing {
             );
             newer_at = newer_at.into_iter().chain(event.first()).min();
         }
-        for block in self.blocks.values_mut().filter(|block| !block.closed) {
-            if block.unknown_revision || block.orphan_uncertain {
-                continue;
-            }
+        for block in self.blocks.values_mut().filter(|block| block.known()) {
             let Some(target) = block.revision else {
                 continue;
             };
@@ -195,14 +242,19 @@ impl Metrics {
         event(&mut landing, &mut registry)
     }
 
+    /// See [`Observation::Active`].
     pub(crate) fn accepted_block(&self, hash: &str, height: u64) {
-        self.accept_block(hash, height, false);
+        self.accept_block(hash, height, Observation::Active);
     }
 
-    /// First local proof of an already-confirmed block may associate the
-    /// coherent current revision. It cannot upgrade an earlier acceptance.
+    /// See [`Observation::Unlanded`] (#493).
+    pub(crate) fn accepted_unlanded_block(&self, hash: &str, height: u64) {
+        self.accept_block(hash, height, Observation::Unlanded);
+    }
+
+    /// See [`Observation::Confirmed`].
     pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64) {
-        self.accept_block(hash, height, true);
+        self.accept_block(hash, height, Observation::Confirmed);
     }
 
     /// A committed proven orphan has no delivery target. Close its wait without
@@ -256,14 +308,20 @@ impl Metrics {
         }
     }
 
-    fn accept_block(&self, hash: &str, height: u64, existing_revision: bool) {
+    fn accept_block(&self, hash: &str, height: u64, observation: Observation) {
         self.landing_event(|state, _| {
             let mut identity = [0; 32];
             if hex::decode_to_slice(hash, &mut identity).is_err() {
                 state.saturated = true;
                 return;
             }
-            if state.blocks.contains_key(&identity) {
+            if let Some(block) = state.blocks.get_mut(&identity) {
+                // An active-chain observation lands an earlier accepted offer
+                // on its original acceptance clock. Nothing downgrades a
+                // landed block, and a tombstone stays closed.
+                if observation != Observation::Unlanded && !block.closed {
+                    block.unlanded = false;
+                }
                 return;
             }
             if state.saturated || height <= state.retired_height {
@@ -284,7 +342,8 @@ impl Metrics {
                     awaiting_settlement: false,
                     unknown_revision: false,
                     orphan_uncertain: false,
-                    existing_revision,
+                    existing_revision: observation == Observation::Confirmed,
+                    unlanded: observation == Observation::Unlanded,
                 },
             );
             state.pending_count += 1;
@@ -412,6 +471,11 @@ impl Metrics {
             let mut identity = [0; 32];
             if hex::decode_to_slice(hash, &mut identity).is_ok() {
                 if let Some(block) = state.blocks.get_mut(&identity) {
+                    // Only an active-chain observation reaches a settlement
+                    // COMMIT: whatever its reply, the block is landed (#493).
+                    if !block.closed {
+                        block.unlanded = false;
+                    }
                     if !block.awaiting_settlement {
                         block.awaiting_settlement = true;
                         return true;
@@ -545,10 +609,12 @@ impl Build<'_> {
                 return;
             }
             registry.increment(Family::RevisionWorkTimeouts, Labels::Empty);
+            // An unlanded block has no revision work yet, so a deadline hit
+            // before it lands cannot have degraded its delivery (#493).
             for block in state
                 .blocks
                 .values_mut()
-                .filter(|block| !block.closed && block.at <= self.at)
+                .filter(|block| !block.closed && !block.unlanded && block.at <= self.at)
             {
                 block.degraded.get_or_insert_with(Instant::now);
             }

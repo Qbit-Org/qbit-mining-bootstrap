@@ -97,7 +97,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 67
+            assert len(before) == 78 and len(after) == 72
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -109,7 +109,8 @@ def main():
             paging = {uid: rule for uid, rule in after.items()
                       if uid in native_uids and rule["labels"].get("page") == "true"}
             assert {"qbit-prism-candidate-oldest-critical", "qbit-prism-semantic-coverage-critical",
-                    "qbit-prism-revision-work-pending-critical"} <= set(paging), sorted(paging)
+                    "qbit-prism-revision-work-pending-critical",
+                    "qbit-prism-candidate-landing-failed-critical"} <= set(paging), sorted(paging)
             for uid, rule in paging.items():
                 assert rule["for"] != "0s", uid
                 assert rule["noDataState"] == "OK", uid
@@ -120,6 +121,21 @@ def main():
                 scraped = "up{" in expr and "== 1" in expr
                 assert fresh or scraped, uid
             assert paging["qbit-prism-revision-work-pending-critical"]["for"] == "1m"
+            # #493: the tracking-unknown and unlanded warnings dwell and never page.
+            for uid, dwell in [("qbit-prism-revision-work-unknown", "2m"),
+                               ("qbit-prism-accepted-block-unlanded", "3m"),
+                               ("qbit-prism-block-candidate-stuck", "3m"),
+                               ("qbit-prism-candidate-landing-failed", "3m")]:
+                assert uid not in paging and after[uid]["labels"].get("page") is None, uid
+                assert after[uid]["labels"]["severity"] == "warning" and after[uid]["for"] == dwell, uid
+            assert after["qbit-prism-revision-work-unknown"]["noDataState"] == "Alerting"
+            assert after["qbit-prism-accepted-block-unlanded"]["noDataState"] == "OK"
+            assert after["qbit-prism-revision-work-pending"]["for"] == "0s"
+            # #493: the candidate paging rule reads the unacknowledged age, not the all-unfinished age.
+            critical = json.dumps(after["qbit-prism-candidate-oldest-critical"])
+            assert "qbit_prism_block_candidate_oldest_unacknowledged_seconds{" in critical
+            assert " or on(job, instance, network) qbit_prism_block_candidate_oldest_pending_seconds{" in critical, "no mixed-version fallback"
+            assert paging["qbit-prism-candidate-landing-failed-critical"]["for"] == "1m"
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
@@ -136,7 +152,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 67 proposed rules; 34 external definitions preserved; "
+          "78 original / 72 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 

@@ -46,13 +46,49 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
             .execute(&mut *tx).await?;
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")
             .execute(&mut *tx).await?;
-        let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
-            &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {}", crate::ledger::CandidateState::UNFINISHED_SQL)
-        ).fetch_one(&mut *tx).await?;
+        // One scan of the unfinished rows yields the count and three ages in
+        // the same snapshot (#493). The paging age counts rows the node has
+        // not accepted: pre-offer rows, offered rows whose one submitblock
+        // outcome is unknown (but not a row adopted on the node's evidence
+        // that its block is active), and rows the node definitively rejected
+        // unless the reply names a side-chain block, which is a lost tip
+        // race. A node-accepted lost race awaiting its orphan proof is
+        // unfinished but acknowledged. The landing-failed age is the oldest
+        // reconciliation row whose audit landing has not committed (the
+        // landing transaction is the only writer of the pool-block row, so
+        // its absence is the durable fact) or whose last error names a
+        // landing refusal: a retry that fails for a transient reason
+        // overwrites the error but not the fact. It is measured from the
+        // offer reservation, the start of the post-offer lifecycle, so
+        // pre-offer backoff never counts toward it.
+        let age = |since: &str, rows: &str| format!(
+            "COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min({since}){rows})),0)::double precision"
+        );
+        const UNACKNOWLEDGED: &str = " FILTER (WHERE state IN ('pending','offer_reserved') \
+            OR (offer_outcome='unknown' AND COALESCE(offer_reply,'') NOT LIKE $1) \
+            OR (offer_outcome='rejected' AND COALESCE(offer_reply,'') <> ALL($3)))";
+        const LANDING_FAILED: &str = " FILTER (WHERE state='reconciliation' \
+            AND (COALESCE(last_error,'') LIKE $2 \
+                 OR NOT EXISTS (SELECT 1 FROM qbit_pool_blocks landed WHERE landed.block_hash=outbox.block_hash)))";
+        let census = format!(
+            "SELECT count(*), {all}, {unacknowledged}, {landing_failed} \
+             FROM qbit_block_candidate_outbox outbox WHERE state IN {unfinished}",
+            all = age("created_at", ""),
+            unacknowledged = age("created_at", UNACKNOWLEDGED),
+            landing_failed = age("COALESCE(offer_reserved_at,created_at)", LANDING_FAILED),
+            unfinished = crate::ledger::CandidateState::UNFINISHED_SQL,
+        );
+        let (candidates, candidate_age, unacknowledged_age, landing_failed_age): (i64, f64, f64, f64) =
+            sqlx::query_as(&census)
+                .bind(format!("{}%", crate::ledger::ADOPTED_OFFER_REPLY_PREFIX))
+                .bind(format!("{}%", crate::ledger::LANDING_FAILED_REASON_PREFIX))
+                .bind(crate::ledger::SIDE_CHAIN_REPLIES)
+                .fetch_one(&mut *tx)
+                .await?;
         let partition_lead_rows: Option<i64> = sqlx::query_scalar(
             "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"
         ).fetch_one(&mut *tx).await?;
-        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, partition_lead_rows };
+        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, candidate_oldest_unacknowledged: seconds(unacknowledged_age)?, candidate_oldest_landing_failed: seconds(landing_failed_age)?, partition_lead_rows };
         // One bounded identity lookup in this same read-only snapshot. Terminal
         // processing state stays orphaned even if a later reorg credits it.
         // Never load retained history or add I/O to work publication/scrapes.

@@ -1810,8 +1810,7 @@ impl Coordinator {
         // pre-offer probe adopts an active pending block: from this commit
         // on, no claim on any frontend offers it, whatever happens next.
         if claim.lifecycle.state == CandidateState::Pending {
-            let evidence =
-                format!("node reports block {block} active at height {height} with tip {tip}");
+            let evidence = crate::ledger::adoption_evidence(block, height, &tip);
             let reason = format!(
                 "adopted by operator recovery before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
             );
@@ -2217,9 +2216,12 @@ impl Coordinator {
         // sample is ever emitted for a call that never began.
         self.observe_first_offer(claim, offered_at_ms);
         let (outcome, reply) = classify_offer(&result);
+        // A definitive acceptance is not an active-chain observation: the
+        // block may have lost a tip race. The landing observation below or a
+        // later reconcile proof lands it; a proven orphan closes it (#493).
         if outcome == OfferOutcome::Accepted {
             self.metrics
-                .accepted_block(&candidate.block_hash, candidate.found_block.block_height);
+                .accepted_unlanded_block(&candidate.block_hash, candidate.found_block.block_height);
         }
         self.ledger
             .record_offer(claim, offered_at_ms, outcome, reply.as_deref())
@@ -2242,9 +2244,10 @@ impl Coordinator {
         lease: CandidateLease,
         tip: &str,
     ) -> Result<()> {
-        let evidence = format!(
-            "node reports block {} active at height {} with tip {tip}",
-            claim.candidate.block_hash, claim.candidate.found_block.block_height
+        let evidence = crate::ledger::adoption_evidence(
+            &claim.candidate.block_hash,
+            claim.candidate.found_block.block_height,
+            tip,
         );
         let reason = format!(
             "adopted before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
@@ -2306,7 +2309,10 @@ impl Coordinator {
     ) -> Result<()> {
         let block = &claim.candidate.block_hash;
         if let Err(reason) = self.land_offered(claim, lease).await? {
-            let reason = format!("landing failed after the offer ({offer}): {reason}");
+            let reason = format!(
+                "{} ({offer}): {reason}",
+                crate::ledger::LANDING_FAILED_REASON_PREFIX
+            );
             tracing::error!(
                 %block,
                 %reason,

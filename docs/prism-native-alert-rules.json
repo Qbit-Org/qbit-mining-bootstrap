@@ -454,7 +454,7 @@
       "uid": "qbit-prism-candidate-oldest-critical",
       "title": "PrismBlockCandidateOldestPendingCritical",
       "role": "run",
-      "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 60) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "expr": "((qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} or on(job, instance, network) qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"}) >= bool 60) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -466,10 +466,95 @@
         "page": "true"
       },
       "summary": "PrismBlockCandidateOldestPendingCritical",
-      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Pages only on a found block the node has not accepted (#493): pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (a transport failure or timeout, or a reservation whose call was lost with its frontend; not a row adopted on the node's own evidence that its block is active), and rows the node definitively rejected unless the reply names a side-chain block (inconclusive, duplicate, duplicate-inconclusive), read from the same database snapshot as the all-unfinished gauges. A rejection such as bad-txnmrklroot, high-hash, bad-cb-* or duplicate-invalid means the pool offered an invalid block, which is the emergency this rule exists for, and it keeps paging exactly as before. A node-accepted lost race sits in reconciliation until a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height; that is expected and never pages here. An unknown outcome keeps paging because receipt is unproven: the block may never have reached the node and is never offered again, so it is indistinguishable from an unoffered block until the chain proves an orphan or a later observation lands it. A landing that keeps failing after acceptance is owned by the landing-failed rules; every other unfinished row by the stuck warning. Mixed-version rollout: on a target that does not export the unacknowledged series yet, the expression falls back to the all-unfinished age, so the base paging behaviour (including its lost-race page) persists there until that frontend is upgraded; deploy frontends first. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "basis": "Pages only on a found block the node has not accepted (#493): pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (a transport failure or timeout, or a reservation whose call was lost with its frontend; not a row adopted on the node's own evidence that its block is active), and rows the node definitively rejected unless the reply names a side-chain block (inconclusive, duplicate, duplicate-inconclusive), read from the same database snapshot as the all-unfinished gauges. A rejection such as bad-txnmrklroot, high-hash, bad-cb-* or duplicate-invalid means the pool offered an invalid block, which is the emergency this rule exists for, and it keeps paging exactly as before. A node-accepted lost race sits in reconciliation until a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height; that is expected and never pages here. An unknown outcome keeps paging because receipt is unproven: the block may never have reached the node and is never offered again, so it is indistinguishable from an unoffered block until the chain proves an orphan or a later observation lands it. A landing that keeps failing after acceptance is owned by the landing-failed rules; every other unfinished row by the stuck warning. Mixed-version rollout: on a target that does not export the unacknowledged series yet, the expression falls back to the all-unfinished age, so the base paging behaviour (including its lost-race page) persists there until that frontend is upgraded; deploy frontends first. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-block-candidate-stuck",
+      "title": "PrismBlockCandidateStuck",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 1800) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateStuck",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. An unfinished candidate row older than 30 minutes (#493), read from the all-unfinished gauge: an offered row in reconciliation whose chain verdict is not arriving, a node-rejected block, or a landing that keeps failing after acceptance. A lost tip race is proven orphan within a few block intervals (six competitor confirmations at the 60-second target spacing plus the reconciliation retry backoff) and leaves this gauge well inside the threshold, aligned with PrismAcceptedBlockUnlanded. The reconciliation backoff is ten seconds times the row's attempt count, capped at an hour, and the count includes the pre-offer attempts, so the cumulative wait to the k-th retry is about 5k(k+1) seconds: the sixth competitor confirmation at 60-second spacing is reached around the eighth retry, about nine minutes, well inside 30 minutes, while a row that needed many pre-offer attempts starts its backoff higher and reaches 30 minutes in a few retries. Pre-offer, unknown-outcome and rejected rows already page at 60 seconds through PrismBlockCandidateOldestPendingCritical and a failing landing through the landing-failed rules; this warning is the non-paging catch-all for the rest, which is operator work (the row's last_error names the reason). Three-minute dwell like the other candidate warnings. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "An unfinished candidate row older than 30 minutes (#493), read from the all-unfinished gauge: an offered row in reconciliation whose chain verdict is not arriving, a node-rejected block, or a landing that keeps failing after acceptance. A lost tip race is proven orphan within a few block intervals (six competitor confirmations at the 60-second target spacing plus the reconciliation retry backoff) and leaves this gauge well inside the threshold, aligned with PrismAcceptedBlockUnlanded. The reconciliation backoff is ten seconds times the row's attempt count, capped at an hour, and the count includes the pre-offer attempts, so the cumulative wait to the k-th retry is about 5k(k+1) seconds: the sixth competitor confirmation at 60-second spacing is reached around the eighth retry, about nine minutes, well inside 30 minutes, while a row that needed many pre-offer attempts starts its backoff higher and reaches 30 minutes in a few retries. Pre-offer, unknown-outcome and rejected rows already page at 60 seconds through PrismBlockCandidateOldestPendingCritical and a failing landing through the landing-failed rules; this warning is the non-paging catch-all for the rest, which is operator work (the row's last_error names the reason). Three-minute dwell like the other candidate warnings. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-candidate-landing-failed",
+      "title": "PrismBlockCandidateLandingFailed",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 60) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateLandingFailed",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. A reconciliation row whose audit landing has not succeeded after the offer (#493): the landing transaction is the only writer of the block's pool-block row, so its absence is the durable fact the collector reads, and a last_error naming a landing refusal (a prefix the coordinator and the collector share) covers a landed row that no longer authenticates; a retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but cannot make this age read zero while nothing has landed. The node accepted or rejected the block, the audit rebuild, its verification or the ledger landing refused, and the row is retried at the reconciliation backoff with read-only chain observations only. The age is measured from the offer reservation, the start of the post-offer lifecycle and the same instant the frontend's acceptance clock starts, so pre-offer retry backoff never counts toward it. Never a lost race: a lost race carries the not-active reason, and a rejection carries its reply, so this age is zero for both. What is at risk is the block's audit, its pool-block row, the deferred solver credit and the next payout revision, which the successful landing writes; the block reward is on the chain regardless. Warning at 60 seconds for three minutes: a transient refusal (a rebuild deadline under a brief database stall) lands on the first retry ten seconds later and never reaches the dwell; the same shape as the pre-#493 candidate critical, without the page. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "A reconciliation row whose audit landing has not succeeded after the offer (#493): the landing transaction is the only writer of the block's pool-block row, so its absence is the durable fact the collector reads, and a last_error naming a landing refusal (a prefix the coordinator and the collector share) covers a landed row that no longer authenticates; a retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but cannot make this age read zero while nothing has landed. The node accepted or rejected the block, the audit rebuild, its verification or the ledger landing refused, and the row is retried at the reconciliation backoff with read-only chain observations only. The age is measured from the offer reservation, the start of the post-offer lifecycle and the same instant the frontend's acceptance clock starts, so pre-offer retry backoff never counts toward it. Never a lost race: a lost race carries the not-active reason, and a rejection carries its reply, so this age is zero for both. What is at risk is the block's audit, its pool-block row, the deferred solver credit and the next payout revision, which the successful landing writes; the block reward is on the chain regardless. Warning at 60 seconds for three minutes: a transient refusal (a rebuild deadline under a brief database stall) lands on the first retry ten seconds later and never reaches the dwell; the same shape as the pre-#493 candidate critical, without the page. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-candidate-landing-failed-critical",
+      "title": "PrismBlockCandidateLandingFailedCritical",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 307) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismBlockCandidateLandingFailedCritical",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. A reconciliation row whose audit landing has not succeeded after the offer (#493): the landing transaction is the only writer of the block's pool-block row, so its absence is the durable fact the collector reads, and a last_error naming a landing refusal (a prefix the coordinator and the collector share) covers a landed row that no longer authenticates; a retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but cannot make this age read zero while nothing has landed. The node accepted or rejected the block, the audit rebuild, its verification or the ledger landing refused, and the row is retried at the reconciliation backoff with read-only chain observations only. The age is measured from the offer reservation, the start of the post-offer lifecycle and the same instant the frontend's acceptance clock starts, so pre-offer retry backoff never counts toward it. Never a lost race: a lost race carries the not-active reason, and a rejection carries its reply, so this age is zero for both. What is at risk is the block's audit, its pool-block row, the deferred solver credit and the next payout revision, which the successful landing writes; the block reward is on the chain regardless. Pages at 307 seconds for one minute, the same floor and dwell as PrismAcceptedRevisionWorkPendingCritical: a landing that fails after the frontend's own active-chain observation already pages that rule at 307 s (the landed identity is a known wait with no revision to deliver), and a landing that fails before it now pages here at the same instant, so a won block whose ledger landing keeps failing is never silent whichever step refused. By 307 seconds the row has been retried about eight times at the reconciliation backoff (ten seconds times the attempt count), so the failure is persistent, never a single deadline. Gated like the other candidate rules on a fresh snapshot and an available collector; no-data and evaluation errors are OK because the unavailable warning owns the missing measurement. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "A reconciliation row whose audit landing has not succeeded after the offer (#493): the landing transaction is the only writer of the block's pool-block row, so its absence is the durable fact the collector reads, and a last_error naming a landing refusal (a prefix the coordinator and the collector share) covers a landed row that no longer authenticates; a retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but cannot make this age read zero while nothing has landed. The node accepted or rejected the block, the audit rebuild, its verification or the ledger landing refused, and the row is retried at the reconciliation backoff with read-only chain observations only. The age is measured from the offer reservation, the start of the post-offer lifecycle and the same instant the frontend's acceptance clock starts, so pre-offer retry backoff never counts toward it. Never a lost race: a lost race carries the not-active reason, and a rejection carries its reply, so this age is zero for both. What is at risk is the block's audit, its pool-block row, the deferred solver credit and the next payout revision, which the successful landing writes; the block reward is on the chain regardless. Pages at 307 seconds for one minute, the same floor and dwell as PrismAcceptedRevisionWorkPendingCritical: a landing that fails after the frontend's own active-chain observation already pages that rule at 307 s (the landed identity is a known wait with no revision to deliver), and a landing that fails before it now pages here at the same instant, so a won block whose ledger landing keeps failing is never silent whichever step refused. By 307 seconds the row has been retried about eight times at the reconciliation backoff (ten seconds times the attempt count), so the failure is persistent, never a single deadline. Gated like the other candidate rules on a fresh snapshot and an available collector; no-data and evaluation errors are OK because the unavailable warning owns the missing measurement. Provisional, measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L67",
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",
@@ -483,7 +568,7 @@
       "uid": "qbit-prism-candidate-metrics-unavailable",
       "title": "PrismBlockCandidateMetricsUnavailable",
       "role": "run",
-      "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == bool 0) or on(job, instance, network) (qbit_prism_block_candidates_pending{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) or on(job, instance, network) (qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)",
+      "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == bool 0) or on(job, instance, network) (qbit_prism_block_candidates_pending{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) or on(job, instance, network) (qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) or on(job, instance, network) (qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) or on(job, instance, network) (qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -494,10 +579,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismBlockCandidateMetricsUnavailable",
-      "description": "Database candidate age/count are unknown, not zero; collector state is live at scrape time. Collector failure, cancellation or expiry after 30 seconds invalidates both gauges.",
+      "description": "Database candidate age/count are unknown, not zero; collector state is live at scrape time. Collector failure, cancellation or expiry after 30 seconds invalidates all four gauges, the unacknowledged and landing-failed ages included (#493).",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
-      "basis": "Collector failure, cancellation or expiry after 30 seconds invalidates both gauges.",
+      "basis": "Collector failure, cancellation or expiry after 30 seconds invalidates all four gauges, the unacknowledged and landing-failed ages included (#493).",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L66",
         "crates/qbit-prism-server/src/metrics/registry.rs#L67",
@@ -747,7 +832,7 @@
       "uid": "qbit-prism-revision-work-pending",
       "title": "PrismAcceptedRevisionWorkPending",
       "role": "run",
-      "expr": "clamp_max((((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 1) + (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)), 1)",
+      "expr": "clamp_max(((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 1) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0), 1)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -758,10 +843,35 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismAcceptedRevisionWorkPending",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Missing series on a configured target and failed scrapes also warn. Unknown tracking (a -1 age, the tracking-unknown gauge, or a missing unknown gauge) is owned by PrismAcceptedRevisionWorkTrackingUnknown, which dwells so a single failed refresh does not warn (#493); a known pending age beside unknown tracking still warns here and remains eligible for the critical rule. An offer the node accepted but has not reported active is an unlanded acceptance, excluded from this age and owned by PrismAcceptedBlockUnlanded (#493).",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
-      "basis": "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Unknown tracking, missing series on a configured target and failed scrapes also warn. The separate tracking-unknown gauge preserves warnings while a known pending age remains eligible for the critical rule; a missing unknown gauge also warns during mixed-version rollout.",
+      "basis": "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, not a measured production percentile; measure in #291. Missing series on a configured target and failed scrapes also warn. Unknown tracking (a -1 age, the tracking-unknown gauge, or a missing unknown gauge) is owned by PrismAcceptedRevisionWorkTrackingUnknown, which dwells so a single failed refresh does not warn (#493); a known pending age beside unknown tracking still warns here and remains eligible for the critical rule. An offer the node accepted but has not reported active is an unlanded acceptance, excluded from this age and owned by PrismAcceptedBlockUnlanded (#493).",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum.rs"
+      ]
+    },
+    {
+      "uid": "qbit-prism-revision-work-unknown",
+      "title": "PrismAcceptedRevisionWorkTrackingUnknown",
+      "role": "run",
+      "expr": "clamp_max((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) + on(job, instance, network) ((qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"} + 1)), 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "2m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismAcceptedRevisionWorkTrackingUnknown",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Unknown or incomplete local landing tracking (#493 point 7): the pending age is -1 (no known wait remains but tracking is unknown), the tracking-unknown gauge is one beside any known age, or the unknown gauge is missing on a configured target during a mixed-version rollout. Two-minute dwell: a failed template refresh marks tracking unknown only until the next successful refresh, one poll interval later (two seconds by default), so a single transient refresh error cannot span the eight consecutive 15-second scrapes this dwell requires, while a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation and lost ordering history persist until terminal evidence or restart and still warn. No-data and evaluation errors alert so a missing measurement stays visible after the same dwell. Non-paging: the critical rule owns known stalls and gates out unknown ages itself; the pending warning owns the no-dwell budget signal. Measure the dwell in #291.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Unknown or incomplete local landing tracking (#493 point 7): the pending age is -1 (no known wait remains but tracking is unknown), the tracking-unknown gauge is one beside any known age, or the unknown gauge is missing on a configured target during a mixed-version rollout. Two-minute dwell: a failed template refresh marks tracking unknown only until the next successful refresh, one poll interval later (two seconds by default), so a single transient refresh error cannot span the eight consecutive 15-second scrapes this dwell requires, while a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation and lost ordering history persist until terminal evidence or restart and still warn. No-data and evaluation errors alert so a missing measurement stays visible after the same dwell. Non-paging: the critical rule owns known stalls and gates out unknown ages itself; the pending warning owns the no-dwell budget signal. Measure the dwell in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",
@@ -784,10 +894,10 @@
         "page": "true"
       },
       "summary": "PrismAcceptedRevisionWorkPendingCritical",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gates (#493): the age must be known (not -1), the target scraped, and at least one authorized miner on the reporting frontend, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. The pending gauge is a live overlay rendered on every scrape, so it is not gated on the metrics snapshot: a database-pool stall that also stalls the health publisher must still page. The miner count is a snapshot family and may be a few refresh intervals old while the snapshot is stale; a false page on a frontend whose miners left inside that window is accepted in exchange for never missing a real stall. If every miner leaves a frontend during a stall, this page resolves and nothing else pages for that frontend: the coverage rules cannot fire with zero authorized clients and the connected-clients rule is a cluster-wide non-paging warning; the pending warning keeps reporting the age until a miner reconnects and receives work. One-minute dwell: the gauge is monotonic during a stall, so the dwell only absorbs a brief gate gap and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rule owns missing or unknown measurements. The floor and dwell are literals in this specification, not deployment variables. A lost race on the offering frontend still pages until its orphan proof; that is a metric-semantics question tracked separately. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gates (#493): the age must be known (not -1), the target scraped, and at least one authorized miner on the reporting frontend, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. The pending gauge is a live overlay rendered on every scrape, so it is not gated on the metrics snapshot: a database-pool stall that also stalls the health publisher must still page. The miner count is a snapshot family and may be a few refresh intervals old while the snapshot is stale; a false page on a frontend whose miners left inside that window is accepted in exchange for never missing a real stall. If every miner leaves a frontend during a stall, this page resolves and nothing else pages for that frontend: the coverage rules cannot fire with zero authorized clients and the connected-clients rule is a cluster-wide non-paging warning; the pending warning keeps reporting the age until a miner reconnects and receives work. One-minute dwell: the gauge is monotonic during a stall, so the dwell only absorbs a brief gate gap and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rules own missing or unknown measurements. The floor and dwell are literals in this specification, not deployment variables. A lost race on the offering frontend never counts here (#493 point 1): an offer the node accepted without an active-chain observation is an unlanded acceptance, excluded from the known pending age until an active-chain observation lands it or its orphan is proven, and reported by accepted_block_unlanded_seconds and PrismAcceptedBlockUnlanded instead. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gates (#493): the age must be known (not -1), the target scraped, and at least one authorized miner on the reporting frontend, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. The pending gauge is a live overlay rendered on every scrape, so it is not gated on the metrics snapshot: a database-pool stall that also stalls the health publisher must still page. The miner count is a snapshot family and may be a few refresh intervals old while the snapshot is stale; a false page on a frontend whose miners left inside that window is accepted in exchange for never missing a real stall. If every miner leaves a frontend during a stall, this page resolves and nothing else pages for that frontend: the coverage rules cannot fire with zero authorized clients and the connected-clients rule is a cluster-wide non-paging warning; the pending warning keeps reporting the age until a miner reconnects and receives work. One-minute dwell: the gauge is monotonic during a stall, so the dwell only absorbs a brief gate gap and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rule owns missing or unknown measurements. The floor and dwell are literals in this specification, not deployment variables. A lost race on the offering frontend still pages until its orphan proof; that is a metric-semantics question tracked separately. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
+      "basis": "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. Gates (#493): the age must be known (not -1), the target scraped, and at least one authorized miner on the reporting frontend, because a frontend with no connected miners has no mining.notify write that can close its wait and would otherwise page after every pool block. The pending gauge is a live overlay rendered on every scrape, so it is not gated on the metrics snapshot: a database-pool stall that also stalls the health publisher must still page. The miner count is a snapshot family and may be a few refresh intervals old while the snapshot is stale; a false page on a frontend whose miners left inside that window is accepted in exchange for never missing a real stall. If every miner leaves a frontend during a stall, this page resolves and nothing else pages for that frontend: the coverage rules cannot fire with zero authorized clients and the connected-clients rule is a cluster-wide non-paging warning; the pending warning keeps reporting the age until a miner reconnects and receives work. One-minute dwell: the gauge is monotonic during a stall, so the dwell only absorbs a brief gate gap and stays well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rules own missing or unknown measurements. The floor and dwell are literals in this specification, not deployment variables. A lost race on the offering frontend never counts here (#493 point 1): an offer the node accepted without an active-chain observation is an unlanded acceptance, excluded from the known pending age until an active-chain observation lands it or its orphan is proven, and reported by accepted_block_unlanded_seconds and PrismAcceptedBlockUnlanded instead. Measure thresholds and scrape/evaluation delay in #291; no operational deployment is claimed.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",
@@ -809,10 +919,35 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismRevisionWorkBuildTimeouts",
-      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the pending warning reports the unknown state instead.",
+      "description": "Acceptance is observed locally; completion requires an actual successful mining.notify write at the post-landing revision. Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the tracking-unknown warning reports the unknown state instead.",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
-      "basis": "Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the pending warning reports the unknown state instead.",
+      "basis": "Any existing build deadline hit while locally observed accepted work awaits delivery; five-minute increase window is provisional, measure in #291. Successful builds and cancellation do not increment the counter. Only a known open wait counts (#493): while this frontend's tracking is unknown and no known wait remains, a deadline hit is an ordinary job-delivery failure, not a revision-work failure, and the tracking-unknown warning reports the unknown state instead.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum.rs"
+      ]
+    },
+    {
+      "uid": "qbit-prism-accepted-block-unlanded",
+      "title": "PrismAcceptedBlockUnlanded",
+      "role": "run",
+      "expr": "(qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 1800)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismAcceptedBlockUnlanded",
+      "description": "Acceptance is observed locally; an unlanded acceptance has no revision work to deliver yet. An offer the node accepted (a null submitblock reply) that this frontend has not observed on the node's active chain for 30 minutes (#493 point 1). A lost tip race is settled as a proven orphan once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS (default 6) confirmations at its height: about six minutes at the 60-second target spacing plus the reconciliation retry backoff, so a routine lost race leaves this gauge well inside the threshold. The reconciliation backoff is ten seconds times the row's attempt count, capped at an hour, and the count includes the pre-offer attempts, so the cumulative wait to the k-th retry is about 5k(k+1) seconds: the sixth competitor confirmation at 60-second spacing is reached around the eighth retry, about nine minutes, well inside 30 minutes, while a row that needed many pre-offer attempts starts its backoff higher and reaches 30 minutes in a few retries. Such an acceptance is never part of the known pending age, so the revision-work critical cannot page on it; a winning offer leaves this gauge at its first active-chain observation and joins the known age on its original acceptance clock. Past 30 minutes the row is not being reconciled, the node is not advancing, or the orphan verdict keeps failing: operator work, warned, never paged; the cluster-wide candidate oldest-pending rules see the same reconciliation row. -1 (none tracked while identity tracking is saturated) is owned by the tracking-unknown warning and does not fire here. Three-minute dwell like the other warnings; no-data is OK because the pending warning already reports a missing landing family. Provisional; measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "An offer the node accepted (a null submitblock reply) that this frontend has not observed on the node's active chain for 30 minutes (#493 point 1). A lost tip race is settled as a proven orphan once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS (default 6) confirmations at its height: about six minutes at the 60-second target spacing plus the reconciliation retry backoff, so a routine lost race leaves this gauge well inside the threshold. The reconciliation backoff is ten seconds times the row's attempt count, capped at an hour, and the count includes the pre-offer attempts, so the cumulative wait to the k-th retry is about 5k(k+1) seconds: the sixth competitor confirmation at 60-second spacing is reached around the eighth retry, about nine minutes, well inside 30 minutes, while a row that needed many pre-offer attempts starts its backoff higher and reaches 30 minutes in a few retries. Such an acceptance is never part of the known pending age, so the revision-work critical cannot page on it; a winning offer leaves this gauge at its first active-chain observation and joins the known age on its original acceptance clock. Past 30 minutes the row is not being reconciled, the node is not advancing, or the orphan verdict keeps failing: operator work, warned, never paged; the cluster-wide candidate oldest-pending rules see the same reconciliation row. -1 (none tracked while identity tracking is saturated) is owned by the tracking-unknown warning and does not fire here. Three-minute dwell like the other warnings; no-data is OK because the pending warning already reports a missing landing family. Provisional; measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs",
         "crates/qbit-prism-server/src/metrics/landing.rs",

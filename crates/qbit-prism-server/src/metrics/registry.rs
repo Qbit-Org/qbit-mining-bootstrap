@@ -70,9 +70,12 @@ families! {
     RevisionWork: Histogram, "accepted_block_to_revision_work_seconds", "Frontend-local definitive acceptance observation to first successful mining.notify write carrying compatible post-landing payout work, in seconds; each frontend samples every block from its own observation, so a sum across instances counts one block once per frontend.";
     RevisionWorkPending: Gauge, "accepted_block_revision_work_pending_seconds", "Monotonic age of the oldest known locally observed acceptance awaiting revision work delivery; -1 when only unknown tracking remains, zero when none; each frontend tracks every block it observes, and a frontend with no connected miners keeps waiting.";
     RevisionWorkUnknown: Gauge, "accepted_block_revision_work_tracking_unknown", "Whether any local landing observation is unknown or incomplete; independent of known pending delivery age.";
+    AcceptedUnlanded: Gauge, "accepted_block_unlanded_seconds", "Monotonic age of the oldest definitive submitblock acceptance this frontend has not yet observed on the node's active chain, such as a lost tip race until its orphan proof; never part of the known pending delivery age; zero when none, -1 when none is tracked and identity tracking is saturated; while the terminal probe that carries peer orphan evidence fails, the pending gauge reads -1 and the tracking-unknown gauge one even if only unlanded acceptances are open.";
     RevisionWorkTimeouts: Counter, "revision_work_build_timeouts_total", "Existing build deadlines actually hit while a known accepted-block revision work wait is open on this frontend; deadlines hit while only unknown tracking remains are not counted.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
+    CandidateUnacknowledgedAge: Gauge, "block_candidate_oldest_unacknowledged_seconds", "Oldest cluster-wide candidate age the node has not accepted: pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (not a row adopted on the node's active-chain evidence), and rows the node rejected unless the reply names a side-chain block; zero when every unfinished row was accepted, or -1 when unknown.";
+    CandidateLandingFailedAge: Gauge, "block_candidate_oldest_landing_failed_seconds", "Oldest cluster-wide time since the offer reservation of a reconciliation row whose audit landing has not committed (no pool-block row) or whose last error names a landing refusal; zero when none, or -1 when unknown.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
     PoolAcquire: Histogram, "database_pool_acquire_seconds", "Actual database pool acquisition wait by outcome.";
     LockWait: Histogram, "database_advisory_lock_wait_seconds", "Database advisory transaction lock wait by lock and outcome.";
@@ -138,6 +141,7 @@ impl Family {
                     | Self::RevisionWork
                     | Self::RevisionWorkPending
                     | Self::RevisionWorkUnknown
+                    | Self::AcceptedUnlanded
                     | Self::RevisionWorkTimeouts
             )
     }
@@ -147,6 +151,8 @@ impl Family {
             self,
             Self::Candidates
                 | Self::CandidateAge
+                | Self::CandidateUnacknowledgedAge
+                | Self::CandidateLandingFailedAge
                 | Self::PartitionLead
                 | Self::Rss
                 | Self::CollectorAvailable
