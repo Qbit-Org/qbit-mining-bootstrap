@@ -12,6 +12,7 @@ use submit_ledger::CommitGate;
 
 mod admission_races;
 mod authority_lease;
+mod block_only;
 mod blockwait;
 mod candidate_preparation;
 mod commit_reconcile;

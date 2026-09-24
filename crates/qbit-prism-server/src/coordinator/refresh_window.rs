@@ -1,11 +1,23 @@
 //! One anchored window per refresh loop, never retained by issued work.
 use super::*;
 use prepared_storage::compact::{
-    finish_refresh_body, prepare_refresh_body_unhashed, CanonicalCompactBalances, CompactOwner,
-    RefreshBody,
+    finish_refresh_body_with, prepare_refresh_body_unhashed_with, CanonicalCompactBalances,
+    CompactOwner, RefreshBody,
 };
 
 mod compute;
+
+/// The refresh build's parallelism (share-array serialization, counted-share
+/// fold, leaf and suffix): the process's builder pool as configured or
+/// detected once; tests force many small chunks so the ordered path is
+/// exercised on any host.
+pub(in crate::coordinator) fn refresh_parallelism() -> qbit_prism::Parallelism {
+    if cfg!(test) {
+        return qbit_prism::Parallelism::new(3, 5);
+    }
+    static DETECTED: std::sync::OnceLock<qbit_prism::Parallelism> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(qbit_prism::Parallelism::detect)
+}
 
 pub(super) type CachedWindow = Arc<RefreshWindow>;
 type CapturedWindow = CompactOwner<(
@@ -75,6 +87,11 @@ impl Coordinator {
                 prior,
             )
             .await?;
+        // The anchor transaction's revision is the one this work will carry;
+        // record it before the build so the landing metric sees it as early
+        // as the ledger probe it replaces did.
+        self.metrics
+            .revision_work_observed(snapshot.snapshot.payout_revision);
         let source = CompactOwner::new((snapshot, permit))
             .spawn_blocking(move |(snapshot, permit)| {
                 let admission = permit;
@@ -88,18 +105,29 @@ impl Coordinator {
             })
             .await?;
         let config = self.config.clone();
+        let parallelism = refresh_parallelism();
         let computed = compute::pipeline(
             source,
-            |capture| {
-                Ok(qbit_prism::CanonicalAuditHashPrefix::new(
+            // One pass over the accepted shares feeds the canonical audit
+            // prefix and the WindowRef's share-array digest together.
+            move |capture| {
+                Ok(qbit_prism::CanonicalAuditHashPrefix::new_with_share_digest(
                     &capture.snapshot.shares,
+                    parallelism,
                 )?)
             },
-            |capture| WindowRef::from_snapshot(&capture.snapshot),
+            |capture, digest| WindowRef::from_snapshot_with_digest(&capture.snapshot, digest?),
             move |capture| {
-                prepare_refresh_body_unhashed(&config, &capture.snapshot, &template, suffix, inputs)
+                prepare_refresh_body_unhashed_with(
+                    &config,
+                    &capture.snapshot,
+                    &template,
+                    suffix,
+                    inputs,
+                    parallelism,
+                )
             },
-            finish_refresh_body,
+            move |prefix, body| finish_refresh_body_with(prefix, body, parallelism),
         )
         .await?;
         computed

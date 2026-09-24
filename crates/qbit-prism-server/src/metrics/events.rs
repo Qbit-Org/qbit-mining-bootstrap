@@ -85,6 +85,34 @@ impl Metrics {
     /// Record one offered candidate settled as a proven orphan (#415), once
     /// the ledger committed the terminal disposition. Attributed to the
     /// settlement event, never to an observation that failed to settle.
+    /// #478: one offer decision for a pending block on the current tip whose
+    /// payout revision was superseded.
+    pub fn record_capture_decision(&self, decision: CaptureDecision) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::CaptureOfferDecisions,
+                Labels::One(("decision", decision.as_str())),
+            );
+    }
+    /// #478: one committed divergent confirmation (a landed block's rows
+    /// started to count on balances other than its as-issued ones) and the
+    /// debt it created.
+    pub fn record_divergent_landing(&self, overpay_sats: u64) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.increment(Family::DivergentLandings, vec![]);
+        registry.add(Family::DivergentOverpay, vec![], overpay_sats as f64);
+    }
+    /// The pool's total carry-forward debt, read from the canonical balances
+    /// after a balance change or a full refresh this process committed.
+    pub fn record_carry_forward_debt(&self, pool_debt_sats: u64) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
+            Family::CarryForwardDebt,
+            vec![],
+            pool_debt_sats as f64,
+        );
+    }
     pub fn record_candidate_orphaned(&self) {
         self.inner
             .lock()

@@ -169,12 +169,31 @@ impl WindowRef {
     /// the reference does not depend on that order and the read path never
     /// re-sorts the vector it returns.
     pub fn from_snapshot(snapshot: &Snapshot) -> Result<Self> {
+        Self::from_snapshot_with(snapshot, || share_array_digest(&snapshot.shares))
+    }
+
+    /// [`WindowRef::from_snapshot`] with `snapshot_sha256` already computed
+    /// by the caller as `sha256(serde_json::to_vec(&snapshot.shares))` over
+    /// this same snapshot: the refresh pipeline's single pass over the share
+    /// array feeds this digest and the canonical audit prefix together. The
+    /// digest is not checked here; an empty snapshot ignores it.
+    pub fn from_snapshot_with_digest(
+        snapshot: &Snapshot,
+        snapshot_sha256: [u8; 32],
+    ) -> Result<Self> {
+        Self::from_snapshot_with(snapshot, || Ok(snapshot_sha256))
+    }
+
+    fn from_snapshot_with(
+        snapshot: &Snapshot,
+        snapshot_sha256: impl FnOnce() -> Result<[u8; 32]>,
+    ) -> Result<Self> {
         let shares = match (snapshot.shares.first(), snapshot.shares.last()) {
             (Some(first), Some(last)) => Some(ShareRange {
                 first_share_seq: first.share_seq,
                 last_share_seq: last.share_seq,
                 share_count: u64::try_from(snapshot.shares.len())?,
-                snapshot_sha256: share_array_digest(&snapshot.shares)?,
+                snapshot_sha256: snapshot_sha256()?,
             }),
             _ => None,
         };
@@ -836,6 +855,10 @@ impl Ledger {
         let rows = prior_balance_rows(&mut tx).await?;
         #[cfg(test)]
         let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
+        // #478: every account's debt, summed on the decoding thread, for the
+        // carry-forward debt gauge.
+        let debt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let debt_sum = debt.clone();
         let prior_balances = completion
             .own(rows)
             .map_anyhow(move |rows| {
@@ -843,10 +866,23 @@ impl Ledger {
                 if let Some(hook) = decode_hook {
                     hook("balances");
                 }
-                decode_prior_balances(rows)
+                let balances = decode_prior_balances(rows)?;
+                let sum: i128 = balances
+                    .iter()
+                    .map(|balance| (-balance.balance_sats).max(0))
+                    .sum();
+                debt_sum.store(
+                    u64::try_from(sum).unwrap_or(u64::MAX - 1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(balances)
             })
             .await?;
         tx.commit().await?;
+        let debt = debt.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.as_deref().filter(|_| debt != u64::MAX) {
+            metrics.record_carry_forward_debt(debt);
+        }
         // Ledger rows are immutable and later commits receive a timestamp
         // strictly greater than this anchor. Release the ordering barrier
         // before scanning a potentially large payout window.

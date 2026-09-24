@@ -5,9 +5,9 @@ use super::{
 use qbit_prism_server::{
     api::router,
     metrics::{
-        AckResult, Collector, ConnectionRefusalReason, DatabaseMetrics, DeliveryMetrics, LockKind,
-        Metrics, Outcome, ProcessMetrics, RefreshAcquisition, RefreshTrigger, RejectReason,
-        StaleJobCause, TaskKind, WindowAcquisition,
+        AckResult, CaptureDecision, Collector, ConnectionRefusalReason, DatabaseMetrics,
+        DeliveryMetrics, LockKind, Metrics, Outcome, ProcessMetrics, RefreshAcquisition,
+        RefreshTrigger, RejectReason, StaleJobCause, TaskKind, WindowAcquisition,
     },
     stratum::StratumStats,
 };
@@ -20,8 +20,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     let startup = running_scrape(router(state.clone()), &[]).await;
     contract::validate(&startup, false).unwrap();
     let startup_census = contract::census(&startup).unwrap();
-    assert_eq!(startup_census.families.len(), 56);
-    assert_eq!(startup_census.series.len(), 235);
+    assert_eq!(startup_census.families.len(), 60);
+    assert_eq!(startup_census.series.len(), 241);
     assert_eq!(sample(&startup, "qbit_prism_runtime_lag_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_block_candidates_pending"), -1.);
     assert_eq!(
@@ -55,6 +55,11 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         for cause in StaleJobCause::ALL {
             metrics.record_stale_job_rejection(*cause);
         }
+        for decision in CaptureDecision::ALL {
+            metrics.record_capture_decision(*decision);
+        }
+        metrics.record_divergent_landing(iteration * 1_000);
+        metrics.record_carry_forward_debt(iteration);
         for outcome in Outcome::ALL {
             metrics.observe_pool_acquire(*outcome, elapsed);
             for lock in LockKind::ALL {
@@ -109,8 +114,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 56);
-        assert_eq!(populated.series.len(), 669);
+        assert_eq!(populated.families.len(), 60);
+        assert_eq!(populated.series.len(), 675);
         assert_eq!(
             sample(&body, "qbit_prism_block_candidates_pending"),
             if known { iteration as f64 } else { -1. }

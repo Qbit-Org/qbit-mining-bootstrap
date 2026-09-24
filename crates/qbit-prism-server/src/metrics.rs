@@ -64,6 +64,8 @@ impl Metrics {
             Family::Grace,
             Family::LateConfirmed,
             Family::CandidatesOrphaned,
+            Family::DivergentLandings,
+            Family::DivergentOverpay,
             Family::RevisionWorkPending,
             Family::RevisionWorkUnknown,
             Family::AcceptedUnlanded,
@@ -83,6 +85,7 @@ impl Metrics {
             Family::PartitionLead,
             Family::Rss,
             Family::ConnectionLimit,
+            Family::CarryForwardDebt,
         ] {
             registry.register(family, vec![], -1.);
         }
@@ -103,6 +106,13 @@ impl Metrics {
             registry.register(
                 Family::ConnectionRefusals,
                 label("reason", reason.as_str()),
+                0.,
+            );
+        }
+        for decision in CaptureDecision::ALL {
+            registry.register(
+                Family::CaptureOfferDecisions,
+                label("decision", decision.as_str()),
                 0.,
             );
         }

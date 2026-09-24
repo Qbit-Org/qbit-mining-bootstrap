@@ -97,6 +97,10 @@ families! {
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
     WindowAcquisitions: Counter, "refresh_window_acquisitions_total", "Refresh payout-window snapshots by acquisition outcome: advanced by the delta path, or the reason the full scan ran.";
     RefreshSeconds: Histogram, "refresh_seconds", "Template refresh from entry to published work, in seconds, by what triggered the rebuild and how its window was acquired.";
+    CaptureOfferDecisions: Counter, "capture_offer_decisions_total", "Offer decisions this instance made for pending blocks on the current tip whose payout revision was superseded (#478 block capture), by decision.";
+    DivergentLandings: Counter, "divergent_landings_total", "Confirmations this instance committed whose landed rows started to count on canonical balances other than their as-issued prior balances.";
+    DivergentOverpay: Counter, "divergent_landing_overpay_sats_total", "Carry-forward debt, in sats, created by the divergent confirmations this instance committed.";
+    CarryForwardDebt: Gauge, "carry_forward_debt_sats", "Sum of negative carry-forward balances, in sats, read from the canonical balances at this instance's latest balance change or full refresh, or -1 before one.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -277,6 +281,17 @@ impl Registry {
         );
         if let Sample::Scalar(value) = self.sample(family, labels.into(), 0.) {
             *value += 1.;
+        }
+    }
+    pub(super) fn add(&mut self, family: Family, labels: impl Into<Labels>, amount: f64) {
+        assert_eq!(
+            family.descriptor().kind,
+            Kind::Counter,
+            "only counters may add"
+        );
+        assert!(amount.is_finite() && amount >= 0.);
+        if let Sample::Scalar(value) = self.sample(family, labels.into(), 0.) {
+            *value += amount;
         }
     }
     pub(super) fn observe(&mut self, family: Family, labels: impl Into<Labels>, seconds: f64) {

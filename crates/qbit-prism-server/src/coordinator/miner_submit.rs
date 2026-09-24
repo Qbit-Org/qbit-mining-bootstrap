@@ -27,6 +27,12 @@ pub(super) enum SaveOutcome {
     Stale,
     /// The ledger did not record the share: `ledger-confirmation-failed`.
     Failed(anyhow::Error),
+    /// A block-only proof whose block is stale by the pool's own decision,
+    /// not by a ledger failure: its candidate was abandoned before its offer
+    /// (a parent change, the #478 overpay ceiling, or capture turned off), or
+    /// it is block-only work, whose share is never credited. `stale-job`,
+    /// with the cause recorded once.
+    Superseded(StaleJobCause),
     /// Not known by the acknowledgement deadline; the share may still be
     /// credited.
     Unknown {
@@ -218,7 +224,7 @@ impl Drop for AppendTask {
 pub(super) async fn submission_candidate(
     job: &MiningJob<JobContext>,
     submission: codec::Submission,
-    share: AcceptedShare,
+    deferred_share: Option<AcceptedShare>,
 ) -> Result<Candidate> {
     let context = Arc::clone(&job.context);
     let job_id = job.wire.job_id.clone();
@@ -264,7 +270,7 @@ pub(super) async fn submission_candidate(
             signer_keys: inputs.signer_keys.clone(),
             leased: false,
             coinbase_suffix_hex: suffix,
-            deferred_share: (!submission.share_pass).then_some(share),
+            deferred_share,
             block_bytes,
             as_issued_balances: (*context.prepared.reservation.balances).clone(),
         })
@@ -340,6 +346,39 @@ impl Coordinator {
             })?
         };
         let parent_stale = selected.hash != job.wire.previousblockhash;
+        // One observation of the published tip, shared by the block-capture
+        // admission and the ordinary candidate-currency check below, so a tip
+        // that moves between them cannot make one see a current parent and the
+        // other a stale one.
+        let observed_tip_is_parent =
+            self.observed_tip.read().await.as_deref() == Some(job.wire.previousblockhash.as_str());
+        // #478 block capture: a block-bearing proof whose parent is still the
+        // active tip is offered to the node even when its payout revision was
+        // superseded by a same-parent settlement bump. The block is valid on
+        // this parent; only the pool's payout snapshot moved. Share credit
+        // stays fenced on the current revision (the deferred/block-only path),
+        // and the block lands as-issued at the observed revision, carrying any
+        // divergence as debt in the additive balance (see `land_offered`).
+        // `PRISM_CAPTURE_OVERPAY_CEILING_BPS=0` turns capture off: such a
+        // proof is refused `stale-job` exactly as before #478.
+        let block_capture = self.config.capture_overpay_ceiling_bps > 0
+            && submission.block_pass
+            && !parent_stale
+            && !selected.share_lease
+            && observed_tip_is_parent;
+        // #478: work a same-parent payout replacement retired is block-only.
+        // It is fenced here, before any grace branch, so it reaches no credit
+        // path at all: not stale grace or parent grace after a flip, not the
+        // ordinary current-revision credit, and (below) not the deferred share
+        // of its captured block. Only a block on the active parent passes.
+        let block_only = job.wire.kind == codec::JobKind::BlockOnly;
+        if block_only && !block_capture {
+            return Err(self.stale_job(if parent_stale {
+                StaleJobCause::ParentGrace
+            } else {
+                StaleJobCause::PayoutRevision
+            }));
+        }
         let grace =
             parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
         if grace {
@@ -355,13 +394,18 @@ impl Coordinator {
         } else if parent_stale {
             // A stale parent is attributed before any coincident revision change.
             return Err(self.stale_job(StaleJobCause::ParentGrace));
-        } else if (context.prepared.snapshot.payout_revision != revision
-            && !(selected.share_lease
-                && context.prepared.snapshot.payout_revision == current.snapshot.payout_revision
-                && current.template["previousblockhash"].as_str()
-                    == Some(job.wire.previousblockhash.as_str())))
-            || (current.snapshot.payout_revision != revision && !selected.share_lease)
+        } else if !block_capture
+            && ((context.prepared.snapshot.payout_revision != revision
+                && !(selected.share_lease
+                    && context.prepared.snapshot.payout_revision
+                        == current.snapshot.payout_revision
+                    && current.template["previousblockhash"].as_str()
+                        == Some(job.wire.previousblockhash.as_str())))
+                || (current.snapshot.payout_revision != revision && !selected.share_lease))
         {
+            // A plain share on a superseded revision is still refused for
+            // credit; only a block-bearing proof on the current tip is spared,
+            // and it is spared for capture, not credit.
             return Err(self.stale_job(StaleJobCause::PayoutRevision));
         }
         // Prior-parent share credit deliberately uses the current durable
@@ -371,9 +415,17 @@ impl Coordinator {
             && !selected.share_lease
             && context.prepared.snapshot.payout_revision == revision
             && current.snapshot.payout_revision == revision
-            && self.observed_tip.read().await.as_deref()
-                == Some(job.wire.previousblockhash.as_str());
-        if !submission.share_pass && !(submission.block_pass && candidate_current) {
+            && observed_tip_is_parent;
+        // #478: a block on the current tip whose revision has moved, or any
+        // block from block-only work. It is captured (offered and landed
+        // as-issued) but its share is never credited at the current revision.
+        // `block_capture` already requires `submission.block_pass &&
+        // !parent_stale && observed tip`, so this is exactly a current-tip
+        // block that must not take the credited path.
+        let capture_stale = block_capture && (block_only || !candidate_current);
+        if !submission.share_pass
+            && !(submission.block_pass && (candidate_current || capture_stale))
+        {
             return Err(protocol_error("low-difficulty", "low difficulty share"));
         }
         let network = context.bundle.found_block.network_difficulty;
@@ -424,9 +476,13 @@ impl Coordinator {
         let start = tokio::time::Instant::now();
         let share_id = share.share_id.clone();
         let block_hash = submission.block_hash_hex.clone();
-        let share_pass = submission.share_pass;
-        let candidate = if submission.block_pass && candidate_current {
-            submission_candidate(job, submission, share.clone())
+        // Credit the share now, defer it to its block's confirmation (a
+        // below-target block proof, or a block captured on a superseded
+        // revision, #478), or never (block-only work, #478).
+        let credit_now = submission.share_pass && !capture_stale;
+        let deferred_share = (!credit_now && !block_only).then(|| share.clone());
+        let candidate = if submission.block_pass && (candidate_current || capture_stale) {
+            submission_candidate(job, submission, deferred_share)
                 .await
                 .map(Some)
         } else {
@@ -434,7 +490,10 @@ impl Coordinator {
         };
         let outcome = match candidate {
             Err(error) => SaveOutcome::Failed(error),
-            Ok(candidate) if share_pass => {
+            // A captured stale-revision block goes through the block-only path:
+            // its share is deferred (credited only if the block confirms), so
+            // no share is credited against the superseded revision.
+            Ok(candidate) if credit_now => {
                 // Ordinary current-tip/candidate admission keeps its existing
                 // credit contract, including a proof that returned from lease
                 // selection to ordinary authority before admission finished.
@@ -472,6 +531,10 @@ impl Coordinator {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(protocol_error("stale-job", "stale job"))
             }
+            SaveOutcome::Superseded(cause) => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(self.stale_job(cause))
+            }
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 if error.downcast_ref::<CommitGateClosed>().is_some() {
@@ -499,7 +562,7 @@ impl Coordinator {
                 // An error response like any other rejection; the share may
                 // still be credited, so its ID is logged for reconciliation.
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                let path = if share_pass { "share" } else { "block-only" };
+                let path = if credit_now { "share" } else { "block-only" };
                 tracing::warn!(
                     share_id,
                     block_hash,
@@ -628,6 +691,10 @@ impl Coordinator {
             Ok(candidate) => candidate,
             Err(error) => return SaveOutcome::Failed(error),
         };
+        // Block-only work (#478) defers no share: no credit will ever appear,
+        // so once its block is captured the share is refused at once rather
+        // than acknowledged at confirmation.
+        let defers_share = candidate.deferred_share.is_some();
         // Nothing is written before the enqueue, so every failure up to it is
         // definite.
         //
@@ -705,6 +772,18 @@ impl Coordinator {
                 };
             }
         }
+        if !defers_share {
+            // The block is captured (enqueued, or being followed); the share
+            // of block-only work is never credited, so it is refused now.
+            if phase == "enqueue-unknown" {
+                tracing::warn!(
+                    share_id = %share.share_id,
+                    block_hash,
+                    "block-only capture enqueue outcome unknown; the candidate loop offers it if it committed, and the share is refused"
+                );
+            }
+            return SaveOutcome::Superseded(StaleJobCause::PayoutRevision);
+        }
         // A block below the advertised share target earns only proven network
         // work, and only after active-chain confirmation.
         loop {
@@ -716,8 +795,8 @@ impl Coordinator {
             // without it, every poll of this loop would descend one per-leaf
             // `share_id` index per attached partition.
             let poll = tokio::time::timeout_at(bound, async {
-                sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
                 .bind(&share.share_id)
                 .bind(block_hash)
@@ -727,18 +806,32 @@ impl Coordinator {
             .await;
             match poll {
                 Err(_) => break,
-                Ok(Ok((true, _, _))) => return SaveOutcome::Accepted,
-                // D2b's answer for a candidate the pre-offer probe abandoned
-                // as superseded, one the node refused after the offer (kept
-                // in reconciliation with the rejected outcome), or one the
-                // chain proved an orphan after the offer (#415, terminal with
-                // its evidence). It is not a proof: reconciliation still
-                // credits the deferred share if the block later becomes
-                // active, and so does the reorg reconciler for an orphaned
-                // block, from its landed audit.
-                Ok(Ok((false, Some(state), outcome)))
-                    if state == "abandoned"
-                        || state == ORPHANED_STATE
+                Ok(Ok((true, _, _, _))) => return SaveOutcome::Accepted,
+                // A candidate abandoned before its offer never reached the
+                // node: the pool itself decided the block is stale (its
+                // parent changed, the #478 overpay ceiling refused it, or
+                // capture is off). That is `stale-job`, as base answered such
+                // a proof at submit, never a ledger failure: the ledger wrote
+                // the candidate, and `ledger-confirmation-failed` feeds the
+                // share-append failure warning.
+                Ok(Ok((false, Some(state), _, reason))) if state == "abandoned" => {
+                    return SaveOutcome::Superseded(
+                        if reason.as_deref() == Some("parent superseded") {
+                            StaleJobCause::ParentGrace
+                        } else {
+                            StaleJobCause::PayoutRevision
+                        },
+                    )
+                }
+                // D2b's answer for a candidate the node refused after the
+                // offer (kept in reconciliation with the rejected outcome),
+                // or one the chain proved an orphan after the offer (#415,
+                // terminal with its evidence). It is not a proof:
+                // reconciliation still credits the deferred share if the
+                // block later becomes active, and so does the reorg
+                // reconciler for an orphaned block, from its landed audit.
+                Ok(Ok((false, Some(state), outcome, _)))
+                    if state == ORPHANED_STATE
                         || (state == CandidateState::Reconciliation.as_str()
                             && outcome.as_deref() == Some(OfferOutcome::Rejected.as_str())) =>
                 {
@@ -746,8 +839,8 @@ impl Coordinator {
                         "block-only proof was not accepted on the active chain"
                     ))
                 }
-                Ok(Ok((false, Some(_), _))) => phase = "candidate-pending",
-                Ok(Ok((false, None, _))) => {}
+                Ok(Ok((false, Some(_), _, _))) => phase = "candidate-pending",
+                Ok(Ok((false, None, _, _))) => {}
                 // The candidate is already durable, so a failed read proves
                 // nothing about its credit.
                 Ok(Err(error)) => {

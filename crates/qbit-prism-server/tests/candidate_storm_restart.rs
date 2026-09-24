@@ -1828,18 +1828,22 @@ const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 ///   carry-forward, each one statement whatever the recipient count;
 ///   `COMMIT`.
 /// - `Ledger::observe_chain_view` again, after the landing, 5.
-/// - `Ledger::finish_candidate_counted_at_revision`, 14: `BEGIN`; the
+/// - `Ledger::finish_candidate_counted_at_revision`, 16: `BEGIN`; the
 ///   settlement and order advisory locks; the writer fence; the revision
 ///   fence; the claim fence (2); the first-confirmation read (`FOR UPDATE`);
-///   the `qbit_pool_blocks` confirmation `UPDATE`; the confirmed `EXISTS`;
-///   the deferred-share read; the revision bump; the terminal `UPDATE` of the
+///   the #478 confirmation record's two reads, the block's not-yet-counting
+///   carry rows (with its height and whether it has a record) and the prior
+///   balances they meet, both one statement whatever the recipient count and
+///   followed by no write because this landing does not diverge; the
+///   `qbit_pool_blocks` confirmation `UPDATE`; the confirmed `EXISTS`; the
+///   deferred-share read; the revision bump; the terminal `UPDATE` of the
 ///   outbox row; `COMMIT`.
 ///
 /// Asserted **equal** at [`storm_scale::BASELINE_CANDIDATES`] and at the run's
 /// own cardinality before it is compared with this constant, so a drift in the
 /// sequence and a dependence on N fail with different messages. A failure
 /// against this constant prints the whole observed sequence.
-const STATEMENTS_PER_RECOVERED_ROW: usize = 62;
+const STATEMENTS_PER_RECOVERED_ROW: usize = 64;
 
 #[path = "support/ledger_execution_proxy.rs"]
 mod ledger_execution_proxy;

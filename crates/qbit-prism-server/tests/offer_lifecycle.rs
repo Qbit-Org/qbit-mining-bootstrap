@@ -15,7 +15,8 @@ use qbit_prism::{
     FoundBlock, PayoutPolicy,
 };
 use qbit_prism_server::ledger::{
-    Candidate, CandidateState, Ledger, OfferOutcome, SignerKeys, Snapshot, WindowRef,
+    Candidate, CandidateClaim, CandidateState, Ledger, OfferOutcome, SignerKeys, Snapshot,
+    WindowRef,
 };
 use qbit_prism_server::metrics::{collectors, Metrics};
 use qbit_prism_test_gate as gate;
@@ -23,6 +24,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Mutex;
+use tracing::instrument::WithSubscriber;
 
 #[path = "support/ledger_database.rs"]
 #[allow(dead_code)]
@@ -56,8 +58,8 @@ const PRE_011: [(i32, &str); 10] = [
     ),
     (14, include_str!("../migrations/014_policy_transition.sql")),
 ];
-const ALL_VERSIONS: [i32; 18] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+const ALL_VERSIONS: [i32; 19] = [
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
@@ -2259,7 +2261,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2296,11 +2298,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2337,7 +2339,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
@@ -2499,6 +2501,337 @@ async fn oldest_due_lane_and_dispatch_probe_use_the_unfinished_index_over_retain
             ensure!(slot.is_some(), "the dispatch probe saw no due work");
             tx.rollback().await?;
             ledger.pool.close().await;
+            Ok(())
+        })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// The divergence alert a post-offer landing raises
+// ---------------------------------------------------------------------------
+
+/// The start of the warning `land_candidate` raises when it lands an offered
+/// block whose as-issued prior balances are no longer the canonical ones.
+const DIVERGENCE_ALERT: &str =
+    "ALERT: landing an as-issued audit whose prior balances differ from the current canonical balances";
+
+/// Collects one landing's events. `offer_lifecycle` is a many-test binary, so
+/// the subscriber is attached to the landing future alone (never installed
+/// globally) and the capture belongs to that one test.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn events(&self) -> Result<Vec<Value>> {
+        self.text()
+            .lines()
+            .map(|line| Ok(serde_json::from_str(line)?))
+            .collect()
+    }
+}
+
+/// miner-c, whose only share of the divergence window is a quarter of its
+/// weight and who carries no seeded balance.
+const MINER_C_PROGRAM: &str = "33333333333333333333333333333333333333333333333333333333333333cc";
+
+/// The window both divergence tests are issued on. miner-a takes all but a
+/// rounding sliver of the coinbase; miner-c's sliver lands under the payout
+/// policy's dust floor, so it accrues instead of being paid on chain and
+/// miner-a absorbs it against its seeded balance. That accrual is the one
+/// lever in this fixture that moves the canonical balances the way production
+/// moves them — `SUM(gross - onchain)` over a landed and confirmed block's
+/// own carry rows — rather than by writing balance rows behind the ledger's
+/// back. The window is read at a difficulty wide enough to hold both shares.
+const WINDOW_DIFFICULTY: u128 = 1_000_000;
+
+async fn seed_divergence_window(ledger: &Ledger) -> Result<()> {
+    let mut major = appended_share(1);
+    major.share_difficulty = 500_000;
+    ledger.append(major, None).await?;
+    let mut minor = appended_share(2);
+    minor.miner_id = "miner-c".into();
+    minor.order_key = "c".into();
+    minor.p2mr_program_hex = MINER_C_PROGRAM.into();
+    ledger.append(minor, None).await?;
+    Ok(())
+}
+
+/// A subscriber that records warnings as JSON into `capture`, for
+/// `.with_subscriber(..)` on a single future.
+fn capturing_subscriber(capture: &LogCapture) -> impl tracing::Subscriber + Send + Sync {
+    let writer = capture.clone();
+    tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish()
+}
+
+/// Land `claim` with `subscriber` attached to that future alone. The digest
+/// comparison runs on a blocking thread, but the warning is emitted on the
+/// async task after that await, so the per-future subscriber sees it.
+async fn land_capturing(
+    ledger: &Ledger,
+    claim: &CandidateClaim,
+    key: &str,
+    capture: &LogCapture,
+) -> Result<qbit_prism::AuditVerificationReport> {
+    let revision = ledger.payout_revision().await?;
+    ledger
+        .land_candidate_at_revision(claim, key, revision)
+        .with_subscriber(capturing_subscriber(capture))
+        .await
+}
+
+/// Claim the one candidate the outbox is expected to hand out next, with the
+/// bundle its parts are rebuilt from.
+async fn claim_expecting(
+    ledger: &Ledger,
+    hash: &str,
+    bundle: AuditBundle,
+) -> Result<CandidateClaim> {
+    let claim = ledger
+        .claim_candidate(60)
+        .await?
+        .context("the candidate is not claimable")?;
+    ensure!(
+        claim.candidate.block_hash == hash,
+        "claimed {} instead of {hash}",
+        claim.candidate.block_hash
+    );
+    Ok(claim.with_bundle(bundle))
+}
+
+async fn offer(ledger: &Ledger, claim: &CandidateClaim) -> Result<()> {
+    ledger.reserve_offer(claim).await?;
+    ledger
+        .record_offer(claim, OFFERED_MS, OfferOutcome::Accepted, None)
+        .await
+}
+
+/// The prior balance `block_hash`'s carry row records for `program`: the
+/// amount the block's audit was issued against, which for a divergent landing
+/// is the as-issued balance and not the current one.
+async fn landed_prior_balance(pool: &PgPool, block_hash: &str, program: &str) -> Result<i128> {
+    let prior: String = sqlx::query_scalar("SELECT prior_balance_sats::text FROM qbit_payout_carry_forward WHERE block_hash=$1 AND p2mr_program=decode($2,'hex')")
+        .bind(block_hash).bind(program).fetch_one(pool).await?;
+    Ok(prior.parse()?)
+}
+
+/// `program`'s canonical balance, or zero when it carries none.
+async fn current_balance(pool: &PgPool, program: &str) -> Result<i128> {
+    let balance: Option<String> = sqlx::query_scalar("SELECT balance_sats::text FROM qbit_current_carry_forward_balances() WHERE p2mr_program=decode($1,'hex')")
+        .bind(program).fetch_optional(pool).await?;
+    Ok(balance
+        .map(|balance| balance.parse())
+        .transpose()?
+        .unwrap_or_default())
+}
+
+async fn as_issued_marker(pool: &PgPool, block_hash: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT as_issued_audit_sha256 FROM qbit_pool_blocks WHERE block_hash=$1",
+    )
+    .bind(block_hash)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// An offered block lands on balances another block of the same window moved
+/// out from under it. The landing is allowed — the node has or may have the
+/// block — but it is reported: one WARN naming the block, its lifecycle state
+/// and both digests. The alert is not the whole contract, so the same test
+/// holds the landing to the rest of it: the provenance marker records the
+/// audit the block was issued with, the carry rows keep the as-issued prior
+/// balance rather than the moved one, and the validator that reads marked
+/// rows against their manifest stays clean once the block is confirmed.
+#[tokio::test]
+async fn a_divergent_offered_landing_warns_with_both_digests_and_keeps_its_as_issued_accounts(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("divergence").await?;
+            seed_carry(&db.pool).await?;
+            seed_divergence_window(&ledger).await?;
+            let issued = ledger.snapshot(WINDOW_DIFFICULTY).await?;
+            let key = keys().1.public_key_hex();
+
+            // The victim is claimed on the issued balances and held, unlanded,
+            // while another block of the same window settles beneath it.
+            let (victim, victim_bundle) = candidate_for(&issued, 20)?;
+            let victim_hash = victim.block_hash.clone();
+            ensure!(ledger.enqueue_candidate_observed(victim, None).await?);
+            let victim_claim = claim_expecting(&ledger, &victim_hash, victim_bundle).await?;
+
+            // The mover moves the canonical balances the way production does:
+            // it lands and is confirmed, and the carry triggers do the rest.
+            // An UPDATE or a hand-written carry row would move the digest
+            // without moving the balances the landing is judged against.
+            let (mover, mover_bundle) = candidate_for(&issued, 21)?;
+            let mover_hash = mover.block_hash.clone();
+            ensure!(ledger.enqueue_candidate_observed(mover, None).await?);
+            let mover_claim = claim_expecting(&ledger, &mover_hash, mover_bundle).await?;
+            offer(&ledger, &mover_claim).await?;
+            let revision = ledger.payout_revision().await?;
+            ledger
+                .land_candidate_at_revision(&mover_claim, &key, revision)
+                .await?;
+            ledger
+                .finish_candidate_at_revision(&mover_claim, true, None, revision)
+                .await?;
+
+            // Without this the fixture could pass the control's assertions by
+            // accident: a mover that moved nothing raises no alert either.
+            let as_issued = qbit_prism::prior_balances_digest(&issued.prior_balances);
+            let current = qbit_prism::prior_balances_digest(
+                &ledger.snapshot(WINDOW_DIFFICULTY).await?.prior_balances,
+            );
+            ensure!(
+                current != as_issued,
+                "the mover left the canonical balances where the victim was issued on"
+            );
+            ensure!(
+                victim_claim.candidate.window.prior_balances_digest == as_issued,
+                "the victim does not carry the issued digest"
+            );
+            // miner-c is the account the mover moved: no seeded balance, and
+            // the mover's accrual gives it one.
+            let moved = current_balance(&db.pool, MINER_C_PROGRAM).await?;
+            ensure!(moved > 0, "the mover accrued nothing to miner-c");
+
+            offer(&ledger, &victim_claim).await?;
+            let capture = LogCapture::default();
+            let report = land_capturing(&ledger, &victim_claim, &key, &capture).await?;
+
+            // (i) The divergence is reported once, with both digests.
+            let events = capture.events()?;
+            let alerts: Vec<&Value> = events
+                .iter()
+                .filter(|event| {
+                    event["level"] == "WARN"
+                        && event["fields"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.starts_with(DIVERGENCE_ALERT))
+                })
+                .collect();
+            ensure!(
+                alerts.len() == 1,
+                "expected one divergence alert, captured {}",
+                capture.text()
+            );
+            let fields = &alerts[0]["fields"];
+            ensure!(fields["block"] == victim_hash.as_str(), "{fields}");
+            ensure!(fields["state"] == "offered", "{fields}");
+            ensure!(
+                fields["as_issued_balances"] == hex::encode(as_issued),
+                "{fields}"
+            );
+            ensure!(
+                fields["current_balances"] == hex::encode(current),
+                "{fields}"
+            );
+            ensure!(
+                fields["as_issued_balances"] != fields["current_balances"],
+                "the alert reported one digest twice: {fields}"
+            );
+
+            // (ii) The provenance marker records the audit that was issued.
+            let marker = as_issued_marker(&db.pool, &victim_hash).await?;
+            ensure!(
+                marker.as_deref() == Some(report.audit_bundle_sha256_hex.as_str()),
+                "the divergent landing did not record its as-issued provenance: {marker:?}"
+            );
+
+            // (iii) The carry rows are the issued accounts, not the moved
+            // ones: the victim was issued when miner-c carried nothing, and
+            // that is the prior it lands with even though miner-c now carries
+            // the mover's accrual.
+            let victim_prior =
+                landed_prior_balance(&db.pool, &victim_hash, MINER_C_PROGRAM).await?;
+            ensure!(
+                victim_prior == 0,
+                "the landed carry row is not the issued account: miner-c prior \
+                 {victim_prior}, current {moved}"
+            );
+            ensure!(
+                landed_prior_balance(&db.pool, &victim_hash, &"11".repeat(32)).await? == 1_000,
+                "the victim's seeded account did not land on its issued prior either"
+            );
+
+            // (iv) The as-issued validator accepts the pair it just created.
+            let revision = ledger.payout_revision().await?;
+            ledger
+                .finish_candidate_at_revision(&victim_claim, true, None, revision)
+                .await?;
+            let (mismatches, drift, reasons) = db.integrity().await?;
+            ensure!(mismatches == 0 && drift == 0, "{reasons:?} drift {drift}");
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The control the alert has to be read against: the same fixture with no
+/// mover. The landing is not divergent, so nothing is reported — but the
+/// provenance marker is written all the same, because it records how the
+/// block was issued and not whether the balances moved.
+#[tokio::test]
+async fn an_undisturbed_offered_landing_is_marked_without_a_divergence_alert() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("no-divergence").await?;
+            seed_carry(&db.pool).await?;
+            seed_divergence_window(&ledger).await?;
+            let issued = ledger.snapshot(WINDOW_DIFFICULTY).await?;
+            let key = keys().1.public_key_hex();
+            let (victim, bundle) = candidate_for(&issued, 20)?;
+            let hash = victim.block_hash.clone();
+            ensure!(ledger.enqueue_candidate_observed(victim, None).await?);
+            let claim = claim_expecting(&ledger, &hash, bundle).await?;
+            offer(&ledger, &claim).await?;
+
+            let capture = LogCapture::default();
+            let report = land_capturing(&ledger, &claim, &key, &capture).await?;
+
+            ensure!(
+                !capture.text().contains(DIVERGENCE_ALERT),
+                "an undisturbed landing reported a divergence: {}",
+                capture.text()
+            );
+            let marker = as_issued_marker(&db.pool, &hash).await?;
+            ensure!(
+                marker.as_deref() == Some(report.audit_bundle_sha256_hex.as_str()),
+                "every fresh landing records its provenance, divergent or not: {marker:?}"
+            );
+            let prior = landed_prior_balance(&db.pool, &hash, &"11".repeat(32)).await?;
+            ensure!(
+                prior == 1_000,
+                "the landed carry row is not the issued account: prior {prior}"
+            );
+
+            let revision = ledger.payout_revision().await?;
+            ledger
+                .finish_candidate_at_revision(&claim, true, None, revision)
+                .await?;
+            let (mismatches, drift, reasons) = db.integrity().await?;
+            ensure!(mismatches == 0 && drift == 0, "{reasons:?} drift {drift}");
             Ok(())
         })
     })

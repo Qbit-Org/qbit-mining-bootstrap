@@ -111,6 +111,8 @@ pub fn expected(populated: bool) -> Census {
         "late_confirmed_shares_total",
         "block_candidates_orphaned_total",
         "revision_work_build_timeouts_total",
+        "divergent_landings_total",
+        "divergent_landing_overpay_sats_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -140,6 +142,7 @@ pub fn expected(populated: bool) -> Census {
         "accepted_block_revision_work_pending_seconds",
         "accepted_block_revision_work_tracking_unknown",
         "accepted_block_unlanded_seconds",
+        "carry_forward_debt_sats",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -159,6 +162,12 @@ pub fn expected(populated: bool) -> Census {
             "reason",
             "global_limit,username_limit,ip_limit,malformed_frame_budget,unknown_job_budget,authorize_budget",
         ),
+        &[],
+    );
+    result.family(
+        "capture_offer_decisions_total",
+        "counter",
+        &labels("decision", "offered,abandoned_ceiling,abandoned_disabled"),
         &[],
     );
     result.family(

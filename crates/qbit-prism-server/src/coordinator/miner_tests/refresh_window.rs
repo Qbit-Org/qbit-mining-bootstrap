@@ -189,6 +189,54 @@ async fn economic_drift_during_fee_probe_defers_until_next_refresh() {
     assert_eq!(current.reservation.balances[0].balance_sats, 123);
 }
 
+#[tokio::test]
+async fn ledger_probes_run_only_where_they_can_keep_work() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let published = f.coordinator.prepared.read().await.clone().unwrap();
+    let probes = || f.store.compact.probe_calls.load(Ordering::SeqCst);
+    let snapshots = || f.store.snapshots.lock().unwrap().len();
+    // Same template: the early probe decides that the published work stays.
+    let (before, taken) = (probes(), snapshots());
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(probes() - before, 1);
+    assert_eq!(snapshots(), taken);
+    assert!(Arc::ptr_eq(
+        &published,
+        f.coordinator.prepared.read().await.as_ref().unwrap()
+    ));
+    // A new tip replaces the published work whatever the early probe would
+    // show, and the transition's revision bump outdates the cached window:
+    // no probe at all, one snapshot read.
+    let (before, taken) = (probes(), snapshots());
+    f.detect(2).await;
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(probes() - before, 0);
+    assert_eq!(snapshots(), taken + 1);
+    let rebuilt = f.coordinator.prepared.read().await.clone().unwrap();
+    assert_eq!(rebuilt.template["previousblockhash"], hash(2));
+    assert_eq!(
+        rebuilt.snapshot.payout_revision,
+        published.snapshot.payout_revision + 1
+    );
+    // A tip a peer already recorded leaves the revision alone, so the cached
+    // window may still fit: only the admitted probe runs, and the window is
+    // reused without a snapshot read.
+    *f.store.tip.lock().unwrap() = Some(hash(3));
+    let (before, taken) = (probes(), snapshots());
+    f.detect(3).await;
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(probes() - before, 1);
+    assert_eq!(snapshots(), taken);
+    let reused = f.coordinator.prepared.read().await.clone().unwrap();
+    assert_eq!(reused.template["previousblockhash"], hash(3));
+    assert_eq!(
+        reused.snapshot.payout_revision,
+        rebuilt.snapshot.payout_revision
+    );
+    assert_eq!(reused.window, rebuilt.window);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuildWaitChange {
     Share,

@@ -4,8 +4,8 @@ use crate::{
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
         BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
-        HeartbeatHealth, Ledger, OfferOutcome, RecoveryClaim, SignerKeys, Snapshot, Window,
-        WindowError, WindowRef, ORPHANED_STATE,
+        HeartbeatHealth, Ledger, OfferOutcome, OfferReservation, RecoveryClaim, SignerKeys,
+        Snapshot, Window, WindowError, WindowRef, ORPHANED_STATE,
     },
     metrics::{RefreshAcquisition, RefreshTrigger},
     rpc::Rpc,
@@ -633,6 +633,10 @@ impl Coordinator {
         metrics: Arc<crate::metrics::Metrics>,
         register_frontend: bool,
     ) -> Result<Arc<Self>> {
+        if let Some(threads) = config.refresh_build_threads {
+            qbit_prism::parallel::configure_builder_threads(threads)
+                .context("PRISM_REFRESH_BUILD_THREADS")?;
+        }
         let rpc = Rpc::new(
             config.rpc_url.clone(),
             config.rpc_user.clone(),
@@ -1024,6 +1028,11 @@ impl Coordinator {
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
+        // The landing metric's "revision observed" instant stays here, where
+        // the ledger probe used to feed it: the chain-observation write
+        // returned the current revision. A bump after this point is recorded
+        // again, idempotently, from the anchor transaction and at selection.
+        self.metrics.revision_work_observed(observed_revision);
         let bits =
             codec::parse_u32_hex(template["bits"].as_str().context("template bits missing")?)?;
         let network = codec::scaled_target_difficulty(&codec::target_from_compact(bits)?)?;
@@ -1035,30 +1044,58 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let probe = self
-            .work_ledger
-            .refresh_probe(crate::ledger::ReadAdmission::default())
-            .await?;
-        let state = probe.payout_state;
-        self.metrics.revision_work_observed(state.payout_revision);
-        let share_seq = probe.accepted_share_seq;
+        // The ledger probe only matters when it can keep the published work.
+        // The fingerprint carries previousblockhash, so a new tip replaces
+        // the work whatever the probe would show; that refresh reads its
+        // revision from the anchor transaction instead. On the same template
+        // the probe still precedes the fee read, as it always has.
+        let same_template = self
+            .prepared
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.fingerprint == fingerprint);
+        let probe = if same_template {
+            let probe = self
+                .work_ledger
+                .refresh_probe(crate::ledger::ReadAdmission::default())
+                .await?;
+            self.metrics
+                .revision_work_observed(probe.payout_state.payout_revision);
+            Some(probe)
+        } else {
+            None
+        };
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         let current_prepared = self.prepared.read().await;
         // Named before the reuse test below decides, from the same inputs, so
         // the refresh metric and log say what invalidated the published work.
-        let trigger = refresh_trigger(
-            current_prepared.as_deref(),
-            parent,
-            &state,
-            share_seq,
-            cached_window.as_ref().is_some_and(|window| {
-                window.within_reanchor_interval(self.config.snapshot_interval)
-            }),
-            &fee,
-        );
-        if let Some(current) = current_prepared.as_ref() {
+        // Without a probe the template already differs from the published
+        // work: a new tip, or a new template on the same tip.
+        let trigger = match &probe {
+            Some(probe) => refresh_trigger(
+                current_prepared.as_deref(),
+                parent,
+                &probe.payout_state,
+                probe.accepted_share_seq,
+                cached_window.as_ref().is_some_and(|window| {
+                    window.within_reanchor_interval(self.config.snapshot_interval)
+                }),
+                &fee,
+            ),
+            None => match current_prepared.as_deref() {
+                None => RefreshTrigger::Initial,
+                Some(current) if current.template["previousblockhash"].as_str() != Some(parent) => {
+                    RefreshTrigger::Tip
+                }
+                Some(_) => RefreshTrigger::Template,
+            },
+        };
+        if let (Some(probe), Some(current)) = (probe, current_prepared.as_ref()) {
+            let state = probe.payout_state;
+            let share_seq = probe.accepted_share_seq;
             // A new share invalidates build inputs, but does not itself replace
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
@@ -1131,7 +1168,13 @@ impl Coordinator {
         // Select valid inputs after that wait, at the same boundary where a
         // fresh snapshot would be read. Later shares belong to the next window;
         // the selected WindowRef remains immutable through build/publication.
-        let reuse_window = if let Some(window) = cached_window.as_ref() {
+        // Every payout revision write is an increment, so a window anchored
+        // below the revision this refresh's chain observation returned can
+        // never satisfy `reusable`: its probe is skipped and it is rebuilt.
+        let reuse_window = if let Some(window) = cached_window
+            .as_ref()
+            .filter(|window| window.snapshot.payout_revision >= observed_revision)
+        {
             let probe = self
                 .work_ledger
                 .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
@@ -1193,6 +1236,12 @@ impl Coordinator {
         // This lets build admission end after actual build cleanup, so existing
         // lease holders can resume while a replacement reservation waits.
         let window = Arc::clone(cached_window.as_ref().expect("captured refresh window"));
+        // The revision this work carries is the one its anchor transaction
+        // returned, whether the window was just captured or reused; the
+        // published-refresh log below names the cutoff the same way.
+        self.metrics
+            .revision_work_observed(window.snapshot.payout_revision);
+        let share_seq = window.snapshot.share_seq;
         let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
         let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
@@ -2055,7 +2104,27 @@ impl Coordinator {
             if active {
                 return self.adopt_active_candidate(claim, lease, &tip).await;
             }
-            if revision != candidate.payout_revision || tip != parent {
+            // #478 block capture: a superseded payout revision on the
+            // still-current tip is not abandoned here. The block is a valid
+            // proof on this parent; only the pool's payout snapshot moved. The
+            // reservation below holds it to the overpay ceiling, and the
+            // post-offer landing lands it as-issued at the observed revision,
+            // carrying any payout divergence as debt (`land_offered`,
+            // `ledger/blocks.rs`). A genuine parent change abandons, and so
+            // does a superseded revision when capture is off.
+            if tip != parent {
+                self.ledger
+                    .finish_candidate_at_revision(claim, false, Some("parent superseded"), revision)
+                    .await?;
+                return Ok(());
+            }
+            if self.config.capture_overpay_ceiling_bps == 0 && revision != candidate.payout_revision
+            {
+                self.ledger
+                    .record_capture_disabled(candidate, revision)
+                    .await?;
+                self.metrics
+                    .record_capture_decision(crate::metrics::CaptureDecision::AbandonedDisabled);
                 self.ledger
                     .finish_candidate_at_revision(
                         claim,
@@ -2076,7 +2145,65 @@ impl Coordinator {
         unix_ms_now().context("the first-offer boundary needs the wall clock")?;
         // The durable reservation: once it commits, no claim on any
         // frontend, this one included after a crash, offers the block again.
-        self.ledger.reserve_offer(claim).await?;
+        // A block whose payout revision was superseded is held to the
+        // overpay ceiling in the same transaction (#478). An unknown bound
+        // is an error like any other here: nothing is reserved, nothing is
+        // abandoned, and the claim is retried.
+        match self
+            .ledger
+            .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
+            .await?
+        {
+            OfferReservation::Reserved { bound: None } => {}
+            OfferReservation::Reserved { bound: Some(bound) } => {
+                self.metrics
+                    .record_capture_decision(crate::metrics::CaptureDecision::Offered);
+                tracing::info!(
+                    block = %candidate.block_hash,
+                    candidate_revision = candidate.payout_revision,
+                    observed_revision = bound.observed_revision,
+                    overpay_bound_sats = %bound.bound_sats,
+                    overpay_ceiling_sats = %bound.ceiling_sats,
+                    "offering a block whose payout revision was superseded: its overpay bound is within the ceiling"
+                );
+            }
+            OfferReservation::Refused(bound) => {
+                let decision = if bound.ceiling_bps == 0 {
+                    crate::metrics::CaptureDecision::AbandonedDisabled
+                } else {
+                    crate::metrics::CaptureDecision::AbandonedCeiling
+                };
+                self.metrics.record_capture_decision(decision);
+                // Capture off keeps the pre-#478 reason; a ceiling refusal
+                // names its bound and ceiling.
+                let reason = if bound.ceiling_bps == 0 {
+                    "payout revision or parent superseded".to_owned()
+                } else {
+                    format!(
+                        "capture overpay bound {} sats exceeds the ceiling {} sats ({} bps of the coinbase value)",
+                        bound.bound_sats, bound.ceiling_sats, bound.ceiling_bps
+                    )
+                };
+                tracing::warn!(
+                    block = %candidate.block_hash,
+                    candidate_revision = candidate.payout_revision,
+                    observed_revision = bound.observed_revision,
+                    overpay_bound_sats = %bound.bound_sats,
+                    overpay_ceiling_sats = %bound.ceiling_sats,
+                    %reason,
+                    "abandoning a block whose payout revision was superseded"
+                );
+                self.ledger
+                    .finish_candidate_at_revision(
+                        claim,
+                        false,
+                        Some(&reason),
+                        bound.observed_revision,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
         #[cfg(test)]
         self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.

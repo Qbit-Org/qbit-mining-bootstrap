@@ -1555,9 +1555,15 @@ async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Resul
     )
     .await?;
     coordinator.refresh_once().await?;
-    let integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
+    let mut integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
         .fetch_one(&coordinator.ledger.pool)
         .await?;
+    // #478: the divergence line is reported, never a failure: its debt is an
+    // accepted, bounded cost that exact accounting carries.
+    integrity["payout_divergence"] =
+        sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
+            .fetch_one(&coordinator.ledger.pool)
+            .await?;
     report.health = Some(coordinator.health().await);
     report.carry_forward_integrity = Some(integrity.clone());
     for field in ["mismatch_count", "current_drift_count"] {

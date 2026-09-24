@@ -30,6 +30,28 @@ pub(super) fn build_body(
     suffix: String,
     inputs: BundleInputs,
 ) -> Result<(qbit_prism::AuditBundleBody, Option<AcceptedShare>)> {
+    build_body_with(
+        config,
+        snapshot,
+        template,
+        bootstrap,
+        suffix,
+        inputs,
+        qbit_prism::Parallelism::serial(),
+    )
+}
+
+/// [`build_body`] with the builder's fold and leaf digest spread over
+/// `parallelism` worker threads; the body is identical for every value.
+pub(super) fn build_body_with(
+    config: &Config,
+    snapshot: &Snapshot,
+    template: &Value,
+    bootstrap: Option<Worker>,
+    suffix: String,
+    inputs: BundleInputs,
+    parallelism: qbit_prism::Parallelism,
+) -> Result<(qbit_prism::AuditBundleBody, Option<AcceptedShare>)> {
     let network = codec::scaled_target_difficulty(&codec::target_from_compact(
         codec::parse_u32_hex(template["bits"].as_str().context("missing bits")?)?,
     )?)?;
@@ -77,7 +99,7 @@ pub(super) fn build_body(
     // Prior-only recipients remain in the payout universe, including
     // during bootstrap after an empty reward window.
     let bundle = if let Some(ctv) = inputs.ctv {
-        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options(
+        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
             shares,
             found,
             snapshot.prior_balances.clone(),
@@ -89,9 +111,10 @@ pub(super) fn build_body(
             witnesses,
             &manifest_key,
             &ledger_key,
+            parallelism,
         )?
     } else {
-        qbit_prism::build_audit_bundle_body_with_coinbase_options(
+        qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
             shares,
             found,
             snapshot.prior_balances.clone(),
@@ -100,6 +123,7 @@ pub(super) fn build_body(
             witnesses,
             &manifest_key,
             &ledger_key,
+            parallelism,
         )?
     };
     Ok((bundle, bootstrap_share))

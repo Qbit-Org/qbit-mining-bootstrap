@@ -286,18 +286,27 @@ pub(in crate::coordinator) struct RefreshBody {
 pub(in crate::coordinator) type CapturedRefreshBody =
     CompactOwner<(Result<RefreshBody>, Arc<tokio::sync::OwnedSemaphorePermit>)>;
 
-pub(in crate::coordinator) fn prepare_refresh_body(
+/// The reused-window rebuild (a new template on the same window): the same
+/// chunked fold, leaf, prefix and suffix as the pipelined refresh, on one lane.
+pub(in crate::coordinator) fn prepare_refresh_body_with(
     config: &Config,
     snapshot: &Snapshot,
     template: &Value,
     suffix: String,
     inputs: BundleInputs,
+    parallelism: qbit_prism::Parallelism,
 ) -> Result<RefreshBody> {
-    let prepared = prepare_refresh_body_unhashed(config, snapshot, template, suffix, inputs)?;
-    finish_refresh_body(
-        qbit_prism::CanonicalAuditHashPrefix::new(&snapshot.shares)?,
-        prepared,
-    )
+    let prepared = prepare_refresh_body_unhashed_with(
+        config,
+        snapshot,
+        template,
+        suffix,
+        inputs,
+        parallelism,
+    )?;
+    let (prefix, _share_digest) =
+        qbit_prism::CanonicalAuditHashPrefix::new_with_share_digest(&snapshot.shares, parallelism)?;
+    finish_refresh_body_with(prefix, prepared, parallelism)
 }
 
 /// The body worker returns before audit encoding, so its continuation can
@@ -307,19 +316,33 @@ pub(in crate::coordinator) struct UnhashedRefreshBody {
     base_wire: Option<codec::Job>,
 }
 
-pub(in crate::coordinator) fn prepare_refresh_body_unhashed(
+/// The body worker's output before audit encoding, with the builder's
+/// counted-share fold and leaf digest spread over `parallelism`.
+pub(in crate::coordinator) fn prepare_refresh_body_unhashed_with(
     config: &Config,
     snapshot: &Snapshot,
     template: &Value,
     suffix: String,
     inputs: BundleInputs,
+    parallelism: qbit_prism::Parallelism,
 ) -> Result<UnhashedRefreshBody> {
     // WindowRef::from_snapshot uses precisely this condition for shares: Some.
     // The native digest remains mandatory before any compact record is assembled.
     let body = if snapshot.shares.is_empty() {
         None
     } else {
-        Some(bundle_build::build_body(config, snapshot, template, None, suffix, inputs)?.0)
+        Some(
+            bundle_build::build_body_with(
+                config,
+                snapshot,
+                template,
+                None,
+                suffix,
+                inputs,
+                parallelism,
+            )?
+            .0,
+        )
     };
     let base_wire = body
         .as_ref()
@@ -334,16 +357,19 @@ pub(in crate::coordinator) fn prepare_refresh_body_unhashed(
     Ok(UnhashedRefreshBody { body, base_wire })
 }
 
-pub(in crate::coordinator) fn finish_refresh_body(
+/// Finish the body worker's output with the independently computed prefix;
+/// the audit suffix's counted-share array is serialized over `parallelism`.
+pub(in crate::coordinator) fn finish_refresh_body_with(
     prefix: qbit_prism::CanonicalAuditHashPrefix,
     prepared: UnhashedRefreshBody,
+    parallelism: qbit_prism::Parallelism,
 ) -> Result<RefreshBody> {
     let UnhashedRefreshBody { body, base_wire } = prepared;
     let hashes = body
         .as_ref()
         .map(|body| {
             Ok::<_, anyhow::Error>(PreparedAuditHashes {
-                audit_bundle_sha256: prefix.finish(body)?,
+                audit_bundle_sha256: prefix.finish_with(body, parallelism)?,
                 coinbase_manifest_sha256: canonical_json_sha256(
                     &body.signed_coinbase_manifest.manifest,
                 )?,
@@ -397,12 +423,13 @@ impl Coordinator {
                     base_wire,
                 } = match source.body {
                     Some(body) => body.into_inner().0?,
-                    None => prepare_refresh_body(
+                    None => prepare_refresh_body_with(
                         &config,
                         snapshot,
                         &source.template,
                         source.suffix.clone(),
                         source.inputs.clone(),
+                        refresh_window::refresh_parallelism(),
                     )?,
                 };
                 let template = PreparedTemplate::encode(&source.template)?;
@@ -439,16 +466,19 @@ impl Coordinator {
                     Instant::now(),
                     Some(source.proof),
                 )?;
-                // Counted shares drop under admission; the refresh loop alone
-                // retains the original accepted rows until invalidation.
-                drop(body);
+                // The refresh loop alone retains the original accepted rows
+                // until invalidation; the counted shares leave with admission.
                 drop(source.window);
-                Ok::<_, anyhow::Error>(CompactOwner::new((captured, admission)))
+                Ok::<_, anyhow::Error>(CompactOwner::new((captured, body, admission)))
             })
             .await??;
-        let (captured, permit) = result.into_inner();
+        let (captured, body, permit) = result.into_inner();
         let captured = CompactOwner::new(captured);
+        // The build slot is released first: a queued blocking task must not
+        // hold admission. The counted shares are then destroyed on the
+        // blocking pool, off this awaited path.
         drop(permit);
+        drop(CompactOwner::new(body));
         Ok(captured)
     }
 }

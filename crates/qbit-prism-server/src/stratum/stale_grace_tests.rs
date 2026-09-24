@@ -529,3 +529,55 @@ mod retained_tests;
 
 #[path = "session_timer_tests.rs"]
 mod session_timer_tests;
+
+/// REVIEW #478 (payout-integrity): a job retired by a same-parent payout
+/// replacement is buried "block-only" by the candidate. After the NEXT tip
+/// change it is an ordinary previous-parent job, and the coordinator's
+/// stale-grace branch has no payout-revision check, so a proof on it is
+/// credited as a stale-grace share. On the base the job was discarded at the
+/// replacement and the same submit is `unknown-job`. The replacement job
+/// (same parent, current revision) is the positive control: grace credit is
+/// expected for it on both.
+#[tokio::test]
+async fn review_b478_superseded_same_parent_job_gets_no_grace_credit_after_next_tip() {
+    let mut client = Connection::new(30.0, 64).await;
+    let superseded = client.deliver().await;
+    // Same-parent payout replacement: the durable revision moves, the tip
+    // does not, and the session receives replacement work.
+    client
+        .backend
+        .fixture
+        .store
+        .revision
+        .store(1, Ordering::SeqCst);
+    client.tip(1).await;
+    let replacement = client.deliver().await;
+    assert_eq!(
+        replacement.wire.previousblockhash,
+        superseded.wire.previousblockhash
+    );
+    assert_ne!(
+        replacement.wire.payout_revision,
+        superseded.wire.payout_revision
+    );
+    // The next block arrives; the session gets work on it, anchoring grace.
+    client.tip(2).await;
+    client.deliver().await;
+    let control = client.submit(&replacement, 7).await;
+    assert_eq!(control["result"], true, "control: {control}");
+    let response = client.submit(&superseded, 9).await;
+    let records = client.backend.fixture.store.records.lock().unwrap();
+    let superseded_credit = records
+        .iter()
+        .filter(|(share, _, _)| share.job_id == superseded.wire.job_id)
+        .count();
+    assert_eq!(
+        superseded_credit,
+        0,
+        "a job superseded same-parent was credited through stale grace: {response}; records {:?}",
+        records
+            .iter()
+            .map(|(share, _, _)| (share.job_id.clone(), share.credit_policy.clone()))
+            .collect::<Vec<_>>()
+    );
+}

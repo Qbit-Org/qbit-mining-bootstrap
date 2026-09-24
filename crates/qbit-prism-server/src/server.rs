@@ -20,25 +20,13 @@ pub async fn run(config: Config) -> Result<()> {
     let partition_settings = crate::partitions::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
-    // Validate both listeners before coordinator startup can write cluster state.
+    // Validate and bind both Stratum listeners before coordinator startup can
+    // write cluster state: a restart that loses the bind race to its
+    // predecessor must exit without a `starting` instance row, which
+    // `fatal-state clear` would refuse on. The audit listener binds later
+    // because it serves the coordinator's ledger.
     let highdiff = stratum_config.highdiff_config()?;
     let mut api_config = ApiConfig::from_env()?;
-    let registry = Arc::new(metrics::Metrics::default());
-    let coordinator = Coordinator::new(config, registry.clone()).await?;
-    // The share ledger has no DEFAULT partition, so an append whose sequence
-    // value has run past the last attached bound is refused (#144). Attaching
-    // the lead is a precondition of serving, not a background convenience: an
-    // instance that cannot maintain its partitions must refuse to start
-    // rather than accept shares until the lead runs out.
-    let attached =
-        crate::partitions::ensure_with_metrics(&coordinator.ledger.pool, Some(&registry))
-            .await
-            .context("attach the share ledger partition lead at startup")?;
-    if attached > 0 {
-        tracing::info!(created = attached, "share ledger partitions attached");
-    }
-    let config = &coordinator.config;
-    let (shutdown, shutdown_rx) = watch::channel(false);
     let primary = TcpListener::bind((
         config::value("PRISM_STRATUM_BIND", "127.0.0.1"),
         config::number("PRISM_STRATUM_PORT", 3340u16)?,
@@ -59,6 +47,27 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
+    let registry = Arc::new(metrics::Metrics::default());
+    let coordinator = Coordinator::new(config, registry.clone()).await?;
+    // The share ledger has no DEFAULT partition, so an append whose sequence
+    // value has run past the last attached bound is refused (#144). Attaching
+    // the lead is a precondition of serving, not a background convenience: an
+    // instance that cannot maintain its partitions must refuse to start
+    // rather than accept shares until the lead runs out.
+    let attached =
+        crate::partitions::ensure_with_metrics(&coordinator.ledger.pool, Some(&registry))
+            .await
+            .context("attach the share ledger partition lead at startup")?;
+    if attached > 0 {
+        tracing::info!(created = attached, "share ledger partitions attached");
+    }
+    // The share ledger has no DEFAULT partition, so an append whose sequence
+    // value has run past the last attached bound is refused (#144). Attaching
+    // the lead is a precondition of serving, not a background convenience: an
+    // instance that cannot maintain its partitions must refuse to start
+    // rather than accept shares until the lead runs out.
+    let config = &coordinator.config;
+    let (shutdown, shutdown_rx) = watch::channel(false);
     api_config.rpc_url = config.rpc_url.clone();
     api_config.rpc_user = config.rpc_user.clone();
     api_config.rpc_password = config.rpc_password.clone();

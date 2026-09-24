@@ -163,9 +163,20 @@ async fn same_parent_payout_replacement_has_no_grace_exception() {
     fixture.observe(1, true).await;
     fixture.store.revision.store(1, Ordering::SeqCst);
     let old = fixture.job(1, 0, "original.worker");
+    // A plain SHARE on the superseded job is refused credit: a same-parent
+    // payout replacement grants no stale-grace exception. (#478 Option B now
+    // captures a BLOCK on such a job — pinned by
+    // `tests/b478_stale_revision_block.rs` and `readiness_rpc` — but its share
+    // credit stays fenced, so this asserts the share path with a non-block proof.)
+    let mut proof = fixture.proof(&old, 0);
+    proof.block_pass = false;
     for grace in [false, true] {
         assert_error(
-            fixture.submit(&old, grace).await.unwrap_err(),
+            fixture
+                .coordinator
+                .submit(&old.context.worker, &old, proof.clone(), grace.into())
+                .await
+                .unwrap_err(),
             "stale-job",
             "stale job",
         );

@@ -86,6 +86,7 @@ fn sample_job() -> (codec::Job, String) {
         resume_expires_at: None,
         refresh_generation: 0,
         payout_revision: 0,
+        kind: codec::JobKind::Credit,
     };
     (job, extranonce1)
 }
