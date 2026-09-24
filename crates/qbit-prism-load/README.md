@@ -255,8 +255,13 @@ moved anyway reports the changes it saw rather than a zero.
 
 ### Which rejections a landing owns
 
-A landing owns the rejections, inside its span, of work it retired: a share
-proven on a job whose parent or payout revision the landing replaced. The
+A landing owns the rejections of retired work answered inside its span: a
+share proven on a job whose parent or payout revision had been replaced, or
+whose job ID the session no longer held. Attribution is by time, not lineage.
+A share on work an earlier landing retired, answered after this landing's tip
+change, is this landing's. An `unknown-job` means the ID has left both the
+session's live list and its retained graveyard (`stratum/retained_jobs.rs`,
+which has a cap and a TTL), and any job churn can cause that. The
 harness recognises them by `reason_id` together with the message
 `crates/qbit-prism-server` sends on the submit path, and publishes the list in
 the section as `rejection_attribution.counted_classes`
@@ -352,18 +357,49 @@ there was no bump or no such job inside the span, and with the unrecognised
 reason when the span held an unrecognised rejection.
 
 **The same edge as #458.** The server's
-`qbit_prism_accepted_block_to_revision_work_seconds` runs from a frontend's
-definitive `submitblock` acceptance to the first `mining.notify` it writes at
-the post-landing revision. A landing's span starts at the fake node's tip
-change, which the node stamps as it accepts `submitblock`, so
-`rejected_before_new_revision_work` counts over the same edge, and
-`acceptance_to_new_revision_work_millis` — the same first `clean_jobs` notify,
-measured from the acceptance instead of the bump — is the harness's reading of
-that histogram. Both are on the harness's monotonic clock: the server starts
-when the frontend classifies the reply and stops at the notify's socket write,
-so its number sits inside the harness's by one RPC reply and one notify
-transit. `proposed_budget_for_issue_291.same_edge_as_issue_458` carries the
-p99 of each.
+`qbit_prism_accepted_block_to_revision_work_seconds` takes one sample per
+block and frontend. Each sample ends at the earliest successful
+`mining.notify` write at the post-landing revision on any of that frontend's
+sessions (`Landing::resolve`, `min_by_key`). A landing's span starts at the
+fake node's tip change, which the node stamps as it accepts `submitblock`.
+
+The harness reads that edge like this:
+
+- `rejected_before_new_revision_work` counts up to the earliest session's
+  new-revision work, so it covers the same interval.
+- `acceptance_to_new_revision_work_millis` is the same first `clean_jobs`
+  notify, per session, measured from the acceptance instead of the bump. Its
+  per-table **min** (the earliest session) is the #458-comparable figure. Its
+  **max** (the latest session) adds the notify fan-out across the frontend's
+  sessions, which the server does not include, and is published beside it
+  under its own name.
+
+`proposed_budget_for_issue_291.same_edge_as_issue_458` carries the p99 of
+each:
+
+- `rejected_before_new_revision_work_per_landing_per_frontend_p99`;
+- `acceptance_to_new_revision_work_p99_millis` (min);
+- `acceptance_to_new_revision_work_with_fanout_p99_millis` (max).
+
+The two timings are notify timings. An unrecognised rejection does not null
+them: only a run with no landing does.
+
+The harness's numbers are on its monotonic clock, from the node's stamp to
+the client's read of the notify. The server's interval is shorter, and not
+by a transit:
+
+- On the submitting frontend, `accepted_block` is called at the end of
+  `observe_candidate`. That is after `ready_chain_info`,
+  `observe_chain_view`, `getblockhash`, `getbestblockhash` and `ready_tip`:
+  several RPCs and a ledger round trip after the node's stamp.
+- On every other frontend it is called from `reconcile` when that frontend
+  discovers the tip, so it trails the stamp by tip-discovery latency.
+- The server stops at the notify's socket write, one transit before the
+  client's read.
+
+The harness's end is also bounded below by the revision sampler. A
+new-revision notify written before the 25 ms sampler saw the bump is not
+counted. `clock_note` in the block says the same.
 
 The label travels with the numbers: every object that carries a new-revision
 figure carries `new_revision_work_approximation` beside it — the per-landing,
@@ -391,7 +427,16 @@ as a clean pass in the one situation that would make it fail. The per-landing,
 per-frontend `lost_valid_shares` tables are unchanged and still count a span's
 rejections, so they sum to `shares_attributed`. When any rejection in the phase
 is unrecognised, `shares` is `null` with `shares_unavailable_reason`, and
-`shares_recognised` carries the recognised count as a lower bound.
+`shares_recognised` carries the recognised count as a lower bound. So does
+`shares_found_in_postgres`, which is `null` with its own reason beside a null
+`shares`. The checks that were made are published apart:
+
+- `shares_recognised_found_in_postgres`, over the recognised shares;
+- `unrecognised_shares_found_in_postgres`, with a sample, over the
+  unrecognised rejections' shares, which are looked up too.
+
+A table's `lost_valid_shares_found_in_postgres` is likewise `null` when its
+`lost_valid_shares` is.
 
 ### Where the rebuild queues
 
@@ -840,9 +885,11 @@ The side report repeats all of this under `honest_value_notes`.
   advisory-lock statement's `calls` and `total_exec_time` are recorded too, and
   the three PRISM locks share one normalized query text.
 - **Every distribution names its own unit.** A percentile summary carries
-  `unit` and `clock`. The five count distributions in the dense section —
+  `unit` and `clock`. The seven count distributions in the dense section —
   `tip_pending_rejections_per_landing`,
   `payout_pending_rejections_per_landing`,
+  `stale_job_rejections_per_landing`,
+  `unknown_job_rejections_per_landing`,
   `combined_rebuild_pending_rejections_per_landing`,
   `rejected_before_new_revision_work_per_landing` and
   `lost_valid_shares_per_landing` — carry `"unit": "count"`, because they count

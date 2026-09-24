@@ -8709,8 +8709,10 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
         document["proposed_budget_for_issue_291"]["recommended_soak_budget_millis"],
         Value::Null
     );
-    // #480: the count was the field that read 0.0 in #447. With no landing it
-    // is unknown, and every null in the block says why.
+    // #480: with no landing every number in the block is unknown, and each
+    // null now carries its own reason. (#447's 0.0 came from landings whose
+    // spans were credited nothing; that shape is
+    // landings_whose_spans_held_no_owned_rejection_report_measured_zeros.)
     let budget = &document["proposed_budget_for_issue_291"];
     for (value, reason) in [
         (
@@ -8961,6 +8963,27 @@ fn landing_cost_keys_on_the_reason_and_the_servers_messages() {
 /// digit for its share, a session, milliseconds from the phase's start to the
 /// response, and the answer.
 fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -> Value {
+    vocabulary_document(true, extra, &[])
+}
+
+/// The share identifier `current_vocabulary_document` gives a hex digit and
+/// session.
+fn vocabulary_share_id(digit: u32, session: usize) -> String {
+    let hash = char::from_digit(digit, 16)
+        .expect("a digit")
+        .to_string()
+        .repeat(64);
+    format!("pload1abc.s{session:05}:{hash}")
+}
+
+/// `current_vocabulary_document`, with the owned rejections left out when
+/// `owned` is false (only the not-owned ones remain), and the `(digit,
+/// session)` shares in `committed` made present in PostgreSQL.
+fn vocabulary_document(
+    owned: bool,
+    extra: Vec<(u32, usize, u64, client::Outcome)>,
+    committed: &[(u32, usize)],
+) -> Value {
     use qbit_prism_load::cadence;
     let base = std::time::Instant::now();
     let landing = |index: usize, millis: u64, session: usize| cadence::Landing {
@@ -9006,19 +9029,27 @@ fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -
             client::Outcome::Accepted,
             true,
         ),
-        // Before any span: owned by no landing, so unattributed.
-        share(1, 2, 3_000, stale()),
-        // Landing 0's span: three stale-job and one unknown-job, the last
-        // stale-job after new-revision work reached the frontend at 9.0 s.
-        share(2, 2, 7_200, stale()),
-        share(3, 3, 7_600, stale()),
-        share(
-            4,
-            2,
-            8_000,
-            rejected(21, "unknown-job", classify::STALE_JOB),
-        ),
-        share(5, 3, 10_000, stale()),
+    ];
+    if owned {
+        submits.extend([
+            // Before any span: owned by no landing, so unattributed.
+            share(1, 2, 3_000, stale()),
+            // Landing 0's span: three stale-job and one unknown-job, the last
+            // stale-job after new-revision work reached the frontend at 9.0 s.
+            share(2, 2, 7_200, stale()),
+            share(3, 3, 7_600, stale()),
+            share(
+                4,
+                2,
+                8_000,
+                rejected(21, "unknown-job", classify::STALE_JOB),
+            ),
+            share(5, 3, 10_000, stale()),
+            // Landing 1's span.
+            share(9, 3, 16_200, stale()),
+        ]);
+    }
+    submits.extend([
         // Landing 0's span, and not landing 0's: a backend refusal, a closed
         // commit gate and a fee-floor stale-job.
         share(
@@ -9059,9 +9090,7 @@ fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -
                 message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
             }),
         ),
-        // Landing 1's span.
-        share(9, 3, 16_200, stale()),
-    ];
+    ]);
     submits.extend(
         extra
             .into_iter()
@@ -9103,7 +9132,10 @@ fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -
     let session_frontend = vec![0usize, 0, 0, 0];
     let gaps = vec![9.0];
     let offsets = vec![5.0, 14.0];
-    let committed = std::collections::BTreeSet::new();
+    let committed: std::collections::BTreeSet<String> = committed
+        .iter()
+        .map(|(digit, session)| vocabulary_share_id(*digit, *session))
+        .collect();
     cadence::build(&cadence::ReportInputs {
         cadence: cadence::Cadence::Dense,
         gaps: &gaps,
@@ -9213,6 +9245,11 @@ fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattribu
         "7.2, 7.6 and 8.0 s precede the first clean_jobs job at 9.0 s; 10.0 s does not"
     );
     assert_eq!(
+        first["acceptance_to_new_revision_work_millis"]["min"],
+        json!(2_000.0),
+        "from the acceptance at 7.0 s to the earliest session's job at 9.0 s"
+    );
+    assert_eq!(
         first["acceptance_to_new_revision_work_millis"]["max"],
         json!(2_400.0),
         "from the acceptance at 7.0 s to the later session's job at 9.4 s"
@@ -9248,10 +9285,22 @@ fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattribu
         edge["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
         json!(3.0)
     );
+    // #458's histogram ends at the earliest delivery on the frontend
+    // (Landing::resolve, min_by_key), so the comparable figure is the
+    // earliest session's: 9.0 s - 7.0 s in landing 0, 18.0 s - 16.0 s in
+    // landing 1. The latest session's is the fan-out, under its own name.
     assert_eq!(
         edge["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_with_fanout_p99_millis"],
         json!(2_400.0)
     );
+    assert!(edge["clock_note"]
+        .as_str()
+        .expect("a clock note")
+        .contains("observe_candidate"));
     let overall = &document["summaries"]["overall"];
     assert_eq!(
         overall["stale_job_rejections_per_landing"]["max"],
@@ -9273,12 +9322,18 @@ fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattribu
 /// subset passed off as the whole and never 0.0 (#480, EP-OBSERVABILITY).
 #[test]
 fn an_unrecognised_message_in_a_span_makes_the_landings_cost_null_with_a_reason() {
-    let document = current_vocabulary_document(vec![(
-        0xf,
-        2,
-        8_500,
-        rejected(21, "stale-job", "some wording this harness has never seen"),
-    )]);
+    // The unrecognised rejection's share is in PostgreSQL: the report must
+    // surface it rather than check only the recognised shares.
+    let document = vocabulary_document(
+        true,
+        vec![(
+            0xf,
+            2,
+            8_500,
+            rejected(21, "stale-job", "some wording this harness has never seen"),
+        )],
+        &[(0xf, 2)],
+    );
     let first = &document["landing_records"][0]["frontends"][0];
     assert_eq!(first["unrecognised_rejections_in_span"], json!(1));
     assert_eq!(
@@ -9322,6 +9377,19 @@ fn an_unrecognised_message_in_a_span_makes_the_landings_cost_null_with_a_reason(
     assert_eq!(lost["shares"], Value::Null);
     assert_eq!(lost["shares_recognised"], json!(6));
     assert!(lost["shares_unavailable_reason"].is_string());
+    assert_eq!(
+        lost["shares_found_in_postgres"],
+        Value::Null,
+        "a 0 beside a null shares would read as a clean pass over the whole phase"
+    );
+    assert!(lost["shares_found_in_postgres_unavailable_reason"].is_string());
+    assert_eq!(lost["shares_recognised_found_in_postgres"], json!(0));
+    assert_eq!(lost["unrecognised_shares_found_in_postgres"], json!(1));
+    assert_eq!(
+        lost["unrecognised_shares_found_in_postgres_sample"][0],
+        json!(vocabulary_share_id(0xf, 2))
+    );
+    assert_eq!(first["lost_valid_shares_found_in_postgres"], Value::Null);
 
     let overall = &document["summaries"]["overall"];
     assert_eq!(overall["unattributable_landing_frontend_tables"], json!(1));
@@ -9354,6 +9422,80 @@ fn an_unrecognised_message_in_a_span_makes_the_landings_cost_null_with_a_reason(
             ["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
         Value::Null
     );
+    // The acceptance -> new-revision-work times are notify timings, which no
+    // rejection's classification changes: they stay measured.
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_unavailable_reason"],
+        Value::Null
+    );
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_with_fanout_p99_millis"],
+        json!(2_400.0)
+    );
+}
+
+/// #447's exact shape: landings happened, and no span held a rejection a
+/// landing owns. The count is a measured zero and the budget is non-null; only
+/// the window, which has nothing to take a percentile of, is null with its
+/// reason. The not-owned rejections stay beside it (#480).
+#[test]
+fn landings_whose_spans_held_no_owned_rejection_report_measured_zeros() {
+    let document = vocabulary_document(false, Vec::new(), &[]);
+    assert_eq!(document["landings"], json!(2));
+    assert_eq!(
+        document["rejection_attribution"]["rebuild_pending_rejections_in_phase"],
+        json!(0)
+    );
+    assert_eq!(
+        document["rejection_attribution"]["unrecognised_in_phase"],
+        json!(0)
+    );
+    assert_eq!(
+        document["rejection_attribution"]["not_owned_in_phase"],
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        })
+    );
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["combined_rebuild_pending_window"]["count"], json!(0));
+    assert_eq!(first["lost_valid_shares"], json!(0));
+    assert_eq!(first["rejected_before_new_revision_work"], json!(0));
+
+    let budget = &document["proposed_budget_for_issue_291"];
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99"],
+        json!(0.0),
+        "a measured zero: landings happened and owned nothing"
+    );
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99_unavailable_reason"],
+        Value::Null
+    );
+    assert_eq!(budget["window_p99_millis"], Value::Null);
+    assert!(budget["window_p99_unavailable_reason"]
+        .as_str()
+        .expect("the null window says why")
+        .contains("no landing's span held a rejection the landing owns"));
+    assert_eq!(budget["recommended_soak_budget_millis"], Value::Null);
+    let edge = &budget["same_edge_as_issue_458"];
+    assert_eq!(
+        edge["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        json!(0.0)
+    );
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], json!(0));
+    assert_eq!(lost["shares_found_in_postgres"], json!(0));
 }
 
 #[test]

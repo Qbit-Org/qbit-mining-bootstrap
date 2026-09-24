@@ -721,6 +721,11 @@ struct Distribution {
     lost: Vec<f64>,
     tip_work_max: Vec<f64>,
     revision_work_max: Vec<f64>,
+    /// Per table, the earliest session's acceptance -> new-revision work: the
+    /// statistic #458's histogram samples once per block and frontend.
+    acceptance_work_min: Vec<f64>,
+    /// Per table, the latest session's: the same edge plus the notify
+    /// fan-out across the frontend's sessions.
     acceptance_work_max: Vec<f64>,
     /// Landing-and-frontend tables whose span held an unrecognised rejection,
     /// so their combined, before-revision and lost counts are unknown and are
@@ -745,6 +750,7 @@ impl Distribution {
             "lost_valid_shares_per_landing": count_summary(&self.lost),
             "time_to_new_tip_work_max_millis": millis_summary(&self.tip_work_max),
             "time_to_new_revision_work_max_millis": millis_summary(&self.revision_work_max),
+            "acceptance_to_new_revision_work_min_millis": millis_summary(&self.acceptance_work_min),
             "acceptance_to_new_revision_work_max_millis": millis_summary(&self.acceptance_work_max),
             "unattributable_landing_frontend_tables": self.unattributable,
             "unattributable_note": "tables whose span held an unrecognised rejection are left out \
@@ -945,12 +951,13 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 // later job -- which understated the time and stopped the
                 // rejected-before count at the wrong event (EP-STATE).
                 let mut revision_work: Vec<f64> = Vec::new();
-                // The same first clean_jobs notify, measured from the
-                // landing's own acceptance instead of the bump: the fake node
-                // stamps the tip change as it accepts submitblock, so this is
-                // the harness's reading of the acceptance -> new-revision-work
-                // edge #458's accepted_block_to_revision_work_seconds measures
-                // on the server.
+                // The same first clean_jobs notify per session, measured from
+                // the landing's own acceptance instead of the bump: the fake
+                // node stamps the tip change as it accepts submitblock. The
+                // earliest session's value is the harness's reading of the
+                // acceptance -> new-revision-work edge #458's
+                // accepted_block_to_revision_work_seconds samples once per
+                // frontend; the latest adds the notify fan-out.
                 let mut acceptance_work: Vec<f64> = Vec::new();
                 let mut first_revision_work: Option<Instant> = None;
                 if let Some(bump) = reference {
@@ -1053,6 +1060,9 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     if let Some(worst) = revision_work.iter().copied().max_by(f64::total_cmp) {
                         target.revision_work_max.push(worst);
                     }
+                    if let Some(first) = acceptance_work.iter().copied().min_by(f64::total_cmp) {
+                        target.acceptance_work_min.push(first);
+                    }
                     if let Some(worst) = acceptance_work.iter().copied().max_by(f64::total_cmp) {
                         target.acceptance_work_max.push(worst);
                     }
@@ -1093,10 +1103,12 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     "lost_valid_shares": attributable.then_some(lost.len()),
                     "lost_valid_shares_unavailable_reason":
                         (!attributable).then(|| unrecognised_reason(unrecognised)),
-                    "lost_valid_shares_found_in_postgres": lost
+                    // Null beside a null lost_valid_shares: a count over the
+                    // recognised subset is not a durability answer for the span.
+                    "lost_valid_shares_found_in_postgres": attributable.then(|| lost
                         .iter()
                         .filter(|share| inputs.committed.contains(**share))
-                        .count(),
+                        .count()),
                     "incomplete": incomplete.is_some(),
                     "incomplete_reason": incomplete,
                     "span_truncated_at_phase_end": truncated,
@@ -1204,6 +1216,16 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         .iter()
         .filter(|share| inputs.committed.contains(**share))
         .map(|share| (*share).to_owned())
+        .collect();
+    // An unrecognised rejection may be lost work too, so its share is looked
+    // up as well: a whole-phase durability answer that skipped them would read
+    // as a clean pass over shares nobody checked.
+    let unrecognised_in_postgres: Vec<String> = rejections
+        .iter()
+        .filter(|rejection| rejection.cost == LandingCost::Unrecognised)
+        .map(|rejection| rejection.record.share_id.as_str())
+        .filter(|share| inputs.committed.contains(*share))
+        .map(str::to_owned)
         .collect();
     let no_landing_reason = no_landing_reason(inputs, &resolved, with_windows);
     let budget = proposed_budget(
@@ -1317,15 +1339,27 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
             "shares_recognised": lost_shares.len(),
             "shares_attributed": attributed_rejections,
             "shares_unattributed": unattributed_rejections,
-            "split_note": "shares counts every owned rejection in the phase and is what \
-                           shares_found_in_postgres is checked over; it is null when an \
-                           unrecognised rejection makes the total unknown, and shares_recognised \
-                           always carries the recognised count. shares_attributed is the subset \
+            "split_note": "shares counts every owned rejection in the phase and \
+                           shares_found_in_postgres is checked over it; both are null when an \
+                           unrecognised rejection makes the total unknown, and then \
+                           shares_recognised and shares_recognised_found_in_postgres carry the \
+                           recognised count and its check, and \
+                           unrecognised_shares_found_in_postgres the check over the unrecognised \
+                           rejections' shares. shares_attributed is the subset \
                            a landing's span owns, which is what the per-landing, per-frontend \
                            lost_valid_shares tables sum to; the rest fell inside no span and is \
                            counted here rather than leaving the census.",
-            "shares_found_in_postgres": lost_in_postgres.len(),
+            "shares_found_in_postgres": (unrecognised_in_phase == 0).then_some(lost_in_postgres.len()),
+            "shares_found_in_postgres_unavailable_reason": (unrecognised_in_phase > 0).then(|| format!(
+                "shares is unknown ({unrecognised_in_phase} unrecognised rejection(s)), so a \
+                 durability answer over it is too; shares_recognised_found_in_postgres and \
+                 unrecognised_shares_found_in_postgres carry the two checks that were made"
+            )),
+            "shares_recognised_found_in_postgres": lost_in_postgres.len(),
             "shares_found_in_postgres_sample": lost_in_postgres.iter().take(10).collect::<Vec<_>>(),
+            "unrecognised_shares_found_in_postgres": unrecognised_in_postgres.len(),
+            "unrecognised_shares_found_in_postgres_sample":
+                unrecognised_in_postgres.iter().take(10).collect::<Vec<_>>(),
         },
         "frontend_health": inputs.frontends.iter().map(|health| json!({
             "frontend": health.index,
@@ -1454,11 +1488,28 @@ fn proposed_budget(
         "no frontend reached new-revision work inside a landing's span \
          (new_revision_work_unavailable_reason in the tables says why for each)",
     );
-    let (acceptance, acceptance_reason) = measured(
-        p99(&overall.acceptance_work_max, millis_summary),
-        "no frontend reached new-revision work inside a landing's span \
-         (new_revision_work_unavailable_reason in the tables says why for each)",
-    );
+    // The acceptance -> new-revision-work times are notify timings: they do
+    // not depend on which rejections a landing owns, so an unrecognised
+    // rejection does not null them. Only a run with no landing does.
+    let timing = |values: &[f64]| -> (Option<f64>, Option<String>) {
+        match (no_landing_reason, p99(values, millis_summary)) {
+            (Some(reason), _) => (
+                None,
+                Some(format!("no landing produced a window: {reason}")),
+            ),
+            (None, Some(value)) => (Some(value), None),
+            (None, None) => (
+                None,
+                Some(
+                    "no frontend reached new-revision work inside a landing's span \
+                     (new_revision_work_unavailable_reason in the tables says why for each)"
+                        .to_owned(),
+                ),
+            ),
+        }
+    };
+    let (acceptance, acceptance_reason) = timing(&overall.acceptance_work_min);
+    let (fanout, fanout_reason) = timing(&overall.acceptance_work_max);
     json!({
         "metric": "p99 of the combined rebuild-pending window per landing, per frontend, over \
                    every rejection the landing owns (rejection_attribution.counted_classes)",
@@ -1476,10 +1527,30 @@ fn proposed_budget(
             "rejected_before_new_revision_work_unavailable_reason": before_reason,
             "acceptance_to_new_revision_work_p99_millis": acceptance,
             "acceptance_to_new_revision_work_unavailable_reason": acceptance_reason,
-            "clock_note": "harness monotonic. The server starts its histogram when the frontend \
-                           classifies the submitblock reply and ends it at the notify's socket \
-                           write, so the server's number sits inside this one by one RPC reply \
-                           and one notify transit.",
+            "acceptance_to_new_revision_work_statistic": "per landing and frontend, the earliest \
+                                                          session's first clean_jobs notify, \
+                                                          as the server's histogram takes the \
+                                                          earliest delivery on the frontend",
+            "acceptance_to_new_revision_work_with_fanout_p99_millis": fanout,
+            "acceptance_to_new_revision_work_with_fanout_unavailable_reason": fanout_reason,
+            "acceptance_to_new_revision_work_with_fanout_statistic": "per landing and frontend, the \
+                                                                      latest session's: the same \
+                                                                      edge plus the notify fan-out \
+                                                                      across the frontend's \
+                                                                      sessions, which the server's \
+                                                                      histogram does not include",
+            "clock_note": "harness monotonic, from the fake node's submitblock stamp to the \
+                           client's read of the notify. The server's histogram starts later: on \
+                           the submitting frontend accepted_block is called at the end of \
+                           observe_candidate, after ready_chain_info, observe_chain_view, \
+                           getblockhash, getbestblockhash and ready_tip (several RPCs and a \
+                           ledger round trip after the node's stamp); on every other frontend it \
+                           is called from reconcile when that frontend discovers the tip, so it \
+                           trails the stamp by tip-discovery latency. It ends at the notify's \
+                           socket write, one transit before the client's read. The server's \
+                           number is therefore shorter than this one, by those amounts. This \
+                           end is also bounded below by the revision sampler: a notify written \
+                           before the sampler (25 ms interval) saw the bump is not counted.",
         },
         "note": "the soak in #291 should fail if either number is exceeded at the same topology. \
                  Every number is null with its reason, never zero, when this run produced no \
@@ -1612,10 +1683,12 @@ pub fn definitions() -> Value {
                                               a job seen only after the span is the next \
                                               landing's and stops nothing here.",
         "acceptance_to_new_revision_work": "the same first clean_jobs notify as \
-                                            time_to_new_revision_work, measured from the \
-                                            landing's acceptance (its tip change) instead of the \
-                                            bump: the harness's reading of \
-                                            qbit_prism_accepted_block_to_revision_work_seconds.",
+                                            time_to_new_revision_work, per session, measured \
+                                            from the landing's acceptance (its tip change) \
+                                            instead of the bump. The earliest session per \
+                                            landing and frontend (min) is the harness's reading \
+                                            of qbit_prism_accepted_block_to_revision_work_seconds; \
+                                            the latest (max) adds the notify fan-out.",
         "lost_valid_shares": "every rejection the landing owns in the span. Null, with a reason, \
                               when the span also held an unrecognised rejection. The client only submits \
                               a nonce it has already checked against the share target, so each one \
