@@ -118,8 +118,20 @@ async fn payout_revision_mismatch_on_the_current_parent_counts_each_refusal_once
     fixture.observe(1, true).await;
     fixture.store.revision.store(1, Ordering::SeqCst);
     let old = fixture.job(1, 0, "original.worker");
+    // A plain SHARE (not a block — #478 Option B captures a block on the current
+    // parent) refused for a superseded revision counts the payout_revision cause
+    // once per submit.
+    let mut proof = fixture.proof(&old, 0);
+    proof.block_pass = false;
     for (grace, expected) in [(false, 1.), (true, 2.)] {
-        assert_stale_wire(fixture.submit(&old, grace).await.unwrap_err(), "stale job");
+        assert_stale_wire(
+            fixture
+                .coordinator
+                .submit(&old.context.worker, &old, proof.clone(), grace.into())
+                .await
+                .unwrap_err(),
+            "stale job",
+        );
         assert_eq!(stale_causes(&metrics), [0., 0., 0., expected]);
     }
     assert!(fixture.store.records.lock().unwrap().is_empty());

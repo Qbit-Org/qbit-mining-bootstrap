@@ -27,7 +27,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// after its last change, so a start refuses the database until that has
 /// completed.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -2139,6 +2139,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         19,
         include_str!("../../migrations/019_signing_transitions.sql"),
     ),
+    (
+        20,
+        include_str!("../../migrations/020_payout_divergences.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3120,6 +3124,17 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(19)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&20) {
+        // #478 payout-divergence evidence and its report function. Additive
+        // only: no capability and no shutdown proof. A binary that does not
+        // know the tables never reads or writes them.
+        sqlx::raw_sql(native_migration(20))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(20)")
             .execute(&mut **tx)
             .await?;
     }

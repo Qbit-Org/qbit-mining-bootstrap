@@ -144,6 +144,7 @@ impl Fixture {
             share_commit_grace: Duration::from_secs(5),
             block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: ORPHAN_CONFIRMATIONS,
+            capture_overpay_ceiling_bps: 100,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),

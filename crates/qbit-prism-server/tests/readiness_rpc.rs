@@ -225,6 +225,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         share_commit_grace: Duration::from_secs(5),
         block_only_ack_timeout: Duration::from_secs(60),
         candidate_orphan_confirmations: 6,
+        capture_overpay_ceiling_bps: 100,
         extranonce2_size: 8,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),
@@ -612,21 +613,38 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
     fixture.close(result).await
 }
 
+// #478 Option B: a block-bearing proof on the current tip whose payout revision
+// was bumped same-parent is no longer dropped `stale-job`. It is CAPTURED, even
+// before this frontend refreshes past the bump: a candidate is enqueued at the
+// job's own revision and offered to the node, while its solver share is
+// deferred, refused credit against the superseded revision. This fixture's
+// node leaves the offer's outcome unknown, so the block does not LAND here
+// (landing is pinned by `tests/b478_stale_revision_block.rs`). This pin asserts
+// the capture, the offer, the unknown outcome held for reconciliation, the
+// deferred share, and the share fence on both frontends before and after
+// refresh, with and without grace. A reconnecting miner is still fenced by the
+// durable resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace(
+async fn another_frontend_payout_revision_captures_the_same_parent_block_but_fences_its_share(
 ) -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let fixture = FixtureDatabase::open(&raw, "prism_job_revision_").await?;
     let node = Node::open().await?;
+    // The node keeps every offer's outcome unknown, so bound the block-only
+    // acknowledgement instead of waiting the full default for a landing that
+    // cannot happen against this node.
+    let mut first_config = coordinator_config(fixture.url.clone(), &node)?;
+    first_config.block_only_ack_timeout = Duration::from_secs(3);
     let first = Coordinator::new(
-        coordinator_config(fixture.url.clone(), &node)?,
+        first_config,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     )
     .await?;
     let mut config = coordinator_config(fixture.url.clone(), &node)?;
     config.instance_id = "readiness-second".into();
+    config.block_only_ack_timeout = Duration::from_secs(3);
     let second = Coordinator::new(
         config,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
@@ -664,24 +682,97 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         let revision: i64 = sqlx::query_scalar("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton RETURNING payout_revision")
             .fetch_one(&second.ledger.pool).await?;
         ensure!(revision != old.context.prepared.snapshot.payout_revision);
-        for frontend in [&first, &second] {
-            ensure!(frontend.health().await["ready"] == false);
-            for grace in [false, true] {
-                let error = frontend.submit(&worker, &old, old_proof.clone(), grace.into()).await.unwrap_err();
-                ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
+        // A plain share (share target, no block) on the superseded job.
+        let mut share_only = solve(&old, 40_000)?;
+        share_only.block_pass = false;
+        let refuses_share = |frontend: &'static str, error: qbit_prism_server::stratum::StratumError| {
+            ensure!(
+                error.reason_id.as_deref() == Some("stale-job"),
+                "{frontend}: a share on the superseded job was not refused stale-job: {error}"
+            );
+            Ok(())
+        };
+
+        // #478 Option B, in the realistic window: the durable revision moved
+        // and this frontend has NOT refreshed yet. Its plain share is refused;
+        // its block-bearing proof on the still-current tip is CAPTURED, not
+        // dropped: a candidate is enqueued at the job's own revision and
+        // offered to the node while its solver share is deferred. Drive the
+        // candidate concurrently, as the runtime would.
+        ensure!(first.health().await["ready"] == false);
+        for grace in [false, true] {
+            refuses_share("first, before refresh", first.submit(&worker, &old, share_only.clone(), grace.into()).await.unwrap_err())?;
+        }
+        let hash = old_proof.block_hash_hex.clone();
+        let submit = first.submit(&worker, &old, old_proof.clone(), false.into());
+        let drive = async {
+            for _ in 0..800 {
+                if let Some(claim) = first.ledger.claim_candidate(60).await? {
+                    ensure!(claim.candidate.block_hash == hash, "a different candidate was claimed");
+                    first.process_candidate(&claim).await?;
+                    return Ok::<bool, anyhow::Error>(true);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(false)
+        };
+        let (submit_res, drove) = tokio::join!(submit, drive);
+        ensure!(drove?, "#478: the block-bearing proof produced no candidate — it was dropped");
+        // It was offered to the node (the base never offered it). This node
+        // leaves the offer's outcome unknown, so nothing lands here and the
+        // block-only acknowledgement resolves unknown at its bound.
+        ensure!(
+            node.state.lock().await.submit_calls >= 1,
+            "the captured block was never offered to the node"
+        );
+        let unknown = submit_res.expect_err("nothing landed, so the capture cannot be acknowledged");
+        ensure!(
+            unknown.reason_id.as_deref() == Some("ledger-outcome-unknown"),
+            "the capture must resolve unknown, not fail: {unknown}"
+        );
+        let (state, outcome): (String, Option<String>) = sqlx::query_as("SELECT state,offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(&hash).fetch_one(&first.ledger.pool).await?;
+        ensure!(
+            (state.as_str(), outcome.as_deref()) == ("reconciliation", Some("unknown")),
+            "the unknown offer must be held for reconciliation: {state} {outcome:?}"
+        );
+        // The candidate was captured at the job's OWN (superseded) revision.
+        let cand: Value = sqlx::query_scalar("SELECT candidate FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(&hash).fetch_one(&first.ledger.pool).await?;
+        let cand: Candidate = serde_json::from_value(cand)?;
+        ensure!(
+            cand.payout_revision == old.context.prepared.snapshot.payout_revision,
+            "the block must be captured at the job's own revision, not the current one"
+        );
+        ensure!(cand.payout_revision != revision, "and the current revision moved past it");
+        // The solver share is deferred, not lost and not credited: one deferred
+        // row for this block, and the seed share is the only credited share.
+        let deferred: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_deferred_shares WHERE block_hash=$1")
+            .bind(&hash).fetch_one(&first.ledger.pool).await?;
+        ensure!(deferred == 1, "the solver share must be deferred exactly once; found {deferred}");
+
+        // A reconnecting miner is still fenced: neither frontend RESUMES the
+        // superseded job from durable state (only the live connection's
+        // retained copy is block-submittable, covered by the stratum tests),
+        // and neither credits its plain share, before or after its refresh.
+        for (name, frontend) in [("first", &first), ("second", &second)] {
+            if name == "second" {
+                ensure!(frontend.health().await["ready"] == false);
+                for grace in [false, true] {
+                    refuses_share("second, before refresh", frontend.submit(&worker, &old, share_only.clone(), grace.into()).await.unwrap_err())?;
+                }
             }
             ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
             frontend.refresh_once().await?;
             ensure!(frontend.health().await["ready"] == true);
             for grace in [false, true] {
-                let error = frontend.submit(&worker, &old, old_proof.clone(), grace.into()).await.unwrap_err();
-                ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
+                refuses_share(name, frontend.submit(&worker, &old, share_only.clone(), grace.into()).await.unwrap_err())?;
             }
             ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
         }
-        let rejected: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM qbit_share_ledger),(SELECT count(*) FROM qbit_block_candidate_outbox)")
+        let fenced: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM qbit_share_ledger),(SELECT count(*) FROM qbit_block_candidate_outbox)")
             .fetch_one(&first.ledger.pool).await?;
-        ensure!(rejected == (1,0), "superseded work was ACKed or enqueued");
+        ensure!(fenced == (1, 1), "only the seed share is credited and only the captured block is enqueued: {fenced:?}");
 
         let fresh = first.build_job(&worker, &extra, 1e-12, 0.0).await?;
         ensure!(fresh.wire.previousblockhash == old.wire.previousblockhash);

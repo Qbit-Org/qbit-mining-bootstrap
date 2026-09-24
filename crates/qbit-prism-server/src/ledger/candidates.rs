@@ -881,28 +881,6 @@ impl Ledger {
         tx.commit().await?;
         Ok(())
     }
-
-    /// The durable reservation before the one `submitblock` call: the
-    /// pending row this live claim holds becomes `offer_reserved`, recording
-    /// which instance took it and when (database clock). The row is the
-    /// unique reservation per block hash; once it commits, no claim on any
-    /// frontend, this one included after a crash, will offer the block
-    /// again.
-    pub async fn reserve_offer(&self, claim: &CandidateClaim) -> Result<()> {
-        let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
-        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
-            .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
-            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).execute(&mut *tx).await?.rows_affected();
-        ensure!(
-            reserved == 1,
-            "candidate claim was lost or expired before the offer reservation"
-        );
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Record how the reserved row's one `submitblock` call ended, moving it
     /// to `offered`. `offered_at_ms` is the offering frontend's wall clock
     /// immediately before the call, never the reservation time.

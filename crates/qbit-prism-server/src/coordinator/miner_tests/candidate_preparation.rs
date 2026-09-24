@@ -35,7 +35,11 @@ fn candidate_construction_yields_before_copying_issued_balances() {
                     let _ = wait.recv();
                 });
                 ready.await.unwrap();
-                let candidate = miner_submit::submission_candidate(&job, proof, share.clone());
+                let candidate = miner_submit::submission_candidate(
+                    &job,
+                    proof,
+                    (!share_pass).then(|| share.clone()),
+                );
                 tokio::pin!(candidate);
                 let started = Instant::now();
                 assert!(

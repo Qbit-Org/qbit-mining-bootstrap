@@ -340,6 +340,19 @@ pub fn witness_merkle_leaves_hex(transactions: &[Vec<u8>]) -> Vec<String> {
         .collect()
 }
 
+/// What issued work may still earn (#478).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JobKind {
+    /// Ordinary work: its share may be credited under the usual fences.
+    #[default]
+    Credit,
+    /// Work retired by a same-parent payout replacement. It may still carry a
+    /// block to the node while its parent is the active tip, but it reaches no
+    /// credit path at all: no stale grace, no parent grace, and no deferred
+    /// share on a captured block.
+    BlockOnly,
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
     pub job_id: String,
@@ -367,6 +380,8 @@ pub struct Job {
     pub refresh_generation: u64,
     /// Payout state is invalidated independently of the parent block hash.
     pub payout_revision: i64,
+    /// Set only by the Stratum session that retires this work; never on the wire.
+    pub kind: JobKind,
 }
 
 impl Job {
@@ -456,6 +471,7 @@ impl Job {
             resume_expires_at: None,
             refresh_generation: 0,
             payout_revision: 0,
+            kind: JobKind::Credit,
         })
     }
 

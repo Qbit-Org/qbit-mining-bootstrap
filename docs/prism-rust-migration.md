@@ -556,6 +556,11 @@ Migration 019 adds the immutable signing-key rotation journal
 (`qbit_prism_signing_transitions`). It is additive and declares no capability:
 a binary that does not know the table never reads or writes it. See
 [signing-key rotation](prism-ledger-ops.md#signing-key-rotation).
+Migration 020 adds the payout-divergence evidence of #478 block capture
+(`qbit_prism_payout_divergences`, `qbit_prism_payout_divergence_accounts`) and
+its report function (`qbit_prism_payout_divergence_report()`). It is additive
+and declares no capability. See
+[block capture and payout divergence](prism-ledger-ops.md#block-capture-and-payout-divergence-478).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a

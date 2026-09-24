@@ -132,7 +132,8 @@ where
             ntime: proof.ntime,
             credit_policy: None,
         };
-        let candidate = submission_candidate(&job, proof, share.clone()).await?;
+        let deferred = (!proof.share_pass).then(|| share.clone());
+        let candidate = submission_candidate(&job, proof, deferred).await?;
         Arc::get_mut(&mut fixture.coordinator)
             .expect("fixture coordinator has no other owners before the test starts")
             .ledger = Arc::new(ledger);
@@ -566,13 +567,26 @@ async fn block_only_poll_terminal_results_preserve_checkout_success() -> Result<
             let before = counts(h.metrics());
             drop(held);
             let answer = tokio::time::timeout(WAIT, persist).await?;
-            if disposition == Disposition::Accepted {
-                assert!(matches!(answer, SaveOutcome::Accepted));
-            } else {
-                let SaveOutcome::Failed(error) = answer else {
-                    panic!("terminal disposition {disposition:?}: {answer:?}")
-                };
-                assert_eq!(error.to_string(), "block-only proof was not accepted on the active chain");
+            match disposition {
+                Disposition::Accepted => assert!(matches!(answer, SaveOutcome::Accepted)),
+                // Abandoned before its offer: the pool's own staleness
+                // decision, `stale-job`, never a ledger failure (#478).
+                Disposition::Abandoned => assert!(
+                    matches!(
+                        answer,
+                        SaveOutcome::Superseded(crate::metrics::StaleJobCause::PayoutRevision)
+                    ),
+                    "abandoned before its offer: {answer:?}"
+                ),
+                Disposition::Orphaned | Disposition::Rejected => {
+                    let SaveOutcome::Failed(error) = answer else {
+                        panic!("terminal disposition {disposition:?}: {answer:?}")
+                    };
+                    assert_eq!(
+                        error.to_string(),
+                        "block-only proof was not accepted on the active chain"
+                    );
+                }
             }
             assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
             drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
