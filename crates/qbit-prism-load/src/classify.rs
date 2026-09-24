@@ -87,8 +87,13 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
         | "internal-error" => RejectionClass::Backend,
         "" => {
             // `too many connections for username` carries code 20 and no
-            // reason_id (`stratum.rs`, authorize).
-            if rejection.message.contains("too many connections") {
+            // reason_id (`stratum.rs`, authorize). So does the session's
+            // unknown-job budget refusal (`stratum.rs`, submit): a miss on a
+            // job ID the session no longer holds costs a ledger lookup, and a
+            // session that spends its budget is refused before the lookup.
+            if rejection.message.contains("too many connections")
+                || is_unknown_job_budget(rejection)
+            {
                 RejectionClass::Expected
             } else {
                 RejectionClass::Unknown
@@ -96,6 +101,17 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
         }
         _ => RejectionClass::Unknown,
     }
+}
+
+/// The refusal `stratum.rs` answers, with code 20 and no reason_id, once a
+/// session has spent its unknown-job budget
+/// (`ConnectionRefusalReason::UnknownJobBudget`). It is a rate limit on
+/// lookups, not a verdict on the work: the job may or may not have been
+/// retired, so no landing owns it.
+pub const UNKNOWN_JOB_BUDGET: &str = "too many unknown job submissions";
+
+pub fn is_unknown_job_budget(rejection: &Rejection) -> bool {
+    rejection.code == 20 && rejection.reason_id.is_none() && rejection.message == UNKNOWN_JOB_BUDGET
 }
 
 /// A definite failure to record credit on current producers, including a
@@ -172,7 +188,8 @@ pub enum LandingCost {
     /// Recognised, and not the landing's: a backend refusal
     /// (`backend-rpc-unavailable`, `ledger-confirmation-failed`,
     /// `ledger-outcome-unknown`, `internal-error`), a fee-floor `stale-job`,
-    /// `pool-closed`, or a harness-bug class. Reported beside the landing's
+    /// `pool-closed`, the reason-less unknown-job budget refusal
+    /// ([`UNKNOWN_JOB_BUDGET`]), or a harness-bug class. Reported beside the landing's
     /// cost, never inside it.
     NotOwned,
     /// A `stale-job` or `unknown-job` message the harness does not know, or a

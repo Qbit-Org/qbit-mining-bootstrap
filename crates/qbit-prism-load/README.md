@@ -271,6 +271,7 @@ the section as `rejection_attribution.counted_classes`
 | `backend-rpc-unavailable` | on the submit path `current chain state is unavailable`, `current payout state is unavailable`, `current tip parent is unavailable`, `job resume unavailable`, `job resume timed out`; any message counts the same | no. |
 | `ledger-confirmation-failed` | `share was not committed because its commit gate closed`, `share was not confirmed by the database`; any message counts the same | no. |
 | `ledger-outcome-unknown`, `internal-error`, `pool-closed`, harness-bug classes | any | no. |
+| none (code 20) | `too many unknown job submissions` | no: the session spent its unknown-job budget (`stratum.rs`), a rate limit on job lookups rather than a verdict on the work. Tallied under `(no reason_id)`. |
 | `stale-job` or `unknown-job` | anything else; or a `reason_id` the classifier does not know | **unknown** — see below. |
 
 The backend refusals in a span are not the landing's cost. Their `reason_id`

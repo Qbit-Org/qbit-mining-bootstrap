@@ -1405,8 +1405,9 @@ pub const COUNTED_CLASSES: &str =
      ledger-confirmation-failed: `share was not committed because its commit gate closed`, \
      `share was not confirmed by the database`; ledger-outcome-unknown; internal-error), which \
      say the backend could not classify or record the share rather than that the work was \
-     retired, nor stale-job with `job CTV fee is below the current relay floor`, pool-closed or a \
-     harness-bug class: those are tallied by reason_id beside the cost. Any other stale-job or \
+     retired, nor stale-job with `job CTV fee is below the current relay floor`, pool-closed, the \
+     reason-less `too many unknown job submissions` budget refusal (tallied as (no reason_id)) or \
+     a harness-bug class: those are tallied by reason_id beside the cost. Any other stale-job or \
      unknown-job message, or a reason the classifier does not know, is unrecognised, and makes \
      the cost of the span it falls in unknown (null, with a reason).";
 

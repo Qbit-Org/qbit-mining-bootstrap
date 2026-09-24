@@ -8925,6 +8925,34 @@ fn landing_cost_keys_on_the_reason_and_the_servers_messages() {
         );
     }
     assert!(!LandingCost::Unrecognised.owned());
+
+    // The session's unknown-job budget refusal carries code 20 and no
+    // reason_id (stratum.rs, submit). It is a rate limit on lookups, not
+    // retired work and not unknown: a D1/400k dense run answers thousands of
+    // unknown-job submits, and one of these inside a span must not null the
+    // span's cost.
+    let budget = Rejection {
+        code: 20,
+        reason_id: None,
+        message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+    };
+    assert!(classify::is_unknown_job_budget(&budget));
+    assert_eq!(
+        classify::classify(&budget),
+        classify::RejectionClass::Expected
+    );
+    assert_eq!(classify::landing_cost(&budget), LandingCost::NotOwned);
+    // Only that exact shape: the same words under a reason_id or another code
+    // are not the budget refusal.
+    for (code, reason_id) in [(21, None), (20, Some("unknown-job".to_owned()))] {
+        let other = Rejection {
+            code,
+            reason_id,
+            message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+        };
+        assert!(!classify::is_unknown_job_budget(&other), "{other:?}");
+        assert_eq!(classify::landing_cost(&other), LandingCost::Unrecognised);
+    }
 }
 
 /// Two landings on one frontend, answered in the current server's vocabulary
@@ -9018,6 +9046,18 @@ fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -
             2,
             7_450,
             rejected(21, "stale-job", classify::FEE_BELOW_RELAY_FLOOR),
+        ),
+        // Landing 0's span, and not landing 0's either: the session spent
+        // its unknown-job budget, a reason-less code-20 refusal.
+        share(
+            0xa,
+            3,
+            7_700,
+            client::Outcome::Rejected(Rejection {
+                code: 20,
+                reason_id: None,
+                message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+            }),
         ),
         // Landing 1's span.
         share(9, 3, 16_200, stale()),
@@ -9120,8 +9160,14 @@ fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattribu
     assert_eq!(attribution["unrecognised_in_phase"], json!(0));
     assert_eq!(
         attribution["not_owned_in_phase"],
-        json!({"backend-rpc-unavailable": 1, "ledger-confirmation-failed": 1, "stale-job": 1}),
-        "backend refusals and the fee-floor stale-job are tallied, not owned"
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        }),
+        "backend refusals, the fee-floor stale-job and the unknown-job budget refusal are \
+         tallied, not owned"
     );
     assert!(attribution["counted_classes"]
         .as_str()
@@ -9148,9 +9194,18 @@ fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattribu
     );
     assert_eq!(
         first["not_owned_rejections_in_span"],
-        json!({"backend-rpc-unavailable": 1, "ledger-confirmation-failed": 1, "stale-job": 1})
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        })
     );
-    assert_eq!(first["unrecognised_rejections_in_span"], json!(0));
+    assert_eq!(
+        first["unrecognised_rejections_in_span"],
+        json!(0),
+        "the unknown-job budget refusal is recognised, so the span's cost stays measured"
+    );
     assert_eq!(first["lost_valid_shares"], json!(4));
     assert_eq!(
         first["rejected_before_new_revision_work"],
