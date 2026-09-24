@@ -957,7 +957,12 @@ mod tests {
             configure_builder_threads(running + 1),
             Err(BuilderThreadsFixed { threads: running })
         );
-        assert!(!Parallelism::detect().is_serial());
+        // The detected parallelism follows the running pool: one worker per
+        // pool thread (at most eight in flight), which is the serial path on
+        // a host whose pool has a single thread.
+        let detected = Parallelism::detect();
+        assert_eq!(detected.workers(), running.min(Parallelism::MAX_WORKERS));
+        assert_eq!(detected.is_serial(), running == 1);
     }
 
     #[test]
