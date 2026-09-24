@@ -609,10 +609,12 @@ impl Build<'_> {
                 return;
             }
             registry.increment(Family::RevisionWorkTimeouts, Labels::Empty);
+            // An unlanded block has no revision work yet, so a deadline hit
+            // before it lands cannot have degraded its delivery (#493).
             for block in state
                 .blocks
                 .values_mut()
-                .filter(|block| !block.closed && block.at <= self.at)
+                .filter(|block| !block.closed && !block.unlanded && block.at <= self.at)
             {
                 block.degraded.get_or_insert_with(Instant::now);
             }

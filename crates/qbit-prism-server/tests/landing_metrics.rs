@@ -1040,6 +1040,15 @@ async fn lost_race_stays_unlanded_until_its_orphan_proof_and_an_active_block_sti
     .await
 }
 
+async fn row_reason(f: &Fixture, hash: &str) -> Result<(String, Option<String>)> {
+    Ok(sqlx::query_as(
+        "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+    )
+    .bind(hash)
+    .fetch_one(f.pool())
+    .await?)
+}
+
 async fn row_state(f: &Fixture, hash: &str) -> Result<String> {
     Ok(
         sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
@@ -1314,6 +1323,112 @@ async fn failed_audit_landing_after_the_offer_is_reported_until_a_retry_lands() 
                 qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
             ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
             ensure!(census.candidate_oldest_unacknowledged == Duration::ZERO);
+            ensure!(census.candidate_oldest > Duration::ZERO);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Review M1 on #503: an accepted block whose post-offer processing keeps
+/// erroring before the landing (here the candidate observation fails on a
+/// tip change every attempt, the "post-offer processing failed" reason) has
+/// no pool-block row, so the landing-failed age reports it from the offer
+/// reservation and keeps growing across retries; nothing is unacknowledged
+/// and the frontend identity stays unlanded. Restoring the node lands it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistently_failing_post_offer_observation_is_reported_from_the_offer_reservation(
+) -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let claim = queue_block(&f.a).await?;
+            let hash = claim.candidate.block_hash.clone();
+            f.node.set_reply(
+                "submitblock",
+                serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+                serde_json::Value::Null,
+            );
+            // The observation after the offer fails on every attempt.
+            f.node.set_reply(
+                "getbestblockhash",
+                serde_json::json!([]),
+                serde_json::json!("cc".repeat(32)),
+            );
+            f.a.process_candidate(&claim).await?;
+            let (state, error) = row_reason(f, &hash).await?;
+            ensure!(
+                state == "reconciliation"
+                    && error
+                        .as_deref()
+                        .is_some_and(|error| { error.starts_with("post-offer processing failed") }),
+                "{state} {error:?}"
+            );
+            let landed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1)",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(!landed, "an errored landing wrote a pool-block row");
+            let first =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(first.candidates == 1);
+            ensure!(
+                first.candidate_oldest_landing_failed > Duration::ZERO,
+                "an accepted block whose post-offer processing keeps erroring was silent"
+            );
+            ensure!(first.candidate_oldest_landing_failed <= first.candidate_oldest);
+            ensure!(first.candidate_oldest_unacknowledged == Duration::ZERO);
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(
+                sample(&f.a.metrics, UNLANDED) > 0.,
+                "the identity did not stay unlanded"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            retry_reconciliation(f, &hash).await?;
+            let (state, error) = row_reason(f, &hash).await?;
+            ensure!(
+                state == "reconciliation"
+                    && error
+                        .as_deref()
+                        .is_some_and(|error| { error.starts_with("post-offer processing failed") }),
+                "{state} {error:?}"
+            );
+            let second =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(
+                second.candidate_oldest_landing_failed > first.candidate_oldest_landing_failed,
+                "the landing-failed age did not keep growing across a failing retry"
+            );
+            ensure!(second.candidate_oldest_landing_failed <= second.candidate_oldest);
+            // The node recovers: the retry lands the audit, the row waits for
+            // the chain, and the age returns to zero.
+            f.node.set_reply(
+                "getbestblockhash",
+                serde_json::json!([]),
+                serde_json::json!("ab".repeat(32)),
+            );
+            retry_reconciliation(f, &hash).await?;
+            let (state, error) = row_reason(f, &hash).await?;
+            ensure!(
+                state == "reconciliation"
+                    && !error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("post-offer"),
+                "{state} {error:?}"
+            );
+            let landed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1)",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(landed);
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
             ensure!(census.candidate_oldest > Duration::ZERO);
             Ok(())
         })

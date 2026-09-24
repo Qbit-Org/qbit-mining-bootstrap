@@ -738,3 +738,33 @@ async fn unlanded_age_reports_saturation_as_unknown_rather_than_zero() {
     assert_eq!(age(&m), -1.);
     assert_eq!(unlanded(&m), 2.);
 }
+
+#[tokio::test(start_paused = true)]
+async fn deadline_attributed_to_a_known_wait_does_not_degrade_an_unlanded_block() {
+    // Review L1 on #503: known wait X attributes the deadline; winning block
+    // Y is still unlanded (its observation has not happened yet). Y lands
+    // later and publishes: its sample is published, not degraded.
+    let m = Metrics::default();
+    let x = "11".repeat(32);
+    let y = "22".repeat(32);
+    m.accepted_block(&x, 1);
+    m.landed_block(&x, 7);
+    m.accepted_unlanded_block(&y, 2);
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 1.);
+    m.revision_work_delivered(7);
+    assert_eq!(count(&m, "degraded"), 1., "X's own delivery is degraded");
+    m.accepted_block(&y, 2);
+    m.landed_block(&y, 8);
+    tick().await;
+    m.revision_work_delivered(8);
+    assert_eq!(count(&m, "degraded"), 1.);
+    assert_eq!(
+        count(&m, "published"),
+        1.,
+        "the unlanded block was degraded by a deadline that fired before it landed"
+    );
+    assert_eq!(age(&m), 0.);
+}
