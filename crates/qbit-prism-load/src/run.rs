@@ -598,6 +598,9 @@ struct PhaseRun {
     /// reason when it could not be timed. Unknown is not zero.
     proxy_delay_observed_ms: std::result::Result<f64, String>,
     min_mem_available_kib: Option<u64>,
+    /// Memory-floor checks at which `MemAvailable` could not be read; see
+    /// [`PhaseOutcome::mem_available_unread_checks`].
+    mem_available_unread_checks: u64,
     scheduled_blocks: usize,
     frontend_restarts: usize,
     /// Every drained restart this phase completed, with its timings and the
@@ -688,6 +691,9 @@ pub fn stratum_admission_block(environment: &BTreeMap<String, String>, args: &Ar
 
 pub async fn execute(args: Args) -> Result<i32> {
     args.validate()?;
+    // A memory floor the host cannot measure is refused before anything is
+    // created, rather than skipped once a second for the whole run (#485).
+    measure::verify_memory_floor(args.min_mem_available_mib, measure::mem_available_kib())?;
     // The managed cluster's binaries are resolved and checked before anything
     // is created, so a wrong `--pg-bin-dir` names the flag and the missing
     // binary rather than surfacing later as a failed `initdb`. An external
@@ -1377,6 +1383,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             delay_settled_seconds,
             proxy_delay_observed_ms,
             min_mem_available_kib: outcome.min_mem_available_kib,
+            mem_available_unread_checks: outcome.mem_available_unread_checks,
             scheduled_blocks: outcome.scheduled_blocks,
             frontend_restarts: outcome.frontend_restarts,
             restart_records: outcome.restart_records,
@@ -1980,6 +1987,12 @@ pub struct PhaseOutcome {
     pub dispatched: u64,
     pub shortfall: u64,
     pub min_mem_available_kib: Option<u64>,
+    /// How many once-a-second floor checks found `MemAvailable` unreadable.
+    /// The entry refused a floor the host cannot measure at all, so this is
+    /// a read that failed mid-run; at each one the floor did not operate,
+    /// and the count says so rather than the phase reading as guarded
+    /// throughout (EP-OBSERVABILITY).
+    pub mem_available_unread_checks: u64,
     pub aborted: Option<String>,
     pub scheduled_blocks: usize,
     pub frontend_restarts: usize,
@@ -2032,11 +2045,13 @@ pub async fn drive_phase(
     // Every offer this loop places is stamped with this phase, however late
     // the session gets to send it.
     let phase: Arc<str> = Arc::from(plan.name.as_str());
+    let mem_available_at_start = measure::mem_available_kib();
     let mut outcome = PhaseOutcome {
         tokens: 0,
         dispatched: 0,
         shortfall: 0,
-        min_mem_available_kib: measure::mem_available_kib(),
+        min_mem_available_kib: mem_available_at_start,
+        mem_available_unread_checks: u64::from(mem_available_at_start.is_none()),
         aborted: None,
         scheduled_blocks: 0,
         frontend_restarts: 0,
@@ -2234,6 +2249,9 @@ pub async fn drive_phase(
         if mem_check.elapsed() >= Duration::from_secs(1) {
             mem_check = Instant::now();
             let available = measure::mem_available_kib();
+            if available.is_none() {
+                outcome.mem_available_unread_checks += 1;
+            }
             if let Some(available) = available {
                 outcome.min_mem_available_kib = Some(
                     outcome
@@ -3301,6 +3319,7 @@ fn phase_report(
         "database_delay_observation_error": phase.proxy_delay_observed_ms.as_ref().err(),
         "database_delay_round_trip_floor_milliseconds": delay_floor_millis(phase.proxy_delay_configured_ms),
         "min_mem_available_kib": phase.min_mem_available_kib,
+        "mem_available_unread_checks": phase.mem_available_unread_checks,
         "scheduled_blocks": phase.scheduled_blocks,
         "frontend_restarts": phase.frontend_restarts,
         "drained_restarts": phase.restart_records.iter().map(|record| json!({

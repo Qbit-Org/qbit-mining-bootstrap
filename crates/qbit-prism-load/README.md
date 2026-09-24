@@ -70,6 +70,26 @@ measure.
 - **File descriptors.** The harness raises its own soft `RLIMIT_NOFILE` to what
   the session count needs and the child frontends inherit it.
 
+- **Linux for measurements; macOS for smoke runs.** Qualification evidence is
+  taken on Linux. macOS (with Homebrew's PostgreSQL 16) runs the harness for
+  a smoke run, with these differences:
+  - There is no `/proc/meminfo`, so the memory floor cannot operate, and a run
+    that asks for one is refused at entry rather than run unguarded. Pass
+    `--min-mem-available-mib 0` to run without it.
+  - Per-frontend peak RSS is a sampled maximum rather than the kernel peak
+    Linux's `VmHWM` gives (see [Honest values](#honest-values)).
+  - `pg_stat_statements` is found as Homebrew's `pg_stat_statements.dylib` as
+    well as `pg_stat_statements.so`, and preloaded when either is in
+    `pg_config --pkglibdir`.
+  - The managed cluster's root is `$TMPDIR/prism-load-<12 hex>`, and
+    PostgreSQL's Unix socket goes in it. PostgreSQL refuses a socket path
+    over 103 bytes on macOS (107 on Linux). The default macOS `TMPDIR`
+    (`/var/folders/<2>/<28>/T/`) fits; a deeper `TMPDIR` is refused before
+    the cluster is created, naming the limit, and `TMPDIR=/tmp` is the
+    workaround. A cluster that still fails to start reports the last lines
+    of PostgreSQL's own log beside `pg_ctl`'s output, since the log goes with
+    the cluster root unless `--keep-artifacts` is given.
+
 ## Running
 
 ```sh
@@ -128,7 +148,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--share-commit-timeout-seconds` | 15 | `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` per frontend |
 | `--lock-sample-interval-ms` | 10 | PRISM advisory-lock sampling cadence, 1..1000 ms. One poll covers both sampled locks |
 | `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence, 50..60000 ms |
-| `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this |
+| `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this. A floor the host cannot measure (no readable `MemAvailable` in `/proc/meminfo`, as on macOS) is refused at entry; `0` asks for no floor |
 | `--out` | `load-out` | Output directory |
 | `--keep-artifacts` | off | Keep cluster data directories and logs |
 
@@ -965,7 +985,11 @@ the barriers prove they have all been applied before the census is read.
 
 - Build release. Debug builds change every number.
 - Run on a quiet host. The harness records the lowest `MemAvailable` it saw and
-  stops the run if it falls below `--min-mem-available-mib`.
+  stops the run if it falls below `--min-mem-available-mib`. A floor the host
+  cannot measure is refused at entry. A phase's `mem_available_unread_checks`
+  counts the once-a-second checks at which `MemAvailable` could not be read
+  mid-run: at each of them the floor did not operate, and a non-zero count
+  means the phase was not guarded throughout.
 - Repeat and interleave runs. Take at least three of each configuration and
   interleave the frontend counts rather than running all of one and then all of
   another, so a drifting host shows up as spread rather than as a trend.
@@ -1001,7 +1025,8 @@ deferred`).
 
 ## Tests
 
-`cargo test --locked -p qbit-prism-load` is database-free and covers header
+`cargo test --locked -p qbit-prism-load` is database-free apart from the gated
+tests, and covers header
 building and share-identifier derivation against the server's own `codec`,
 digest canonicalisation, the window arithmetic, the fake node's chainwork,
 height map, `submitblock` parent check and `waitfornewblock` wake-up, that the
@@ -1012,5 +1037,14 @@ builder's output passes `validate_capacity_evidence` and fails once one
 required field or one phase is removed, the rejection classifier, the
 blocked-log classifier against the real refusal message, the dense-cadence gap
 generator and its entry validation, the attribution of synthetic rejections and
-bumps to landings (including the unattributed ones), and the no-landing
-report.
+bumps to landings (including the unattributed ones), the no-landing
+report, the entry refusal of a memory floor the host cannot measure, the
+`pg_stat_statements` library under either suffix, and the refusal of a cluster
+root too deep for PostgreSQL's socket.
+
+The gated tests start the managed cluster against real PostgreSQL 16 server
+binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
+skip without them: the quorum-standby detection in `tests/quorum_replication.rs`,
+and in `tests/harness.rs` a cluster that fails to start, whose error has to
+carry PostgreSQL's own reason. Run them with
+`test/prism-native-tests.sh cargo-args --locked -p qbit-prism-load --test <name>`.
