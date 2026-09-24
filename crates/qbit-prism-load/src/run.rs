@@ -2769,7 +2769,10 @@ fn rejection_report(records: &[SubmitRecord]) -> Value {
                 "phase": phase, "code": code, "reason_id": reason, "message": message,
                 "count": count,
                 "class": classify::classify(&rejection).as_str(),
-                "rebuild_pending": classify::is_rebuild_pending(&rejection),
+                // The dense section's ownership test, so this table and its
+                // rebuild_pending_rejections_in_phase agree on the current
+                // server's `stale job` answers (#480).
+                "rebuild_pending": classify::landing_cost(&rejection).owned(),
                 "by_frontend": by_frontend.into_iter().map(|(frontend, count)| json!({"frontend": frontend, "count": count})).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),

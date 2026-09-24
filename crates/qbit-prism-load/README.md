@@ -217,10 +217,10 @@ The artifact's phases are exactly `steady_state`, `reconnect` and
 `--cadence dense` adds a side phase, `dense_cadence`, that lands own blocks on
 the shape #224 recorded — an accepted-candidate minimum interarrival of about
 9.14 s, 35 accepted blocks in the trailing hour, and repeated pairs about
-18–20 s apart — and reports, for every payout-revision bump, how long each
-frontend rejects shares with `new payout work is pending` and how many shares
-it rejects before it serves work at the new revision. That number is the budget
-#291's soak should hold itself to.
+18–20 s apart — and reports, for every landing, how long each frontend rejects
+shares on work the landing retired and how many shares it rejects before it
+serves work at the new revision. That number is the budget #291's soak should
+hold itself to.
 
 It runs after `slow_database`, with **no proxy delay**: the measurement is the
 frontends' rebuild latency, and a delayed database would drown it out. It is
@@ -273,22 +273,71 @@ The top-level `bumps` key is every observed change — the same number as
 counts only that landing's. So a run in which nothing landed but the revision
 moved anyway reports the changes it saw rather than a zero.
 
-### The two windows are reported apart
+### Which rejections a landing owns
 
-`coordinator.rs` checks the observed tip before it checks the payout revision,
-so a landing produces `new tip work is pending` first, and
-`new payout work is pending` only when the revision moves again after that
-frontend has rebuilt. The report therefore carries three windows per landing
-and frontend:
+A landing owns the rejections of retired work answered inside its span: a
+share proven on a job whose parent or payout revision had been replaced, or
+whose job ID the session no longer held. Attribution is by time, not lineage.
+A share on work an earlier landing retired, answered after this landing's tip
+change, is this landing's. An `unknown-job` means the ID has left both the
+session's live list and its retained graveyard (`stratum/retained_jobs.rs`,
+which has a cap and a TTL), and any job churn can cause that. The
+harness recognises them by `reason_id` together with the message
+`crates/qbit-prism-server` sends on the submit path, and publishes the list in
+the section as `rejection_attribution.counted_classes`
+(`definitions.counted_classes`, `cadence::COUNTED_CLASSES`):
 
-- the **tip-pending window**: first and last `new tip work is pending`, the
+| `reason_id` | message | the landing's? |
+|---|---|---|
+| `stale-job` | `stale job` | **yes.** The current server's single answer for a share on a retired parent or payout revision (`Coordinator::stale_job` in `coordinator/miner_submit.rs`, the lease checks there and in `coordinator/tip_observation.rs`, the resume expiry in `stratum.rs`). Which of the two it was goes only to `qbit_prism_stale_job_rejections_total{cause}`, not on the wire. |
+| `unknown-job` | `stale job` | **yes.** The job ID has left the session's job list (`stratum.rs`), which the rebuild's `clean_jobs` notify retires. |
+| `stale-job` | `new tip work is pending`, `new payout work is pending` | **yes**, from older producers. The current server sends neither: `new tip work is pending` survives only as an internal issuance error (`coordinator/tip_observation.rs`), which a submit that resumes a job answers as `backend-rpc-unavailable` / `job resume unavailable`. |
+| `stale-job` | `job CTV fee is below the current relay floor` | no: a fee change retired the job, not a landing. |
+| `backend-rpc-unavailable` | on the submit path `current chain state is unavailable`, `current payout state is unavailable`, `current tip parent is unavailable`, `job resume unavailable`, `job resume timed out`; any message counts the same | no. |
+| `ledger-confirmation-failed` | `share was not committed because its commit gate closed`, `share was not confirmed by the database`; any message counts the same | no. |
+| `ledger-outcome-unknown`, `internal-error`, `pool-closed`, harness-bug classes | any | no. |
+| none (code 20) | `too many unknown job submissions` | no: the session spent its unknown-job budget (`stratum.rs`), a rate limit on job lookups rather than a verdict on the work. Tallied under `(no reason_id)`. |
+| `stale-job` or `unknown-job` | anything else; or a `reason_id` the classifier does not know | **unknown** — see below. |
+
+The backend refusals in a span are not the landing's cost. Their `reason_id`
+says the backend could not classify or record the share — readiness was
+revoked by a failed node poll, the COMMIT gate closed on a deadline, a lock or
+readiness rather than a proven stale cause — not that the work was retired, and
+the harness cannot tell a refusal the landing's rebuild provoked from one it
+did not. They are reported beside the cost, by `reason_id`, as
+`not_owned_rejections_in_span` in each per-landing, per-frontend table and
+`rejection_attribution.not_owned_in_phase` for the phase, so a reader can see
+how many there were without their being counted as lost work or budgeted.
+
+A rejection whose message the harness does not recognise may or may not be the
+landing's, so it is **unrecognised**, and the cost of the span it falls in is
+unknown: that table's `combined_rebuild_pending_window` count, times and
+duration, `lost_valid_shares` and `rejected_before_new_revision_work` are
+`null`, each with a reason, and `owned_count_lower_bound` carries the
+recognised subset as the lower bound it is. `unrecognised_sample` names up to
+five distinct `(reason_id, message)` pairs. The #291 budget is then `null` with
+the reason too: a percentile over only the other tables would understate
+exactly the landings in doubt. This is the failure #480 fixed: on `a1937054`
+the harness keyed on the two older messages, attributed none of the
+16,461–21,504 `stale-job` and 1,512–2,997 `unknown-job` rejections of each of
+#447's dense runs, and proposed a p99 of `0.0` rejections per landing.
+
+### The windows
+
+The report carries, per landing and frontend:
+
+- the **stale-job window**: first and last `stale-job` with `stale job`, the
   count, and last minus first;
-- the **payout-pending window**: the same for `new payout work is pending`;
-- the **combined rebuild-pending window**: first to last of either, with both
-  counts summed. This is the one #291 should budget against.
+- the **unknown-job window**: the same for `unknown-job` with `stale job`;
+- the **tip-pending** and **payout-pending windows**: the same for the two
+  older messages, which stay empty on the current server;
+- the **combined rebuild-pending window**: first to last of every rejection the
+  landing owns, with the count. This is the one #291 should budget against.
 
 A rejection is stamped when the client read the response line, which is the
-only instant the harness observed directly.
+only instant the harness observed directly. The per-message windows are exact
+counts of their message whatever else the span held; only the combined window
+becomes unknown when the span held an unrecognised rejection.
 
 ### Time to new-tip work and time to new-revision work
 
@@ -312,7 +361,7 @@ set when the parent *or* the payout revision differs from the session's last
 job (`stratum.rs`, `deliver_job`), so inside a landing's window — after the new
 tip has already been served — it is the rebuild at the new revision. The bump
 it is measured from is the last bump attributed to the landing: the revision a
-frontend has to reach before it stops answering `new payout work is pending`.
+frontend has to reach before its refusals of shares on the old revision stop.
 
 The search stops at the span's end. The next landing's own `clean_jobs` notify
 is that landing's work, and a frontend that had not served the new revision by
@@ -321,10 +370,56 @@ then is reported as such: `sessions_with_new_revision_work` is 0, the time is
 revision was seen inside the span. Borrowing the later job would have
 understated the time and stopped the count below at the wrong event.
 
-`rejected_before_new_revision_work` counts the rebuild-pending rejections a
-frontend returned between the landing and the earliest new-revision work on any
-of its sessions inside the span. It is `null`, with the same reason, when there
-was no bump or no such job inside the span.
+`rejected_before_new_revision_work` counts the rejections the landing owns
+that a frontend returned between the landing and the earliest new-revision work
+on any of its sessions inside the span. It is `null`, with the same reason, when
+there was no bump or no such job inside the span, and with the unrecognised
+reason when the span held an unrecognised rejection.
+
+**The same edge as #458.** The server's
+`qbit_prism_accepted_block_to_revision_work_seconds` takes one sample per
+block and frontend. Each sample ends at the earliest successful
+`mining.notify` write at the post-landing revision on any of that frontend's
+sessions (`Landing::resolve`, `min_by_key`). A landing's span starts at the
+fake node's tip change, which the node stamps as it accepts `submitblock`.
+
+The harness reads that edge like this:
+
+- `rejected_before_new_revision_work` counts up to the earliest session's
+  new-revision work, so it covers the same interval.
+- `acceptance_to_new_revision_work_millis` is the same first `clean_jobs`
+  notify, per session, measured from the acceptance instead of the bump. Its
+  per-table **min** (the earliest session) is the #458-comparable figure. Its
+  **max** (the latest session) adds the notify fan-out across the frontend's
+  sessions, which the server does not include, and is published beside it
+  under its own name.
+
+`proposed_budget_for_issue_291.same_edge_as_issue_458` carries the p99 of
+each:
+
+- `rejected_before_new_revision_work_per_landing_per_frontend_p99`;
+- `acceptance_to_new_revision_work_p99_millis` (min);
+- `acceptance_to_new_revision_work_with_fanout_p99_millis` (max).
+
+The two timings are notify timings. An unrecognised rejection does not null
+them: only a run with no landing does.
+
+The harness's numbers are on its monotonic clock, from the node's stamp to
+the client's read of the notify. The server's interval is shorter, and not
+by a transit:
+
+- On the submitting frontend, `accepted_block` is called at the end of
+  `observe_candidate`. That is after `ready_chain_info`,
+  `observe_chain_view`, `getblockhash`, `getbestblockhash` and `ready_tip`:
+  several RPCs and a ledger round trip after the node's stamp.
+- On every other frontend it is called from `reconcile` when that frontend
+  discovers the tip, so it trails the stamp by tip-discovery latency.
+- The server stops at the notify's socket write, one transit before the
+  client's read.
+
+The harness's end is also bounded below by the revision sampler. A
+new-revision notify written before the 25 ms sampler saw the bump is not
+counted. `clock_note` in the block says the same.
 
 The label travels with the numbers: every object that carries a new-revision
 figure carries `new_revision_work_approximation` beside it — the per-landing,
@@ -336,21 +431,32 @@ is indexed on, so a reader looking either one up there would find nothing.
 
 ### Lost valid work
 
-Every rebuild-pending rejection is a share the client had already proven
+Every rejection a landing owns is a share the client had already proven
 against the share target, so each one is miner work the pool discarded. None of
 them is persisted, so none is a durability finding — and the report checks that
 against this run's committed share identifiers rather than asserting it
 (`shares_found_in_postgres`, which must be 0).
 
-The census covers **every** rebuild-pending rejection in the phase, not only
-the ones a landing's span owns. `lost_valid_work` publishes the split —
+The census covers **every** owned rejection in the phase, not only the ones a
+landing's span holds. `lost_valid_work` publishes the split —
 `shares`, `shares_attributed`, `shares_unattributed` — and
 `shares_found_in_postgres` is checked over all of them. A landing whose pool tip
 change is missing leaves its rejections unattributed, and that is exactly the
 case the cross-check exists for: counting only the attributed subset would read
 as a clean pass in the one situation that would make it fail. The per-landing,
 per-frontend `lost_valid_shares` tables are unchanged and still count a span's
-rejections, so they sum to `shares_attributed`.
+rejections, so they sum to `shares_attributed`. When any rejection in the phase
+is unrecognised, `shares` is `null` with `shares_unavailable_reason`, and
+`shares_recognised` carries the recognised count as a lower bound. So does
+`shares_found_in_postgres`, which is `null` with its own reason beside a null
+`shares`. The checks that were made are published apart:
+
+- `shares_recognised_found_in_postgres`, over the recognised shares;
+- `unrecognised_shares_found_in_postgres`, with a sample, over the
+  unrecognised rejections' shares, which are looked up too.
+
+A table's `lost_valid_shares_found_in_postgres` is likewise `null` when its
+`lost_valid_shares` is.
 
 ### Where the rebuild queues
 
@@ -382,9 +488,17 @@ found by name.
 - A frontend that restarted or died during the phase is reported, and its
   windows are marked `incomplete` with the reason. The last landing's window is
   marked `span_truncated_at_phase_end`.
-- Every rebuild-pending rejection and every bump belongs to exactly one landing
+- Every rejection a landing owns and every bump belongs to exactly one landing
   or to `unattributed`; the counts are reconciled in
-  `rejection_attribution` and `bump_attribution`.
+  `rejection_attribution` and `bump_attribution`. `rejection_attribution` also
+  splits the owned count `by_class` and tallies the not-owned and unrecognised
+  rejections apart.
+- Every number in `proposed_budget_for_issue_291` is `null` with its own
+  `*_unavailable_reason` when it could not be measured — no landing, an
+  unrecognised rejection in a span, or no window to take a percentile of —
+  never a `0.0` that reads as "no rejected work". A `0` count from landings
+  whose spans held no owned rejection is a measured zero, and is reported as
+  one.
 - `landings` and `windows_available` count the landings that were granted an
   attribution span, which is exactly the ones that have a window: a span is
   granted on the landing's own pool tip change, whatever its outcome. That is
@@ -791,9 +905,11 @@ The side report repeats all of this under `honest_value_notes`.
   advisory-lock statement's `calls` and `total_exec_time` are recorded too, and
   the three PRISM locks share one normalized query text.
 - **Every distribution names its own unit.** A percentile summary carries
-  `unit` and `clock`. The five count distributions in the dense section —
+  `unit` and `clock`. The seven count distributions in the dense section —
   `tip_pending_rejections_per_landing`,
   `payout_pending_rejections_per_landing`,
+  `stale_job_rejections_per_landing`,
+  `unknown_job_rejections_per_landing`,
   `combined_rebuild_pending_rejections_per_landing`,
   `rejected_before_new_revision_work_per_landing` and
   `lost_valid_shares_per_landing` — carry `"unit": "count"`, because they count
