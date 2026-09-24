@@ -32,7 +32,8 @@ pub use candidates::{
     authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
     Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimLifecycle, ClaimParts,
     LandedAudit, OfferOutcome, OfferRecord, RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys,
-    ORPHANED_STATE,
+    ADOPTED_OFFER_REPLY_PREFIX, LANDING_FAILED_REASON_PREFIX, ORPHANED_STATE,
+    SIDE_CHAIN_REPLIES_SQL,
 };
 mod connect;
 use connect::{require_revision, writable};

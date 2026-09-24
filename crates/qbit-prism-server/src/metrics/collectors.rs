@@ -46,13 +46,22 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
             .execute(&mut *tx).await?;
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")
             .execute(&mut *tx).await?;
-        let (candidates, candidate_age): (i64, f64) = sqlx::query_as(
-            &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {}", crate::ledger::CandidateState::UNFINISHED_SQL)
-        ).fetch_one(&mut *tx).await?;
+        // The same rows, twice more filtered on the same scan (#493). The
+        // paging age counts rows the node has not accepted: pre-offer rows,
+        // offered rows whose one submitblock outcome is unknown (but not a
+        // row adopted on the node's evidence that its block is active), and
+        // rows the node definitively rejected unless the reply names a
+        // side-chain block, which is a lost tip race. A node-accepted lost
+        // race awaiting its orphan proof is unfinished but acknowledged. The
+        // landing-failed age is the oldest row whose audit landing keeps
+        // failing after the offer, whatever its reply.
+        let (candidates, candidate_age, unacknowledged_age, landing_failed_age): (i64, f64, f64, f64) = sqlx::query_as(
+            &format!("SELECT count(*), COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at))),0)::double precision, COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at) FILTER (WHERE state IN ('pending','offer_reserved') OR (offer_outcome='unknown' AND COALESCE(offer_reply,'') NOT LIKE $1) OR (offer_outcome='rejected' AND COALESCE(offer_reply,'') NOT IN {side_chain})))),0)::double precision, COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min(created_at) FILTER (WHERE state='reconciliation' AND COALESCE(last_error,'') LIKE $2))),0)::double precision FROM qbit_block_candidate_outbox WHERE state IN {unfinished}", side_chain = crate::ledger::SIDE_CHAIN_REPLIES_SQL, unfinished = crate::ledger::CandidateState::UNFINISHED_SQL)
+        ).bind(format!("{}%", crate::ledger::ADOPTED_OFFER_REPLY_PREFIX)).bind(format!("{}%", crate::ledger::LANDING_FAILED_REASON_PREFIX)).fetch_one(&mut *tx).await?;
         let partition_lead_rows: Option<i64> = sqlx::query_scalar(
             "SELECT max(upper_seq)-qbit_prism_share_next_seq() FROM qbit_prism_share_partitions WHERE state='attached'"
         ).fetch_one(&mut *tx).await?;
-        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, partition_lead_rows };
+        let snapshot = DatabaseMetrics { candidates: candidates.try_into()?, candidate_oldest: seconds(candidate_age)?, candidate_oldest_unacknowledged: seconds(unacknowledged_age)?, candidate_oldest_landing_failed: seconds(landing_failed_age)?, partition_lead_rows };
         // One bounded identity lookup in this same read-only snapshot. Terminal
         // processing state stays orphaned even if a later reorg credits it.
         // Never load retained history or add I/O to work publication/scrapes.

@@ -22,6 +22,8 @@ const PENDING: &str = "qbit_prism_accepted_block_revision_work_pending_seconds";
 const TIMEOUTS: &str = "qbit_prism_revision_work_build_timeouts_total";
 
 const UNKNOWN: &str = "qbit_prism_accepted_block_revision_work_tracking_unknown";
+const UNLANDED: &str = "qbit_prism_accepted_block_unlanded_seconds";
+const ORPHANED: &str = "qbit_prism_block_candidates_orphaned_total";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_and_failed_terminal_collection_preserves_wait_until_durable_read() -> Result<()>
@@ -61,10 +63,13 @@ async fn cancelled_and_failed_terminal_collection_preserves_wait_until_durable_r
             collection.abort();
             ensure!(matches!(collection.await, Err(error) if error.is_cancelled()));
             blocker.rollback().await?;
+            // The unlanded acceptance stays visible, and the failed terminal
+            // read leaves the empty known state unknown rather than zero.
             ensure!(
-                sample(&f.a.metrics, PENDING) > 0.,
+                sample(&f.a.metrics, UNLANDED) > 0.,
                 "cancelled read fabricated empty state"
             );
+            ensure!(sample(&f.a.metrics, PENDING) == -1.);
             ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
             let closed = sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy_with(f.pool().connect_options().as_ref().clone());
@@ -74,9 +79,11 @@ async fn cancelled_and_failed_terminal_collection_preserves_wait_until_durable_r
                     .await
                     .is_err()
             );
-            ensure!(sample(&f.a.metrics, PENDING) > 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) > 0.);
+            ensure!(sample(&f.a.metrics, PENDING) == -1.);
             ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
             qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
             ensure!(sample(&f.a.metrics, PENDING) == 0.);
             ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
             no_delivery(&f.a.metrics)?;
@@ -104,11 +111,23 @@ async fn offered_without_active_proof(f: &Fixture) -> Result<String> {
             .fetch_one(f.pool())
             .await?;
     ensure!(state == "reconciliation");
-    ensure!(sample(&f.a.metrics, PENDING) > 0.);
+    // A block the node accepted but does not hold on its active chain is an
+    // unlanded acceptance, never a known pending delivery wait (#493).
+    ensure!(
+        sample(&f.a.metrics, PENDING) == 0.,
+        "lost race counted as a known pending wait"
+    );
+    ensure!(
+        sample(&f.a.metrics, UNLANDED) > 0.,
+        "accepted offer without active proof is invisible"
+    );
+    ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
     ensure!(sample(&f.b.metrics, PENDING) == 0.);
+    ensure!(sample(&f.b.metrics, UNLANDED) == 0.);
     // A successful read without terminal evidence must preserve the wait.
     qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
-    ensure!(sample(&f.a.metrics, PENDING) > 0.);
+    ensure!(sample(&f.a.metrics, UNLANDED) > 0.);
+    ensure!(sample(&f.a.metrics, PENDING) == 0.);
     let height = claim.candidate.found_block.block_height;
     let competitor = "66".repeat(32);
     f.node
@@ -167,15 +186,17 @@ async fn peer_orphan_evidence_closes_the_accepting_frontend_without_delivery() -
             f.b.process_candidate(&claim).await?;
             durable_orphan(f, &hash).await?;
             ensure!(
-                sample(&f.a.metrics, PENDING) > 0.,
+                sample(&f.a.metrics, UNLANDED) > 0.,
                 "peer invented local knowledge"
             );
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
             for _ in 0..2 {
                 qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
                 ensure!(
-                    sample(&f.a.metrics, PENDING) == 0.,
+                    sample(&f.a.metrics, UNLANDED) == 0.,
                     "peer terminal evidence left a permanent wait"
                 );
+                ensure!(sample(&f.a.metrics, PENDING) == 0.);
                 ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
                 no_delivery(&f.a.metrics)?;
                 no_delivery(&f.b.metrics)?;
@@ -192,6 +213,7 @@ async fn peer_orphan_evidence_closes_the_accepting_frontend_without_delivery() -
             f.a.refresh_once().await?;
             deliver(&f.a).await?;
             ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
             no_delivery(&f.a.metrics)?;
             Ok(())
         })
@@ -216,7 +238,8 @@ async fn lost_orphan_commit_reply_is_unknown_until_terminal_evidence() -> Result
                 .orphan_candidate_at_revision(&claim, "stale proof", revision - 1)
                 .await
                 .is_err());
-            ensure!(sample(&f.a.metrics, PENDING) > 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) > 0.);
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
             ensure!(
                 sample(&f.a.metrics, UNKNOWN) == 0.,
                 "precommit rejection invented uncertainty"
@@ -239,10 +262,15 @@ async fn lost_orphan_commit_reply_is_unknown_until_terminal_evidence() -> Result
                 "lost orphan outcome remained a known wait"
             );
             ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            ensure!(
+                sample(&f.a.metrics, UNLANDED) > 0.,
+                "lost orphan outcome hid the unlanded acceptance"
+            );
             no_delivery(&f.a.metrics)?;
             qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
             ensure!(sample(&f.a.metrics, PENDING) == 0.);
             ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
             no_delivery(&f.a.metrics)?;
             Ok(())
         })
@@ -277,10 +305,12 @@ async fn cancelled_orphan_commit_reply_reconciles_without_reopening_tombstone() 
                 "cancelled orphan outcome remained a known wait"
             );
             ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+            ensure!(sample(&f.a.metrics, UNLANDED) > 0.);
             qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
             reply.release();
             ensure!(sample(&f.a.metrics, PENDING) == 0.);
             ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
             no_delivery(&f.a.metrics)?;
             Ok(())
         })
@@ -428,6 +458,10 @@ async fn land_from(f: &Fixture, frontend: &Arc<Coordinator>) -> Result<String> {
             .fetch_one(f.pool())
             .await?;
     ensure!(state == "submitted", "offer did not land: {state}");
+    ensure!(
+        sample(&frontend.metrics, UNLANDED) == 0.,
+        "a landed offer stayed unlanded"
+    );
     Ok(claim.candidate.block_hash)
 }
 
@@ -886,6 +920,7 @@ async fn lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout
             .await?;
             ensure!(outcome == "unknown");
             ensure!(sample(&f.a.metrics, PENDING) > 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
             f.a.refresh_once().await?;
             deliver(&f.a).await?;
             ensure!(count(&f.a.metrics, "published") == 1.);
@@ -897,6 +932,352 @@ async fn lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout
             for identity in [&hash, "landing.rig", "delivery-one.rig", "delivery-two.rig"] {
                 ensure!(!rendered.contains(identity), "identity entered metrics");
             }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #493 point 1: a routine lost race. The node accepts the offer, a competitor
+/// holds the height, and the orphan is proven after the configured
+/// confirmations. On no frontend is the pending age ever a known wait, so the
+/// paging rule cannot fire; the unlanded gauge reports the acceptance until
+/// the proof. The positive control lands an active block on the same
+/// fixture: its wait is a known pending age that grows until real delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_race_stays_unlanded_until_its_orphan_proof_and_an_active_block_still_pages(
+) -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let claim = queue_block(&f.a).await?;
+            let hash = claim.candidate.block_hash.clone();
+            let height = claim.candidate.found_block.block_height;
+            f.node.set_reply(
+                "submitblock",
+                serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+                serde_json::Value::Null,
+            );
+            f.a.process_candidate(&claim).await?;
+            ensure!(row_state(f, &hash).await? == "reconciliation");
+            ensure!(
+                sample(&f.a.metrics, PENDING) == 0.,
+                "lost race counted as a known pending wait"
+            );
+            let accepted_age = sample(&f.a.metrics, UNLANDED);
+            ensure!(accepted_age > 0., "accepted offer is invisible");
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            ensure!(sample(&f.b.metrics, PENDING) == 0.);
+            ensure!(sample(&f.b.metrics, UNLANDED) == 0.);
+            // The competitor advances to one confirmation short of the proof.
+            // Every frontend reconciles the block as not active and keeps
+            // delivering ordinary work; nothing lands, closes or resets it.
+            let competitor = "66".repeat(32);
+            f.node.set_reply(
+                "getblockhash",
+                serde_json::json!([height]),
+                serde_json::json!(competitor),
+            );
+            f.node
+                .set_tip(&"68".repeat(32), &"67".repeat(32), height + 4, "9999");
+            for frontend in [&f.a, &f.b] {
+                frontend.refresh_once().await?;
+                deliver(frontend).await?;
+                ensure!(sample(&frontend.metrics, PENDING) == 0.);
+                no_delivery(&frontend.metrics)?;
+            }
+            ensure!(
+                sample(&f.a.metrics, UNLANDED) >= accepted_age,
+                "reconciliation reset the unlanded age"
+            );
+            ensure!(sample(&f.b.metrics, UNLANDED) == 0.);
+            retry_reconciliation(f, &hash).await?;
+            ensure!(row_state(f, &hash).await? == "reconciliation");
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNLANDED) >= accepted_age);
+            ensure!(sample(&f.a.metrics, ORPHANED) == 0.);
+            // The configured sixth confirmation proves the orphan on the
+            // offering frontend itself. The wait closes without a sample.
+            f.node
+                .set_tip(&"69".repeat(32), &"68".repeat(32), height + 5, "aaaa");
+            retry_reconciliation(f, &hash).await?;
+            durable_orphan(f, &hash).await?;
+            ensure!(sample(&f.a.metrics, ORPHANED) == 1.);
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
+            for frontend in [&f.a, &f.b] {
+                frontend.refresh_once().await?;
+                deliver(frontend).await?;
+                ensure!(sample(&frontend.metrics, PENDING) == 0.);
+                ensure!(sample(&frontend.metrics, UNLANDED) == 0.);
+                no_delivery(&frontend.metrics)?;
+            }
+            // Positive control: an active block's wait is a known pending age
+            // on every frontend, grows until real delivery, and is never
+            // unlanded once the node holds it.
+            land(f).await?;
+            ensure!(sample(&f.a.metrics, UNLANDED) == 0.);
+            let before = sample(&f.a.metrics, PENDING);
+            ensure!(before > 0., "an active block's wait is not a known age");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ensure!(
+                sample(&f.a.metrics, PENDING) > before,
+                "an active block's known wait did not age"
+            );
+            for frontend in [&f.a, &f.b] {
+                frontend.refresh_once().await?;
+                ensure!(sample(&frontend.metrics, PENDING) > 0.);
+                ensure!(sample(&frontend.metrics, UNLANDED) == 0.);
+                deliver(frontend).await?;
+                ensure!(sample(&frontend.metrics, PENDING) == 0.);
+                ensure!(count(&frontend.metrics, "published") == 1.);
+                ensure!(sample(&frontend.metrics, TIMEOUTS) == 0.);
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+async fn row_state(f: &Fixture, hash: &str) -> Result<String> {
+    Ok(
+        sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(hash)
+            .fetch_one(f.pool())
+            .await?,
+    )
+}
+
+/// Make the reconciliation row due now and process it on the offering
+/// frontend, as its ordinary retry would.
+async fn retry_reconciliation(f: &Fixture, hash: &str) -> Result<()> {
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+        .bind(hash).execute(f.pool()).await?;
+    let claim =
+        f.a.ledger
+            .claim_candidate(60)
+            .await?
+            .context("reconciliation retry claim")?;
+    ensure!(claim.candidate.block_hash == hash);
+    f.a.process_candidate(&claim).await
+}
+
+/// #493: the candidate collector's paging measurement. A node-accepted lost
+/// race in reconciliation is unfinished but acknowledged, so it ages only the
+/// all-unfinished gauge; a pending row and an offer whose one submitblock
+/// outcome is unknown age the unacknowledged gauge the paging rule reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_collector_keeps_an_acknowledged_lost_race_out_of_the_paging_age() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let hash = offered_without_active_proof(f).await?;
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidates == 1);
+            ensure!(census.candidate_oldest > Duration::ZERO);
+            ensure!(
+                census.candidate_oldest_unacknowledged == Duration::ZERO,
+                "a node-accepted lost race counted as unacknowledged"
+            );
+            // A found block the node has not been offered yet is unacknowledged.
+            f.b.refresh_once().await?;
+            let waiting = queue_block(&f.b).await?;
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidates == 2);
+            ensure!(census.candidate_oldest_unacknowledged > Duration::ZERO);
+            ensure!(census.candidate_oldest_unacknowledged <= census.candidate_oldest);
+            // Its one offer fails without a definitive reply: the outcome is
+            // unknown, the row is reconciled against the chain (not active,
+            // no competitor at its height yet) and stays unacknowledged.
+            f.b.process_candidate(&waiting).await?;
+            let (state, outcome): (String, Option<String>) = sqlx::query_as(
+                "SELECT state,offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&waiting.candidate.block_hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(state == "reconciliation" && outcome.as_deref() == Some("unknown"));
+            ensure!(row_state(f, &hash).await? == "reconciliation");
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidates == 2);
+            ensure!(
+                census.candidate_oldest_unacknowledged > Duration::ZERO,
+                "an unknown offer outcome was treated as acknowledged"
+            );
+            ensure!(census.candidate_oldest_unacknowledged < census.candidate_oldest);
+            // Without a definitive acceptance nothing is unlanded or pending.
+            ensure!(sample(&f.b.metrics, PENDING) == 0.);
+            ensure!(sample(&f.b.metrics, UNLANDED) == 0.);
+            // Published, the gauges render together and invalidate together.
+            f.a.metrics.publish_database(Some(census));
+            ensure!(
+                sample(
+                    &f.a.metrics,
+                    "qbit_prism_block_candidate_oldest_unacknowledged_seconds"
+                ) > 0.
+            );
+            ensure!(
+                sample(
+                    &f.a.metrics,
+                    "qbit_prism_block_candidate_oldest_pending_seconds"
+                ) > 0.
+            );
+            f.a.metrics.publish_database(None);
+            ensure!(
+                sample(
+                    &f.a.metrics,
+                    "qbit_prism_block_candidate_oldest_unacknowledged_seconds"
+                ) == -1.
+            );
+            ensure!(
+                sample(
+                    &f.a.metrics,
+                    "qbit_prism_block_candidate_oldest_pending_seconds"
+                ) == -1.
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #493 review B1: a definitive node rejection is the pool building an
+/// invalid block, and it keeps paging through the unacknowledged age; a
+/// side-chain reply (`inconclusive`) is a lost tip race and does not. Neither
+/// opens a frontend identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_rejected_block_pages_as_unacknowledged_but_a_side_chain_reply_does_not() -> Result<()>
+{
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let mut hashes = Vec::new();
+            // One block per frontend: each extranonce space yields its own proof.
+            for (frontend, reply, unacknowledged) in
+                [(&f.a, "inconclusive", false), (&f.b, "bad-cb-payee", true)]
+            {
+                let claim = queue_block(frontend).await?;
+                let hash = claim.candidate.block_hash.clone();
+                f.node.set_reply(
+                    "submitblock",
+                    serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+                    serde_json::json!(reply),
+                );
+                frontend.process_candidate(&claim).await?;
+                let (state, outcome, recorded): (String, Option<String>, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT state,offer_outcome,offer_reply FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+                    )
+                    .bind(&hash)
+                    .fetch_one(f.pool())
+                    .await?;
+                ensure!(
+                    state == "reconciliation"
+                        && outcome.as_deref() == Some("rejected")
+                        && recorded.as_deref() == Some(reply),
+                    "{state} {outcome:?} {recorded:?}"
+                );
+                let census =
+                    qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics)
+                        .await?;
+                ensure!(census.candidates == hashes.len() as u64 + 1);
+                ensure!(census.candidate_oldest > Duration::ZERO);
+                ensure!(
+                    (census.candidate_oldest_unacknowledged > Duration::ZERO) == unacknowledged,
+                    "reply {reply}: unacknowledged age {:?}",
+                    census.candidate_oldest_unacknowledged
+                );
+                ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
+                ensure!(sample(&frontend.metrics, PENDING) == 0.);
+                ensure!(sample(&frontend.metrics, UNLANDED) == 0.);
+                ensure!(sample(&frontend.metrics, UNKNOWN) == 0.);
+                hashes.push(hash);
+            }
+            // The rejected block is the younger row: the paging age is its
+            // own age, not the older side-chain row's.
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidate_oldest_unacknowledged < census.candidate_oldest);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #493 review M1: a won block whose audit landing fails after the offer is
+/// reported by the landing-failed age (never by the unacknowledged age), and
+/// leaves it as soon as a retry lands. Here the landing transaction is
+/// aborted through the wire proxy on the first attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_audit_landing_after_the_offer_is_reported_until_a_retry_lands() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let claim = queue_block(&f.a).await?;
+            let hash = claim.candidate.block_hash.clone();
+            f.node.set_reply(
+                "submitblock",
+                serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+                serde_json::Value::Null,
+            );
+            sqlx::raw_sql("CREATE FUNCTION landing_insert_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'prism-execution-marker qbit_pool_blocks INSERT'; RETURN NEW; END $$; CREATE TRIGGER landing_insert_marker AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION landing_insert_marker();")
+                .execute(f.pool()).await?;
+            f.proxy.plan(support::execution::Fault {
+                table: "qbit_pool_blocks".into(),
+                op: "INSERT".into(),
+                phase: support::execution::FaultPhase::AfterExecution,
+            });
+            let outcome = timeout(Duration::from_secs(10), f.a.process_candidate(&claim)).await?;
+            ensure!(f.proxy.fired().is_some(), "landing fault did not fire");
+            let (state, error): (String, Option<String>) = sqlx::query_as(
+                "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(
+                state == "reconciliation"
+                    && error.as_deref().is_some_and(|error| {
+                        error.starts_with(qbit_prism_server::ledger::LANDING_FAILED_REASON_PREFIX)
+                    }),
+                "{state} {error:?} (processing: {outcome:?})"
+            );
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidates == 1);
+            ensure!(
+                census.candidate_oldest_landing_failed > Duration::ZERO,
+                "a failed landing was silent"
+            );
+            ensure!(census.candidate_oldest_unacknowledged == Duration::ZERO);
+            f.a.metrics.publish_database(Some(census));
+            ensure!(
+                sample(&f.a.metrics, "qbit_prism_block_candidate_oldest_landing_failed_seconds")
+                    > 0.
+            );
+            // The retry lands the audit; the row waits for the chain again.
+            retry_reconciliation(f, &hash).await?;
+            let (state, error): (String, Option<String>) = sqlx::query_as(
+                "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(
+                state == "reconciliation"
+                    && !error.as_deref().unwrap_or_default().starts_with(
+                        qbit_prism_server::ledger::LANDING_FAILED_REASON_PREFIX
+                    ),
+                "{state} {error:?}"
+            );
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
+            ensure!(census.candidate_oldest_unacknowledged == Duration::ZERO);
+            ensure!(census.candidate_oldest > Duration::ZERO);
             Ok(())
         })
     })

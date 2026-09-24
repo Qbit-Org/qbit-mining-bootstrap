@@ -128,6 +128,8 @@ pub fn expected(populated: bool) -> Census {
         "stratum_semantic_current_work_ratio",
         "block_candidates_pending",
         "block_candidate_oldest_pending_seconds",
+        "block_candidate_oldest_unacknowledged_seconds",
+        "block_candidate_oldest_landing_failed_seconds",
         "share_ledger_partition_lead_rows",
         "process_resident_memory_bytes",
         "runtime_lag_seconds",
@@ -137,6 +139,7 @@ pub fn expected(populated: bool) -> Census {
         "stratum_connection_limit",
         "accepted_block_revision_work_pending_seconds",
         "accepted_block_revision_work_tracking_unknown",
+        "accepted_block_unlanded_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }

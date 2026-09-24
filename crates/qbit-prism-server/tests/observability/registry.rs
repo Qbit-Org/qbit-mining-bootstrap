@@ -456,6 +456,8 @@ fn pending_candidate_count_and_age_move_together_without_database_prerequisites(
     metrics.publish_database(Some(metrics::DatabaseMetrics {
         candidates: 2,
         candidate_oldest: Duration::from_secs(5),
+        candidate_oldest_unacknowledged: Duration::from_secs(2),
+        candidate_oldest_landing_failed: Duration::from_secs(1),
         partition_lead_rows: Some(67_108_864),
     }));
     let body = metrics.render();
@@ -463,6 +465,20 @@ fn pending_candidate_count_and_age_move_together_without_database_prerequisites(
     assert_eq!(
         sample(&body, "qbit_prism_block_candidate_oldest_pending_seconds"),
         5.
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "qbit_prism_block_candidate_oldest_unacknowledged_seconds"
+        ),
+        2.
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "qbit_prism_block_candidate_oldest_landing_failed_seconds"
+        ),
+        1.
     );
     assert_eq!(
         sample(&body, "qbit_prism_share_ledger_partition_lead_rows"),
@@ -473,6 +489,13 @@ fn pending_candidate_count_and_age_move_together_without_database_prerequisites(
     assert_eq!(sample(&body, "qbit_prism_block_candidates_pending"), 0.);
     assert_eq!(
         sample(&body, "qbit_prism_block_candidate_oldest_pending_seconds"),
+        0.
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "qbit_prism_block_candidate_oldest_unacknowledged_seconds"
+        ),
         0.
     );
     // An unpartitioned ledger has no lead to report, and a successful

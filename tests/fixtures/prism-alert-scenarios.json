@@ -16,7 +16,9 @@
       "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
-      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
     },
     "expect": {
       "PrismBlockCandidateBacklog": 0,
@@ -26,7 +28,11 @@
       "PrismSemanticWorkCoverageLoss": 0,
       "PrismWorkMetricsUnavailable": 0,
       "PrismRuntimeLagHigh": 0,
-      "PrismMetricsNoData": 0
+      "PrismMetricsNoData": 0,
+      "PrismBlockCandidateStuck": 0,
+      "PrismBlockCandidateOldestPendingCritical": 0,
+      "PrismBlockCandidateLandingFailed": 0,
+      "PrismBlockCandidateLandingFailedCritical": 0
     }
   },
   {
@@ -46,7 +52,9 @@
       "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
-      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1
     },
     "expect": {
       "PrismBlockCandidateBacklog": null,
@@ -54,7 +62,10 @@
       "PrismResidentMemoryHigh": null,
       "PrismProcessMetricsUnavailable": 1,
       "PrismSemanticWorkCoverageLoss": null,
-      "PrismWorkMetricsUnavailable": 2
+      "PrismWorkMetricsUnavailable": 2,
+      "PrismBlockCandidateStuck": null,
+      "PrismBlockCandidateLandingFailed": null,
+      "PrismBlockCandidateLandingFailedCritical": null
     }
   },
   {
@@ -100,7 +111,9 @@
       "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
-      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 60,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
     },
     "expect": {
       "PrismBlockCandidateBacklog": 1,
@@ -108,7 +121,416 @@
       "PrismBlockCandidateOldestPendingCritical": 1,
       "PrismResidentMemoryHigh": 1,
       "PrismSemanticWorkCoverageLoss": 1,
-      "PrismSemanticWorkCoverageLossCritical": 1
+      "PrismSemanticWorkCoverageLossCritical": 1,
+      "PrismBlockCandidateStuck": 0,
+      "PrismBlockCandidateLandingFailedCritical": 0
+    }
+  },
+  {
+    "name": "candidate lost race in reconciliation never pages",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x899 0x300",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "1x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200"
+    },
+    "eval_time": "14m59s",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 0,
+      "PrismBlockCandidateStuck": 0,
+      "PrismBlockCandidateOldestPending": 1,
+      "PrismBlockCandidateLandingFailedCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateStuck": [],
+      "PrismBlockCandidateOldestPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateLandingFailedCritical": []
+    }
+  },
+  {
+    "name": "candidate lost race orphan proof clears the backlog",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x899 0x300",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "1x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200"
+    },
+    "eval_time": "20m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 0,
+      "PrismBlockCandidateStuck": 0,
+      "PrismBlockCandidateOldestPending": 0,
+      "PrismBlockCandidateLandingFailedCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateStuck": [],
+      "PrismBlockCandidateOldestPending": [],
+      "PrismBlockCandidateLandingFailedCritical": []
+    }
+  },
+  {
+    "name": "candidate pre-offer or unknown-outcome row is pending under the paging dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
+    },
+    "eval_time": "3m59s",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 1,
+      "PrismBlockCandidateOldestPending": 1
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateOldestPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "candidate pre-offer or unknown-outcome row still pages after the dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
+    },
+    "eval_time": "4m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 1,
+      "PrismBlockCandidateStuck": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateStuck": []
+    }
+  },
+  {
+    "name": "candidate stuck reconciliation row warns without paging",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1790+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 0,
+      "PrismBlockCandidateStuck": 1,
+      "PrismBlockCandidateOldestPending": 1
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateStuck": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateOldestPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "candidate stuck reconciliation row is pending under the dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1790+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
+    },
+    "eval_time": "2m",
+    "expect": {
+      "PrismBlockCandidateStuck": 1
+    },
+    "alerts": {
+      "PrismBlockCandidateStuck": []
+    }
+  },
+  {
+    "name": "candidate collector failure invalidates the unacknowledged age with the others",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockCandidateMetricsUnavailable": 1,
+      "PrismBlockCandidateOldestPendingCritical": null,
+      "PrismBlockCandidateStuck": null,
+      "PrismBlockCandidateLandingFailedCritical": null
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateStuck": []
+    }
+  },
+  {
+    "name": "candidate rejected block keeps paging like a pre-offer row",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "4m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 1,
+      "PrismBlockCandidateLandingFailedCritical": 0,
+      "PrismBlockCandidateStuck": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateLandingFailedCritical": [],
+      "PrismBlockCandidateStuck": []
+    }
+  },
+  {
+    "name": "candidate failing landing warns at 60s after its dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "4m",
+    "expect": {
+      "PrismBlockCandidateLandingFailed": 1,
+      "PrismBlockCandidateLandingFailedCritical": 0,
+      "PrismBlockCandidateOldestPendingCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateLandingFailed": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateLandingFailedCritical": [],
+      "PrismBlockCandidateOldestPendingCritical": []
+    }
+  },
+  {
+    "name": "candidate failing landing is pending under the paging dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m6s",
+    "expect": {
+      "PrismBlockCandidateLandingFailedCritical": 1,
+      "PrismBlockCandidateOldestPendingCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateLandingFailedCritical": [],
+      "PrismBlockCandidateOldestPendingCritical": []
+    }
+  },
+  {
+    "name": "candidate failing landing pages at 307s plus one minute",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x420",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m8s",
+    "expect": {
+      "PrismBlockCandidateLandingFailedCritical": 1,
+      "PrismBlockCandidateOldestPendingCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateLandingFailedCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateOldestPendingCritical": []
+    }
+  },
+  {
+    "name": "candidate landing refused once then landed never reaches the dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x9 0x350",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockCandidateLandingFailed": 0,
+      "PrismBlockCandidateLandingFailedCritical": 0,
+      "PrismBlockCandidateOldestPendingCritical": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateLandingFailed": [],
+      "PrismBlockCandidateLandingFailedCritical": [],
+      "PrismBlockCandidateOldestPendingCritical": []
+    }
+  },
+  {
+    "name": "candidate mixed-version rollout falls back to the all-unfinished age",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "4m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 1,
+      "PrismBlockCandidateOldestPending": 1,
+      "PrismBlockCandidateMetricsUnavailable": 0
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismBlockCandidateOldestPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "candidate mixed-version rollout fallback is pending under the dwell",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "3m59s",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 1
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": []
+    }
+  },
+  {
+    "name": "candidate upgraded target ignores the fallback for an acknowledged row",
+    "series": {
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x360",
+      "qbit_prism_block_candidate_oldest_unacknowledged_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x360",
+      "qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockCandidateOldestPendingCritical": 0,
+      "PrismBlockCandidateOldestPending": 1
+    },
+    "alerts": {
+      "PrismBlockCandidateOldestPendingCritical": [],
+      "PrismBlockCandidateOldestPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
     }
   },
   {
@@ -826,15 +1248,20 @@
       "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
       "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
-      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
     },
     "expect": {
       "PrismAcceptedRevisionWorkPending": 0,
-      "PrismAcceptedRevisionWorkPendingCritical": 0
+      "PrismAcceptedRevisionWorkPendingCritical": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0,
+      "PrismAcceptedBlockUnlanded": 0
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedBlockUnlanded": []
     }
   },
   {
@@ -864,7 +1291,8 @@
     },
     "expect": {
       "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": 0
+      "PrismAcceptedRevisionWorkPendingCritical": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [
@@ -874,7 +1302,8 @@
           "network": "mainnet"
         }
       ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": []
     }
   },
   {
@@ -938,18 +1367,20 @@
       "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
     },
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": null
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
-      "PrismAcceptedRevisionWorkPending": [
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
           "network": "mainnet"
         }
-      ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      ]
     }
   },
   {
@@ -959,7 +1390,8 @@
     },
     "expect": {
       "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": null
+      "PrismAcceptedRevisionWorkPendingCritical": null,
+      "PrismAcceptedRevisionWorkTrackingUnknown": null
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [
@@ -969,7 +1401,8 @@
           "network": "mainnet"
         }
       ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": []
     }
   },
   {
@@ -981,7 +1414,8 @@
     },
     "expect": {
       "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": null
+      "PrismAcceptedRevisionWorkPendingCritical": null,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [
@@ -991,7 +1425,8 @@
           "network": "mainnet"
         }
       ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": []
     }
   },
   {
@@ -1003,7 +1438,8 @@
       "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0
     },
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0
     }
   },
   {
@@ -1062,20 +1498,22 @@
     },
     "eval_time": "2m",
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
       "PrismAcceptedRevisionWorkPendingCritical": null,
-      "PrismRevisionWorkBuildTimeouts": 0
+      "PrismRevisionWorkBuildTimeouts": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
-      "PrismAcceptedRevisionWorkPending": [
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismRevisionWorkBuildTimeouts": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
           "network": "mainnet"
         }
-      ],
-      "PrismAcceptedRevisionWorkPendingCritical": [],
-      "PrismRevisionWorkBuildTimeouts": []
+      ]
     }
   },
   {
@@ -1091,7 +1529,8 @@
     "expect": {
       "PrismAcceptedRevisionWorkPending": 1,
       "PrismAcceptedRevisionWorkPendingCritical": 1,
-      "PrismRevisionWorkBuildTimeouts": 1
+      "PrismRevisionWorkBuildTimeouts": 1,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [
@@ -1109,6 +1548,13 @@
         }
       ],
       "PrismRevisionWorkBuildTimeouts": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
@@ -1218,7 +1664,8 @@
     "eval_time": "2m",
     "expect": {
       "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": 1
+      "PrismAcceptedRevisionWorkPendingCritical": 1,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [
@@ -1229,6 +1676,13 @@
         }
       ],
       "PrismAcceptedRevisionWorkPendingCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
@@ -1247,18 +1701,20 @@
     },
     "eval_time": "2m",
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": 0
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
-      "PrismAcceptedRevisionWorkPending": [
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
           "network": "mainnet"
         }
-      ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      ]
     }
   },
   {
@@ -1270,18 +1726,20 @@
     },
     "eval_time": "2m",
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": 0
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
-      "PrismAcceptedRevisionWorkPending": [
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
           "network": "mainnet"
         }
-      ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      ]
     }
   },
   {
@@ -1506,18 +1964,20 @@
       "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 3
     },
     "expect": {
-      "PrismAcceptedRevisionWorkPending": 1,
-      "PrismAcceptedRevisionWorkPendingCritical": null
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1
     },
     "alerts": {
-      "PrismAcceptedRevisionWorkPending": [
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
         {
           "job": "qbit-prism",
           "instance": "one",
           "network": "mainnet"
         }
-      ],
-      "PrismAcceptedRevisionWorkPendingCritical": []
+      ]
     }
   },
   {
@@ -1579,6 +2039,270 @@
       ]
     },
     "eval_time": "1m40s"
+  },
+  {
+    "name": "landing one failed refresh is pending under the unknown dwell",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 -1 -1 0x327",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 1 1 0x327",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "32s",
+    "expect": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPending": 0
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPending": []
+    }
+  },
+  {
+    "name": "landing one failed refresh never warns",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 -1 -1 0x327",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 1 1 0x327",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing persistent unknown is pending under the dwell",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "1m59s",
+    "expect": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing persistent unknown warns once the dwell elapses",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "2m",
+    "expect": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing saturation beside a known age warns after the dwell",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 5,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedBlockUnlanded": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedBlockUnlanded": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing budget warning is unchanged by the split",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.01,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "1s",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkTrackingUnknown": []
+    }
+  },
+  {
+    "name": "landing lost race stays inside the unlanded threshold",
+    "series": {
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x899 0x300",
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1200"
+    },
+    "eval_time": "14m59s",
+    "expect": {
+      "PrismAcceptedBlockUnlanded": 0,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedBlockUnlanded": [],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing lost race orphan proof clears the unlanded gauge",
+    "series": {
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x899 0x300",
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1200"
+    },
+    "eval_time": "20m",
+    "expect": {
+      "PrismAcceptedBlockUnlanded": 0,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedBlockUnlanded": [],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing stuck unlanded row is pending under the dwell",
+    "series": {
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1700+1x400",
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 3
+    },
+    "eval_time": "2m",
+    "expect": {
+      "PrismAcceptedBlockUnlanded": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedBlockUnlanded": [],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing stuck unlanded row warns after the dwell",
+    "series": {
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1700+1x400",
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 3
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismAcceptedBlockUnlanded": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": 0
+    },
+    "alerts": {
+      "PrismAcceptedBlockUnlanded": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing saturated unlanded tracking is unknown not stuck",
+    "series": {
+      "qbit_prism_accepted_block_unlanded_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 3
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismAcceptedBlockUnlanded": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedBlockUnlanded": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
   },
   {
     "name": "advisory lock: slow order waits fire while settlement stays fast",

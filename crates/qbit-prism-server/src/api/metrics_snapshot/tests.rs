@@ -227,6 +227,8 @@ async fn unpublished_snapshot_exposes_live_pool_waits_without_inventing_lazy_sam
             ("metrics_snapshot_age_seconds", -1.),
             ("block_candidates_pending", -1.),
             ("block_candidate_oldest_pending_seconds", -1.),
+            ("block_candidate_oldest_unacknowledged_seconds", -1.),
+            ("block_candidate_oldest_landing_failed_seconds", -1.),
             ("collector_available{collector=\"database\"}", 0.),
             ("collector_success{collector=\"database\"}", -1.),
         ] {

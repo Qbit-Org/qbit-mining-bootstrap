@@ -165,6 +165,25 @@ pub enum CandidateState {
 /// [`Ledger::orphan_candidate_at_revision`] only.
 pub const ORPHANED_STATE: &str = "orphaned";
 
+/// The `offer_reply` prefix of a row adopted on the node's evidence that its
+/// block is already active (the pre-offer probe or operator recovery): its
+/// outcome is `unknown` because no offer was recorded, but the node holds
+/// the block, so the candidate collector does not count it as
+/// unacknowledged (#493).
+pub const ADOPTED_OFFER_REPLY_PREFIX: &str = "node reports block ";
+
+/// The `last_error` prefix a row carries while its audit landing keeps
+/// failing after the offer; the candidate collector reports the oldest such
+/// row separately, so a won block whose ledger landing fails is never silent
+/// (#493).
+pub const LANDING_FAILED_REASON_PREFIX: &str = "landing failed after the offer";
+
+/// The node's definitive replies that describe a side-chain block rather
+/// than an invalid one: a tip race lost to a block that arrived first. Every
+/// other rejection reply means the pool offered a block the node refused,
+/// and the candidate collector keeps it in the paging age (#493).
+pub const SIDE_CHAIN_REPLIES_SQL: &str = "('inconclusive','duplicate','duplicate-inconclusive')";
+
 impl CandidateState {
     /// The SQL list of every unfinished state, for `state IN` predicates.
     /// Every other state is terminal, so `state NOT IN` this list is the

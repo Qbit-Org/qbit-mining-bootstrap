@@ -32,6 +32,12 @@ fn timeouts(metrics: &Metrics) -> f64 {
         "qbit_prism_revision_work_build_timeouts_total",
     )
 }
+fn unlanded(metrics: &Metrics) -> f64 {
+    sample(
+        &metrics.render(),
+        "qbit_prism_accepted_block_unlanded_seconds",
+    )
+}
 async fn tick() {
     tokio::time::advance(Duration::from_secs(1)).await;
 }
@@ -587,4 +593,148 @@ async fn recovery_from_unknown_before_the_deadline_attributes_the_timeout() {
     assert_eq!(count(&m, "degraded"), 1.);
     assert_eq!(count(&m, "published"), 0.);
     assert_eq!(age(&m), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_race_acceptance_is_unlanded_and_never_a_known_pending_wait() {
+    // #493 point 1: a definitive submitblock acceptance without an
+    // active-chain observation is not a delivery wait. Its age is reported by
+    // the unlanded gauge and can never reach the paging floor.
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_unlanded_block(&hash, 1);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(unlanded(&m), 0.);
+    tokio::time::advance(Duration::from_secs(400)).await;
+    assert_eq!(age(&m), 0., "a lost race counted as a known pending wait");
+    assert_eq!(unlanded(&m), 400.);
+    assert_eq!(unknown(&m), 0., "an unlanded block is a known state");
+    // The unlanded acceptance is not a known wait for deadline attribution.
+    let build = m.revision_work_build();
+    tick().await;
+    build.deadline_hit();
+    assert_eq!(timeouts(&m), 0.);
+    // A revision observed while it is unlanded is not its delivery target.
+    m.revision_work_observed(5);
+    m.revision_work_delivered(5);
+    assert_eq!(count(&m, "published"), 0.);
+    assert_eq!(count(&m, "superseded"), 0.);
+    // The live overlay reports the same unlanded age on a cached body.
+    let mut cached = m.render();
+    tick().await;
+    m.overlay_live_observations(&mut cached);
+    assert_eq!(
+        sample(&cached, "qbit_prism_accepted_block_unlanded_seconds"),
+        402.
+    );
+    // The proven orphan closes it without a sample; the tombstone holds.
+    m.revision_work_orphaned(&hash);
+    assert_eq!(unlanded(&m), 0.);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(unknown(&m), 0.);
+    m.accepted_unlanded_block(&hash, 1);
+    m.accepted_block(&hash, 1);
+    assert_eq!(unlanded(&m), 0.);
+    assert_eq!(age(&m), 0.);
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+    assert_eq!(m.landing.lock().unwrap().blocks.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_chain_observation_lands_an_accepted_offer_on_its_acceptance_clock() {
+    // A winning offer: the acceptance clock starts at the definitive reply,
+    // the wait becomes known at the first active-chain observation, and the
+    // histogram measures from the acceptance.
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_unlanded_block(&hash, 1);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    m.accepted_block(&hash, 1);
+    assert_eq!(unlanded(&m), 0.);
+    assert_eq!(age(&m), 2., "landing restarted the acceptance clock");
+    m.landed_block(&hash, 7);
+    tick().await;
+    m.revision_work_delivered(7);
+    assert_eq!(count(&m, "published"), 1.);
+    assert_eq!(
+        sample(
+            &m.render(),
+            "qbit_prism_accepted_block_to_revision_work_seconds_sum{result=\"published\"}"
+        ),
+        3.
+    );
+    assert_eq!(age(&m), 0.);
+    // A landed block is never downgraded by a later duplicate acceptance.
+    let m = Metrics::default();
+    m.accepted_block(&hash, 1);
+    tick().await;
+    m.accepted_unlanded_block(&hash, 1);
+    assert_eq!(unlanded(&m), 0.);
+    assert_eq!(age(&m), 1.);
+    // The settlement observer's own active-chain observation lands it too,
+    // whatever its COMMIT reply: a committed first confirmation binds the
+    // target, a lost reply leaves the landed wait unknown.
+    for lost in [false, true] {
+        let m = Metrics::default();
+        m.accepted_unlanded_block(&hash, 1);
+        tick().await;
+        assert_eq!(unlanded(&m), 1.);
+        let settlement = m.revision_work_settlement(&hash);
+        assert_eq!(unlanded(&m), 0.);
+        if lost {
+            drop(settlement);
+            assert_eq!(age(&m), -1.);
+            assert_eq!(unknown(&m), 1.);
+        } else {
+            settlement.committed(true, 3);
+            assert_eq!(age(&m), 1.);
+            m.revision_work_delivered(3);
+            assert_eq!(count(&m, "published"), 1.);
+        }
+    }
+    // A committed orphan verdict closes an unlanded block armed for it.
+    let m = Metrics::default();
+    m.accepted_unlanded_block(&hash, 1);
+    tick().await;
+    {
+        let _lost = m.revision_work_orphan_settlement(&hash);
+        assert_eq!(unlanded(&m), 1.);
+        assert_eq!(age(&m), -1.);
+    }
+    assert_eq!(unknown(&m), 1.);
+    m.revision_work_terminal_probe()
+        .succeeded(std::slice::from_ref(&hash));
+    assert_eq!(unlanded(&m), 0.);
+    assert_eq!(age(&m), 0.);
+    assert_eq!(unknown(&m), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unlanded_age_reports_saturation_as_unknown_rather_than_zero() {
+    let m = Metrics::default();
+    assert_eq!(unlanded(&m), 0.);
+    m.accepted_block("not a block hash", 1);
+    assert_eq!(
+        unlanded(&m),
+        -1.,
+        "saturation was reported as no unlanded block"
+    );
+    assert_eq!(unknown(&m), 1.);
+    // A tracked unlanded age stays visible beside saturation; a known wait is
+    // still reported by the pending gauge only.
+    let m = Metrics::default();
+    m.accepted_unlanded_block(&"11".repeat(32), 1);
+    tick().await;
+    m.accepted_block(&"22".repeat(32), 2);
+    m.landed_block(&"22".repeat(32), 7);
+    tick().await;
+    m.accepted_block("not a block hash", 3);
+    assert_eq!(unlanded(&m), 2.);
+    assert_eq!(age(&m), 1.);
+    assert_eq!(unknown(&m), 1.);
+    m.revision_work_delivered(7);
+    assert_eq!(age(&m), -1.);
+    assert_eq!(unlanded(&m), 2.);
 }

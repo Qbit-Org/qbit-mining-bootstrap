@@ -20,8 +20,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     let startup = running_scrape(router(state.clone()), &[]).await;
     contract::validate(&startup, false).unwrap();
     let startup_census = contract::census(&startup).unwrap();
-    assert_eq!(startup_census.families.len(), 53);
-    assert_eq!(startup_census.series.len(), 232);
+    assert_eq!(startup_census.families.len(), 56);
+    assert_eq!(startup_census.series.len(), 235);
     assert_eq!(sample(&startup, "qbit_prism_runtime_lag_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_block_candidates_pending"), -1.);
     assert_eq!(
@@ -86,6 +86,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         metrics.publish_database(known.then_some(DatabaseMetrics {
             candidates: iteration,
             candidate_oldest: elapsed,
+            candidate_oldest_unacknowledged: elapsed / 2,
+            candidate_oldest_landing_failed: elapsed / 3,
             partition_lead_rows: Some(iteration as i64),
         }));
         metrics.publish_process(known.then_some(ProcessMetrics {
@@ -107,8 +109,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 53);
-        assert_eq!(populated.series.len(), 666);
+        assert_eq!(populated.families.len(), 56);
+        assert_eq!(populated.series.len(), 669);
         assert_eq!(
             sample(&body, "qbit_prism_block_candidates_pending"),
             if known { iteration as f64 } else { -1. }
