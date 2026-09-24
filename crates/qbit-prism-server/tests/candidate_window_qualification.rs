@@ -274,6 +274,7 @@ fn frontend_config(database_url: &str, node: &FakeNode, instance_id: &str) -> Re
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,
+        refresh_build_threads: None,
         runtime_workers: 2,
         snapshot_interval: Duration::from_secs(3600),
         health_timeout: Duration::from_secs(3600),

@@ -80,6 +80,10 @@ pub use broadcast::*;
 mod audit_hash;
 pub use audit_hash::CanonicalAuditHashPrefix;
 
+/// Builder-only ordered parallel serialization; verifiers stay serial.
+pub mod parallel;
+pub use parallel::Parallelism;
+
 mod audit_body_ref;
 pub use audit_body_ref::*;
 
@@ -796,47 +800,7 @@ pub fn compute_prism_window(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
 ) -> Result<PrismWindow, PrismError> {
-    if found_block.network_difficulty == 0 {
-        return Err(PrismError::ZeroNetworkDifficulty);
-    }
-    let mut seen_share_ids = HashSet::with_capacity(shares.len());
-    let mut eligible = Vec::with_capacity(shares.len());
-    for share in shares {
-        if share.share_difficulty == 0 {
-            return Err(PrismError::ZeroShareDifficulty {
-                share_seq: share.share_seq,
-            });
-        }
-        if !seen_share_ids.insert(share.share_id.as_str()) {
-            return Err(PrismError::DuplicateShareId {
-                share_id: share.share_id.clone(),
-            });
-        }
-        if share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
-            && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
-        {
-            eligible.push(share);
-        }
-    }
-
-    let requested_window_weight = found_block
-        .network_difficulty
-        .checked_mul(PRISM_WINDOW_MULTIPLIER)
-        .ok_or(PrismError::WindowOverflow)?;
-    // Production ledger snapshots are emitted in strictly ascending share
-    // sequence. Reverse that common case in O(n), while retaining the stable
-    // sort (and therefore byte-for-byte behavior) for arbitrary API callers.
-    if eligible
-        .windows(2)
-        .all(|pair| pair[0].share_seq < pair[1].share_seq)
-    {
-        eligible.reverse();
-    } else if !eligible
-        .windows(2)
-        .all(|pair| pair[0].share_seq > pair[1].share_seq)
-    {
-        eligible.sort_by_key(|share| std::cmp::Reverse(share.share_seq));
-    }
+    let (eligible, requested_window_weight) = eligible_window(shares, found_block)?;
 
     let mut remaining = requested_window_weight;
     let mut counted_shares = Vec::new();
@@ -883,6 +847,241 @@ pub fn compute_prism_window(
         shares: counted_shares,
         entitlements,
     })
+}
+
+/// Validation, eligibility and newest-first ordering, shared by the serial
+/// fold and the builder's parallel fold so both take the same shares in the
+/// same order.
+fn eligible_window<'a>(
+    shares: &'a [AcceptedShare],
+    found_block: &FoundBlock,
+) -> Result<(Vec<&'a AcceptedShare>, u128), PrismError> {
+    if found_block.network_difficulty == 0 {
+        return Err(PrismError::ZeroNetworkDifficulty);
+    }
+    let mut seen_share_ids = HashSet::with_capacity(shares.len());
+    let mut eligible = Vec::with_capacity(shares.len());
+    for share in shares {
+        if share.share_difficulty == 0 {
+            return Err(PrismError::ZeroShareDifficulty {
+                share_seq: share.share_seq,
+            });
+        }
+        if !seen_share_ids.insert(share.share_id.as_str()) {
+            return Err(PrismError::DuplicateShareId {
+                share_id: share.share_id.clone(),
+            });
+        }
+        if share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
+            && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
+        {
+            eligible.push(share);
+        }
+    }
+
+    let requested_window_weight = found_block
+        .network_difficulty
+        .checked_mul(PRISM_WINDOW_MULTIPLIER)
+        .ok_or(PrismError::WindowOverflow)?;
+    // Production ledger snapshots are emitted in strictly ascending share
+    // sequence. Reverse that common case in O(n), while retaining the stable
+    // sort (and therefore byte-for-byte behavior) for arbitrary API callers.
+    if eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq < pair[1].share_seq)
+    {
+        eligible.reverse();
+    } else if !eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq > pair[1].share_seq)
+    {
+        eligible.sort_by_key(|share| std::cmp::Reverse(share.share_seq));
+    }
+    Ok((eligible, requested_window_weight))
+}
+
+/// The builder's fold: the `PrismWindow` of [`compute_prism_window`] and the
+/// [`share_slice_digest_hex`] of its shares, with the counted shares
+/// constructed on worker threads in chunk order while this thread streams
+/// the slice digest over each finished chunk and merges its entitlement
+/// weights. The counted difficulties are decided serially first, so every
+/// chunk is a pure function of the ordered eligible shares.
+fn compute_prism_window_parallel(
+    shares: &[AcceptedShare],
+    found_block: &FoundBlock,
+    parallelism: Parallelism,
+) -> Result<(PrismWindow, String), PrismError> {
+    let (eligible, requested_window_weight) = eligible_window(shares, found_block)?;
+    let mut remaining = requested_window_weight;
+    let mut counted = Vec::with_capacity(eligible.len());
+    for share in &eligible {
+        if remaining == 0 {
+            break;
+        }
+        let taken = share.share_difficulty.min(remaining);
+        counted.push(taken);
+        remaining -= taken;
+    }
+    if counted.is_empty() {
+        return Err(PrismError::EmptyWindow {
+            anchor_job_issued_at_ms: found_block.anchor_job_issued_at_ms,
+        });
+    }
+    let counted_window_weight = counted
+        .iter()
+        .try_fold(0_u128, |sum, taken| sum.checked_add(*taken))
+        .ok_or(PrismError::WindowOverflow)?;
+    let taken = &eligible[..counted.len()];
+    let anchor_share_seq = taken[0].share_seq;
+    let chunk_len = parallelism.chunk_len().min(taken.len());
+    let chunks = taken.len().div_ceil(chunk_len);
+    let mut counted_shares = Vec::with_capacity(taken.len());
+    let mut weights: BTreeMap<(&str, &str, &str), u128> = BTreeMap::new();
+    // Workers build the counted shares, their slice-digest bytes and their
+    // entitlement partial sums per chunk; this thread appends and merges in
+    // order and hands each chunk's digest bytes to the digest thread.
+    let pool = parallel::BufferPool::new();
+    let digest = std::thread::scope(|scope| {
+        let (send, hasher) = parallel::spawn_hasher(scope, &pool, 4);
+        let folded = parallel::ordered_chunks(
+            chunks,
+            parallelism.workers(),
+            |index| {
+                let range = index * chunk_len..((index + 1) * chunk_len).min(taken.len());
+                let mut chunk = Vec::with_capacity(range.len());
+                let mut digest_bytes = pool.take();
+                let mut chunk_weights: BTreeMap<(&str, &str, &str), u128> = BTreeMap::new();
+                for (share, credited) in taken[range.clone()].iter().zip(&counted[range]) {
+                    chunk.push(CountedShare {
+                        share_seq: share.share_seq,
+                        share_id: share.share_id.clone(),
+                        miner_id: share.miner_id.clone(),
+                        order_key: share.order_key.clone(),
+                        p2mr_program_hex: share.p2mr_program_hex.clone(),
+                        share_difficulty: share.share_difficulty,
+                        counted_difficulty: *credited,
+                        job_issued_at_ms: share.job_issued_at_ms,
+                        accepted_at_ms: share.accepted_at_ms,
+                        credit_policy: share.credit_policy.clone(),
+                    });
+                    update_slice_digest(&mut digest_bytes, chunk.last().expect("just pushed"));
+                    let weight = chunk_weights
+                        .entry((
+                            share.miner_id.as_str(),
+                            share.order_key.as_str(),
+                            share.p2mr_program_hex.as_str(),
+                        ))
+                        .or_insert(0);
+                    *weight = weight
+                        .checked_add(*credited)
+                        .ok_or(PrismError::WindowOverflow)?;
+                }
+                Ok((chunk, digest_bytes, chunk_weights))
+            },
+            |_, (chunk, digest_bytes, chunk_weights)| {
+                send.send(digest_bytes)
+                    .map_err(|_| PrismError::Json(parallel::stopped("share slice digest")))?;
+                counted_shares.extend(chunk);
+                for (key, weight) in chunk_weights {
+                    let total = weights.entry(key).or_insert(0);
+                    *total = total
+                        .checked_add(weight)
+                        .ok_or(PrismError::WindowOverflow)?;
+                }
+                Ok::<(), PrismError>(())
+            },
+        );
+        drop(send);
+        let hasher = hasher.join().expect("share slice digest thread");
+        folded.map(|()| hasher)
+    })?;
+    let entitlements = weights
+        .into_iter()
+        .map(
+            |((miner_id, order_key, p2mr_program_hex), weight)| WeightedEntitlement {
+                recipient_id: miner_id.to_owned(),
+                order_key: order_key.to_owned(),
+                p2mr_program_hex: p2mr_program_hex.to_owned(),
+                weight,
+            },
+        )
+        .collect();
+    Ok((
+        PrismWindow {
+            anchor_job_issued_at_ms: found_block.anchor_job_issued_at_ms,
+            anchor_share_seq,
+            requested_window_weight,
+            counted_window_weight,
+            shares: counted_shares,
+            entitlements,
+        },
+        hex::encode(digest.finalize()),
+    ))
+}
+
+/// [`build_prism_reward_manifest`] for the builder: serial parallelism is
+/// that function; anything wider folds through [`compute_prism_window_parallel`]
+/// and produces the identical manifest.
+fn build_prism_reward_manifest_parallel(
+    shares: &[AcceptedShare],
+    found_block: &FoundBlock,
+    parallelism: Parallelism,
+) -> Result<PrismRewardManifest, PrismError> {
+    if parallelism.is_serial() {
+        return build_prism_reward_manifest(shares, found_block);
+    }
+    let (window, share_slice_digest_hex) =
+        compute_prism_window_parallel(shares, found_block, parallelism)?;
+    let newest_share_seq = window.shares[0].share_seq;
+    let oldest_share_seq = window
+        .shares
+        .last()
+        .expect("non-empty PRISM windows have a last share")
+        .share_seq;
+    Ok(PrismRewardManifest {
+        schema: "qbit.prism.reward-manifest.v1".to_string(),
+        block_height: found_block.block_height,
+        coinbase_value_sats: found_block.coinbase_value_sats,
+        network_difficulty: found_block.network_difficulty,
+        window_multiplier: PRISM_WINDOW_MULTIPLIER,
+        requested_window_weight: window.requested_window_weight,
+        counted_window_weight: window.counted_window_weight,
+        anchor_job_issued_at_ms: window.anchor_job_issued_at_ms,
+        anchor_share_seq: window.anchor_share_seq,
+        newest_share_seq,
+        oldest_share_seq,
+        included_share_count: window.shares.len(),
+        share_slice_digest_hex,
+        shares: window.shares,
+        entitlements: window.entitlements,
+    })
+}
+
+/// Write exactly `serde_json::to_writer(writer, manifest)`: the derived
+/// field order, with the `shares` array's bytes produced in ordered chunks.
+pub(crate) fn write_reward_manifest<W: std::io::Write>(
+    writer: &mut W,
+    manifest: &PrismRewardManifest,
+    parallelism: Parallelism,
+) -> Result<(), serde_json::Error> {
+    if parallelism.is_serial() {
+        return serde_json::to_writer(writer, manifest);
+    }
+    manifest.serialize(parallel::StructSplice::object(writer, "shares", |writer| {
+        parallel::write_array(writer, &manifest.shares, parallelism)
+    }))
+}
+
+/// `sha256(canonical_reward_manifest_bytes(manifest))` without materializing
+/// the bytes: the builder's input to the commitment leaf and, with CTV
+/// settlement, to every fan-out precommitment.
+fn reward_manifest_sha256(
+    manifest: &PrismRewardManifest,
+    parallelism: Parallelism,
+) -> Result<[u8; 32], serde_json::Error> {
+    let mut writer = audit_hash::DigestWriter(Sha256::new());
+    write_reward_manifest(&mut writer, manifest, parallelism)?;
+    Ok(writer.0.finalize().into())
 }
 
 pub fn build_prism_reward_manifest(
@@ -1103,11 +1302,21 @@ pub fn prism_audit_commitment_leaf_hex(
     let payout_policy_manifest_hash = Sha256::digest(canonical_payout_policy_manifest_bytes(
         payout_policy_manifest,
     )?);
+    Ok(commitment_leaf_hex(
+        &reward_manifest_hash,
+        &payout_policy_manifest_hash,
+    ))
+}
+
+/// The leaf over both manifests' canonical sha256 digests: one recipe for
+/// the serial verifier above and the builder, which supplies the reward
+/// digest from [`reward_manifest_sha256`].
+fn commitment_leaf_hex(reward_manifest_hash: &[u8], payout_policy_manifest_hash: &[u8]) -> String {
     let mut payload = Vec::with_capacity(PRISM_AUDIT_COMMITMENT_LEAF_TAG.len() + 64);
     payload.extend_from_slice(PRISM_AUDIT_COMMITMENT_LEAF_TAG.as_bytes());
-    payload.extend_from_slice(&reward_manifest_hash);
-    payload.extend_from_slice(&payout_policy_manifest_hash);
-    Ok(sha256_hex(&payload))
+    payload.extend_from_slice(reward_manifest_hash);
+    payload.extend_from_slice(payout_policy_manifest_hash);
+    sha256_hex(&payload)
 }
 
 pub fn audit_commitment_root_hex(commitment_leaves_hex: &[String]) -> Result<String, PrismError> {
@@ -1832,6 +2041,35 @@ pub fn build_audit_bundle_body_with_coinbase_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundleBody, PrismError> {
+    build_audit_bundle_body_with_coinbase_options_parallel(
+        shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        coinbase_script_sig_suffix_hex,
+        witness_merkle_leaves_hex,
+        coinbase_signing_key,
+        ledger_signing_key,
+        Parallelism::serial(),
+    )
+}
+
+/// [`build_audit_bundle_body_with_coinbase_options`] with the counted-share
+/// fold and the reward manifest's leaf digest spread over `parallelism`
+/// worker threads. The body is identical for every parallelism; verifiers
+/// never take this path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_audit_bundle_body_with_coinbase_options_parallel(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    coinbase_script_sig_suffix_hex: Option<String>,
+    witness_merkle_leaves_hex: Vec<String>,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+    parallelism: Parallelism,
+) -> Result<AuditBundleBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1839,7 +2077,7 @@ pub fn build_audit_bundle_body_with_coinbase_options(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest(shares, &found_block)
+        build_prism_reward_manifest_parallel(shares, &found_block, parallelism)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -1850,10 +2088,14 @@ pub fn build_audit_bundle_body_with_coinbase_options(
         })?;
     let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
         profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
-            let leaves = vec![prism_audit_commitment_leaf_hex(
-                &reward_manifest,
-                &payout_policy_manifest,
-            )?];
+            let reward_manifest_hash = reward_manifest_sha256(&reward_manifest, parallelism)?;
+            let payout_policy_manifest_hash = Sha256::digest(
+                canonical_payout_policy_manifest_bytes(&payout_policy_manifest)?,
+            );
+            let leaves = vec![commitment_leaf_hex(
+                &reward_manifest_hash,
+                &payout_policy_manifest_hash,
+            )];
             let root = audit_commitment_root_hex(&leaves)?;
             Ok::<_, PrismError>((leaves, root))
         })?;
@@ -1938,6 +2180,42 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundleBody, PrismError> {
+    build_audit_bundle_body_with_ctv_settlement_options_parallel(
+        shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        direct_floor_sats,
+        settlement_config,
+        ctv_fanout_fee_policy,
+        coinbase_script_sig_suffix_hex,
+        witness_merkle_leaves_hex,
+        coinbase_signing_key,
+        ledger_signing_key,
+        Parallelism::serial(),
+    )
+}
+
+/// [`build_audit_bundle_body_with_ctv_settlement_options`] with the
+/// counted-share fold and the reward manifest's digest spread over
+/// `parallelism` worker threads. The reward manifest is digested once for
+/// the commitment leaf and every fan-out precommitment; the body is
+/// identical for every parallelism, and verifiers never take this path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_audit_bundle_body_with_ctv_settlement_options_parallel(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    direct_floor_sats: u64,
+    settlement_config: SettlementModeConfig,
+    ctv_fanout_fee_policy: Option<FanoutFeeRatePolicy>,
+    coinbase_script_sig_suffix_hex: Option<String>,
+    witness_merkle_leaves_hex: Vec<String>,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+    parallelism: Parallelism,
+) -> Result<AuditBundleBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1945,7 +2223,7 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest(shares, &found_block)
+        build_prism_reward_manifest_parallel(shares, &found_block, parallelism)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -1975,15 +2253,17 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
             };
             Ok::<_, PrismError>((payout_manifest, settlement_decision, fee_recipients))
         })?;
-    let (reward_manifest_sha256_hex, payout_policy_manifest_sha256_hex) =
+    let (reward_manifest_hash, payout_policy_manifest_hash) =
         profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
             Ok::<_, PrismError>((
-                sha256_hex(&canonical_reward_manifest_bytes(&reward_manifest)?),
-                sha256_hex(&canonical_payout_policy_manifest_bytes(
+                reward_manifest_sha256(&reward_manifest, parallelism)?,
+                Sha256::digest(canonical_payout_policy_manifest_bytes(
                     &payout_policy_manifest,
                 )?),
             ))
         })?;
+    let reward_manifest_sha256_hex = hex::encode(reward_manifest_hash);
+    let payout_policy_manifest_sha256_hex = hex::encode(payout_policy_manifest_hash);
 
     let prepared_fanouts = profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
         let mut prepared = Vec::new();
@@ -2034,10 +2314,10 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
 
     let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
         profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
-            let mut leaves = vec![prism_audit_commitment_leaf_hex(
-                &reward_manifest,
-                &payout_policy_manifest,
-            )?];
+            let mut leaves = vec![commitment_leaf_hex(
+                &reward_manifest_hash,
+                &payout_policy_manifest_hash,
+            )];
             leaves.extend(
                 prepared_fanouts
                     .iter()
@@ -2758,21 +3038,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn share_slice_digest_hex(shares: &[CountedShare]) -> String {
     let mut hasher = Sha256::new();
     for share in shares {
-        update_u64(&mut hasher, share.share_seq);
-        update_string(&mut hasher, &share.share_id);
-        update_string(&mut hasher, &share.miner_id);
-        update_string(&mut hasher, &share.order_key);
-        update_string(&mut hasher, &share.p2mr_program_hex);
-        update_u128(&mut hasher, share.share_difficulty);
-        update_u128(&mut hasher, share.counted_difficulty);
-        update_i64(&mut hasher, share.job_issued_at_ms);
-        update_i64(&mut hasher, share.accepted_at_ms);
-        if let Some(credit_policy) = &share.credit_policy {
-            update_string(&mut hasher, "credit_policy");
-            update_string(&mut hasher, credit_policy);
-        }
+        update_slice_digest(&mut hasher, share);
     }
     hex::encode(hasher.finalize())
+}
+
+/// One counted share's contribution to the slice digest, in window order.
+fn update_slice_digest(hasher: &mut impl Absorb, share: &CountedShare) {
+    update_u64(hasher, share.share_seq);
+    update_string(hasher, &share.share_id);
+    update_string(hasher, &share.miner_id);
+    update_string(hasher, &share.order_key);
+    update_string(hasher, &share.p2mr_program_hex);
+    update_u128(hasher, share.share_difficulty);
+    update_u128(hasher, share.counted_difficulty);
+    update_i64(hasher, share.job_issued_at_ms);
+    update_i64(hasher, share.accepted_at_ms);
+    if let Some(credit_policy) = &share.credit_policy {
+        update_string(hasher, "credit_policy");
+        update_string(hasher, credit_policy);
+    }
 }
 
 /// The sha256 digest a ledger window attestation commits to for the prior
@@ -2813,25 +3098,44 @@ fn prior_balances_digest_hex(balances: &[CarryForwardBalance]) -> String {
     hex::encode(prior_balances_digest(balances))
 }
 
-fn update_string(hasher: &mut Sha256, value: &str) {
+/// Where the hand-rolled digests put their bytes: the hasher itself, or a
+/// buffer the builder hands to the hasher later in one update. The digest is
+/// the same either way; only the number of hasher calls differs.
+trait Absorb {
+    fn absorb(&mut self, bytes: &[u8]);
+}
+
+impl Absorb for Sha256 {
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+}
+
+impl Absorb for Vec<u8> {
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+fn update_string(hasher: &mut impl Absorb, value: &str) {
     update_u64(hasher, value.len() as u64);
-    hasher.update(value.as_bytes());
+    hasher.absorb(value.as_bytes());
 }
 
-fn update_u64(hasher: &mut Sha256, value: u64) {
-    hasher.update(value.to_be_bytes());
+fn update_u64(hasher: &mut impl Absorb, value: u64) {
+    hasher.absorb(&value.to_be_bytes());
 }
 
-fn update_i64(hasher: &mut Sha256, value: i64) {
-    hasher.update(value.to_be_bytes());
+fn update_i64(hasher: &mut impl Absorb, value: i64) {
+    hasher.absorb(&value.to_be_bytes());
 }
 
-fn update_i128(hasher: &mut Sha256, value: i128) {
-    hasher.update(value.to_be_bytes());
+fn update_i128(hasher: &mut impl Absorb, value: i128) {
+    hasher.absorb(&value.to_be_bytes());
 }
 
-fn update_u128(hasher: &mut Sha256, value: u128) {
-    hasher.update(value.to_be_bytes());
+fn update_u128(hasher: &mut impl Absorb, value: u128) {
+    hasher.absorb(&value.to_be_bytes());
 }
 
 fn aggregate_entitlements(

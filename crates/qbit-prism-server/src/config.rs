@@ -34,6 +34,10 @@ pub struct Config {
     pub poll_interval: Duration,
     pub blockwait: bool,
     pub build_workers: usize,
+    /// `PRISM_REFRESH_BUILD_THREADS`: the refresh builder pool's threads for
+    /// this process (`0` runs the builder serially); `None` lets the builder
+    /// size it from the host.
+    pub refresh_build_threads: Option<usize>,
     pub runtime_workers: usize,
     pub snapshot_interval: Duration,
     pub health_timeout: Duration,
@@ -437,6 +441,9 @@ impl Config {
             1,
             runtime_workers + 8,
         )?;
+        let refresh_build_threads = optional("PRISM_REFRESH_BUILD_THREADS")
+            .map(|_| bounded_usize("PRISM_REFRESH_BUILD_THREADS", 0, 0, 64))
+            .transpose()?;
         let ctv_config = SettlementModeConfig {
             max_coinbase_settlement_outputs: bounded_usize(
                 "PRISM_MAX_COINBASE_SETTLEMENT_OUTPUTS",
@@ -510,6 +517,7 @@ impl Config {
             blockwait: flag("PRISM_BLOCKWAIT_ENABLED", true)?,
             runtime_workers,
             build_workers,
+            refresh_build_threads,
             snapshot_interval: seconds("PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS", 60.0)?,
             health_timeout: seconds("PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS", 15.0)?,
             share_commit_timeout,
@@ -608,6 +616,7 @@ mod tests {
             poll_interval: Duration::from_secs(2),
             blockwait: true,
             build_workers: 2,
+            refresh_build_threads: None,
             runtime_workers: 2,
             snapshot_interval: Duration::from_secs(60),
             health_timeout: Duration::from_secs(15),

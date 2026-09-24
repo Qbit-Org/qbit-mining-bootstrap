@@ -169,12 +169,31 @@ impl WindowRef {
     /// the reference does not depend on that order and the read path never
     /// re-sorts the vector it returns.
     pub fn from_snapshot(snapshot: &Snapshot) -> Result<Self> {
+        Self::from_snapshot_with(snapshot, || share_array_digest(&snapshot.shares))
+    }
+
+    /// [`WindowRef::from_snapshot`] with `snapshot_sha256` already computed
+    /// by the caller as `sha256(serde_json::to_vec(&snapshot.shares))` over
+    /// this same snapshot: the refresh pipeline's single pass over the share
+    /// array feeds this digest and the canonical audit prefix together. The
+    /// digest is not checked here; an empty snapshot ignores it.
+    pub fn from_snapshot_with_digest(
+        snapshot: &Snapshot,
+        snapshot_sha256: [u8; 32],
+    ) -> Result<Self> {
+        Self::from_snapshot_with(snapshot, || Ok(snapshot_sha256))
+    }
+
+    fn from_snapshot_with(
+        snapshot: &Snapshot,
+        snapshot_sha256: impl FnOnce() -> Result<[u8; 32]>,
+    ) -> Result<Self> {
         let shares = match (snapshot.shares.first(), snapshot.shares.last()) {
             (Some(first), Some(last)) => Some(ShareRange {
                 first_share_seq: first.share_seq,
                 last_share_seq: last.share_seq,
                 share_count: u64::try_from(snapshot.shares.len())?,
-                snapshot_sha256: share_array_digest(&snapshot.shares)?,
+                snapshot_sha256: snapshot_sha256()?,
             }),
             _ => None,
         };

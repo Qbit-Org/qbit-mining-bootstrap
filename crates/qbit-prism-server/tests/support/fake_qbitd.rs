@@ -290,6 +290,7 @@ pub fn coordinator_config_at(
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,
+        refresh_build_threads: None,
         runtime_workers: 2,
         snapshot_interval: Duration::from_secs(60),
         health_timeout: Duration::from_secs(15),
