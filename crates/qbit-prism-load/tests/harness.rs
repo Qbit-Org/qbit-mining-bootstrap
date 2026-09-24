@@ -7534,6 +7534,14 @@ fn pending(message: &str) -> client::Outcome {
     })
 }
 
+fn rejected(code: i64, reason_id: &str, message: &str) -> client::Outcome {
+    client::Outcome::Rejected(Rejection {
+        code,
+        reason_id: Some(reason_id.to_owned()),
+        message: message.to_owned(),
+    })
+}
+
 fn node_submission(hash: &str, height: u64, accepted: bool) -> node::SubmissionRecord {
     node::SubmissionRecord {
         block_hash: hash.to_owned(),
@@ -8701,6 +8709,41 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
         document["proposed_budget_for_issue_291"]["recommended_soak_budget_millis"],
         Value::Null
     );
+    // #480: the count was the field that read 0.0 in #447. With no landing it
+    // is unknown, and every null in the block says why.
+    let budget = &document["proposed_budget_for_issue_291"];
+    for (value, reason) in [
+        (
+            "rejections_per_landing_per_frontend_p99",
+            "rejections_per_landing_per_frontend_p99_unavailable_reason",
+        ),
+        ("window_p99_millis", "window_p99_unavailable_reason"),
+    ] {
+        assert_eq!(budget[value], Value::Null, "{value} is unknown, never 0.0");
+        assert!(
+            budget[reason]
+                .as_str()
+                .expect("a null carries its reason")
+                .contains("no landing produced a window"),
+            "{reason}"
+        );
+    }
+    for (value, reason) in [
+        (
+            "rejected_before_new_revision_work_per_landing_per_frontend_p99",
+            "rejected_before_new_revision_work_unavailable_reason",
+        ),
+        (
+            "acceptance_to_new_revision_work_p99_millis",
+            "acceptance_to_new_revision_work_unavailable_reason",
+        ),
+    ] {
+        assert_eq!(budget["same_edge_as_issue_458"][value], Value::Null);
+        assert!(
+            budget["same_edge_as_issue_458"][reason].is_string(),
+            "{reason}"
+        );
+    }
     assert_eq!(document["lost_valid_work"]["shares"], json!(0));
 
     // Every attempt failing is a different reason, and it names the tally.
@@ -8722,6 +8765,42 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
     assert_eq!(failed["bumps"], json!(0));
     let reason = failed["reason"].as_str().expect("a reason");
     assert!(reason.contains("never_produced=1"), "{reason}");
+
+    // Rejections the landing would own, in a phase where nothing landed: they
+    // are counted and unattributed, and the per-landing cost stays unknown
+    // rather than collapsing to 0.0 (#480).
+    let stranded = vec![dense_submit(
+        &"9".repeat(64),
+        1,
+        1,
+        at(base, 30_000),
+        at(base, 30_100),
+        rejected(21, "stale-job", classify::STALE_JOB),
+        false,
+    )];
+    let unlanded = cadence::build(&cadence::ReportInputs {
+        landing_budget: 12,
+        slots_over_budget: 0,
+        landings: &landings,
+        submits: &stranded,
+        ..inputs
+    });
+    assert_eq!(unlanded["landings"], json!(0));
+    assert_eq!(
+        unlanded["rejection_attribution"]["rebuild_pending_rejections_in_phase"],
+        json!(1)
+    );
+    assert_eq!(unlanded["rejection_attribution"]["unattributed"], json!(1));
+    assert_eq!(
+        unlanded["proposed_budget_for_issue_291"]["rejections_per_landing_per_frontend_p99"],
+        Value::Null,
+        "no landing, so no per-landing count: null, not 0.0"
+    );
+    assert!(unlanded["proposed_budget_for_issue_291"]
+        ["rejections_per_landing_per_frontend_p99_unavailable_reason"]
+        .as_str()
+        .expect("a reason")
+        .contains("never_produced=1"));
 
     // A run that never asked for the scenario says so.
     let none = cadence::build(&cadence::ReportInputs {
@@ -8769,6 +8848,456 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
     assert_eq!(
         drifted["bumps"],
         drifted["revision_sampler"]["changes_observed"]
+    );
+}
+
+#[test]
+fn landing_cost_keys_on_the_reason_and_the_servers_messages() {
+    use classify::LandingCost;
+    let cost = |reason: Option<&str>, message: &str| {
+        classify::landing_cost(&Rejection {
+            code: 21,
+            reason_id: reason.map(str::to_owned),
+            message: message.to_owned(),
+        })
+    };
+    // What the current server answers for retired work (#480).
+    assert_eq!(
+        cost(Some("stale-job"), classify::STALE_JOB),
+        LandingCost::StaleJob
+    );
+    assert_eq!(
+        cost(Some("unknown-job"), classify::STALE_JOB),
+        LandingCost::UnknownJob
+    );
+    // Older producers' two messages are still the landing's.
+    assert_eq!(
+        cost(Some("stale-job"), classify::NEW_TIP_WORK_PENDING),
+        LandingCost::TipPending
+    );
+    assert_eq!(
+        cost(Some("stale-job"), classify::NEW_PAYOUT_WORK_PENDING),
+        LandingCost::PayoutPending
+    );
+    for owned in [
+        LandingCost::StaleJob,
+        LandingCost::UnknownJob,
+        LandingCost::TipPending,
+        LandingCost::PayoutPending,
+    ] {
+        assert!(owned.owned(), "{owned:?}");
+    }
+    // Recognised, and not a landing's cost.
+    for (reason, message) in [
+        (Some("stale-job"), classify::FEE_BELOW_RELAY_FLOOR),
+        (
+            Some("backend-rpc-unavailable"),
+            "current chain state is unavailable",
+        ),
+        (
+            Some("ledger-confirmation-failed"),
+            "share was not committed because its commit gate closed",
+        ),
+        (Some("pool-closed"), "no current work"),
+        (Some("low-difficulty"), "low difficulty share"),
+    ] {
+        assert_eq!(
+            cost(reason, message),
+            LandingCost::NotOwned,
+            "{reason:?} {message}"
+        );
+        assert!(!LandingCost::NotOwned.owned());
+    }
+    // Unknown is its own answer, never owned and never not-owned.
+    for (reason, message) in [
+        (
+            Some("stale-job"),
+            "some wording this harness has never seen",
+        ),
+        (Some("unknown-job"), "job not found"),
+        (Some("a-reason-from-the-future"), "stale job"),
+        (None, "stale job"),
+    ] {
+        assert_eq!(
+            cost(reason, message),
+            LandingCost::Unrecognised,
+            "{reason:?} {message}"
+        );
+    }
+    assert!(!LandingCost::Unrecognised.owned());
+}
+
+/// Two landings on one frontend, answered in the current server's vocabulary
+/// (#480): landing 0's span runs 7.0 s to 16.0 s, landing 1's from 16.0 s to
+/// the phase's end. `extra` adds rejections to the fixed set, each as a hex
+/// digit for its share, a session, milliseconds from the phase's start to the
+/// response, and the answer.
+fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -> Value {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let landing = |index: usize, millis: u64, session: usize| cadence::Landing {
+        index,
+        scheduled_offset_seconds: millis as f64 / 1000.0,
+        requested_monotonic: at(base, millis),
+        requested_wall: chrono::Utc::now(),
+        session,
+        frontend: 0,
+    };
+    let landings = vec![landing(0, 5_000, 0), landing(1, 14_000, 1)];
+    let stale = || rejected(21, "stale-job", classify::STALE_JOB);
+    let share = |digit: u32, session: usize, millis: u64, outcome: client::Outcome| {
+        dense_submit(
+            &char::from_digit(digit, 16)
+                .expect("a digit")
+                .to_string()
+                .repeat(64),
+            session,
+            0,
+            at(base, millis - 100),
+            at(base, millis),
+            outcome,
+            false,
+        )
+    };
+    let mut submits = vec![
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            HASH_ONE,
+            1,
+            0,
+            at(base, 14_100),
+            at(base, 14_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        // Before any span: owned by no landing, so unattributed.
+        share(1, 2, 3_000, stale()),
+        // Landing 0's span: three stale-job and one unknown-job, the last
+        // stale-job after new-revision work reached the frontend at 9.0 s.
+        share(2, 2, 7_200, stale()),
+        share(3, 3, 7_600, stale()),
+        share(
+            4,
+            2,
+            8_000,
+            rejected(21, "unknown-job", classify::STALE_JOB),
+        ),
+        share(5, 3, 10_000, stale()),
+        // Landing 0's span, and not landing 0's: a backend refusal, a closed
+        // commit gate and a fee-floor stale-job.
+        share(
+            6,
+            2,
+            7_300,
+            rejected(
+                20,
+                "backend-rpc-unavailable",
+                "current chain state is unavailable",
+            ),
+        ),
+        share(
+            7,
+            3,
+            7_400,
+            rejected(
+                20,
+                "ledger-confirmation-failed",
+                "share was not committed because its commit gate closed",
+            ),
+        ),
+        share(
+            8,
+            2,
+            7_450,
+            rejected(21, "stale-job", classify::FEE_BELOW_RELAY_FLOOR),
+        ),
+        // Landing 1's span.
+        share(9, 3, 16_200, stale()),
+    ];
+    submits.extend(
+        extra
+            .into_iter()
+            .map(|(digit, session, millis, outcome)| share(digit, session, millis, outcome)),
+    );
+    let node_submissions = vec![
+        node_submission(HASH_ZERO, 104, true),
+        node_submission(HASH_ONE, 105, true),
+    ];
+    let tip_changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 7_000)),
+        pool_tip(HASH_ONE, 105, at(base, 16_000)),
+    ];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: vec![
+            bump(5, Some(4), at(base, 7_500)),
+            bump(6, Some(5), at(base, 16_500)),
+        ],
+    };
+    let notify = |session: usize, tip: &str, millis: u64| client::NotifySighting {
+        session,
+        frontend: 0,
+        job_id: format!("job-{session}-{millis}"),
+        tip: tip.to_owned(),
+        clean_jobs: true,
+        at: at(base, millis),
+    };
+    let notifies = vec![
+        notify(2, HASH_ZERO, 9_000),
+        notify(3, HASH_ZERO, 9_400),
+        notify(2, HASH_ONE, 18_000),
+    ];
+    let frontends = vec![health(0)];
+    let session_frontend = vec![0usize, 0, 0, 0];
+    let gaps = vec![9.0];
+    let offsets = vec![5.0, 14.0];
+    let committed = std::collections::BTreeSet::new();
+    cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 2,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &notifies,
+        tips: &[],
+        node_submissions: &node_submissions,
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &[],
+        committed: &committed,
+        aborted: None,
+    })
+}
+
+/// #447's dense runs answered 16,461-21,504 `stale-job` and 1,512-2,997
+/// `unknown-job` per phase, all `stale job`, and the section attributed none
+/// of them: it keyed on two messages the server no longer sends. A landing
+/// owns the stale-job and unknown-job rejections inside its span, and one
+/// outside every span stays unattributed (#480).
+#[test]
+fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattributed() {
+    let document = current_vocabulary_document(Vec::new());
+    assert_eq!(document["landings"], json!(2));
+
+    let attribution = &document["rejection_attribution"];
+    assert_eq!(attribution["rebuild_pending_rejections_in_phase"], json!(6));
+    assert_eq!(
+        attribution["attributed"],
+        json!(5),
+        "four in span 0, one in span 1"
+    );
+    assert_eq!(
+        attribution["unattributed"],
+        json!(1),
+        "the stale-job before the first landing is counted, and owned by none"
+    );
+    assert_eq!(
+        attribution["by_class"],
+        json!({"tip_pending": 0, "payout_pending": 0, "stale_job": 5, "unknown_job": 1})
+    );
+    assert_eq!(attribution["unrecognised_in_phase"], json!(0));
+    assert_eq!(
+        attribution["not_owned_in_phase"],
+        json!({"backend-rpc-unavailable": 1, "ledger-confirmation-failed": 1, "stale-job": 1}),
+        "backend refusals and the fee-floor stale-job are tallied, not owned"
+    );
+    assert!(attribution["counted_classes"]
+        .as_str()
+        .expect("the section says what counts")
+        .contains("unknown-job with `stale job`"));
+
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["stale_job_window"]["count"], json!(3));
+    assert_eq!(
+        first["stale_job_window"]["first_millis_after_landing"],
+        json!(200.0)
+    );
+    assert_eq!(first["stale_job_window"]["duration_millis"], json!(2_800.0));
+    assert_eq!(first["unknown_job_window"]["count"], json!(1));
+    assert_eq!(first["tip_pending_window"]["count"], json!(0));
+    assert_eq!(
+        first["combined_rebuild_pending_window"]["count"],
+        json!(4),
+        "the landing's cost is every rejection it owns in its span"
+    );
+    assert_eq!(
+        first["combined_rebuild_pending_window"]["duration_millis"],
+        json!(2_800.0)
+    );
+    assert_eq!(
+        first["not_owned_rejections_in_span"],
+        json!({"backend-rpc-unavailable": 1, "ledger-confirmation-failed": 1, "stale-job": 1})
+    );
+    assert_eq!(first["unrecognised_rejections_in_span"], json!(0));
+    assert_eq!(first["lost_valid_shares"], json!(4));
+    assert_eq!(
+        first["rejected_before_new_revision_work"],
+        json!(3),
+        "7.2, 7.6 and 8.0 s precede the first clean_jobs job at 9.0 s; 10.0 s does not"
+    );
+    assert_eq!(
+        first["acceptance_to_new_revision_work_millis"]["max"],
+        json!(2_400.0),
+        "from the acceptance at 7.0 s to the later session's job at 9.4 s"
+    );
+    assert_eq!(
+        first["time_to_new_revision_work_millis"]["max"],
+        json!(1_900.0),
+        "the bump-anchored figure is unchanged"
+    );
+    let second = &document["landing_records"][1]["frontends"][0];
+    assert_eq!(second["combined_rebuild_pending_window"]["count"], json!(1));
+    assert_eq!(second["rejected_before_new_revision_work"], json!(1));
+
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], json!(6));
+    assert_eq!(lost["shares_recognised"], json!(6));
+    assert_eq!(lost["shares_attributed"], json!(5));
+    assert_eq!(lost["shares_unattributed"], json!(1));
+    assert_eq!(lost["shares_unavailable_reason"], Value::Null);
+
+    // Landings occurred and every rejection was recognised, so the budget
+    // is measured: the #447 runs' 0.0 is gone.
+    let budget = &document["proposed_budget_for_issue_291"];
+    assert_eq!(budget["window_p99_millis"], json!(2_800.0));
+    assert_eq!(budget["window_p99_unavailable_reason"], Value::Null);
+    assert_eq!(budget["recommended_soak_budget_millis"], json!(2_800.0));
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99"],
+        json!(4.0)
+    );
+    let edge = &budget["same_edge_as_issue_458"];
+    assert_eq!(
+        edge["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        json!(3.0)
+    );
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_400.0)
+    );
+    let overall = &document["summaries"]["overall"];
+    assert_eq!(
+        overall["stale_job_rejections_per_landing"]["max"],
+        json!(3.0)
+    );
+    assert_eq!(
+        overall["unknown_job_rejections_per_landing"]["max"],
+        json!(1.0)
+    );
+    assert_eq!(overall["unattributable_landing_frontend_tables"], json!(0));
+    assert_eq!(
+        overall["acceptance_to_new_revision_work_max_millis"]["unit"],
+        json!("milliseconds")
+    );
+}
+
+/// A message the harness does not know may or may not be the landing's, so
+/// the landing's cost is unknown: null with a reason, never the recognised
+/// subset passed off as the whole and never 0.0 (#480, EP-OBSERVABILITY).
+#[test]
+fn an_unrecognised_message_in_a_span_makes_the_landings_cost_null_with_a_reason() {
+    let document = current_vocabulary_document(vec![(
+        0xf,
+        2,
+        8_500,
+        rejected(21, "stale-job", "some wording this harness has never seen"),
+    )]);
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["unrecognised_rejections_in_span"], json!(1));
+    assert_eq!(
+        first["unrecognised_sample"][0]["message"],
+        json!("some wording this harness has never seen")
+    );
+    let combined = &first["combined_rebuild_pending_window"];
+    assert_eq!(combined["count"], Value::Null, "unknown, not 4 and not 0");
+    assert_eq!(combined["duration_millis"], Value::Null);
+    assert_eq!(combined["owned_count_lower_bound"], json!(4));
+    assert!(combined["unavailable_reason"]
+        .as_str()
+        .expect("a null carries its reason")
+        .contains("does not recognise"));
+    assert_eq!(first["lost_valid_shares"], Value::Null);
+    assert!(first["lost_valid_shares_unavailable_reason"].is_string());
+    assert_eq!(first["rejected_before_new_revision_work"], Value::Null);
+    assert!(
+        first["rejected_before_new_revision_work_unavailable_reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("does not recognise")
+    );
+    // The per-message windows are still exact counts of their message.
+    assert_eq!(first["stale_job_window"]["count"], json!(3));
+    // The other landing's span held nothing unrecognised and keeps its cost.
+    assert_eq!(
+        document["landing_records"][1]["frontends"][0]["combined_rebuild_pending_window"]["count"],
+        json!(1)
+    );
+
+    let attribution = &document["rejection_attribution"];
+    assert_eq!(attribution["unrecognised_in_phase"], json!(1));
+    assert_eq!(attribution["unrecognised_in_spans"], json!(1));
+    assert_eq!(
+        attribution["rebuild_pending_rejections_in_phase"],
+        json!(6),
+        "an unrecognised rejection is never counted as owned"
+    );
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], Value::Null);
+    assert_eq!(lost["shares_recognised"], json!(6));
+    assert!(lost["shares_unavailable_reason"].is_string());
+
+    let overall = &document["summaries"]["overall"];
+    assert_eq!(overall["unattributable_landing_frontend_tables"], json!(1));
+    assert_eq!(
+        overall["combined_rebuild_pending_rejections_per_landing"]["samples"],
+        json!(1),
+        "the unattributable table is left out, not entered as a partial count"
+    );
+
+    let budget = &document["proposed_budget_for_issue_291"];
+    for (value, reason) in [
+        ("window_p99_millis", "window_p99_unavailable_reason"),
+        (
+            "rejections_per_landing_per_frontend_p99",
+            "rejections_per_landing_per_frontend_p99_unavailable_reason",
+        ),
+    ] {
+        assert_eq!(budget[value], Value::Null, "{value}");
+        assert!(
+            budget[reason]
+                .as_str()
+                .expect("a null carries its reason")
+                .contains("does not recognise"),
+            "{reason}"
+        );
+    }
+    assert_eq!(budget["recommended_soak_budget_millis"], Value::Null);
+    assert_eq!(
+        budget["same_edge_as_issue_458"]
+            ["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        Value::Null
     );
 }
 

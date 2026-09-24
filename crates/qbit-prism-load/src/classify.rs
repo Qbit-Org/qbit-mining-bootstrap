@@ -137,6 +137,78 @@ pub fn is_rebuild_pending(rejection: &Rejection) -> bool {
             || rejection.message == NEW_TIP_WORK_PENDING)
 }
 
+/// The one message the current server attaches to a `stale-job` or
+/// `unknown-job` refusal of retired work: `Coordinator::stale_job` in
+/// `coordinator/miner_submit.rs` (a stale parent or a superseded payout
+/// revision, whose internal cause goes only to
+/// `qbit_prism_stale_job_rejections_total{cause}`), the lease checks there and
+/// in `coordinator/tip_observation.rs`, and the job lookup and resume expiry in
+/// `stratum.rs` (`unknown-job` for a job ID the session no longer holds).
+pub const STALE_JOB: &str = "stale job";
+/// The `stale-job` refusal for a job whose CTV fee fell below the relay floor
+/// (`coordinator/miner_submit.rs`). A fee change, not a landing, retired it.
+pub const FEE_BELOW_RELAY_FLOOR: &str = "job CTV fee is below the current relay floor";
+
+/// What a rejection is to the dense-cadence landing whose span it falls in
+/// (Qbit-Org/qbit-mining-bootstrap#480).
+///
+/// A landing owns the refusals of work it retired: a share proven on a job
+/// whose parent or payout revision the landing replaced. The wire says so by
+/// `reason_id` together with a message the harness knows, so a message it
+/// does not know is [`LandingCost::Unrecognised`], never silently owned or
+/// silently dropped (EP-OBSERVABILITY).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LandingCost {
+    /// `stale-job` with `new tip work is pending` (older producers).
+    TipPending,
+    /// `stale-job` with `new payout work is pending` (older producers).
+    PayoutPending,
+    /// `stale-job` with `stale job`: the current server's answer for a share
+    /// on a retired parent or payout revision.
+    StaleJob,
+    /// `unknown-job` with `stale job`: the job ID had already left the
+    /// session's job list, which the rebuild's `clean_jobs` notify retires.
+    UnknownJob,
+    /// Recognised, and not the landing's: a backend refusal
+    /// (`backend-rpc-unavailable`, `ledger-confirmation-failed`,
+    /// `ledger-outcome-unknown`, `internal-error`), a fee-floor `stale-job`,
+    /// `pool-closed`, or a harness-bug class. Reported beside the landing's
+    /// cost, never inside it.
+    NotOwned,
+    /// A `stale-job` or `unknown-job` message the harness does not know, or a
+    /// reason the classifier does not know: whether the landing owns it is
+    /// unknown.
+    Unrecognised,
+}
+
+impl LandingCost {
+    /// True when the landing whose span holds the rejection owns it.
+    pub fn owned(self) -> bool {
+        matches!(
+            self,
+            Self::TipPending | Self::PayoutPending | Self::StaleJob | Self::UnknownJob
+        )
+    }
+}
+
+/// Classify a rejection for dense-cadence attribution.
+pub fn landing_cost(rejection: &Rejection) -> LandingCost {
+    match (rejection.reason_id.as_deref(), rejection.message.as_str()) {
+        (Some("stale-job"), NEW_TIP_WORK_PENDING) => LandingCost::TipPending,
+        (Some("stale-job"), NEW_PAYOUT_WORK_PENDING) => LandingCost::PayoutPending,
+        (Some("stale-job"), STALE_JOB) => LandingCost::StaleJob,
+        (Some("stale-job"), FEE_BELOW_RELAY_FLOOR) => LandingCost::NotOwned,
+        (Some("unknown-job"), STALE_JOB) => LandingCost::UnknownJob,
+        (Some("stale-job" | "unknown-job"), _) => LandingCost::Unrecognised,
+        _ => match classify(rejection) {
+            RejectionClass::Unknown => LandingCost::Unrecognised,
+            RejectionClass::Expected | RejectionClass::HarnessBug | RejectionClass::Backend => {
+                LandingCost::NotOwned
+            }
+        },
+    }
+}
+
 /// A frontend log line that says this window size cannot be served.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockedLog {
