@@ -163,7 +163,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
             .await?;
     assert_eq!(
         versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     );
     let cycled: bool = sqlx::query_scalar(
         "SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass",

@@ -981,6 +981,12 @@ async fn audit(state: &ApiState, path: &str, q: &Query) -> ApiResult<Value> {
                 sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
                     .fetch_one(&state.pool)
                     .await?;
+            // #478: debt from divergent landings is exact accounting, so the
+            // report's mismatch count never shows it; this line does.
+            value["payout_divergence"] =
+                sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
+                    .fetch_one(&state.pool)
+                    .await?;
             value["ledger_backend"] = json!("postgres-native");
             return Ok(value);
         }

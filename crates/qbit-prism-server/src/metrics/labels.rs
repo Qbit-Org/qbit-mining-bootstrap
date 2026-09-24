@@ -115,6 +115,12 @@ labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",
     ParentGrace => "parent_grace", PayoutRevision => "payout_revision"
 });
+// #478: what the offer did with a pending block on the current tip whose
+// payout revision was superseded.
+labels!(CaptureDecision {
+    Offered => "offered", AbandonedCeiling => "abandoned_ceiling",
+    AbandonedDisabled => "abandoned_disabled"
+});
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.

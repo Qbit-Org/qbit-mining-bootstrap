@@ -4,8 +4,8 @@ use crate::{
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
         BlockObservation, Candidate, CandidateClaim, CandidateCtv, CandidateState, ClaimParts,
-        HeartbeatHealth, Ledger, OfferOutcome, RecoveryClaim, SignerKeys, Snapshot, Window,
-        WindowError, WindowRef, ORPHANED_STATE,
+        HeartbeatHealth, Ledger, OfferOutcome, OfferReservation, RecoveryClaim, SignerKeys,
+        Snapshot, Window, WindowError, WindowRef, ORPHANED_STATE,
     },
     metrics::{RefreshAcquisition, RefreshTrigger},
     rpc::Rpc,
@@ -2056,7 +2056,27 @@ impl Coordinator {
             if active {
                 return self.adopt_active_candidate(claim, lease, &tip).await;
             }
-            if revision != candidate.payout_revision || tip != parent {
+            // #478 block capture: a superseded payout revision on the
+            // still-current tip is not abandoned here. The block is a valid
+            // proof on this parent; only the pool's payout snapshot moved. The
+            // reservation below holds it to the overpay ceiling, and the
+            // post-offer landing lands it as-issued at the observed revision,
+            // carrying any payout divergence as debt (`land_offered`,
+            // `ledger/blocks.rs`). A genuine parent change abandons, and so
+            // does a superseded revision when capture is off.
+            if tip != parent {
+                self.ledger
+                    .finish_candidate_at_revision(claim, false, Some("parent superseded"), revision)
+                    .await?;
+                return Ok(());
+            }
+            if self.config.capture_overpay_ceiling_bps == 0 && revision != candidate.payout_revision
+            {
+                self.ledger
+                    .record_capture_disabled(candidate, revision)
+                    .await?;
+                self.metrics
+                    .record_capture_decision(crate::metrics::CaptureDecision::AbandonedDisabled);
                 self.ledger
                     .finish_candidate_at_revision(
                         claim,
@@ -2077,7 +2097,65 @@ impl Coordinator {
         unix_ms_now().context("the first-offer boundary needs the wall clock")?;
         // The durable reservation: once it commits, no claim on any
         // frontend, this one included after a crash, offers the block again.
-        self.ledger.reserve_offer(claim).await?;
+        // A block whose payout revision was superseded is held to the
+        // overpay ceiling in the same transaction (#478). An unknown bound
+        // is an error like any other here: nothing is reserved, nothing is
+        // abandoned, and the claim is retried.
+        match self
+            .ledger
+            .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
+            .await?
+        {
+            OfferReservation::Reserved { bound: None } => {}
+            OfferReservation::Reserved { bound: Some(bound) } => {
+                self.metrics
+                    .record_capture_decision(crate::metrics::CaptureDecision::Offered);
+                tracing::info!(
+                    block = %candidate.block_hash,
+                    candidate_revision = candidate.payout_revision,
+                    observed_revision = bound.observed_revision,
+                    overpay_bound_sats = %bound.bound_sats,
+                    overpay_ceiling_sats = %bound.ceiling_sats,
+                    "offering a block whose payout revision was superseded: its overpay bound is within the ceiling"
+                );
+            }
+            OfferReservation::Refused(bound) => {
+                let decision = if bound.ceiling_bps == 0 {
+                    crate::metrics::CaptureDecision::AbandonedDisabled
+                } else {
+                    crate::metrics::CaptureDecision::AbandonedCeiling
+                };
+                self.metrics.record_capture_decision(decision);
+                // Capture off keeps the pre-#478 reason; a ceiling refusal
+                // names its bound and ceiling.
+                let reason = if bound.ceiling_bps == 0 {
+                    "payout revision or parent superseded".to_owned()
+                } else {
+                    format!(
+                        "capture overpay bound {} sats exceeds the ceiling {} sats ({} bps of the coinbase value)",
+                        bound.bound_sats, bound.ceiling_sats, bound.ceiling_bps
+                    )
+                };
+                tracing::warn!(
+                    block = %candidate.block_hash,
+                    candidate_revision = candidate.payout_revision,
+                    observed_revision = bound.observed_revision,
+                    overpay_bound_sats = %bound.bound_sats,
+                    overpay_ceiling_sats = %bound.ceiling_sats,
+                    %reason,
+                    "abandoning a block whose payout revision was superseded"
+                );
+                self.ledger
+                    .finish_candidate_at_revision(
+                        claim,
+                        false,
+                        Some(&reason),
+                        bound.observed_revision,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
         #[cfg(test)]
         self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.

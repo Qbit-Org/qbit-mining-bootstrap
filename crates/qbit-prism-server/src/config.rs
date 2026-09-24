@@ -58,6 +58,17 @@ pub struct Config {
     /// either way, because the reorg reconciler credits a reactivated block
     /// from its landed audit. 1 to 1000.
     pub candidate_orphan_confirmations: u64,
+    /// `PRISM_CAPTURE_OVERPAY_CEILING_BPS` (#478): the most a captured block
+    /// may overpay, in basis points of its own coinbase value. A pending block
+    /// on the current tip whose payout revision was superseded is offered only
+    /// when its positive as-issued float, the most debt its confirmation can
+    /// create in any order, is at most this share of its coinbase; above it
+    /// the block is abandoned, as every such block was before #478. `0` turns
+    /// capture off entirely (the pre-#478 behaviour): such a block is refused
+    /// at submit and abandoned at offer. Per frontend, not in the cluster
+    /// fingerprint: every frontend should run the same value. Default 100
+    /// (1%), 0 to 10000.
+    pub capture_overpay_ceiling_bps: u16,
     pub extranonce2_size: usize,
     pub coinbase_tag: String,
     pub manifest_seed: String,
@@ -490,6 +501,8 @@ impl Config {
         let block_only_ack_timeout = share_commit_timeout.max(Duration::from_secs(60));
         let candidate_orphan_confirmations =
             bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
+        let capture_overpay_ceiling_bps =
+            bounded_usize("PRISM_CAPTURE_OVERPAY_CEILING_BPS", 100, 0, 10_000)? as u16;
         Ok(Self {
             database_url,
             instance_id,
@@ -516,6 +529,7 @@ impl Config {
             share_commit_grace,
             block_only_ack_timeout,
             candidate_orphan_confirmations,
+            capture_overpay_ceiling_bps,
             extranonce2_size,
             coinbase_tag,
             manifest_seed,
@@ -615,6 +629,7 @@ mod tests {
             share_commit_grace: Duration::from_secs(5),
             block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: 6,
+            capture_overpay_ceiling_bps: 100,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),

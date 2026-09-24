@@ -828,8 +828,11 @@ current is refused (it is superseded work); an offered block lands as issued.
 Current balances still sum the active per-block `(gross − onchain)` deltas, so
 a block that lands after another block moved a miner's balance adds its own
 issued deltas, and a miner paid a carried balance on chain by both blocks
-carries the difference as visible debt; nothing is paid a third time and no
-commitment is rebuilt. `qbit_carry_forward_integrity_mismatches()` validates a
+carries the difference as visible debt. No commitment is rebuilt. Each block
+whose work predates a landing pays that landing's paydown again, so a carry can
+be paid a third time by a third such block; see
+[block capture and payout divergence](#block-capture-and-payout-divergence-478)
+for how every such landing is recorded and bounded. `qbit_carry_forward_integrity_mismatches()` validates a
 marked block against that manifest: the arithmetic of every manifest account,
 fee recipients included; each carry row field by field against the matching
 miner account; and the payout entries against every account. A marked block
@@ -842,6 +845,267 @@ its balances stop contributing; it can reactivate. Terminal reversal preserves
 audit history and marks payout/carry rows reversed. A mature disconnect sets a
 shared fatal state and stops ordinary accounting until investigated. Other
 instances must not continue with a different interpretation of that event.
+
+## Block capture and payout divergence (#478)
+
+Every own block that lands bumps the payout revision twice on the same tip:
+once when a frontend observes the block as the new tip, and once when the
+block's landing is confirmed and its payout changes the canonical balances.
+Work issued between the two carries the earlier revision. Before #478 a block
+found on such work was refused `stale-job` at submit and a pending one was
+abandoned at offer, so a valid block on the active tip was dropped with its
+whole coinbase.
+
+A block-bearing proof on the active tip is now captured whatever its payout
+revision. Its share is deferred: it is credited only if the block confirms,
+never against the current revision. Plain shares on superseded work are still
+refused. Work a Stratum session retired at a same-parent payout replacement
+is kept for a block only: it holds no username reservation, it gets no stale
+grace, parent grace or deferred share, and it is dropped once its parent is
+no longer the tip. A block found on it is captured, and its share is refused
+`stale-job`.
+
+### The overpay a captured block can cause
+
+A captured block's coinbase pays the prior balances its work was issued with.
+If a landing has paid those balances down by the time the captured block's
+rows start to count, the miner is paid twice against one balance. The additive
+balance carries the difference as debt. The ledger stays exact: on-chain
+amounts equal the coinbases, and `qbit_carry_forward_integrity_report()` shows
+no mismatch or drift, because a marked as-issued landing is validated against
+its own manifest.
+
+Debt is realized when a landed block's rows start to count, at its
+confirmation. Per account `m`, it is the increase in `max(0, −balance(m))` at
+that moment.
+
+The payout policy never pays an account more than its candidate balance. So a
+block's on-chain amount minus its gross is at most `max(0, issued(m))`, and
+the debt the block creates for `m` is at most `max(0, issued(m))`. This holds
+whatever confirms before or after it. Summed over accounts, a block's realized
+debt is at most `F`, the positive as-issued float: the sum of
+`max(0, issued(m))` over the accounts of its own as-issued balances. A bound
+computed from the balances at the offer is not enough. A later block that is
+current at its own offer can confirm first and pay the same carry out, which
+leaves the captured block to realize its whole float.
+
+The offer reservation first reads the payout revision `FOR SHARE`. Every
+revision bump updates that row, so no bump commits between that read and the
+reservation's commit: a block whose revision is still current there is
+reserved current. For a block whose revision was already superseded, the
+reservation reads the block's own immutable as-issued snapshot and computes
+`F`. It then records the decision and reserves the block, or refuses it, in
+one transaction.
+
+- **Within the ceiling.** If `F` is at most
+  `PRISM_CAPTURE_OVERPAY_CEILING_BPS` of the block's coinbase value (default
+  100 bps, 1%), the block is reserved for its one offer.
+- **Over the ceiling.** The block is abandoned without being offered. The
+  bound and the ceiling go in `last_error`, a WARN log is written, and
+  `qbit_prism_capture_offer_decisions_total{decision="abandoned_ceiling"}`
+  counts it. Its miner is answered `stale-job`, counted under
+  `payout_revision`, as base answered such a proof at submit. Whenever the
+  pool's positive carry float exceeds the ceiling, captures are refused. The
+  pool then loses those blocks exactly as it did before #478.
+- **Unknown.** If the bound cannot be computed, for example because of a
+  database error or a missing as-issued snapshot, nothing is reserved and
+  nothing is abandoned. The offer fails and is retried like any other offer
+  failure.
+- **Off.** `PRISM_CAPTURE_OVERPAY_CEILING_BPS=0` is the pre-#478 behaviour:
+  - Such a proof is refused `stale-job` at submit.
+  - A pending block whose revision moved is abandoned at offer with
+    `payout revision or parent superseded`.
+  - The abandonment is recorded as decision `disabled`, with no bound
+    computed, and counted as `abandoned_disabled`. This holds on the ordinary
+    pre-offer path and when a reservation races the bump.
+
+A captured block abandoned before its offer because its parent is no longer
+the tip (a lost race) is answered `stale-job` too, counted under
+`parent_grace`. An abandonment before the offer is the pool's own staleness
+decision on a block the ledger wrote correctly, so it never answers
+`ledger-confirmation-failed`. That answer feeds the share-append failure
+warning.
+
+The ceiling bounds, in every order of confirmations, each block whose payout
+revision was already superseded when its offer was reserved. It does not
+bound:
+
+- a block reserved current that lands divergent because an earlier landing
+  confirmed after its reservation, which is the pre-#478 double-payment
+  class;
+- a leased candidate (#350), which is reserved without the check, as base
+  offers it before any supersession check.
+
+Both are recorded at their confirmation, without an offer decision.
+
+### Every divergence is recorded
+
+Migration 020 adds `qbit_prism_payout_divergences`, with one row per block
+that either had an offer decision or diverged at its confirmation:
+
+- The offer decision: `offered`, `abandoned` by the ceiling, or `disabled`
+  because capture is off. The row also holds the observed revision, the bound
+  `F` (none for `disabled`) and the ceiling in sats.
+- The confirmation: the digest of the canonical balances the block's rows
+  met, `divergent_accounts`, `overpay_sats` (the debt this confirmation
+  created), `overpaid_debt_after_sats` and `pool_debt_after_sats`.
+  `divergent_accounts` counts every account whose balance moved between
+  issue and confirmation, whether it was overpaid or underpaid. The overpaid
+  ones are the rows in `qbit_prism_payout_divergence_accounts`.
+
+The confirmation is recorded in the transaction that makes the rows count:
+the settlement's confirmation or the chain reconciler's, in height order when
+several blocks confirm together. A re-confirmation after a reorg replaces
+these fields. `qbit_prism_payout_divergence_accounts` has one row per overpaid
+account, with its as-issued and current priors, gross, on-chain, overpay and
+resulting debt.
+
+For the blocks that count now, the recorded `overpay_sats` sum to the debt
+those confirmations created. The debt fields are read from the current
+balances. They equal that sum until an indebted miner's later gross repays
+part of it; after that they are lower.
+
+The integrity report served at `/audit/carry-forward-integrity`, and printed
+by `self-check`, carries a `payout_divergence` line from
+`qbit_prism_payout_divergence_report()`. The line never fails a check. It
+shows:
+
+- the confirmed divergent landings and their total overpay;
+- the offers abandoned by the ceiling;
+- the offers refused because capture is off;
+- the debtor count, the total debt and the largest debt, from the current
+  balances.
+
+The metrics:
+
+- `qbit_prism_capture_offer_decisions_total{decision}` counts the offer
+  decisions.
+- `qbit_prism_divergent_landings_total` and
+  `qbit_prism_divergent_landing_overpay_sats_total` count divergent
+  confirmations and their debt, on the frontend that committed them.
+- `qbit_prism_carry_forward_debt_sats` is read from the canonical balances
+  after every balance change and every full refresh a frontend commits.
+
+### Accepted cost and its bound
+
+A miner's debt is recovered only from that miner's later gross. A miner who
+stops mining keeps it, and it is typically the miner whose carry the earlier
+landing paid out. The remaining miners then bear it as claims the pool cannot
+fund from that miner. This is an accepted cost of capturing blocks that were
+previously dropped whole, within these bounds:
+
+- **Per captured block, in every order:** the debt it creates is at most its
+  positive as-issued float `F`. The offer holds `F` to the ceiling, so it is at
+  most 1% of the block's coinbase value by default. `F` is the positive carry
+  float of the pool when the block's work was issued. It grows with the
+  number of miners holding a balance below the payout floor (14,720 sats by
+  default): about 2.9·10⁷ sats at 2,000 such miners, against a 5·10⁷-sat
+  default ceiling. See [Sizing the ceiling](#sizing-the-ceiling).
+- **Per day, at the #224 cadence** (35 own blocks in a trailing hour, pairs
+  18 to 20 s apart; at most 840 own blocks a day): at most 840 times the
+  ceiling, 8.4 coinbase values at the default. That worst case needs every
+  own block to be a capture and each capture to pay its whole float out
+  again. A capture needs an own parent and a block found between that
+  parent's observation and the delivery of its post-landing work. That window
+  is `W`, about 1 s at the #275 bar. The realized figure is
+  `qbit_prism_divergent_landing_overpay_sats_total` and the report line.
+- **What it replaces:** each capture keeps a coinbase the pool previously lost
+  entirely. At the ceiling, a capture still keeps at least 99% of its value
+  for the pool.
+
+The same double payment also happens without capture, for a block offered
+before an earlier landing confirmed. Such a confirmation is recorded the same
+way, without an offer decision, and is not held to the ceiling.
+
+### Sizing the ceiling
+
+The default of 100 bps is a starting point, not a value known to fit a given
+pool. A capture is refused whenever its float `F` exceeds the ceiling, so a
+ceiling below the pool's positive carry float refuses every capture and the
+pool loses those blocks as it did before #478.
+
+- **Check it against the live float** before relying on capture, and again
+  as the miner count grows. The live float is the sum of the positive carry
+  balances: the sum of `balance_sats` over `/owed-balances`, or
+  `SELECT sum(owed_balance_sats) FROM qbit_current_owed_balances()`. Each
+  offer decision also records the `F` it was checked against, in
+  `qbit_prism_payout_divergences.overpay_bound_sats`, next to
+  `overpay_ceiling_sats`.
+- **Example.** Each miner below the payout floor carries under 14,720 sats.
+  At 2,000 such miners the float is at most about 2.9·10⁷ sats, inside the
+  5·10⁷-sat default (1% of a 5·10⁹-sat coinbase). At about 3,400 miners all
+  near the floor it can exceed the default on its own, and the default then
+  refuses every capture.
+- **Raise the ceiling if captures are abandoned by it.** Captures refused by
+  the ceiling show as
+  `qbit_prism_capture_offer_decisions_total{decision="abandoned_ceiling"}`,
+  as `offers_abandoned_by_ceiling` on the report's `payout_divergence` line,
+  and as a WARN log naming the bound and the ceiling. Raise
+  `PRISM_CAPTURE_OVERPAY_CEILING_BPS` above the recorded bounds, on every
+  frontend, and restart them all. The setting accepts up to 10000 (100%).
+  The per-capture and per-day bounds above scale with it.
+- `F` is conservative. A block superseded only by a balance-neutral bump,
+  such as a maturity or fatal-clear bump, can create no more debt than a
+  current block, but it is still held to `F`.
+
+### Known record limitations
+
+These affect the divergence records and counters only. The balances, the
+report's `debt_sats` and the `qbit_prism_carry_forward_debt_sats` gauge are
+read from the canonical balances and stay exact.
+
+- **Reorg order.** The chain reconciler confirms and deactivates in one pass,
+  in height order. If one reconciliation confirms an own block below an own
+  block it deactivates, the lower block's confirmation is recorded against
+  balances that still count the higher block. Its `overpay_sats` can then be
+  too low (the deactivated block accrued to the account) or too high (it paid
+  the account down). This needs own blocks on both branches of a reorg.
+- **Observed revision.** For a superseded block, the offer reads the revision
+  and computes `F` in one transaction and records the decision in a second.
+  A bump between them leaves `offer_observed_payout_revision` one revision
+  behind the one current at the decision. `F` does not depend on it; the
+  column is the revision at which the supersession was observed.
+
+### Upgrade and operations notes
+
+- **Rolling upgrade.** A frontend without #478 abandons a claimed captured
+  block with `payout revision or parent superseded`, exactly as before, and
+  its deferred share stays uncredited. The miner, waiting on a new frontend,
+  is answered `stale-job`. A frontend without #478 that lands or confirms a
+  block writes the as-issued rows and the ALERT log line, but no
+  `qbit_prism_payout_divergences` row and no metrics. That includes a
+  captured block a new frontend reserved. The records and metrics are
+  complete only once every frontend runs this release. Until then the
+  report's `divergent_landings` and `overpay_sats` can undercount, while
+  `debt_sats`, read from the balances, stays exact. Capture is reliable only
+  once every frontend runs this release.
+- **The ceiling is per frontend.** `PRISM_CAPTURE_OVERPAY_CEILING_BPS` is read
+  by each frontend at startup and is not part of the cluster fingerprint.
+  Each offer is decided by the frontend that claimed it. Set the same value
+  for every frontend (the Compose file passes one value to all of them). To
+  change it, including to turn capture off with 0, restart every frontend.
+  Until the last one restarts, the others keep deciding with the old value.
+- **Fatal-state clear.** The clear bumps the revision without moving the tip,
+  so a pre-fatal pending block on a still-current tip is now offered after the
+  clear, within the ceiling, instead of being abandoned. The clear already
+  requires stopped frontends and a clean integrity report.
+- **Rejection causes.** A block-bearing proof from ordinary work on the
+  active tip is captured, not refused, so it no longer counts under
+  `stale_job_rejections_total{cause="payout_revision"}`. Answers still counted
+  there or under `parent_grace`:
+  - retired, block-only work: its plain shares, and the share of a block
+    captured from it, under `payout_revision`, or under `parent_grace` after a
+    tip change. Before #478 these were answered `unknown-job` with no cause
+    series.
+  - a capture abandoned before its offer: under `payout_revision` for a
+    ceiling refusal or capture off, under `parent_grace` for a lost race.
+- **Acknowledgement.** A block captured from ordinary work defers its share:
+  the miner is acknowledged when the block confirms and the share is
+  credited, within the block-only acknowledgement bound (60 s), as for every
+  block-only proof, and the session's next work waits for that answer. A
+  block found on block-only work is enqueued with no deferred share, and its
+  share is refused `stale-job` as soon as the enqueue settles, because nothing
+  will ever credit it.
 
 ## Audit storage and retention
 

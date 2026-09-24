@@ -13,6 +13,21 @@
       },
       "status": "Observed once per refresh that published rebuilt work, from the refresh's entry (after the poll or block-wait wake) to its publication, on the coordinator's monotonic clock. A refresh that reused the published work unchanged, or that failed, records nothing. `trigger` names what invalidated the published work, by the label's own precedence when several inputs changed on one poll: `initial` (nothing published yet), then `tip` (the template parent changed), `revision` (the payout revision changed), `balances` (the carry-forward balances changed), `reanchor` (the cached window aged past `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS`, or no cached window was held while work was published), `shares` (new shares with no cached bundle), `fee` (the relay fee floor changed) and `template` (any other template or publication change, including a cached window that no longer matches the published reference). The reuse test itself checks these inputs in a different order; the label is a classification of the same inputs, never a decision. `acquisition` says where the window came from: `delta` or `full` for a fresh ledger snapshot by that path, `cached` when the previous refresh's window was reused and only the body was rebuilt. Series appear on their first observation. Default buckets."
     },
+    "capture_offer_decisions_total": {
+      "labels": {
+        "decision": "CaptureDecision"
+      },
+      "status": "#478 block capture. `offered`: the block's positive as-issued float (the most debt its confirmation can create, in any order) was within `PRISM_CAPTURE_OVERPAY_CEILING_BPS` of the coinbase value, and the block was reserved for its one offer, decided in the reservation's transaction. `abandoned_ceiling`: the float exceeded the ceiling and the pending block was abandoned; the WARN log names the bound and the ceiling, and `qbit_prism_payout_divergences` keeps both. `abandoned_disabled`: the ceiling is 0, so the block was abandoned as before #478 (recorded as decision `disabled`). The miner of an abandoned capture is answered `stale-job`, never `ledger-confirmation-failed`. A bound that cannot be computed abandons nothing: the offer fails and is retried. Process-local; every series starts at zero. No firing rule."
+    },
+    "divergent_landings_total": {
+      "status": "Counted at the confirmation, when a landed block's rows start to count: it is divergent when those rows meet canonical balances other than the as-issued ones its coinbase commits to (#478 captures, and the pre-existing case of a block whose work predates an earlier confirmation). Each is recorded in `qbit_prism_payout_divergences`, in the confirming transaction, with its per-account overpay; a frontend without #478 records and counts nothing. Process-local; starts at zero. No firing rule."
+    },
+    "divergent_landing_overpay_sats_total": {
+      "status": "The sum over committed divergent confirmations of the carry-forward debt each created: per account, the increase in max(0, -balance) when the block's rows start to count. Unrecovered while the indebted miner earns no further gross; see the ledger operations guide for the accepted-cost bound. Process-local; starts at zero. No firing rule."
+    },
+    "carry_forward_debt_sats": {
+      "status": "Read from the canonical balances after every confirmation or deactivation this frontend commits and at every full refresh snapshot; zero when no account is negative. Process-local. No firing rule."
+    },
     "ctv_fanout_broadcaster_tip_refresh_yields_total": {
       "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]
     },
@@ -226,7 +241,7 @@
       "labels": {
         "cause": "StaleJobCause"
       },
-      "status": "Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id=\"stale-job\"}`. Stale-grace credit is not a rejection. Process-local; every series starts at zero."
+      "status": "Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id=\"stale-job\"}`. Stale-grace credit is not a rejection. Since #478 a block-bearing proof from ordinary work on the active tip is captured whatever its payout revision, so it is no longer counted under `payout_revision`. Still counted: block-only work a same-parent payout replacement retired (its plain shares, and the share of a block captured from it) under `payout_revision`, or `parent_grace` after a tip change; and a capture abandoned before its offer, under `payout_revision` for a ceiling refusal or capture off and `parent_grace` for a lost race. Process-local; every series starts at zero."
     },
     "accepted_block_to_revision_work_seconds": {
       "labels": {

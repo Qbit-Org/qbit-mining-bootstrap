@@ -1,6 +1,6 @@
 use qbit_pool_builder::{build_manifest, CoinbaseBuildRequest, WeightedEntitlement};
 use qbit_prism_server::{
-    codec::{Job, Submission},
+    codec::{Job, JobKind, Submission},
     stratum::*,
 };
 use serde_json::{json, Value};
@@ -34,6 +34,8 @@ struct Backend {
     shares: Mutex<HashSet<String>>,
     credited_workers: Mutex<Vec<String>>,
     grace: Mutex<Vec<bool>>,
+    /// The kind of every job that reached `submit`, in order (#478).
+    kinds: Mutex<Vec<JobKind>>,
     stored: Mutex<HashMap<String, StoredMockJob>>,
     hints: MockDifficulties,
     ready: AtomicBool,
@@ -189,6 +191,7 @@ impl MiningBackend for Backend {
         if let Some(gate) = gate {
             gate.wait().await;
         }
+        self.kinds.lock().unwrap().push(job.wire.kind);
         if let Some(error) = self.submit_error.lock().unwrap().take() {
             return Err(error);
         }
@@ -822,7 +825,7 @@ async fn negotiation_reauthorization_retains_original_job_worker_and_grace_expir
 }
 
 #[tokio::test]
-async fn same_parent_payout_replacement_clears_retained_work_but_equivalent_updates_do_not() {
+async fn same_parent_payout_replacement_retains_the_superseded_job_for_block_submission() {
     let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
     let mut client = Client::connect(address).await;
     client.login("miner.payout").await;
@@ -836,13 +839,58 @@ async fn same_parent_payout_replacement_clears_retained_work_but_equivalent_upda
     client.next_job().await;
     assert_eq!(client.notify["params"][1], parent);
     assert_eq!(client.notify["params"][8], true);
+    // #478 block capture: the superseded same-parent job is RETAINED, so a
+    // solved submit on it reaches the backend instead of being refused
+    // unknown-job, and it reaches it as BLOCK-ONLY work. This in-memory backend
+    // does not model `submit_share`, which refuses block-only work every credit
+    // path and captures only its block; that is pinned by the coordinator suite
+    // and tests/b478_stale_revision_block.rs. Here the point is that the
+    // stratum layer keeps the job reachable and marks what it may earn.
     client.send(old).await;
-    assert_eq!(client.response(10).await["error"][0], 21);
-    assert!(backend.shares.lock().unwrap().is_empty());
-    client
-        .send(client.solved_submit(11, "miner.payout", 0))
-        .await;
+    assert_eq!(client.response(10).await["result"], true);
+    assert_eq!(
+        backend.kinds.lock().unwrap().as_slice(),
+        [JobKind::BlockOnly]
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #478 (general review B1): block-only work never earns stale grace after a
+// flip. Once its parent is not the tip it cannot be captured either, so the
+// graveyard drops it and the answer is base's `unknown-job`. Work issued at the
+// latest revision on the same prior parent keeps its grace credit (control).
+#[tokio::test]
+async fn superseded_same_parent_work_is_dropped_not_grace_credited_after_a_flip() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.grace").await;
+    let superseded = client.solved_submit(10, "miner.grace", 0);
+    let parent = client.notify["params"][1].clone();
+    backend.payout_revision.store(1, Ordering::Relaxed);
+    refresh.send(1).unwrap();
+    client.next_job().await;
+    assert_eq!(
+        client.notify["params"][1], parent,
+        "same-parent payout replacement"
+    );
+    let latest = client.solved_submit(11, "miner.grace", 50_000);
+    backend.generation.store(1, Ordering::SeqCst);
+    refresh.send(2).unwrap();
+    client.next_job().await;
+    assert_ne!(client.notify["params"][1], parent, "the parent flipped");
+    client.send(superseded).await;
+    let dropped = client.response(10).await;
+    assert_eq!(dropped["error"][0], 21, "{dropped}");
+    assert_eq!(dropped["error"][2]["reason_id"], "unknown-job", "{dropped}");
+    client.send(latest).await;
     assert_eq!(client.response(11).await["result"], true);
+    assert_eq!(backend.grace.lock().unwrap().as_slice(), [true]);
+    assert_eq!(backend.kinds.lock().unwrap().as_slice(), [JobKind::Credit]);
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.grace"]
+    );
     shutdown.send(true).unwrap();
     task.await.unwrap();
 }
@@ -1101,9 +1149,17 @@ async fn reauthorization_disconnect_reclaims_current_and_retained_username_capac
     task.await.unwrap();
 }
 
+// #478 (coordinator decision): a same-parent payout REPLACEMENT still reclaims
+// the username reservation immediately. Option B keeps the superseded jobs as
+// BLOCK-ONLY work: their reservation is released at the replacement, exactly as
+// discarding them did before, so capacity is reclaimed at once. Block-only
+// same-tip work is capped at N per session, counting the graveyard's evicted
+// work too. With N = 1 the replacement supersedes two A-era jobs (the evicted
+// A job and the live B job), so the older one, A's, is dropped: `unknown-job`.
+// With N = 64 both stay reachable for a solved submit, as block-only work.
 #[tokio::test]
 async fn retained_username_capacity_reclaims_evicted_and_replaced_jobs() {
-    for max_jobs in [1, 64] {
+    for (max_jobs, old_job_kept) in [(1, false), (64, true)] {
         let (address, backend, refresh, shutdown, task) = start(StratumConfig {
             max_connections_per_username: 1,
             max_jobs_per_connection: max_jobs,
@@ -1127,9 +1183,25 @@ async fn retained_username_capacity_reclaims_evicted_and_replaced_jobs() {
         first.next_job().await;
         assert_eq!(first.notify["params"][8], true);
         authorize_eventually(&mut second, "miner.A").await;
+        // The superseded job's reservation is released (capacity reclaimed
+        // above). Within the block-only cap the job is kept: a solved submit
+        // on it reaches the backend as block-only work.
         first.send(old_submit).await;
-        assert_eq!(first.response(10).await["error"][0], 21);
-        assert!(backend.credited_workers.lock().unwrap().is_empty());
+        let answer = first.response(10).await;
+        if old_job_kept {
+            assert_eq!(answer["result"], true, "N={max_jobs}: {answer}");
+            assert_eq!(
+                backend.kinds.lock().unwrap().as_slice(),
+                [JobKind::BlockOnly]
+            );
+        } else {
+            assert_eq!(answer["error"][0], 21, "N={max_jobs}: {answer}");
+            assert_eq!(
+                answer["error"][2]["reason_id"], "unknown-job",
+                "N={max_jobs}"
+            );
+            assert!(backend.kinds.lock().unwrap().is_empty());
+        }
         shutdown.send(true).unwrap();
         task.await.unwrap();
     }

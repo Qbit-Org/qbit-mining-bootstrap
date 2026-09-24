@@ -40,7 +40,10 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    async fn open(raw: &str) -> Result<Self> {
+    async fn open(
+        raw: &str,
+        tune: &dyn Fn(&mut qbit_prism_server::config::Config),
+    ) -> Result<Self> {
         let admin = PgPool::connect(raw).await?;
         let settings = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes, current_setting('synchronous_commit') AS synchronous_commit")
             .fetch_one(&admin).await?;
@@ -74,13 +77,10 @@ impl Fixture {
             let database_url = proxy.rewrite_url(url.as_str())?;
             let node = fake_qbitd::FakeNode::open().await?;
             for instance in ["runtime-a", "runtime-b"] {
-                frontends.push(
-                    Coordinator::new(
-                        fake_qbitd::coordinator_config(database_url.clone(), &node, instance)?,
-                        Arc::new(Metrics::default()),
-                    )
-                    .await?,
-                );
+                let mut config =
+                    fake_qbitd::coordinator_config(database_url.clone(), &node, instance)?;
+                tune(&mut config);
+                frontends.push(Coordinator::new(config, Arc::new(Metrics::default())).await?);
             }
             // Row triggers count committed row writes, including rewrites of
             // unchanged payloads. The proxy separately observes unknown commits.
@@ -303,11 +303,20 @@ pub async fn run(
     site: gate::Site,
     body: impl for<'a> FnOnce(&'a Fixture) -> LocalBoxFuture<'a, Result<()>>,
 ) -> Result<()> {
+    run_tuned(site, |_| {}, body).await
+}
+
+/// [`run`] with both frontends' configuration adjusted before they start.
+pub async fn run_tuned(
+    site: gate::Site,
+    tune: impl Fn(&mut qbit_prism_server::config::Config),
+    body: impl for<'a> FnOnce(&'a Fixture) -> LocalBoxFuture<'a, Result<()>>,
+) -> Result<()> {
     let _serial = SERIAL.lock().await;
     let Some(raw) = gate::database_url(site)? else {
         return Ok(());
     };
-    let fixture = Fixture::open(&raw).await?;
+    let fixture = Fixture::open(&raw, &tune).await?;
     let result = timeout(Duration::from_secs(45), body(&fixture))
         .await
         .context("runtime test exceeded 45 seconds")

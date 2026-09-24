@@ -836,6 +836,10 @@ impl Ledger {
         let rows = prior_balance_rows(&mut tx).await?;
         #[cfg(test)]
         let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
+        // #478: every account's debt, summed on the decoding thread, for the
+        // carry-forward debt gauge.
+        let debt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let debt_sum = debt.clone();
         let prior_balances = completion
             .own(rows)
             .map_anyhow(move |rows| {
@@ -843,10 +847,23 @@ impl Ledger {
                 if let Some(hook) = decode_hook {
                     hook("balances");
                 }
-                decode_prior_balances(rows)
+                let balances = decode_prior_balances(rows)?;
+                let sum: i128 = balances
+                    .iter()
+                    .map(|balance| (-balance.balance_sats).max(0))
+                    .sum();
+                debt_sum.store(
+                    u64::try_from(sum).unwrap_or(u64::MAX - 1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(balances)
             })
             .await?;
         tx.commit().await?;
+        let debt = debt.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.as_deref().filter(|_| debt != u64::MAX) {
+            metrics.record_carry_forward_debt(debt);
+        }
         // Ledger rows are immutable and later commits receive a timestamp
         // strictly greater than this anchor. Release the ordering barrier
         // before scanning a potentially large payout window.

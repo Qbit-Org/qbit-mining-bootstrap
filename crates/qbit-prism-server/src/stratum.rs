@@ -1142,15 +1142,14 @@ async fn deliver_job<B: MiningBackend>(
     for prior in &mut session.jobs {
         prior.retired_at.get_or_insert(now);
     }
-    session.jobs.retain(|prior| {
-        // A same-parent payout replacement has no stale grace. Previous-parent
-        // jobs retain their separate, notification-anchored grace deadline.
-        prior.job.wire.previousblockhash != job.wire.previousblockhash
-            || prior.job.wire.payout_revision == job.wire.payout_revision
-    });
-    session.retained.replace_payout(&job.wire);
     // Publication may have advanced while persistence or notification waited.
     let retention_tip = backend.observed_tip_hint().await;
+    // #478 block capture: a same-parent payout replacement no longer discards
+    // the superseded jobs. They are retired to block-only work, so a block
+    // found on one can still be offered while its parent is the active tip;
+    // `submit_share` refuses block-only work every credit path. Previous-parent
+    // jobs keep their separate, notification-anchored grace deadline.
+    session.bury_superseded_same_parent(&job.wire, config, retention_tip.as_ref());
     session.make_job_room(config, retention_tip.as_ref());
     session.jobs.push_back(IssuedJob {
         job,

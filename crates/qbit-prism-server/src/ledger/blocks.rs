@@ -25,6 +25,10 @@ pub(super) struct ReconcileEffects {
     first_confirmations: std::collections::HashSet<String>,
     confirmed: std::collections::HashSet<String>,
     revision_bumps: i64,
+    /// #478: each confirmation's divergence, and every account's debt after
+    /// the balance changes, for metrics once the transaction commits.
+    divergences: Vec<super::divergence::LandingDivergence>,
+    debt: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -186,9 +190,19 @@ impl Ledger {
         // is reported, and the marker written below records the provenance
         // the integrity validator checks marked rows by.
         let prior = read_prior_balances(&mut tx).await?;
-        let current =
-            tokio::task::spawn_blocking(move || qbit_prism::prior_balances_digest(&prior)).await?;
-        if current != landing.prior_balances_digest {
+        // A projection of the debt this landing would create if its rows
+        // counted now, for the log line only (#478). The debt is realized,
+        // recorded and metered at the confirmation, when the rows count.
+        let accounts = parts.body.payout_policy_manifest.accounts.clone();
+        let (current, divergence) = tokio::task::spawn_blocking(move || {
+            (
+                qbit_prism::prior_balances_digest(&prior),
+                super::divergence::landing_divergence(&accounts, &prior),
+            )
+        })
+        .await?;
+        let divergent = current != landing.prior_balances_digest;
+        if divergent {
             ensure!(
                 state != CandidateState::Pending,
                 "candidate prior balances differ from current canonical balances"
@@ -198,7 +212,9 @@ impl Ledger {
                 state = state.as_str(),
                 as_issued_balances = %hex::encode(landing.prior_balances_digest),
                 current_balances = %hex::encode(current),
-                "ALERT: landing an as-issued audit whose prior balances differ from the current canonical balances; the block's issued accounts are recorded as evidence and the additive balances carry the difference"
+                divergent_accounts = divergence.divergent_accounts,
+                projected_overpay_sats = %divergence.overpay_sats,
+                "ALERT: landing an as-issued audit whose prior balances differ from the current canonical balances; the block's issued accounts are recorded as evidence, the additive balances carry the difference, and its confirmation records the debt it creates in qbit_prism_payout_divergences"
             );
         }
         // Solver attribution is recorded on the block row, once, here (#144).
@@ -280,6 +296,8 @@ impl Ledger {
         let state = require_claim(&mut tx, claim).await?;
         let mut first_confirmation = false;
         let mut committed_revision = expected_revision;
+        let mut divergence = None;
+        let mut debt = None;
         if submitted {
             first_confirmation = sqlx::query_scalar::<_, bool>(
                 "SELECT audit_publication_sequence IS NULL FROM qbit_pool_blocks WHERE block_hash=$1 FOR UPDATE",
@@ -288,6 +306,15 @@ impl Ledger {
             .fetch_optional(&mut *tx)
             .await?
             .unwrap_or(false);
+            // #478: the debt this block's rows create is realized here, when
+            // they start to count; record it against the balances they meet.
+            // Nothing is read for a block whose rows already count.
+            divergence = super::divergence::record_confirmation(
+                &mut tx,
+                &claim.candidate.block_hash,
+                Some(&claim.candidate),
+            )
+            .await?;
             let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
             let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND chain_state='confirmed')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(
@@ -299,6 +326,11 @@ impl Ledger {
             if changed > 0 {
                 bump_revision(&mut tx).await?;
                 committed_revision += 1;
+                // Every account's debt after this confirmation, from the
+                // balances the record read plus this block's own rows.
+                debt = divergence.as_ref().map(|divergence| {
+                    u64::try_from(divergence.pool_debt_after_sats).unwrap_or(u64::MAX)
+                });
             }
         } else {
             ensure!(
@@ -333,6 +365,7 @@ impl Ledger {
         if let Some(landing) = landing {
             landing.committed(first_confirmation, committed_revision);
         }
+        self.record_debt_metrics(divergence.iter(), debt);
         Ok((first_confirmation, committed_revision))
     }
 
@@ -489,6 +522,7 @@ impl Ledger {
                 .collect()
         });
         tx.commit().await?;
+        self.record_debt_metrics(effects.divergences.iter(), effects.debt);
         for (hash, observation) in landing {
             let first = effects.first_confirmations.contains(hash);
             // A fatal early return can commit a first confirmation before the
@@ -546,6 +580,13 @@ impl Ledger {
                 {
                     effects.first_confirmations.insert(hash.clone());
                 }
+                // #478: the rows count from here; record the debt they
+                // create against the balances they meet, in height order.
+                if let Some(divergence) =
+                    super::divergence::record_confirmation(tx, &hash, None).await?
+                {
+                    effects.divergences.push(divergence);
+                }
                 sqlx::query(
                     "UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1",
                 )
@@ -569,6 +610,7 @@ impl Ledger {
         if changed {
             bump_revision(tx).await?;
             effects.revision_bumps += 1;
+            effects.debt = Some(super::divergence::pool_debt(tx).await?);
         }
         let matured: i32 = sqlx::query_scalar("SELECT qbit_mark_mature_pool_payouts($1)")
             .bind(i64::try_from(tip_height)?)
