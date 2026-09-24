@@ -1,4 +1,5 @@
-//! Database-free unit coverage for the load harness.
+//! Database-free unit coverage for the load harness, and one gated start of
+//! the managed cluster against a real PostgreSQL 16.
 //!
 //! Every assertion here is checked against the production code it has to
 //! agree with: the server's `codec`, its `capacity` validator and the refusal
@@ -4760,6 +4761,208 @@ fn a_postgres_bin_directory_without_the_server_binaries_is_refused() -> Result<(
     );
     assert!(partial.contains("pg_ctl"), "{partial}");
     std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// A scratch directory under the temp dir, emptied first.
+fn scratch_dir(tag: &str) -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("prism-load-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// #485: `--min-mem-available-mib` reads `MemAvailable`, and when that could
+/// not be read -- on macOS, where there is no `/proc/meminfo` -- the floor
+/// check did nothing and the run went on unguarded. A floor the host cannot
+/// measure is refused at entry, naming the flag and the way to run without
+/// one; a floor of 0 asks for none and runs anywhere.
+#[test]
+fn a_memory_floor_the_host_cannot_measure_is_refused_at_entry() -> Result<()> {
+    let dir = scratch_dir("meminfo")?;
+
+    // The source: a missing file, and one without the line, both read as
+    // unknown, never as some amount of memory.
+    assert_eq!(measure::mem_available_kib_at(&dir.join("absent")), None);
+    let without = dir.join("without");
+    std::fs::write(&without, "MemTotal:       16318320 kB\nMemFree:  1 kB\n")?;
+    assert_eq!(measure::mem_available_kib_at(&without), None);
+    let with = dir.join("with");
+    std::fs::write(
+        &with,
+        "MemTotal:       16318320 kB\nMemAvailable:    9876543 kB\n",
+    )?;
+    assert_eq!(measure::mem_available_kib_at(&with), Some(9_876_543));
+
+    // The entry: the default floor with nothing to read is refused.
+    let unread = measure::mem_available_kib_at(&dir.join("absent"));
+    let refused = format!(
+        "{:#}",
+        measure::verify_memory_floor(4096, unread)
+            .expect_err("a floor that can never operate is refused")
+    );
+    assert!(
+        refused.contains("--min-mem-available-mib 4096"),
+        "{refused}"
+    );
+    assert!(refused.contains("cannot be enforced"), "{refused}");
+    assert!(refused.contains(measure::MEMINFO_PATH), "{refused}");
+    assert!(
+        refused.contains("--min-mem-available-mib 0"),
+        "the refusal names the way to run without a floor: {refused}"
+    );
+
+    // No floor asked for: nothing to enforce, accepted without a reading.
+    measure::verify_memory_floor(0, None)?;
+    // A floor with a reading, whatever it is, is the run's own business.
+    measure::verify_memory_floor(4096, Some(1))?;
+    measure::verify_memory_floor(4096, measure::mem_available_kib_at(&with))?;
+
+    // This host's own source is what `execute` hands the check.
+    if cfg!(target_os = "linux") {
+        assert!(
+            measure::mem_available_kib().is_some(),
+            "a Linux host reads MemAvailable from {}",
+            measure::MEMINFO_PATH
+        );
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: the managed cluster preloaded `pg_stat_statements` only when
+/// `pkglibdir` held `pg_stat_statements.so`; Homebrew's PostgreSQL ships
+/// `pg_stat_statements.dylib`, so on macOS the extension was never loaded
+/// and every lock-statement column read `n/a`.
+#[test]
+fn pg_stat_statements_is_found_as_a_shared_object_or_a_dylib() -> Result<()> {
+    use qbit_prism_load::cluster::pg_stat_statements_library;
+    let dir = scratch_dir("pkglibdir")?;
+    assert_eq!(pg_stat_statements_library(&dir), None, "an empty pkglibdir");
+
+    // A directory of that name is not the library.
+    std::fs::create_dir(dir.join("pg_stat_statements.so"))?;
+    assert_eq!(pg_stat_statements_library(&dir), None);
+    std::fs::remove_dir(dir.join("pg_stat_statements.so"))?;
+
+    // macOS, Homebrew.
+    std::fs::write(dir.join("pg_stat_statements.dylib"), b"")?;
+    assert_eq!(
+        pg_stat_statements_library(&dir),
+        Some(dir.join("pg_stat_statements.dylib"))
+    );
+    std::fs::remove_file(dir.join("pg_stat_statements.dylib"))?;
+
+    // Linux.
+    std::fs::write(dir.join("pg_stat_statements.so"), b"")?;
+    assert_eq!(
+        pg_stat_statements_library(&dir),
+        Some(dir.join("pg_stat_statements.so"))
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: under macOS's default `TMPDIR` the cluster root put PostgreSQL's
+/// socket at 107 bytes, over the 103 it accepts, and the harness exited with
+/// `pg_ctl failed` and nothing else. The root is now short enough for that
+/// `TMPDIR`, and a base too deep for any root is refused before anything is
+/// created, naming `TMPDIR` and the limit. Linux's limit is 107 bytes rather
+/// than 103, so the deep base here is deep enough for both.
+#[test]
+fn a_cluster_root_too_deep_for_the_postgres_socket_is_refused_before_it_is_created() -> Result<()> {
+    use qbit_prism_load::cluster::{TempRoot, MAX_SOCKET_PATH_BYTES};
+
+    // macOS's default: `/var/folders/<2>/<28>/T/`, 49 bytes. Measured, not
+    // created: the root has to fit with the widest port.
+    let macos_default = std::path::Path::new("/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T");
+    let root_name = format!("prism-load-{}", "0".repeat(12));
+    let socket = macos_default.join(&root_name).join(".s.PGSQL.65535");
+    assert!(
+        socket.as_os_str().len() <= 103,
+        "{} is {} bytes, over macOS's 103",
+        socket.display(),
+        socket.as_os_str().len()
+    );
+
+    // A root really created under the ordinary temp dir has that shape.
+    let root = TempRoot::create(false)?;
+    let name = root
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 root name")
+        .to_owned();
+    assert_eq!(name.len(), root_name.len(), "{name}");
+    assert!(name.starts_with("prism-load-"), "{name}");
+    drop(root);
+
+    // A base too deep for the socket at all.
+    let deep = std::env::temp_dir().join("d".repeat(MAX_SOCKET_PATH_BYTES));
+    let refused = format!(
+        "{:#}",
+        TempRoot::create_in(&deep, false)
+            .err()
+            .expect("a root whose socket cannot fit is refused")
+    );
+    assert!(refused.contains("TMPDIR"), "{refused}");
+    assert!(
+        refused.contains(&format!("{MAX_SOCKET_PATH_BYTES}-byte limit")),
+        "{refused}"
+    );
+    assert!(
+        !deep.exists(),
+        "the refusal comes before anything is created"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_start_carries_the_end_of_the_server_log() -> Result<()> {
+    use qbit_prism_load::cluster::log_tail;
+    let dir = scratch_dir("logtail")?;
+    assert_eq!(log_tail(&dir.join("absent.log"), 20), None);
+    std::fs::write(dir.join("empty.log"), "\n\n")?;
+    assert_eq!(log_tail(&dir.join("empty.log"), 20), None);
+    let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    std::fs::write(dir.join("server.log"), lines.join("\n\n") + "\n")?;
+    assert_eq!(
+        log_tail(&dir.join("server.log"), 3).as_deref(),
+        Some("line 28\nline 29\nline 30")
+    );
+    assert_eq!(
+        log_tail(&dir.join("server.log"), 100).map(|tail| tail.lines().count()),
+        Some(30)
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: a managed cluster that fails to start reports PostgreSQL's own
+/// reason. `pg_ctl` says only that the server did not start, and the log
+/// holding the reason used to be removed with the failed root. A
+/// `max_connections` of 0 is refused by the server itself, the same way the
+/// over-long socket path was: in its log, after `pg_ctl` has started it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_managed_cluster_that_fails_to_start_reports_the_servers_own_reason() -> Result<()> {
+    use qbit_prism_load::cluster::{self, ManagedPostgres, Replication};
+    use qbit_prism_test_gate as gate;
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let bin = std::path::PathBuf::from(bin);
+    cluster::verify_bin_dir(&bin)?;
+    let error = ManagedPostgres::start(bin, Replication::None, 0, false)
+        .await
+        .err()
+        .expect("PostgreSQL refuses max_connections=0");
+    let error = format!("{error:#}");
+    assert!(error.contains("pg_ctl failed"), "{error}");
+    assert!(error.contains("PostgreSQL did not start"), "{error}");
+    assert!(
+        error.contains("max_connections"),
+        "the server's own reason is in the error: {error}"
+    );
     Ok(())
 }
 

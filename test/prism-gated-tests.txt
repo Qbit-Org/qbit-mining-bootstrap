@@ -3,6 +3,7 @@
 # execution manifest with this list; a gated test that is added, renamed or
 # minimum executed count. scripts/check_gate_manifest.py compares the gate's
 # removed must be changed here too. See docs/prism-integration-test-gate.md.
+qbit-prism-load::harness::a_managed_cluster_that_fails_to_start_reports_the_servers_own_reason
 qbit-prism-load::quorum_replication::an_any_1_quorum_standby_on_postgres_16_is_observed_as_sync_like_first_1
 qbit-prism-server::api_2x::block_views_markers_and_network_estimate_keep_2x_contracts
 qbit-prism-server::api_2x::chart_rollups_match_raw_boundaries_tail_and_missing_progress
