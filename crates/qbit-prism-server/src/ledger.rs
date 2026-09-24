@@ -36,6 +36,7 @@ pub use candidates::{
     LANDING_FAILED_REASON_PREFIX, ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
 mod connect;
+pub(crate) use connect::shielded_begin;
 use connect::{require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;

@@ -1351,6 +1351,138 @@ it:
   items stay imported, there is no partially imported item, and rerunning the
   command resumes with the rows that still lack canonical bytes.
 
+### A ledger future cancelled inside `BEGIN` (#482)
+
+Every D1 run of #447 logged PostgreSQL's `WARNING: there is already a
+transaction in progress` on the frontend, 10,303 times across the 33 runs on
+`a1937054`: 8,431 in `slow_database`, 1,866 in the drain after it, five in
+flush-control phases, and one in the `steady_state` of
+`d1-dense400k-fe1-async-r1`, a phase with no share-commit cancellation. The
+warning is what PostgreSQL says to a `BEGIN` that arrives on a connection
+whose transaction block is already open. Every run reconciled exactly. This
+section names the trigger, records why nothing could commit or stay locked
+across it, and describes the guard that now keeps such a connection out of
+the pool.
+
+**The trigger.** SQLx 0.8.6's `PgTransactionManager::begin`
+(`sqlx-postgres/src/transaction.rs`) queues the `BEGIN`, awaits the reply
+with `wait_until_ready`, and only then increments `transaction_depth`. The
+guard it drops on cancellation calls `start_rollback`, which does nothing at
+depth 0. A future dropped between the write and the reply therefore hands
+its `PoolConnection` back with `transaction_depth == 0` while the server has
+opened a transaction: the pool's release ping (`Sync`, then
+`wait_until_ready`) consumes the `BEGIN` reply and offers the connection as
+idle, and the next checkout's `BEGIN` lands inside the leftover transaction.
+`crates/qbit-prism-server/tests/ledger_cancelled_begin.rs` reproduces this
+deterministically by holding the `BEGIN` reply at the wire proxy and
+cancelling the future there; against the code before this guard,
+`pg_stat_activity` showed the cancelled checkout's backend `idle in
+transaction` with `query = BEGIN` while it sat in the pool, the proxy saw
+`BEGIN`, `BEGIN` on that connection with no `ROLLBACK` between, the next
+transaction ran on the same backend pid, and SQLx relayed the warning while
+it ran. The futures that can be dropped there:
+
+- the persist task aborted at `share_commit_timeout` (`AppendTask::abort`,
+  the #324 mechanism), logged as `share commit deadline passed before COMMIT
+  was sent`: the bulk of the `slow_database` and drain occurrences;
+- the persist task aborted because the submit handler itself was dropped
+  (`AppendTask::drop`), which is what a miner disconnect during a submit
+  does. Nothing is logged for it, so it is the likeliest reading of the one
+  `steady_state` occurrence;
+- the metrics collector's three-second deadline around its snapshot
+  transaction (`metrics database collection unavailable` with `deadline
+  exceeded` in the log), which runs every ten seconds in every phase;
+- session allocation under the subscribe timeout (`session allocation timed
+  out`), and any other `tokio::time::timeout` around a ledger transaction.
+
+**Why no advisory lock can be held across it.** `ORDER_LOCK` and
+`SETTLEMENT_LOCK` are taken by `pg_advisory_xact_lock` inside a transaction
+that has completed its `BEGIN`, so the connection is at depth 1 from then on.
+Dropping the `Transaction` at any later await queues `ROLLBACK`
+(`start_rollback`), and SQLx's pool return flushes the queued protocol and
+waits for its replies before the connection is released, so a lock taken by
+a cancelled append is released before the pool can offer that connection.
+The one await that cannot queue a rollback is the `BEGIN` reply itself, and
+a transaction cancelled there has run nothing but `BEGIN`: it holds no lock
+and contains no statement. The tests assert the absence of both keys in
+`pg_locks` after the cancellation.
+
+**What the leftover could still do.** Nothing on the share path: the next
+append's `BEGIN` joined the empty transaction, and its own `COMMIT` or
+rollback ended it with nothing foreign inside. The hazard was a statement
+that runs without a transaction of its own, on a connection checked out
+directly: the heartbeat, a session-reservation `DELETE`, a difficulty
+record, the landed-audit-bits `UPDATE`. Inside the leftover such a
+statement is reported successful but is neither durable nor visible until
+the connection's next transaction user ends the block, and a later dropped
+`Transaction` on that connection rolls it back; its row locks are held while
+the connection sits idle in the pool; an error in it leaves the block
+aborted, and the pool would keep re-offering that connection until SQLx's
+default `max_lifetime` of thirty minutes; and the collector's
+`transaction_timestamp()` ages would be measured from the leftover `BEGIN`.
+None of this was observed in #447, and the exact reconciliation says the
+share path was never affected; it is why the outcome is guarded rather than
+only documented.
+
+**The guard.** Two places, one per form of `BEGIN`:
+
+- `ledger::shielded_begin` runs `Transaction::begin` on an already
+  checked-out connection in a task of its own and joins it. `Ledger::begin`
+  (every owned transaction: session allocation, configuration, divergence,
+  archive, the startup migration) and the metrics collector use it. A caller
+  dropped or aborted mid-`BEGIN` detaches from the task; the task still reads
+  the reply, and the transaction it then drops queues the `ROLLBACK` that the
+  pool return flushes. The connection returns clean and serves the next
+  transaction; the wire shows `BEGIN`, `ROLLBACK`, `BEGIN`.
+- The share append borrows its connection through the admission guard
+  (`AppendConnection`), so its `BEGIN` cannot be moved into a task. The guard
+  now records whether `BEGIN` completed, and when it did not, its drop
+  retires the connection: `PoolConnection::detach` leaves the pool
+  synchronously, size and permit included, so the pool opens a replacement
+  and can never see that connection again, and the socket is closed on the
+  runtime the append ran on (a close that is never polled, at shutdown,
+  drops the raw connection, which closes the socket and makes the server
+  abort whatever it held). Retirement was chosen over a rollback issued from
+  the drop because a drop must not block and must never return a connection
+  whose server side may be in a transaction: a rollback would have to run on
+  the captured runtime before the connection re-enters the pool, could not
+  run at all while that runtime is shutting down, and would then need the
+  close as its fallback anyway. The cost is one reconnect per append
+  cancelled inside `BEGIN`, on the order of three hundred per D1 run in
+  `slow_database` and none in steady state.
+
+On the successful path nothing changes: an append is the same ten
+statements on one connection, followed by SQLx's own release ping, and the
+test prints that trace after the retirement so the count can be compared
+with the trace recorded before the guard.
+
+**Rejected alternative.** A pool-level `after_release` hook in the ledger's
+pool builder that rolls back any open transaction would cover every
+cancellation source in one place, but SQLx exposes no client-side
+transaction status: `PgConnection::in_transaction` is crate-private, and
+`Connection::is_in_transaction` reports SQLx's own depth, which is exactly
+the number that is wrong here. Detection therefore needs a statement round
+trip on every release, in addition to the release ping, and an unconditional
+`ROLLBACK` would warn in the server log on every release. That is roughly one
+extra round trip per checkout on a path that costs ten statements and a ping
+today, paid as connection occupancy in the pool-bound `slow_database` phase,
+with the `ORDER_LOCK` hold time unchanged. `idle_in_transaction_session_timeout`
+was rejected too: it reaps an idle leftover only after its timeout, does
+nothing under load, where the leftover is reused within milliseconds, and
+would end legitimate transactions that idle between statements.
+
+**Residual.** `partitions::ensure_with_metrics` and the rollup writer open
+their transactions with a plain `Transaction::begin` on a fresh checkout. The
+former runs inside the persist task on the missing-partition retry path and
+could be aborted mid-`BEGIN` there; it needs a detached partition lead first.
+The issued-job batch writer's `BatchConnection` runs in the batcher task and
+is cancelled only at shutdown.
+
+```sh
+test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
+  --test ledger_cancelled_begin -- --nocapture
+```
+
 ### Native snapshot rejection and legacy segments
 
 A native audit body references an immutable share snapshot in

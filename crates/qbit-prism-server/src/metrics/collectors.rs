@@ -1,7 +1,7 @@
 //! Background observations. HTTP rendering performs no external I/O.
 use super::{time_pool_acquire, DatabaseMetrics, Metrics, ProcessMetrics};
 use anyhow::{Context, Result};
-use sqlx::{Connection, PgPool};
+use sqlx::PgPool;
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -40,8 +40,8 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let terminal = metrics.revision_work_terminal_probe();
     tokio::time::timeout_at(deadline, async {
-        let mut connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
-        let mut tx = connection.begin().await?;
+        let connection = time_pool_acquire(Some(metrics), pool.acquire()).await?;
+        let mut tx = crate::ledger::shielded_begin(connection).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx).await?;
         sqlx::query("SELECT set_config('statement_timeout','2000',true),set_config('lock_timeout','500',true)")

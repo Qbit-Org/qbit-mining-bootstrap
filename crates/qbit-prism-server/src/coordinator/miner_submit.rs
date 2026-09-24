@@ -166,7 +166,9 @@ impl AppendTask {
 
     /// Cancel an append whose gate is closed. Every await before COMMIT rolls
     /// back when dropped, so the doomed append stops queueing for the pool and
-    /// `ORDER_LOCK` now instead of running to the hook's refusal.
+    /// `ORDER_LOCK` now instead of running to the hook's refusal. The one
+    /// await that could not roll back, the reply to `BEGIN`, retires its
+    /// connection instead (`ledger::append_admission`, #482).
     fn abort(mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();

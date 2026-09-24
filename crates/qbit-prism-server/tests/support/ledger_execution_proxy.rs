@@ -281,6 +281,13 @@ struct PausePlan {
     control: Arc<CommitPauseState>,
 }
 
+/// Holds the completion of the next execution whose statement text is
+/// exactly `sql`, on whichever connection runs it.
+struct StatementPausePlan {
+    sql: String,
+    control: Arc<CommitPauseState>,
+}
+
 #[derive(Default)]
 struct State {
     executions: Vec<Execution>,
@@ -292,6 +299,7 @@ struct State {
     fired: Option<u64>,
     pause_plan: Option<PausePlan>,
     pause_armed: Option<u64>,
+    statement_pause: Option<StatementPausePlan>,
 }
 
 struct Shared {
@@ -439,6 +447,26 @@ impl ExecutionProxy {
             control: control.clone(),
         });
         state.pause_armed = None;
+        Ok(CommitPause(control))
+    }
+
+    /// Hold the reply of the next execution whose statement text is exactly
+    /// `sql` (a simple-protocol `Query`, such as `BEGIN`), from its
+    /// `CommandComplete` on, so the client stays blocked waiting for that
+    /// statement's `ReadyForQuery` until the handle releases it or drops.
+    /// Nothing is severed: the server has already run the statement, and the
+    /// connection stays usable once the reply is delivered.
+    pub fn pause_statement(&self, sql: &str) -> Result<CommitPause> {
+        let mut state = self.shared.state.lock().expect("proxy state");
+        ensure!(
+            state.plan.is_none() && state.pause_plan.is_none() && state.statement_pause.is_none(),
+            "proxy already has a delivery plan"
+        );
+        let control = Arc::new(CommitPauseState::default());
+        state.statement_pause = Some(StatementPausePlan {
+            sql: sql.into(),
+            control: control.clone(),
+        });
         Ok(CommitPause(control))
     }
 
@@ -995,6 +1023,7 @@ fn complete(
         fired,
         pause_plan,
         pause_armed,
+        statement_pause,
     } = &mut *state;
     let execution = &mut executions[index];
     if let Some(count) = tag.strip_prefix("SELECT ") {
@@ -1027,6 +1056,14 @@ fn complete(
                 pause = Some(plan.control.clone());
                 *pause_plan = None;
                 *pause_armed = None;
+            }
+        }
+        if pause.is_none() {
+            if let Some(plan) = statement_pause.as_ref() {
+                if execution.sql == plan.sql {
+                    pause = Some(plan.control.clone());
+                    *statement_pause = None;
+                }
             }
         }
     }
