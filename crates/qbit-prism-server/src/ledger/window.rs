@@ -668,7 +668,7 @@ impl Ledger {
     ) -> Result<AppendResult> {
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
-        let mut tx = Transaction::begin(&mut *connection.connection, None).await?;
+        let mut tx = connection.begin().await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {
