@@ -42,6 +42,31 @@ async fn terminate(admin: &PgPool, pid: i32) -> Result<()> {
     Ok(())
 }
 
+/// Wait until the pool's one connection is back on the idle queue, so the
+/// backend can be terminated while the socket is idle rather than mid-ping.
+///
+/// A dropped `PoolConnection` is returned by a task SQLx spawns, which pings
+/// the server first and only then makes the connection idle. Right after
+/// [`backend_pid`] that ping can still be in flight; a backend terminated then
+/// fails the ping, SQLx discards the connection on the spot, and the checkout
+/// under test opens a fresh one instead of receiving the dead socket, so the
+/// statement succeeds on a new pid.
+async fn settled(pool: &PgPool) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.num_idle() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("the pooled connection was not returned to the idle queue within 5 s")?;
+    ensure!(
+        pool.size() == 1,
+        "the pool holds {} connections, not the one under test",
+        pool.size()
+    );
+    Ok(())
+}
+
 /// One slot, so the checkout under test is the only connection the pool has.
 fn probed_pool(idle_at_least: Duration) -> PgPoolOptions {
     PgPoolOptions::new()
@@ -63,7 +88,12 @@ async fn a_dead_idle_connection_is_replaced_when_the_idle_gap_reaches_the_thresh
             let admin = PgPool::connect(url).await?;
             pools.push(admin.clone());
             let first = backend_pid(&pool).await?;
+            settled(&pool).await?;
             terminate(&admin, first).await?;
+            ensure!(
+                pool.num_idle() == 1,
+                "the dead connection left the pool before the checkout"
+            );
             // Threshold zero: every checkout probes, so the dead connection is
             // discarded and the statement runs on a fresh one without an error.
             let second = tokio::time::timeout(Duration::from_secs(5), backend_pid(&pool))
@@ -89,7 +119,12 @@ async fn a_dead_idle_connection_inside_the_probe_window_fails_one_statement_then
             let admin = PgPool::connect(url).await?;
             pools.push(admin.clone());
             let first = backend_pid(&pool).await?;
+            settled(&pool).await?;
             terminate(&admin, first).await?;
+            ensure!(
+                pool.num_idle() == 1,
+                "the dead connection left the pool before the checkout"
+            );
             // Inside the window no probe runs: the first statement on the dead
             // socket fails as an error, never as a hang or a silent success.
             let failed = tokio::time::timeout(Duration::from_secs(5), backend_pid(&pool))
