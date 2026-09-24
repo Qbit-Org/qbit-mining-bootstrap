@@ -403,3 +403,73 @@ async fn postgres_run_shutdown_during_sql_preserves_success_and_compatibility() 
         Ok(())
     })).await
 }
+
+/// The environment is process-wide; the enabled flag is read under this lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const ENABLED: &str = "PRISM_HASHRATE_ROLLUP_ENABLED";
+const LAG: &str = "qbit_prism_hashrate_rollup_watermark_lag_seconds";
+
+fn lag(metrics: &Metrics) -> Option<f64> {
+    let body = metrics.render();
+    assert!(body.contains(&format!("# HELP {LAG} ")), "{body}");
+    assert!(body.contains(&format!("# TYPE {LAG} gauge\n")), "{body}");
+    let values: Vec<_> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix(&format!("{LAG} ")))
+        .collect();
+    assert!(
+        values.len() <= 1,
+        "expected at most one {LAG} sample: {body}"
+    );
+    values.first().map(|value| value.parse().unwrap())
+}
+
+#[test]
+fn a_disabled_rollup_declares_its_lag_without_publishing_one() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    std::env::set_var(ENABLED, "0");
+    let settings = settings_from_env();
+    std::env::remove_var(ENABLED);
+    // No settings means no spawned loop, so nothing ever starts the lag.
+    assert!(settings.unwrap().is_none());
+    assert_eq!(lag(&Metrics::default()), None);
+}
+
+#[test]
+fn rollup_lag_is_unknown_until_a_caught_up_pass_and_only_such_a_pass_resets_it() {
+    let metrics = Metrics::default();
+    assert_eq!(lag(&metrics), None);
+    metrics.start_hashrate_rollup();
+    assert_eq!(lag(&metrics), Some(-1.));
+    // An idle pool scans nothing and still advances the watermark.
+    let idle = Progress {
+        scanned: 0,
+        last_share_seq: 42,
+        advanced: true,
+    };
+    assert!(idle.caught_up(8));
+    metrics.record_hashrate_rollup_pass(idle.caught_up(8));
+    assert!((0. ..1.).contains(&lag(&metrics).unwrap()));
+    std::thread::sleep(Duration::from_millis(25));
+    // A pass stopped at its batch bound, and one that lost the watermark race,
+    // both leave unfolded shares behind: neither may claim this frontend is
+    // caught up, so the stamp keeps ageing.
+    for progress in [
+        Progress {
+            scanned: 8,
+            last_share_seq: 50,
+            advanced: true,
+        },
+        Progress {
+            scanned: 0,
+            last_share_seq: 42,
+            advanced: false,
+        },
+    ] {
+        assert!(!progress.caught_up(8));
+        metrics.record_hashrate_rollup_pass(progress.caught_up(8));
+        assert!(lag(&metrics).unwrap() >= 0.025);
+    }
+    metrics.record_hashrate_rollup_pass(idle.caught_up(8));
+    assert!(lag(&metrics).unwrap() < 0.025);
+}

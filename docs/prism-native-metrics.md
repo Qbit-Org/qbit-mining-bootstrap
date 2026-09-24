@@ -79,6 +79,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_divergent_landings_total` | counter | none | run | Confirmations this instance committed whose landed rows started to count on canonical balances other than their as-issued prior balances. Counted at the confirmation, when a landed block's rows start to count: it is divergent when those rows meet canonical balances other than the as-issued ones its coinbase commits to (#478 captures, and the pre-existing case of a block whose work predates an earlier confirmation). Each is recorded in `qbit_prism_payout_divergences`, in the confirming transaction, with its per-account overpay; a frontend without #478 records and counts nothing. Process-local; starts at zero. No firing rule. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
 | `qbit_prism_grace_credited_shares_total` | counter | none | run | Durably accepted shares credited by stale grace. | `qbit_prism_grace_credited_shares_total` |
+| `qbit_prism_hashrate_rollup_watermark_lag_seconds` | gauge | none | run | Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled. The stored watermark is a share sequence, not a time; a caught-up pass is one that advanced the watermark within its batch bound, leaving no unfolded share. A pass that lost the race to another frontend leaves the stamp unchanged, so a frontend that keeps losing reads high: alert on the minimum across instances. -1 runs from loop start until its first such pass, and PRISM_HASHRATE_ROLLUP_ENABLED=0 leaves the family declared with no sample at all. | none |
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
 | `qbit_prism_job_delivery_failures_total` | counter | none | run | Failed local job deliveries. | none |
 | `qbit_prism_job_delivery_successes_total` | counter | none | run | Successful local job deliveries. | none |
@@ -87,6 +88,9 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_metrics_snapshot_age_seconds` | gauge | none | run | Monotonic age of the metrics snapshot, or -1 before the first publication. | `qbit_prism_metrics_snapshot_age_seconds` |
 | `qbit_prism_metrics_snapshot_available` | gauge | none | run | Whether a complete metrics snapshot has been published. | `qbit_prism_metrics_snapshot_available` |
 | `qbit_prism_metrics_snapshot_stale` | gauge | none | run | Whether the metrics snapshot is missing or exceeds the health freshness budget. | `qbit_prism_metrics_snapshot_stale` |
+| `qbit_prism_node_initial_block_download` | gauge | none | run | Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown. Recorded whenever the latest getblockchaininfo answered with the boolean, including the 1 that then makes readiness fail. -1 means startup, a failed call, or a field that was not a boolean. | none |
+| `qbit_prism_node_observation_age_seconds` | gauge | none | run | Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable. Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. Peers and the sync flag come from the latest attempt to start, so a slower older attempt landing late cannot roll them back, while the age keeps the latest answer any attempt received. | none |
+| `qbit_prism_node_peers` | gauge | none | run | Node peer connections from the latest node observation, or -1 when unknown. Recorded only when the readiness attempt reached getnetworkinfo and it answered, which is never on regtest, during initial block download, or while blocks and headers disagree; observation adds no RPC call. -1 means the latest attempt did not learn the count, including RPC failure; the gauge never keeps an earlier reading. An answered zero is a real zero, and it is below every configured PRISM_MIN_PEERS floor. | none |
 | `qbit_prism_pending_job_builds` | gauge | none | run | Current local pending job deliveries. Delivery count replaces the operational intent of queue depth, not its implementation. | `qbit_prism_job_delivery_queue_depth` |
 | `qbit_prism_process_resident_memory_bytes` | gauge | none | run | Process resident memory bytes from procfs, or -1 when unknown. | `qbit_prism_process_resident_memory_bytes` |
 | `qbit_prism_public_audit_artifact_refusals_total` | counter | none | public-api | Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight. Public-api role only: the mining process serves the same route on its operator listener and applies the same cap there, but has no public-service metrics owner, so those refusals are uncounted. | `qbit_prism_public_audit_artifact_refusals_total` |
@@ -302,8 +306,9 @@ The coordinator adds the three health compatibility aliases whose native sources
 are known; the fixture deliberately identifies unmapped legacy fields: `ready_miner_count` (accepted-share participants) and `max_blocks` (the 2.x accepted-block pool-close cap) have no native health equivalents.
 
 No new configuration setting is introduced. Worker slots, per-worker series,
-node gauges, rollup-lag series and payout-build duration remain outside the
-trimmed metrics scope. #458 adds the landing observation contract below. The subsequent
+payout-build duration remains outside the trimmed metrics scope; the node gauges
+and the rollup-lag series in the inventory above were added by the #278 hardening
+remainder and still add no setting. #458 adds the landing observation contract below. The subsequent
 [#278 cardinality/privacy qualification](prism-metrics-cardinality-privacy.md)
 pins the complete run-role wire census and tests identifier-bearing inputs
 through Stratum and the candidate collector without expanding the family set.
@@ -625,3 +630,42 @@ near zero within 100 ms after recovery; completed tracked polls retain their
 maximum separately in `runtime_poll_lag_seconds`. The health `ledger_backend`
 alias uses `postgres-native`, matching the other native API responses, while the
 existing `backend` field retains its storage-engine value `postgres`.
+
+## Reading the node gauges and the rollup lag
+
+`qbit_prism_node_peers`, `qbit_prism_node_initial_block_download` and
+`qbit_prism_node_observation_age_seconds` come from one observation site, the
+readiness chain check, and record only what that attempt already fetched. They
+add no RPC call, so a check that short-circuits before `getnetworkinfo` -
+regtest, a node in initial block download, or a node whose blocks and headers
+disagree - leaves the peer count unknown at -1. Unknown never means the last
+reading: a refused `getnetworkinfo` reports -1 rather than the peer count of an
+earlier attempt, so the gauge cannot advertise a peer floor nobody confirmed. An
+answered zero is a real zero, and it is below every configured `PRISM_MIN_PEERS`.
+
+The sync flag is recorded whenever `getblockchaininfo` answers with the boolean,
+including the 1 that then makes readiness fail, and reads -1 only when that call
+failed or answered with something that is not a boolean. The observation age is
+stamped on that answered call rather than on a fully successful check, so a node
+that answers but is not ready keeps a small age while an unreachable node's age
+grows without bound. It is monotonic and computed at scrape time. Concurrent
+refresh, block-wait, candidate and broadcaster observations are ordered by the
+instant each attempt began, so a slower older attempt landing late cannot roll
+back a newer observation. That ordering governs the peer count and the sync
+flag, which belong to one attempt; the age instead keeps the latest answer any
+attempt received, so a superseded attempt whose call answered last still proves
+the node was reachable then.
+
+`qbit_prism_hashrate_rollup_watermark_lag_seconds` is not derived from the
+stored watermark: `qbit_hashrate_rollup_progress.last_share_seq` is a share
+sequence, not a time, and its `updated_at` uses the database clock. The series
+is instead the monotonic time since this frontend last completed a rollup pass
+that advanced the watermark without filling its batch bound, which is the pass
+that left no unfolded share behind. An idle pool scans nothing and still
+advances, so it stays caught up; a backlog, a failing pass or a stopped loop
+grows the lag without bound. Competing frontends race, and the loser advances
+nothing, so a frontend that keeps losing reads high while the cluster is healthy:
+alert on the minimum across instances, never on a single one. The series reads
+-1 from loop start until its first caught-up pass, and while
+`PRISM_HASHRATE_ROLLUP_ENABLED=0` the family is declared without any sample,
+because a frontend that never runs the rollup has no lag to report.

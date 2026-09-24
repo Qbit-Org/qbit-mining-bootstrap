@@ -12,6 +12,15 @@ pub struct Progress {
     pub advanced: bool,
 }
 
+impl Progress {
+    /// A pass that advanced the watermark without filling its batch bound left
+    /// no unfolded share behind, so this frontend is caught up. A lost race or
+    /// a full batch proves nothing about the lag and leaves the stamp alone.
+    fn caught_up(&self, batch: u32) -> bool {
+        self.advanced && self.scanned < i64::from(batch)
+    }
+}
+
 pub struct Settings {
     batch: u32,
     interval: Duration,
@@ -83,6 +92,9 @@ pub(crate) async fn run_with_metrics(
     mut shutdown: watch::Receiver<bool>,
     metrics: Option<Arc<Metrics>>,
 ) -> Result<()> {
+    if let Some(metrics) = metrics.as_deref() {
+        metrics.start_hashrate_rollup();
+    }
     let mut tick = tokio::time::interval(settings.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -93,9 +105,14 @@ pub(crate) async fn run_with_metrics(
         tokio::select! {
             _ = shutdown.changed() => break,
             result = advance_with_metrics(&pool, settings.batch, metrics.as_deref()) => match result {
-                Ok(progress) => tracing::debug!(scanned=progress.scanned,
-                    last_share_seq=progress.last_share_seq, advanced=progress.advanced,
-                    "hashrate rollup maintenance"),
+                Ok(progress) => {
+                    if let Some(metrics) = metrics.as_deref() {
+                        metrics.record_hashrate_rollup_pass(progress.caught_up(settings.batch));
+                    }
+                    tracing::debug!(scanned=progress.scanned,
+                        last_share_seq=progress.last_share_seq, advanced=progress.advanced,
+                        "hashrate rollup maintenance")
+                }
                 Err(error) => tracing::warn!(%error, "hashrate rollup maintenance unavailable"),
             }
         }

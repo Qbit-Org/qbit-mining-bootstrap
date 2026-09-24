@@ -2,14 +2,15 @@
 //! rendering, and test/thread setup. Run with `cargo test --release --locked
 //! -p qbit-prism-server --test metrics_allocation` as well as the debug suite.
 use qbit_prism_server::metrics::{
-    AckResult, ConnectionRefusalReason, LockKind, Metrics, Outcome, RejectReason, StaleJobCause,
+    AckResult, ConnectionRefusalReason, LockKind, Metrics, NodeObservation, Outcome, RejectReason,
+    StaleJobCause,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     hint::black_box,
     sync::{Arc, Barrier},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct CountingAllocator;
@@ -86,6 +87,16 @@ fn increment_all(metrics: &Metrics) {
         metrics.record_stale_job_rejection(*cause);
     }
     metrics.set_stratum_connection_limit(384);
+    // Both the known and the unknown observation reuse their reserved keys.
+    for chain in [Some((false, Instant::now())), None] {
+        metrics.record_node_observation(NodeObservation {
+            started: Instant::now(),
+            peers: chain.map(|_| 7),
+            chain,
+        });
+    }
+    metrics.start_hashrate_rollup();
+    metrics.record_hashrate_rollup_pass(true);
 }
 
 #[test]
@@ -196,6 +207,10 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
         assert_eq!(sample(&body, &key), 2048.);
     }
     assert_eq!(sample(&body, "qbit_prism_stratum_connection_limit"), 384.);
+    // The last observation in a round leaves peers and the flag unknown.
+    for name in ["node_peers", "node_initial_block_download"] {
+        assert_eq!(sample(&body, &format!("qbit_prism_{name}")), -1.);
+    }
     for (name, count) in [
         ("stale", 4096.),
         ("duplicate", 2048.),
