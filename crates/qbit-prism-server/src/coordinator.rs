@@ -1761,10 +1761,7 @@ impl Coordinator {
         // pre-offer probe adopts an active pending block: from this commit
         // on, no claim on any frontend offers it, whatever happens next.
         if claim.lifecycle.state == CandidateState::Pending {
-            let evidence = format!(
-                "{}{block} active at height {height} with tip {tip}",
-                crate::ledger::ADOPTED_OFFER_REPLY_PREFIX
-            );
+            let evidence = crate::ledger::adoption_evidence(block, height, &tip);
             let reason = format!(
                 "adopted by operator recovery before any recorded offer: {evidence}; the original offer time is unknown, never offered again"
             );
@@ -2120,11 +2117,10 @@ impl Coordinator {
         lease: CandidateLease,
         tip: &str,
     ) -> Result<()> {
-        let evidence = format!(
-            "{}{} active at height {} with tip {tip}",
-            crate::ledger::ADOPTED_OFFER_REPLY_PREFIX,
-            claim.candidate.block_hash,
-            claim.candidate.found_block.block_height
+        let evidence = crate::ledger::adoption_evidence(
+            &claim.candidate.block_hash,
+            claim.candidate.found_block.block_height,
+            tip,
         );
         let reason = format!(
             "adopted before any recorded offer: {evidence}; the original offer time is unknown, never offered again"

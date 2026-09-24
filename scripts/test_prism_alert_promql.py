@@ -81,8 +81,11 @@ def main():
                          for name, expr in expressions.items()]
         checked_rules.append(pool_alert)
         tests.extend(pool_tests)
+        # Every rule is also an alert rule with its dwell, so a scenario may
+        # assert pending versus firing for any of them; the pool-wait rule is
+        # registered by pool_wait_tests above with its labels.
         for rule in rules:
-            if not (rule["uid"].startswith(("qbit-prism-revision-work-", "qbit-prism-accepted-block-", "qbit-prism-block-candidate-", "qbit-prism-candidate-")) or rule in load("docs/prism-postgres-alert-rules.json")["rules"]):
+            if rule["title"] == POOL_WAIT_TITLE:
                 continue
             assert rule["evaluator"] == "gt" and rule["threshold"] == 0
             checked_rules.append({"alert": rule["title"], "expr": f"({expressions[rule['title']]}) > 0",

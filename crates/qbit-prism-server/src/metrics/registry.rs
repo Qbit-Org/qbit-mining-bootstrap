@@ -75,7 +75,7 @@ families! {
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
     CandidateUnacknowledgedAge: Gauge, "block_candidate_oldest_unacknowledged_seconds", "Oldest cluster-wide candidate age the node has not accepted: pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (not a row adopted on the node's active-chain evidence), and rows the node rejected unless the reply names a side-chain block; zero when every unfinished row was accepted, or -1 when unknown.";
-    CandidateLandingFailedAge: Gauge, "block_candidate_oldest_landing_failed_seconds", "Oldest cluster-wide age of a reconciliation row whose audit landing keeps failing after the offer; zero when none, or -1 when unknown.";
+    CandidateLandingFailedAge: Gauge, "block_candidate_oldest_landing_failed_seconds", "Oldest cluster-wide time since the offer reservation of a reconciliation row whose audit landing has not committed (no pool-block row) or whose last error names a landing refusal; zero when none, or -1 when unknown.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
     PoolAcquire: Histogram, "database_pool_acquire_seconds", "Actual database pool acquisition wait by outcome.";
     LockWait: Histogram, "database_advisory_lock_wait_seconds", "Database advisory transaction lock wait by lock and outcome.";

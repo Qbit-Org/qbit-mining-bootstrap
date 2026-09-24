@@ -169,20 +169,31 @@ pub const ORPHANED_STATE: &str = "orphaned";
 /// block is already active (the pre-offer probe or operator recovery): its
 /// outcome is `unknown` because no offer was recorded, but the node holds
 /// the block, so the candidate collector does not count it as
-/// unacknowledged (#493).
+/// unacknowledged (#493). Ceiling: this is the one classification the
+/// collector reads from prose rather than from the row's typed columns;
+/// [`adoption_evidence`] is the only writer, and a typed adoption outcome
+/// would need a migration.
 pub const ADOPTED_OFFER_REPLY_PREFIX: &str = "node reports block ";
 
-/// The `last_error` prefix a row carries while its audit landing keeps
-/// failing after the offer; the candidate collector reports the oldest such
-/// row separately, so a won block whose ledger landing fails is never silent
-/// (#493).
+/// The `offer_reply` of an adopted row: the node's evidence, in the one
+/// form the collector recognises.
+pub fn adoption_evidence(block_hash: &str, height: u64, tip: &str) -> String {
+    format!("{ADOPTED_OFFER_REPLY_PREFIX}{block_hash} active at height {height} with tip {tip}")
+}
+
+/// The `last_error` prefix a row carries while its audit landing was refused
+/// after the offer. The candidate collector reports the oldest such row
+/// together with every reconciliation row whose landing never committed
+/// (no pool-block row), so a won block whose ledger landing fails is never
+/// silent, even after a transient retry failure or a refused operator
+/// recovery overwrites this reason (#493).
 pub const LANDING_FAILED_REASON_PREFIX: &str = "landing failed after the offer";
 
 /// The node's definitive replies that describe a side-chain block rather
 /// than an invalid one: a tip race lost to a block that arrived first. Every
 /// other rejection reply means the pool offered a block the node refused,
 /// and the candidate collector keeps it in the paging age (#493).
-pub const SIDE_CHAIN_REPLIES_SQL: &str = "('inconclusive','duplicate','duplicate-inconclusive')";
+pub const SIDE_CHAIN_REPLIES: &[&str] = &["inconclusive", "duplicate", "duplicate-inconclusive"];
 
 impl CandidateState {
     /// The SQL list of every unfinished state, for `state IN` predicates.

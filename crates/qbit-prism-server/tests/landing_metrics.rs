@@ -1252,13 +1252,50 @@ async fn failed_audit_landing_after_the_offer_is_reported_until_a_retry_lands() 
                 census.candidate_oldest_landing_failed > Duration::ZERO,
                 "a failed landing was silent"
             );
+            ensure!(
+                census.candidate_oldest_landing_failed <= census.candidate_oldest,
+                "the landing-failed age counted time before the offer"
+            );
             ensure!(census.candidate_oldest_unacknowledged == Duration::ZERO);
             f.a.metrics.publish_database(Some(census));
             ensure!(
                 sample(&f.a.metrics, "qbit_prism_block_candidate_oldest_landing_failed_seconds")
                     > 0.
             );
-            // The retry lands the audit; the row waits for the chain again.
+            // A retry that fails for a transient reason (the node's tip
+            // changes under the observation) overwrites the row's last_error
+            // without landing anything: the age stays.
+            f.node.set_reply(
+                "getbestblockhash",
+                serde_json::json!([]),
+                serde_json::json!("cc".repeat(32)),
+            );
+            retry_reconciliation(f, &hash).await?;
+            let (state, error): (String, Option<String>) = sqlx::query_as(
+                "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(
+                state == "reconciliation"
+                    && error.as_deref().is_some_and(|error| {
+                        error.starts_with("post-offer processing failed")
+                    }),
+                "{state} {error:?}"
+            );
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(
+                census.candidate_oldest_landing_failed > Duration::ZERO,
+                "a transient retry failure hid the unlanded audit"
+            );
+            // The next retry lands the audit; the row waits for the chain again.
+            f.node.set_reply(
+                "getbestblockhash",
+                serde_json::json!([]),
+                serde_json::json!("ab".repeat(32)),
+            );
             retry_reconciliation(f, &hash).await?;
             let (state, error): (String, Option<String>) = sqlx::query_as(
                 "SELECT state,last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",

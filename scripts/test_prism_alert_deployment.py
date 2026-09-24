@@ -134,7 +134,7 @@ def main():
             # #493: the candidate paging rule reads the unacknowledged age, not the all-unfinished age.
             critical = json.dumps(after["qbit-prism-candidate-oldest-critical"])
             assert "qbit_prism_block_candidate_oldest_unacknowledged_seconds{" in critical
-            assert " unless on(job, instance, network) " in critical, "no mixed-version fallback"
+            assert " or on(job, instance, network) qbit_prism_block_candidate_oldest_pending_seconds{" in critical, "no mixed-version fallback"
             assert paging["qbit-prism-candidate-landing-failed-critical"]["for"] == "1m"
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2

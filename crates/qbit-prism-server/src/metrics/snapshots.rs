@@ -21,8 +21,9 @@ pub struct DatabaseMetrics {
     /// names a side-chain block. Zero when every unfinished row was accepted,
     /// as a node-accepted lost race awaiting its orphan proof is.
     pub candidate_oldest_unacknowledged: Duration,
-    /// Oldest age among the reconciliation rows whose audit landing keeps
-    /// failing after the offer (#493); zero when none.
+    /// Oldest age, since the offer reservation, among the reconciliation
+    /// rows whose audit landing has not committed (no pool-block row) or
+    /// whose last error names a landing refusal (#493); zero when none.
     pub candidate_oldest_landing_failed: Duration,
     /// Rows of attached share ledger partition headroom above the next
     /// `share_seq`, or `None` where the ledger is not partitioned yet. An

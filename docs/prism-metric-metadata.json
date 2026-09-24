@@ -14,20 +14,14 @@
       "status": "Observed once per refresh that published rebuilt work, from the refresh's entry (after the poll or block-wait wake) to its publication, on the coordinator's monotonic clock. A refresh that reused the published work unchanged, or that failed, records nothing. `trigger` names what invalidated the published work, by the label's own precedence when several inputs changed on one poll: `initial` (nothing published yet), then `tip` (the template parent changed), `revision` (the payout revision changed), `balances` (the carry-forward balances changed), `reanchor` (the cached window aged past `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS`, or no cached window was held while work was published), `shares` (new shares with no cached bundle), `fee` (the relay fee floor changed) and `template` (any other template or publication change, including a cached window that no longer matches the published reference). The reuse test itself checks these inputs in a different order; the label is a classification of the same inputs, never a decision. `acquisition` says where the window came from: `delta` or `full` for a fresh ledger snapshot by that path, `cached` when the previous refresh's window was reused and only the body was rebuilt. Series appear on their first observation. Default buckets."
     },
     "ctv_fanout_broadcaster_tip_refresh_yields_total": {
-      "replaces": [
-        "qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"
-      ]
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]
     },
     "ctv_fanout_broadcaster_chunk_rows": {
-      "replaces": [
-        "qbit_prism_ctv_fanout_broadcaster_chunk_rows"
-      ],
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_rows"],
       "status": "Values are rows, not seconds: instead of the default time ladder this histogram exports the single finite bound `le=\"1\"` plus `+Inf`, so `_count` is the number of claimed fanout attempts and `_sum` equals `_count`. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported; a query for a higher `le` matches no series."
     },
     "ctv_fanout_broadcaster_chunk_seconds": {
-      "replaces": [
-        "qbit_prism_ctv_fanout_broadcaster_chunk_seconds"
-      ],
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_seconds"],
       "status": "Default histogram ladder in seconds; one observation per claimed attempt, recorded even when persisting the attempt's completion fails."
     },
     "accepted_shares_total": {
@@ -117,13 +111,10 @@
       "status": "Read in the same database snapshot as the two all-unfinished gauges (#493): the unfinished rows the node has not accepted are pending and offer_reserved rows, offered or reconciliation rows whose one submitblock outcome is unknown (a transport failure or timeout, or a reservation whose call was lost with its frontend; a row adopted on the node's own evidence that its block is active carries the adoption reply and is excluded), and rows the node definitively rejected unless the reply names a side-chain block (inconclusive, duplicate, duplicate-inconclusive: a lost tip race). A node-accepted lost race awaiting its orphan proof and a landing that keeps failing after acceptance are unfinished but accepted, so they age only block_candidate_oldest_pending_seconds (and the landing-failed gauge). PrismBlockCandidateOldestPendingCritical pages on this gauge, falling back to the all-unfinished age on a target that does not export it yet; PrismBlockCandidateStuck warns on the all-unfinished age at 30 minutes. -1 with the other candidate gauges when the collector fails."
     },
     "block_candidate_oldest_landing_failed_seconds": {
-      "status": "Read in the same database snapshot as the other candidate gauges (#493 review M1): the oldest reconciliation row whose last_error carries the landing-failed prefix the coordinator and the collector share, that is a row the node accepted or rejected whose audit rebuild, verification or ledger landing keeps refusing and is retried at the reconciliation backoff. Zero for a lost race (not-active reason) and for a rejection (its reply). PrismBlockCandidateLandingFailed warns at 60 s for 3 m and PrismBlockCandidateLandingFailedCritical pages at 307 s for 1 m, the same floor and dwell the revision-work critical applies when the landing fails after the frontend's own active-chain observation, so a won block whose landing keeps failing is never silent. -1 with the other candidate gauges when the collector fails."
+      "status": "Read in the same database snapshot as the other candidate gauges (#493 review M1): the oldest reconciliation row whose landing has not committed (the landing transaction is the only writer of the block's qbit_pool_blocks row, so its absence is the durable fact) or whose last_error carries the landing-failed prefix the coordinator and the collector share (a landed row that no longer authenticates): a row the node accepted or rejected whose audit rebuild, verification or ledger landing keeps refusing and is retried at the reconciliation backoff. A retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but not the missing pool-block row, so the age never reads zero while nothing has landed. Measured from offer_reserved_at, the start of the post-offer lifecycle, so pre-offer retry backoff never counts toward it. Zero for a lost race (not-active reason) and for a rejection (its reply). PrismBlockCandidateLandingFailed warns at 60 s for 3 m and PrismBlockCandidateLandingFailedCritical pages at 307 s for 1 m, the same floor and dwell the revision-work critical applies when the landing fails after the frontend's own active-chain observation, so a won block whose landing keeps failing is never silent. -1 with the other candidate gauges when the collector fails."
     },
     "blocks_total": {
-      "replaces": [
-        "qbit_prism_blocks_accepted_total"
-      ],
-      "status": "Native confirmed-block process counter; not the legacy node-acceptance accounting boundary."
+      "status": "Process-local count of first block confirmations observed after a successful settlement or reconciliation commit. Reconciliation includes a previously orphaned candidate that later becomes active; the durable audit publication marker prevents repeat counting on later disconnect/reconnect cycles. Cancellation or restart after commit can lose an increment."
     },
     "block_candidates_orphaned_total": {
       "status": "Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
@@ -221,6 +212,12 @@
       "replaces": [
         "qbit_prism_metrics_snapshot_age_seconds"
       ]
+    },
+    "blocks_total": {
+      "replaces": [
+        "qbit_prism_blocks_accepted_total"
+      ],
+      "status": "Native confirmed-block process counter; not the legacy node-acceptance accounting boundary."
     },
     "stratum_connection_refusals_total": {
       "labels": {
