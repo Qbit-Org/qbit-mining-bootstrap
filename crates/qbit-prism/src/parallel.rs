@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{Scope, ScopedJoinHandle};
 
 /// How much of a build may run on worker threads.
@@ -85,9 +85,9 @@ impl Default for Parallelism {
     }
 }
 
-/// One job on the builder pool: a borrowed closure whose lifetime was erased
-/// by [`ordered_chunks`], which never returns (or unwinds) before the job
-/// has finished.
+/// One job on the builder pool: a closure borrowing the caller's `produce`,
+/// its lifetime erased by [`ordered_chunks`], which never returns (or
+/// unwinds) before every job's last use of that borrow.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// The builder pool's thread count for this process, fixed by the operator
@@ -264,18 +264,27 @@ impl<C, E> State<C, E> {
     }
 }
 
-/// Waits for every submitted job to finish, also while unwinding: no job may
-/// outlive the borrowed closures and state it was given.
-struct Drain<'a, C, E> {
-    state: &'a Mutex<State<C, E>>,
-    signal: &'a Condvar,
+/// One [`ordered_chunks`] call's state, shared with its jobs through an
+/// `Arc` rather than borrowed. A job's last actions, decrementing
+/// `outstanding` and unlocking the mutex, touch only this, and a finished
+/// job may still be inside that unlock (its futex wake) after the caller
+/// has seen zero and returned; nothing on the caller's frame is involved.
+/// Only `produce` stays borrowed, and its last use is inside a job's
+/// `catch_unwind`, before the decrement.
+struct Shared<C, E> {
+    state: Mutex<State<C, E>>,
+    signal: Condvar,
 }
+
+/// Waits for every submitted job to finish, also while unwinding: no job may
+/// outlive the borrowed `produce` it was given.
+struct Drain<'a, C, E>(&'a Shared<C, E>);
 
 impl<C, E> Drop for Drain<'_, C, E> {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         while state.outstanding > 0 {
-            state = self.signal.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self.0.signal.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -319,32 +328,31 @@ where
         }
     };
     let max_inflight = workers.clamp(1, count) * 2;
-    let state = Mutex::new(State {
-        ready: BTreeMap::new(),
-        failed: None,
-        panicked: None,
-        outstanding: 0,
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            ready: BTreeMap::new(),
+            failed: None,
+            panicked: None,
+            outstanding: 0,
+        }),
+        signal: Condvar::new(),
     });
-    let signal = Condvar::new();
-    let drain = Drain {
-        state: &state,
-        signal: &signal,
-    };
+    let drain = Drain(&shared);
     let produce: &(dyn Fn(usize) -> Result<C, E> + Sync) = &produce;
-    let (state_ref, signal_ref) = (&state, &signal);
     let mut next = 0;
     for index in 0..count {
         {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             while next < count && next - index < max_inflight && !guard.stopping() {
                 guard.outstanding += 1;
                 let submitted = next;
                 next += 1;
+                let shared = Arc::clone(&shared);
                 let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         produce(submitted)
                     }));
-                    let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     match outcome {
                         Ok(Ok(chunk)) => {
                             guard.ready.insert(submitted, chunk);
@@ -357,19 +365,22 @@ where
                         }
                     }
                     guard.outstanding -= 1;
-                    signal_ref.notify_all();
+                    shared.signal.notify_all();
                 });
-                // SAFETY: the job borrows `produce`, `state` and `signal`,
-                // which outlive every exit path of this function: `drain`,
-                // declared after them, waits for `outstanding` to reach zero
-                // before it is dropped, on return and on unwind alike, and
-                // jobs never block, so that wait ends.
+                // SAFETY: the only borrow the job carries is `produce`, a
+                // parameter of this function that outlives every exit path:
+                // `drain`, declared after it, waits for `outstanding` to
+                // reach zero before it is dropped, on return and on unwind
+                // alike, jobs never block, so that wait ends, and a job's
+                // last use of `produce` is inside `catch_unwind`, before it
+                // decrements `outstanding`. Everything a job touches after
+                // that decrement is owned by its clone of `shared`.
                 let job: Job = unsafe { std::mem::transmute(job) };
                 pool.submit(job);
             }
         }
         let chunk = {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(chunk) = guard.ready.remove(&index) {
                     break Some(chunk);
@@ -377,14 +388,15 @@ where
                 if guard.stopping() {
                     break None;
                 }
-                guard = signal.wait(guard).unwrap_or_else(|e| e.into_inner());
+                guard = shared.signal.wait(guard).unwrap_or_else(|e| e.into_inner());
             }
         };
         let Some(chunk) = chunk else {
             break;
         };
         if let Err(error) = consume(index, chunk) {
-            state
+            shared
+                .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .failed
@@ -393,11 +405,14 @@ where
         }
     }
     drop(drain);
-    let mut state = state.into_inner().unwrap_or_else(|e| e.into_inner());
-    if let Some(panic) = state.panicked.take() {
+    let (panicked, failed) = {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.panicked.take(), state.failed.take())
+    };
+    if let Some(panic) = panicked {
         std::panic::resume_unwind(panic);
     }
-    match state.failed.take() {
+    match failed {
         Some(error) => Err(error),
         None => Ok(()),
     }
