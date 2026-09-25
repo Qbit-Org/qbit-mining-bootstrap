@@ -30,10 +30,12 @@ pub async fn waits_for_the_cohort_fence<T: Send + 'static>(
     let cohort_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *cohort)
         .await?;
-    let mut writer = tokio::spawn(writer);
+    // Aborted if this helper leaves early (a timeout or a failed probe), so
+    // no writer outlives the test's database.
+    let mut writer = AbortOnDrop(tokio::spawn(writer));
     let blocked = timeout(Duration::from_secs(10), async {
         loop {
-            if writer.is_finished() {
+            if writer.0.is_finished() {
                 return Ok::<_, anyhow::Error>(false);
             }
             let blocked: bool = sqlx::query_scalar(
@@ -51,7 +53,7 @@ pub async fn waits_for_the_cohort_fence<T: Send + 'static>(
     .await
     .with_context(|| format!("{what} neither finished nor waited for a job cohort's fence"))??;
     if !blocked {
-        let outcome = (&mut writer).await?;
+        let outcome = (&mut writer.0).await?;
         cohort.rollback().await?;
         bail!(
             "{what} finished under a held job cohort fence ({:?}); an authority write must take the cluster row FOR UPDATE first",
@@ -59,8 +61,16 @@ pub async fn waits_for_the_cohort_fence<T: Send + 'static>(
         );
     }
     cohort.commit().await?;
-    timeout(Duration::from_secs(30), writer)
+    timeout(Duration::from_secs(30), &mut writer.0)
         .await
         .with_context(|| format!("{what} never proceeded after the cohort fence was released"))?
         .context("writer task")
+}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }

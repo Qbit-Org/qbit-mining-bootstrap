@@ -762,10 +762,12 @@ impl Ledger {
         // function call inside the probe's WHERE clause the floor was applied
         // as a per-leaf filter and the executor descended every attached
         // partition, the empty lead included; as bound values the executor
-        // prunes at startup to the leaves between them (this transaction
-        // forces generic plans, see `APPEND_TRANSACTION_BEGIN`, so the probe
-        // is planned once per connection and pruned at run time rather than
-        // re-planned per share). The ceiling is the next share_seq: every row
+        // prunes at startup to the leaves between them (the share append's
+        // transaction forces generic plans, see `APPEND_TRANSACTION_BEGIN`, so
+        // the probe is planned once per connection and pruned at run time
+        // rather than re-planned per share; the settlement's deferred-share
+        // credit runs this inside the settlement's transaction under the default mode,
+        // once per landed block, where a custom plan is fine). The ceiling is the next share_seq: every row
         // that can exist is below it, because rows are appended under the
         // lock this transaction holds and imported partitions carry sequences
         // the ledger already handed out (archive attach refuses a partition

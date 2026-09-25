@@ -2573,21 +2573,18 @@ pub async fn restore(
                 .await?;
         }
         // The append's share_id probe is bounded above by the next share
-        // sequence (#479): every row it can match must lie below it. Checked
-        // last, so every earlier refusal keeps its meaning. The
-        // restored rows themselves, not the archive's summary, are checked,
-        // on a fresh import and on a re-attach alike. A row above would still
-        // be answered by the credited-header fallback, so this keeps the
-        // bounded fast path exact rather than closing a duplicate hole.
-        let highest: Option<i64> =
-            sqlx::query_scalar(&format!("SELECT max(share_seq) FROM {partition_name}"))
-                .fetch_one(&mut *tx)
-                .await?;
+        // sequence (#479): every row it can match must lie below it. A fresh
+        // import already refused a last share sequence at or above it; this
+        // covers a re-attach too. `summary` was re-streamed from the restored
+        // rows above, so its last sequence is theirs. Checked last, so every
+        // earlier refusal keeps its meaning. A row above would still be
+        // answered by the credited-header fallback, so this keeps the bounded
+        // fast path exact rather than closing a duplicate hole.
         let ceiling = next_share_seq(&mut tx).await?;
         ensure!(
-            highest.is_none_or(|highest| highest < ceiling),
+            summary.last_share_seq.is_none_or(|last| last < ceiling),
             "refusing to attach {partition_name}: it holds share sequence {} at or above the destination's next share sequence {ceiling}, where the append's bounded duplicate probe does not look. Restore without --attach to inspect the archive",
-            number_or(highest, "(none)")
+            number_or(summary.last_share_seq, "(none)")
         );
         attached = true;
     }
