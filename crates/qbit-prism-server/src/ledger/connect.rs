@@ -624,6 +624,24 @@ pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     Ok(())
 }
 
+/// Take the cluster row's exclusive lock before an authority write.
+///
+/// Every writer of `payout_revision`, `config_fingerprint` or `fatal_error`
+/// holds this (or its own `SELECT … FOR UPDATE` on the row) before its
+/// `UPDATE`, so a job-persistence transaction can fence authority with
+/// `FOR KEY SHARE`: that lock conflicts with `FOR UPDATE` and with blob GC's
+/// exclusive fence, but not with the share append's `ledger_clock_ms`
+/// `UPDATE`, which changes no key column and is not an authority write. A
+/// bare `UPDATE` of a non-key column would take `FOR NO KEY UPDATE` and slip
+/// past a `KEY SHARE` fence, which is why authority writers never rely on the
+/// `UPDATE`'s own lock.
+pub(super) async fn lock_cluster_authority(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn require_revision(
     tx: &mut Transaction<'_, Postgres>,
     expected: i64,

@@ -201,10 +201,12 @@ impl Ledger {
         let payload =
             tokio::task::spawn_blocking(move || encode_record(&owned, expires_at_ms)).await??;
         let mut tx = self.begin().await?;
-        // Fence ordinary authority UPDATEs and blob GC before ALL authority
-        // checks. No advisory lock may be acquired after this shared row fence.
+        // Fence authority writers (each takes the row FOR UPDATE first; see
+        // `lock_cluster_authority`) and blob GC before ALL authority checks,
+        // without blocking the share append's non-key clock UPDATE. No
+        // advisory lock may be acquired after this shared row fence.
         let fingerprint: Option<String> = sqlx::query_scalar(
-            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
+            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE",
         )
         .fetch_one(&mut *tx)
         .await?;

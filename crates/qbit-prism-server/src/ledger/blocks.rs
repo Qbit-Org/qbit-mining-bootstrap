@@ -570,6 +570,7 @@ impl Ledger {
                 let message = format!(
                     "mature pool block disconnected: {hash}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>"
                 );
+                super::connect::lock_cluster_authority(tx).await?;
                 sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut **tx).await?;
                 return Ok((Some(message), effects));
             }
@@ -896,6 +897,7 @@ async fn deactivate_pool_block(
 }
 
 async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    super::connect::lock_cluster_authority(tx).await?;
     sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton").execute(&mut **tx).await?;
     Ok(())
 }

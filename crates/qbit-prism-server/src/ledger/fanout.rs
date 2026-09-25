@@ -71,6 +71,7 @@ impl Ledger {
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         require_fanout(&mut tx, claim).await?;
         require_revision(&mut tx, expected_revision).await?;
+        super::connect::lock_cluster_authority(&mut tx).await?;
         sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton")
             .bind(format!("deep confirmed CTV fanout disconnected: {}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>",claim.fanout_txid)).execute(&mut *tx).await?;
         tx.commit().await?;

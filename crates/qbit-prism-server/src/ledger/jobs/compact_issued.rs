@@ -161,12 +161,14 @@ impl Ledger {
 
         let mut tx = self.begin().await?;
         // Acquire the row fence before reading mutable cluster state: if this
-        // waits behind an ordinary authority UPDATE, all checks below see its
-        // committed state. SHARE (not KEY SHARE) also excludes blob GC through
-        // commit, including repair that reuses surviving orphan blobs. Never
-        // acquire SETTLEMENT or ORDER after this fence.
+        // waits behind an authority writer's FOR UPDATE, all checks below see
+        // its committed state. KEY SHARE conflicts with that FOR UPDATE and
+        // with blob GC's exclusive fence through commit, including repair that
+        // reuses surviving orphan blobs, but not with the share append's
+        // non-key `ledger_clock_ms` UPDATE (see `lock_cluster_authority`).
+        // Never acquire SETTLEMENT or ORDER after this fence.
         let fingerprint: Option<String> = sqlx::query_scalar(
-            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
+            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE",
         )
         .fetch_one(&mut *tx)
         .await?;
