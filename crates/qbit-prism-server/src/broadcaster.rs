@@ -23,10 +23,11 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
     // Tip observations recorded from here on can supersede this chain view.
     let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.
-    let chain = crate::readiness::chain_info(
+    let chain = crate::readiness::chain_info_with_metrics(
         &coordinator.rpc,
         &coordinator.config.chain,
         coordinator.config.min_peers,
+        Some(&coordinator.metrics),
     )
     .await?;
     coordinator
@@ -125,10 +126,11 @@ fn confirmed(hash: &str, height: u64, tip: u64) -> Result<(&'static str, Value)>
 
 async fn process(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<(&'static str, Value)> {
     coordinator.ledger.renew_fanout_claim(claim, 120).await?;
-    let chain = crate::readiness::chain_info(
+    let chain = crate::readiness::chain_info_with_metrics(
         &coordinator.rpc,
         &coordinator.config.chain,
         coordinator.config.min_peers,
+        Some(&coordinator.metrics),
     )
     .await?;
     let revision = coordinator

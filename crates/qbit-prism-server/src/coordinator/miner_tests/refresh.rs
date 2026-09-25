@@ -252,3 +252,135 @@ async fn replacement_lease_cannot_persist_a_superseded_same_parent_payout() {
         .unwrap()
         .contains_key(&old.wire.job_id));
 }
+
+/// Observations of `qbit_prism_refresh_seconds` with `trigger`, summed over
+/// every acquisition, beside the rendered refresh samples for the message.
+fn refresh_observations(coordinator: &Coordinator, trigger: &str) -> (f64, String) {
+    let wanted = format!("trigger=\"{trigger}\"");
+    let rendered = coordinator.metrics.render();
+    let samples: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("qbit_prism_refresh_seconds_count{"))
+        .collect();
+    let count = samples
+        .iter()
+        .filter(|line| line.contains(&wanted))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<f64>().unwrap())
+        .fold(0.0, |sum, value| sum + value);
+    (count, samples.join("\n"))
+}
+
+fn assert_refresh_observations(coordinator: &Coordinator, trigger: &str, expected: f64) {
+    let (count, samples) = refresh_observations(coordinator, trigger);
+    assert_eq!(count, expected, "trigger={trigger} samples:\n{samples}");
+}
+
+/// The refresh trigger label keeps its precedence on a new template for the
+/// same tip, where no ledger probe runs at entry: a payout revision that
+/// changed as well is named `revision`, not `template`, and a template change
+/// alone stays `template`.
+#[tokio::test]
+async fn same_tip_template_change_names_a_revision_change_ahead_of_template() {
+    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    // The fixture installs published work without a cached window, so the
+    // first refresh rebuilds on the same template and is labelled `reanchor`,
+    // as documented; it leaves the cached window the next refreshes read.
+    fixture.coordinator.refresh_once().await.unwrap();
+    assert_refresh_observations(&fixture.coordinator, "reanchor", 1.0);
+    let retemplate = |coinbasevalue: u64| {
+        let mut node = fixture.node.lock().unwrap();
+        let tip = node.tip.clone();
+        node.template = Some(json!({"version":0x20000000u32,"bits":"207fffff",
+            "curtime":chrono::Utc::now().timestamp(),"previousblockhash":tip,
+            "transactions":[],"height":101,"coinbasevalue":coinbasevalue}));
+    };
+    // A new template on the same tip and a new payout revision on one poll.
+    retemplate(500_000_001);
+    fixture.store.revision.store(1, Ordering::SeqCst);
+    fixture.coordinator.refresh_once().await.unwrap();
+    assert_eq!(
+        fixture
+            .coordinator
+            .prepared
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .payout_revision,
+        1
+    );
+    assert_refresh_observations(&fixture.coordinator, "revision", 1.0);
+    assert_refresh_observations(&fixture.coordinator, "template", 0.0);
+    // A new template alone.
+    retemplate(500_000_002);
+    fixture.coordinator.refresh_once().await.unwrap();
+    assert_refresh_observations(&fixture.coordinator, "template", 1.0);
+    assert_refresh_observations(&fixture.coordinator, "revision", 1.0);
+}
+
+/// The label's precedence over what changed, `template` last.
+#[test]
+fn refresh_trigger_precedence_is_tip_revision_balances_reanchor_shares_fee_template() {
+    let within = RefreshChanges {
+        window_within_reanchor: true,
+        ..RefreshChanges::default()
+    };
+    assert_eq!(classify_refresh(within), RefreshTrigger::Template);
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            fee: true,
+            ..within
+        }),
+        RefreshTrigger::Fee
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            shares: true,
+            fee: true,
+            ..within
+        }),
+        RefreshTrigger::Shares
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            window_within_reanchor: false,
+            shares: true,
+            fee: true,
+            ..within
+        }),
+        RefreshTrigger::Reanchor
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            balances: true,
+            window_within_reanchor: false,
+            shares: true,
+            fee: true,
+            ..within
+        }),
+        RefreshTrigger::Balances
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            revision: true,
+            balances: true,
+            window_within_reanchor: false,
+            shares: true,
+            fee: true,
+            ..within
+        }),
+        RefreshTrigger::Revision
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            tip: true,
+            revision: true,
+            balances: true,
+            window_within_reanchor: false,
+            shares: true,
+            fee: true,
+        }),
+        RefreshTrigger::Tip
+    );
+}

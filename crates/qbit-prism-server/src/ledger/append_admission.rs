@@ -1,6 +1,6 @@
 //! Keep share transactions from occupying every connection while they wait
 //! for ORDER_LOCK. This is admission to one pool, not an accounting lock.
-use sqlx::{pool::PoolConnection, PgPool, Postgres};
+use sqlx::{pool::PoolConnection, PgPool, Postgres, Transaction};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -76,7 +76,8 @@ impl Admission {
 
     pub(super) fn attach(self, connection: PoolConnection<Postgres>) -> AppendConnection {
         AppendConnection {
-            connection,
+            connection: Some(connection),
+            began: false,
             admission: Some(self),
         }
     }
@@ -85,13 +86,72 @@ impl Admission {
 pub(super) struct AppendConnection {
     // The transaction borrows this connection. Its drop must queue rollback
     // before this guard hands the connection and permit to SQLx cleanup.
-    pub(super) connection: PoolConnection<Postgres>,
+    // Taken by `Drop`; present for the guard's whole life before that.
+    connection: Option<PoolConnection<Postgres>>,
+    // Whether `BEGIN` completed. From then on the transaction's own drop
+    // queues its `ROLLBACK`; before that, the server may hold a transaction
+    // this client has not counted (see `begin`).
+    began: bool,
     admission: Option<Admission>,
+}
+
+impl AppendConnection {
+    /// `statement` opens the transaction on this connection, borrowed so
+    /// that the guard keeps owning the checkout and its permit.
+    ///
+    /// SQLx counts the transaction only once the reply to `BEGIN` is read
+    /// (`sqlx-postgres` 0.8.6, `PgTransactionManager::begin`), and its
+    /// cancellation guard rolls back nothing before that. A persist task
+    /// aborted at the share-commit deadline, or dropped by a miner
+    /// disconnect, between the write and the reply would therefore hand the
+    /// pool a connection whose server side is still in a transaction, and
+    /// the next checkout's `BEGIN` would land inside it (#482). The guard
+    /// records completion here; until then, `Drop` retires the connection
+    /// instead of returning it.
+    ///
+    /// `statement` may carry more than `BEGIN` (the append sends its
+    /// `SET LOCAL` in the same simple query). SQLx sends it as one simple
+    /// query and reads every reply up to its `ReadyForQuery` before it
+    /// returns, so completion is recorded only once the whole round trip is
+    /// in; a cancel between any two of its replies still retires the
+    /// connection.
+    pub(super) async fn begin(
+        &mut self,
+        statement: &'static str,
+    ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+        let connection = self.connection.as_mut().expect("append connection");
+        let transaction = Transaction::begin(&mut **connection, Some(statement.into())).await?;
+        self.began = true;
+        Ok(transaction)
+    }
 }
 
 impl Drop for AppendConnection {
     fn drop(&mut self) {
         let admission = self.admission.take().expect("append connection admission");
+        let runtime = admission.runtime.clone();
+        let Some(mut connection) = self.connection.take() else {
+            return;
+        };
+        if !self.began {
+            // `BEGIN` never completed: its reply was not read (the append was
+            // cancelled between the write and the reply) or the server
+            // refused it. The server may be inside a transaction SQLx would
+            // not roll back, so this connection must not be offered to the
+            // next checkout. `detach` leaves the pool synchronously, size
+            // and permit included, so the pool opens a replacement and can
+            // never see this connection again, whether or not the close
+            // below ever runs. The graceful close sends `Terminate`; a close
+            // that is never polled (runtime shut down) drops the raw
+            // connection, which closes the socket, and the server aborts
+            // whatever it held. The admission permit is released with it.
+            let raw = connection.detach();
+            runtime.spawn(async move {
+                let _ = sqlx::Connection::close(raw).await;
+                drop(admission);
+            });
+            return;
+        }
         // Transaction::drop only QUEUES rollback. SQLx's normal pool return
         // flushes the pending protocol, including rollback or an uncertain
         // COMMIT reply, before releasing/closing the connection. Keep the
@@ -105,8 +165,7 @@ impl Drop for AppendConnection {
         // ownership, the permit. Re-check this on any SQLx upgrade. SQLx's
         // own PoolConnection::drop then sees no live connection and spawns
         // nothing for the ledger pool, which sets no min_connections.
-        let cleanup = self.connection.return_to_pool();
-        let runtime = admission.runtime.clone();
+        let cleanup = connection.return_to_pool();
         runtime.spawn(async move {
             cleanup.await;
             drop(admission);

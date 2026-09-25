@@ -1,5 +1,6 @@
 use super::*;
 use crate::metrics::{time_pool_acquire, LockKind, Metrics, Outcome};
+use sqlx::pool::PoolConnection;
 use sqlx::PgConnection;
 
 mod acquire;
@@ -171,8 +172,10 @@ impl Ledger {
     }
 
     /// Begin a ledger transaction, recording this ledger's pool acquisition.
+    /// The `BEGIN` round trip itself is [`shielded_begin`]: a caller cancelled
+    /// while it is in flight leaves no transaction behind on the connection.
     pub(super) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-        Transaction::begin(self.acquire().await?, None).await
+        shielded_begin(self.acquire().await?).await
     }
 
     /// Take one advisory lock, recording this ledger's wait for it.
@@ -608,7 +611,39 @@ async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-    Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await
+    shielded_begin(time_pool_acquire(metrics, pool.acquire()).await?).await
+}
+
+/// `BEGIN` on a checked-out connection, in a task of its own so that the
+/// caller's cancellation cannot leave the server's transaction behind.
+///
+/// SQLx 0.8.6 (`sqlx-postgres/src/transaction.rs`, `PgTransactionManager::begin`)
+/// writes `BEGIN`, awaits its reply and only then counts the transaction
+/// (`transaction_depth`); the guard it drops on cancellation rolls back
+/// nothing at depth 0. A future dropped between the write and the reply, at
+/// the share-commit deadline, a miner disconnect or any `tokio::time::timeout`
+/// around a ledger call, hands the connection back to the pool with a
+/// transaction open on the server that the client never learned about: the
+/// pool's release ping consumes the reply, and the next checkout's `BEGIN`
+/// lands inside that transaction, which PostgreSQL reports as `there is
+/// already a transaction in progress` (#482). Running the round trip in its
+/// own task detaches it from the caller: an aborted or dropped caller lets
+/// the task read the reply, and the transaction the task then drops queues
+/// the `ROLLBACK` that the pool return flushes before the connection is
+/// offered again. On the successful path nothing changes: one `BEGIN`, the
+/// same connection, no further statement. The task is joined, never
+/// spawned-and-forgotten, so a panic in it propagates as it did before.
+pub(crate) async fn shielded_begin(
+    connection: PoolConnection<Postgres>,
+) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+    match tokio::spawn(Transaction::begin(connection, None)).await {
+        Ok(began) => began,
+        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+        // Only a runtime that is shutting down cancels the task; the
+        // connection it held is closed rather than returned, and the caller
+        // sees the same kind of error a closed socket would give it.
+        Err(join) => Err(sqlx::Error::Io(std::io::Error::other(join))),
+    }
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {

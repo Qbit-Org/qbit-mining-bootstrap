@@ -1,4 +1,5 @@
-//! Database-free unit coverage for the load harness.
+//! Database-free unit coverage for the load harness, and one gated start of
+//! the managed cluster against a real PostgreSQL 16.
 //!
 //! Every assertion here is checked against the production code it has to
 //! agree with: the server's `codec`, its `capacity` validator and the refusal
@@ -4763,6 +4764,208 @@ fn a_postgres_bin_directory_without_the_server_binaries_is_refused() -> Result<(
     Ok(())
 }
 
+/// A scratch directory under the temp dir, emptied first.
+fn scratch_dir(tag: &str) -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("prism-load-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// #485: `--min-mem-available-mib` reads `MemAvailable`, and when that could
+/// not be read -- on macOS, where there is no `/proc/meminfo` -- the floor
+/// check did nothing and the run went on unguarded. A floor the host cannot
+/// measure is refused at entry, naming the flag and the way to run without
+/// one; a floor of 0 asks for none and runs anywhere.
+#[test]
+fn a_memory_floor_the_host_cannot_measure_is_refused_at_entry() -> Result<()> {
+    let dir = scratch_dir("meminfo")?;
+
+    // The source: a missing file, and one without the line, both read as
+    // unknown, never as some amount of memory.
+    assert_eq!(measure::mem_available_kib_at(&dir.join("absent")), None);
+    let without = dir.join("without");
+    std::fs::write(&without, "MemTotal:       16318320 kB\nMemFree:  1 kB\n")?;
+    assert_eq!(measure::mem_available_kib_at(&without), None);
+    let with = dir.join("with");
+    std::fs::write(
+        &with,
+        "MemTotal:       16318320 kB\nMemAvailable:    9876543 kB\n",
+    )?;
+    assert_eq!(measure::mem_available_kib_at(&with), Some(9_876_543));
+
+    // The entry: the default floor with nothing to read is refused.
+    let unread = measure::mem_available_kib_at(&dir.join("absent"));
+    let refused = format!(
+        "{:#}",
+        measure::verify_memory_floor(4096, unread)
+            .expect_err("a floor that can never operate is refused")
+    );
+    assert!(
+        refused.contains("--min-mem-available-mib 4096"),
+        "{refused}"
+    );
+    assert!(refused.contains("cannot be enforced"), "{refused}");
+    assert!(refused.contains(measure::MEMINFO_PATH), "{refused}");
+    assert!(
+        refused.contains("--min-mem-available-mib 0"),
+        "the refusal names the way to run without a floor: {refused}"
+    );
+
+    // No floor asked for: nothing to enforce, accepted without a reading.
+    measure::verify_memory_floor(0, None)?;
+    // A floor with a reading, whatever it is, is the run's own business.
+    measure::verify_memory_floor(4096, Some(1))?;
+    measure::verify_memory_floor(4096, measure::mem_available_kib_at(&with))?;
+
+    // This host's own source is what `execute` hands the check.
+    if cfg!(target_os = "linux") {
+        assert!(
+            measure::mem_available_kib().is_some(),
+            "a Linux host reads MemAvailable from {}",
+            measure::MEMINFO_PATH
+        );
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: the managed cluster preloaded `pg_stat_statements` only when
+/// `pkglibdir` held `pg_stat_statements.so`; Homebrew's PostgreSQL ships
+/// `pg_stat_statements.dylib`, so on macOS the extension was never loaded
+/// and every lock-statement column read `n/a`.
+#[test]
+fn pg_stat_statements_is_found_as_a_shared_object_or_a_dylib() -> Result<()> {
+    use qbit_prism_load::cluster::pg_stat_statements_library;
+    let dir = scratch_dir("pkglibdir")?;
+    assert_eq!(pg_stat_statements_library(&dir), None, "an empty pkglibdir");
+
+    // A directory of that name is not the library.
+    std::fs::create_dir(dir.join("pg_stat_statements.so"))?;
+    assert_eq!(pg_stat_statements_library(&dir), None);
+    std::fs::remove_dir(dir.join("pg_stat_statements.so"))?;
+
+    // macOS, Homebrew.
+    std::fs::write(dir.join("pg_stat_statements.dylib"), b"")?;
+    assert_eq!(
+        pg_stat_statements_library(&dir),
+        Some(dir.join("pg_stat_statements.dylib"))
+    );
+    std::fs::remove_file(dir.join("pg_stat_statements.dylib"))?;
+
+    // Linux.
+    std::fs::write(dir.join("pg_stat_statements.so"), b"")?;
+    assert_eq!(
+        pg_stat_statements_library(&dir),
+        Some(dir.join("pg_stat_statements.so"))
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: under macOS's default `TMPDIR` the cluster root put PostgreSQL's
+/// socket at 107 bytes, over the 103 it accepts, and the harness exited with
+/// `pg_ctl failed` and nothing else. The root is now short enough for that
+/// `TMPDIR`, and a base too deep for any root is refused before anything is
+/// created, naming `TMPDIR` and the limit. Linux's limit is 107 bytes rather
+/// than 103, so the deep base here is deep enough for both.
+#[test]
+fn a_cluster_root_too_deep_for_the_postgres_socket_is_refused_before_it_is_created() -> Result<()> {
+    use qbit_prism_load::cluster::{TempRoot, MAX_SOCKET_PATH_BYTES};
+
+    // macOS's default: `/var/folders/<2>/<28>/T/`, 49 bytes. Measured, not
+    // created: the root has to fit with the widest port.
+    let macos_default = std::path::Path::new("/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T");
+    let root_name = format!("prism-load-{}", "0".repeat(12));
+    let socket = macos_default.join(&root_name).join(".s.PGSQL.65535");
+    assert!(
+        socket.as_os_str().len() <= 103,
+        "{} is {} bytes, over macOS's 103",
+        socket.display(),
+        socket.as_os_str().len()
+    );
+
+    // A root really created under the ordinary temp dir has that shape.
+    let root = TempRoot::create(false)?;
+    let name = root
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 root name")
+        .to_owned();
+    assert_eq!(name.len(), root_name.len(), "{name}");
+    assert!(name.starts_with("prism-load-"), "{name}");
+    drop(root);
+
+    // A base too deep for the socket at all.
+    let deep = std::env::temp_dir().join("d".repeat(MAX_SOCKET_PATH_BYTES));
+    let refused = format!(
+        "{:#}",
+        TempRoot::create_in(&deep, false)
+            .err()
+            .expect("a root whose socket cannot fit is refused")
+    );
+    assert!(refused.contains("TMPDIR"), "{refused}");
+    assert!(
+        refused.contains(&format!("{MAX_SOCKET_PATH_BYTES}-byte limit")),
+        "{refused}"
+    );
+    assert!(
+        !deep.exists(),
+        "the refusal comes before anything is created"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_start_carries_the_end_of_the_server_log() -> Result<()> {
+    use qbit_prism_load::cluster::log_tail;
+    let dir = scratch_dir("logtail")?;
+    assert_eq!(log_tail(&dir.join("absent.log"), 20), None);
+    std::fs::write(dir.join("empty.log"), "\n\n")?;
+    assert_eq!(log_tail(&dir.join("empty.log"), 20), None);
+    let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    std::fs::write(dir.join("server.log"), lines.join("\n\n") + "\n")?;
+    assert_eq!(
+        log_tail(&dir.join("server.log"), 3).as_deref(),
+        Some("line 28\nline 29\nline 30")
+    );
+    assert_eq!(
+        log_tail(&dir.join("server.log"), 100).map(|tail| tail.lines().count()),
+        Some(30)
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// #485: a managed cluster that fails to start reports PostgreSQL's own
+/// reason. `pg_ctl` says only that the server did not start, and the log
+/// holding the reason used to be removed with the failed root. A
+/// `max_connections` of 0 is refused by the server itself, the same way the
+/// over-long socket path was: in its log, after `pg_ctl` has started it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_managed_cluster_that_fails_to_start_reports_the_servers_own_reason() -> Result<()> {
+    use qbit_prism_load::cluster::{self, ManagedPostgres, Replication};
+    use qbit_prism_test_gate as gate;
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let bin = std::path::PathBuf::from(bin);
+    cluster::verify_bin_dir(&bin)?;
+    let error = ManagedPostgres::start(bin, Replication::None, 0, false)
+        .await
+        .err()
+        .expect("PostgreSQL refuses max_connections=0");
+    let error = format!("{error:#}");
+    assert!(error.contains("pg_ctl failed"), "{error}");
+    assert!(error.contains("PostgreSQL did not start"), "{error}");
+    assert!(
+        error.contains("max_connections"),
+        "the server's own reason is in the error: {error}"
+    );
+    Ok(())
+}
+
 #[test]
 fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     assert_eq!(
@@ -7534,6 +7737,14 @@ fn pending(message: &str) -> client::Outcome {
     })
 }
 
+fn rejected(code: i64, reason_id: &str, message: &str) -> client::Outcome {
+    client::Outcome::Rejected(Rejection {
+        code,
+        reason_id: Some(reason_id.to_owned()),
+        message: message.to_owned(),
+    })
+}
+
 fn node_submission(hash: &str, height: u64, accepted: bool) -> node::SubmissionRecord {
     node::SubmissionRecord {
         block_hash: hash.to_owned(),
@@ -8701,6 +8912,43 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
         document["proposed_budget_for_issue_291"]["recommended_soak_budget_millis"],
         Value::Null
     );
+    // #480: with no landing every number in the block is unknown, and each
+    // null now carries its own reason. (#447's 0.0 came from landings whose
+    // spans were credited nothing; that shape is
+    // landings_whose_spans_held_no_owned_rejection_report_measured_zeros.)
+    let budget = &document["proposed_budget_for_issue_291"];
+    for (value, reason) in [
+        (
+            "rejections_per_landing_per_frontend_p99",
+            "rejections_per_landing_per_frontend_p99_unavailable_reason",
+        ),
+        ("window_p99_millis", "window_p99_unavailable_reason"),
+    ] {
+        assert_eq!(budget[value], Value::Null, "{value} is unknown, never 0.0");
+        assert!(
+            budget[reason]
+                .as_str()
+                .expect("a null carries its reason")
+                .contains("no landing produced a window"),
+            "{reason}"
+        );
+    }
+    for (value, reason) in [
+        (
+            "rejected_before_new_revision_work_per_landing_per_frontend_p99",
+            "rejected_before_new_revision_work_unavailable_reason",
+        ),
+        (
+            "acceptance_to_new_revision_work_p99_millis",
+            "acceptance_to_new_revision_work_unavailable_reason",
+        ),
+    ] {
+        assert_eq!(budget["same_edge_as_issue_458"][value], Value::Null);
+        assert!(
+            budget["same_edge_as_issue_458"][reason].is_string(),
+            "{reason}"
+        );
+    }
     assert_eq!(document["lost_valid_work"]["shares"], json!(0));
 
     // Every attempt failing is a different reason, and it names the tally.
@@ -8722,6 +8970,42 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
     assert_eq!(failed["bumps"], json!(0));
     let reason = failed["reason"].as_str().expect("a reason");
     assert!(reason.contains("never_produced=1"), "{reason}");
+
+    // Rejections the landing would own, in a phase where nothing landed: they
+    // are counted and unattributed, and the per-landing cost stays unknown
+    // rather than collapsing to 0.0 (#480).
+    let stranded = vec![dense_submit(
+        &"9".repeat(64),
+        1,
+        1,
+        at(base, 30_000),
+        at(base, 30_100),
+        rejected(21, "stale-job", classify::STALE_JOB),
+        false,
+    )];
+    let unlanded = cadence::build(&cadence::ReportInputs {
+        landing_budget: 12,
+        slots_over_budget: 0,
+        landings: &landings,
+        submits: &stranded,
+        ..inputs
+    });
+    assert_eq!(unlanded["landings"], json!(0));
+    assert_eq!(
+        unlanded["rejection_attribution"]["rebuild_pending_rejections_in_phase"],
+        json!(1)
+    );
+    assert_eq!(unlanded["rejection_attribution"]["unattributed"], json!(1));
+    assert_eq!(
+        unlanded["proposed_budget_for_issue_291"]["rejections_per_landing_per_frontend_p99"],
+        Value::Null,
+        "no landing, so no per-landing count: null, not 0.0"
+    );
+    assert!(unlanded["proposed_budget_for_issue_291"]
+        ["rejections_per_landing_per_frontend_p99_unavailable_reason"]
+        .as_str()
+        .expect("a reason")
+        .contains("never_produced=1"));
 
     // A run that never asked for the scenario says so.
     let none = cadence::build(&cadence::ReportInputs {
@@ -8770,6 +9054,651 @@ fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
         drifted["bumps"],
         drifted["revision_sampler"]["changes_observed"]
     );
+}
+
+#[test]
+fn landing_cost_keys_on_the_reason_and_the_servers_messages() {
+    use classify::LandingCost;
+    let cost = |reason: Option<&str>, message: &str| {
+        classify::landing_cost(&Rejection {
+            code: 21,
+            reason_id: reason.map(str::to_owned),
+            message: message.to_owned(),
+        })
+    };
+    // What the current server answers for retired work (#480).
+    assert_eq!(
+        cost(Some("stale-job"), classify::STALE_JOB),
+        LandingCost::StaleJob
+    );
+    assert_eq!(
+        cost(Some("unknown-job"), classify::STALE_JOB),
+        LandingCost::UnknownJob
+    );
+    // Older producers' two messages are still the landing's.
+    assert_eq!(
+        cost(Some("stale-job"), classify::NEW_TIP_WORK_PENDING),
+        LandingCost::TipPending
+    );
+    assert_eq!(
+        cost(Some("stale-job"), classify::NEW_PAYOUT_WORK_PENDING),
+        LandingCost::PayoutPending
+    );
+    for owned in [
+        LandingCost::StaleJob,
+        LandingCost::UnknownJob,
+        LandingCost::TipPending,
+        LandingCost::PayoutPending,
+    ] {
+        assert!(owned.owned(), "{owned:?}");
+    }
+    // Recognised, and not a landing's cost.
+    for (reason, message) in [
+        (Some("stale-job"), classify::FEE_BELOW_RELAY_FLOOR),
+        (
+            Some("backend-rpc-unavailable"),
+            "current chain state is unavailable",
+        ),
+        (
+            Some("ledger-confirmation-failed"),
+            "share was not committed because its commit gate closed",
+        ),
+        (Some("pool-closed"), "no current work"),
+        (Some("low-difficulty"), "low difficulty share"),
+    ] {
+        assert_eq!(
+            cost(reason, message),
+            LandingCost::NotOwned,
+            "{reason:?} {message}"
+        );
+        assert!(!LandingCost::NotOwned.owned());
+    }
+    // Unknown is its own answer, never owned and never not-owned.
+    for (reason, message) in [
+        (
+            Some("stale-job"),
+            "some wording this harness has never seen",
+        ),
+        (Some("unknown-job"), "job not found"),
+        (Some("a-reason-from-the-future"), "stale job"),
+        (None, "stale job"),
+    ] {
+        assert_eq!(
+            cost(reason, message),
+            LandingCost::Unrecognised,
+            "{reason:?} {message}"
+        );
+    }
+    assert!(!LandingCost::Unrecognised.owned());
+
+    // The session's unknown-job budget refusal carries code 20 and no
+    // reason_id (stratum.rs, submit). It is a rate limit on lookups, not
+    // retired work and not unknown: a D1/400k dense run answers thousands of
+    // unknown-job submits, and one of these inside a span must not null the
+    // span's cost.
+    let budget = Rejection {
+        code: 20,
+        reason_id: None,
+        message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+    };
+    assert!(classify::is_unknown_job_budget(&budget));
+    assert_eq!(
+        classify::classify(&budget),
+        classify::RejectionClass::Expected
+    );
+    assert_eq!(classify::landing_cost(&budget), LandingCost::NotOwned);
+    // Only that exact shape: the same words under a reason_id or another code
+    // are not the budget refusal.
+    for (code, reason_id) in [(21, None), (20, Some("unknown-job".to_owned()))] {
+        let other = Rejection {
+            code,
+            reason_id,
+            message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+        };
+        assert!(!classify::is_unknown_job_budget(&other), "{other:?}");
+        assert_eq!(classify::landing_cost(&other), LandingCost::Unrecognised);
+    }
+}
+
+/// Two landings on one frontend, answered in the current server's vocabulary
+/// (#480): landing 0's span runs 7.0 s to 16.0 s, landing 1's from 16.0 s to
+/// the phase's end. `extra` adds rejections to the fixed set, each as a hex
+/// digit for its share, a session, milliseconds from the phase's start to the
+/// response, and the answer.
+fn current_vocabulary_document(extra: Vec<(u32, usize, u64, client::Outcome)>) -> Value {
+    vocabulary_document(true, extra, &[])
+}
+
+/// The share identifier `current_vocabulary_document` gives a hex digit and
+/// session.
+fn vocabulary_share_id(digit: u32, session: usize) -> String {
+    let hash = char::from_digit(digit, 16)
+        .expect("a digit")
+        .to_string()
+        .repeat(64);
+    format!("pload1abc.s{session:05}:{hash}")
+}
+
+/// `current_vocabulary_document`, with the owned rejections left out when
+/// `owned` is false (only the not-owned ones remain), and the `(digit,
+/// session)` shares in `committed` made present in PostgreSQL.
+fn vocabulary_document(
+    owned: bool,
+    extra: Vec<(u32, usize, u64, client::Outcome)>,
+    committed: &[(u32, usize)],
+) -> Value {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let landing = |index: usize, millis: u64, session: usize| cadence::Landing {
+        index,
+        scheduled_offset_seconds: millis as f64 / 1000.0,
+        requested_monotonic: at(base, millis),
+        requested_wall: chrono::Utc::now(),
+        session,
+        frontend: 0,
+    };
+    let landings = vec![landing(0, 5_000, 0), landing(1, 14_000, 1)];
+    let stale = || rejected(21, "stale-job", classify::STALE_JOB);
+    let share = |digit: u32, session: usize, millis: u64, outcome: client::Outcome| {
+        dense_submit(
+            &char::from_digit(digit, 16)
+                .expect("a digit")
+                .to_string()
+                .repeat(64),
+            session,
+            0,
+            at(base, millis - 100),
+            at(base, millis),
+            outcome,
+            false,
+        )
+    };
+    let mut submits = vec![
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            HASH_ONE,
+            1,
+            0,
+            at(base, 14_100),
+            at(base, 14_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+    ];
+    if owned {
+        submits.extend([
+            // Before any span: owned by no landing, so unattributed.
+            share(1, 2, 3_000, stale()),
+            // Landing 0's span: three stale-job and one unknown-job, the last
+            // stale-job after new-revision work reached the frontend at 9.0 s.
+            share(2, 2, 7_200, stale()),
+            share(3, 3, 7_600, stale()),
+            share(
+                4,
+                2,
+                8_000,
+                rejected(21, "unknown-job", classify::STALE_JOB),
+            ),
+            share(5, 3, 10_000, stale()),
+            // Landing 1's span.
+            share(9, 3, 16_200, stale()),
+        ]);
+    }
+    submits.extend([
+        // Landing 0's span, and not landing 0's: a backend refusal, a closed
+        // commit gate and a fee-floor stale-job.
+        share(
+            6,
+            2,
+            7_300,
+            rejected(
+                20,
+                "backend-rpc-unavailable",
+                "current chain state is unavailable",
+            ),
+        ),
+        share(
+            7,
+            3,
+            7_400,
+            rejected(
+                20,
+                "ledger-confirmation-failed",
+                "share was not committed because its commit gate closed",
+            ),
+        ),
+        share(
+            8,
+            2,
+            7_450,
+            rejected(21, "stale-job", classify::FEE_BELOW_RELAY_FLOOR),
+        ),
+        // Landing 0's span, and not landing 0's either: the session spent
+        // its unknown-job budget, a reason-less code-20 refusal.
+        share(
+            0xa,
+            3,
+            7_700,
+            client::Outcome::Rejected(Rejection {
+                code: 20,
+                reason_id: None,
+                message: classify::UNKNOWN_JOB_BUDGET.to_owned(),
+            }),
+        ),
+    ]);
+    submits.extend(
+        extra
+            .into_iter()
+            .map(|(digit, session, millis, outcome)| share(digit, session, millis, outcome)),
+    );
+    let node_submissions = vec![
+        node_submission(HASH_ZERO, 104, true),
+        node_submission(HASH_ONE, 105, true),
+    ];
+    let tip_changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 7_000)),
+        pool_tip(HASH_ONE, 105, at(base, 16_000)),
+    ];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: vec![
+            bump(5, Some(4), at(base, 7_500)),
+            bump(6, Some(5), at(base, 16_500)),
+        ],
+    };
+    let notify = |session: usize, tip: &str, millis: u64| client::NotifySighting {
+        session,
+        frontend: 0,
+        job_id: format!("job-{session}-{millis}"),
+        tip: tip.to_owned(),
+        clean_jobs: true,
+        at: at(base, millis),
+    };
+    let notifies = vec![
+        notify(2, HASH_ZERO, 9_000),
+        notify(3, HASH_ZERO, 9_400),
+        notify(2, HASH_ONE, 18_000),
+    ];
+    let frontends = vec![health(0)];
+    let session_frontend = vec![0usize, 0, 0, 0];
+    let gaps = vec![9.0];
+    let offsets = vec![5.0, 14.0];
+    let committed: std::collections::BTreeSet<String> = committed
+        .iter()
+        .map(|(digit, session)| vocabulary_share_id(*digit, *session))
+        .collect();
+    cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 2,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &notifies,
+        tips: &[],
+        node_submissions: &node_submissions,
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &[],
+        committed: &committed,
+        aborted: None,
+    })
+}
+
+/// #447's dense runs answered 16,461-21,504 `stale-job` and 1,512-2,997
+/// `unknown-job` per phase, all `stale job`, and the section attributed none
+/// of them: it keyed on two messages the server no longer sends. A landing
+/// owns the stale-job and unknown-job rejections inside its span, and one
+/// outside every span stays unattributed (#480).
+#[test]
+fn stale_job_rejections_inside_a_span_are_the_landings_and_outside_are_unattributed() {
+    let document = current_vocabulary_document(Vec::new());
+    assert_eq!(document["landings"], json!(2));
+
+    let attribution = &document["rejection_attribution"];
+    assert_eq!(attribution["rebuild_pending_rejections_in_phase"], json!(6));
+    assert_eq!(
+        attribution["attributed"],
+        json!(5),
+        "four in span 0, one in span 1"
+    );
+    assert_eq!(
+        attribution["unattributed"],
+        json!(1),
+        "the stale-job before the first landing is counted, and owned by none"
+    );
+    assert_eq!(
+        attribution["by_class"],
+        json!({"tip_pending": 0, "payout_pending": 0, "stale_job": 5, "unknown_job": 1})
+    );
+    assert_eq!(attribution["unrecognised_in_phase"], json!(0));
+    assert_eq!(
+        attribution["not_owned_in_phase"],
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        }),
+        "backend refusals, the fee-floor stale-job and the unknown-job budget refusal are \
+         tallied, not owned"
+    );
+    assert!(attribution["counted_classes"]
+        .as_str()
+        .expect("the section says what counts")
+        .contains("unknown-job with `stale job`"));
+
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["stale_job_window"]["count"], json!(3));
+    assert_eq!(
+        first["stale_job_window"]["first_millis_after_landing"],
+        json!(200.0)
+    );
+    assert_eq!(first["stale_job_window"]["duration_millis"], json!(2_800.0));
+    assert_eq!(first["unknown_job_window"]["count"], json!(1));
+    assert_eq!(first["tip_pending_window"]["count"], json!(0));
+    assert_eq!(
+        first["combined_rebuild_pending_window"]["count"],
+        json!(4),
+        "the landing's cost is every rejection it owns in its span"
+    );
+    assert_eq!(
+        first["combined_rebuild_pending_window"]["duration_millis"],
+        json!(2_800.0)
+    );
+    assert_eq!(
+        first["not_owned_rejections_in_span"],
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        })
+    );
+    assert_eq!(
+        first["unrecognised_rejections_in_span"],
+        json!(0),
+        "the unknown-job budget refusal is recognised, so the span's cost stays measured"
+    );
+    assert_eq!(first["lost_valid_shares"], json!(4));
+    assert_eq!(
+        first["rejected_before_new_revision_work"],
+        json!(3),
+        "7.2, 7.6 and 8.0 s precede the first clean_jobs job at 9.0 s; 10.0 s does not"
+    );
+    assert_eq!(
+        first["acceptance_to_new_revision_work_millis"]["min"],
+        json!(2_000.0),
+        "from the acceptance at 7.0 s to the earliest session's job at 9.0 s"
+    );
+    assert_eq!(
+        first["acceptance_to_new_revision_work_millis"]["max"],
+        json!(2_400.0),
+        "from the acceptance at 7.0 s to the later session's job at 9.4 s"
+    );
+    assert_eq!(
+        first["time_to_new_revision_work_millis"]["max"],
+        json!(1_900.0),
+        "the bump-anchored figure is unchanged"
+    );
+    let second = &document["landing_records"][1]["frontends"][0];
+    assert_eq!(second["combined_rebuild_pending_window"]["count"], json!(1));
+    assert_eq!(second["rejected_before_new_revision_work"], json!(1));
+
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], json!(6));
+    assert_eq!(lost["shares_recognised"], json!(6));
+    assert_eq!(lost["shares_attributed"], json!(5));
+    assert_eq!(lost["shares_unattributed"], json!(1));
+    assert_eq!(lost["shares_unavailable_reason"], Value::Null);
+
+    // Landings occurred and every rejection was recognised, so the budget
+    // is measured: the #447 runs' 0.0 is gone.
+    let budget = &document["proposed_budget_for_issue_291"];
+    assert_eq!(budget["window_p99_millis"], json!(2_800.0));
+    assert_eq!(budget["window_p99_unavailable_reason"], Value::Null);
+    assert_eq!(budget["recommended_soak_budget_millis"], json!(2_800.0));
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99"],
+        json!(4.0)
+    );
+    let edge = &budget["same_edge_as_issue_458"];
+    assert_eq!(
+        edge["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        json!(3.0)
+    );
+    // #458's histogram ends at the earliest delivery on the frontend
+    // (Landing::resolve, min_by_key), so the comparable figure is the
+    // earliest session's: 9.0 s - 7.0 s in landing 0, 18.0 s - 16.0 s in
+    // landing 1. The latest session's is the fan-out, under its own name.
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_with_fanout_p99_millis"],
+        json!(2_400.0)
+    );
+    assert!(edge["clock_note"]
+        .as_str()
+        .expect("a clock note")
+        .contains("observe_candidate"));
+    let overall = &document["summaries"]["overall"];
+    assert_eq!(
+        overall["stale_job_rejections_per_landing"]["max"],
+        json!(3.0)
+    );
+    assert_eq!(
+        overall["unknown_job_rejections_per_landing"]["max"],
+        json!(1.0)
+    );
+    assert_eq!(overall["unattributable_landing_frontend_tables"], json!(0));
+    assert_eq!(
+        overall["acceptance_to_new_revision_work_max_millis"]["unit"],
+        json!("milliseconds")
+    );
+}
+
+/// A message the harness does not know may or may not be the landing's, so
+/// the landing's cost is unknown: null with a reason, never the recognised
+/// subset passed off as the whole and never 0.0 (#480, EP-OBSERVABILITY).
+#[test]
+fn an_unrecognised_message_in_a_span_makes_the_landings_cost_null_with_a_reason() {
+    // The unrecognised rejection's share is in PostgreSQL: the report must
+    // surface it rather than check only the recognised shares.
+    let document = vocabulary_document(
+        true,
+        vec![(
+            0xf,
+            2,
+            8_500,
+            rejected(21, "stale-job", "some wording this harness has never seen"),
+        )],
+        &[(0xf, 2)],
+    );
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["unrecognised_rejections_in_span"], json!(1));
+    assert_eq!(
+        first["unrecognised_sample"][0]["message"],
+        json!("some wording this harness has never seen")
+    );
+    let combined = &first["combined_rebuild_pending_window"];
+    assert_eq!(combined["count"], Value::Null, "unknown, not 4 and not 0");
+    assert_eq!(combined["duration_millis"], Value::Null);
+    assert_eq!(combined["owned_count_lower_bound"], json!(4));
+    assert!(combined["unavailable_reason"]
+        .as_str()
+        .expect("a null carries its reason")
+        .contains("does not recognise"));
+    assert_eq!(first["lost_valid_shares"], Value::Null);
+    assert!(first["lost_valid_shares_unavailable_reason"].is_string());
+    assert_eq!(first["rejected_before_new_revision_work"], Value::Null);
+    assert!(
+        first["rejected_before_new_revision_work_unavailable_reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("does not recognise")
+    );
+    // The per-message windows are still exact counts of their message.
+    assert_eq!(first["stale_job_window"]["count"], json!(3));
+    // The other landing's span held nothing unrecognised and keeps its cost.
+    assert_eq!(
+        document["landing_records"][1]["frontends"][0]["combined_rebuild_pending_window"]["count"],
+        json!(1)
+    );
+
+    let attribution = &document["rejection_attribution"];
+    assert_eq!(attribution["unrecognised_in_phase"], json!(1));
+    assert_eq!(attribution["unrecognised_in_spans"], json!(1));
+    assert_eq!(
+        attribution["rebuild_pending_rejections_in_phase"],
+        json!(6),
+        "an unrecognised rejection is never counted as owned"
+    );
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], Value::Null);
+    assert_eq!(lost["shares_recognised"], json!(6));
+    assert!(lost["shares_unavailable_reason"].is_string());
+    assert_eq!(
+        lost["shares_found_in_postgres"],
+        Value::Null,
+        "a 0 beside a null shares would read as a clean pass over the whole phase"
+    );
+    assert!(lost["shares_found_in_postgres_unavailable_reason"].is_string());
+    assert_eq!(lost["shares_recognised_found_in_postgres"], json!(0));
+    assert_eq!(lost["unrecognised_shares_found_in_postgres"], json!(1));
+    assert_eq!(
+        lost["unrecognised_shares_found_in_postgres_sample"][0],
+        json!(vocabulary_share_id(0xf, 2))
+    );
+    assert_eq!(first["lost_valid_shares_found_in_postgres"], Value::Null);
+
+    let overall = &document["summaries"]["overall"];
+    assert_eq!(overall["unattributable_landing_frontend_tables"], json!(1));
+    assert_eq!(
+        overall["combined_rebuild_pending_rejections_per_landing"]["samples"],
+        json!(1),
+        "the unattributable table is left out, not entered as a partial count"
+    );
+
+    let budget = &document["proposed_budget_for_issue_291"];
+    for (value, reason) in [
+        ("window_p99_millis", "window_p99_unavailable_reason"),
+        (
+            "rejections_per_landing_per_frontend_p99",
+            "rejections_per_landing_per_frontend_p99_unavailable_reason",
+        ),
+    ] {
+        assert_eq!(budget[value], Value::Null, "{value}");
+        assert!(
+            budget[reason]
+                .as_str()
+                .expect("a null carries its reason")
+                .contains("does not recognise"),
+            "{reason}"
+        );
+    }
+    assert_eq!(budget["recommended_soak_budget_millis"], Value::Null);
+    assert_eq!(
+        budget["same_edge_as_issue_458"]
+            ["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        Value::Null
+    );
+    // The acceptance -> new-revision-work times are notify timings, which no
+    // rejection's classification changes: they stay measured.
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_unavailable_reason"],
+        Value::Null
+    );
+    assert_eq!(
+        budget["same_edge_as_issue_458"]["acceptance_to_new_revision_work_with_fanout_p99_millis"],
+        json!(2_400.0)
+    );
+}
+
+/// #447's exact shape: landings happened, and no span held a rejection a
+/// landing owns. The count is a measured zero and the budget is non-null; only
+/// the window, which has nothing to take a percentile of, is null with its
+/// reason. The not-owned rejections stay beside it (#480).
+#[test]
+fn landings_whose_spans_held_no_owned_rejection_report_measured_zeros() {
+    let document = vocabulary_document(false, Vec::new(), &[]);
+    assert_eq!(document["landings"], json!(2));
+    assert_eq!(
+        document["rejection_attribution"]["rebuild_pending_rejections_in_phase"],
+        json!(0)
+    );
+    assert_eq!(
+        document["rejection_attribution"]["unrecognised_in_phase"],
+        json!(0)
+    );
+    assert_eq!(
+        document["rejection_attribution"]["not_owned_in_phase"],
+        json!({
+            "(no reason_id)": 1,
+            "backend-rpc-unavailable": 1,
+            "ledger-confirmation-failed": 1,
+            "stale-job": 1
+        })
+    );
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["combined_rebuild_pending_window"]["count"], json!(0));
+    assert_eq!(first["lost_valid_shares"], json!(0));
+    assert_eq!(first["rejected_before_new_revision_work"], json!(0));
+
+    let budget = &document["proposed_budget_for_issue_291"];
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99"],
+        json!(0.0),
+        "a measured zero: landings happened and owned nothing"
+    );
+    assert_eq!(
+        budget["rejections_per_landing_per_frontend_p99_unavailable_reason"],
+        Value::Null
+    );
+    assert_eq!(budget["window_p99_millis"], Value::Null);
+    assert!(budget["window_p99_unavailable_reason"]
+        .as_str()
+        .expect("the null window says why")
+        .contains("no landing's span held a rejection the landing owns"));
+    assert_eq!(budget["recommended_soak_budget_millis"], Value::Null);
+    let edge = &budget["same_edge_as_issue_458"];
+    assert_eq!(
+        edge["rejected_before_new_revision_work_per_landing_per_frontend_p99"],
+        json!(0.0)
+    );
+    assert_eq!(
+        edge["acceptance_to_new_revision_work_p99_millis"],
+        json!(2_000.0)
+    );
+    let lost = &document["lost_valid_work"];
+    assert_eq!(lost["shares"], json!(0));
+    assert_eq!(lost["shares_found_in_postgres"], json!(0));
 }
 
 #[test]

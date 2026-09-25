@@ -807,15 +807,19 @@ impl Coordinator {
 
     async fn observe_chain_info(&self, from_refresh: bool) -> Result<Value> {
         let sequence = self.observed_tip.write().await.reserve();
-        let result =
-            crate::readiness::chain_info(&self.rpc, &self.config.chain, self.config.min_peers)
-                .await
-                .and_then(|info| {
-                    let hash = tip_observation::tip_hash(&info["bestblockhash"])
-                        .context("qbit did not report a valid tip hash")?
-                        .to_owned();
-                    Ok((info, hash))
-                });
+        let result = crate::readiness::chain_info_with_metrics(
+            &self.rpc,
+            &self.config.chain,
+            self.config.min_peers,
+            Some(&self.metrics),
+        )
+        .await
+        .and_then(|info| {
+            let hash = tip_observation::tip_hash(&info["bestblockhash"])
+                .context("qbit did not report a valid tip hash")?
+                .to_owned();
+            Ok((info, hash))
+        });
         match result {
             Ok((info, hash)) => {
                 self.observed_tip
@@ -1070,29 +1074,30 @@ impl Coordinator {
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
         let current_prepared = self.prepared.read().await;
+        // Whether the cached window, as held at entry, is still inside the
+        // reanchor interval: an input of the trigger label below, read here
+        // because the window may be retired before the label is named.
+        let cached_within_reanchor = cached_window
+            .as_ref()
+            .is_some_and(|window| window.within_reanchor_interval(self.config.snapshot_interval));
         // Named before the reuse test below decides, from the same inputs, so
         // the refresh metric and log say what invalidated the published work.
         // Without a probe the template already differs from the published
-        // work: a new tip, or a new template on the same tip.
-        let trigger = match &probe {
-            Some(probe) => refresh_trigger(
+        // work and the ledger's state is not read here; the label is then
+        // named from the window the rebuild uses, once it is admitted, so its
+        // precedence (revision before balances before template, and so on)
+        // holds on that path too.
+        let early_trigger = probe.as_ref().map(|probe| {
+            refresh_trigger(
                 current_prepared.as_deref(),
                 parent,
-                &probe.payout_state,
+                probe.payout_state.payout_revision,
+                probe.payout_state.prior_balances_digest,
                 probe.accepted_share_seq,
-                cached_window.as_ref().is_some_and(|window| {
-                    window.within_reanchor_interval(self.config.snapshot_interval)
-                }),
+                cached_within_reanchor,
                 &fee,
-            ),
-            None => match current_prepared.as_deref() {
-                None => RefreshTrigger::Initial,
-                Some(current) if current.template["previousblockhash"].as_str() != Some(parent) => {
-                    RefreshTrigger::Tip
-                }
-                Some(_) => RefreshTrigger::Template,
-            },
-        };
+            )
+        });
         if let (Some(probe), Some(current)) = (probe, current_prepared.as_ref()) {
             let state = probe.payout_state;
             let share_seq = probe.accepted_share_seq;
@@ -1243,7 +1248,22 @@ impl Coordinator {
             .revision_work_observed(window.snapshot.payout_revision);
         let share_seq = window.snapshot.share_seq;
         let admitted = prepared_storage::compact::CompactOwner::new((window, permit));
-        let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
+        let current = self.prepared.read().await;
+        // The label for a refresh that ran no probe at entry: the published
+        // work against the window this rebuild carries, by the same
+        // precedence as the probed path.
+        let trigger = early_trigger.unwrap_or_else(|| {
+            refresh_trigger(
+                current.as_deref(),
+                parent,
+                admitted.0.snapshot.payout_revision,
+                admitted.0.reference.prior_balances_digest,
+                admitted.0.snapshot.share_seq,
+                cached_within_reanchor,
+                &fee,
+            )
+        });
+        let equivalent = current.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
@@ -1251,6 +1271,7 @@ impl Coordinator {
                     == admitted.0.reference.prior_balances_digest
                 && current.fee == fee
         });
+        drop(current);
         let generation = self
             .refresh
             .borrow()
@@ -3071,15 +3092,18 @@ mod window_incident_tests;
 mod storm_evidence_tests;
 
 /// What invalidated the published work, from the same inputs the reuse test
-/// in `refresh_once_inner` reads, ranked by this function's own precedence
+/// in `refresh_once_inner` reads, ranked by [`classify_refresh`]'s precedence
 /// (tip, revision, balances, reanchor, shares, fee, then template) when
 /// several changed on one poll; the reuse test checks them in another order.
-/// A missing cached window with published work is labelled `reanchor`. A
+/// The revision, balances digest and share sequence are the ledger probe's
+/// on a same-template poll and the admitted window's on a new template. A
+/// missing cached window with published work is labelled `reanchor`. A
 /// label for the refresh metric and log, never a decision input.
 fn refresh_trigger(
     current: Option<&Prepared>,
     parent: &str,
-    state: &crate::ledger::PayoutState,
+    payout_revision: i64,
+    prior_balances_digest: [u8; 32],
     share_seq: u64,
     window_within_reanchor: bool,
     fee: &Option<FanoutFeeRatePolicy>,
@@ -3087,21 +3111,44 @@ fn refresh_trigger(
     let Some(current) = current else {
         return RefreshTrigger::Initial;
     };
-    if current.template["previousblockhash"].as_str() != Some(parent) {
+    classify_refresh(RefreshChanges {
+        tip: current.template["previousblockhash"].as_str() != Some(parent),
+        revision: current.snapshot.payout_revision != payout_revision,
+        balances: current.window.prior_balances_digest != prior_balances_digest,
+        window_within_reanchor,
+        shares: current.bundle.is_none() && current.snapshot.share_seq != share_seq,
+        fee: current.fee != *fee,
+    })
+}
+
+/// Which of the published work's inputs a refresh found changed.
+#[derive(Clone, Copy, Debug, Default)]
+struct RefreshChanges {
+    tip: bool,
+    revision: bool,
+    balances: bool,
+    window_within_reanchor: bool,
+    shares: bool,
+    fee: bool,
+}
+
+/// The trigger label's precedence over what changed, with `template` for
+/// everything else: a changed fingerprint, an aged template, or a cached
+/// window that no longer matches the published reference.
+fn classify_refresh(changes: RefreshChanges) -> RefreshTrigger {
+    if changes.tip {
         RefreshTrigger::Tip
-    } else if current.snapshot.payout_revision != state.payout_revision {
+    } else if changes.revision {
         RefreshTrigger::Revision
-    } else if current.window.prior_balances_digest != state.prior_balances_digest {
+    } else if changes.balances {
         RefreshTrigger::Balances
-    } else if !window_within_reanchor {
+    } else if !changes.window_within_reanchor {
         RefreshTrigger::Reanchor
-    } else if current.bundle.is_none() && current.snapshot.share_seq != share_seq {
+    } else if changes.shares {
         RefreshTrigger::Shares
-    } else if current.fee != *fee {
+    } else if changes.fee {
         RefreshTrigger::Fee
     } else {
-        // A changed fingerprint, an aged template, or a cached window that
-        // no longer matches the published reference.
         RefreshTrigger::Template
     }
 }

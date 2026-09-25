@@ -4,12 +4,13 @@
 //! EP-OBSERVABILITY: every quantity records its units and its clock, and an
 //! unknown or failed measurement is `None` with a reason, never 0.
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::{
     collections::{BTreeMap, HashMap},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1233,9 +1234,19 @@ pub fn ack_delta_across_restarts(
     delta
 }
 
-/// `MemAvailable`, in kibibytes.
+/// Where `MemAvailable` is read from. Linux only: macOS has no `/proc`.
+pub const MEMINFO_PATH: &str = "/proc/meminfo";
+
+/// `MemAvailable`, in kibibytes, or `None` when [`MEMINFO_PATH`] cannot be
+/// read or holds no such line.
 pub fn mem_available_kib() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo")
+    mem_available_kib_at(Path::new(MEMINFO_PATH))
+}
+
+/// [`mem_available_kib`] from a given file, so an unreadable source can be
+/// tested on a host whose own `/proc/meminfo` is fine.
+pub fn mem_available_kib_at(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))?
@@ -1243,6 +1254,25 @@ pub fn mem_available_kib() -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Refuse a `--min-mem-available-mib` floor the host cannot measure.
+///
+/// The floor is checked once a second against `MemAvailable`; when that
+/// cannot be read, the check used to do nothing and the run proceeded
+/// unguarded, with only a `null` `min_mem_available_kib` in the side report to
+/// show for it -- on macOS, where there is no `/proc/meminfo`, on every run
+/// (#485). A floor the run cannot enforce is refused at entry instead of
+/// being passed through (EP-CONFIG); `--min-mem-available-mib 0` asks for no
+/// floor and is accepted anywhere. `available_kib` is the entry read.
+pub fn verify_memory_floor(floor_mib: u64, available_kib: Option<u64>) -> Result<()> {
+    ensure!(
+        floor_mib == 0 || available_kib.is_some(),
+        "--min-mem-available-mib {floor_mib} cannot be enforced: MemAvailable could not be read \
+         from {MEMINFO_PATH}, so the floor would never operate. Run on a Linux host, or pass \
+         --min-mem-available-mib 0 to run without a memory floor"
+    );
+    Ok(())
 }
 
 /// CPU model, core count, RAM and OS, for the report header.

@@ -662,7 +662,9 @@ impl Ledger {
     /// that probe (it prunes at plan time and looks cheaper than the generic
     /// estimate over every partition) and re-plans it on every share, inside
     /// `ORDER_LOCK`. Sent with `BEGIN` in one round trip; `SET LOCAL` ends
-    /// with the transaction.
+    /// with the transaction. `AppendConnection::begin` records the `BEGIN`
+    /// as complete only after the reply to the whole batch is read, so a
+    /// cancel before then still retires the connection (#482).
     const APPEND_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL plan_cache_mode = force_generic_plan";
 
     /// One complete attempt of [`Ledger::append_checked`], from BEGIN to
@@ -678,11 +680,7 @@ impl Ledger {
     ) -> Result<AppendResult> {
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
-        let mut tx = Transaction::begin(
-            &mut *connection.connection,
-            Some(Self::APPEND_TRANSACTION_BEGIN.into()),
-        )
-        .await?;
+        let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {

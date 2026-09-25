@@ -3,6 +3,7 @@
 # execution manifest with this list; a gated test that is added, renamed or
 # minimum executed count. scripts/check_gate_manifest.py compares the gate's
 # removed must be changed here too. See docs/prism-integration-test-gate.md.
+qbit-prism-load::harness::a_managed_cluster_that_fails_to_start_reports_the_servers_own_reason
 qbit-prism-load::quorum_replication::an_any_1_quorum_standby_on_postgres_16_is_observed_as_sync_like_first_1
 qbit-prism-server::api_2x::block_views_markers_and_network_estimate_keep_2x_contracts
 qbit-prism-server::api_2x::chart_rollups_match_raw_boundaries_tail_and_missing_progress
@@ -239,6 +240,9 @@ qbit-prism-server::landing_metrics::peer_orphan_evidence_closes_the_accepting_fr
 qbit-prism-server::landing_metrics::persistently_failing_post_offer_observation_is_reported_from_the_offer_reservation
 qbit-prism-server::landing_metrics::real_offer_and_peer_proof_finish_once_only_after_notify_delivery
 qbit-prism-server::landing_metrics::stale_reconcile_before_commit_does_not_poison_peer_landing
+qbit-prism-server::ledger_cancelled_begin::session_allocation_dropped_inside_begin_returns_the_connection_clean
+qbit-prism-server::ledger_cancelled_begin::share_append_cancelled_before_its_begin_batch_ends_retires_the_connection
+qbit-prism-server::ledger_cancelled_begin::share_append_cancelled_inside_begin_retires_the_connection
 qbit-prism-server::ledger_deadline_atomicity::backfill_item_failure_is_atomic
 qbit-prism-server::ledger_deadline_atomicity::conflicting_audit_preserves_original
 qbit-prism-server::ledger_deadline_atomicity::import_item_failure_preserves_completed_items

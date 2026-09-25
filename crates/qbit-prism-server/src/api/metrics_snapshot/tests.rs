@@ -499,6 +499,8 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
     let metrics = Arc::new(Metrics::default());
     let state = ApiState::new(pool, ApiConfig::default(), metrics.clone());
     metrics.observe_first_offer(Duration::from_millis(125));
+    // The rollup lag is a series only once its loop starts.
+    metrics.start_hashrate_rollup();
     for lock in LockKind::ALL {
         for outcome in Outcome::ALL {
             metrics.observe_advisory_lock(*lock, *outcome, Duration::from_millis(25));

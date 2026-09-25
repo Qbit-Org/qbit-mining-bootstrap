@@ -1,13 +1,47 @@
 //! Live node checks shared by work publication and settlement observations.
+use crate::metrics::{Metrics, NodeObservation};
 use crate::rpc::Rpc;
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The same check without a registry, for callers that own no metrics.
+pub async fn chain_info(rpc: &Rpc, chain: &str, min_peers: u64) -> Result<Value> {
+    chain_info_with_metrics(rpc, chain, min_peers, None).await
+}
 
 /// Public nodes must have downloaded every known header and retain the
 /// configured peer floor. Regtest permits absent header metadata and no peers.
-pub async fn chain_info(rpc: &Rpc, chain: &str, min_peers: u64) -> Result<Value> {
+///
+/// This is also the single node observation site. It records what the attempt
+/// already fetched and adds no RPC call, so a short-circuited or refused check
+/// leaves the values it never learned unknown instead of stale.
+pub async fn chain_info_with_metrics(
+    rpc: &Rpc,
+    chain: &str,
+    min_peers: u64,
+    metrics: Option<&Metrics>,
+) -> Result<Value> {
+    let mut observation = NodeObservation::started();
+    let result = observe_chain_info(rpc, chain, min_peers, &mut observation).await;
+    if let Some(metrics) = metrics {
+        metrics.record_node_observation(observation);
+    }
+    result
+}
+
+async fn observe_chain_info(
+    rpc: &Rpc,
+    chain: &str,
+    min_peers: u64,
+    observation: &mut NodeObservation,
+) -> Result<Value> {
     let info = rpc.call("getblockchaininfo", json!([])).await?;
+    // The node answered, so its sync state is known even though this check
+    // then refuses a synchronizing node.
+    if let Some(initial_block_download) = info["initialblockdownload"].as_bool() {
+        observation.chain = Some((initial_block_download, Instant::now()));
+    }
     ensure!(
         info["initialblockdownload"] == false,
         "qbit is still synchronizing"
@@ -31,6 +65,8 @@ pub async fn chain_info(rpc: &Rpc, chain: &str, min_peers: u64) -> Result<Value>
         let peers = network["connections"]
             .as_u64()
             .context("qbit did not report a nonnegative integer peer count")?;
+        // A count below the floor is still an answered count, not unknown.
+        observation.peers = Some(peers);
         ensure!(
             peers >= min_peers,
             "qbit has {peers} peers, requires at least {min_peers}"

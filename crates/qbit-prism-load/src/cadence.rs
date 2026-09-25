@@ -5,9 +5,9 @@
 //! accepted-candidate minimum interarrival of about 9.14 s, 35 accepted blocks
 //! in the trailing hour, and repeated pairs about 18–20 s apart — and for a
 //! per-frontend answer to two questions: how long does a frontend reject
-//! shares with `new payout work is pending`, and how many shares does it
-//! reject before it serves work at the new revision. The answer sets the
-//! budget for #291's soak.
+//! shares on work a landing retired, and how many shares does it reject
+//! before it serves work at the new revision. The answer sets the budget for
+//! #291's soak. Which rejections a landing owns is `COUNTED_CLASSES` (#480).
 //!
 //! Four clocks appear here, and every reported time names the one it came
 //! from (EP-OBSERVABILITY):
@@ -28,7 +28,7 @@
 //! outside the delay proxy.
 
 use crate::{
-    classify::{self, Rejection},
+    classify::{self, LandingCost, Rejection},
     client::{ClientFailure, FailureKind, NotifySighting, Outcome, SubmitRecord, TipSighting},
     measure,
     node::{SubmissionRecord, TipChange, TipOrigin},
@@ -588,32 +588,99 @@ fn resolve<'a>(inputs: &ReportInputs<'a>) -> Vec<Resolved<'a>> {
     resolved
 }
 
-/// One rebuild-pending rejection, already attributed.
-struct PendingRejection<'a> {
+/// One rejection of the phase, with what it is to a landing (#480).
+struct PhaseRejection<'a> {
     record: &'a SubmitRecord,
+    rejection: &'a Rejection,
     at: Instant,
-    payout: bool,
+    cost: LandingCost,
 }
 
-fn pending_rejections(submits: &[SubmitRecord]) -> Vec<PendingRejection<'_>> {
+impl PhaseRejection<'_> {
+    /// `reason_id`, or a marker for a rejection that carried none, so a tally
+    /// keyed on it never merges the two.
+    fn reason(&self) -> String {
+        self.rejection
+            .reason_id
+            .clone()
+            .unwrap_or_else(|| "(no reason_id)".to_owned())
+    }
+}
+
+/// Every rejection of the phase the client read an answer for, classified.
+/// Nothing is filtered by class here: owned, not-owned and unrecognised
+/// rejections are all counted, each in its own bucket (EP-OBSERVABILITY).
+fn phase_rejections(submits: &[SubmitRecord]) -> Vec<PhaseRejection<'_>> {
     submits
         .iter()
         .filter(|record| record.phase == PHASE && !record.reoffer)
         .filter_map(|record| {
             let rejection = rejection_of(record)?;
-            if !classify::is_rebuild_pending(rejection) {
-                return None;
-            }
             // A rejection is stamped when the client read it, which is the
             // only instant the harness observed directly.
             let at = record.responded?;
-            Some(PendingRejection {
+            Some(PhaseRejection {
                 record,
+                rejection,
                 at,
-                payout: rejection.message == classify::NEW_PAYOUT_WORK_PENDING,
+                cost: classify::landing_cost(rejection),
             })
         })
         .collect()
+}
+
+/// Up to `UNRECOGNISED_SAMPLE` distinct `(reason_id, message)` pairs the
+/// harness could not attribute, so a reader can see what the vocabulary
+/// missed rather than only how often.
+const UNRECOGNISED_SAMPLE: usize = 5;
+
+fn unrecognised_sample<'a>(rejections: impl Iterator<Item = &'a PhaseRejection<'a>>) -> Value {
+    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for rejection in rejections.filter(|rejection| rejection.cost == LandingCost::Unrecognised) {
+        *seen
+            .entry((rejection.reason(), rejection.rejection.message.clone()))
+            .or_insert(0) += 1;
+    }
+    json!(seen
+        .into_iter()
+        .take(UNRECOGNISED_SAMPLE)
+        .map(|((reason_id, message), count)| json!({
+            "reason_id": reason_id,
+            "message": message,
+            "count": count,
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// Not-owned rejections by `reason_id`.
+fn not_owned_tally<'a>(rejections: impl Iterator<Item = &'a PhaseRejection<'a>>) -> Value {
+    let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+    for rejection in rejections.filter(|rejection| rejection.cost == LandingCost::NotOwned) {
+        *tally.entry(rejection.reason()).or_insert(0) += 1;
+    }
+    json!(tally)
+}
+
+/// A window whose count is unknown because the span held rejections the
+/// harness could not attribute. The owned rejections it did recognise are a
+/// lower bound, reported as one, never as the count.
+fn unknown_window(owned_lower_bound: usize, unrecognised: usize) -> Value {
+    json!({
+        "count": Value::Null,
+        "first_millis_after_landing": Value::Null,
+        "last_millis_after_landing": Value::Null,
+        "duration_millis": Value::Null,
+        "owned_count_lower_bound": owned_lower_bound,
+        "unavailable_reason": unrecognised_reason(unrecognised),
+    })
+}
+
+fn unrecognised_reason(unrecognised: usize) -> String {
+    format!(
+        "{unrecognised} rejection(s) in the span carry a reason_id or message the harness does \
+         not recognise (unrecognised_sample names them), so whether the landing owns them is \
+         unknown; the landing's cost is not reported as the recognised subset"
+    )
 }
 
 /// First, last, count and duration of one window.
@@ -642,14 +709,28 @@ fn window(origin: Instant, times: &[Instant]) -> Value {
 struct Distribution {
     tip_duration: Vec<f64>,
     payout_duration: Vec<f64>,
+    stale_job_duration: Vec<f64>,
+    unknown_job_duration: Vec<f64>,
     combined_duration: Vec<f64>,
     tip_count: Vec<f64>,
     payout_count: Vec<f64>,
+    stale_job_count: Vec<f64>,
+    unknown_job_count: Vec<f64>,
     combined_count: Vec<f64>,
     before_revision: Vec<f64>,
     lost: Vec<f64>,
     tip_work_max: Vec<f64>,
     revision_work_max: Vec<f64>,
+    /// Per table, the earliest session's acceptance -> new-revision work: the
+    /// statistic #458's histogram samples once per block and frontend.
+    acceptance_work_min: Vec<f64>,
+    /// Per table, the latest session's: the same edge plus the notify
+    /// fan-out across the frontend's sessions.
+    acceptance_work_max: Vec<f64>,
+    /// Landing-and-frontend tables whose span held an unrecognised rejection,
+    /// so their combined, before-revision and lost counts are unknown and are
+    /// left out of those distributions rather than entered as a partial count.
+    unattributable: usize,
 }
 
 impl Distribution {
@@ -657,14 +738,25 @@ impl Distribution {
         json!({
             "tip_pending_window_duration_millis": millis_summary(&self.tip_duration),
             "payout_pending_window_duration_millis": millis_summary(&self.payout_duration),
+            "stale_job_window_duration_millis": millis_summary(&self.stale_job_duration),
+            "unknown_job_window_duration_millis": millis_summary(&self.unknown_job_duration),
             "combined_rebuild_pending_window_duration_millis": millis_summary(&self.combined_duration),
             "tip_pending_rejections_per_landing": count_summary(&self.tip_count),
             "payout_pending_rejections_per_landing": count_summary(&self.payout_count),
+            "stale_job_rejections_per_landing": count_summary(&self.stale_job_count),
+            "unknown_job_rejections_per_landing": count_summary(&self.unknown_job_count),
             "combined_rebuild_pending_rejections_per_landing": count_summary(&self.combined_count),
             "rejected_before_new_revision_work_per_landing": count_summary(&self.before_revision),
             "lost_valid_shares_per_landing": count_summary(&self.lost),
             "time_to_new_tip_work_max_millis": millis_summary(&self.tip_work_max),
             "time_to_new_revision_work_max_millis": millis_summary(&self.revision_work_max),
+            "acceptance_to_new_revision_work_min_millis": millis_summary(&self.acceptance_work_min),
+            "acceptance_to_new_revision_work_max_millis": millis_summary(&self.acceptance_work_max),
+            "unattributable_landing_frontend_tables": self.unattributable,
+            "unattributable_note": "tables whose span held an unrecognised rejection are left out \
+                                    of the combined, rejected-before-new-revision-work and lost \
+                                    distributions, whose samples count only the tables that \
+                                    could be attributed; the per-message distributions keep them",
             // The label travels with the summarised numbers, because these are
             // the ones a reader quotes. The per-landing tables carry the same
             // sibling; the summaries used to carry nothing, and the
@@ -708,7 +800,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         });
     }
     let resolved = resolve(inputs);
-    let rejections = pending_rejections(inputs.submits);
+    let rejections = phase_rejections(inputs.submits);
     let empty = RevisionSeries::default();
     let revisions = inputs.revisions.unwrap_or(&empty);
 
@@ -765,6 +857,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
     let mut per_frontend: BTreeMap<usize, Distribution> = BTreeMap::new();
     let mut overall = Distribution::default();
     let mut attributed_rejections = 0usize;
+    let mut unrecognised_in_spans = 0usize;
 
     for entry in &resolved {
         *counts.entry(entry.outcome.as_str()).or_insert(0) += 1;
@@ -781,7 +874,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     .filter(|(_, frontend)| **frontend == health.index)
                     .map(|(session, _)| session)
                     .collect();
-                let mine: Vec<&PendingRejection<'_>> = rejections
+                let in_span: Vec<&PhaseRejection<'_>> = rejections
                     .iter()
                     .filter(|rejection| {
                         rejection.record.frontend == health.index
@@ -789,17 +882,31 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                             && rejection.at < end
                     })
                     .collect();
+                let mine: Vec<&PhaseRejection<'_>> = in_span
+                    .iter()
+                    .copied()
+                    .filter(|rejection| rejection.cost.owned())
+                    .collect();
+                let unrecognised = in_span
+                    .iter()
+                    .filter(|rejection| rejection.cost == LandingCost::Unrecognised)
+                    .count();
+                unrecognised_in_spans += unrecognised;
+                // An unrecognised rejection in the span makes the landing's
+                // total unknown: it may be the landing's, and a count that
+                // leaves it out is a lower bound, not the cost (#480).
+                let attributable = unrecognised == 0;
                 attributed_rejections += mine.len();
-                let tip_times: Vec<Instant> = mine
-                    .iter()
-                    .filter(|rejection| !rejection.payout)
-                    .map(|rejection| rejection.at)
-                    .collect();
-                let payout_times: Vec<Instant> = mine
-                    .iter()
-                    .filter(|rejection| rejection.payout)
-                    .map(|rejection| rejection.at)
-                    .collect();
+                let times_of = |cost: LandingCost| -> Vec<Instant> {
+                    mine.iter()
+                        .filter(|rejection| rejection.cost == cost)
+                        .map(|rejection| rejection.at)
+                        .collect()
+                };
+                let tip_times = times_of(LandingCost::TipPending);
+                let payout_times = times_of(LandingCost::PayoutPending);
+                let stale_job_times = times_of(LandingCost::StaleJob);
+                let unknown_job_times = times_of(LandingCost::UnknownJob);
                 let combined_times: Vec<Instant> =
                     mine.iter().map(|rejection| rejection.at).collect();
 
@@ -844,6 +951,14 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 // later job -- which understated the time and stopped the
                 // rejected-before count at the wrong event (EP-STATE).
                 let mut revision_work: Vec<f64> = Vec::new();
+                // The same first clean_jobs notify per session, measured from
+                // the landing's own acceptance instead of the bump: the fake
+                // node stamps the tip change as it accepts submitblock. The
+                // earliest session's value is the harness's reading of the
+                // acceptance -> new-revision-work edge #458's
+                // accepted_block_to_revision_work_seconds samples once per
+                // frontend; the latest adds the notify fan-out.
+                let mut acceptance_work: Vec<f64> = Vec::new();
                 let mut first_revision_work: Option<Instant> = None;
                 if let Some(bump) = reference {
                     for session in &sessions {
@@ -860,14 +975,13 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                             .min()
                         {
                             revision_work.push(millis_since(bump.monotonic, at));
+                            acceptance_work.push(millis_since(start, at));
                             first_revision_work = Some(
                                 first_revision_work.map_or(at, |current: Instant| current.min(at)),
                             );
                         }
                     }
                 }
-                let rejected_before_new_revision_work = first_revision_work
-                    .map(|at| mine.iter().filter(|rejection| rejection.at < at).count());
                 // Unknown is not zero: a frontend with no new-revision work
                 // inside the span is its own outcome, with its own reason.
                 let new_revision_work_unavailable_reason =
@@ -876,9 +990,18 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                         (Some(_), true) => Some(NO_NEW_REVISION_WORK_IN_SPAN),
                         (Some(_), false) => None,
                     };
+                let rejected_before_new_revision_work = first_revision_work
+                    .filter(|_| attributable)
+                    .map(|at| mine.iter().filter(|rejection| rejection.at < at).count());
+                let rejected_before_new_revision_work_unavailable_reason =
+                    match new_revision_work_unavailable_reason {
+                        Some(reason) => Some(reason.to_owned()),
+                        None if !attributable => Some(unrecognised_reason(unrecognised)),
+                        None => None,
+                    };
 
                 // Lost valid work: the client only ever offers a nonce that
-                // meets the share target, so every rebuild-pending rejection
+                // meets the share target, so every rejection the landing owns
                 // is a valid share the pool threw away. None of them is
                 // persisted, which is checked here rather than asserted.
                 let lost: Vec<&str> = mine
@@ -893,33 +1016,55 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 });
                 let distribution = per_frontend.entry(health.index).or_default();
                 for target in [distribution, &mut overall] {
-                    if let (Some(first), Some(last)) =
-                        (tip_times.iter().min(), tip_times.iter().max())
-                    {
-                        target.tip_duration.push(millis_since(*first, *last));
+                    for (times, durations, counts) in [
+                        (&tip_times, &mut target.tip_duration, &mut target.tip_count),
+                        (
+                            &payout_times,
+                            &mut target.payout_duration,
+                            &mut target.payout_count,
+                        ),
+                        (
+                            &stale_job_times,
+                            &mut target.stale_job_duration,
+                            &mut target.stale_job_count,
+                        ),
+                        (
+                            &unknown_job_times,
+                            &mut target.unknown_job_duration,
+                            &mut target.unknown_job_count,
+                        ),
+                    ] {
+                        if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max())
+                        {
+                            durations.push(millis_since(*first, *last));
+                        }
+                        counts.push(times.len() as f64);
                     }
-                    if let (Some(first), Some(last)) =
-                        (payout_times.iter().min(), payout_times.iter().max())
-                    {
-                        target.payout_duration.push(millis_since(*first, *last));
+                    if attributable {
+                        if let (Some(first), Some(last)) =
+                            (combined_times.iter().min(), combined_times.iter().max())
+                        {
+                            target.combined_duration.push(millis_since(*first, *last));
+                        }
+                        target.combined_count.push(combined_times.len() as f64);
+                        target.lost.push(lost.len() as f64);
+                    } else {
+                        target.unattributable += 1;
                     }
-                    if let (Some(first), Some(last)) =
-                        (combined_times.iter().min(), combined_times.iter().max())
-                    {
-                        target.combined_duration.push(millis_since(*first, *last));
-                    }
-                    target.tip_count.push(tip_times.len() as f64);
-                    target.payout_count.push(payout_times.len() as f64);
-                    target.combined_count.push(combined_times.len() as f64);
                     if let Some(count) = rejected_before_new_revision_work {
                         target.before_revision.push(count as f64);
                     }
-                    target.lost.push(lost.len() as f64);
                     if let Some(worst) = tip_work.iter().copied().max_by(f64::total_cmp) {
                         target.tip_work_max.push(worst);
                     }
                     if let Some(worst) = revision_work.iter().copied().max_by(f64::total_cmp) {
                         target.revision_work_max.push(worst);
+                    }
+                    if let Some(first) = acceptance_work.iter().copied().min_by(f64::total_cmp) {
+                        target.acceptance_work_min.push(first);
+                    }
+                    if let Some(worst) = acceptance_work.iter().copied().max_by(f64::total_cmp) {
+                        target.acceptance_work_max.push(worst);
                     }
                 }
 
@@ -929,8 +1074,16 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     "sessions": sessions.len(),
                     "tip_pending_window": window(start, &tip_times),
                     "payout_pending_window": window(start, &payout_times),
-                    "combined_rebuild_pending_window":
-                        window(start, &combined_times),
+                    "stale_job_window": window(start, &stale_job_times),
+                    "unknown_job_window": window(start, &unknown_job_times),
+                    "combined_rebuild_pending_window": if attributable {
+                        window(start, &combined_times)
+                    } else {
+                        unknown_window(combined_times.len(), unrecognised)
+                    },
+                    "unrecognised_rejections_in_span": unrecognised,
+                    "unrecognised_sample": unrecognised_sample(in_span.iter().copied()),
+                    "not_owned_rejections_in_span": not_owned_tally(in_span.iter().copied()),
                     "reference_bump": reference.map(|bump| json!({
                         "revision": bump.revision,
                         "server_timestamp": bump.server_timestamp.to_rfc3339(),
@@ -940,17 +1093,22 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     "sessions_with_new_tip_work": tip_work.len(),
                     "new_tip_work_unavailable_reason": new_tip_work_unavailable_reason,
                     "time_to_new_revision_work_millis": millis_summary(&revision_work),
+                    "acceptance_to_new_revision_work_millis": millis_summary(&acceptance_work),
                     "sessions_with_new_revision_work": revision_work.len(),
                     "new_revision_work_unavailable_reason": new_revision_work_unavailable_reason,
                     "new_revision_work_approximation": NEW_REVISION_APPROXIMATION,
                     "rejected_before_new_revision_work": rejected_before_new_revision_work,
                     "rejected_before_new_revision_work_unavailable_reason":
-                        new_revision_work_unavailable_reason,
-                    "lost_valid_shares": lost.len(),
-                    "lost_valid_shares_found_in_postgres": lost
+                        rejected_before_new_revision_work_unavailable_reason,
+                    "lost_valid_shares": attributable.then_some(lost.len()),
+                    "lost_valid_shares_unavailable_reason":
+                        (!attributable).then(|| unrecognised_reason(unrecognised)),
+                    // Null beside a null lost_valid_shares: a count over the
+                    // recognised subset is not a durability answer for the span.
+                    "lost_valid_shares_found_in_postgres": attributable.then(|| lost
                         .iter()
                         .filter(|share| inputs.committed.contains(**share))
-                        .count(),
+                        .count()),
                     "incomplete": incomplete.is_some(),
                     "incomplete_reason": incomplete,
                     "span_truncated_at_phase_end": truncated,
@@ -1025,16 +1183,32 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
     // landing_outcomes.landed is still reported, one key away.
     let with_windows = resolved.iter().filter(|entry| entry.span.is_some()).count();
     let landed = *counts.get("landed").unwrap_or(&0);
-    let unattributed_rejections = rejections.len().saturating_sub(attributed_rejections);
+    // Only the rejections a landing owns are its cost; the rest of the phase's
+    // rejections are counted apart, by kind, never folded in or dropped.
+    let owned_in_phase: Vec<&PhaseRejection<'_>> = rejections
+        .iter()
+        .filter(|rejection| rejection.cost.owned())
+        .collect();
+    let unattributed_rejections = owned_in_phase.len().saturating_sub(attributed_rejections);
+    let unrecognised_in_phase = rejections
+        .iter()
+        .filter(|rejection| rejection.cost == LandingCost::Unrecognised)
+        .count();
+    let owned_by_class = |cost: LandingCost| {
+        owned_in_phase
+            .iter()
+            .filter(|rejection| rejection.cost == cost)
+            .count()
+    };
 
-    // Lost valid work is counted over every rebuild-pending rejection in the
-    // phase, not only the ones a landing's span owns. An unattributed
-    // rejection is just as much a proven share the pool discarded, and it is
-    // precisely the case the PostgreSQL cross-check exists for: a landing
-    // whose pool tip change is missing leaves its rejections unattributed, and
-    // a census that skipped them would read as a clean pass in the one
-    // situation that would make it fail (EP-STATE).
-    let lost_shares: Vec<&str> = rejections
+    // Lost valid work is counted over every owned rejection in the phase, not
+    // only the ones a landing's span owns. An unattributed rejection is just
+    // as much a proven share the pool discarded, and it is precisely the case
+    // the PostgreSQL cross-check exists for: a landing whose pool tip change
+    // is missing leaves its rejections unattributed, and a census that
+    // skipped them would read as a clean pass in the one situation that would
+    // make it fail (EP-STATE).
+    let lost_shares: Vec<&str> = owned_in_phase
         .iter()
         .map(|rejection| rejection.record.share_id.as_str())
         .collect();
@@ -1043,11 +1217,22 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         .filter(|share| inputs.committed.contains(**share))
         .map(|share| (*share).to_owned())
         .collect();
+    // An unrecognised rejection may be lost work too, so its share is looked
+    // up as well: a whole-phase durability answer that skipped them would read
+    // as a clean pass over shares nobody checked.
+    let unrecognised_in_postgres: Vec<String> = rejections
+        .iter()
+        .filter(|rejection| rejection.cost == LandingCost::Unrecognised)
+        .map(|rejection| rejection.record.share_id.as_str())
+        .filter(|share| inputs.committed.contains(*share))
+        .map(str::to_owned)
+        .collect();
     let no_landing_reason = no_landing_reason(inputs, &resolved, with_windows);
-    let combined_p99 = optional_summary(&overall.combined_duration, millis_summary)
-        .and_then(|summary| summary.p99);
-    let count_p99 =
-        optional_summary(&overall.combined_count, count_summary).and_then(|summary| summary.p99);
+    let budget = proposed_budget(
+        &overall,
+        no_landing_reason.as_deref(),
+        unrecognised_in_spans,
+    );
 
     json!({
         "ran": true,
@@ -1121,27 +1306,60 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                      attributed + unattributed equals it.",
         },
         "rejection_attribution": {
-            "rebuild_pending_rejections_in_phase": rejections.len(),
+            "counted_classes": COUNTED_CLASSES,
+            "rebuild_pending_rejections_in_phase": owned_in_phase.len(),
             "attributed": attributed_rejections,
             "unattributed": unattributed_rejections,
-            "note": "a rebuild-pending rejection outside every landing's span is counted as \
-                     unattributed, never dropped",
+            "by_class": {
+                "tip_pending": owned_by_class(LandingCost::TipPending),
+                "payout_pending": owned_by_class(LandingCost::PayoutPending),
+                "stale_job": owned_by_class(LandingCost::StaleJob),
+                "unknown_job": owned_by_class(LandingCost::UnknownJob),
+            },
+            "unrecognised_in_phase": unrecognised_in_phase,
+            "unrecognised_in_spans": unrecognised_in_spans,
+            "unrecognised_sample": unrecognised_sample(rejections.iter()),
+            "not_owned_in_phase": not_owned_tally(rejections.iter()),
+            "note": "rebuild_pending_rejections_in_phase counts every rejection a landing owns \
+                     (counted_classes), in a span or not; one outside every landing's span is \
+                     unattributed, never dropped. Not-owned rejections are tallied by reason_id \
+                     and unrecognised ones apart: neither is part of any landing's cost.",
         },
         "lost_valid_work": {
             "definition": "a share the client had already proven against the share target, \
-                           rejected with new tip work is pending or new payout work is pending. \
-                           It was never persisted, so it is not a durability finding, but it is \
-                           miner work the pool discarded.",
-            "shares": lost_shares.len(),
+                           rejected with a class a landing owns (counted_classes in \
+                           rejection_attribution). It was never persisted, so it is not a \
+                           durability finding, but it is miner work the pool discarded.",
+            "shares": (unrecognised_in_phase == 0).then_some(lost_shares.len()),
+            "shares_unavailable_reason": (unrecognised_in_phase > 0).then(|| format!(
+                "{unrecognised_in_phase} rejection(s) in the phase carry a reason_id or message the \
+                 harness does not recognise, so the phase's lost valid work is unknown; \
+                 shares_recognised is a lower bound"
+            )),
+            "shares_recognised": lost_shares.len(),
             "shares_attributed": attributed_rejections,
             "shares_unattributed": unattributed_rejections,
-            "split_note": "shares counts every rebuild-pending rejection in the phase and is what \
-                           shares_found_in_postgres is checked over. shares_attributed is the \
-                           subset a landing's span owns, which is what the per-landing, \
-                           per-frontend lost_valid_shares tables sum to; the rest fell inside no \
-                           span and is counted here rather than leaving the census.",
-            "shares_found_in_postgres": lost_in_postgres.len(),
+            "split_note": "shares counts every owned rejection in the phase and \
+                           shares_found_in_postgres is checked over it; both are null when an \
+                           unrecognised rejection makes the total unknown, and then \
+                           shares_recognised and shares_recognised_found_in_postgres carry the \
+                           recognised count and its check, and \
+                           unrecognised_shares_found_in_postgres the check over the unrecognised \
+                           rejections' shares. shares_attributed is the subset \
+                           a landing's span owns, which is what the per-landing, per-frontend \
+                           lost_valid_shares tables sum to; the rest fell inside no span and is \
+                           counted here rather than leaving the census.",
+            "shares_found_in_postgres": (unrecognised_in_phase == 0).then_some(lost_in_postgres.len()),
+            "shares_found_in_postgres_unavailable_reason": (unrecognised_in_phase > 0).then(|| format!(
+                "shares is unknown ({unrecognised_in_phase} unrecognised rejection(s)), so a \
+                 durability answer over it is too; shares_recognised_found_in_postgres and \
+                 unrecognised_shares_found_in_postgres carry the two checks that were made"
+            )),
+            "shares_recognised_found_in_postgres": lost_in_postgres.len(),
             "shares_found_in_postgres_sample": lost_in_postgres.iter().take(10).collect::<Vec<_>>(),
+            "unrecognised_shares_found_in_postgres": unrecognised_in_postgres.len(),
+            "unrecognised_shares_found_in_postgres_sample":
+                unrecognised_in_postgres.iter().take(10).collect::<Vec<_>>(),
         },
         "frontend_health": inputs.frontends.iter().map(|health| json!({
             "frontend": health.index,
@@ -1160,15 +1378,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
             }).collect::<Vec<_>>(),
             "overall": overall.summarize(),
         },
-        "proposed_budget_for_issue_291": {
-            "metric": "p99 of the combined rebuild-pending window per landing, per frontend",
-            "window_p99_millis": combined_p99,
-            "rejections_per_landing_per_frontend_p99": count_p99,
-            "recommended_soak_budget_millis": combined_p99
-                .map(|p99| (p99 / 100.0).ceil() * 100.0),
-            "note": "the soak in #291 should fail if either number is exceeded at the same \
-                     topology. Both are unknown, not zero, when this run produced no landing.",
-        },
+        "proposed_budget_for_issue_291": budget,
         "definitions": definitions(),
     })
 }
@@ -1214,6 +1424,138 @@ fn no_landing_reason(
                 .join(" ")
         }
     ))
+}
+
+/// The rejections a landing owns, and the ones it does not (#480). The
+/// messages are the ones `crates/qbit-prism-server` emits on the submit path.
+pub const COUNTED_CLASSES: &str =
+    "a landing owns, inside its span: stale-job with `stale job` (the current server's answer \
+     for a share on a parent or payout revision the landing retired), unknown-job with `stale \
+     job` (a job ID the session no longer holds after the rebuild's clean_jobs notify), and, from \
+     older producers, stale-job with `new tip work is pending` or `new payout work is pending`. \
+     It does not own backend refusals, whatever their message (backend-rpc-unavailable: \
+     `current chain state is unavailable`, `current payout state is unavailable`, `current tip \
+     parent is unavailable`, `job resume unavailable`, `job resume timed out`; \
+     ledger-confirmation-failed: `share was not committed because its commit gate closed`, \
+     `share was not confirmed by the database`; ledger-outcome-unknown; internal-error), which \
+     say the backend could not classify or record the share rather than that the work was \
+     retired, nor stale-job with `job CTV fee is below the current relay floor`, pool-closed, the \
+     reason-less `too many unknown job submissions` budget refusal (tallied as (no reason_id)) or \
+     a harness-bug class: those are tallied by reason_id beside the cost. Any other stale-job or \
+     unknown-job message, or a reason the classifier does not know, is unrecognised, and makes \
+     the cost of the span it falls in unknown (null, with a reason).";
+
+/// The #291 budget block: null with a reason wherever the number could not be
+/// measured, never a zero that reads as "no rejected work" (EP-OBSERVABILITY).
+fn proposed_budget(
+    overall: &Distribution,
+    no_landing_reason: Option<&str>,
+    unrecognised_in_spans: usize,
+) -> Value {
+    let p99 = |values: &[f64], summarize: fn(&[f64]) -> measure::LatencySummary| {
+        optional_summary(values, summarize).and_then(|summary| summary.p99)
+    };
+    // A reason that nulls every number in the block: nothing to measure, or a
+    // cost the harness cannot attribute. A p99 over only the attributable
+    // tables would understate the cost of exactly the landings in doubt.
+    let blocking = match (no_landing_reason, overall.unattributable) {
+        (Some(reason), _) => Some(format!("no landing produced a window: {reason}")),
+        (None, 0) => None,
+        (None, tables) => Some(format!(
+            "{tables} landing-and-frontend table(s) held {unrecognised_in_spans} rejection(s) the \
+             harness does not recognise (rejection_attribution.unrecognised_sample names them), so \
+             their landings' cost is unknown and a percentile over the rest would understate it"
+        )),
+    };
+    let measured = |value: Option<f64>, empty: &str| -> (Option<f64>, Option<String>) {
+        match (&blocking, value) {
+            (Some(reason), _) => (None, Some(reason.clone())),
+            (None, Some(value)) => (Some(value), None),
+            (None, None) => (None, Some(empty.to_owned())),
+        }
+    };
+    let (window, window_reason) = measured(
+        p99(&overall.combined_duration, millis_summary),
+        "no landing's span held a rejection the landing owns, so there is no window to take a \
+         percentile of; rejections_per_landing_per_frontend_p99 is then a measured count",
+    );
+    let (count, count_reason) = measured(
+        p99(&overall.combined_count, count_summary),
+        "no landing-and-frontend table was built: the run has no frontend to measure",
+    );
+    let (before, before_reason) = measured(
+        p99(&overall.before_revision, count_summary),
+        "no frontend reached new-revision work inside a landing's span \
+         (new_revision_work_unavailable_reason in the tables says why for each)",
+    );
+    // The acceptance -> new-revision-work times are notify timings: they do
+    // not depend on which rejections a landing owns, so an unrecognised
+    // rejection does not null them. Only a run with no landing does.
+    let timing = |values: &[f64]| -> (Option<f64>, Option<String>) {
+        match (no_landing_reason, p99(values, millis_summary)) {
+            (Some(reason), _) => (
+                None,
+                Some(format!("no landing produced a window: {reason}")),
+            ),
+            (None, Some(value)) => (Some(value), None),
+            (None, None) => (
+                None,
+                Some(
+                    "no frontend reached new-revision work inside a landing's span \
+                     (new_revision_work_unavailable_reason in the tables says why for each)"
+                        .to_owned(),
+                ),
+            ),
+        }
+    };
+    let (acceptance, acceptance_reason) = timing(&overall.acceptance_work_min);
+    let (fanout, fanout_reason) = timing(&overall.acceptance_work_max);
+    json!({
+        "metric": "p99 of the combined rebuild-pending window per landing, per frontend, over \
+                   every rejection the landing owns (rejection_attribution.counted_classes)",
+        "window_p99_millis": window,
+        "window_p99_unavailable_reason": window_reason,
+        "rejections_per_landing_per_frontend_p99": count,
+        "rejections_per_landing_per_frontend_p99_unavailable_reason": count_reason,
+        "recommended_soak_budget_millis": window.map(|p99| (p99 / 100.0).ceil() * 100.0),
+        "same_edge_as_issue_458": {
+            "edge": "from the landing's acceptance (the fake node's tip change, stamped as it \
+                     accepts submitblock) to the first clean_jobs notify at the new revision on \
+                     the frontend: the edge qbit_prism_accepted_block_to_revision_work_seconds \
+                     measures, read on the harness's side of the wire",
+            "rejected_before_new_revision_work_per_landing_per_frontend_p99": before,
+            "rejected_before_new_revision_work_unavailable_reason": before_reason,
+            "acceptance_to_new_revision_work_p99_millis": acceptance,
+            "acceptance_to_new_revision_work_unavailable_reason": acceptance_reason,
+            "acceptance_to_new_revision_work_statistic": "per landing and frontend, the earliest \
+                                                          session's first clean_jobs notify, \
+                                                          as the server's histogram takes the \
+                                                          earliest delivery on the frontend",
+            "acceptance_to_new_revision_work_with_fanout_p99_millis": fanout,
+            "acceptance_to_new_revision_work_with_fanout_unavailable_reason": fanout_reason,
+            "acceptance_to_new_revision_work_with_fanout_statistic": "per landing and frontend, the \
+                                                                      latest session's: the same \
+                                                                      edge plus the notify fan-out \
+                                                                      across the frontend's \
+                                                                      sessions, which the server's \
+                                                                      histogram does not include",
+            "clock_note": "harness monotonic, from the fake node's submitblock stamp to the \
+                           client's read of the notify. The server's histogram starts later: on \
+                           the submitting frontend accepted_block is called at the end of \
+                           observe_candidate, after ready_chain_info, observe_chain_view, \
+                           getblockhash, getbestblockhash and ready_tip (several RPCs and a \
+                           ledger round trip after the node's stamp); on every other frontend it \
+                           is called from reconcile when that frontend discovers the tip, so it \
+                           trails the stamp by tip-discovery latency. It ends at the notify's \
+                           socket write, one transit before the client's read. The server's \
+                           number is therefore shorter than this one, by those amounts. This \
+                           end is also bounded below by the revision sampler: a notify written \
+                           before the sampler (25 ms interval) saw the bump is not counted.",
+        },
+        "note": "the soak in #291 should fail if either number is exceeded at the same topology. \
+                 Every number is null with its reason, never zero, when this run produced no \
+                 landing or a landing's cost could not be attributed.",
+    })
 }
 
 /// How the first `clean_jobs` notify stands in for a revision the wire never
@@ -1284,19 +1626,39 @@ pub fn definitions() -> Value {
         "span": "a landing's attribution span runs from its own pool tip change to the next \
                  landing's pool tip change, and for the last landing to the end of the phase \
                  (span_truncated_at_phase_end is then true). The spans tile the phase, so every \
-                 bump and every rebuild-pending rejection belongs to exactly one landing or to \
-                 unattributed.",
+                 bump and every rejection a landing owns belongs to exactly one landing or to \
+                 unattributed. The span starts at the landing's acceptance, the same instant \
+                 #458's server-side landing metric starts from.",
+        "counted_classes": COUNTED_CLASSES,
         "tip_pending_window": "the first and last `new tip work is pending` rejection that \
                                frontend returned inside the span, the count, and last minus first \
                                in milliseconds. The instant is when the client read the rejection \
                                line, which is the only instant the harness observed directly.",
-        "payout_pending_window": "the same for `new payout work is pending`. The two are reported \
-                                  apart because coordinator.rs checks the tip before the payout \
-                                  revision, so a landing produces the tip message first and the \
-                                  payout message only if the revision moved again after the \
-                                  rebuild.",
-        "combined_rebuild_pending_window": "first to last of either message, with the sum of both \
-                                            counts. This is the window #291 should budget against.",
+        "payout_pending_window": "the same for `new payout work is pending`. Both messages come \
+                                  from older producers; the current server answers every \
+                                  retired share `stale job`, so on it these two windows are \
+                                  empty and stale_job_window and unknown_job_window carry the \
+                                  cost.",
+        "stale_job_window": "the same for stale-job with `stale job`: the current server's answer \
+                             for a share on a parent or payout revision the landing retired. Its \
+                             internal cause (parent or revision) is on the server's \
+                             qbit_prism_stale_job_rejections_total{cause}, not on the wire.",
+        "unknown_job_window": "the same for unknown-job with `stale job`: a job ID the session no \
+                               longer holds once the rebuild's clean_jobs notify retired it.",
+        "combined_rebuild_pending_window": "first to last of every rejection the landing owns \
+                                            (counted_classes), with the count. This is the window \
+                                            #291 should budget against. When the span also held \
+                                            an unrecognised rejection the count, times and \
+                                            duration are null with unavailable_reason, and \
+                                            owned_count_lower_bound carries the recognised \
+                                            subset.",
+        "not_owned_rejections_in_span": "the rejections in the span a landing does not own, by \
+                                         reason_id: backend refusals, a fee-floor stale-job, \
+                                         pool-closed, harness-bug classes. Reported beside the \
+                                         cost, never inside it.",
+        "unrecognised_rejections_in_span": "rejections in the span whose reason_id or message \
+                                            the harness does not recognise; unrecognised_sample \
+                                            names up to five distinct pairs.",
         "time_to_new_tip_work": "t1 - t0 per session, where t0 is the landing's tip change on the \
                                  node and t1 is the first mining.notify whose prevhash resolves to \
                                  that tip and arrives before the end of the landing's span. Same \
@@ -1308,24 +1670,34 @@ pub fn definitions() -> Value {
                                  new_tip_work_unavailable_reason rather than a borrowed time.",
         "time_to_new_revision_work": NEW_REVISION_APPROXIMATION,
         "reference_bump": "the last bump attributed to the landing: the revision a frontend has to \
-                           reach before it stops answering `new payout work is pending`. \
+                           reach before its answers to shares on the old revision stop. \
                            time_to_new_revision_work and rejected_before_new_revision_work are \
                            both measured from it.",
-        "rejected_before_new_revision_work": "rebuild-pending rejections that frontend returned \
+        "rejected_before_new_revision_work": "rejections the landing owns that frontend returned \
                                               between the landing's tip change and the earliest \
                                               new-revision work on any of its sessions inside the \
-                                              landing's span. Null, with a reason, when there was \
-                                              no bump or no such job inside the span; a job seen \
-                                              only after the span is the next landing's and stops \
-                                              nothing here.",
-        "lost_valid_shares": "every rebuild-pending rejection in the span. The client only submits \
+                                              landing's span: the acceptance -> new-revision-work \
+                                              edge of #458's server-side metric. Null, with a \
+                                              reason, when there was no bump, no such job inside \
+                                              the span, or an unrecognised rejection in the span; \
+                                              a job seen only after the span is the next \
+                                              landing's and stops nothing here.",
+        "acceptance_to_new_revision_work": "the same first clean_jobs notify as \
+                                            time_to_new_revision_work, per session, measured \
+                                            from the landing's acceptance (its tip change) \
+                                            instead of the bump. The earliest session per \
+                                            landing and frontend (min) is the harness's reading \
+                                            of qbit_prism_accepted_block_to_revision_work_seconds; \
+                                            the latest (max) adds the notify fan-out.",
+        "lost_valid_shares": "every rejection the landing owns in the span. Null, with a reason, \
+                              when the span also held an unrecognised rejection. The client only submits \
                               a nonce it has already checked against the share target, so each one \
                               is a valid share the pool discarded. None is persisted, which is \
                               verified against this run's committed share identifiers rather than \
                               asserted. The per-landing tables count a span's rejections; the \
-                              phase-wide lost_valid_work block counts every rebuild-pending \
-                              rejection, attributed or not, and its shares_found_in_postgres is \
-                              checked over all of them.",
+                              phase-wide lost_valid_work block counts every owned rejection, \
+                              attributed or not, and its shares_found_in_postgres is checked over \
+                              all of them.",
         "bump": "an observed change of qbit_prism_cluster.payout_revision. Two bumps inside one \
                  sampling interval appear as one change with revision_delta above 1, so the delta \
                  is reported rather than assumed to be 1. The top-level bumps key is this count, \
@@ -1349,7 +1721,10 @@ pub fn definitions() -> Value {
             "shared_sampler": "one poll carries both locks, so the two blocks cover exactly the \
                                same instants and share a samples count and a sampler cost."
         },
-        "unknown_is_not_zero": "a measurement that could not be taken is null with a reason. A \
+        "unknown_is_not_zero": "a measurement that could not be taken is null with a reason: a \
+                                landing's cost is null when its span held a rejection the \
+                                harness does not recognise, and the #291 budget is null when any \
+                                was, or when nothing landed. A \
                                 run with no landing reports landings 0 and no windows, and bumps \
                                 only as many payout-revision changes as were actually observed -- \
                                 all of them unattributed, since there is no span to own them. A \

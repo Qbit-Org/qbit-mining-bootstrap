@@ -101,6 +101,10 @@ families! {
     DivergentLandings: Counter, "divergent_landings_total", "Confirmations this instance committed whose landed rows started to count on canonical balances other than their as-issued prior balances.";
     DivergentOverpay: Counter, "divergent_landing_overpay_sats_total", "Carry-forward debt, in sats, created by the divergent confirmations this instance committed.";
     CarryForwardDebt: Gauge, "carry_forward_debt_sats", "Sum of negative carry-forward balances, in sats, read from the canonical balances at this instance's latest balance change or full refresh, or -1 before one.";
+    NodePeers: Gauge, "node_peers", "Node peer connections from the latest node observation, or -1 when unknown.";
+    NodeIbd: Gauge, "node_initial_block_download", "Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown.";
+    NodeObservationAge: Gauge, "node_observation_age_seconds", "Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable.";
+    RollupLag: Gauge, "hashrate_rollup_watermark_lag_seconds", "Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -143,6 +147,10 @@ impl Family {
                     | Self::RevisionWorkUnknown
                     | Self::AcceptedUnlanded
                     | Self::RevisionWorkTimeouts
+                    | Self::NodePeers
+                    | Self::NodeIbd
+                    | Self::NodeObservationAge
+                    | Self::RollupLag
             )
     }
 
@@ -204,7 +212,7 @@ impl Registry {
         // These owner-dependent families have no samples at startup. Reserve
         // their closed keys now so even the first event needs no allocation.
         match family {
-            Family::FirstOffer => {
+            Family::FirstOffer | Family::RollupLag => {
                 self.samples
                     .insert((family, Labels::Empty), Sample::Pending);
             }
@@ -272,6 +280,14 @@ impl Registry {
         self.declare(family);
         self.samples
             .insert((family, labels.into()), Sample::Scalar(value));
+    }
+    /// Refresh a live sample without publishing one where its owner never did.
+    /// A reserved (pending) key stays absent, as when the rollup is disabled.
+    pub(super) fn refresh(&mut self, family: Family, labels: impl Into<Labels>, value: f64) {
+        assert!(value.is_finite());
+        if let Some(Sample::Scalar(sample)) = self.samples.get_mut(&(family, labels.into())) {
+            *sample = value;
+        }
     }
     pub(super) fn increment(&mut self, family: Family, labels: impl Into<Labels>) {
         assert_eq!(

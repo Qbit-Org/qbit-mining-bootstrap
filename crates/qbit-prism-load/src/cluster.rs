@@ -316,8 +316,15 @@ impl Cluster {
         self.run("pg_ctl", &all).map(|_| ())
     }
 
+    /// Start the server, or fail with the end of its own log.
+    ///
+    /// `pg_ctl` reports only that the server did not start and asks for the
+    /// log to be examined; the reason -- a socket path over the platform's
+    /// limit, a setting out of range -- is in the log, and the log is in the
+    /// cluster root, which goes with the failure unless `--keep-artifacts`
+    /// was given. The error carries its last lines instead (#485).
     fn start(&mut self, options: &str) -> Result<()> {
-        self.control(&[
+        let started = self.control(&[
             "-l",
             self.log.to_str().context("non-UTF-8 log path")?,
             "-o",
@@ -326,7 +333,22 @@ impl Cluster {
             "-t",
             "120",
             "start",
-        ])?;
+        ]);
+        if let Err(error) = started {
+            let pg_ctl = format!("{error:#}");
+            let pg_ctl = pg_ctl.trim_end();
+            let log = self.log.display();
+            bail!(match log_tail(&self.log, START_FAILURE_LOG_LINES) {
+                Some(tail) => format!(
+                    "{pg_ctl}\nPostgreSQL did not start; the last lines of its log {log} (removed \
+                     with the cluster root unless --keep-artifacts):\n{tail}"
+                ),
+                None => format!(
+                    "{pg_ctl}\nPostgreSQL did not start, and its log {log} could not be read or \
+                     is empty"
+                ),
+            });
+        }
         self.running = true;
         Ok(())
     }
@@ -338,6 +360,39 @@ impl Cluster {
         }
     }
 }
+
+/// How many trailing lines of a server log a failed start carries.
+pub const START_FAILURE_LOG_LINES: usize = 20;
+
+/// The last `lines` non-empty lines of a log, or `None` when it cannot be
+/// read or holds nothing.
+pub fn log_tail(path: &Path, lines: usize) -> Option<String> {
+    let contents = std::fs::read(path).ok()?;
+    let contents = String::from_utf8_lossy(&contents);
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    (!kept.is_empty()).then(|| kept[kept.len().saturating_sub(lines)..].join("\n"))
+}
+
+/// The longest Unix-domain socket path PostgreSQL accepts: one less than
+/// `sizeof(sun_path)`, which is 108 on Linux and 104 on macOS and the BSDs.
+#[cfg(target_os = "linux")]
+pub const MAX_SOCKET_PATH_BYTES: usize = 107;
+#[cfg(not(target_os = "linux"))]
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+
+/// The socket file PostgreSQL creates in `-k <dir>`, at the widest port, so
+/// a root that fits it fits whatever port is allocated later.
+const WIDEST_SOCKET_FILE: &str = ".s.PGSQL.65535";
+
+/// Hex digits of the random part of a root's name. The root used to carry a
+/// whole simple UUID (32), which put the socket 107 bytes deep under macOS's
+/// default `TMPDIR` of `/var/folders/<2>/<28>/T/`; 12 bring it to 87 there.
+/// The name is claimed with `create_dir`, so a collision fails rather than
+/// sharing a directory.
+const ROOT_NAME_HEX: usize = 12;
 
 /// The temporary cluster root, removed on drop unless the run asked to keep
 /// it.
@@ -354,10 +409,35 @@ pub struct TempRoot {
 }
 
 impl TempRoot {
+    /// A root under the process temp directory (`TMPDIR`).
     pub fn create(keep: bool) -> Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("prism-load-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&path).context("create cluster root")?;
+        Self::create_in(&std::env::temp_dir(), keep)
+    }
+
+    /// A root under `base`, refused before anything is created when
+    /// PostgreSQL's socket in it would exceed [`MAX_SOCKET_PATH_BYTES`].
+    /// The server would refuse to start there, and a refusal at entry names
+    /// the cause where the server's own line would otherwise have to be
+    /// dug out of its log (EP-CONFIG).
+    pub fn create_in(base: &Path, keep: bool) -> Result<Self> {
+        let name = format!(
+            "prism-load-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..ROOT_NAME_HEX]
+        );
+        let path = base.join(name);
+        let socket = path.join(WIDEST_SOCKET_FILE);
+        let socket_bytes = socket.as_os_str().len();
+        ensure!(
+            socket_bytes <= MAX_SOCKET_PATH_BYTES,
+            "the managed cluster's Unix socket would be {} ({socket_bytes} bytes), over the \
+             {MAX_SOCKET_PATH_BYTES}-byte limit PostgreSQL accepts on this platform, because the \
+             temporary directory {} is too deep; set TMPDIR to a shorter directory (for \
+             example TMPDIR=/tmp) or use --database-url",
+            socket.display(),
+            base.display()
+        );
+        std::fs::create_dir(&path)
+            .with_context(|| format!("create cluster root {}", path.display()))?;
         Ok(Self { path, keep })
     }
 
@@ -457,6 +537,21 @@ pub fn verify_bin_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The file names `pg_stat_statements` ships under: `.so` on Linux, and
+/// `.dylib` from Homebrew's PostgreSQL on macOS, which the managed cluster
+/// used never to find, so it never preloaded the extension there (#485).
+pub const PG_STAT_STATEMENTS_LIBRARIES: [&str; 2] =
+    ["pg_stat_statements.so", "pg_stat_statements.dylib"];
+
+/// The `pg_stat_statements` library in `pkglibdir`, if it is there under
+/// either name.
+pub fn pg_stat_statements_library(pkglibdir: &Path) -> Option<PathBuf> {
+    PG_STAT_STATEMENTS_LIBRARIES
+        .iter()
+        .map(|name| pkglibdir.join(name))
+        .find(|path| path.is_file())
+}
+
 fn pkglibdir(bin: &Path) -> Option<PathBuf> {
     let output = Command::new(bin.join("pg_config"))
         .arg("--pkglibdir")
@@ -519,8 +614,7 @@ impl ManagedPostgres {
         )?;
         let primary_port = free_port()?;
         let preload = pkglibdir(&bin_dir)
-            .map(|dir| dir.join("pg_stat_statements.so"))
-            .filter(|path| path.exists())
+            .and_then(|dir| pg_stat_statements_library(&dir))
             .map(|_| "pg_stat_statements".to_owned());
         // `synchronous_standby_names` is deliberately absent: a command-line
         // value shadows the `ALTER SYSTEM` flip the synchronous mode needs.

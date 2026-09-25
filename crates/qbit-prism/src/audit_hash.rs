@@ -199,12 +199,45 @@ pub struct CanonicalAuditHashPrefix {
     schema: &'static str,
 }
 
+thread_local! {
+    /// Share-array digests computed on this thread by
+    /// [`CanonicalAuditHashPrefix::new_with_share_digest`]: a probe for the
+    /// builder's tests, which pin that a rebuild computes none.
+    static SHARE_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CanonicalAuditHashPrefix {
+    /// How many share-array digests
+    /// [`CanonicalAuditHashPrefix::new_with_share_digest`] has computed on the
+    /// calling thread. A test probe: a rebuild that takes
+    /// [`CanonicalAuditHashPrefix::new_with`] leaves it unchanged.
+    #[doc(hidden)]
+    pub fn share_digests_computed_on_this_thread() -> usize {
+        SHARE_DIGESTS.with(std::cell::Cell::get)
+    }
+
     /// Hash the original ordered window while its audit body is being built.
     pub fn new(shares: &[AcceptedShare]) -> Result<Self, serde_json::Error> {
         let schema = audit_bundle_schema_for_shares(shares);
         let mut writer = DigestWriter(Sha256::new());
         write_prefix(&mut writer, schema, shares)?;
+        Ok(Self { writer, schema })
+    }
+
+    /// [`CanonicalAuditHashPrefix::new`] for the builder: the share array is
+    /// serialized in ordered chunks on `parallelism`, and nothing but the
+    /// prefix state is computed. The rebuild of a window whose `WindowRef`
+    /// already carries the share-array digest takes this; a first build of
+    /// a window takes [`CanonicalAuditHashPrefix::new_with_share_digest`].
+    /// The state is that of the serial computation.
+    pub fn new_with(
+        shares: &[AcceptedShare],
+        parallelism: Parallelism,
+    ) -> Result<Self, serde_json::Error> {
+        let schema = audit_bundle_schema_for_shares(shares);
+        let mut writer = DigestWriter(Sha256::new());
+        write_prefix_header(&mut writer, schema)?;
+        parallel::write_array(&mut writer, shares, parallelism)?;
         Ok(Self { writer, schema })
     }
 
@@ -217,6 +250,7 @@ impl CanonicalAuditHashPrefix {
         shares: &[AcceptedShare],
         parallelism: Parallelism,
     ) -> Result<(Self, [u8; 32]), serde_json::Error> {
+        SHARE_DIGESTS.with(|count| count.set(count.get() + 1));
         let schema = audit_bundle_schema_for_shares(shares);
         let mut writer = DigestWriter(Sha256::new());
         write_prefix_header(&mut writer, schema)?;
@@ -296,6 +330,41 @@ mod tests {
         )
         .unwrap();
         (body, shares)
+    }
+
+    #[test]
+    fn prefix_only_constructor_matches_the_serial_prefix_and_computes_no_share_digest() {
+        let (body, shares) = fixture();
+        let serial = CanonicalAuditHashPrefix::new(&shares)
+            .unwrap()
+            .finish(&body)
+            .unwrap();
+        for parallelism in [
+            Parallelism::serial(),
+            Parallelism::new(2, 2),
+            Parallelism::new(3, 5),
+            Parallelism::new(8, 1),
+        ] {
+            let digests = CanonicalAuditHashPrefix::share_digests_computed_on_this_thread();
+            let prefix = CanonicalAuditHashPrefix::new_with(&shares, parallelism).unwrap();
+            assert_eq!(
+                CanonicalAuditHashPrefix::share_digests_computed_on_this_thread(),
+                digests,
+                "new_with computed a share digest at {parallelism:?}"
+            );
+            assert_eq!(prefix.finish_with(&body, parallelism).unwrap(), serial);
+            let (with_digest, array) =
+                CanonicalAuditHashPrefix::new_with_share_digest(&shares, parallelism).unwrap();
+            assert_eq!(
+                CanonicalAuditHashPrefix::share_digests_computed_on_this_thread(),
+                digests + 1
+            );
+            assert_eq!(with_digest.finish_with(&body, parallelism).unwrap(), serial);
+            assert_eq!(
+                array,
+                <[u8; 32]>::from(Sha256::digest(serde_json::to_vec(&shares).unwrap()))
+            );
+        }
     }
 
     #[test]

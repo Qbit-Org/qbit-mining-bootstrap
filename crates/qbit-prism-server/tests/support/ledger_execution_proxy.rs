@@ -281,6 +281,24 @@ struct PausePlan {
     control: Arc<CommitPauseState>,
 }
 
+/// Holds the reply of the next execution whose statement text is exactly
+/// `sql`, on whichever connection runs it, from the frame `at` names on.
+struct StatementPausePlan {
+    sql: String,
+    at: PauseAt,
+    control: Arc<CommitPauseState>,
+}
+
+/// Where in a statement's reply a [`StatementPausePlan`] holds delivery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PauseAt {
+    /// The first `CommandComplete`: the client has read none of the reply.
+    Completion,
+    /// The `ReadyForQuery` that closes a simple query: every completion of
+    /// the batch has been delivered, only the end of the round trip is held.
+    Ready,
+}
+
 #[derive(Default)]
 struct State {
     executions: Vec<Execution>,
@@ -292,6 +310,7 @@ struct State {
     fired: Option<u64>,
     pause_plan: Option<PausePlan>,
     pause_armed: Option<u64>,
+    statement_pause: Option<StatementPausePlan>,
 }
 
 struct Shared {
@@ -439,6 +458,40 @@ impl ExecutionProxy {
             control: control.clone(),
         });
         state.pause_armed = None;
+        Ok(CommitPause(control))
+    }
+
+    /// Hold the reply of the next execution whose statement text is exactly
+    /// `sql` (a simple-protocol `Query`, such as `BEGIN`), from its
+    /// `CommandComplete` on, so the client stays blocked waiting for that
+    /// statement's `ReadyForQuery` until the handle releases it or drops.
+    /// Nothing is severed: the server has already run the statement, and the
+    /// connection stays usable once the reply is delivered.
+    pub fn pause_statement(&self, sql: &str) -> Result<CommitPause> {
+        self.plan_statement_pause(sql, PauseAt::Completion)
+    }
+
+    /// Like [`Self::pause_statement`], but delivers every `CommandComplete`
+    /// of the simple query `sql` and holds only its closing `ReadyForQuery`,
+    /// so a multi-statement query such as `BEGIN; SET LOCAL …` can be held
+    /// after the transport has accepted all of its completions but before
+    /// its round trip ends.
+    pub fn pause_statement_ready(&self, sql: &str) -> Result<CommitPause> {
+        self.plan_statement_pause(sql, PauseAt::Ready)
+    }
+
+    fn plan_statement_pause(&self, sql: &str, at: PauseAt) -> Result<CommitPause> {
+        let mut state = self.shared.state.lock().expect("proxy state");
+        ensure!(
+            state.plan.is_none() && state.pause_plan.is_none() && state.statement_pause.is_none(),
+            "proxy already has a delivery plan"
+        );
+        let control = Arc::new(CommitPauseState::default());
+        state.statement_pause = Some(StatementPausePlan {
+            sql: sql.into(),
+            at,
+            control: control.clone(),
+        });
         Ok(CommitPause(control))
     }
 
@@ -804,7 +857,7 @@ enum Action {
     Deliver(Delivery),
     Sever,
     Pause {
-        index: usize,
+        delivery: Delivery,
         control: Arc<CommitPauseState>,
     },
 }
@@ -865,7 +918,7 @@ async fn pump_server(
                     matches!(body.as_slice(), [b'I' | b'T' | b'E']),
                     "invalid ReadyForQuery frame"
                 );
-                Action::Deliver(Delivery::Ready(body[0]))
+                ready_action(&shared, &connection, body[0])
             }
             _ => Action::Forward,
         };
@@ -873,7 +926,7 @@ async fn pump_server(
             Action::Forward => None,
             Action::Deliver(delivery) => Some(delivery),
             Action::Sever => return Ok(ServerEnd::Closed),
-            Action::Pause { index, control } => {
+            Action::Pause { delivery, control } => {
                 // No observer lock or PostgreSQL transaction lock is held here.
                 loop {
                     let release = control.release.notified();
@@ -884,7 +937,7 @@ async fn pump_server(
                     }
                     release.await;
                 }
-                Some(Delivery::Complete(index))
+                Some(delivery)
             }
         };
         let bytes = frame(kind, &body)?;
@@ -995,6 +1048,7 @@ fn complete(
         fired,
         pause_plan,
         pause_armed,
+        statement_pause,
     } = &mut *state;
     let execution = &mut executions[index];
     if let Some(count) = tag.strip_prefix("SELECT ") {
@@ -1029,6 +1083,14 @@ fn complete(
                 *pause_armed = None;
             }
         }
+        if pause.is_none() {
+            if let Some(plan) = statement_pause.as_ref() {
+                if plan.at == PauseAt::Completion && execution.sql == plan.sql {
+                    pause = Some(plan.control.clone());
+                    *statement_pause = None;
+                }
+            }
+        }
     }
     execution.outcome = Outcome::Completed {
         tag,
@@ -1050,10 +1112,37 @@ fn complete(
     if sever {
         Ok(Action::Sever)
     } else if let Some(control) = pause {
-        Ok(Action::Pause { index, control })
+        Ok(Action::Pause {
+            delivery: Delivery::Complete(index),
+            control,
+        })
     } else {
         Ok(Action::Deliver(Delivery::Complete(index)))
     }
+}
+
+/// A `ReadyForQuery` is delivered as observed unless it closes the simple
+/// query a [`PauseAt::Ready`] plan is waiting for.
+fn ready_action(shared: &Shared, connection: &Mutex<Connection>, status: u8) -> Action {
+    let delivery = Delivery::Ready(status);
+    let Some(index) = front(connection) else {
+        return Action::Deliver(delivery);
+    };
+    let mut state = shared.state.lock().expect("proxy state");
+    let execution = &state.executions[index];
+    let seq = execution.seq;
+    let matched = state.statement_pause.as_ref().is_some_and(|plan| {
+        plan.at == PauseAt::Ready
+            && execution.protocol == Protocol::Simple
+            && execution.sql == plan.sql
+    });
+    if !matched {
+        return Action::Deliver(delivery);
+    }
+    let control = state.statement_pause.take().expect("matched plan").control;
+    control.seq.store(seq, Ordering::SeqCst);
+    control.entered.notify_waiters();
+    Action::Pause { delivery, control }
 }
 
 /// An `ErrorResponse` answers the oldest unanswered client frame. A client
