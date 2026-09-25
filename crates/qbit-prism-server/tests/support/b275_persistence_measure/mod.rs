@@ -552,12 +552,23 @@ fn complete_receipts_do_not_hide_durable_identity_failure() {
 
 /// Preserve the old blocking assertion at the actual authority fence. The
 /// historical advisory baseline remains attributed to its original revision.
+///
+/// The hold is an authority write as the server makes one: the cluster row
+/// `FOR UPDATE` (`lock_cluster_authority`), then a `payout_revision`
+/// `UPDATE`, rolled back after three seconds so the job persists under its
+/// original revision. Before #479 the hold was a `ledger_clock_ms` `UPDATE`,
+/// which job persistence no longer waits for (see
+/// [`clock_hold_does_not_block_persistence`]): the clock is not authority and
+/// no persistence path reads it.
 pub async fn authority_lock(fixture: &Fixture) -> Result<()> {
     let frontend = &fixture.frontends[0];
     let worker = frontend.authorize("b275.authority").await?;
     let job = frontend.build_job(&worker, "11223344", 1.0, 0.0).await?;
     let mut tx = fixture.direct.begin().await?;
-    sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=ledger_clock_ms WHERE singleton")
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
         .execute(&mut *tx)
         .await?;
     let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -592,6 +603,38 @@ pub async fn authority_lock(fixture: &Fixture) -> Result<()> {
         "B275_AUTHORITY_LOCK {}",
         json!({"hold_target_seconds":3,"persist_seconds":elapsed,
         "ordinary_update_wait_observed":true,"scope":"legitimate authority row contention retained"})
+    );
+    Ok(())
+}
+
+/// The converse of [`authority_lock`] (#479): the share append's clock
+/// `UPDATE` holds the cluster row `FOR NO KEY UPDATE` under ORDER_LOCK, and
+/// job persistence's `FOR KEY SHARE` fence does not wait for it, so shares
+/// and job persistence no longer queue behind each other on the clock.
+pub async fn clock_hold_does_not_block_persistence(fixture: &Fixture) -> Result<()> {
+    let frontend = &fixture.frontends[0];
+    let worker = frontend.authorize("b275.clock").await?;
+    let job = frontend.build_job(&worker, "55667788", 1.0, 0.0).await?;
+    let mut tx = fixture.direct.begin().await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=ledger_clock_ms WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+    let start = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        frontend.persist_issued_job(&worker, &job, 0, Duration::from_secs(60)),
+    )
+    .await
+    .context("job persistence waited behind a held ledger clock UPDATE")??;
+    let elapsed = start.elapsed().as_secs_f64();
+    ensure!(
+        frontend.ledger.job(&job.wire.job_id).await?.is_some(),
+        "persist succeeded without durable row"
+    );
+    tx.rollback().await?;
+    println!(
+        "B275_CLOCK_HOLD {}",
+        json!({"persist_seconds":elapsed,"clock_hold_open":true})
     );
     Ok(())
 }
@@ -764,6 +807,11 @@ pub async fn revision_fence(fixture: &Fixture) -> Result<()> {
             .fetch_one(&fixture.direct)
             .await?;
     let mut tx = fixture.direct.begin().await?;
+    // An authority writer as the server makes one: the row FOR UPDATE, then
+    // the UPDATE (a bare non-key UPDATE is forbidden, #479).
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
         .execute(&mut *tx)
         .await?;

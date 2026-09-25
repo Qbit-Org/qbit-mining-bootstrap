@@ -8,8 +8,9 @@
 //!
 //! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
 //! ORDER_LOCK, then the cluster row FOR UPDATE before fresh reference scans and
-//! blob deletion. Compact prepared/issued writers hold cluster FOR SHARE through
-//! commit; candidate balance writers take ORDER before that shared fence.
+//! blob deletion. Compact prepared/issued writers hold cluster FOR KEY SHARE
+//! through commit (#479); candidate balance writers take ORDER before that
+//! shared fence.
 //! Stop ALL frontends/collectors for this protocol upgrade: old collectors are
 //! unsafe with new writers, even though the persisted format is unchanged.
 //! Retain blobs named

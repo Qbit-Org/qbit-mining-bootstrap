@@ -1043,21 +1043,114 @@ async fn changing_the_partition_width_keeps_names_unique_and_bounds_contiguous()
     result
 }
 
-/// The leaves the append's own share_id probe descends, with the floor and
-/// the ceiling bound as parameters the way `append_in` binds them (#479).
+/// Text fragments of the two statements `append_in` prepares for the probe
+/// (#479): the bounds read, whose last two columns are the inlined floor and
+/// ceiling, and the share_id probe that binds them.
+const BOUNDS_STATEMENT: &str = "FROM qbit_prism_share_partitioning, ";
+const PROBE_STATEMENT: &str = "WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3";
+
+/// Every idle session of the ledger's pool that has prepared a statement
+/// containing `fragment`, with that statement's name. These are the
+/// server's own statements as `append_in` sent them, not copies of their
+/// text, so a test through them fails when the code changes.
+async fn prepared_on_ledger_sessions(
+    pool: &PgPool,
+    fragment: &str,
+) -> Result<Vec<(sqlx::pool::PoolConnection<sqlx::Postgres>, String)>> {
+    // An append returns its connection to the pool from a cleanup task after
+    // the call itself has returned; wait for every session to be idle.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.num_idle() < pool.size() as usize {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("the ledger's sessions never all returned to the pool")?;
+    let mut idle = Vec::new();
+    while let Some(connection) = pool.try_acquire() {
+        idle.push(connection);
+    }
+    let mut found = Vec::new();
+    for mut connection in idle {
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM pg_prepared_statements WHERE strpos(statement,$1)>0",
+        )
+        .bind(fragment)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(name) = name {
+            found.push((connection, name));
+        }
+    }
+    ensure!(
+        !found.is_empty(),
+        "no ledger session has prepared a statement containing {fragment:?}"
+    );
+    Ok(found)
+}
+
+/// Generic and custom plans the server built for the append's share_id probe,
+/// summed over the ledger's sessions.
+async fn append_probe_plans(pool: &PgPool) -> Result<(i64, i64)> {
+    let mut plans = (0, 0);
+    for (mut connection, name) in prepared_on_ledger_sessions(pool, PROBE_STATEMENT).await? {
+        let (generic, custom): (i64, i64) = sqlx::query_as(
+            "SELECT generic_plans,custom_plans FROM pg_prepared_statements WHERE name=$1",
+        )
+        .bind(&name)
+        .fetch_one(&mut *connection)
+        .await?;
+        plans.0 += generic;
+        plans.1 += custom;
+    }
+    Ok(plans)
+}
+
+/// Append `share` and require the probe to have run on a generic plan: one
+/// more generic plan use and no custom plan. Under the default
+/// `plan_cache_mode = auto` the planner chooses a custom plan for this probe
+/// on every share (#479).
+async fn append_on_a_generic_probe_plan(
+    db: &Database,
+    share: AcceptedShare,
+) -> Result<AcceptedShare> {
+    let before = append_probe_plans(db.pool()).await.unwrap_or((0, 0));
+    let landed = db.ledger.append(share, None).await?.share;
+    let after = append_probe_plans(db.pool()).await?;
+    ensure!(
+        after.0 > before.0 && after.1 == before.1,
+        "the append's probe was not run on a generic plan: (generic, custom) plans went from {before:?} to {after:?}"
+    );
+    Ok(landed)
+}
+
+/// EXPLAIN the append's own prepared probe for `share_id`, with the floor and
+/// the ceiling the running bounds statement returns, under `mode`.
+async fn explain_append_probe(pool: &PgPool, share_id: &str, mode: &str) -> Result<Vec<String>> {
+    let (floor, ceiling) = running_bounds(pool, share_id).await?;
+    let (mut connection, name) = prepared_on_ledger_sessions(pool, PROBE_STATEMENT)
+        .await?
+        .into_iter()
+        .next()
+        .context("probe session")?;
+    let plan: Vec<String> = sqlx::raw_sql(&format!(
+        "BEGIN; SET LOCAL plan_cache_mode = {mode}; \
+         EXPLAIN EXECUTE {name}('{}', {floor}, {ceiling}); ROLLBACK",
+        share_id.replace('\'', "''")
+    ))
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .filter_map(|row| sqlx::Row::try_get::<String, _>(&row, 0).ok())
+    .collect();
+    ensure!(!plan.is_empty(), "EXPLAIN EXECUTE {name} returned no plan");
+    Ok(plan)
+}
+
+/// The leaves the append's own share_id probe descends under a custom plan
+/// for its bound floor and ceiling (plan-time pruning).
 async fn append_probe_leaves(pool: &PgPool, share_id: &str) -> Result<Vec<String>> {
-    let (floor, ceiling): (i64, i64) =
-        sqlx::query_as("SELECT qbit_prism_share_probe_floor(),qbit_prism_share_next_seq()")
-            .fetch_one(pool)
-            .await?;
-    let plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3",
-    )
-    .bind(share_id)
-    .bind(floor)
-    .bind(ceiling)
-    .fetch_all(pool)
-    .await?;
+    let plan = explain_append_probe(pool, share_id, "force_custom_plan").await?;
     let mut leaves = Vec::new();
     for line in &plan {
         if let Some(rest) = line.split(" on qbit_share_ledger_p").nth(1) {
@@ -1075,30 +1168,10 @@ async fn append_probe_leaves(pool: &PgPool, share_id: &str) -> Result<Vec<String
 }
 
 /// How many attached partitions executor-startup pruning removes from the
-/// append's probe under the generic plan the append transaction forces
-/// (`plan_cache_mode = force_generic_plan`), which is the plan the server's
-/// prepared statement runs with: the bounds are parameters at plan time and
-/// values only at execution.
+/// append's own probe under the generic plan the append transaction forces:
+/// the bounds are parameters at plan time and values only at execution.
 async fn append_probe_subplans_removed(pool: &PgPool, share_id: &str) -> Result<i64> {
-    let (floor, ceiling): (i64, i64) =
-        sqlx::query_as("SELECT qbit_prism_share_probe_floor(),qbit_prism_share_next_seq()")
-            .fetch_one(pool)
-            .await?;
-    let mut connection = pool.acquire().await?;
-    let plan: Vec<String> = sqlx::raw_sql(&format!(
-        "SET plan_cache_mode = force_generic_plan; \
-         PREPARE append_probe(text, bigint, bigint) AS SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3; \
-         EXPLAIN EXECUTE append_probe('{}', {floor}, {ceiling})",
-        share_id.replace('\'', "''")
-    ))
-    .fetch_all(&mut *connection)
-    .await?
-    .into_iter()
-    .filter_map(|row| sqlx::Row::try_get::<String, _>(&row, 0).ok())
-    .collect();
-    sqlx::raw_sql("DEALLOCATE append_probe; RESET plan_cache_mode")
-        .execute(&mut *connection)
-        .await?;
+    let plan = explain_append_probe(pool, share_id, "force_generic_plan").await?;
     let removed = plan
         .iter()
         .find_map(|line| line.trim().strip_prefix("Subplans Removed: "))
@@ -1108,21 +1181,32 @@ async fn append_probe_subplans_removed(pool: &PgPool, share_id: &str) -> Result<
     Ok(removed)
 }
 
+/// The floor and ceiling the append's own bounds statement returns now.
+async fn running_bounds(pool: &PgPool, share_id: &str) -> Result<(i64, i64)> {
+    let (mut connection, name) = prepared_on_ledger_sessions(pool, BOUNDS_STATEMENT)
+        .await?
+        .into_iter()
+        .next()
+        .context("bounds session")?;
+    let row = sqlx::raw_sql(&format!(
+        "EXECUTE {name}(NULL, '{}')",
+        share_id.replace('\'', "''")
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok((sqlx::Row::try_get(&row, 3)?, sqlx::Row::try_get(&row, 4)?))
+}
+
 /// The bounds `append_in` inlines are the bodies of migration 016's
 /// `qbit_prism_share_probe_floor()` and `qbit_prism_share_next_seq()`; they
-/// must agree in every catalog state.
-async fn inlined_bounds_match_the_functions(pool: &PgPool) -> Result<()> {
-    let (floor, ceiling, inline_floor, inline_ceiling): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT qbit_prism_share_probe_floor(),qbit_prism_share_next_seq(),\
-         COALESCE((SELECT COALESCE(lower_seq,0) FROM qbit_prism_share_partitions \
-            WHERE state='attached' AND (lower_seq IS NULL OR lower_seq<=next_seq.value) \
-            ORDER BY upper_seq DESC OFFSET 2 LIMIT 1),0),next_seq.value \
-         FROM qbit_prism_share_partitioning, \
-         (SELECT CASE WHEN is_called THEN last_value+1 ELSE last_value END AS value \
-            FROM qbit_share_ledger_share_seq_seq) AS next_seq WHERE singleton",
-    )
-    .fetch_one(pool)
-    .await?;
+/// must agree in every catalog state. The inlined pair is read through the
+/// append's own prepared statement.
+async fn inlined_bounds_match_the_functions(pool: &PgPool, share_id: &str) -> Result<()> {
+    let (floor, ceiling): (i64, i64) =
+        sqlx::query_as("SELECT qbit_prism_share_probe_floor(),qbit_prism_share_next_seq()")
+            .fetch_one(pool)
+            .await?;
+    let (inline_floor, inline_ceiling) = running_bounds(pool, share_id).await?;
     ensure!(
         (floor, ceiling) == (inline_floor, inline_ceiling),
         "the inlined bounds ({inline_floor}, {inline_ceiling}) differ from the functions ({floor}, {ceiling})"
@@ -1145,8 +1229,8 @@ async fn the_append_probe_is_pruned_to_the_leaves_between_the_floor_and_the_sequ
     let result = async {
         let attached = db.attached().await?;
         ensure!(attached.len() == 5, "unexpected attached set: {attached:?}");
-        let fresh = db.ledger.append(share(1, "alice"), None).await?.share;
-        inlined_bounds_match_the_functions(db.pool()).await?;
+        let fresh = append_on_a_generic_probe_plan(&db, share(1, "alice")).await?;
+        inlined_bounds_match_the_functions(db.pool(), &fresh.share_id).await?;
         let leaves = append_probe_leaves(db.pool(), &fresh.share_id).await?;
         ensure!(
             leaves == ["qbit_share_ledger_p0"],
@@ -1163,8 +1247,8 @@ async fn the_append_probe_is_pruned_to_the_leaves_between_the_floor_and_the_sequ
             partitions::ensure(db.pool()).await? > 0,
             "no lead was attached for the moved sequence"
         );
-        let landed = db.ledger.append(share(2, "alice"), None).await?.share;
-        inlined_bounds_match_the_functions(db.pool()).await?;
+        let landed = append_on_a_generic_probe_plan(&db, share(2, "alice")).await?;
+        inlined_bounds_match_the_functions(db.pool(), &landed.share_id).await?;
         let attached = db.attached().await?.len() as i64;
         let removed = append_probe_subplans_removed(db.pool(), &landed.share_id).await?;
         ensure!(

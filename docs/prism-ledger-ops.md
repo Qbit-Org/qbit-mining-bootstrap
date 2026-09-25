@@ -63,20 +63,59 @@ Groups share the complete original compact dependency identity and the expected
 current revision and parent; each Coordinator is bound to its own ledger/frontend.
 Only small owned child metadata is queued. Prepared reservations, inline/direct
 single-job APIs, and missing-dependency cold repair keep their existing paths.
-Compact hot batches and single-child repair take cluster `FOR SHARE`, prepared
-`FOR KEY SHARE`, and template/balance `FOR KEY SHARE` locks in that order when
-those rows exist. Direct compact prepared storage also takes cluster `FOR SHARE`
-before its authority checks and blob writes. These persistence transactions do
+Compact hot batches and single-child repair take cluster `FOR KEY SHARE`,
+prepared `FOR KEY SHARE`, and template/balance `FOR KEY SHARE` locks in that
+order when those rows exist. Direct compact prepared storage also takes cluster
+`FOR KEY SHARE` before its authority checks and blob writes. These persistence transactions do
 not acquire `SETTLEMENT_LOCK` or `ORDER_LOCK`.
 Shared revision, configuration, writable-state and dependency checks happen
 after the row waits. Children and any retention extension through the largest
 child expiry plus existing headroom commit atomically; original reservation
 identity and each child's absolute expiry never change.
 
-`FOR SHARE` is required: it conflicts with ordinary non-key `UPDATE`s of payout
-revision, fatal state, configuration and the ledger clock. `FOR KEY SHARE` would
-allow those updates and is not an authority fence. Mutable authority is checked
-after acquiring the shared fence and stays fenced until commit. Coordinator
+The cluster row's lock matrix (#479):
+
+| Who | Lock on the cluster row |
+|---|---|
+| Authority writers (`payout_revision`, `config_fingerprint`, `fatal_error`) | `FOR UPDATE`, then the `UPDATE` |
+| Job persistence cohorts, repair and prepared storage | `FOR KEY SHARE` |
+| Blob GC | `FOR UPDATE` |
+| Share append clock and snapshot anchor (`ledger_clock_ms`) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
+| Candidate, offer and append revision readers | `FOR SHARE` |
+
+`FOR KEY SHARE` conflicts with `FOR UPDATE`, so a cohort still serialises
+against every authority change and against blob GC, but it does not conflict
+with the clock `UPDATE`: shares and cohorts no longer queue behind each other
+on the clock, which no persistence path reads. A **bare `UPDATE` of an
+authority column is forbidden**: it takes only `FOR NO KEY UPDATE` and passes a
+held cohort fence. Every authority writer takes the row `FOR UPDATE` in the
+same transaction before it writes (`lock_cluster_authority`, or its own
+`SELECT … FOR UPDATE`). The `*_waits_for_a_job_cohort_fence` tests drive each
+production writer through its API against a held fence: configure, tip
+observation, the settlement, reconcile and orphan revision bumps, both halts,
+fatal-state clear and the policy transition (`ledger_postgres`), and the
+signing transition (`signing_transition`) and orphan settlement
+(`offer_lifecycle`). `authority_writers_lock_the_cluster_row_first` scans the
+source for a bare one. Mutable authority is checked after acquiring the
+shared fence and stays fenced until commit.
+
+**Upgrading from a 3.x.x build before #517.** Such a build's authority writers
+are bare `UPDATE`s, which pass the new cohorts' `FOR KEY SHARE`. Do not mix the
+two: drain and stop every older frontend, collector and one-shot tool
+(coordinated, as for any fence change) before starting a build with this
+fence. The schema is unchanged.
+
+**MultiXact use.** A clock `UPDATE` that overlaps a cohort's fence now
+proceeds instead of waiting. It leaves a locker-plus-updater MultiXact on the
+singleton row, and the lock is carried to the new row version. On PostgreSQL
+16, 1,000 clock `UPDATE`s used no MultiXact IDs with no locker and 2,000 with
+one `FOR KEY SHARE` holder open. At 500 shares/s with a fraction *f* of
+appends overlapping a cohort, that is about 86 M·*f* a day, which brings the
+anti-wraparound MultiXact vacuum forward to about every 4.6/*f* days at the
+default `autovacuum_multixact_freeze_max_age`. This is far cheaper than the
+wait it replaces, and it is not a correctness issue. To do: in the next D1
+run, record `pg_stat_slru` (`MultiXactOffset`, `MultiXactMember`) and
+`mxid_age(datminmxid)` before and after, and note the measured rate here. Coordinator
 readiness, publication generation, epoch and lease checks still run before and
 after storage; a durable undelivered row grants no delivery authority.
 
@@ -1457,10 +1496,14 @@ only documented.
   reply but before the end of the batch retires the connection as well. The
   test proves it by also holding only the batch's closing `ReadyForQuery`.
 
-On the successful path nothing changes: an append is the same ten
-statements on one connection, followed by SQLx's own release ping, and the
-test prints that trace after the retirement so the count can be compared
-with the trace recorded before the guard.
+On the successful path nothing changes: an append is the same ten round
+trips on one connection, followed by SQLx's own release ping. Since #479 they
+carry eleven server statements: the opening simple query is `BEGIN` plus
+`SET LOCAL plan_cache_mode = force_generic_plan`, which applies to every
+statement of the append transaction and makes the share_id probe planned once
+per connection, and `pg_stat_statements` shows the `SET`. The test prints the
+trace after the retirement so the count can be compared with the trace
+recorded before the guard.
 
 **Rejected alternative.** A pool-level `after_release` hook in the ledger's
 pool builder that rolls back any open transaction would cover every
@@ -2465,8 +2508,9 @@ from a killed one once its heartbeat is stale. If such a process halts the
 cluster between the reset and the first new-key pin, `fatal-state clear`
 refuses (the fingerprint is missing) and no frontend can start (halted). The
 exposure is the same as the by-hand reset's. Recovery, as the database owner:
-restore the old fingerprint from the journal row,
-`UPDATE qbit_prism_cluster SET config_fingerprint=(SELECT previous_fingerprint FROM qbit_prism_signing_transitions ORDER BY transition_id DESC LIMIT 1) WHERE singleton`,
+restore the old fingerprint from the journal row, taking the row lock first
+as every authority write must,
+`BEGIN; SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE; UPDATE qbit_prism_cluster SET config_fingerprint=(SELECT previous_fingerprint FROM qbit_prism_signing_transitions ORDER BY transition_id DESC LIMIT 1) WHERE singleton; COMMIT`,
 make sure the process that wrote the halt is really gone, run
 `fatal-state clear` with the **old** key environment, then run
 `signing-transition --confirm` again; the journal keeps both rows.

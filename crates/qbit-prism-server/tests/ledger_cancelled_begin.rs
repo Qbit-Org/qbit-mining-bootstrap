@@ -323,6 +323,8 @@ struct Observed {
     /// Statement texts on the cancelled connection since the cancelled
     /// `BEGIN`, in order.
     wire: Vec<String>,
+    /// For each statement in `wire`, whether it opens a transaction.
+    wire_begins: Vec<bool>,
     /// Server notices SQLx relayed while the next transaction ran.
     notices: Vec<(String, String)>,
 }
@@ -432,10 +434,16 @@ async fn cancel_inside_begin<T: Send + 'static>(
     let next = h.proxy.executions_since(next_mark)?;
     let next_connection = next
         .iter()
-        .find(|execution| execution.sql == "BEGIN")
+        .find(|execution| execution.begins_transaction())
         .context("the next transaction's BEGIN")?
         .connection;
-    let wire = wire(&h.proxy.executions_since(mark)?, cancelled_connection);
+    let since = h.proxy.executions_since(mark)?;
+    let wire_begins = since
+        .iter()
+        .filter(|execution| execution.connection == cancelled_connection)
+        .map(Execution::begins_transaction)
+        .collect();
+    let wire = wire(&since, cancelled_connection);
     eprintln!("wire on proxy connection {cancelled_connection}: {wire:?}");
     eprintln!(
         "next transaction: backend {next_pid} on proxy connection {next_connection}, notices {notices:?}"
@@ -449,6 +457,7 @@ async fn cancel_inside_begin<T: Send + 'static>(
         next_pid,
         next_connection,
         wire,
+        wire_begins,
         notices,
     })
 }
@@ -477,18 +486,16 @@ fn assert_clean(h: &Harness, observed: &Observed, begin: &str) -> Result<()> {
         "the cancelled BEGIN was not the first statement observed: {:?}",
         observed.wire
     );
+    // Any later statement that opens a transaction, whether a plain `BEGIN`
+    // or an append's `BEGIN; SET LOCAL …` batch, must follow a ROLLBACK.
+    let second_begin = observed.wire_begins[1..].iter().position(|begins| *begins);
     ensure!(
-        !observed.wire[1..].contains(&"BEGIN".to_owned())
-            || observed.wire[1..]
+        second_begin.is_none_or(|begin| {
+            observed.wire[1..]
                 .iter()
                 .position(|sql| sql == "ROLLBACK")
-                .is_some_and(|rollback| {
-                    rollback
-                        < observed.wire[1..]
-                            .iter()
-                            .position(|sql| sql == "BEGIN")
-                            .unwrap()
-                }),
+                .is_some_and(|rollback| rollback < begin)
+        }),
         "a second BEGIN reached the cancelled connection before a ROLLBACK: {:?}",
         observed.wire
     );

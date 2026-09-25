@@ -662,9 +662,19 @@ impl Ledger {
     /// that probe (it prunes at plan time and looks cheaper than the generic
     /// estimate over every partition) and re-plans it on every share, inside
     /// `ORDER_LOCK`. Sent with `BEGIN` in one round trip; `SET LOCAL` ends
-    /// with the transaction. `AppendConnection::begin` records the `BEGIN`
-    /// as complete only after the reply to the whole batch is read, so a
-    /// cancel before then still retires the connection (#482).
+    /// with the transaction, and applies to every statement in it; the others
+    /// are key lookups or scan every leaf either way. `AppendConnection::begin`
+    /// records the `BEGIN` as complete only after the reply to the whole batch
+    /// is read, so a cancel before then still retires the connection (#482).
+    ///
+    /// Plan cache: SQLx prepares the probe once per connection. Under
+    /// `force_generic_plan` its first execution builds the generic plan,
+    /// with the bounds as parameters, and every later execution reuses it;
+    /// executor startup then prunes the partitions outside the bound values
+    /// ("Subplans Removed" in EXPLAIN EXECUTE, pinned by
+    /// `the_append_probe_is_pruned_to_the_leaves_between_the_floor_and_the_sequence`).
+    /// A partition attach or detach invalidates the plan and the next
+    /// execution rebuilds it once.
     const APPEND_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL plan_cache_mode = force_generic_plan";
 
     /// One complete attempt of [`Ledger::append_checked`], from BEGIN to
@@ -758,7 +768,8 @@ impl Ledger {
         // re-planned per share). The ceiling is the next share_seq: every row
         // that can exist is below it, because rows are appended under the
         // lock this transaction holds and imported partitions carry sequences
-        // the ledger already handed out. The two subqueries are the bodies of
+        // the ledger already handed out (archive attach refuses a partition
+        // holding a row at or above it). The two subqueries are the bodies of
         // migration 016's `qbit_prism_share_probe_floor()` and
         // `qbit_prism_share_next_seq()`, inlined because a SQL-language
         // function is re-planned on every call; a test holds them equal.

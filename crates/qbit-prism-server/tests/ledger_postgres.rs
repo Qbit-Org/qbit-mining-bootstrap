@@ -45,6 +45,12 @@ mod share_partitions;
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
 
+#[path = "support/cohort_fence.rs"]
+mod cohort_fence;
+
+#[path = "support/authority_writers.rs"]
+mod authority_writers;
+
 #[path = "support/ledger_database.rs"]
 #[allow(dead_code)]
 mod ledger_database;

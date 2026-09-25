@@ -62,6 +62,9 @@ use fake_qbitd as fake;
 mod ledger_database;
 use ledger_database::FixtureDatabase;
 
+#[path = "support/cohort_fence.rs"]
+mod cohort_fence;
+
 /// The fake node's genesis, which the fingerprint binds.
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 /// The default heartbeat cadence, whose freshness window is fifteen seconds.
@@ -1026,5 +1029,27 @@ async fn without_confirm_nothing_is_checked_or_changed() -> Result<()> {
         assert!(stderr.contains("--confirm"), "{stderr}");
         assert_eq!(fixture.state().await?, before);
     }
+    fixture.close().await
+}
+
+/// The reset of the pinned fingerprint is an authority write (#479): it
+/// waits for a job cohort's `FOR KEY SHARE` fence on the cluster row.
+#[tokio::test]
+async fn the_signing_reset_waits_for_a_job_cohort_fence() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    fixture.stop_both().await?;
+    let pool = sqlx::PgPool::connect(&fixture.database.url).await?;
+    let operator = fixture.operator.clone();
+    let config = fixture.config.clone();
+    let waited =
+        cohort_fence::waits_for_the_cohort_fence(&pool, "the signing transition", async move {
+            operator.transition_signing(&config, CADENCE).await
+        })
+        .await;
+    pool.close().await;
+    waited??;
+    assert_eq!(fixture.fingerprint().await?, None);
     fixture.close().await
 }

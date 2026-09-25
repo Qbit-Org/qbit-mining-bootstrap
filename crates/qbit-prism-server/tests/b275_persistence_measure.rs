@@ -54,6 +54,17 @@ async fn three_second_authority_row_hold_still_blocks_persistence() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_ledger_clock_update_does_not_block_persistence() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    support::run(&raw, 1, |fixture, _| {
+        support::clock_hold_does_not_block_persistence(fixture).boxed_local()
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn original_revision_fence_survives_lock_wait() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());

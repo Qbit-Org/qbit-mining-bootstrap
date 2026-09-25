@@ -124,7 +124,11 @@ pub struct Execution {
     /// Statement text learned from `Parse` (through the portal) or `Query`.
     pub sql: String,
     pub markers: Vec<Marker>,
+    /// The latest answer; for a simple-query batch, its last completion.
     pub outcome: Outcome,
+    /// Every completion tag the server sent for this execution, in order: a
+    /// simple-query batch such as `BEGIN; SET LOCAL …` has one per statement.
+    pub tags: Vec<String>,
     /// Actual DataRow frames, counted without retaining their payloads.
     pub rows_received: u64,
     pub jsonb_writes: BTreeMap<(String, String), JsonbWrites>,
@@ -139,7 +143,23 @@ impl Execution {
             .any(|marker| marker.table == table && marker.op == op)
     }
 
-    /// The completion tag, whether or not it reached the client.
+    /// Whether this execution opens a transaction: its first statement's
+    /// completion is `BEGIN`, or, before the server has answered, its text
+    /// starts with `BEGIN`. A batch such as `BEGIN; SET LOCAL …` counts; its
+    /// last completion (`completion`) is the `SET`.
+    pub fn begins_transaction(&self) -> bool {
+        match self.tags.first() {
+            Some(tag) => tag == "BEGIN",
+            None => self
+                .sql
+                .trim_start()
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("BEGIN")),
+        }
+    }
+
+    /// The completion tag, whether or not it reached the client; for a
+    /// simple-query batch, its last statement's.
     pub fn completion(&self) -> Option<&str> {
         match &self.outcome {
             Outcome::Completed { tag, .. } => Some(tag),
@@ -767,6 +787,7 @@ fn record(
             sql,
             markers: Vec::new(),
             outcome: Outcome::Pending,
+            tags: Vec::new(),
             rows_received: 0,
             jsonb_writes: BTreeMap::new(),
             select_rows: None,
@@ -1092,6 +1113,7 @@ fn complete(
             }
         }
     }
+    execution.tags.push(tag.clone());
     execution.outcome = Outcome::Completed {
         tag,
         delivered: false,

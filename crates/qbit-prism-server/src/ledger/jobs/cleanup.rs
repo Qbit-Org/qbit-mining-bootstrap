@@ -24,7 +24,7 @@ impl Ledger {
     /// starting this deadline: its larger DELETE must not hold advisory locks.
     ///
     /// Acquire SETTLEMENT -> ORDER -> cluster FOR UPDATE before fresh reference
-    /// scans. Compact writers hold cluster FOR SHARE through commit; ORDER
+    /// scans. Compact writers hold cluster FOR KEY SHARE through commit; ORDER
     /// must precede the row fence because candidate writers take it first.
     /// Settlement still excludes legacy writers. Keep every job reference (even
     /// an expired row awaiting the next batch) and every candidate reference.
