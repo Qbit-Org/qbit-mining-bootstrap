@@ -570,6 +570,7 @@ impl Ledger {
                 let message = format!(
                     "mature pool block disconnected: {hash}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>"
                 );
+                super::connect::lock_cluster_authority(tx).await?;
                 sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut **tx).await?;
                 return Ok((Some(message), effects));
             }
@@ -895,7 +896,14 @@ async fn deactivate_pool_block(
     Ok(changed > 0)
 }
 
+/// Callers validated the revision earlier in this transaction, without the
+/// row lock, while holding SETTLEMENT_LOCK, which every revision writer holds:
+/// the row cannot have moved since. The lock is taken here, not at that
+/// check, because these settlement transactions bump only on some paths, and
+/// holding the row `FOR UPDATE` from the start would make every job cohort's
+/// `KEY SHARE` fence wait for the whole landing.
 async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    super::connect::lock_cluster_authority(tx).await?;
     sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton").execute(&mut **tx).await?;
     Ok(())
 }

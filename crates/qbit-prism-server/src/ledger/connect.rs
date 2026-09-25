@@ -406,7 +406,8 @@ impl Ledger {
         }
         tx.commit().await?;
         // Retained only once the pin or the match is durable. A later writer
-        // fence compares the row it re-reads `FOR SHARE` against this value.
+        // fence compares the row it re-reads (`FOR SHARE`, or `FOR KEY SHARE`
+        // for job persistence) against this value.
         let _ = self.config_fingerprint.set(fingerprint.to_owned());
         Ok(())
     }
@@ -415,8 +416,10 @@ impl Ledger {
     /// [`Ledger::configure`], or `None` before `configure` has succeeded.
     ///
     /// Writers fence against a fingerprint reset by re-reading
-    /// `qbit_prism_cluster.config_fingerprint` `FOR SHARE` in their own
-    /// transaction and refusing when it is not this value.
+    /// `qbit_prism_cluster.config_fingerprint` `FOR SHARE` (`FOR KEY SHARE`
+    /// for job persistence, which a reset still waits for: see
+    /// `lock_cluster_authority`) in their own transaction and refusing when it
+    /// is not this value.
     pub fn config_fingerprint(&self) -> Option<&str> {
         self.config_fingerprint.get().map(String::as_str)
     }
@@ -656,6 +659,26 @@ pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         !row.try_get::<bool, _>("legacy_live")?,
         "live legacy Python writer lease"
     );
+    Ok(())
+}
+
+/// Take the cluster row's exclusive lock before an authority write.
+///
+/// Every writer of `payout_revision`, `config_fingerprint` or `fatal_error`
+/// holds this (or its own `SELECT … FOR UPDATE` on the row) before its
+/// `UPDATE`, so a job-persistence transaction can fence authority with
+/// `FOR KEY SHARE`: that lock conflicts with `FOR UPDATE` and with blob GC's
+/// exclusive fence, but not with the share append's `ledger_clock_ms`
+/// `UPDATE`, which changes no key column and is not an authority write. A
+/// bare `UPDATE` of a non-key column would take `FOR NO KEY UPDATE` and slip
+/// past a `KEY SHARE` fence, which is why authority writers never rely on the
+/// `UPDATE`'s own lock. The `*_waits_for_a_job_cohort_fence` tests hold that
+/// contract for every writer, and `authority_writers_lock_the_cluster_row_first`
+/// scans for a bare authority `UPDATE`.
+pub(super) async fn lock_cluster_authority(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .fetch_one(&mut **tx)
+        .await?;
     Ok(())
 }
 

@@ -11,8 +11,9 @@
 //!
 //! Every test here routes one two-connection ledger pool through
 //! `support/ledger_execution_proxy.rs`, holds the reply of exactly one
-//! `BEGIN` at the proxy, aborts the future waiting for it, releases the
-//! reply and then reads the connection back from three sides: the server
+//! `BEGIN` at the proxy (the share append's `BEGIN; SET LOCAL …` batch is
+//! also held after its completions, at the closing `ReadyForQuery`), aborts
+//! the future waiting for it, releases the reply and then reads the connection back from three sides: the server
 //! (`pg_stat_activity`, `pg_locks`), the wire (the proxy's execution log for
 //! that connection) and the next checkout, which runs with a subscriber that
 //! records every warning SQLx relays from a server notice. The proof is that
@@ -44,6 +45,9 @@ const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
 const WAIT: Duration = Duration::from_secs(10);
 const NOTICE_TARGET: &str = "sqlx::postgres::notice";
 const ALREADY_IN_PROGRESS: &str = "there is already a transaction in progress";
+/// The share append's opening simple query (`Ledger::APPEND_TRANSACTION_BEGIN`):
+/// `BEGIN` and the transaction's generic-plan setting in one round trip.
+const APPEND_BEGIN: &str = "BEGIN; SET LOCAL plan_cache_mode = force_generic_plan";
 
 fn share(id: u64) -> AcceptedShare {
     AcceptedShare {
@@ -291,6 +295,17 @@ enum Cancel {
     Drop,
 }
 
+/// Which part of the opening statement's reply the proxy holds.
+#[derive(Clone, Copy)]
+enum Hold {
+    /// Everything from its first `CommandComplete`: the client has none of
+    /// the reply.
+    Reply,
+    /// Only the closing `ReadyForQuery`: every completion of the batch has
+    /// been handed to the client's socket, the round trip has not ended.
+    ReadyForQuery,
+}
+
 /// What the observer saw once a future cancelled inside `BEGIN` had settled.
 struct Observed {
     /// Backend pid of the cancelled checkout.
@@ -308,17 +323,21 @@ struct Observed {
     /// Statement texts on the cancelled connection since the cancelled
     /// `BEGIN`, in order.
     wire: Vec<String>,
+    /// For each statement in `wire`, whether it opens a transaction.
+    wire_begins: Vec<bool>,
     /// Server notices SQLx relayed while the next transaction ran.
     notices: Vec<(String, String)>,
 }
 
-/// Cancel `operation` while the reply to its `BEGIN` is held at the proxy,
-/// release the reply, wait for the checkout to settle and run the next
-/// transaction on the pool, which can only get the connection the cancelled
-/// checkout used or a replacement for it.
+/// Cancel `operation` while the reply to its opening statement `begin` is
+/// held at the proxy, release the reply, wait for the checkout to settle and
+/// run the next transaction on the pool, which can only get the connection
+/// the cancelled checkout used or a replacement for it.
 async fn cancel_inside_begin<T: Send + 'static>(
     h: &Harness,
     cancel: Cancel,
+    begin: &str,
+    hold: Hold,
     operation: impl Future<Output = T> + Send + 'static,
 ) -> Result<Observed> {
     // Keep one connection checked out so the cancelled one is the only
@@ -332,7 +351,10 @@ async fn cancel_inside_begin<T: Send + 'static>(
         register_backend(h, &mut second).await?
     };
     let mark = h.proxy.mark();
-    let pause = h.proxy.pause_statement("BEGIN")?;
+    let pause = match hold {
+        Hold::Reply => h.proxy.pause_statement(begin)?,
+        Hold::ReadyForQuery => h.proxy.pause_statement_ready(begin)?,
+    };
     let held = match cancel {
         Cancel::Abort => {
             let mut running = spawn(operation);
@@ -366,7 +388,16 @@ async fn cancel_inside_begin<T: Send + 'static>(
         .into_iter()
         .find(|execution| execution.seq == held)
         .context("held execution")?;
-    ensure!(held.sql == "BEGIN", "held {:?}", held.sql);
+    ensure!(held.sql == begin, "held {:?}", held.sql);
+    if let Hold::ReadyForQuery = hold {
+        // Every completion of the batch, `BEGIN`'s and `SET`'s, went out
+        // before the held `ReadyForQuery`; only the end of the round trip
+        // was outstanding when the future was cancelled.
+        ensure!(
+            held.delivered() && held.completion() == Some("SET"),
+            "the batch's completions were not delivered before the hold: {held:?}"
+        );
+    }
     let cancelled_connection = held.connection;
     // Before the reply is delivered the server has already run BEGIN: the
     // backend is in a transaction the client will never learn about.
@@ -403,10 +434,16 @@ async fn cancel_inside_begin<T: Send + 'static>(
     let next = h.proxy.executions_since(next_mark)?;
     let next_connection = next
         .iter()
-        .find(|execution| execution.sql == "BEGIN")
+        .find(|execution| execution.begins_transaction())
         .context("the next transaction's BEGIN")?
         .connection;
-    let wire = wire(&h.proxy.executions_since(mark)?, cancelled_connection);
+    let since = h.proxy.executions_since(mark)?;
+    let wire_begins = since
+        .iter()
+        .filter(|execution| execution.connection == cancelled_connection)
+        .map(Execution::begins_transaction)
+        .collect();
+    let wire = wire(&since, cancelled_connection);
     eprintln!("wire on proxy connection {cancelled_connection}: {wire:?}");
     eprintln!(
         "next transaction: backend {next_pid} on proxy connection {next_connection}, notices {notices:?}"
@@ -420,13 +457,14 @@ async fn cancel_inside_begin<T: Send + 'static>(
         next_pid,
         next_connection,
         wire,
+        wire_begins,
         notices,
     })
 }
 
 /// What every cancellation must leave behind, whichever way the guard
-/// disposed of the connection.
-fn assert_clean(h: &Harness, observed: &Observed) -> Result<()> {
+/// disposed of the connection. `begin` is the cancelled opening statement.
+fn assert_clean(h: &Harness, observed: &Observed, begin: &str) -> Result<()> {
     ensure!(
         observed
             .settled
@@ -444,22 +482,20 @@ fn assert_clean(h: &Harness, observed: &Observed) -> Result<()> {
         observed.notices
     );
     ensure!(
-        observed.wire.first().map(String::as_str) == Some("BEGIN"),
+        observed.wire.first().map(String::as_str) == Some(begin),
         "the cancelled BEGIN was not the first statement observed: {:?}",
         observed.wire
     );
+    // Any later statement that opens a transaction, whether a plain `BEGIN`
+    // or an append's `BEGIN; SET LOCAL …` batch, must follow a ROLLBACK.
+    let second_begin = observed.wire_begins[1..].iter().position(|begins| *begins);
     ensure!(
-        !observed.wire[1..].contains(&"BEGIN".to_owned())
-            || observed.wire[1..]
+        second_begin.is_none_or(|begin| {
+            observed.wire[1..]
                 .iter()
                 .position(|sql| sql == "ROLLBACK")
-                .is_some_and(|rollback| {
-                    rollback
-                        < observed.wire[1..]
-                            .iter()
-                            .position(|sql| sql == "BEGIN")
-                            .unwrap()
-                }),
+                .is_some_and(|rollback| rollback < begin)
+        }),
         "a second BEGIN reached the cancelled connection before a ROLLBACK: {:?}",
         observed.wire
     );
@@ -475,13 +511,27 @@ fn assert_clean(h: &Harness, observed: &Observed) -> Result<()> {
 /// replacement.
 #[tokio::test]
 async fn share_append_cancelled_inside_begin_retires_the_connection() -> Result<()> {
+    share_append_cancelled_inside_begin(Hold::Reply).await
+}
+
+/// The append's `BEGIN` carries its `SET LOCAL plan_cache_mode` in the same
+/// simple query. Cancelled after both completions went out but before the
+/// `ReadyForQuery` that ends the round trip, the guard must still count the
+/// `BEGIN` as unfinished and retire the connection: completion is recorded
+/// only once the whole batch has been read, not at `BEGIN`'s own reply.
+#[tokio::test]
+async fn share_append_cancelled_before_its_begin_batch_ends_retires_the_connection() -> Result<()> {
+    share_append_cancelled_inside_begin(Hold::ReadyForQuery).await
+}
+
+async fn share_append_cancelled_inside_begin(hold: Hold) -> Result<()> {
     let Some(h) = Harness::open().await? else {
         return Ok(());
     };
     let result = async {
         create_backend_registry(&h).await?;
         let ledger = h.ledger.clone();
-        let observed = cancel_inside_begin(&h, Cancel::Abort, async move {
+        let observed = cancel_inside_begin(&h, Cancel::Abort, APPEND_BEGIN, hold, async move {
             ledger.append(share(1), None).await
         })
         .await?;
@@ -489,9 +539,9 @@ async fn share_append_cancelled_inside_begin_retires_the_connection() -> Result<
             h.ids().await?.is_empty(),
             "a cancelled append credited a share"
         );
-        assert_clean(&h, &observed)?;
+        assert_clean(&h, &observed, APPEND_BEGIN)?;
         ensure!(
-            observed.wire == ["BEGIN"],
+            observed.wire == [APPEND_BEGIN],
             "the retired connection carried more than the cancelled BEGIN: {:?}",
             observed.wire
         );
@@ -549,11 +599,11 @@ async fn session_allocation_dropped_inside_begin_returns_the_connection_clean() 
     let result = async {
         create_backend_registry(&h).await?;
         let ledger = h.ledger.clone();
-        let observed = cancel_inside_begin(&h, Cancel::Drop, async move {
+        let observed = cancel_inside_begin(&h, Cancel::Drop, "BEGIN", Hold::Reply, async move {
             ledger.new_session_id().await.map(|id| id.value())
         })
         .await?;
-        assert_clean(&h, &observed)?;
+        assert_clean(&h, &observed, "BEGIN")?;
         ensure!(
             observed.wire.starts_with(&[
                 "BEGIN".to_owned(),

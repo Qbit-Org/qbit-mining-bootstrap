@@ -8,8 +8,9 @@
 //!
 //! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
 //! ORDER_LOCK, then the cluster row FOR UPDATE before fresh reference scans and
-//! blob deletion. Compact prepared/issued writers hold cluster FOR SHARE through
-//! commit; candidate balance writers take ORDER before that shared fence.
+//! blob deletion. Compact prepared/issued writers hold cluster FOR KEY SHARE
+//! through commit (#479); candidate balance writers take ORDER before that
+//! shared fence.
 //! Stop ALL frontends/collectors for this protocol upgrade: old collectors are
 //! unsafe with new writers, even though the persisted format is unchanged.
 //! Retain blobs named
@@ -201,10 +202,12 @@ impl Ledger {
         let payload =
             tokio::task::spawn_blocking(move || encode_record(&owned, expires_at_ms)).await??;
         let mut tx = self.begin().await?;
-        // Fence ordinary authority UPDATEs and blob GC before ALL authority
-        // checks. No advisory lock may be acquired after this shared row fence.
+        // Fence authority writers (each takes the row FOR UPDATE first; see
+        // `lock_cluster_authority`) and blob GC before ALL authority checks,
+        // without blocking the share append's non-key clock UPDATE. No
+        // advisory lock may be acquired after this shared row fence.
         let fingerprint: Option<String> = sqlx::query_scalar(
-            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR SHARE",
+            "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE",
         )
         .fetch_one(&mut *tx)
         .await?;

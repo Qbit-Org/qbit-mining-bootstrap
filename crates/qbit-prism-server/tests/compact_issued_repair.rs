@@ -783,6 +783,12 @@ async fn current_revision_configuration_and_writable_fences_recheck_after_row_wa
                 let repair = original.repair()?;
                 delete_dependencies(db, true).await?;
                 let mut hold = db.ledger.pool.begin().await?;
+                // An authority writer as the server makes one: the row FOR UPDATE, then
+                // the UPDATE (a bare non-key UPDATE is forbidden and passes a KEY SHARE
+                // job fence by design, #479).
+                sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+                    .execute(&mut *hold)
+                    .await?;
                 sqlx::query(&format!(
                     "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
                 ))
@@ -1050,14 +1056,24 @@ async fn ordinary_authority_updates_wait_for_cold_repair_commit() -> Result<()> 
                     spawn_save(db.ledger.clone(), original.repair()?, original.expires);
                 let writer_pid = blocked_query(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
                 let pool = db.ledger.pool.clone();
+                // An authority writer as the server makes one: the row FOR UPDATE, then
+                // the UPDATE (a bare non-key UPDATE is forbidden and passes a KEY SHARE
+                // job fence by design, #479).
                 let mut updating = Running(tokio::spawn(async move {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query(
+                        "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
                     sqlx::query(&format!(
                         "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
                     ))
-                    .execute(&pool)
-                    .await
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await
                 }));
-                blocked_query(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+                blocked_query(db, writer_pid, "SELECT singleton FROM qbit_prism_cluster").await?;
                 ensure!(db.ledger.job("child").await?.is_none());
                 gate.rollback().await?;
                 ensure!((&mut saving.0).await?? == IssuedJobSave::Saved);

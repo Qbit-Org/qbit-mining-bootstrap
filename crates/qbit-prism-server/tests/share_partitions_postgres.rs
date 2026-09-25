@@ -1042,3 +1042,318 @@ async fn changing_the_partition_width_keeps_names_unique_and_bounds_contiguous()
     db.close().await?;
     result
 }
+
+/// Text fragments of the two statements `append_in` prepares for the probe
+/// (#479): the bounds read, whose last two columns are the inlined floor and
+/// ceiling, and the share_id probe that binds them.
+const BOUNDS_STATEMENT: &str = "FROM qbit_prism_share_partitioning, ";
+const PROBE_STATEMENT: &str = "WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3";
+
+/// Every idle session of the ledger's pool that has prepared a statement
+/// containing `fragment`, with that statement's name. These are the
+/// server's own statements as `append_in` sent them, not copies of their
+/// text, so a test through them fails when the code changes.
+async fn prepared_on_ledger_sessions(
+    pool: &PgPool,
+    fragment: &str,
+) -> Result<Vec<(sqlx::pool::PoolConnection<sqlx::Postgres>, String)>> {
+    // An append returns its connection to the pool from a cleanup task after
+    // the call itself has returned; wait for every session to be idle.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.num_idle() < pool.size() as usize {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("the ledger's sessions never all returned to the pool")?;
+    let mut idle = Vec::new();
+    while let Some(connection) = pool.try_acquire() {
+        idle.push(connection);
+    }
+    let mut found = Vec::new();
+    for mut connection in idle {
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM pg_prepared_statements WHERE strpos(statement,$1)>0",
+        )
+        .bind(fragment)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(name) = name {
+            found.push((connection, name));
+        }
+    }
+    ensure!(
+        !found.is_empty(),
+        "no ledger session has prepared a statement containing {fragment:?}"
+    );
+    Ok(found)
+}
+
+/// Generic and custom plans the server built for the append's share_id probe,
+/// summed over the ledger's sessions.
+async fn append_probe_plans(pool: &PgPool) -> Result<(i64, i64)> {
+    let mut plans = (0, 0);
+    for (mut connection, name) in prepared_on_ledger_sessions(pool, PROBE_STATEMENT).await? {
+        let (generic, custom): (i64, i64) = sqlx::query_as(
+            "SELECT generic_plans,custom_plans FROM pg_prepared_statements WHERE name=$1",
+        )
+        .bind(&name)
+        .fetch_one(&mut *connection)
+        .await?;
+        plans.0 += generic;
+        plans.1 += custom;
+    }
+    Ok(plans)
+}
+
+/// Append `share` and require the probe to have run on a generic plan: one
+/// more generic plan use and no custom plan. Under the default
+/// `plan_cache_mode = auto` the planner chooses a custom plan for this probe
+/// on every share (#479).
+async fn append_on_a_generic_probe_plan(
+    db: &Database,
+    share: AcceptedShare,
+) -> Result<AcceptedShare> {
+    let before = append_probe_plans(db.pool()).await.unwrap_or((0, 0));
+    let landed = db.ledger.append(share, None).await?.share;
+    let after = append_probe_plans(db.pool()).await?;
+    ensure!(
+        after.0 > before.0 && after.1 == before.1,
+        "the append's probe was not run on a generic plan: (generic, custom) plans went from {before:?} to {after:?}"
+    );
+    Ok(landed)
+}
+
+/// EXPLAIN the append's own prepared probe for `share_id`, with the floor and
+/// the ceiling the running bounds statement returns, under `mode`.
+async fn explain_append_probe(pool: &PgPool, share_id: &str, mode: &str) -> Result<Vec<String>> {
+    let (floor, ceiling) = running_bounds(pool, share_id).await?;
+    let (mut connection, name) = prepared_on_ledger_sessions(pool, PROBE_STATEMENT)
+        .await?
+        .into_iter()
+        .next()
+        .context("probe session")?;
+    let plan: Vec<String> = sqlx::raw_sql(&format!(
+        "BEGIN; SET LOCAL plan_cache_mode = {mode}; \
+         EXPLAIN EXECUTE {name}('{}', {floor}, {ceiling}); ROLLBACK",
+        share_id.replace('\'', "''")
+    ))
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .filter_map(|row| sqlx::Row::try_get::<String, _>(&row, 0).ok())
+    .collect();
+    ensure!(!plan.is_empty(), "EXPLAIN EXECUTE {name} returned no plan");
+    Ok(plan)
+}
+
+/// The leaves the append's own share_id probe descends under a custom plan
+/// for its bound floor and ceiling (plan-time pruning).
+async fn append_probe_leaves(pool: &PgPool, share_id: &str) -> Result<Vec<String>> {
+    let plan = explain_append_probe(pool, share_id, "force_custom_plan").await?;
+    let mut leaves = Vec::new();
+    for line in &plan {
+        if let Some(rest) = line.split(" on qbit_share_ledger_p").nth(1) {
+            let number: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            leaves.push(format!("qbit_share_ledger_p{number}"));
+        }
+    }
+    ensure!(
+        !leaves.is_empty(),
+        "the append probe plan names no partition: {plan:?}"
+    );
+    leaves.sort();
+    leaves.dedup();
+    Ok(leaves)
+}
+
+/// How many attached partitions executor-startup pruning removes from the
+/// append's own probe under the generic plan the append transaction forces:
+/// the bounds are parameters at plan time and values only at execution.
+async fn append_probe_subplans_removed(pool: &PgPool, share_id: &str) -> Result<i64> {
+    let plan = explain_append_probe(pool, share_id, "force_generic_plan").await?;
+    let removed = plan
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("Subplans Removed: "))
+        .map(str::parse::<i64>)
+        .transpose()?
+        .unwrap_or(0);
+    Ok(removed)
+}
+
+/// The floor and ceiling the append's own bounds statement returns now.
+async fn running_bounds(pool: &PgPool, share_id: &str) -> Result<(i64, i64)> {
+    let (mut connection, name) = prepared_on_ledger_sessions(pool, BOUNDS_STATEMENT)
+        .await?
+        .into_iter()
+        .next()
+        .context("bounds session")?;
+    let row = sqlx::raw_sql(&format!(
+        "EXECUTE {name}(NULL, '{}')",
+        share_id.replace('\'', "''")
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok((sqlx::Row::try_get(&row, 3)?, sqlx::Row::try_get(&row, 4)?))
+}
+
+/// The bounds `append_in` inlines are the bodies of migration 016's
+/// `qbit_prism_share_probe_floor()` and `qbit_prism_share_next_seq()`; they
+/// must agree in every catalog state. The inlined pair is read through the
+/// append's own prepared statement.
+async fn inlined_bounds_match_the_functions(pool: &PgPool, share_id: &str) -> Result<()> {
+    let (floor, ceiling): (i64, i64) =
+        sqlx::query_as("SELECT qbit_prism_share_probe_floor(),qbit_prism_share_next_seq()")
+            .fetch_one(pool)
+            .await?;
+    let (inline_floor, inline_ceiling) = running_bounds(pool, share_id).await?;
+    ensure!(
+        (floor, ceiling) == (inline_floor, inline_ceiling),
+        "the inlined bounds ({inline_floor}, {inline_ceiling}) differ from the functions ({floor}, {ceiling})"
+    );
+    Ok(())
+}
+
+/// With the floor and the next share_seq bound as values, the append's probe
+/// is pruned to the leaves between them: one leaf while the sequence is in
+/// the release partition (the lead is empty and above the ceiling), and at
+/// most three once the sequence has moved on. As a function call inside the
+/// WHERE clause the same floor was a per-leaf filter over every attached
+/// partition (#479).
+#[tokio::test]
+async fn the_append_probe_is_pruned_to_the_leaves_between_the_floor_and_the_sequence() -> Result<()>
+{
+    let Some(db) = Database::open("prune").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let attached = db.attached().await?;
+        ensure!(attached.len() == 5, "unexpected attached set: {attached:?}");
+        let fresh = append_on_a_generic_probe_plan(&db, share(1, "alice")).await?;
+        inlined_bounds_match_the_functions(db.pool(), &fresh.share_id).await?;
+        let leaves = append_probe_leaves(db.pool(), &fresh.share_id).await?;
+        ensure!(
+            leaves == ["qbit_share_ledger_p0"],
+            "with the sequence in p0 the append probe descends {leaves:?}, not p0 alone"
+        );
+        let removed = append_probe_subplans_removed(db.pool(), &fresh.share_id).await?;
+        ensure!(
+            removed == 4,
+            "the generic plan removed {removed} of the four leaves above the sequence at startup"
+        );
+        let width = db.partition_rows().await?;
+        db.set_next_seq(3 * width + 10).await?;
+        ensure!(
+            partitions::ensure(db.pool()).await? > 0,
+            "no lead was attached for the moved sequence"
+        );
+        let landed = append_on_a_generic_probe_plan(&db, share(2, "alice")).await?;
+        inlined_bounds_match_the_functions(db.pool(), &landed.share_id).await?;
+        let attached = db.attached().await?.len() as i64;
+        let removed = append_probe_subplans_removed(db.pool(), &landed.share_id).await?;
+        ensure!(
+            removed >= attached - 3,
+            "the generic plan removed {removed} of {attached} leaves with the sequence in p3"
+        );
+        let leaves = append_probe_leaves(db.pool(), &landed.share_id).await?;
+        ensure!(
+            leaves.len() <= 3
+                && leaves.iter().all(|leaf| {
+                    [
+                        "qbit_share_ledger_p1",
+                        "qbit_share_ledger_p2",
+                        "qbit_share_ledger_p3",
+                    ]
+                    .contains(&leaf.as_str())
+                }),
+            "with the sequence in p3 the append probe descends {leaves:?}, not p1..p3"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    db.close().await?;
+    result
+}
+
+/// Duplicate detection does not depend on the bounds: a share whose row is
+/// below the floor is still answered through its globally credited header,
+/// exactly as before, both while its partition is attached (the unbounded
+/// fallback finds the row and the replay is idempotent) and after the
+/// partition has left the online ledger (the replay is refused as the
+/// duplicate it is, because the row can no longer be compared) (#419, #479).
+#[tokio::test]
+async fn a_duplicate_below_the_floor_is_still_detected_across_a_partition_boundary_and_after_a_detach(
+) -> Result<()> {
+    let Some(db) = Database::open("dupfloor").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let original = share(7, "alice");
+        let first = db.ledger.append(original.clone(), None).await?;
+        ensure!(first.inserted, "the first append was not credited");
+        // Same partition, moments later: the bounded probe finds the row.
+        let replay = db.ledger.append(original.clone(), None).await?;
+        ensure!(
+            !replay.inserted && replay.share == first.share,
+            "an immediate replay was not idempotent"
+        );
+        // Move the sequence three cells up so the floor rises above the row.
+        let width = db.partition_rows().await?;
+        db.set_next_seq(3 * width + 10).await?;
+        ensure!(
+            partitions::ensure(db.pool()).await? > 0,
+            "no lead was attached"
+        );
+        let floor: i64 = sqlx::query_scalar("SELECT qbit_prism_share_probe_floor()")
+            .fetch_one(db.pool())
+            .await?;
+        ensure!(
+            floor > i64::try_from(first.share.share_seq)?,
+            "the floor {floor} did not rise above share_seq {}",
+            first.share.share_seq
+        );
+        ensure!(
+            db.ledger.append(share(8, "alice"), None).await?.inserted,
+            "a fresh share was refused above the boundary"
+        );
+        let replay = db.ledger.append(original.clone(), None).await?;
+        ensure!(
+            !replay.inserted && replay.share == first.share,
+            "a replay across the partition boundary was not answered by the credited header"
+        );
+        let changed = AcceptedShare {
+            share_difficulty: original.share_difficulty + 1,
+            ..original.clone()
+        };
+        let error = db
+            .ledger
+            .append(changed, None)
+            .await
+            .expect_err("a replay with a changed payload was credited")
+            .to_string();
+        ensure!(
+            error.contains("duplicate share_id payload mismatch"),
+            "{error}"
+        );
+        // The row's partition leaves the online ledger (as the retention path's
+        // detach does); the header stays credited globally and the replay is
+        // refused rather than credited again.
+        db.remove_partition("qbit_share_ledger_p0").await?;
+        let error = db
+            .ledger
+            .append(original.clone(), None)
+            .await
+            .expect_err("a replay of a share whose partition left the ledger was credited again")
+            .to_string();
+        ensure!(
+            error.contains(
+                "duplicate-share: header already credited globally, and its share is archived"
+            ),
+            "{error}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    db.close().await?;
+    result
+}

@@ -222,7 +222,7 @@ async fn shared_pool_queue_uses_original_deadline_and_cancels_without_sql() -> R
             h.proxy
                 .executions_since(mark)?
                 .iter()
-                .all(|e| e.sql != "BEGIN"),
+                .all(|e| !e.begins_transaction()),
             "queued append checked out a connection and began a transaction"
         );
         ensure!(
@@ -312,7 +312,7 @@ async fn cancelled_transaction_keeps_admission_until_connection_cleanup() -> Res
             h.proxy
                 .executions_since(mark)?
                 .iter()
-                .all(|e| e.sql != "BEGIN"),
+                .all(|e| !e.begins_transaction()),
             "permit released before rollback cleanup"
         );
         ensure!(
@@ -366,7 +366,7 @@ async fn append_dropped_outside_runtime_context_keeps_admission_until_cleanup() 
             h.proxy
                 .executions_since(mark)?
                 .iter()
-                .all(|e| e.sql != "BEGIN"),
+                .all(|e| !e.begins_transaction()),
             "permit released before rollback cleanup"
         );
         ensure!(
@@ -438,7 +438,7 @@ async fn min_connections_pool_dropped_outside_runtime_panics_once_like_sqlx_and_
             h.proxy
                 .executions_since(mark)?
                 .iter()
-                .all(|e| e.sql != "BEGIN"),
+                .all(|e| !e.begins_transaction()),
             "permit released before rollback cleanup"
         );
         blocker.rollback().await?;
@@ -533,7 +533,7 @@ async fn uncertain_commit_holds_admission_and_durable_replay_is_not_recredited()
             h.proxy
                 .executions_since(mark)?
                 .iter()
-                .all(|e| e.sql != "BEGIN"),
+                .all(|e| !e.begins_transaction()),
             "uncertain COMMIT released admission before connection cleanup"
         );
         ensure!(

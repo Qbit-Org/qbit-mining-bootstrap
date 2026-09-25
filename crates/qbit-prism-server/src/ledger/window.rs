@@ -655,6 +655,28 @@ impl Ledger {
         .await
     }
 
+    /// `BEGIN` for the share append: generic plans for the transaction, so
+    /// the share_id probe on the partitioned ledger is planned once per
+    /// connection and pruned at run time from its bound share_seq bounds.
+    /// With the default `auto` the planner keeps choosing a custom plan for
+    /// that probe (it prunes at plan time and looks cheaper than the generic
+    /// estimate over every partition) and re-plans it on every share, inside
+    /// `ORDER_LOCK`. Sent with `BEGIN` in one round trip; `SET LOCAL` ends
+    /// with the transaction, and applies to every statement in it; the others
+    /// are key lookups or scan every leaf either way. `AppendConnection::begin`
+    /// records the `BEGIN` as complete only after the reply to the whole batch
+    /// is read, so a cancel before then still retires the connection (#482).
+    ///
+    /// Plan cache: SQLx prepares the probe once per connection. Under
+    /// `force_generic_plan` its first execution builds the generic plan,
+    /// with the bounds as parameters, and every later execution reuses it;
+    /// executor startup then prunes the partitions outside the bound values
+    /// ("Subplans Removed" in EXPLAIN EXECUTE, pinned by
+    /// `the_append_probe_is_pruned_to_the_leaves_between_the_floor_and_the_sequence`).
+    /// A partition attach or detach invalidates the plan and the next
+    /// execution rebuilds it once.
+    const APPEND_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL plan_cache_mode = force_generic_plan";
+
     /// One complete attempt of [`Ledger::append_checked`], from BEGIN to
     /// COMMIT. Runs the share append, the prepared candidate persistence and
     /// the pre-commit gate under one `ORDER_LOCK`; every path out of it has
@@ -668,7 +690,7 @@ impl Ledger {
     ) -> Result<AppendResult> {
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
-        let mut tx = connection.begin().await?;
+        let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
         self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {
@@ -734,20 +756,46 @@ impl Ledger {
         // mapped to an earlier row.
         // A credited row that has left the online ledger cannot be compared
         // and is refused as the duplicate it is.
+        //
+        // The probe's share_seq bounds are read here, in the same statement
+        // and under the same ORDER_LOCK, and bound as parameters below. As a
+        // function call inside the probe's WHERE clause the floor was applied
+        // as a per-leaf filter and the executor descended every attached
+        // partition, the empty lead included; as bound values the executor
+        // prunes at startup to the leaves between them (the share append's
+        // transaction forces generic plans, see `APPEND_TRANSACTION_BEGIN`, so
+        // the probe is planned once per connection and pruned at run time
+        // rather than re-planned per share; the settlement's deferred-share
+        // credit runs this inside the settlement's transaction under the default mode,
+        // once per landed block, where a custom plan is fine). The ceiling is the next share_seq: every row
+        // that can exist is below it, because rows are appended under the
+        // lock this transaction holds and imported partitions carry sequences
+        // the ledger already handed out (archive attach refuses a partition
+        // holding a row at or above it). The two subqueries are the bodies of
+        // migration 016's `qbit_prism_share_probe_floor()` and
+        // `qbit_prism_share_next_seq()`, inlined because a SQL-language
+        // function is re-planned on every call; a test holds them equal.
         let header_hash = share_header_hash(&share.share_id);
-        let (credited, rejected_seq, legacy_bound): (Option<String>, Option<i64>, i64) = sqlx::query_as(
+        let (credited, rejected_seq, legacy_bound, floor, ceiling): (Option<String>, Option<i64>, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),\
-             (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2),conversion_bound \
-             FROM qbit_prism_share_partitioning WHERE singleton",
+             (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2),conversion_bound,\
+             COALESCE((SELECT COALESCE(lower_seq,0) FROM qbit_prism_share_partitions \
+                WHERE state='attached' AND (lower_seq IS NULL OR lower_seq<=next_seq.value) \
+                ORDER BY upper_seq DESC OFFSET 2 LIMIT 1),0),next_seq.value \
+             FROM qbit_prism_share_partitioning, \
+             (SELECT CASE WHEN is_called THEN last_value+1 ELSE last_value END AS value \
+                FROM qbit_share_ledger_share_seq_seq) AS next_seq WHERE singleton",
         )
         .bind(&header_hash)
         .bind(&share.share_id)
         .fetch_one(&mut **tx)
         .await?;
         let mut existing = sqlx::query(&format!(
-            "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()"
+            "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3"
         ))
         .bind(&share.share_id)
+        .bind(floor)
+        .bind(ceiling)
         .fetch_optional(&mut **tx)
         .await?;
         if existing.is_none() {

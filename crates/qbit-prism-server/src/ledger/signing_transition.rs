@@ -82,8 +82,9 @@ impl Ledger {
         writable(&mut tx).await.context(
             "signing-transition requires a writable cluster; clear a fatal state with the current keys first (docs/prism-ledger-ops.md, Signing-key rotation)",
         )?;
-        // The row lock `Ledger::configure` takes and every writer fence reads
-        // `FOR SHARE`. Everything below is decided and written under it.
+        // The row lock `Ledger::configure` takes; every writer fence conflicts
+        // with it (`FOR SHARE`, or job persistence's `FOR KEY SHARE`).
+        // Everything below is decided and written under it.
         let (saved, revision): (Option<String>, i64) = sqlx::query_as(
             "SELECT config_fingerprint,payout_revision FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
         )

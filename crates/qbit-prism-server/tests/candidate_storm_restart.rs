@@ -1828,7 +1828,7 @@ const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 ///   carry-forward, each one statement whatever the recipient count;
 ///   `COMMIT`.
 /// - `Ledger::observe_chain_view` again, after the landing, 5.
-/// - `Ledger::finish_candidate_counted_at_revision`, 16: `BEGIN`; the
+/// - `Ledger::finish_candidate_counted_at_revision`, 17: `BEGIN`; the
 ///   settlement and order advisory locks; the writer fence; the revision
 ///   fence; the claim fence (2); the first-confirmation read (`FOR UPDATE`);
 ///   the #478 confirmation record's two reads, the block's not-yet-counting
@@ -1836,14 +1836,16 @@ const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 ///   balances they meet, both one statement whatever the recipient count and
 ///   followed by no write because this landing does not diverge; the
 ///   `qbit_pool_blocks` confirmation `UPDATE`; the confirmed `EXISTS`; the
-///   deferred-share read; the revision bump; the terminal `UPDATE` of the
-///   outbox row; `COMMIT`.
+///   deferred-share read; the revision bump, which takes the cluster row
+///   `FOR UPDATE` before its `UPDATE` so that it waits for any job cohort's
+///   `KEY SHARE` authority fence (`lock_cluster_authority`, #479), 2; the
+///   terminal `UPDATE` of the outbox row; `COMMIT`.
 ///
 /// Asserted **equal** at [`storm_scale::BASELINE_CANDIDATES`] and at the run's
 /// own cardinality before it is compared with this constant, so a drift in the
 /// sequence and a dependence on N fail with different messages. A failure
 /// against this constant prints the whole observed sequence.
-const STATEMENTS_PER_RECOVERED_ROW: usize = 64;
+const STATEMENTS_PER_RECOVERED_ROW: usize = 65;
 
 #[path = "support/ledger_execution_proxy.rs"]
 mod ledger_execution_proxy;
@@ -1879,13 +1881,15 @@ async fn install_recovery_markers(ledger: &Ledger, block_hash: &str) -> Result<(
 /// `BEGIN` through the `COMMIT` or `ROLLBACK` that ends it, or one statement a
 /// pooled connection ran outside any transaction. The boundaries come from the
 /// server's own completion tags, never from statement text, so nothing here
-/// depends on how the server spells anything.
+/// depends on how the server spells anything. A run opens at an execution
+/// whose *first* tag is `BEGIN`: the append's `BEGIN; SET LOCAL …` batch ends
+/// on `SET`, and its last tag alone would miss the transaction.
 fn runs(executions: &[Execution]) -> Vec<Vec<Execution>> {
     let mut open: BTreeMap<u64, Vec<Execution>> = BTreeMap::new();
     let mut closed: Vec<Vec<Execution>> = Vec::new();
     for execution in executions {
         let tag = execution.completion();
-        if tag == Some("BEGIN") {
+        if execution.tags.first().map(String::as_str) == Some("BEGIN") {
             if let Some(abandoned) = open.remove(&execution.connection) {
                 closed.push(abandoned);
             }

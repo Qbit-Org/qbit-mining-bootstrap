@@ -760,6 +760,14 @@ async fn prepared_authority_is_fenced_before_checks_in_both_update_orders() -> R
                             .execute(&mut *hold)
                             .await?;
                     } else {
+                        // An authority writer as the server makes one: the row FOR UPDATE, then
+                        // the UPDATE (a bare non-key UPDATE is forbidden and passes a KEY SHARE
+                        // job fence by design, #479).
+                        sqlx::query(
+                            "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+                        )
+                        .execute(&mut *hold)
+                        .await?;
                         sqlx::query(&format!(
                             "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
                         ))
@@ -785,13 +793,21 @@ async fn prepared_authority_is_fenced_before_checks_in_both_update_orders() -> R
                             blocked_query(db, hold_pid, "INSERT INTO qbit_prism_jobs").await?;
                         let pool = db.ledger.pool.clone();
                         let update = tokio::spawn(async move {
+                            let mut tx = pool.begin().await?;
+                            sqlx::query(
+                                "SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
+                            )
+                            .execute(&mut *tx)
+                            .await?;
                             sqlx::query(&format!(
                                 "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
                             ))
-                            .execute(&pool)
-                            .await
+                            .execute(&mut *tx)
+                            .await?;
+                            tx.commit().await
                         });
-                        blocked_query(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+                        blocked_query(db, writer_pid, "SELECT singleton FROM qbit_prism_cluster")
+                            .await?;
                         assert_empty(db).await?;
                         hold.rollback().await?;
                         ensure!(saving.await??);

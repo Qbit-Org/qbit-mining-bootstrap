@@ -124,7 +124,11 @@ pub struct Execution {
     /// Statement text learned from `Parse` (through the portal) or `Query`.
     pub sql: String,
     pub markers: Vec<Marker>,
+    /// The latest answer; for a simple-query batch, its last completion.
     pub outcome: Outcome,
+    /// Every completion tag the server sent for this execution, in order: a
+    /// simple-query batch such as `BEGIN; SET LOCAL …` has one per statement.
+    pub tags: Vec<String>,
     /// Actual DataRow frames, counted without retaining their payloads.
     pub rows_received: u64,
     pub jsonb_writes: BTreeMap<(String, String), JsonbWrites>,
@@ -139,7 +143,23 @@ impl Execution {
             .any(|marker| marker.table == table && marker.op == op)
     }
 
-    /// The completion tag, whether or not it reached the client.
+    /// Whether this execution opens a transaction: its first statement's
+    /// completion is `BEGIN`, or, before the server has answered, its text
+    /// starts with `BEGIN`. A batch such as `BEGIN; SET LOCAL …` counts; its
+    /// last completion (`completion`) is the `SET`.
+    pub fn begins_transaction(&self) -> bool {
+        match self.tags.first() {
+            Some(tag) => tag == "BEGIN",
+            None => self
+                .sql
+                .trim_start()
+                .get(..5)
+                .is_some_and(|head| head.eq_ignore_ascii_case("BEGIN")),
+        }
+    }
+
+    /// The completion tag, whether or not it reached the client; for a
+    /// simple-query batch, its last statement's.
     pub fn completion(&self) -> Option<&str> {
         match &self.outcome {
             Outcome::Completed { tag, .. } => Some(tag),
@@ -281,11 +301,22 @@ struct PausePlan {
     control: Arc<CommitPauseState>,
 }
 
-/// Holds the completion of the next execution whose statement text is
-/// exactly `sql`, on whichever connection runs it.
+/// Holds the reply of the next execution whose statement text is exactly
+/// `sql`, on whichever connection runs it, from the frame `at` names on.
 struct StatementPausePlan {
     sql: String,
+    at: PauseAt,
     control: Arc<CommitPauseState>,
+}
+
+/// Where in a statement's reply a [`StatementPausePlan`] holds delivery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PauseAt {
+    /// The first `CommandComplete`: the client has read none of the reply.
+    Completion,
+    /// The `ReadyForQuery` that closes a simple query: every completion of
+    /// the batch has been delivered, only the end of the round trip is held.
+    Ready,
 }
 
 #[derive(Default)]
@@ -457,6 +488,19 @@ impl ExecutionProxy {
     /// Nothing is severed: the server has already run the statement, and the
     /// connection stays usable once the reply is delivered.
     pub fn pause_statement(&self, sql: &str) -> Result<CommitPause> {
+        self.plan_statement_pause(sql, PauseAt::Completion)
+    }
+
+    /// Like [`Self::pause_statement`], but delivers every `CommandComplete`
+    /// of the simple query `sql` and holds only its closing `ReadyForQuery`,
+    /// so a multi-statement query such as `BEGIN; SET LOCAL …` can be held
+    /// after the transport has accepted all of its completions but before
+    /// its round trip ends.
+    pub fn pause_statement_ready(&self, sql: &str) -> Result<CommitPause> {
+        self.plan_statement_pause(sql, PauseAt::Ready)
+    }
+
+    fn plan_statement_pause(&self, sql: &str, at: PauseAt) -> Result<CommitPause> {
         let mut state = self.shared.state.lock().expect("proxy state");
         ensure!(
             state.plan.is_none() && state.pause_plan.is_none() && state.statement_pause.is_none(),
@@ -465,6 +509,7 @@ impl ExecutionProxy {
         let control = Arc::new(CommitPauseState::default());
         state.statement_pause = Some(StatementPausePlan {
             sql: sql.into(),
+            at,
             control: control.clone(),
         });
         Ok(CommitPause(control))
@@ -742,6 +787,7 @@ fn record(
             sql,
             markers: Vec::new(),
             outcome: Outcome::Pending,
+            tags: Vec::new(),
             rows_received: 0,
             jsonb_writes: BTreeMap::new(),
             select_rows: None,
@@ -832,7 +878,7 @@ enum Action {
     Deliver(Delivery),
     Sever,
     Pause {
-        index: usize,
+        delivery: Delivery,
         control: Arc<CommitPauseState>,
     },
 }
@@ -893,7 +939,7 @@ async fn pump_server(
                     matches!(body.as_slice(), [b'I' | b'T' | b'E']),
                     "invalid ReadyForQuery frame"
                 );
-                Action::Deliver(Delivery::Ready(body[0]))
+                ready_action(&shared, &connection, body[0])
             }
             _ => Action::Forward,
         };
@@ -901,7 +947,7 @@ async fn pump_server(
             Action::Forward => None,
             Action::Deliver(delivery) => Some(delivery),
             Action::Sever => return Ok(ServerEnd::Closed),
-            Action::Pause { index, control } => {
+            Action::Pause { delivery, control } => {
                 // No observer lock or PostgreSQL transaction lock is held here.
                 loop {
                     let release = control.release.notified();
@@ -912,7 +958,7 @@ async fn pump_server(
                     }
                     release.await;
                 }
-                Some(Delivery::Complete(index))
+                Some(delivery)
             }
         };
         let bytes = frame(kind, &body)?;
@@ -1060,13 +1106,14 @@ fn complete(
         }
         if pause.is_none() {
             if let Some(plan) = statement_pause.as_ref() {
-                if execution.sql == plan.sql {
+                if plan.at == PauseAt::Completion && execution.sql == plan.sql {
                     pause = Some(plan.control.clone());
                     *statement_pause = None;
                 }
             }
         }
     }
+    execution.tags.push(tag.clone());
     execution.outcome = Outcome::Completed {
         tag,
         delivered: false,
@@ -1087,10 +1134,37 @@ fn complete(
     if sever {
         Ok(Action::Sever)
     } else if let Some(control) = pause {
-        Ok(Action::Pause { index, control })
+        Ok(Action::Pause {
+            delivery: Delivery::Complete(index),
+            control,
+        })
     } else {
         Ok(Action::Deliver(Delivery::Complete(index)))
     }
+}
+
+/// A `ReadyForQuery` is delivered as observed unless it closes the simple
+/// query a [`PauseAt::Ready`] plan is waiting for.
+fn ready_action(shared: &Shared, connection: &Mutex<Connection>, status: u8) -> Action {
+    let delivery = Delivery::Ready(status);
+    let Some(index) = front(connection) else {
+        return Action::Deliver(delivery);
+    };
+    let mut state = shared.state.lock().expect("proxy state");
+    let execution = &state.executions[index];
+    let seq = execution.seq;
+    let matched = state.statement_pause.as_ref().is_some_and(|plan| {
+        plan.at == PauseAt::Ready
+            && execution.protocol == Protocol::Simple
+            && execution.sql == plan.sql
+    });
+    if !matched {
+        return Action::Deliver(delivery);
+    }
+    let control = state.statement_pause.take().expect("matched plan").control;
+    control.seq.store(seq, Ordering::SeqCst);
+    control.entered.notify_waiters();
+    Action::Pause { delivery, control }
 }
 
 /// An `ErrorResponse` answers the oldest unanswered client frame. A client

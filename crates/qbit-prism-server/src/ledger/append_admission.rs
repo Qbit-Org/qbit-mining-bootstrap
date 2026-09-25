@@ -96,8 +96,8 @@ pub(super) struct AppendConnection {
 }
 
 impl AppendConnection {
-    /// `BEGIN` on this connection, borrowed so that the guard keeps owning
-    /// the checkout and its permit.
+    /// `statement` opens the transaction on this connection, borrowed so
+    /// that the guard keeps owning the checkout and its permit.
     ///
     /// SQLx counts the transaction only once the reply to `BEGIN` is read
     /// (`sqlx-postgres` 0.8.6, `PgTransactionManager::begin`), and its
@@ -108,9 +108,19 @@ impl AppendConnection {
     /// the next checkout's `BEGIN` would land inside it (#482). The guard
     /// records completion here; until then, `Drop` retires the connection
     /// instead of returning it.
-    pub(super) async fn begin(&mut self) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    ///
+    /// `statement` may carry more than `BEGIN` (the append sends its
+    /// `SET LOCAL` in the same simple query). SQLx sends it as one simple
+    /// query and reads every reply up to its `ReadyForQuery` before it
+    /// returns, so completion is recorded only once the whole round trip is
+    /// in; a cancel between any two of its replies still retires the
+    /// connection.
+    pub(super) async fn begin(
+        &mut self,
+        statement: &'static str,
+    ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
         let connection = self.connection.as_mut().expect("append connection");
-        let transaction = Transaction::begin(&mut **connection, None).await?;
+        let transaction = Transaction::begin(&mut **connection, Some(statement.into())).await?;
         self.began = true;
         Ok(transaction)
     }

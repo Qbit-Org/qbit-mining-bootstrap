@@ -331,6 +331,12 @@ async fn revision_configuration_and_fatal_state_revalidate_after_cluster_wait() 
                     .await?;
                 let before = snapshot(db).await?;
                 let mut hold = db.ledger.pool.begin().await?;
+                // An authority writer as the server makes one: the row FOR UPDATE, then
+                // the UPDATE (a bare non-key UPDATE is forbidden and passes a KEY SHARE
+                // job fence by design, #479).
+                sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+                    .execute(&mut *hold)
+                    .await?;
                 sqlx::query(&format!(
                     "UPDATE qbit_prism_cluster SET {mutation} WHERE singleton"
                 ))
@@ -384,10 +390,15 @@ async fn ordinary_authority_updates_wait_for_atomic_64_child_commit() -> Result<
             let saving = spawn(db, &original, entries.clone(), Arc::new(CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))));
             let writer_pid = blocked(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
             let pool = db.ledger.pool.clone();
+            // An authority writer as the server makes one: the row FOR UPDATE,
+            // then the UPDATE (a bare non-key UPDATE is forbidden, #479).
             let updating = tokio::spawn(async move {
-                sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation} WHERE singleton")).execute(&pool).await
+                let mut tx = pool.begin().await?;
+                sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE").execute(&mut *tx).await?;
+                sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation} WHERE singleton")).execute(&mut *tx).await?;
+                tx.commit().await
             });
-            blocked(db, writer_pid, "UPDATE qbit_prism_cluster").await?;
+            blocked(db, writer_pid, "SELECT singleton FROM qbit_prism_cluster").await?;
             let children: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id LIKE 'child-%'").fetch_one(&db.ledger.pool).await?;
             ensure!(children == 0, "partial cohort visible before commit");
             gate.rollback().await?;
@@ -404,6 +415,58 @@ async fn ordinary_authority_updates_wait_for_atomic_64_child_commit() -> Result<
         })).await?;
     }
     Ok(())
+}
+
+/// The cohort's cluster fence is `FOR KEY SHARE` (#479): it must not queue
+/// the share append, whose non-key `ledger_clock_ms` `UPDATE` runs under
+/// ORDER_LOCK and would hold every later share behind the cohort. The real
+/// 64-child cohort is held between its fence and its commit (its last insert
+/// is gated), and a share append must commit meanwhile, well inside the
+/// cohort's own five-second lock timeout.
+#[tokio::test]
+async fn a_held_cohort_fence_does_not_hold_up_a_share_append() -> Result<()> {
+    run(|db| Box::pin(async move {
+        let original = seed(db).await?;
+        db.ledger.configure("original", &original.record.signer_keys).await?;
+        let entries: Vec<_> = (0..64).map(|i| CompactIssuedJob {
+            job_id: format!("child-{i}"),
+            payload: json!({"prepared_key":"prepared","expires_at_ms":original.expiry+60_000+i,"nonce":i}),
+            expires_at_ms: original.expiry+60_000+i,
+        }).collect();
+        sqlx::raw_sql(&format!("CREATE FUNCTION gate_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({INSERT_GATE}); RETURN NEW; END; $$; CREATE TRIGGER gate_batch AFTER INSERT ON qbit_prism_jobs FOR EACH ROW WHEN (NEW.job_id='child-63') EXECUTE FUNCTION gate_batch();"))
+            .execute(&db.ledger.pool).await?;
+        let mut gate = db.ledger.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(INSERT_GATE).execute(&mut *gate).await?;
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *gate).await?;
+        let saving = spawn(db, &original, entries, Arc::new(CompactBatchAttempt::new(Instant::now()+Duration::from_secs(10))));
+        let cohort_pid = blocked(db, gate_pid, "INSERT INTO qbit_prism_jobs").await?;
+        let fenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='relation' AND relation=to_regclass($2))")
+            .bind(cohort_pid).bind(format!("{}.qbit_prism_cluster", db.schema)).fetch_one(&db.admin).await?;
+        ensure!(fenced, "the cohort reached its last insert without its cluster fence");
+        let share = qbit_prism::AcceptedShare {
+            share_seq: 0,
+            share_id: format!("worker:{:064x}", 1),
+            miner_id: "miner".into(),
+            order_key: "miner".into(),
+            p2mr_program_hex: "11".repeat(32),
+            share_difficulty: 1,
+            network_difficulty: 100,
+            template_height: 100,
+            job_id: "job".into(),
+            job_issued_at_ms: 1,
+            accepted_at_ms: 0,
+            ntime: 1_800_000_000,
+            credit_policy: None,
+        };
+        let appended = timeout(Duration::from_secs(2), db.ledger.append(share, None))
+            .await
+            .context("the share append waited behind a held job cohort's cluster fence")??;
+        ensure!(appended.inserted);
+        ensure!(!saving.is_finished(), "the cohort committed before the append was tried under it");
+        gate.rollback().await?;
+        ensure!(saving.await?? == IssuedJobSave::Saved);
+        Ok(())
+    })).await
 }
 
 #[tokio::test]

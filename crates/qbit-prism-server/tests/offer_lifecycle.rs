@@ -26,6 +26,9 @@ use sqlx::PgPool;
 use std::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
+#[path = "support/cohort_fence.rs"]
+mod cohort_fence;
+
 #[path = "support/ledger_database.rs"]
 #[allow(dead_code)]
 mod ledger_database;
@@ -2832,6 +2835,59 @@ async fn an_undisturbed_offered_landing_is_marked_without_a_divergence_alert() -
                 .await?;
             let (mismatches, drift, reasons) = db.integrity().await?;
             ensure!(mismatches == 0 && drift == 0, "{reasons:?} drift {drift}");
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// An orphan settlement that deactivates its prepared block bumps the payout
+/// revision, an authority write (#479): it waits for a job cohort's
+/// `FOR KEY SHARE` fence on the cluster row.
+#[tokio::test]
+async fn an_orphan_settlement_that_deactivates_its_block_waits_for_a_job_cohort_fence() -> Result<()>
+{
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("orphan-fence").await?;
+            ledger.append(appended_share(1), None).await?;
+            let snapshot = ledger.snapshot(100).await?;
+            let (candidate, bundle) = candidate_for(&snapshot, 51)?;
+            ensure!(
+                ledger
+                    .enqueue_candidate_observed(candidate, Some(PROOF_MS))
+                    .await?
+            );
+            let claim = ledger.claim_candidate(60).await?.context("claim")?;
+            let revision = ledger.payout_revision().await?;
+            ledger.reserve_offer(&claim).await?;
+            ledger
+                .record_offer(&claim, OFFERED_MS, OfferOutcome::Accepted, None)
+                .await?;
+            let claim = claim.with_bundle(bundle);
+            ledger
+                .land_candidate_at_revision(&claim, &keys().1.public_key_hex(), revision)
+                .await?;
+            let revision = ledger.payout_revision().await?;
+            let settling = ledger.clone();
+            cohort_fence::waits_for_the_cohort_fence(
+                &db.pool,
+                "an orphan settlement",
+                async move {
+                    settling
+                        .orphan_candidate_at_revision(
+                            &claim,
+                            "proven orphan: another block is active at height 101",
+                            revision,
+                        )
+                        .await
+                },
+            )
+            .await??;
+            ensure!(
+                ledger.payout_revision().await? == revision + 1,
+                "the orphan did not bump the revision"
+            );
             Ok(())
         })
     })
