@@ -42,8 +42,8 @@ pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
 pub use divergence::{
-    landing_divergence, overpay_bound, overpay_ceiling_sats, rows_divergence, AccountOverpay,
-    CarryRow, LandingDivergence, OfferReservation, OverpayBound,
+    landing_divergence, overpay_bound, overpay_ceiling_sats, payout_divergence_line,
+    rows_divergence, AccountOverpay, CarryRow, LandingDivergence, OfferReservation, OverpayBound,
 };
 mod fanout;
 mod fatal_state;

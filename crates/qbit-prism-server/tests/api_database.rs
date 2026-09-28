@@ -188,6 +188,12 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         let (status, body) = get(&app, &path).await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
     }
+    // #506: the divergence line carries the live positive float, alice's 100.
+    let (_, integrity) = get(&app, "/audit/carry-forward-integrity").await;
+    assert_eq!(
+        integrity["payout_divergence"]["positive_float_sats"], "100",
+        "{integrity}"
+    );
     let ctv_hash = "9".repeat(64);
     let fanout_hash = "8".repeat(64);
     let manifest_hash = hex::encode(sha2::Sha256::digest(b"{\"z\":1,\"a\":2}"));

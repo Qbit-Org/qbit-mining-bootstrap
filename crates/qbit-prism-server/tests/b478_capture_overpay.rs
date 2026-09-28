@@ -24,7 +24,7 @@ use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     codec,
     coordinator::{Coordinator, JobContext},
-    ledger::OfferReservation,
+    ledger::{overpay_bound, payout_divergence_line, OfferReservation},
     stratum::{MiningBackend, MiningJob, Worker},
 };
 use qbit_prism_test_gate as gate;
@@ -698,6 +698,55 @@ async fn an_unknown_bound_abandons_nothing() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// The report line (#506).
+
+/// The divergence line shows the live positive float, `F` of work issued
+/// against the current balances, next to the debt. It is per account and
+/// net: an account's rows sum before it counts, and an account that owes
+/// adds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_divergence_line_shows_the_live_positive_float() -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            let line = &integrity(f).await?["payout_divergence"];
+            ensure!(
+                line["positive_float_sats"] == "0" && line["debt_sats"] == "0",
+                "an empty pool floats nothing: {line}"
+            );
+            let [aa, bb, cc, dd, ee] = ["aa", "bb", "cc", "dd", "ee"].map(|byte| byte.repeat(32));
+            seed_block(
+                f,
+                &"5e".repeat(32),
+                50,
+                &[
+                    (&aa, 5_000),
+                    (&bb, 7_000),
+                    (&cc, -3_000),
+                    (&dd, 2_000),
+                    (&ee, 4_000),
+                ],
+            )
+            .await?;
+            seed_block(f, &"5f".repeat(32), 51, &[(&dd, -500), (&ee, -4_000)]).await?;
+            let line = &integrity(f).await?["payout_divergence"];
+            // 5,000 + 7,000 + (2,000 - 500): `cc` owes and `ee` nets to zero.
+            ensure!(sats(&line["positive_float_sats"]) == Some(13_500), "{line}");
+            ensure!(
+                line["debtor_count"] == 1 && sats(&line["debt_sats"]) == Some(3_000),
+                "{line}"
+            );
+            let bound = overpay_bound(&current_balances(f).await?);
+            ensure!(
+                bound == 13_500,
+                "the float is the bound work issued now is held to: {bound}"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Helpers.
 
 /// A report amount, which the report serializes as text.
@@ -758,10 +807,7 @@ async fn integrity(f: &Fixture) -> Result<Value> {
     let mut report: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
         .fetch_one(f.pool())
         .await?;
-    report["payout_divergence"] =
-        sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
-            .fetch_one(f.pool())
-            .await?;
+    report["payout_divergence"] = payout_divergence_line(f.pool()).await?;
     Ok(report)
 }
 
@@ -846,21 +892,51 @@ async fn own_block_on_the_node(
 }
 
 async fn seed_carry(f: &Fixture, program: &str, sats: i64) -> Result<()> {
-    let hash = "5e".repeat(32);
+    seed_block(f, &"5e".repeat(32), 50, &[(program, sats)]).await
+}
+
+/// A confirmed block at `height` whose carry rows move each program's balance
+/// by `sats`: accrued when positive, paid on chain when negative.
+async fn seed_block(f: &Fixture, hash: &str, height: i64, rows: &[(&str, i64)]) -> Result<()> {
     // Keep the seed block active through every reconcile.
     f.node
-        .set_reply("getblockhash", json!([50]), json!(hash.clone()));
+        .set_reply("getblockhash", json!([height]), json!(hash));
     let mut tx = f.pool().begin().await?;
-    sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES($1,50,repeat('00',32),repeat('5e',32),repeat('5e',32),'prepared')")
-        .bind(&hash).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO qbit_payout_carry_forward(block_hash,block_height,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES($1,50,'seed-aa','k',decode($2,'hex'),$3,0,$3,0,$3,'accrued')")
-        .bind(&hash).bind(program).bind(sats).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES($1,$2,repeat('00',32),repeat('5e',32),repeat('5e',32),'prepared')")
+        .bind(hash).bind(height).execute(&mut *tx).await?;
+    for &(program, sats) in rows {
+        let (gross, onchain, action) = if sats >= 0 {
+            (sats, 0, "accrued")
+        } else {
+            (0, -sats, "onchain")
+        };
+        sqlx::query("INSERT INTO qbit_payout_carry_forward(block_hash,block_height,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES($1,$2,'seed-'||left($3,2),'k',decode($3,'hex'),$4,0,$4,$5,$6,$7)")
+            .bind(hash).bind(height).bind(program).bind(gross).bind(onchain).bind(sats).bind(action).execute(&mut *tx).await?;
+    }
     sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=$1")
-        .bind(&hash)
+        .bind(hash)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn current_balances(f: &Fixture) -> Result<Vec<qbit_prism::CarryForwardBalance>> {
+    sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT miner_id,payout_order_key,encode(p2mr_program,'hex'),balance_sats::text FROM qbit_current_carry_forward_balances()",
+    )
+    .fetch_all(f.pool())
+    .await?
+    .into_iter()
+    .map(|(recipient_id, order_key, p2mr_program_hex, balance)| {
+        Ok(qbit_prism::CarryForwardBalance {
+            recipient_id,
+            order_key,
+            p2mr_program_hex,
+            balance_sats: balance.parse()?,
+        })
+    })
+    .collect()
 }
 
 async fn balance(f: &Fixture, program: &str) -> Result<i64> {

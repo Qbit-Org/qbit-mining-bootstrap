@@ -21,7 +21,7 @@ use qbit_prism::{
 use qbit_prism_server::{
     codec,
     coordinator::{Coordinator, JobContext},
-    ledger::{landing_divergence, overpay_bound, overpay_ceiling_sats},
+    ledger::{landing_divergence, overpay_bound, overpay_ceiling_sats, payout_divergence_line},
     stratum::{MiningBackend, MiningJob, Worker},
 };
 use qbit_prism_test_gate as gate;
@@ -372,10 +372,7 @@ async fn integrity(f: &Fixture) -> Result<Value> {
     let mut report: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
         .fetch_one(f.pool())
         .await?;
-    report["payout_divergence"] =
-        sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
-            .fetch_one(f.pool())
-            .await?;
+    report["payout_divergence"] = payout_divergence_line(f.pool()).await?;
     Ok(report)
 }
 
