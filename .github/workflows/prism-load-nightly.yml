@@ -6,20 +6,21 @@ name: PRISM load harness (nightly)
 # names the runner it needs and states its gates, so what runs, where, and
 # what it is held to are all reviewed in one file.
 #
-# A run builds qbit-prism-server and qbit-prism-load in release mode at the
-# chosen ref, records pg_test_fsync on the filesystem the harness puts its
-# PostgreSQL cluster on, runs the preset, and gates it with
-# qbit-prism-load-gate: exit 0 (completed and reconciled exactly), no
-# durability finding, shortfall == 0 in each gated phase, #473's D1 rule
-# where the preset asks for it, and the tip-to-last-notify p99 budget where
-# the preset sets one. The verdict table goes to the job summary and the
+# The plan job pins the chosen ref to one commit for the whole matrix, and
+# one job builds qbit-prism-server and qbit-prism-load in release mode there.
+# Each preset job downloads those binaries, records pg_test_fsync on the
+# filesystem the harness puts its PostgreSQL cluster on, runs the preset,
+# and gates it with qbit-prism-load-gate: exit 0 (completed and reconciled
+# exactly), no acknowledged share missing, no durability finding,
+# shortfall == 0 in each gated phase, #473's D1 rule where the preset asks
+# for it, and the tip-to-last-notify p99 budget where the preset sets one. The verdict table goes to the job summary and the
 # harness's reports to an artifact.
 #
 # Runners: every nightly preset runs on an 8 vCPU runner, the size #271's
 # 20k matrix was taken on; that includes one 400k D1 cell of #473's
-# (d1-473-400k-fe1-async, the production-window baseline) and the 400k
+# (throughput-400k-window-1fe-async, the production-window baseline) and the 400k
 # realism and #275 presets. The heavier manual presets (#473's multi-frontend
-# and 500k cells, growth-20x's 8,000 sessions on four frontends) take a
+# and 500k cells, mainnet-shape-2600-addresses's 8,000 sessions on four frontends) take a
 # 16 vCPU runner so the client and the database do not starve the frontends
 # being measured. Rates are only comparable run to run on the same runner
 # class, which is why the runner is part of the preset.
@@ -36,7 +37,7 @@ on:
         description: >-
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
-          (growth-20x and #473's cells other than 400k fe1 async).
+          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async).
         required: true
         default: nightly
       ref:
@@ -47,8 +48,8 @@ on:
         description: >-
           Override every selected preset's tip-to-last-notify p99 budget, in
           ms. Empty keeps each preset's own (gates.tip_last_notify_p99_budget_ms:
-          2,500 for tip-275*, 3,000 for mainnet-floor and growth-5x, 5,000 for
-          growth-20x; ungated for the D1 presets, whose rule is #473's).
+          2,500 for tip-delivery-2000-miners-400k-2fe-retarget*, 3,000 for mainnet-shape-130-addresses and mainnet-shape-650-addresses, 5,000 for
+          mainnet-shape-2600-addresses; ungated for the D1 presets, whose rule is #473's).
         required: false
         default: ""
       max_shortfall:
@@ -78,12 +79,13 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      sha: ${{ steps.plan.outputs.sha }}
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || '3.x.x' }}
-      - name: Select presets
+      - name: Select presets and pin the commit
         id: plan
         env:
           SELECTION: ${{ inputs.preset || 'nightly' }}
@@ -92,28 +94,75 @@ jobs:
           matrix="$(python3 scripts/prism_load_matrix.py "${SELECTION}")"
           echo "${matrix}"
           printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT}"
+          # Every later job checks out this commit, so the binaries built
+          # once and the presets each run reads are the same revision even
+          # if the ref moves while the matrix runs.
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build the release binaries once
+    needs: plan
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Build the server, the harness and the gate in release mode
+        run: cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+      # The Cargo dep-info files go with the binaries: the harness ties the
+      # server to the checkout through them, as it does for a local build.
+      # A tar keeps the executable bits an artifact upload would drop.
+      - name: Pack the binaries and their dep-info
+        run: |
+          set -euo pipefail
+          tar -C target/release -cf "${RUNNER_TEMP}/prism-load-binaries.tar" \
+            qbit-prism-server qbit-prism-server.d \
+            qbit-prism-load qbit-prism-load.d qbit-prism-load-gate
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-binaries
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/prism-load-binaries.tar
+          if-no-files-found: error
 
   run:
     name: ${{ matrix.preset }}
-    needs: plan
+    needs: [plan, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - name: Check out the ref under test
+      - name: Check out the pinned commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || '3.x.x' }}
-      - name: Set up Rust
-        uses: ./.github/actions/rust-toolchain
+          ref: ${{ needs.plan.outputs.sha }}
       - name: Install PostgreSQL 16 server binaries
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
-      - name: Build the server, the harness and the gate in release mode
-        run: cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+      - name: Download the binaries built once
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-load-binaries
+          path: ${{ runner.temp }}
+      # Unpacked where a local release build puts them, at the same workspace
+      # path they were built at, and stamped after this checkout, so the
+      # harness can show the server was built from the sources beside it.
+      - name: Unpack the binaries into target/release
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar"
+          touch target/release/qbit-prism-server target/release/qbit-prism-load \
+            target/release/qbit-prism-load-gate
       - name: Record the host
         env:
           PRESET: ${{ matrix.preset }}
@@ -150,9 +199,8 @@ jobs:
   # test/prism-nightly-gated-tests.txt, run explicitly with --ignored --exact
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
-  # Today that is #523's qbitd -reindex crash variant and #524's 130-payee
-  # weighted-recipients variant. TODO(#521): add scenario 5's dense-cadence
-  # soak to the list when it lands on 3.x.x.
+  # That is #523's qbitd -reindex crash variant, #524's 130-payee
+  # weighted-recipients variant and scenario 5's dense-cadence soak.
   live-nightly:
     name: Live regtest nightly variants
     if: ${{ github.event_name == 'schedule' || inputs.live }}
