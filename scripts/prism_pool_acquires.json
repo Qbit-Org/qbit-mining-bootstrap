@@ -179,6 +179,7 @@
     "ledger/candidates.rs::renew_candidate_claim#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::retry_candidate#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::record_offer#1::self .begin()": [1,"ledger"],
+    "ledger/candidates.rs::release_unsent_offer#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::adopt_active_candidate#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::reconcile_candidate#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::list_candidates#1::read_only_pool(url)": [1,"operator"],
