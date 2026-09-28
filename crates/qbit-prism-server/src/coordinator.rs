@@ -286,7 +286,9 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 /// a string is the node's rejection reason, and anything else, a transport
 /// failure or a timeout included, leaves delivery unknown: the block may or
 /// may not have reached the node, and the row is reconciled against the
-/// chain rather than offered again.
+/// chain rather than offered again. A call that never established its
+/// connection (`rpc::RpcNotSentError`) never reaches this classification: it
+/// returns the reservation to `pending` instead (#522).
 fn classify_offer(result: &Result<Value>) -> (OfferOutcome, Option<String>) {
     match result {
         Ok(Value::Null) => (OfferOutcome::Accepted, None),
@@ -2231,6 +2233,25 @@ impl Coordinator {
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
         let (result, offered_at_ms) = self.submit_block(params).await?;
+        // #522: a call whose connection was never established provably did
+        // not reach the node, so nothing was offered. The reservation goes
+        // back to `pending` for another attempt after the ordinary backoff,
+        // with no outcome, no call time and no first-offer sample. Every
+        // other failure may have followed the write and stays unknown below.
+        if let Some(not_sent) = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<crate::rpc::RpcNotSentError>())
+        {
+            let reason = format!(
+                "{}: {not_sent}; the reservation taken by {} was returned to pending for another offer",
+                crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
+                self.config.instance_id
+            );
+            self.ledger.release_unsent_offer(claim, &reason).await?;
+            tracing::warn!(block = %candidate.block_hash, %reason, "block offer not sent; it will be offered again");
+            return Ok(());
+        }
         // The one sample, emitted once the one call has returned, from the
         // start time captured immediately before it: a crash during the call
         // loses the sample (the approved unknown-timing exception), and no

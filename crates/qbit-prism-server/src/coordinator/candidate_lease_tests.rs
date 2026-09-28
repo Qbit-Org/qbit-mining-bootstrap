@@ -11,6 +11,9 @@ use tokio::task::JoinHandle;
 #[path = "candidate_checkout_tests.rs"]
 mod checkout_tests;
 
+#[path = "offer_not_sent_tests.rs"]
+mod offer_not_sent_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn landing_transaction_renews_across_expiries_and_terminal_contention_finishes_once(
 ) -> Result<()> {

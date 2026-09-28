@@ -135,7 +135,10 @@ pub enum CandidateState {
     Pending,
     /// The durable reservation taken before the one `submitblock` call. A
     /// claim that finds a row here did not take the reservation: the call
-    /// may or may not have happened, so it never offers.
+    /// may or may not have happened, so it never offers. Only the attempt
+    /// that holds the reservation may return it to `pending`, and only when
+    /// its call provably never left the frontend (#522, see
+    /// [`Ledger::release_unsent_offer`]).
     OfferReserved,
     /// The node's answer is recorded; the audit is still to be landed.
     Offered,
@@ -188,6 +191,13 @@ pub fn adoption_evidence(block_hash: &str, height: u64, tip: &str) -> String {
 /// silent, even after a transient retry failure or a refused operator
 /// recovery overwrites this reason (#493).
 pub const LANDING_FAILED_REASON_PREFIX: &str = "landing failed after the offer";
+
+/// The `last_error` prefix of a `pending` row whose reservation was returned
+/// because its `submitblock` call provably never reached the node: the
+/// connection the request would have been written to was never established
+/// (#522). Such a row was never offered; its offer columns are empty again,
+/// and the next claim offers it after the ordinary pending backoff.
+pub const OFFER_NOT_SENT_REASON_PREFIX: &str = "offer not sent";
 
 /// The node's definitive replies that describe a side-chain block rather
 /// than an invalid one: a tip race lost to a block that arrived first. Every
@@ -930,6 +940,42 @@ impl Ledger {
         ensure!(
             recorded == 1,
             "candidate claim was lost or expired while recording the offer outcome"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Return the reservation this live claim holds to `pending` after its
+    /// one `submitblock` call provably never left this frontend: the
+    /// connection the request would have been written to was never
+    /// established (`rpc::RpcNotSentError`, #522). The reservation and every
+    /// offer column are cleared, because no offer was made, and `pending` is
+    /// again what it always means: never offered. The attempt is recorded in
+    /// `last_error` under [`OFFER_NOT_SENT_REASON_PREFIX`], the claim is
+    /// released, and the row backs off `min(60, attempt_count)` seconds like
+    /// any pending retry. The next claim runs the full pre-offer phase again,
+    /// so a block whose parent was superseded meanwhile is abandoned there
+    /// and never offered.
+    ///
+    /// One transaction, fenced on the live token and on a reservation that
+    /// recorded no call. Nothing else ever returns a reservation: a crash or
+    /// a lost claim between the failed connect and this commit leaves
+    /// `offer_reserved`, which recovery treats as delivery unknown and never
+    /// offers again, because nothing durable proves that the call was not
+    /// made.
+    pub async fn release_unsent_offer(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
+        ensure!(
+            reason.starts_with(OFFER_NOT_SENT_REASON_PREFIX),
+            "an unsent offer's reason must start with {OFFER_NOT_SENT_REASON_PREFIX:?}"
+        );
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        lock_candidate_row(&mut tx, claim).await?;
+        let released = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL,last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            released == 1,
+            "candidate claim was lost or expired before the unsent offer was returned to pending; the reservation stays and recovers as delivery unknown"
         );
         tx.commit().await?;
         Ok(())
