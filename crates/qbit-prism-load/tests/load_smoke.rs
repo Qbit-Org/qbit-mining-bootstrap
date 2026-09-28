@@ -4,7 +4,9 @@
 //!
 //! One debug frontend, 100 sessions over 20 payout addresses skewed by a
 //! whale and a Zipf tail with a two-order difficulty spread, a 20k window,
-//! and 3 retargeting tips in a warm-up-only plan. It asserts what the nightly
+//! and 3 retargeting tips in a warm-up-only plan, then 30 s of rental churn:
+//! bursts of 20 and 40 rental sessions leaving abruptly, a reconnect storm
+//! dropping 30% of the connected sessions, and 2 tips. It asserts what the nightly
 //! gate asserts -- every session got usable work on every tip within the
 //! preset's generous bound, the harness exited 0 (reconciled exactly), no
 //! acknowledged share was lost and no offer fell short -- and that the skew
@@ -146,6 +148,47 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         "the 60% whale's share of accepted work: {whale}"
     );
     assert_eq!(report["validator"]["artifact_written"], false);
+
+    // The churn phase drove what the preset planned, and every abandoned
+    // submit is accounted for as the churn's, never as a divergence.
+    let churn = &report["churn"];
+    assert_eq!(churn["ran"], true, "{churn}");
+    let realised = &churn["realised"];
+    assert_eq!(realised["rentals_spawned"], 60, "{realised}");
+    assert!(
+        realised["rentals_departed"].as_u64().context("departed")? > 0,
+        "rentals left abruptly: {realised}"
+    );
+    let storms = realised["storms"].as_array().context("storms")?;
+    assert_eq!(storms.len(), 1, "{realised}");
+    assert!(
+        storms[0]["dropped"].as_u64().context("dropped")? > 0,
+        "{realised}"
+    );
+    assert!(
+        realised["reconnects_completed"]
+            .as_u64()
+            .context("reconnects")?
+            > 0,
+        "stormed sessions came back: {realised}"
+    );
+    assert_eq!(realised["rentals_still_outstanding_at_phase_end"], 0);
+    let delivery = churn["tip_delivery"]["tips"]
+        .as_array()
+        .context("churn tips")?;
+    assert_eq!(delivery.len(), 2, "{churn}");
+    for tip in delivery {
+        assert_eq!(tip["unserved"], 0, "{tip}");
+    }
+    assert_eq!(
+        report["no_response_commits"]["shares"]
+            .as_array()
+            .context("no-response commits")?
+            .iter()
+            .filter(|share| share["churn_closed"] != true && share["window_ended"] != true)
+            .count(),
+        0
+    );
     Ok(())
 }
 

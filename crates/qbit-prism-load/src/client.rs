@@ -153,6 +153,14 @@ pub struct JobState {
 /// closed mid-run is the failure this harness exists to catch.
 pub const RUN_ENDED: &str = "run ended";
 
+/// The `NoResponse` reason prefix for a submit the churn model abandoned by
+/// closing its session's socket abruptly (#521): a rental leaving, or a
+/// reconnect storm. The miner left without waiting, so an answer that never
+/// came is the scenario rather than a transport fault, and a share the
+/// server committed anyway is reported as such, never as an ACK/commit
+/// divergence.
+pub const CHURN_CLOSED: &str = "churn close";
+
 #[derive(Clone, Debug)]
 pub enum Outcome {
     Accepted,
@@ -252,9 +260,34 @@ pub struct NotifySighting {
     pub at: Instant,
 }
 
+/// A connection that reached work: when the attempt started and when the
+/// session held its first job, so a new session's time to first job is
+/// `ready - started`. `cause` is why the connection was sought: `initial`,
+/// or the reconnect reason.
+#[derive(Clone, Debug)]
+pub struct ConnectionOpened {
+    pub session: usize,
+    pub frontend: usize,
+    pub started: Instant,
+    pub ready: Instant,
+    pub cause: String,
+}
+
+/// A connection that ended, and why.
+#[derive(Clone, Debug)]
+pub struct ConnectionClosed {
+    pub session: usize,
+    pub at: Instant,
+    pub cause: String,
+}
+
 /// Everything a session reports back.
 #[derive(Debug)]
 pub enum Event {
+    /// A connection reached work; see [`ConnectionOpened`].
+    Opened(ConnectionOpened),
+    /// A connection ended; see [`ConnectionClosed`].
+    Closed(ConnectionClosed),
     /// Acknowledge only after the collector has applied this session's prior events.
     CensusBarrier(mpsc::UnboundedSender<()>),
     Submit(Box<SubmitRecord>),
@@ -385,6 +418,14 @@ pub enum Control {
     },
     /// Find a network-target solution on the current job and submit it.
     ScheduledBlock,
+    /// Close the socket now, as a miner that leaves does: no quiesce, every
+    /// outstanding submit recorded as abandoned ([`CHURN_CLOSED`]). With
+    /// `reconnect_after` the session reconnects that long after (a reconnect
+    /// storm); without, it stops for good (a rental leaving).
+    Depart {
+        reason: String,
+        reconnect_after: Option<Duration>,
+    },
     /// Re-offer an indeterminate share with exactly the header it carried.
     Reoffer {
         share_id: String,
@@ -637,10 +678,28 @@ async fn run_session(
     // attempt's record measures from here, so the outage is what is
     // reported, not the attempt that finally ended it.
     let mut reconnect_started = Instant::now();
+    // A churn reconnect waits this long before its first attempt.
+    let mut hold_until: Option<Instant> = None;
     while !stopping {
         if connection.is_none() {
-            match connect(&config, &address, &shared, &frontend).await {
-                Ok(fresh) => {
+            let held = hold_until.filter(|until| Instant::now() < *until);
+            if held.is_none() {
+                hold_until = None;
+            }
+            let attempt_started = Instant::now();
+            let attempt = match held {
+                Some(_) => None,
+                None => Some(connect(&config, &address, &shared, &frontend).await),
+            };
+            match attempt {
+                Some(Ok(fresh)) => {
+                    let _ = shared.events.send(Event::Opened(ConnectionOpened {
+                        session: config.index,
+                        frontend: frontend.load(Ordering::Relaxed),
+                        started: attempt_started,
+                        ready: Instant::now(),
+                        cause: reconnect_reason.clone(),
+                    }));
                     let _ = shared.events.send(Event::Connected {
                         session: config.index,
                         frontend: frontend.load(Ordering::Relaxed),
@@ -658,27 +717,43 @@ async fn run_session(
                     }
                     connection = Some(fresh);
                 }
-                Err(error) => {
-                    // The initial connection has no phase to belong to: the
-                    // run stamps it "setup" until the first phase starts.
-                    if reconnect_reason == "initial" {
-                        reconnect_phase = shared.phase();
+                failed_or_held => {
+                    if let Some(Err(error)) = failed_or_held {
+                        // The initial connection has no phase to belong to:
+                        // the run stamps it "setup" until the first phase
+                        // starts.
+                        if reconnect_reason == "initial" {
+                            reconnect_phase = shared.phase();
+                        }
+                        let _ = shared.events.send(Event::Reconnect(ReconnectRecord {
+                            session: config.index,
+                            frontend: frontend.load(Ordering::Relaxed),
+                            phase: reconnect_phase.clone(),
+                            reason: reconnect_reason.clone(),
+                            completed: false,
+                            error: Some(format!("{error:#}")),
+                            seconds: reconnect_started.elapsed().as_secs_f64(),
+                        }));
                     }
-                    let _ = shared.events.send(Event::Reconnect(ReconnectRecord {
-                        session: config.index,
-                        frontend: frontend.load(Ordering::Relaxed),
-                        phase: reconnect_phase.clone(),
-                        reason: reconnect_reason.clone(),
-                        completed: false,
-                        error: Some(format!("{error:#}")),
-                        seconds: reconnect_started.elapsed().as_secs_f64(),
-                    }));
                     // Wait for a control message or a short backoff, so a
-                    // frontend that is still restarting is not hammered.
+                    // frontend that is still restarting is not hammered; a
+                    // churn reconnect waits out its hold instead.
+                    let backoff = held.map_or(Duration::from_millis(250), |until| {
+                        until.saturating_duration_since(Instant::now())
+                    });
                     tokio::select! {
                         message = control.recv() => {
                             match message {
                                 Some(Control::Stop) | None => break,
+                                // Already away: a departure for good ends the
+                                // session, a storm's is already happening.
+                                Some(Control::Depart { reconnect_after, .. }) => {
+                                    if reconnect_after.is_none() {
+                                        paused.store(true, Ordering::Relaxed);
+                                        drain_work(&mut work, &outstanding, &shared, config.index);
+                                        break;
+                                    }
+                                }
                                 Some(Control::Retarget { frontend: index, address: next, .. }) => {
                                     frontend.store(index, Ordering::Relaxed);
                                     address = next;
@@ -731,7 +806,7 @@ async fn run_session(
                                 }
                             }
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        _ = tokio::time::sleep(backoff) => {}
                     }
                     continue;
                 }
@@ -757,6 +832,37 @@ async fn run_session(
                         // run's drain would wait for work that is not coming.
                         drain_work(&mut work, &outstanding, &shared, config.index);
                     }
+                    Some(Control::Depart { reason, reconnect_after }) => {
+                        let reason = format!("{CHURN_CLOSED}: {reason}");
+                        fail_pending(active, &reason, shared.fence(), &shared, &config, &outstanding);
+                        let _ = shared.events.send(Event::Disconnected {
+                            session: config.index,
+                            frontend: frontend.load(Ordering::Relaxed),
+                            reason: reason.clone(),
+                        });
+                        let _ = shared.events.send(Event::Closed(ConnectionClosed {
+                            session: config.index,
+                            at: Instant::now(),
+                            cause: reason.clone(),
+                        }));
+                        // Dropping the connection drops the write half: the
+                        // socket closes with no goodbye, as a miner's does.
+                        active.drop_reader();
+                        connection = None;
+                        match reconnect_after {
+                            Some(delay) => {
+                                hold_until = Some(Instant::now() + delay);
+                                reconnect_phase = shared.phase();
+                                reconnect_started = Instant::now();
+                                reconnect_reason = reason;
+                            }
+                            None => {
+                                paused.store(true, Ordering::Relaxed);
+                                drain_work(&mut work, &outstanding, &shared, config.index);
+                                stopping = true;
+                            }
+                        }
+                    }
                     Some(Control::Retarget { frontend: index, address: next, reconnect }) => {
                         frontend.store(index, Ordering::Relaxed);
                         address = next;
@@ -764,6 +870,11 @@ async fn run_session(
                         if reconnect {
                             reconnect_phase = shared.phase();
                             quiesce(active, &shared, &config, &frontend, &outstanding).await;
+                            let _ = shared.events.send(Event::Closed(ConnectionClosed {
+                                session: config.index,
+                                at: Instant::now(),
+                                cause: "retarget".into(),
+                            }));
                             active.drop_reader();
                             connection = None;
                             reconnect_started = Instant::now();
@@ -778,6 +889,11 @@ async fn run_session(
                         // restart lifts it. Lifting it here would let the
                         // scheduler offer to a session whose frontend is down.
                         quiesce(active, &shared, &config, &frontend, &outstanding).await;
+                        let _ = shared.events.send(Event::Closed(ConnectionClosed {
+                            session: config.index,
+                            at: Instant::now(),
+                            cause: reason.clone(),
+                        }));
                         active.drop_reader();
                         connection = None;
                         reconnect_started = Instant::now();
@@ -860,6 +976,11 @@ async fn run_session(
                             frontend: frontend.load(Ordering::Relaxed),
                             reason: reason.clone(),
                         });
+                        let _ = shared.events.send(Event::Closed(ConnectionClosed {
+                            session: config.index,
+                            at: Instant::now(),
+                            cause: format!("socket closed: {reason}"),
+                        }));
                         active.drop_reader();
                         connection = None;
                         reconnect_started = Instant::now();
@@ -889,6 +1010,11 @@ async fn run_session(
         }
     }
     if let Some(mut active) = connection {
+        let _ = shared.events.send(Event::Closed(ConnectionClosed {
+            session: config.index,
+            at: Instant::now(),
+            cause: "stopped".into(),
+        }));
         // The run stopping is the cause, and it is happening now.
         fail_pending(
             &mut active,

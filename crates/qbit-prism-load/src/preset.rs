@@ -82,6 +82,14 @@ pub struct Gates {
     pub tip_last_notify_p99_budget_ms: Option<f64>,
     /// Print #473's D1 verdict table.
     pub d1_verdict_table: bool,
+    /// The churn phase's tips: per tip, the slowest of the sessions connected
+    /// at the tip that stayed connected; the p99 over the tips. `null` does
+    /// not gate on it.
+    pub churn_tip_last_notify_p99_budget_ms: Option<f64>,
+    /// The churn phase's new sessions (rental arrivals and storm
+    /// reconnects): connection attempt to first job, p99. `null` does not
+    /// gate on it.
+    pub new_session_first_job_p99_budget_ms: Option<f64>,
 }
 
 /// The keys of [`Gates`], every one required.
@@ -92,6 +100,8 @@ pub const GATE_KEYS: &[&str] = &[
     "max_unanswered_submits",
     "tip_last_notify_p99_budget_ms",
     "d1_verdict_table",
+    "churn_tip_last_notify_p99_budget_ms",
+    "new_session_first_job_p99_budget_ms",
 ];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -157,12 +167,27 @@ impl Preset {
         );
         let gates: Gates = serde_json::from_value(Value::Object(file.gates.clone()))
             .with_context(|| format!("preset {}: gates", file.name))?;
-        if let Some(budget) = gates.tip_last_notify_p99_budget_ms {
-            ensure!(
-                budget.is_finite() && budget > 0.0,
-                "preset {}: tip_last_notify_p99_budget_ms must be finite and positive",
-                file.name
-            );
+        for (key, budget) in [
+            (
+                "tip_last_notify_p99_budget_ms",
+                gates.tip_last_notify_p99_budget_ms,
+            ),
+            (
+                "churn_tip_last_notify_p99_budget_ms",
+                gates.churn_tip_last_notify_p99_budget_ms,
+            ),
+            (
+                "new_session_first_job_p99_budget_ms",
+                gates.new_session_first_job_p99_budget_ms,
+            ),
+        ] {
+            if let Some(budget) = budget {
+                ensure!(
+                    budget.is_finite() && budget > 0.0,
+                    "preset {}: {key} must be finite and positive",
+                    file.name
+                );
+            }
         }
         if let Some(phases) = &gates.phases {
             ensure!(

@@ -307,6 +307,48 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub pool_fee_bps: u16,
 
+    /// Length of the `churn` side phase, in seconds; 0 (the default) runs
+    /// none. The phase follows `slow_database` (or warm-up, under `--plan
+    /// tips`) with no proxy delay, and drives the rental bursts, lifetimes
+    /// and reconnect storms below. See `churn.rs`.
+    #[arg(long, default_value_t = 0)]
+    pub churn_seconds: u64,
+    /// Offered share rate during `churn`. Defaults to the steady-state rate.
+    #[arg(long)]
+    pub churn_rate: Option<f64>,
+    /// External tips minted evenly through `churn`.
+    #[arg(long, default_value_t = 0)]
+    pub churn_tips: usize,
+    /// Rental burst sizes, in order: `none`, a list (`100,500,2000`), or
+    /// `pareto:xm=<x>,alpha=<a>,max=<m>;count=<n>` (or `lognormal:...`)
+    /// seeded draws.
+    #[arg(long, default_value = "none")]
+    pub rental_bursts: String,
+    /// Seconds over which a burst's sessions connect.
+    #[arg(long, default_value_t = 10.0)]
+    pub rental_burst_window_seconds: f64,
+    /// Seconds between the starts of consecutive bursts; the first starts
+    /// 5 s into the phase.
+    #[arg(long, default_value_t = 60.0)]
+    pub rental_burst_interval_seconds: f64,
+    /// How long a rental session stays before its socket closes abruptly:
+    /// `pareto:xm=<s>,alpha=<a>,max=<s>` or `lognormal:median=<s>,sigma=<x>,max=<s>`.
+    #[arg(long, default_value = "pareto:xm=30,alpha=1.5,max=3600")]
+    pub rental_lifetime: String,
+    /// A rental session's hashrate over a mean base session's.
+    #[arg(long, default_value_t = 20.0)]
+    pub rental_hashrate: f64,
+    /// Reconnect storms, in order: `none` or fractions of the connected
+    /// sessions dropped abruptly (`0.1,0.25,0.5`).
+    #[arg(long, default_value = "none")]
+    pub reconnect_storms: String,
+    /// Seconds between consecutive storms.
+    #[arg(long, default_value_t = 60.0)]
+    pub storm_interval_seconds: f64,
+    /// A stormed session reconnects after a uniform delay up to this.
+    #[arg(long, default_value_t = 5.0)]
+    pub storm_reconnect_seconds: f64,
+
     /// A checked-in preset (`crates/qbit-prism-load/presets/*.json`) whose
     /// flags are added to the command line; any flag it sets cannot be given
     /// again. The side report records its name and SHA-256.
@@ -468,6 +510,7 @@ impl Args {
         );
         self.population_spec()?;
         self.arrival()?;
+        self.churn_spec()?;
         // The gap pattern and the phase length are checked against each other
         // here, at the entry boundary, because a pattern that cannot hold ten
         // landings measures nothing and the run must say so before it starts
@@ -485,7 +528,9 @@ impl Args {
     pub fn stratum_limits(&self) -> StratumLimits {
         // `validate` refuses zero frontends; the guard only keeps this
         // derivation total for a caller that asks before validating.
-        let sessions_per_frontend = self.sessions.div_ceil(self.frontends.max(1));
+        // Sized for every session that can be connected at once, which is
+        // `--sessions` unless a churn phase adds rentals.
+        let sessions_per_frontend = self.peak_sessions().div_ceil(self.frontends.max(1));
         let (max_pending_initial_jobs, admission_source) =
             match self.stratum_max_pending_initial_jobs {
                 Some(value) => (value, AdmissionSource::Flag),
@@ -571,6 +616,102 @@ impl Args {
         })
     }
 
+    /// The churn flags, parsed and range-checked (EP-VALIDATION).
+    pub fn churn_spec(&self) -> Result<crate::churn::ChurnSpec> {
+        let bursts = crate::churn::BurstSizes::parse(&self.rental_bursts)?;
+        let storms = crate::churn::parse_storms(&self.reconnect_storms)?;
+        let on = self.churn_seconds > 0;
+        if on {
+            ensure!(
+                (30..=7200).contains(&self.churn_seconds),
+                "--churn-seconds must be 0 (off) or 30..7200"
+            );
+        } else {
+            ensure!(
+                bursts == crate::churn::BurstSizes::None
+                    && storms.is_empty()
+                    && self.churn_tips == 0,
+                "--rental-bursts, --reconnect-storms and --churn-tips drive the churn phase, so \
+                 they need --churn-seconds"
+            );
+        }
+        if let Some(rate) = self.churn_rate {
+            ensure!(
+                rate.is_finite() && rate > 0.0,
+                "--churn-rate must be finite and positive"
+            );
+        }
+        for (name, value, low, high) in [
+            (
+                "--rental-burst-window-seconds",
+                self.rental_burst_window_seconds,
+                0.0,
+                600.0,
+            ),
+            (
+                "--rental-burst-interval-seconds",
+                self.rental_burst_interval_seconds,
+                1.0,
+                7200.0,
+            ),
+            (
+                "--rental-hashrate",
+                self.rental_hashrate,
+                0.001,
+                1_000_000.0,
+            ),
+            (
+                "--storm-interval-seconds",
+                self.storm_interval_seconds,
+                1.0,
+                7200.0,
+            ),
+            (
+                "--storm-reconnect-seconds",
+                self.storm_reconnect_seconds,
+                0.0,
+                600.0,
+            ),
+        ] {
+            ensure!(
+                value.is_finite() && (low..=high).contains(&value),
+                "{name} must be finite and {low}..{high}"
+            );
+        }
+        ensure!(
+            bursts.upper_bound() <= crate::churn::MAX_RENTAL_SESSIONS,
+            "--rental-bursts could add {} sessions, over {}",
+            bursts.upper_bound(),
+            crate::churn::MAX_RENTAL_SESSIONS
+        );
+        Ok(crate::churn::ChurnSpec {
+            seconds: self.churn_seconds,
+            tips: self.churn_tips,
+            bursts,
+            burst_window_seconds: self.rental_burst_window_seconds,
+            burst_interval_seconds: self.rental_burst_interval_seconds,
+            lifetime: crate::churn::Tail::parse(&self.rental_lifetime, "--rental-lifetime")?,
+            rental_hashrate: self.rental_hashrate,
+            storms,
+            storm_interval_seconds: self.storm_interval_seconds,
+            storm_reconnect_seconds: self.storm_reconnect_seconds,
+            seed: self.seed,
+        })
+    }
+
+    /// The most sessions the frontends can hold at once: `--sessions`, plus
+    /// every rental the churn phase could have connected together.
+    pub fn peak_sessions(&self) -> usize {
+        let rentals = if self.churn_seconds > 0 {
+            crate::churn::BurstSizes::parse(&self.rental_bursts)
+                .map(|bursts| bursts.upper_bound())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.sessions + rentals
+    }
+
     pub fn arrival(&self) -> Result<crate::realism::Arrival> {
         crate::realism::Arrival::parse(&self.arrival)
     }
@@ -644,6 +785,10 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         });
     }
     if plan == Plan::Tips {
+        plans.extend(churn_phase(
+            args,
+            args.steady_state_rate.unwrap_or(args.rate),
+        ));
         return Ok(plans);
     }
     plans.push(PhasePlan {
@@ -703,6 +848,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             dense_cadence: true,
         });
     }
+    plans.extend(churn_phase(args, steady_rate));
     if args.mid_flight_kill {
         plans.push(PhasePlan {
             name: "mid_flight_kill".into(),
@@ -721,4 +867,19 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         });
     }
     Ok(plans)
+}
+
+/// The `churn` side phase, when `--churn-seconds` asks for one: no proxy
+/// delay, outside the artifact.
+fn churn_phase(args: &Args, steady_rate: f64) -> Option<PhasePlan> {
+    (args.churn_seconds > 0).then(|| PhasePlan {
+        name: crate::churn::PHASE.into(),
+        seconds: args.churn_seconds,
+        rate: args.churn_rate.unwrap_or(steady_rate),
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+    })
 }
