@@ -1386,3 +1386,13 @@ repair or a compatible native image preserving all durable history.
    zero completeness and integrity counts and successful readiness. #291 must
    repeat this procedure on production-sized history and retain this exact data
    loss boundary when completing `doc/release-notes-3.0.0.md` before rollout is approved.
+
+CI runs steps 2 to 7 every week on a scaled 2.x.x ledger built from the frozen
+release SQL: a pre-ACK isolated restore, `migrate` and `import-audits` with
+exact evidence equality, both native servers mining their own blocks on a
+real regtest node over the migrated history, `self-check`, and the post-ACK
+boundary (the tail query above names exactly the native shares, the isolated
+restore still equals the source, and the legacy revert refuses). The scenario
+is `migration_lifecycle_tests` in `crates/qbit-prism-server/tests/live_regtest.rs`,
+listed in `test/prism-weekly-gated-tests.txt`. It does not replace #291's
+rehearsal on production-sized history.
