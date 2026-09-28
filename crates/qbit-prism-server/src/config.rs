@@ -569,6 +569,30 @@ impl Config {
         })
     }
 
+    /// #525: refuse a configuration that can build no work once a sub-floor
+    /// balance exists. `apply_payout_policy` selects only the accounts whose
+    /// candidate balance reaches the payout floor, so any positive sub-floor
+    /// balance leaves the selected balances short of the coinbase; only a
+    /// pool fee (`add_swept_dust_to_pool_fee`, at any rate, 0 bps included)
+    /// can take that dust. Without one every work build on the new tip fails
+    /// with `PayoutExceedsCandidateBalance` and mining stops. The non-CTV
+    /// builder applies the same policy and is equally exposed; it is not
+    /// refused here, and the current-parent work alert is its safety net.
+    ///
+    /// Checked where a process would run or validate this policy (`run`,
+    /// `check-config`, `self-check` and a policy-transition target), not in
+    /// `from_env`: the operator tools, and the current side of the policy
+    /// transition that leaves this configuration, must still read it.
+    pub fn ensure_pool_fee_settles_dust(&self) -> Result<()> {
+        ensure!(
+            !self.ctv_enabled || self.payout_policy.pool_fee_policy.is_some(),
+            "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 \
+             is allowed): without a pool fee, sub-floor dust cannot be settled, so the first \
+             positive balance below the payout floor fails every work build and stops mining"
+        );
+        Ok(())
+    }
+
     pub(crate) fn verify_genesis(&self, actual: &str) -> Result<()> {
         if let Some(expected) = genesis_pin(&self.chain, self.expected_genesis_hash.clone())? {
             ensure!(
@@ -660,6 +684,55 @@ mod tests {
             audit_bind: "127.0.0.1".into(),
             audit_port: 3341,
         }
+    }
+
+    fn pool_fee(fee_bps: u16) -> Option<PoolFeePolicy> {
+        Some(PoolFeePolicy {
+            fee_bps,
+            recipient_id: "pool-fee".into(),
+            order_key: "pool-fee".into(),
+            p2mr_program_hex: "fe".repeat(32),
+        })
+    }
+
+    /// #525: CTV settlement without a pool fee stalls on the first sub-floor
+    /// balance, so it must be refused, naming both settings and the reason.
+    #[test]
+    fn ctv_settlement_without_a_pool_fee_is_refused() {
+        let config = automatic_ctv_config();
+        assert!(config.payout_policy.pool_fee_policy.is_none());
+        let error = config
+            .ensure_pool_fee_settles_dust()
+            .unwrap_err()
+            .to_string();
+        for part in [
+            "PRISM_CTV_SETTLEMENT_ENABLED=1",
+            "PRISM_POOL_FEE_ENABLED=1",
+            "PRISM_POOL_FEE_BPS=0",
+            "sub-floor dust cannot be settled",
+            "stops mining",
+        ] {
+            assert!(error.contains(part), "{part:?} missing from {error:?}");
+        }
+    }
+
+    #[test]
+    fn ctv_settlement_with_any_pool_fee_is_accepted() {
+        for fee_bps in [200, 0] {
+            let mut config = automatic_ctv_config();
+            config.payout_policy.pool_fee_policy = pool_fee(fee_bps);
+            config.ensure_pool_fee_settles_dust().unwrap();
+        }
+    }
+
+    /// Only CTV settlement is refused (#525). The direct builder applies the
+    /// same policy and is equally exposed; until it is refused too, the
+    /// current-parent work alert is its safety net.
+    #[test]
+    fn direct_settlement_without_a_pool_fee_is_not_refused_here() {
+        let mut config = automatic_ctv_config();
+        config.ctv_enabled = false;
+        config.ensure_pool_fee_settles_dust().unwrap();
     }
 
     #[test]

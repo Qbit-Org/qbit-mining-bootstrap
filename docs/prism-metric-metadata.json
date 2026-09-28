@@ -146,6 +146,9 @@
     "hashrate_rollup_watermark_lag_seconds": {
       "status": "The stored watermark is a share sequence, not a time; a caught-up pass is one that advanced the watermark within its batch bound, leaving no unfolded share. A pass that lost the race to another frontend leaves the stamp unchanged, so a frontend that keeps losing reads high: alert on the minimum across instances. -1 runs from loop start until its first such pass, and PRISM_HASHRATE_ROLLUP_ENABLED=0 leaves the family declared with no sample at all."
     },
+    "current_parent_work_missing_seconds": {
+      "status": "Read from the coordinator's tip state at each health publication (#525). The clock starts at the first departure a refresh observed, like the replacement-build lease, and retries or newer tips never renew it; publishing work on the observed tip resets it to zero. A work build that keeps failing on a new tip, such as PayoutExceedsCandidateBalance when sub-floor dust exists without a pool fee, grows it without bound on either settlement path, while semantic coverage keeps reading one because sessions still hold the latest published generation. -1 only before the first tip observation. Pages through PrismCurrentParentWorkMissingCritical."
+    },
     "share_ledger_partition_lead_rows": {
       "status": "max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it."
     },

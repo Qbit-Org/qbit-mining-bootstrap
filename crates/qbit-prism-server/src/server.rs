@@ -16,6 +16,7 @@ use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
 pub async fn run(config: Config) -> Result<()> {
+    config.ensure_pool_fee_settles_dust()?;
     let rollup_settings = crate::rollups::settings_from_env()?;
     let partition_settings = crate::partitions::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
@@ -364,6 +365,7 @@ async fn publish_health(
                 coordinator.blocks.load(Ordering::Relaxed),
             );
             registry.publish_delivery(stats.delivery_metrics());
+            registry.publish_parent_work(coordinator.observed_tip.read().await.unpublished_for());
             state.publish_metrics(registry.render())?;
             Ok(health)
         })

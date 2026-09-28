@@ -340,6 +340,32 @@
       ]
     },
     {
+      "uid": "qbit-prism-parent-work-missing-critical",
+      "title": "PrismCurrentParentWorkMissingCritical",
+      "role": "run",
+      "expr": "(qbit_prism_current_parent_work_missing_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 120) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismCurrentParentWorkMissingCritical",
+      "description": "The node tip this frontend observes has had no published work on it for 120 seconds, measured from the first departure a refresh observed, which retries never renew: every miner on this frontend is hashing on a stale parent, a total work stall whatever the cause, for example #525, where a pool without a fee cannot settle sub-floor dust and every build on the new tip fails with PayoutExceedsCandidateBalance on either settlement path. Semantic coverage cannot see it: it compares sessions with the latest published generation, which stays on the old parent while every refresh fails. A healthy refresh publishes within seconds of a new tip; 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS), after which even the old parent's shares stop earning. One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend with no work on the tip is stalled for every miner that connects. -1 (no tip observed) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "The node tip this frontend observes has had no published work on it for 120 seconds, measured from the first departure a refresh observed, which retries never renew: every miner on this frontend is hashing on a stale parent, a total work stall whatever the cause, for example #525, where a pool without a fee cannot settle sub-floor dust and every build on the new tip fails with PayoutExceedsCandidateBalance on either settlement path. Semantic coverage cannot see it: it compares sessions with the latest published generation, which stays on the old parent while every refresh fails. A healthy refresh publishes within seconds of a new tip; 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS), after which even the old parent's shares stop earning. One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend with no work on the tip is stalled for every miner that connects. -1 (no tip observed) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/coordinator/tip_observation.rs",
+        "crates/qbit-prism-server/src/server.rs"
+      ]
+    },
+    {
       "uid": "qbit-prism-work-metrics-unavailable",
       "title": "PrismWorkMetricsUnavailable",
       "role": "run",

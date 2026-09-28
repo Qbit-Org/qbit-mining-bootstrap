@@ -1481,5 +1481,35 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotIn("docker is required", result.stderr)
 
 
+    def test_ctv_settlement_requires_a_pool_fee_before_docker_check(self) -> None:
+        # #525: mirrors the server's startup refusal, including an explicit
+        # process-environment disable over the sourced defaults.
+        for fee_enabled in (None, "0", "false"):
+            with self.subTest(fee_enabled=fee_enabled):
+                overrides = {"MINING_LANES": "prism", "PRISM_CTV_SETTLEMENT_ENABLED": "1"}
+                if fee_enabled is not None:
+                    overrides["PRISM_POOL_FEE_ENABLED"] = fee_enabled
+                result = self.run_check_env(**overrides)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1",
+                    result.stderr,
+                )
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_ctv_settlement_accepts_any_enabled_pool_fee(self) -> None:
+        for fee_enabled in ("1", "True", "on"):
+            with self.subTest(fee_enabled=fee_enabled):
+                result = self.run_check_env(
+                    MINING_LANES="prism",
+                    PRISM_CTV_SETTLEMENT_ENABLED="1",
+                    PRISM_POOL_FEE_ENABLED=fee_enabled,
+                    PRISM_POOL_FEE_BPS="0",
+                )
+
+                self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

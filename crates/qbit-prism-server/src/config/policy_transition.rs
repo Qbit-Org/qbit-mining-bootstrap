@@ -38,6 +38,10 @@ pub(crate) fn transition_configs(path: &Path) -> Result<(Config, Config)> {
         }
     }
     let target = Config::from_env().context("invalid target policy configuration")?;
+    // The current policy may be the one being repaired; only the target runs.
+    target
+        .ensure_pool_fee_settles_dust()
+        .context("invalid target policy configuration")?;
     ensure!(
         current.database_url == target.database_url,
         "policy-transition cannot change PRISM_DATABASE_URL"

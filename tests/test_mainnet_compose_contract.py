@@ -227,6 +227,15 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"], "1000")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"], "12000")
 
+    def test_ctv_settlement_runs_with_a_pool_fee(self) -> None:
+        # #525: without one, the first sub-floor balance stops all work.
+        env = self._environment("prism-coordinator")
+
+        self.assertEqual(env["PRISM_CTV_SETTLEMENT_ENABLED"], "1")
+        self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+        self.assertEqual(env["PRISM_POOL_FEE_BPS"], "200")
+        self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress")
+
     def test_prism_uses_explicit_non_lab_difficulty_profile(self) -> None:
         env = self._environment("prism-coordinator")
 

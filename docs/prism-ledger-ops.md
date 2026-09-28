@@ -2394,6 +2394,13 @@ remains deferred.
    can replace an old rate that is already below those floors. Mainnet still
    requires an explicit rate. Rates can change again before restart.
 
+   A CTV target must keep a pool fee (#525): `PRISM_POOL_FEE_ENABLED=1`, with
+   `PRISM_POOL_FEE_BPS=0` allowed. Without one, sub-floor dust cannot be
+   settled and the first balance below the payout floor fails every work
+   build, so `run`, `check-config`, `self-check` and this command's target all
+   refuse it. The current configuration is still read when it lacks a fee, so
+   this command is also how a cluster that ran without one enables it.
+
 2. Disable automatic restarts and stop every frontend and standalone candidate
    or CTV worker. Graceful SIGTERM closes miner admission and drains workers;
    in the bundled stack use

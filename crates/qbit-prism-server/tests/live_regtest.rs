@@ -472,6 +472,21 @@ impl Fixture {
                     "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
                     "1000",
                 );
+            // #525: CTV settlement refuses to start without a pool fee. A
+            // 0 bps fee pays nothing until sub-floor dust must be swept. A
+            // case that configures its own fee in `server_env` replaces this
+            // one whole: an address beside this program would be refused.
+            if !self
+                .server_env
+                .iter()
+                .any(|(name, _)| name.starts_with("PRISM_POOL_FEE_"))
+            {
+                command
+                    .env("PRISM_POOL_FEE_ENABLED", "1")
+                    .env("PRISM_POOL_FEE_BPS", "0")
+                    .env("PRISM_POOL_FEE_RECIPIENT_ID", "live-pool-fee")
+                    .env("PRISM_POOL_FEE_P2MR_PROGRAM_HEX", "fe".repeat(32));
+            }
         }
         if let Some(fee) = fee {
             command

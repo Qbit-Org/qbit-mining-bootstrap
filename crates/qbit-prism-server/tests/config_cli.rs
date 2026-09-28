@@ -506,6 +506,11 @@ async fn ctv_fee_premiums_are_validated_before_automatic_or_explicit_fee_work() 
                     market_rate,
                 ),
                 ("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", "15000"),
+                // #525: CTV settlement requires a pool fee, 0 bps included.
+                ("PRISM_POOL_FEE_ENABLED", "1"),
+                ("PRISM_POOL_FEE_BPS", "0"),
+                ("PRISM_POOL_FEE_RECIPIENT_ID", "pool-fee"),
+                ("PRISM_POOL_FEE_P2MR_PROGRAM_HEX", &"fe".repeat(32)),
             ],
         )
         .await;
