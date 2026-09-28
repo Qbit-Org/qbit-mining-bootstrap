@@ -1938,8 +1938,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "payout_address": ctx.payout_address,
             "payout_addresses": ctx.population.addresses.len(),
             "pool_fee_bps": args.pool_fee_bps,
-            "pool_fee_address": (args.pool_fee_bps > 0)
-                .then(|| frontend::pool_fee_address(&ctx.payout_address)),
+            "pool_fee_address": frontend::pool_fee_address(&ctx.payout_address),
             "share_id_prefix": ctx.share_prefix,
             "writer_ids": writer_ids,
         },

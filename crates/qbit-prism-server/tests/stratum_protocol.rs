@@ -21,6 +21,8 @@ use tokio::{
     sync::watch,
     time::timeout,
 };
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 type StoredMockJob = (MiningJob<()>, Worker, u32, Instant);
 type MockDifficulties = Mutex<HashMap<(String, String), (f64, Instant)>>;
@@ -1863,6 +1865,9 @@ async fn check_config(settings: &[(&str, &str)]) -> std::process::Output {
         .env("QBIT_RPC_URL", "http://127.0.0.1:1/")
         .env("QBIT_CHAIN", "regtest")
         .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1");
+    for (name, value) in pool_fee::default_pool_fee(settings.iter().map(|(name, _)| *name)) {
+        command.env(name, value);
+    }
     for (name, value) in settings {
         command.env(name, value);
     }

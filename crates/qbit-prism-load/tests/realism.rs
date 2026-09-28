@@ -544,8 +544,9 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
     Ok(())
 }
 
-/// The realism presets run mainnet's pool fee, and every legacy preset runs
-/// with it off, as it was measured; the nightly schedule runs on 8 vCPU.
+/// The realism presets run mainnet's pool fee, and every legacy preset a
+/// 0-bps one, which reproduces its fee-off measurement (#535); the nightly
+/// schedule runs on 8 vCPU.
 #[test]
 fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
     for loaded in preset::load_all(&preset::presets_dir())? {
@@ -580,19 +581,15 @@ fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
             .validate()
             .is_err()
     );
-    let mut environment = std::collections::BTreeMap::new();
-    environment.insert("PRISM_POOL_FEE_ENABLED".to_owned(), "0".to_owned());
-    let legacy = environment.clone();
-    qbit_prism_load::frontend::apply_pool_fee(&mut environment, 0, "pload1x");
-    assert_eq!(
-        environment, legacy,
-        "fee off leaves the environment as built"
-    );
+    // #535: every frontend runs a fee, the legacy presets' at 0 bps.
     let address = qbit_prism_load::frontend::pool_fee_address("pload1deadbeef");
-    qbit_prism_load::frontend::apply_pool_fee(&mut environment, 200, &address);
-    assert_eq!(environment["PRISM_POOL_FEE_ENABLED"], "1");
-    assert_eq!(environment["PRISM_POOL_FEE_BPS"], "200");
-    assert_eq!(environment["PRISM_POOL_FEE_ADDRESS"], "pload1deadbeeffee");
+    for (bps, expected) in [(0, "0"), (200, "200")] {
+        let mut environment = std::collections::BTreeMap::new();
+        qbit_prism_load::frontend::apply_pool_fee(&mut environment, bps, &address);
+        assert_eq!(environment["PRISM_POOL_FEE_ENABLED"], "1");
+        assert_eq!(environment["PRISM_POOL_FEE_BPS"], expected);
+        assert_eq!(environment["PRISM_POOL_FEE_ADDRESS"], "pload1deadbeeffee");
+    }
     Ok(())
 }
 
@@ -689,7 +686,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             args.recipients, None,
             "{name}: one payout address, as #473 ran"
         );
-        assert_eq!(args.pool_fee_bps, 0, "{name}: the fee off, as #473 ran");
+        assert_eq!(args.pool_fee_bps, 0, "{name}: no fee earned, as #473 ran");
         assert!(!args.retarget_bits, "{name}");
         assert_eq!(loaded.schedule, schedule, "{name}");
         let gates = &loaded.gates;

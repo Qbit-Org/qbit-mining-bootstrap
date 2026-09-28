@@ -61,6 +61,8 @@ use tokio::{net::TcpStream, sync::watch, task::JoinHandle};
 #[path = "support/ledger_database.rs"]
 mod ledger_database;
 use ledger_database::FixtureDatabase;
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 /// The instance ID every child registers under: each child is a restart of
 /// one frontend, not the arrival of a second one.
@@ -261,6 +263,7 @@ impl ServerChild {
             .env("QBIT_RPC_URL", node_url)
             .env("PRISM_MIN_PEERS", "1")
             .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1")
+            .envs(pool_fee::ZERO_BPS_POOL_FEE)
             .env("PRISM_MANIFEST_SIGNING_SEED_HEX", "11".repeat(32))
             .env("PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX", &ledger_seed)
             .env(

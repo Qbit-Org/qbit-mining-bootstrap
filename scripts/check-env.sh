@@ -929,9 +929,18 @@ check_ctv_fee_config() {
     fi
     printf 'doctor: CTV fanout fee rate will use estimatesmartfee; run prism-self-check to preflight it before accepting miners\n'
   fi
-  # #525: the server refuses the same combination at startup.
-  is_true_env "$(ascii_lower "${PRISM_POOL_FEE_ENABLED:-0}")" \
-    || fail "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed): without a pool fee, sub-floor dust cannot be settled and the first balance below the payout floor stops mining"
+}
+
+# #525, #535: the server refuses a fee-off pool in every settlement mode at
+# startup, in check-config and in self-check.
+check_pool_fee_config() {
+  mining_lane_enabled prism || return 0
+  is_true_env "$(ascii_lower "${PRISM_POOL_FEE_ENABLED:-0}")" && return 0
+  local mode="direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"
+  if is_true_env "$(ascii_lower "${PRISM_CTV_SETTLEMENT_ENABLED:-0}")"; then
+    mode="PRISM_CTV_SETTLEMENT_ENABLED=1"
+  fi
+  fail "${mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed) with a pool fee recipient: without a pool fee, sub-floor dust cannot be settled and the first balance below the payout floor stops mining"
 }
 
 check_bitcoin_peer_bootstrap() {
@@ -1070,6 +1079,7 @@ if mining_lane_enabled auxpow; then
 fi
 check_prism_stale_grace
 check_ctv_fee_config
+check_pool_fee_config
 
 check_production_gate
 check_release_provenance_gate

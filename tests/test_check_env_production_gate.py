@@ -1481,22 +1481,40 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotIn("docker is required", result.stderr)
 
 
-    def test_ctv_settlement_requires_a_pool_fee_before_docker_check(self) -> None:
-        # #525: mirrors the server's startup refusal, including an explicit
-        # process-environment disable over the sourced defaults.
-        for fee_enabled in (None, "0", "false"):
-            with self.subTest(fee_enabled=fee_enabled):
-                overrides = {"MINING_LANES": "prism", "PRISM_CTV_SETTLEMENT_ENABLED": "1"}
-                if fee_enabled is not None:
-                    overrides["PRISM_POOL_FEE_ENABLED"] = fee_enabled
-                result = self.run_check_env(**overrides)
+    def test_settlement_requires_a_pool_fee_in_every_mode_before_docker_check(self) -> None:
+        # #525, #535: mirrors the server's startup refusal in both settlement
+        # modes, including an explicit process-environment disable over the
+        # sourced defaults.
+        for ctv, mode in (
+            ("1", "PRISM_CTV_SETTLEMENT_ENABLED=1"),
+            ("0", "direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"),
+        ):
+            for fee_enabled in ("0", "false", "OFF"):
+                with self.subTest(ctv=ctv, fee_enabled=fee_enabled):
+                    result = self.run_check_env(
+                        MINING_LANES="prism",
+                        PRISM_CTV_SETTLEMENT_ENABLED=ctv,
+                        PRISM_POOL_FEE_ENABLED=fee_enabled,
+                    )
 
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(
-                    "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1",
-                    result.stderr,
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        f"{mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed)",
+                        result.stderr,
+                    )
+                    self.assertNotIn("docker is required", result.stderr)
+
+    def test_env_example_defaults_enable_a_pool_fee_in_every_mode(self) -> None:
+        # #535: a fresh setup copied from .env.example passes the fee check
+        # in either mode and stops only at the Docker boundary.
+        for ctv in ("0", "1"):
+            with self.subTest(ctv=ctv):
+                result = self.run_check_env(
+                    MINING_LANES="prism", PRISM_CTV_SETTLEMENT_ENABLED=ctv
                 )
-                self.assertNotIn("docker is required", result.stderr)
+
+                self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
+                self.assertIn("docker", result.stderr)
 
     def test_process_environment_disables_a_pool_fee_the_env_file_enables(self) -> None:
         # Compose prefers the shell value over the env file; so must the doctor.
@@ -1518,17 +1536,18 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1", refused.stderr
         )
 
-    def test_ctv_settlement_accepts_any_enabled_pool_fee(self) -> None:
-        for fee_enabled in ("1", "True", "on"):
-            with self.subTest(fee_enabled=fee_enabled):
-                result = self.run_check_env(
-                    MINING_LANES="prism",
-                    PRISM_CTV_SETTLEMENT_ENABLED="1",
-                    PRISM_POOL_FEE_ENABLED=fee_enabled,
-                    PRISM_POOL_FEE_BPS="0",
-                )
+    def test_settlement_accepts_any_enabled_pool_fee_in_every_mode(self) -> None:
+        for ctv in ("0", "1"):
+            for fee_enabled in ("1", "True", "on"):
+                with self.subTest(ctv=ctv, fee_enabled=fee_enabled):
+                    result = self.run_check_env(
+                        MINING_LANES="prism",
+                        PRISM_CTV_SETTLEMENT_ENABLED=ctv,
+                        PRISM_POOL_FEE_ENABLED=fee_enabled,
+                        PRISM_POOL_FEE_BPS="0",
+                    )
 
-                self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
+                    self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
 
 
 if __name__ == "__main__":

@@ -2394,12 +2394,25 @@ remains deferred.
    can replace an old rate that is already below those floors. Mainnet still
    requires an explicit rate. Rates can change again before restart.
 
-   A CTV target must keep a pool fee (#525): `PRISM_POOL_FEE_ENABLED=1`, with
-   `PRISM_POOL_FEE_BPS=0` allowed. Without one, sub-floor dust cannot be
-   settled and the first balance below the payout floor fails every work
-   build, so `run`, `check-config`, `self-check` and this command's target all
-   refuse it. The current configuration is still read when it lacks a fee, so
-   this command is also how a cluster that ran without one enables it.
+   Every target must keep a pool fee, in either settlement mode (#525, #535):
+   `PRISM_POOL_FEE_ENABLED=1` with a recipient, `PRISM_POOL_FEE_BPS=0`
+   allowed. Without one, sub-floor dust cannot be settled and the first
+   balance below the payout floor fails every work build, so `run`,
+   `check-config`, `self-check` and this command's target all refuse it. The
+   current configuration is still read when it lacks a fee, so this command
+   is also how a cluster that ran without one enables it. A frontend that ran
+   before #535 with the fee off, including one started from an older
+   `.env.example` or `compose.yaml` default, refuses to start until it does:
+   stop every frontend and run this command with a target such as
+
+   ```dotenv
+   PRISM_POOL_FEE_ENABLED=1
+   PRISM_POOL_FEE_BPS=0
+   PRISM_POOL_FEE_ADDRESS=<reviewed P2MR fee address>
+   ```
+
+   then set the same values in the frontends' environment. A 0-bps fee pays
+   nothing and adds no coinbase output until dust must be swept.
 
 2. Disable automatic restarts and stop every frontend and standalone candidate
    or CTV worker. Graceful SIGTERM closes miner admission and drains workers;

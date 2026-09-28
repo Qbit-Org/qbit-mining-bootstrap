@@ -236,6 +236,54 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_POOL_FEE_BPS"], "200")
         self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress")
 
+    def test_role_rendered_compose_names_exactly_one_pool_fee_recipient(self) -> None:
+        # #535: the deploy role runs compose.yaml alone and renders the fee
+        # address without a program line. A recipient default in compose.yaml
+        # would put a program beside that address, and every server refuses
+        # "configure exactly one pool fee address or P2MR program".
+        fixture = [
+            line
+            for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("PRISM_POOL_FEE_P2MR_PROGRAM_HEX=")
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "role.env"
+            deploy_env.write_text("\n".join(fixture) + "\n", encoding="utf-8")
+            for ctv in ("1", "0"):
+                with self.subTest(ctv=ctv):
+                    env = self._render_coordinator(
+                        deploy_env, PRISM_CTV_SETTLEMENT_ENABLED=ctv
+                    )
+                    self.assertEqual(env["PRISM_CTV_SETTLEMENT_ENABLED"], ctv)
+                    self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+                    self.assertEqual(
+                        env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress"
+                    )
+                    self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")
+        # A deployment that names no fee still gets it enabled, and no
+        # recipient: the server refuses with the settings to set.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "bare.env"
+            deploy_env.write_text("MINING_LANES=prism\n", encoding="utf-8")
+            env = self._render_coordinator(deploy_env)
+            self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+            self.assertEqual(env["PRISM_POOL_FEE_BPS"], "")
+            self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "")
+            self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")
+
+    def _render_coordinator(self, deploy_env: Path, **overrides: str) -> dict[str, str]:
+        completed = subprocess.run(
+            [self.docker, "compose", "--env-file", str(ROOT / "config/upstream.env.example"),
+             "--env-file", str(deploy_env), "-f", str(ROOT / "compose.yaml"),
+             "--project-name", "qbit-role-pool-fee-contract", "--profile", "prism",
+             "config", "--format", "json", "prism-coordinator"],
+            cwd=ROOT, env={**self.compose_env, **overrides}, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        raw_env = json.loads(completed.stdout)["services"]["prism-coordinator"]["environment"]
+        return {str(key): str(value) for key, value in raw_env.items()}
+
     def test_prism_uses_explicit_non_lab_difficulty_profile(self) -> None:
         env = self._environment("prism-coordinator")
 

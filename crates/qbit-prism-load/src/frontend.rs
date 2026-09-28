@@ -159,7 +159,7 @@ pub fn frontend_environment(
     set("PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS", "15".into());
     set("PRISM_CTV_SETTLEMENT_ENABLED", "0".into());
     set("PRISM_CTV_BROADCASTER_ENABLED", "0".into());
-    set("PRISM_POOL_FEE_ENABLED", "0".into());
+    // The pool fee needs the run's own address: `apply_pool_fee`.
     set("PRISM_COINBASE_OUTPUT_POLICY", "canonical".into());
     set("PRISM_COINBASE_TAG", "/PRISM/".into());
     set("PRISM_HASHRATE_ROLLUP_ENABLED", "1".into());
@@ -167,13 +167,13 @@ pub fn frontend_environment(
     env
 }
 
-/// Turn the pool fee on in a frontend environment, as mainnet runs it: the
-/// fee enabled at `bps` to `address`, which the fake node validates as
-/// P2MR. With `bps` 0 the environment is left exactly as built, fee off.
+/// Turn the pool fee on in a frontend environment, as every server now
+/// requires (#535): the fee enabled at `bps` to `address`, which the fake
+/// node validates as P2MR. A 0-bps fee pays nothing and adds no output until
+/// dust below the payout floor must be swept, and a fee-off frontend would
+/// have stopped building work at that point, so every run that completed
+/// fee-off keeps its payouts at 0 bps.
 pub fn apply_pool_fee(env: &mut BTreeMap<String, String>, bps: u16, address: &str) {
-    if bps == 0 {
-        return;
-    }
     env.insert("PRISM_POOL_FEE_ENABLED".into(), "1".into());
     env.insert("PRISM_POOL_FEE_BPS".into(), bps.to_string());
     env.insert("PRISM_POOL_FEE_ADDRESS".into(), address.into());

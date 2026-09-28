@@ -7,6 +7,8 @@ use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use std::{process::Output, time::Duration};
 use tokio::{process::Command, time::timeout};
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 async fn self_check(settings: &[(&str, &str)], deadline: Duration) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
@@ -26,6 +28,9 @@ async fn self_check(settings: &[(&str, &str)], deadline: Duration) -> Output {
         .env("PRISM_RPC_TIMEOUT_SECONDS", "1")
         .env("QBIT_CHAIN", "regtest")
         .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1");
+    for (name, value) in pool_fee::default_pool_fee(settings.iter().map(|(name, _)| *name)) {
+        command.env(name, value);
+    }
     for (name, value) in settings {
         command.env(name, value);
     }

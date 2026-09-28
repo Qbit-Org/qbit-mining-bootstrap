@@ -441,9 +441,11 @@ For a 1 bit/vbyte launch floor, set the market-rate input to `1000`; the default
 preflight also rejects a configured rate below the node's relay or mempool fee
 floor.
 
-CTV settlement requires a pool fee (#525), `PRISM_POOL_FEE_BPS=0` included;
-without one the first sub-floor balance stops all work, so the frontend
-refuses to start:
+Every settlement mode requires a pool fee (#525, #535), `PRISM_POOL_FEE_BPS=0`
+included; without one the first sub-floor balance stops all work, so the
+frontend refuses to start. `compose.yaml` enables the fee but sets no
+recipient, and production refuses `.env.example`'s lab recipient, so name
+exactly one reviewed recipient:
 
 ```dotenv
 PRISM_POOL_FEE_ENABLED=1

@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{process::Output, time::Duration};
 use tokio::{process::Command, time::timeout};
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 fn bundle() -> Result<AuditBundle> {
     Ok(qbit_prism::build_audit_bundle(
@@ -210,7 +212,8 @@ async fn command(db: &Database, args: &[&str], production: bool) -> Result<Outpu
         .env("PRISM_STRATUM_SHARE_DIFF", "16")
         .env("PRISM_STRATUM_VARDIFF_MIN_DIFF", "1")
         .env("PRISM_STRATUM_VARDIFF_START_DIFF", "16")
-        .env("PRISM_STRATUM_VARDIFF_MAX_DIFF", "1024");
+        .env("PRISM_STRATUM_VARDIFF_MAX_DIFF", "1024")
+        .envs(pool_fee::ZERO_BPS_POOL_FEE);
     let output = timeout(Duration::from_secs(10), command.output()).await??;
     for stream in [&output.stdout, &output.stderr] {
         ensure!(!String::from_utf8_lossy(stream).contains("test-only-password"));
