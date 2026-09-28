@@ -2880,6 +2880,18 @@ PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin \
 The test skips unless that server-tool directory is provided. Its test proxy
 and promotion sequence do not replace validation of a production HA manager.
 
+The live regtest suite (#521) runs the documented promotion procedure against a
+disposable primary with one **asynchronous** standby while a found block is
+mid-landing (`live_regtest` tests `pg_failover_tests::*`, which need
+`QBITD_BIN`, `PRISM_TEST_DATABASE_URL` and `PRISM_TEST_PG_BIN_DIR`). With replication cut before the
+failover, the shares committed in the gap are lost and counted, and every
+earlier share survives; after a fenced switch that replays through the old
+primary's flush LSN, none is lost. Either way the block is offered once and
+lands on the promoted primary. When the offering frontend loses the node's
+answer with the old primary, the reservation is recovered without another
+`submitblock`, usually once its 120-second candidate lease expires, and the
+submitted row keeps no offer outcome.
+
 The collector failure/recovery test requires a disposable PostgreSQL database
 and is ignored by ordinary `--all-targets` runs. Invoke it explicitly when
 running without the wrapper:
