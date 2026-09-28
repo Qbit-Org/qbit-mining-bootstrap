@@ -31,7 +31,16 @@ shift 2
 root="$(git rev-parse --show-toplevel)"
 target="${TARGET_DIR:-${root}/target}/release"
 pg_bin="${PG_BIN_DIR:-/usr/lib/postgresql/16/bin}"
-preset_file="${root}/crates/qbit-prism-load/presets/${preset}.json"
+presets="${root}/crates/qbit-prism-load/presets"
+# A deprecated name (presets/aliases.txt) runs the preset it was renamed to.
+if [[ ! -f "${presets}/${preset}.json" && -f "${presets}/aliases.txt" ]]; then
+  renamed="$(awk -v old="${preset}" '$1 == old && $1 !~ /^#/ { print $2 }' "${presets}/aliases.txt")"
+  if [[ -n "${renamed}" ]]; then
+    echo "prism-load-run: ${preset} is deprecated; running ${renamed}" >&2
+    preset="${renamed}"
+  fi
+fi
+preset_file="${presets}/${preset}.json"
 test -f "${preset_file}" || { echo "no preset ${preset_file}" >&2; exit 2; }
 
 mkdir -p "${out}"

@@ -1,7 +1,7 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "d1-473-500k-fe4-async",
-  "description": "PR #473's D1 cell d1-500k-fe4-async: 500k window, 2,000 sessions on 4 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 516, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase.",
+  "name": "throughput-500k-window-4fe-async",
+  "description": "PR #473's D1 cell d1-500k-fe4-async: 500k window, 2,000 sessions on 4 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 516, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase (#447).",
   "issues": [
     "#447",
     "#473",

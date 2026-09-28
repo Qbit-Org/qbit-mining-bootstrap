@@ -1,4 +1,4 @@
-//! The per-PR load-harness smoke run (#521 item 6): the checked-in `smoke`
+//! The per-PR load-harness smoke run (#521 item 6): the checked-in `pr-smoke`
 //! preset end to end, against a debug `qbit-prism-server` and a managed
 //! PostgreSQL 16 cluster, held to the preset's gates.
 //!
@@ -66,7 +66,7 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     let server = build_server()?;
     let built = started.elapsed();
     let out = tempdir()?;
-    let preset_path = preset::presets_dir().join("smoke.json");
+    let preset_path = preset::presets_dir().join("pr-smoke.json");
     let mut argv: Vec<std::ffi::OsString> = vec![
         "qbit-prism-load".into(),
         "--preset".into(),
@@ -84,7 +84,7 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         "--allow-unverified-server-revision".into(),
     ];
     let (expanded, loaded) = preset::expand_command_line(std::mem::take(&mut argv))?;
-    let loaded = loaded.context("the smoke preset")?;
+    let loaded = loaded.context("the pr-smoke preset")?;
     let args = Args::try_parse_from(expanded)?;
     let exit = run::execute_with_preset(args, Some(loaded.clone())).await?;
     let ran = started.elapsed() - built;
@@ -97,7 +97,7 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     assert!(gate::passed(&checks), "{table}");
 
     // The run is the preset's, and the skew it asked for is the skew it drove.
-    assert_eq!(report["preset"]["name"], "smoke");
+    assert_eq!(report["preset"]["name"], "pr-smoke");
     assert_eq!(report["preset"]["sha256"], loaded.sha256.as_str());
     assert_eq!(report["topology"]["sessions"], 100);
     let tips = report["time_to_usable_work"]["tips"]

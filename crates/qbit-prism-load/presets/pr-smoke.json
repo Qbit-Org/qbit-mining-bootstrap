@@ -1,6 +1,6 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "smoke",
+  "name": "pr-smoke",
   "description": "The per-PR smoke run: one debug frontend, 100 sessions over 20 skewed payout addresses, a 20k window and 3 retargeting tips in a tips-only plan, then 30 s of rental churn (bursts of 20 and 40 sessions, abrupt departures, a 30% reconnect storm, 2 tips).",
   "issues": [
     "#521"

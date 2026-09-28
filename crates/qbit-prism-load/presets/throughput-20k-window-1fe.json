@@ -1,14 +1,13 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "d1-473-200k-fe1-async",
-  "description": "PR #473's D1 cell d1-200k-fe1-async: 200k window, 2,000 sessions on 1 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 2016, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase.",
+  "name": "throughput-20k-window-1fe",
+  "description": "The #271 D1 plan over the 20k-share window fixture (w11-20k-fe1-async): 2,000 sessions on one frontend, asynchronous standby, 500/s steady, 2,000/s burst. One payout address, as the fixture was measured.",
   "issues": [
-    "#447",
-    "#473",
+    "#271",
     "#521"
   ],
-  "schedule": "manual",
-  "runner": "blacksmith-16vcpu-ubuntu-2404",
+  "schedule": "nightly",
+  "runner": "blacksmith-8vcpu-ubuntu-2404",
   "timeout_minutes": 60,
   "gates": {
     "phases": [
@@ -78,7 +77,7 @@
     "--stratum-max-pending-initial-jobs": 2016,
     "--template-bits": "1e7fffff",
     "--warmup-seconds": 30,
-    "--window-shares": 200000,
+    "--window-shares": 20000,
     "--work-timeout": 120
   }
 }

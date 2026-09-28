@@ -479,23 +479,23 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
     let presets = preset::load_all(&preset::presets_dir())?;
     let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
     for required in [
-        "d1-20k",
-        "d1-20k-realistic",
-        "tip-275",
-        "tip-275-realistic",
-        "mainnet-floor",
-        "growth-5x",
-        "growth-20x",
-        "smoke",
-        "rental-churn",
-        "d1-473-200k-fe1-async",
-        "d1-473-400k-fe1-async",
-        "d1-473-400k-fe2-async",
-        "d1-473-400k-fe4-async",
-        "d1-473-400k-fe2-sync",
-        "d1-473-500k-fe1-async",
-        "d1-473-500k-fe2-async",
-        "d1-473-500k-fe4-async",
+        "throughput-20k-window-1fe",
+        "throughput-20k-window-1fe-500-addresses",
+        "tip-delivery-2000-miners-400k-2fe-retarget",
+        "tip-delivery-2000-miners-400k-2fe-retarget-500-addresses",
+        "mainnet-shape-130-addresses",
+        "mainnet-shape-650-addresses",
+        "mainnet-shape-2600-addresses",
+        "pr-smoke",
+        "rental-churn-bursts-and-storms",
+        "throughput-200k-window-1fe-async",
+        "throughput-400k-window-1fe-async",
+        "throughput-400k-window-2fe-async",
+        "throughput-400k-window-4fe-async",
+        "throughput-400k-window-2fe-sync",
+        "throughput-500k-window-1fe-async",
+        "throughput-500k-window-2fe-async",
+        "throughput-500k-window-4fe-async",
     ] {
         assert!(
             names.contains(&required),
@@ -552,8 +552,13 @@ fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
         let mut argv = vec!["qbit-prism-load".to_owned()];
         argv.extend(loaded.argv()?);
         let args = Args::try_parse_from(&argv)?;
-        let realism = ["mainnet-floor", "growth-5x", "growth-20x", "rental-churn"]
-            .contains(&loaded.name.as_str());
+        let realism = [
+            "mainnet-shape-130-addresses",
+            "mainnet-shape-650-addresses",
+            "mainnet-shape-2600-addresses",
+            "rental-churn-bursts-and-storms",
+        ]
+        .contains(&loaded.name.as_str());
         assert_eq!(
             args.pool_fee_bps,
             if realism { 200 } else { 0 },
@@ -597,7 +602,7 @@ fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
 fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
     for (name, window, frontends, replication, admission, schedule) in [
         (
-            "d1-473-200k-fe1-async",
+            "throughput-200k-window-1fe-async",
             200_000,
             1,
             "async",
@@ -605,7 +610,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-400k-fe1-async",
+            "throughput-400k-window-1fe-async",
             400_000,
             1,
             "async",
@@ -613,7 +618,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Nightly,
         ),
         (
-            "d1-473-400k-fe2-async",
+            "throughput-400k-window-2fe-async",
             400_000,
             2,
             "async",
@@ -621,7 +626,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-400k-fe4-async",
+            "throughput-400k-window-4fe-async",
             400_000,
             4,
             "async",
@@ -629,7 +634,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-400k-fe2-sync",
+            "throughput-400k-window-2fe-sync",
             400_000,
             2,
             "sync",
@@ -637,7 +642,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-500k-fe1-async",
+            "throughput-500k-window-1fe-async",
             500_000,
             1,
             "async",
@@ -645,7 +650,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-500k-fe2-async",
+            "throughput-500k-window-2fe-async",
             500_000,
             2,
             "async",
@@ -653,7 +658,7 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
             preset::Schedule::Manual,
         ),
         (
-            "d1-473-500k-fe4-async",
+            "throughput-500k-window-4fe-async",
             500_000,
             4,
             "async",
@@ -710,7 +715,8 @@ fn the_473_cells_pin_its_arguments_admission_and_rule() -> Result<()> {
 /// from a real preset, or add a flag the harness grew, and the check refuses.
 #[test]
 fn a_preset_that_omits_a_flag_or_leaves_one_to_a_default_is_refused() -> Result<()> {
-    let base = preset::Preset::load(&preset::presets_dir().join("mainnet-floor.json"))?;
+    let base =
+        preset::Preset::load(&preset::presets_dir().join("mainnet-shape-130-addresses.json"))?;
     for flag in preset::result_flags() {
         let mut missing = base.clone();
         missing.args.remove(&flag);
@@ -728,7 +734,8 @@ fn a_preset_that_omits_a_flag_or_leaves_one_to_a_default_is_refused() -> Result<
     let mut unknown = base.clone();
     unknown.args.insert("--no-such-flag".into(), json!(1));
     assert!(unknown.check_complete().is_err());
-    let mut d1 = preset::Preset::load(&preset::presets_dir().join("d1-20k.json"))?;
+    let mut d1 =
+        preset::Preset::load(&preset::presets_dir().join("throughput-20k-window-1fe.json"))?;
     d1.args.insert("--burst-seconds".into(), Value::Null);
     assert!(
         d1.check_complete().is_err(),
@@ -739,7 +746,7 @@ fn a_preset_that_omits_a_flag_or_leaves_one_to_a_default_is_refused() -> Result<
 
 #[test]
 fn a_preset_flag_cannot_be_given_again_on_the_command_line() -> Result<()> {
-    let path = preset::presets_dir().join("smoke.json");
+    let path = preset::presets_dir().join("pr-smoke.json");
     let (argv, loaded) = preset::expand_command_line(
         [
             "qbit-prism-load",
@@ -752,7 +759,7 @@ fn a_preset_flag_cannot_be_given_again_on_the_command_line() -> Result<()> {
         .map(Into::into)
         .collect(),
     )?;
-    assert_eq!(loaded.expect("preset").name, "smoke");
+    assert_eq!(loaded.expect("preset").name, "pr-smoke");
     let args = Args::try_parse_from(&argv)?;
     assert_eq!(args.sessions, 100);
     assert_eq!(args.recipients, Some(20));
@@ -769,7 +776,7 @@ fn a_preset_flag_cannot_be_given_again_on_the_command_line() -> Result<()> {
         let error =
             preset::expand_command_line(words.into_iter().map(Into::into).collect()).unwrap_err();
         assert!(
-            format!("{error:#}").contains("is pinned by preset smoke"),
+            format!("{error:#}").contains("is pinned by preset pr-smoke"),
             "{extra:?}: {error:#}"
         );
     }
@@ -975,7 +982,7 @@ fn the_d1_table_has_473s_columns_precision_and_verdict_words() {
              "order_lock": {"max_waiters": 15, "mean_waiters": 14.41}},
         ],
     });
-    let table = gate::d1_table(&report, Some(0), "d1-473-400k-fe1-async");
+    let table = gate::d1_table(&report, Some(0), "throughput-400k-window-1fe-async");
     assert!(
         table.contains(&format!("| {} |", gate::D1_COLUMNS.join(" | "))),
         "{table}"
@@ -997,13 +1004,13 @@ fn the_d1_table_has_473s_columns_precision_and_verdict_words() {
             "{row}"
         );
     }
-    let refused = gate::d1_table(&report, Some(5), "d1-473-400k-fe1-async");
+    let refused = gate::d1_table(&report, Some(5), "throughput-400k-window-1fe-async");
     assert!(
         refused.contains("no verdict: no run in the medians"),
         "{refused}"
     );
     assert!(
-        refused.contains("d1-473-400k-fe1-async (exit 5)"),
+        refused.contains("throughput-400k-window-1fe-async (exit 5)"),
         "{refused}"
     );
     for row in refused.lines().filter(|line| line.starts_with("| 400k")) {
