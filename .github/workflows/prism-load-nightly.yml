@@ -150,9 +150,8 @@ jobs:
   # test/prism-nightly-gated-tests.txt, run explicitly with --ignored --exact
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
-  # Today that is #523's qbitd -reindex crash variant and #524's 130-payee
-  # weighted-recipients variant. TODO(#521): add scenario 5's dense-cadence
-  # soak to the list when it lands on 3.x.x.
+  # That is #523's qbitd -reindex crash variant, #524's 130-payee
+  # weighted-recipients variant and scenario 5's dense-cadence soak.
   live-nightly:
     name: Live regtest nightly variants
     if: ${{ github.event_name == 'schedule' || inputs.live }}

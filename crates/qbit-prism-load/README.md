@@ -656,8 +656,8 @@ cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
 
 The same workflow's `live-nightly` job runs the opt-in `#[ignore]`
 `live_regtest` variants listed in `test/prism-nightly-gated-tests.txt`
-(#523's qbitd `-reindex` crash variant and #524's 130-payee weighted
-recipients today) with `--ignored --exact`
+(#523's qbitd `-reindex` crash variant, #524's 130-payee weighted
+recipients, and scenario 5's dense-cadence soak) with `--ignored --exact`
 against a real qbitd and PostgreSQL 16, and proves each executed with
 `scripts/check_gate_manifest.py`, as the PR suite proves its own list.
 
