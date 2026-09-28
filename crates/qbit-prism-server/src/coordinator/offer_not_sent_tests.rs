@@ -25,16 +25,16 @@ enum Submit {
     /// Answer it as qbitd does while it is still warming up after a restart,
     /// without forwarding it: the node never sees the block (#526).
     Warmup,
-    /// Forward it, relay the node's reply, and from then on answer every
-    /// call as a node that restarted into its warmup (#526).
+    /// Forward it, relay the node's reply, and then switch to `Warming`: the
+    /// node restarted into its warmup right after it ran the call (#526).
     WarmupAfterReply,
+    /// Answer every call, of any method, as a node still warming up (#526).
+    Warming,
 }
 
 struct RelayState {
     upstream: SocketAddr,
     submit: std::sync::Mutex<Submit>,
-    /// Every call is answered with the warmup reply (#526).
-    warming: std::sync::atomic::AtomicBool,
     connections: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -55,7 +55,6 @@ impl Relay {
         let state = Arc::new(RelayState {
             upstream,
             submit: std::sync::Mutex::new(Submit::Forward),
-            warming: std::sync::atomic::AtomicBool::new(false),
             connections: std::sync::Mutex::new(Vec::new()),
         });
         let mut relay = Self {
@@ -88,9 +87,6 @@ impl Relay {
     /// The node finished its warmup: calls are forwarded again.
     fn warm(&self) {
         self.submit(Submit::Forward);
-        self.state
-            .warming
-            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn refuse(&mut self) -> Result<()> {
@@ -173,9 +169,7 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
         let call = serde_json::from_slice::<Value>(&body).unwrap_or_default();
         let submit = call["method"] == "submitblock";
         let mode = *state.submit.lock().unwrap();
-        if state.warming.load(std::sync::atomic::Ordering::SeqCst)
-            || (submit && mode == Submit::Warmup)
-        {
+        if mode == Submit::Warming || (submit && mode == Submit::Warmup) {
             if client
                 .get_mut()
                 .write_all(&warmup_reply(&call["id"]))
@@ -193,9 +187,7 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
             return;
         };
         if submit && mode == Submit::WarmupAfterReply {
-            state
-                .warming
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *state.submit.lock().unwrap() = Submit::Warming;
         }
         if submit && mode == Submit::ResetAfterReply {
             let client = client.into_inner();

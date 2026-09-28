@@ -2276,14 +2276,14 @@ impl Coordinator {
         // another attempt after the ordinary backoff, with no outcome, no
         // call time and no first-offer sample. Every other failure may have
         // run on the node and stays unknown below.
-        if let Some(not_sent) = offer_not_executed(&result) {
+        if let Some(not_run) = offer_not_executed(&result) {
             let reason = format!(
-                "{}: {not_sent}; the reservation taken by {} was returned to pending for another offer",
+                "{}: {not_run}; the reservation taken by {} was returned to pending for another offer",
                 crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
                 self.config.instance_id
             );
             self.ledger.release_unsent_offer(claim, &reason).await?;
-            tracing::warn!(block = %candidate.block_hash, %reason, "block offer not sent; it will be offered again");
+            tracing::warn!(block = %candidate.block_hash, %reason, "the node never ran the block offer; it will be offered again");
             return Ok(());
         }
         // The one sample, emitted once the one call has returned, from the

@@ -38,6 +38,7 @@ use num_bigint::BigUint;
 use qbit_prism_server::codec::{
     difficulty_target, double_sha256, hash_display, parse_u32_hex, target_from_compact,
 };
+use qbit_prism_server::rpc::RPC_IN_WARMUP;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::AsyncReadExt,
@@ -499,7 +500,7 @@ async fn restart_node_in_warmup(fixture: &mut Fixture, proxy: &RpcProxy, held: &
     until(
         "the restarted qbit answering from its warmup",
         60,
-        || async { Ok(warmup_code(fixture).await == Some(-28)) },
+        || async { Ok(warmup_code(fixture).await == Some(RPC_IN_WARMUP)) },
     )
     .await?;
     proxy.reopen().await?;
@@ -509,20 +510,28 @@ async fn restart_node_in_warmup(fixture: &mut Fixture, proxy: &RpcProxy, held: &
     .await?;
     wait_unsent(fixture, held, "\"code\":-28").await?;
     ensure!(
-        warmup_code(fixture).await == Some(-28),
+        warmup_code(fixture).await == Some(RPC_IN_WARMUP),
         "the node left its warmup while it was held"
     );
     // Release the startup: an empty fee-estimates file is read, rejected and
-    // ignored. The node still reads the file's time after its open returns,
-    // so the FIFO goes only once the warmup has ended; the node's later flush
-    // then writes a plain file.
-    let writer = fifo.clone();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(writer)),
+    // ignored. A non-blocking open for writing fails (ENXIO) until the node
+    // is waiting in its open for reading, so a node that never gets there
+    // fails the wait instead of hanging the test. The node still reads the
+    // file's time after its open returns, so the FIFO goes only once the
+    // warmup has ended; the node's later flush then writes a plain file.
+    until(
+        "the held node opening its fee-estimates file",
+        30,
+        || async {
+            use std::os::unix::fs::OpenOptionsExt;
+            Ok(std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .is_ok())
+        },
     )
-    .await
-    .context("the held node never opened its fee-estimates file")???;
+    .await?;
     until("qbit out of its warmup", 60, || async {
         Ok(fixture.rpc("getblockcount", json!([])).await?.is_u64())
     })
@@ -1039,7 +1048,7 @@ async fn relay(state: Arc<ProxyState>, downstream: TcpStream) -> Result<()> {
         };
         if let Some(block) = &submitted {
             let answer: Value = serde_json::from_slice(&reply_body).unwrap_or_default();
-            if answer["error"]["code"] == -28 {
+            if answer["error"]["code"] == RPC_IN_WARMUP {
                 state.warmup_answered.lock().unwrap().push(block.clone());
             }
         }
