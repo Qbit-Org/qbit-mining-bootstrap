@@ -37,6 +37,13 @@ async fn rpc(Json(input): Json<Value>) -> Json<Value> {
     Json(json!({"result":result,"error":null,"id":"prism-public"}))
 }
 
+/// Both tests migrate their own schema in the one shared database, and
+/// `Ledger::connect(.., true)` takes the migration advisory lock, whose key is
+/// database-wide, under the 5 s `PRISM_DATABASE_LOCK_TIMEOUT_MS`. Concurrent
+/// migrations make the second wait for the whole of the first, which a loaded
+/// 2-vCPU runner stretches past the timeout (#532). Migrate one at a time.
+static MIGRATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     let Some(url) = gate::database_url(gate::site!()).expect("integration gate") else {
@@ -91,6 +98,7 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     scoped_url
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
+    let migrating = MIGRATING.lock().await;
     let ledger = qbit_prism_server::ledger::Ledger::connect(
         scoped_url.as_str(),
         "api-hydration".into(),
@@ -99,6 +107,7 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     )
     .await
     .unwrap();
+    drop(migrating);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -442,6 +451,7 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
     scoped_url
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
+    let migrating = MIGRATING.lock().await;
     let ledger = qbit_prism_server::ledger::Ledger::connect(
         scoped_url.as_str(),
         "api-chain-states".into(),
@@ -450,6 +460,7 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
     )
     .await
     .unwrap();
+    drop(migrating);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {

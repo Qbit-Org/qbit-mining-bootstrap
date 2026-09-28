@@ -610,11 +610,11 @@ async fn actual_build_deadline_counts_once_and_later_notify_is_degraded() -> Res
         wait_sample(&f.a.metrics, TIMEOUTS, 1.).await?;
         ensure!(sample(&f.a.metrics, PENDING) > 0.);
         ensure!(count(&f.a.metrics, "degraded") == 0., "timeout fabricated delivery");
-        limit.add_permits(1);
-        client.send(serde_json::json!({"id":3,"method":"mining.get_health","params":[]})).await?;
-        loop {
-            if client.read().await?["method"] == "mining.notify" { break; }
-        }
+        // The later notify comes from a listener with the default deadlines.
+        // The held session cannot deliver it reliably: the listener closes a
+        // session that still has no job on its first one-second tick past
+        // the 0.05 s deadline, and every retry is bounded by that deadline.
+        deliver(&f.a).await?;
         wait_sample(&f.a.metrics, PENDING, 0.).await?;
         ensure!(count(&f.a.metrics, "degraded") == 1.);
         ensure!(count(&f.a.metrics, "published") == 0.);
@@ -875,11 +875,10 @@ async fn lost_commit_reply_timeouts_are_not_revision_work_failures() -> Result<(
         );
         ensure!(sample(&f.a.metrics, PENDING) == -1., "unknown tracking was reported as zero");
         ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
-        limit.add_permits(1);
-        client.send(serde_json::json!({"id":3,"method":"mining.get_health","params":[]})).await?;
-        loop {
-            if client.read().await?["method"] == "mining.notify" { break; }
-        }
+        // Real delivery after the deadline, from a listener with the default
+        // deadlines: the held session is closed on its first one-second tick
+        // past the 0.05 s deadline while it still has no job (#528).
+        deliver(&f.a).await?;
         ensure!(sample(&f.a.metrics, PENDING) == -1., "current revision guessed the lost committed revision");
         for result in ["published", "degraded", "superseded"] {
             ensure!(count(&f.a.metrics, result) == 0., "unknown tracking fabricated a {result} delivery");
