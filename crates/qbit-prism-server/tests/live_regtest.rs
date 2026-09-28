@@ -27,6 +27,9 @@ mod highdiff_tests;
 #[path = "support/live_ctv_cpfp.rs"]
 mod cpfp_tests;
 
+#[path = "support/live_pg_failover.rs"]
+mod pg_failover_tests;
+
 #[path = "support/live_node_outage.rs"]
 mod node_outage_tests;
 
