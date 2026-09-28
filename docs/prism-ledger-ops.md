@@ -2402,7 +2402,8 @@ remains deferred.
    current configuration is still read when it lacks a fee, so this command
    is also how a cluster that ran without one enables it. A frontend that ran
    before #535 with the fee off, including one started from an older
-   `.env.example` or `compose.yaml` default, refuses to start until it does:
+   `.env.example` or from `compose.yaml`'s fee-off default, refuses to start
+   until it does:
    stop every frontend and run this command with a target such as
 
    ```dotenv

@@ -139,8 +139,9 @@ to a synthetic lab program (`PRISM_POOL_FEE_P2MR_PROGRAM_HEX`, recipient
 `dev-pool-fee`) that nobody holds a key for, so a fresh lab setup is valid;
 production refuses that program. A real pool sets its own recipient: either
 `PRISM_POOL_FEE_ADDRESS` with the program and recipient ID left empty, or its
-own program with a `PRISM_POOL_FEE_RECIPIENT_ID`. `compose.yaml` enables the
-fee by default but sets no recipient, so a deployment names exactly one. A
+own program with a `PRISM_POOL_FEE_RECIPIENT_ID`. `compose.yaml` sets no fee
+and no recipient by default, so a deployment names the fee and exactly one
+recipient; one that names neither is refused at startup. A
 cluster that ran without a fee enables one offline with `policy-transition`
 ([ledger operations](docs/prism-ledger-ops.md#offline-pool-fee-and-ctv-fee-rate-changes)).
 Whatever the cause, a frontend whose template refresh has not

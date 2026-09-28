@@ -42,21 +42,15 @@ mod weighted_recipients_tests;
 #[path = "support/live_dense_soak.rs"]
 mod dense_soak_tests;
 
-/// The 0-bps pool fee every live server runs unless a case sets its own
-/// (#535). An in-process coordinator sharing a fixture's cluster must pin the
-/// same policy, or its configuration fingerprint differs from the servers'.
-const LIVE_POOL_FEE_RECIPIENT: &str = "live-pool-fee";
-const LIVE_POOL_FEE_PROGRAM: &str =
-    "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe";
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
+/// The payout policy of the 0-bps fee every live server runs unless a case
+/// sets its own (#535). An in-process coordinator sharing a fixture's cluster
+/// must pin it, or its configuration fingerprint differs from the servers'.
 fn live_payout_policy() -> qbit_prism::PayoutPolicy {
     let mut policy = qbit_prism::PayoutPolicy::day_one_default();
-    policy.pool_fee_policy = Some(qbit_prism::PoolFeePolicy {
-        fee_bps: 0,
-        recipient_id: LIVE_POOL_FEE_RECIPIENT.into(),
-        order_key: LIVE_POOL_FEE_RECIPIENT.into(),
-        p2mr_program_hex: LIVE_POOL_FEE_PROGRAM.into(),
-    });
+    policy.pool_fee_policy = Some(pool_fee::zero_bps_policy());
     policy
 }
 
@@ -513,20 +507,10 @@ impl Fixture {
                 );
         }
         // #525, #535: every server refuses to start without a pool fee. A
-        // 0 bps fee pays nothing until sub-floor dust must be swept. A case
-        // that configures its own fee in `server_env` replaces this one
-        // whole: an address beside this program would be refused.
-        if !self
-            .server_env
-            .iter()
-            .any(|(name, _)| name.starts_with("PRISM_POOL_FEE_"))
-        {
-            command
-                .env("PRISM_POOL_FEE_ENABLED", "1")
-                .env("PRISM_POOL_FEE_BPS", "0")
-                .env("PRISM_POOL_FEE_RECIPIENT_ID", LIVE_POOL_FEE_RECIPIENT)
-                .env("PRISM_POOL_FEE_P2MR_PROGRAM_HEX", LIVE_POOL_FEE_PROGRAM);
-        }
+        // case that configures its own fee in `server_env` replaces this one.
+        let pool_fee =
+            pool_fee::default_pool_fee(self.server_env.iter().map(|(name, _)| name.as_str()));
+        command.envs(pool_fee.iter().copied());
         if let Some(fee) = fee {
             command
                 .env("PRISM_CTV_BROADCASTER_WALLET", "prism")

@@ -95,6 +95,8 @@ ENV_PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY="${PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER
 ENV_PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN="${PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN:-}"
 ENV_PRISM_CTV_SETTLEMENT_ENABLED="${PRISM_CTV_SETTLEMENT_ENABLED:-}"
 ENV_PRISM_POOL_FEE_ENABLED="${PRISM_POOL_FEE_ENABLED:-}"
+ENV_PRISM_POOL_FEE_ADDRESS="${PRISM_POOL_FEE_ADDRESS:-}"
+ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX="${PRISM_POOL_FEE_P2MR_PROGRAM_HEX:-}"
 ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT="${PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT:-}"
 ENV_PRISM_CTV_FANOUT_FEE_PREMIUM_BPS="${PRISM_CTV_FANOUT_FEE_PREMIUM_BPS:-}"
 ENV_PRISM_STRATUM_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}"
@@ -326,6 +328,12 @@ if [[ -n "${ENV_PRISM_CTV_SETTLEMENT_ENABLED}" ]]; then
 fi
 if [[ -n "${ENV_PRISM_POOL_FEE_ENABLED}" ]]; then
   PRISM_POOL_FEE_ENABLED="${ENV_PRISM_POOL_FEE_ENABLED}"
+fi
+if [[ -n "${ENV_PRISM_POOL_FEE_ADDRESS}" ]]; then
+  PRISM_POOL_FEE_ADDRESS="${ENV_PRISM_POOL_FEE_ADDRESS}"
+fi
+if [[ -n "${ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX}" ]]; then
+  PRISM_POOL_FEE_P2MR_PROGRAM_HEX="${ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX}"
 fi
 if [[ -n "${ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT}" ]]; then
   PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT="${ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT}"
@@ -931,16 +939,30 @@ check_ctv_fee_config() {
   fi
 }
 
+# .env.example's lab pool fee recipient, which the server refuses in production.
+DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX=dfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfee
+
 # #525, #535: the server refuses a fee-off pool in every settlement mode at
 # startup, in check-config and in self-check.
 check_pool_fee_config() {
   mining_lane_enabled prism || return 0
-  is_true_env "$(ascii_lower "${PRISM_POOL_FEE_ENABLED:-0}")" && return 0
   local mode="direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"
   if is_true_env "$(ascii_lower "${PRISM_CTV_SETTLEMENT_ENABLED:-0}")"; then
     mode="PRISM_CTV_SETTLEMENT_ENABLED=1"
   fi
-  fail "${mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed) with a pool fee recipient: without a pool fee, sub-floor dust cannot be settled and the first balance below the payout floor stops mining"
+  is_true_env "$(ascii_lower "${PRISM_POOL_FEE_ENABLED:-0}")" \
+    || fail "${mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed) with a pool fee recipient: without a pool fee, sub-floor dust cannot be settled and the first balance below the payout floor stops mining"
+  local address="${PRISM_POOL_FEE_ADDRESS:-}"
+  local program
+  program="$(ascii_lower "${PRISM_POOL_FEE_P2MR_PROGRAM_HEX:-}")"
+  [[ -n "${address}" || -n "${program}" ]] \
+    || fail "PRISM_POOL_FEE_ENABLED=1 needs a pool fee recipient: PRISM_POOL_FEE_ADDRESS, or PRISM_POOL_FEE_P2MR_PROGRAM_HEX with PRISM_POOL_FEE_RECIPIENT_ID"
+  # The lab program is sourced from .env.example beneath every env file here,
+  # so it is refused only where no address replaces it; an address beside it
+  # is left to the server, which sees only what Compose passes.
+  if production_mode_enabled && [[ -z "${address}" && "${program}" == "${DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX}" ]]; then
+    fail "production rejects the development pool fee recipient from .env.example; set PRISM_POOL_FEE_ADDRESS (and clear PRISM_POOL_FEE_P2MR_PROGRAM_HEX) or your own PRISM_POOL_FEE_P2MR_PROGRAM_HEX"
+  fi
 }
 
 check_bitcoin_peer_bootstrap() {

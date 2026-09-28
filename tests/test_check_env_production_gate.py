@@ -174,6 +174,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("QBIT_GIT_COMMIT", None)
         env["PATH"] = f"{self.docker_bin}:{env['PATH']}"
+        # A deployment names its own pool fee recipient: production refuses
+        # .env.example's lab program without one (#535). An empty override
+        # leaves the sourced files' value in place, as for every setting.
+        env["PRISM_POOL_FEE_ADDRESS"] = "qb1doctortestpoolfee"
         # Tests exercising successful Docker checks or a minimal PATH supply
         # their own controlled tool fixtures through overrides.
         env.update(overrides)
@@ -1535,6 +1539,47 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn(
             "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1", refused.stderr
         )
+
+    def test_an_enabled_pool_fee_needs_a_recipient(self) -> None:
+        # The lab program is sourced from .env.example; clearing it with no
+        # address leaves no recipient, which the server refuses.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "deploy.env"
+            deploy_env.write_text(
+                "MINING_LANES=prism\nPRISM_POOL_FEE_ENABLED=1\n"
+                "PRISM_POOL_FEE_P2MR_PROGRAM_HEX=\n",
+                encoding="utf-8",
+            )
+            refused = self.run_check_env(
+                DEPLOY_ENV_FILE=str(deploy_env), PRISM_POOL_FEE_ADDRESS=""
+            )
+            accepted = self.run_check_env(DEPLOY_ENV_FILE=str(deploy_env))
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("PRISM_POOL_FEE_ENABLED=1 needs a pool fee recipient", refused.stderr)
+        self.assertNotIn("docker is required", refused.stderr)
+        self.assertNotIn("needs a pool fee recipient", accepted.stderr)
+
+    def test_production_rejects_the_lab_pool_fee_recipient(self) -> None:
+        # #535: .env.example's program is refused in production unless an
+        # address replaces it; lab mode keeps it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_prism_env(Path(temp_dir))
+            refused = self.run_check_env(**env, PRISM_POOL_FEE_ADDRESS="")
+            with_address = self.run_check_env(**env)
+            own_program = self.run_check_env(
+                **env,
+                PRISM_POOL_FEE_ADDRESS="",
+                PRISM_POOL_FEE_P2MR_PROGRAM_HEX="ab" * 32,
+            )
+        lab = self.run_check_env(MINING_LANES="prism", PRISM_POOL_FEE_ADDRESS="")
+
+        message = "production rejects the development pool fee recipient"
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(message, refused.stderr)
+        self.assertNotIn("docker is required", refused.stderr)
+        for result in (with_address, own_program, lab):
+            self.assertNotIn(message, result.stderr)
 
     def test_settlement_accepts_any_enabled_pool_fee_in_every_mode(self) -> None:
         for ctv in ("0", "1"):

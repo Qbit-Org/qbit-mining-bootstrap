@@ -260,13 +260,14 @@ class MainnetComposeContractTests(unittest.TestCase):
                         env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress"
                     )
                     self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")
-        # A deployment that names no fee still gets it enabled, and no
-        # recipient: the server refuses with the settings to set.
+        # A deployment that names no fee gets none and no recipient: the
+        # server refuses to run with the settings to set, while every tool,
+        # policy-transition's current side included, still reads it.
         with tempfile.TemporaryDirectory() as temp_dir:
             deploy_env = Path(temp_dir) / "bare.env"
             deploy_env.write_text("MINING_LANES=prism\n", encoding="utf-8")
             env = self._render_coordinator(deploy_env)
-            self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+            self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "0")
             self.assertEqual(env["PRISM_POOL_FEE_BPS"], "")
             self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "")
             self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")

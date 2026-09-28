@@ -221,15 +221,11 @@ const TOOLS: [&str; 4] = [
 ];
 const TOOL_ENV: [(&str, &str); 5] = [
     ("PRISM_AUDIT_PORT", "1"),
-    ("PRISM_POOL_FEE_ENABLED", "1"),
-    ("PRISM_POOL_FEE_BPS", "0"),
-    ("PRISM_POOL_FEE_RECIPIENT_ID", "pool-fee"),
-    (
-        "PRISM_POOL_FEE_P2MR_PROGRAM_HEX",
-        "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe",
-    ),
+    super::pool_fee::ZERO_BPS_POOL_FEE[0],
+    super::pool_fee::ZERO_BPS_POOL_FEE[1],
+    super::pool_fee::ZERO_BPS_POOL_FEE[2],
+    super::pool_fee::ZERO_BPS_POOL_FEE[3],
 ];
-
 fn tool_stdout(tool: &str) -> Option<&'static str> {
     match tool {
         "import-audits" => Some("Imported 0 audit bodies"),
@@ -298,12 +294,7 @@ async fn one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard() -> Resul
     let (ledger, node, mut config) = setup(&db).await?;
     // #535: `self-check` refuses a configuration without a pool fee, so this
     // cluster pins the 0-bps fee `TOOL_ENV` gives every tool.
-    config.payout_policy.pool_fee_policy = Some(qbit_prism::PoolFeePolicy {
-        fee_bps: 0,
-        recipient_id: TOOL_ENV[3].1.into(),
-        order_key: TOOL_ENV[3].1.into(),
-        p2mr_program_hex: TOOL_ENV[4].1.into(),
-    });
+    config.payout_policy.pool_fee_policy = Some(super::pool_fee::zero_bps_policy());
     sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1")
         .bind(config.fingerprint(&"00".repeat(32))?)
         .execute(&ledger.pool)

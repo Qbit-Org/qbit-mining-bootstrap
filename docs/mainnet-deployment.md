@@ -443,9 +443,9 @@ floor.
 
 Every settlement mode requires a pool fee (#525, #535), `PRISM_POOL_FEE_BPS=0`
 included; without one the first sub-floor balance stops all work, so the
-frontend refuses to start. `compose.yaml` enables the fee but sets no
-recipient, and production refuses `.env.example`'s lab recipient, so name
-exactly one reviewed recipient:
+frontend refuses to start. `compose.yaml` sets no fee and no recipient by
+default, and production refuses `.env.example`'s lab recipient, so enable the
+fee and name exactly one reviewed recipient:
 
 ```dotenv
 PRISM_POOL_FEE_ENABLED=1

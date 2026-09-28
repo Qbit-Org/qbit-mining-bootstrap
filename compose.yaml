@@ -640,12 +640,12 @@ services:
       PRISM_CTV_BROADCASTER_LIMIT: ${PRISM_CTV_BROADCASTER_LIMIT:-100}
       # #525, #535: a fee-off pool stalls on the first sub-floor balance, so
       # every settlement mode refuses to start without a fee (0 bps is
-      # allowed). The recipient has no default here: a deployment names
-      # exactly one address or program, and a default for either would
-      # collide with the other. .env.example carries a lab recipient.
-      # An unset rate is 0 bps; an explicit fee-off configuration stays
-      # readable so policy-transition can enable a fee on it.
-      PRISM_POOL_FEE_ENABLED: ${PRISM_POOL_FEE_ENABLED:-1}
+      # allowed). A deployment names the fee and exactly one recipient; a
+      # recipient default here would collide with the other kind, and an
+      # enabled default without one would make every tool, including
+      # policy-transition's current side, fail to read the configuration.
+      # .env.example enables a 0-bps fee to a lab recipient.
+      PRISM_POOL_FEE_ENABLED: ${PRISM_POOL_FEE_ENABLED:-0}
       PRISM_POOL_FEE_BPS: ${PRISM_POOL_FEE_BPS:-}
       PRISM_POOL_FEE_ADDRESS: ${PRISM_POOL_FEE_ADDRESS:-}
       PRISM_POOL_FEE_P2MR_PROGRAM_HEX: ${PRISM_POOL_FEE_P2MR_PROGRAM_HEX:-}

@@ -169,6 +169,54 @@ async fn policy_transition_refuses_only_a_target_without_a_pool_fee() {
     }
 }
 
+/// #535: `compose.yaml`'s defaults are fee-off, passing every fee setting as
+/// an empty value. A deployment that relied on them is refused at startup,
+/// but `policy-transition` still reads it as the current configuration and
+/// can enable a 0-bps fee, in either mode, with the flag unset or `0`.
+#[tokio::test]
+async fn policy_transition_enables_a_fee_on_compose_default_configurations() {
+    const COMPOSE_EMPTY: [(&str, &str); 5] = [
+        ("PRISM_POOL_FEE_BPS", ""),
+        ("PRISM_POOL_FEE_ADDRESS", ""),
+        ("PRISM_POOL_FEE_P2MR_PROGRAM_HEX", ""),
+        ("PRISM_POOL_FEE_RECIPIENT_ID", ""),
+        ("PRISM_POOL_FEE_ORDER_KEY", ""),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let to = dir.path().join("target.env");
+    let target = fee("0")
+        .iter()
+        .map(|(name, value)| format!("{name}={value}\n"))
+        .collect::<String>();
+    std::fs::write(&to, target).unwrap();
+    let to = to.to_str().unwrap().to_owned();
+    let mut cases = tokio::task::JoinSet::new();
+    for mode in [CTV, DIRECT] {
+        for flag in [None, Some("0")] {
+            let mut current: Vec<(&'static str, &'static str)> = mode.to_vec();
+            current.extend(COMPOSE_EMPTY);
+            current.extend(flag.map(|value| ("PRISM_POOL_FEE_ENABLED", value)));
+            let to = to.clone();
+            cases.spawn(async move {
+                let refused = command(&["check-config"], &current).await;
+                assert_refused(&refused);
+                let output = command(&["policy-transition", "--to", &to], &current).await;
+                (current, output)
+            });
+        }
+    }
+    while let Some(case) = cases.join_next().await {
+        let (current, output) = case.unwrap();
+        // Past configuration, it fails only on the closed database port.
+        assert!(!output.status.success(), "{current:?}");
+        assert!(
+            !stderr(&output).contains("policy configuration"),
+            "{current:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
 /// #535: `.env.example`'s lab recipient is refused in production, where
 /// nobody could spend the dust swept to it; a pool's own program is not.
 #[tokio::test]
