@@ -488,6 +488,7 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
         "mainnet-shape-2600-addresses",
         "pr-smoke",
         "rental-churn-bursts-and-storms",
+        "short-plan-20k-window-1fe",
         "throughput-200k-window-1fe-async",
         "throughput-400k-window-1fe-async",
         "throughput-400k-window-2fe-async",
