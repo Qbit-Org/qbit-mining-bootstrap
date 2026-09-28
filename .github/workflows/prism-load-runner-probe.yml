@@ -109,11 +109,18 @@ jobs:
           set -euo pipefail
           # The duration job's own timeout is 4,320 minutes (72 h), so a
           # longer hold would measure that and not the runner's limit.
-          if [[ ! "${MINUTES}" =~ ^[0-9]+$ ]] || (( MINUTES > 4200 )); then
+          # Read as decimal before the bound check: a leading zero would
+          # otherwise make bash compare the value as octal.
+          if [[ ! "${MINUTES}" =~ ^[0-9]{1,6}$ ]]; then
             echo "duration_probe_minutes ${MINUTES@Q} is not a whole number 0..4200" >&2
             exit 2
           fi
-          printf 'minutes=%d\n' "$((10#${MINUTES}))" >> "${GITHUB_OUTPUT}"
+          minutes=$((10#${MINUTES}))
+          if (( minutes > 4200 )); then
+            echo "duration_probe_minutes ${MINUTES@Q} is not a whole number 0..4200" >&2
+            exit 2
+          fi
+          printf 'minutes=%d\n' "${minutes}" >> "${GITHUB_OUTPUT}"
 
   probe:
     name: ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}
