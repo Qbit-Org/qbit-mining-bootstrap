@@ -471,6 +471,20 @@ pub(super) async fn record_confirmation(
     Ok(Some(divergence))
 }
 
+/// The integrity report's `payout_divergence` line: migration 020's report
+/// plus `positive_float_sats`, the live positive carry float (#506). That is
+/// `F` of work issued against the current balances, `sum over m of
+/// max(0, balance(m))` (the owed balances), which the ceiling must cover for
+/// a capture to be offered. One statement, so the float and the debt fields
+/// are read from one snapshot.
+pub async fn payout_divergence_line(pool: &PgPool) -> sqlx::Result<Value> {
+    sqlx::query_scalar(
+        "SELECT qbit_prism_payout_divergence_report() || jsonb_build_object('positive_float_sats',(SELECT COALESCE(sum(owed_balance_sats),0)::text FROM qbit_current_owed_balances()))",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Every account's debt, from the canonical balances in `tx`.
 pub(super) async fn pool_debt(tx: &mut Transaction<'_, Postgres>) -> Result<u64> {
     let debt: String = sqlx::query_scalar(

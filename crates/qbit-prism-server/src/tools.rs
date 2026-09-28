@@ -1561,9 +1561,7 @@ async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Resul
     // #478: the divergence line is reported, never a failure: its debt is an
     // accepted, bounded cost that exact accounting carries.
     integrity["payout_divergence"] =
-        sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
-            .fetch_one(&coordinator.ledger.pool)
-            .await?;
+        crate::ledger::payout_divergence_line(&coordinator.ledger.pool).await?;
     report.health = Some(coordinator.health().await);
     report.carry_forward_integrity = Some(integrity.clone());
     for field in ["mismatch_count", "current_drift_count"] {

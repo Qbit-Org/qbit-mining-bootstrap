@@ -1009,11 +1009,22 @@ by `self-check`, carries a `payout_divergence` line from
 `qbit_prism_payout_divergence_report()`. The line never fails a check. It
 shows:
 
-- the confirmed divergent landings and their total overpay;
-- the offers abandoned by the ceiling;
-- the offers refused because capture is off;
+- the confirmed divergent landings and their total overpay
+  (`divergent_landings`, `overpay_sats`);
+- the offers abandoned by the ceiling (`offers_abandoned_by_ceiling`);
+- the offers refused because capture is off (`offers_refused_capture_off`);
 - the debtor count, the total debt and the largest debt, from the current
-  balances.
+  balances (`debtor_count`, `debt_sats`, `largest_debt_sats`);
+- the live positive float, `positive_float_sats` (#506): the sum of
+  `max(0, balance)` over the current balances, one per account. It is the `F`
+  that work issued against these balances would be held to if it were
+  captured. See [Sizing the ceiling](#sizing-the-ceiling).
+
+The line is read in one statement, so the float and the debt fields come from
+the same snapshot. Sats amounts are decimal strings. `positive_float_sats` is
+added by the frontend, not by migration 020, so a line served by a frontend
+without #506 does not have it. A missing field means that frontend cannot
+report the float; it does not mean the float is zero.
 
 The metrics:
 
@@ -1064,12 +1075,30 @@ ceiling below the pool's positive carry float refuses every capture and the
 pool loses those blocks as it did before #478.
 
 - **Check it against the live float** before relying on capture, and again
-  as the miner count grows. The live float is the sum of the positive carry
-  balances: the sum of `balance_sats` over `/owed-balances`, or
+  as the miner count grows. The live float is `positive_float_sats` on the
+  report's `payout_divergence` line. It equals the sum of `balance_sats` over
+  `/owed-balances` and
   `SELECT sum(owed_balance_sats) FROM qbit_current_owed_balances()`. Each
   offer decision also records the `F` it was checked against, in
   `qbit_prism_payout_divergences.overpay_bound_sats`, next to
   `overpay_ceiling_sats`.
+- **Compare it with the ceiling in sats.** A block's ceiling is
+  `floor(coinbase_value_sats × PRISM_CAPTURE_OVERPAY_CEILING_BPS / 10000)`.
+  Work issued now can be captured if `positive_float_sats` is at most that.
+  The smallest setting that admits it is
+  `max(1, ceil(positive_float_sats × 10000 / coinbase_value_sats))` bps,
+  because 0 turns capture off. If that exceeds 10000, the largest accepted
+  setting, no setting admits the float. The line
+  shows no headroom because the ceiling depends on the next block's coinbase
+  value, subsidy plus fees, and on each frontend's setting, and the database
+  holds neither. Use the lowest coinbase value you expect, since a block with
+  fewer fees gets a lower ceiling.
+- **Leave margin above the float you read.** A capture is held to the float
+  as it was when its work was issued, before the landing that superseded it.
+  A landing pays some balances out and accrues others, so the float in a
+  report can differ from the `F` of the next capture. Size against the
+  highest float you see across landings, or against the recorded
+  `overpay_bound_sats`, and add margin for miner growth.
 - **Example.** Each miner below the payout floor carries under 14,720 sats.
   At 2,000 such miners the float is at most about 2.9·10⁷ sats, inside the
   5·10⁷-sat default (1% of a 5·10⁹-sat coinbase). At about 3,400 miners all
