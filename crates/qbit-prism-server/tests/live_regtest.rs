@@ -30,6 +30,9 @@ mod cpfp_tests;
 #[path = "support/live_node_outage.rs"]
 mod node_outage_tests;
 
+#[path = "support/live_two_node.rs"]
+mod two_node_tests;
+
 #[path = "support/live_weighted_recipients.rs"]
 mod weighted_recipients_tests;
 
@@ -432,6 +435,18 @@ impl Fixture {
     }
 
     fn start_server_with_sponsorship(&self, index: usize, fee: Option<u64>) -> Result<Process> {
+        self.start_server_with(index, fee, &[])
+    }
+
+    /// `start_server_with_sponsorship`, with `overrides` applied last, after
+    /// `server_env`, so a scenario can point one frontend at another node or
+    /// change a setting for one start.
+    fn start_server_with(
+        &self,
+        index: usize,
+        fee: Option<u64>,
+        overrides: &[(&str, String)],
+    ) -> Result<Process> {
         let mut command = Command::new(&self.server);
         // Inherited operator PRISM settings must not alter a disposable test.
         for (name, _) in std::env::vars()
@@ -479,6 +494,9 @@ impl Fixture {
                 .env("PRISM_CTV_BROADCASTER_FEE_BITS", fee.to_string());
         }
         command.envs(self.server_env.iter().map(|(name, value)| (name, value)));
+        for (name, value) in overrides {
+            command.env(name, value);
+        }
         // Release only this child's ports immediately before spawn. Later
         // servers remain reserved through node startup and migrations.
         self.ports

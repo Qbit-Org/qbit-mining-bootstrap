@@ -6,11 +6,11 @@ use qbit_prism_server::codec::{
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-struct HighdiffClient {
+pub(super) struct HighdiffClient {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     buffer: Vec<u8>,
-    username: String,
+    pub(super) username: String,
     extranonce1: String,
     extranonce2_size: usize,
     difficulty: f64,
@@ -18,14 +18,19 @@ struct HighdiffClient {
 }
 
 impl HighdiffClient {
-    async fn open(fixture: &Fixture, index: usize) -> Result<Self> {
+    pub(super) async fn open(fixture: &Fixture, index: usize) -> Result<Self> {
+        Self::open_as(fixture, index, format!("{}.highdiff", fixture.address)).await
+    }
+
+    /// `open` as the worker `username`, whose address is its payout identity.
+    pub(super) async fn open_as(fixture: &Fixture, index: usize, username: String) -> Result<Self> {
         let stream = tokio::net::TcpStream::connect(("127.0.0.1", fixture.highdiff[index])).await?;
         let (read, write) = stream.into_split();
         let mut client = Self {
             reader: BufReader::new(read),
             writer: write,
             buffer: Vec::new(),
-            username: format!("{}.highdiff", fixture.address),
+            username,
             extranonce1: String::new(),
             extranonce2_size: 0,
             difficulty: 0.0,
@@ -73,7 +78,7 @@ impl HighdiffClient {
         Ok(client)
     }
 
-    async fn send(&mut self, payload: Value) -> Result<()> {
+    pub(super) async fn send(&mut self, payload: Value) -> Result<()> {
         self.writer
             .write_all(format!("{payload}\n").as_bytes())
             .await?;
@@ -102,7 +107,7 @@ impl HighdiffClient {
         Ok(message)
     }
 
-    async fn response(&mut self, id: u64) -> Result<Value> {
+    pub(super) async fn response(&mut self, id: u64) -> Result<Value> {
         loop {
             let value = self.read().await?;
             if value["id"] == id {
@@ -111,7 +116,7 @@ impl HighdiffClient {
         }
     }
 
-    async fn wait_for_parent(&mut self, parent: &str) -> Result<()> {
+    pub(super) async fn wait_for_parent(&mut self, parent: &str) -> Result<()> {
         let mut wire_parent = hex::decode(parent)?;
         wire_parent.reverse();
         let (words, _) = wire_parent.as_chunks_mut::<4>();
@@ -130,7 +135,7 @@ impl HighdiffClient {
         Ok(())
     }
 
-    fn solve(&self, id: u64, future_time: bool) -> Result<(Value, String, u128)> {
+    pub(super) fn solve(&self, id: u64, future_time: bool) -> Result<(Value, String, u128)> {
         let params = self.notify["params"].as_array().context("notify missing")?;
         let field = |index: usize| params[index].as_str().context("invalid notify field");
         let extranonce2 = "00".repeat(self.extranonce2_size);
