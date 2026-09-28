@@ -33,7 +33,7 @@ pub use candidates::{
     coinbase_witness_reserved_value, header_bits_hex, Candidate, CandidateClaim, CandidateCtv,
     CandidateState, ClaimLifecycle, ClaimParts, LandedAudit, OfferOutcome, OfferRecord,
     RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys, ADOPTED_OFFER_REPLY_PREFIX,
-    LANDING_FAILED_REASON_PREFIX, ORPHANED_STATE, SIDE_CHAIN_REPLIES,
+    LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX, ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
 mod connect;
 pub(crate) use connect::shielded_begin;

@@ -33,6 +33,9 @@ mod node_outage_tests;
 #[path = "support/live_two_node.rs"]
 mod two_node_tests;
 
+#[path = "support/live_weighted_recipients.rs"]
+mod weighted_recipients_tests;
+
 /// Each fixture starts a regtest `qbitd` and two servers, and a server binds
 /// its listeners only after coordinator startup: the schema migrations, which
 /// the second server of a fixture waits for under the migrations table lock,
@@ -113,6 +116,9 @@ struct Fixture {
     client: reqwest::Client,
     address: String,
     ctv: bool,
+    /// Settings applied after every other server setting, so a case can
+    /// override one of them. Empty unless a case sets them before a start.
+    server_env: Vec<(String, String)>,
     /// Declared last, so it is released after the processes and pools above.
     _serial: tokio::sync::MutexGuard<'static, ()>,
 }
@@ -377,6 +383,7 @@ impl Fixture {
             client,
             address: String::new(),
             ctv: launch.ctv,
+            server_env: Vec::new(),
             _serial: serial,
         });
         until("qbit RPC", 30, || async {
@@ -431,8 +438,9 @@ impl Fixture {
         self.start_server_with(index, fee, &[])
     }
 
-    /// `start_server_with_sponsorship`, with `overrides` applied last, so a
-    /// scenario can point a frontend at another node or change a setting.
+    /// `start_server_with_sponsorship`, with `overrides` applied last, after
+    /// `server_env`, so a scenario can point one frontend at another node or
+    /// change a setting for one start.
     fn start_server_with(
         &self,
         index: usize,
@@ -485,6 +493,7 @@ impl Fixture {
                 .env("PRISM_CTV_BROADCASTER_WALLET", "prism")
                 .env("PRISM_CTV_BROADCASTER_FEE_BITS", fee.to_string());
         }
+        command.envs(self.server_env.iter().map(|(name, value)| (name, value)));
         for (name, value) in overrides {
             command.env(name, value);
         }
