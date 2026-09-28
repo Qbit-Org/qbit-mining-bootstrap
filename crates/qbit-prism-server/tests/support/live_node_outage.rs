@@ -58,9 +58,10 @@ async fn node_killed_after_accepting_reconciles_the_lost_block_once() -> Result<
 }
 
 /// The crash variant whose restart runs `-reindex`, which recovers the
-/// accepted block from the block files. Nightly only.
+/// accepted block from the block files. Opt-in (`--ignored`): no PR job runs
+/// it; it is meant for the nightly job #521 adds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "nightly-only #521 variant: run with --ignored"]
+#[ignore = "opt-in #521 variant for the nightly job: run with --ignored"]
 async fn node_killed_after_accepting_and_reindexed_lands_the_block_once() -> Result<()> {
     outage_case(Fault::Kill, Hold::Reply, true).await
 }
@@ -120,7 +121,7 @@ async fn outage_steps(
     // A block before the fault: the proxy is transparent.
     let genesis = fixture.rpc("getbestblockhash", json!([])).await?;
     let mut client = BlockClient::current(fixture, 0, &genesis).await?;
-    let before = client.mine(fixture).await?;
+    let before = client.mine().await?;
     wait_state(fixture, &before, "submitted", 30).await?;
     if fault == Fault::Kill {
         // A crash loses whatever the node has not flushed. Flush now so the
@@ -131,7 +132,7 @@ async fn outage_steps(
     // The held block, on current work that builds on the first one.
     let mut client = BlockClient::current(fixture, 0, &json!(before)).await?;
     let hit = proxy.arm(hold);
-    let held = client.mine(fixture).await?;
+    let held = client.mine().await?;
     let hit = tokio::time::timeout(Duration::from_secs(30), hit)
         .await
         .context("no submitblock reached the proxy")??;
@@ -234,7 +235,7 @@ async fn outage_steps(
     // work on the node's current tip, and its block lands.
     let tip = fixture.rpc("getbestblockhash", json!([])).await?;
     let mut client = BlockClient::current(fixture, 1, &tip).await?;
-    let after = client.mine(fixture).await?;
+    let after = client.mine().await?;
     wait_state(fixture, &after, "submitted", 60).await?;
 
     fixture.quiesce().await?;
@@ -523,8 +524,9 @@ impl BlockClient {
     }
 
     /// Solve the current job for a block, submit it, and return its hash.
-    /// The share's reply is not awaited: the offer is what the test holds.
-    async fn mine(&mut self, fixture: &Fixture) -> Result<String> {
+    /// Nothing is awaited after the submission: a held reply must be
+    /// released inside the server's 1-second `submitblock` deadline.
+    async fn mine(&mut self) -> Result<String> {
         self.work().await?;
         let params = self.notify["params"]
             .as_array()
@@ -572,17 +574,7 @@ impl BlockClient {
             if BigUint::from_bytes_le(&hash) <= target {
                 let request = json!({"id":self.next_id,"method":"mining.submit","params":[self.username,field(0)?,extranonce2,format!("{ntime:08x}"),format!("{nonce:08x}")]});
                 self.send(request).await?;
-                let block = hash_display(&hash);
-                until(&format!("candidate {block} enqueued"), 20, || async {
-                    Ok(sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",
-                    )
-                    .bind(&block)
-                    .fetch_one(&fixture.pool)
-                    .await?)
-                })
-                .await?;
-                return Ok(block);
+                return Ok(hash_display(&hash));
             }
         }
         bail!("no regtest block in the nonce budget")
@@ -658,7 +650,14 @@ async fn relay(state: Arc<ProxyState>, downstream: TcpStream) -> Result<()> {
     let mut up_read = BufReader::new(up_read);
     let mut open = state.open.subscribe();
     loop {
-        let Some((request, body)) = read_http(&mut down_read).await? else {
+        // A node connection that closes while idle (qbitd's idle timeout,
+        // or a kill) closes the server's connection too, as a direct
+        // connection would, so the server never reuses a dead one.
+        let next = tokio::select! {
+            next = read_http(&mut down_read) => next?,
+            _ = up_read.fill_buf() => return Ok(()),
+        };
+        let Some((request, body)) = next else {
             return Ok(());
         };
         let submitted = submitted_block(&body);
@@ -708,7 +707,9 @@ fn submitted_block(body: &[u8]) -> Option<String> {
 }
 
 /// One HTTP/1.1 message with a `Content-Length` body: the raw bytes and the
-/// body. `None` at a clean end of stream.
+/// body. `None` at a clean end of stream. qbitd's JSON-RPC server and the
+/// servers' client both frame every message by `Content-Length`; anything
+/// else fails the connection loudly rather than being misread.
 async fn read_http<R>(reader: &mut BufReader<R>) -> Result<Option<(Vec<u8>, Vec<u8>)>>
 where
     R: tokio::io::AsyncRead + Unpin,
