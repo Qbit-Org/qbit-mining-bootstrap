@@ -1,0 +1,225 @@
+name: PRISM load harness (nightly)
+
+# #521 item 6: the load harness (qbit-prism-load) on checked-in presets, every
+# night and on demand. Each preset in crates/qbit-prism-load/presets pins
+# every flag its result depends on (a unit test refuses one that does not),
+# names the runner it needs and states its gates, so what runs, where, and
+# what it is held to are all reviewed in one file.
+#
+# A run builds qbit-prism-server and qbit-prism-load in release mode at the
+# chosen ref, records pg_test_fsync on the filesystem the harness puts its
+# PostgreSQL cluster on, runs the preset, and gates it with
+# qbit-prism-load-gate: exit 0 (completed and reconciled exactly), no
+# durability finding, shortfall == 0 in each gated phase, #473's D1 rule
+# where the preset asks for it, and the tip-to-last-notify p99 budget where
+# the preset sets one. The verdict table goes to the job summary and the
+# harness's reports to an artifact.
+#
+# Runners: every nightly preset runs on an 8 vCPU runner, the size #271's
+# 20k matrix was taken on; that includes one 400k D1 cell of #473's
+# (d1-473-400k-fe1-async, the production-window baseline) and the 400k
+# realism and #275 presets. The heavier manual presets (#473's multi-frontend
+# and 500k cells, growth-20x's 8,000 sessions on four frontends) take a
+# 16 vCPU runner so the client and the database do not starve the frontends
+# being measured. Rates are only comparable run to run on the same runner
+# class, which is why the runner is part of the preset.
+#
+# Schedules run from the default branch's copy of this file; the build and
+# the presets come from `ref` (3.x.x unless dispatched otherwise).
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: >-
+          Preset name(s), comma separated, from crates/qbit-prism-load/presets;
+          `nightly` for the nightly set, `all` for nightly plus manual
+          (growth-20x and #473's cells other than 400k fe1 async).
+        required: true
+        default: nightly
+      ref:
+        description: Git ref to build and run.
+        required: true
+        default: 3.x.x
+      tip_last_notify_p99_budget_ms:
+        description: >-
+          Override every selected preset's tip-to-last-notify p99 budget, in
+          ms. Empty keeps each preset's own (gates.tip_last_notify_p99_budget_ms:
+          2,500 for tip-275*, 3,000 for mainnet-floor and growth-5x, 5,000 for
+          growth-20x; ungated for the D1 presets, whose rule is #473's).
+        required: false
+        default: ""
+      max_shortfall:
+        description: >-
+          Override every selected preset's per-phase shortfall budget. Empty
+          keeps each preset's own (0 for every checked-in preset).
+        required: false
+        default: ""
+      live:
+        description: >-
+          Also run the opt-in live regtest variants listed in
+          test/prism-nightly-gated-tests.txt (the schedule always does).
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prism-load-nightly
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the preset matrix
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Select presets
+        id: plan
+        env:
+          SELECTION: ${{ inputs.preset || 'nightly' }}
+        run: |
+          set -euo pipefail
+          matrix="$(python3 scripts/prism_load_matrix.py "${SELECTION}")"
+          echo "${matrix}"
+          printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT}"
+
+  run:
+    name: ${{ matrix.preset }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Build the server, the harness and the gate in release mode
+        run: cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+      - name: Record the host
+        env:
+          PRESET: ${{ matrix.preset }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${PRESET} on ${RUNNER_LABEL}"
+            echo
+            echo '```'
+            git rev-parse HEAD
+            nproc
+            free -m
+            uname -r
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Run and gate the preset
+        env:
+          PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS: ${{ inputs.tip_last_notify_p99_budget_ms }}
+          PRISM_LOAD_MAX_SHORTFALL: ${{ inputs.max_shortfall }}
+          PRESET: ${{ matrix.preset }}
+        run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
+      - name: Upload the harness reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-${{ matrix.preset }}
+          overwrite: true
+          retention-days: 30
+          path: ${{ runner.temp }}/prism-load-out
+          if-no-files-found: error
+
+  # The opt-in #[ignore] live_regtest variants (#521): each id in
+  # test/prism-nightly-gated-tests.txt, run explicitly with --ignored --exact
+  # in required integration mode against a real qbitd and PostgreSQL 16, and
+  # proven executed with the same gate manifest check the PR suite uses.
+  # Today that is #523's qbitd -reindex crash variant and #524's 130-payee
+  # weighted-recipients variant. TODO(#521): add scenario 5's dense-cadence
+  # soak to the list when it lands on 3.x.x.
+  live-nightly:
+    name: Live regtest nightly variants
+    if: ${{ github.event_name == 'schedule' || inputs.live }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: prism_test
+          POSTGRES_USER: prism_test
+          POSTGRES_PASSWORD: prism_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prism_test -d prism_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Name the gate manifest and the test log
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-nightly-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-nightly-tests.log\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Run the listed variants
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt \
+            | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
+          cargo test --locked -p qbit-prism-server --test live_regtest -- \
+            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+      - name: Prove every listed variant executed
+        run: |
+          python3 scripts/check_gate_manifest.py \
+            --manifest "${PRISM_TEST_GATE_MANIFEST}" \
+            --expected test/prism-nightly-gated-tests.txt \
+            --log "${PRISM_TEST_LOG}"
+      - name: Upload the gate manifest and the test log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-live-nightly
+          overwrite: true
+          retention-days: 30
+          path: |
+            ${{ env.PRISM_TEST_GATE_MANIFEST }}
+            ${{ env.PRISM_TEST_LOG }}
+          if-no-files-found: error

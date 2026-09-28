@@ -2,7 +2,7 @@
 //! and produce a capacity-evidence artifact plus a side report.
 
 use clap::Parser;
-use qbit_prism_load::{cli::Args, frontend, run};
+use qbit_prism_load::{cli::Args, frontend, preset, run};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -12,7 +12,13 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let args = Args::parse();
+    // A `--preset` file's flags join the command line before clap reads it,
+    // so a flag the preset pins cannot be given twice (#521).
+    let (argv, preset) = match preset::expand_command_line(std::env::args_os().collect()) {
+        Ok(expanded) => expanded,
+        Err(error) => fail(error),
+    };
+    let args = Args::parse_from(argv);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("prism-load")
@@ -26,7 +32,7 @@ fn main() {
     // the run rather than killing the process where it stands.
     let code = runtime.block_on(async move {
         tokio::select! {
-            result = run::execute(args) => result,
+            result = run::execute_with_preset(args, preset) => result,
             reason = signal() => {
                 eprintln!("qbit-prism-load: {reason}; tearing down");
                 Ok(run::EXIT_ABORTED)

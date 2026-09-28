@@ -167,6 +167,24 @@ pub fn frontend_environment(
     env
 }
 
+/// Turn the pool fee on in a frontend environment, as mainnet runs it: the
+/// fee enabled at `bps` to `address`, which the fake node validates as
+/// P2MR. With `bps` 0 the environment is left exactly as built, fee off.
+pub fn apply_pool_fee(env: &mut BTreeMap<String, String>, bps: u16, address: &str) {
+    if bps == 0 {
+        return;
+    }
+    env.insert("PRISM_POOL_FEE_ENABLED".into(), "1".into());
+    env.insert("PRISM_POOL_FEE_BPS".into(), bps.to_string());
+    env.insert("PRISM_POOL_FEE_ADDRESS".into(), address.into());
+}
+
+/// The run's pool fee address: the run's own address with a suffix no
+/// session or window recipient uses.
+pub fn pool_fee_address(payout_address: &str) -> String {
+    format!("{payout_address}fee")
+}
+
 /// The 16 keys `capacity-evidence` validates, taken from the exact environment
 /// the frontends were launched with.
 pub fn configuration_block(env: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {

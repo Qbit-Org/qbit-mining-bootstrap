@@ -614,6 +614,9 @@ struct PhaseRun {
     ended: Instant,
     /// Set only for the `dense_cadence` phase.
     dense: Option<DensePhase>,
+    per_second: PerSecond,
+    offers_redirected: u64,
+    offers_weighted: bool,
 }
 
 /// What the dense-cadence phase collected beyond the usual per-phase numbers.
@@ -690,6 +693,12 @@ pub fn stratum_admission_block(environment: &BTreeMap<String, String>, args: &Ar
 }
 
 pub async fn execute(args: Args) -> Result<i32> {
+    execute_with_preset(args, None).await
+}
+
+/// [`execute`] for a run whose flags came from a checked-in preset, which the
+/// side report names (#521).
+pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Preset>) -> Result<i32> {
     args.validate()?;
     // A memory floor the host cannot measure is refused before anything is
     // created, rather than skipped once a second for the whole run (#485).
@@ -711,7 +720,21 @@ pub async fn execute(args: Args) -> Result<i32> {
     let run_tag = run_id.simple().to_string()[..8].to_owned();
     let address_prefix = "pload1".to_owned();
     let payout_address = format!("{address_prefix}{run_tag}");
-    let share_prefix = format!("{payout_address}.");
+    // The live sessions' addresses, usernames, hashrates and difficulties,
+    // generated once from the validated flags (#521). A run that asked for
+    // no realism gets exactly the one address and usernames it always had.
+    let population = Arc::new(crate::realism::Population::build(
+        &args.population_spec()?,
+        &payout_address,
+    )?);
+    let share_prefix = population.share_prefix(&payout_address);
+    // A difficulty spread the frontends cannot serve is refused here, before
+    // the output directory or a cluster is touched (EP-VALIDATION).
+    check_session_difficulties(
+        &window::solve_window(args.template_bits()?, args.window_shares)?,
+        population.max_difficulty_multiplier(),
+        population.mean_offered_multiplier(),
+    )?;
 
     // Whatever this invocation ends as -- blocked, aborted, failed before it
     // measured, or complete -- nothing an earlier run wrote may outlive it in
@@ -775,9 +798,12 @@ pub async fn execute(args: Args) -> Result<i32> {
     let (fd_before, fd_after) = measure::raise_file_descriptor_limit(needed)?;
 
     // --- fake node --------------------------------------------------------
-    let node =
-        FakeNode::open_with_retarget(window::TEMPLATE_BITS, &address_prefix, args.retarget_bits)
-            .await?;
+    let node = FakeNode::open_with_retarget(
+        &format!("{:08x}", args.template_bits()?),
+        &address_prefix,
+        args.retarget_bits,
+    )
+    .await?;
     let node_state = node.state.clone();
 
     // --- PostgreSQL -------------------------------------------------------
@@ -804,6 +830,8 @@ pub async fn execute(args: Args) -> Result<i32> {
             started_wall,
             payout_address,
             share_prefix,
+            population,
+            preset,
             revision,
             revision_evidence,
             dirty,
@@ -856,6 +884,8 @@ struct RunContext {
     started_wall: chrono::DateTime<chrono::Utc>,
     payout_address: String,
     share_prefix: String,
+    population: Arc<crate::realism::Population>,
+    preset: Option<crate::preset::Preset>,
     revision: String,
     /// Whether the server binary was shown to be what `revision` builds.
     revision_evidence: provenance::RevisionEvidence,
@@ -903,13 +933,21 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     }
     let postgres_version = cluster::server_version(&seed_ledger.pool).await?;
 
-    let bits = qbit_prism_server::codec::parse_u32_hex(window::TEMPLATE_BITS)?;
+    let bits = args.template_bits()?;
     let solution = window::solve_window(bits, args.window_shares)?;
-    let seed = window::SeedPlan::new(
+    let live_base = live_base_difficulty(&solution, ctx.population.mean_offered_multiplier());
+    let seed_recipients = ctx
+        .population
+        .window_assignments(args.seed_share_count())
+        .map(|assignments| {
+            window::SeedRecipients::new(ctx.population.addresses.clone(), assignments)
+        });
+    let seed = window::SeedPlan::with_recipients(
         args.seed_share_count(),
         solution.scaled_share_difficulty,
         solution.scaled_network_difficulty,
         args.seed_share_bytes,
+        seed_recipients,
     )?;
     let seed_stats = seed.load(&seed_ledger.pool, "load-seed").await?;
     let window_at_start =
@@ -984,7 +1022,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         args,
         ctx.node_url.clone(),
         format!("load-{}", ctx.run_tag),
-        format!("{}", solution.share_difficulty),
+        format!("{live_base}"),
     );
     let mut frontends: Vec<Frontend> = Vec::new();
     let mut blocked: Vec<BlockedLog> = Vec::new();
@@ -997,7 +1035,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             stratum_port: free_port()?,
             audit_port: free_port()?,
         };
-        let environment = frontend::frontend_environment(&shared_env, &spec);
+        let mut environment = frontend::frontend_environment(&shared_env, &spec);
+        frontend::apply_pool_fee(
+            &mut environment,
+            args.pool_fee_bps,
+            &frontend::pool_fee_address(&ctx.payout_address),
+        );
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
         // Frontend 1 first: concurrent first-boot migrations wait inside a
         // transaction bounded by the 5 s lock_timeout.
@@ -1096,11 +1139,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let quiesce_limit = drain_limit(args.share_commit_timeout_seconds);
     for index in 0..args.sessions {
         let frontend_index = index % args.frontends;
+        let profile = &ctx.population.sessions[index];
+        let (share_difficulty, password) =
+            session_difficulty(live_base, profile.difficulty_multiplier);
         let config = SessionConfig {
             index,
-            username: format!("{}.s{index:05}", ctx.payout_address),
-            password: "x".into(),
-            share_difficulty: solution.share_difficulty,
+            username: profile.username.clone(),
+            password,
+            share_difficulty,
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
@@ -1276,9 +1322,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .store(plan.dense_cadence, std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
         let started_wall = chrono::Utc::now();
-        let outcome = drive_phase(
+        let outcome = drive_phase_with_population(
             args,
             plan,
+            Some(&ctx.population),
             &sessions,
             &mut frontends,
             &process_samplers,
@@ -1392,6 +1439,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             started,
             ended,
             dense,
+            per_second: outcome.per_second,
+            offers_redirected: outcome.offers_redirected,
+            offers_weighted: outcome.offers_weighted,
         });
         if let Some(reason) = outcome.aborted {
             aborted = Some(reason);
@@ -1700,12 +1750,20 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // size the server did not serve in full, or work the configuration does
     // not name (EP-ERRORS). The side report below still carries every
     // number, with the reason.
-    let mut evidence = artifact::write_or_withhold(
-        &inputs,
-        withhold.as_ref(),
-        &args.out,
-        &ctx.server_bin.display().to_string(),
-    )?;
+    let mut evidence = if withhold.is_none() && args.plan()? == crate::cli::Plan::Tips {
+        artifact::not_requested(
+            &args.out,
+            "--plan tips runs warm-up only, so there is no artifact phase and no artifact; \
+             the side report carries the run",
+        )?
+    } else {
+        artifact::write_or_withhold(
+            &inputs,
+            withhold.as_ref(),
+            &args.out,
+            &ctx.server_bin.display().to_string(),
+        )?
+    };
     // A rejection whose reason the classifier does not recognise already
     // invalidates the artifact, through rejected_valid_shares, and used to
     // do so quietly: the reader found it by reading the rejections JSON.
@@ -1792,6 +1850,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "max_outstanding_per_session": args.max_outstanding_per_session,
             "plan": args.plan,
             "payout_address": ctx.payout_address,
+            "payout_addresses": ctx.population.addresses.len(),
+            "pool_fee_bps": args.pool_fee_bps,
+            "pool_fee_address": (args.pool_fee_bps > 0)
+                .then(|| frontend::pool_fee_address(&ctx.payout_address)),
             "share_id_prefix": ctx.share_prefix,
             "writer_ids": writer_ids,
         },
@@ -1807,7 +1869,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         })).collect::<Vec<_>>(),
         "retired_configuration_keys": frontend::RETIRED_CONFIGURATION_KEYS,
         "window": {
-            "template_bits": window::TEMPLATE_BITS,
+            "template_bits": format!("{:08x}", args.template_bits()?),
             "scaled_network_difficulty": solution.scaled_network_difficulty.to_string(),
             "window_weight": solution.window_weight.to_string(),
             "share_difficulty_diff1": format!("{}", solution.share_difficulty),
@@ -1854,13 +1916,36 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                          same rows",
             },
         },
+        "population": population_report(
+            &ctx.population,
+            seed.recipients().map(|recipients| recipients.counts()).as_deref(),
+            &solution,
+            &collected,
+            window::LEGACY_RECIPIENTS,
+        ),
+        "arrival": args.arrival()?.render(),
+        "preset": ctx.preset.as_ref().map(|preset| json!({
+            "name": preset.name,
+            "path": preset.path.display().to_string(),
+            "sha256": preset.sha256,
+            "description": preset.description,
+            "issues": preset.issues,
+            "gates": {
+                "phases": preset.gates.phases,
+                "max_shortfall": preset.gates.max_shortfall,
+                "max_rejected_valid_shares": preset.gates.max_rejected_valid_shares,
+                "max_unanswered_submits": preset.gates.max_unanswered_submits,
+                "tip_last_notify_p99_budget_ms": preset.gates.tip_last_notify_p99_budget_ms,
+                "d1_verdict_table": preset.gates.d1_verdict_table,
+            },
+        })),
         "time_to_usable_work": time_to_usable_work(
             &external_tips, &tip_changes, &collected, args.sessions,
         ),
         "dense_cadence": dense_cadence,
         "node": {
             "url": ctx.node_url,
-            "template_bits": window::TEMPLATE_BITS,
+            "template_bits": format!("{:08x}", args.template_bits()?),
             "retarget_bits": ctx.node_state.retargets(),
             "background_shares_per_second": args.background_shares_per_second,
             "submissions": node_submissions,
@@ -2013,6 +2098,126 @@ pub struct PhaseOutcome {
     /// wait is boundary time, not the phase's.
     pub ended: Instant,
     pub ended_wall: chrono::DateTime<chrono::Utc>,
+    /// Offers minted and placed in each whole second of the phase, so the
+    /// arrival process the phase actually drove can be reported (#521).
+    pub per_second: PerSecond,
+    /// Weighted draws that found their session at its outstanding limit and
+    /// fell back to the round-robin scan.
+    pub offers_redirected: u64,
+    /// Whether offers were placed by share rate rather than round-robin.
+    pub offers_weighted: bool,
+}
+
+/// Offers minted and placed per whole second of a phase.
+#[derive(Clone, Debug, Default)]
+pub struct PerSecond {
+    pub tokens: Vec<u64>,
+    pub dispatched: Vec<u64>,
+}
+
+impl PerSecond {
+    fn record(&mut self, second: usize, dispatched: bool) {
+        if self.tokens.len() <= second {
+            self.tokens.resize(second + 1, 0);
+            self.dispatched.resize(second + 1, 0);
+        }
+        self.tokens[second] += 1;
+        if dispatched {
+            self.dispatched[second] += 1;
+        }
+    }
+}
+
+/// Where the scheduler places each offer. Round-robin, as every run before
+/// #521 did, unless the population's sessions offer at different rates;
+/// then each offer goes to a session drawn by its share rate from the
+/// phase's own seeded stream, falling back to the round-robin scan when the
+/// drawn session is at its outstanding limit, so an offer is only a
+/// shortfall when every session is busy, as before.
+pub struct OfferPicker {
+    table: Option<crate::realism::AliasTable>,
+    rng: crate::realism::Rng,
+    redirected: u64,
+}
+
+impl OfferPicker {
+    pub fn new(
+        population: Option<&crate::realism::Population>,
+        sessions: usize,
+        phase: &str,
+    ) -> Self {
+        let table = population
+            .filter(|population| {
+                !population.uniform_offers() && population.sessions.len() == sessions
+            })
+            .map(|population| {
+                let weights: Vec<f64> =
+                    population.sessions.iter().map(|s| s.offer_weight).collect();
+                crate::realism::AliasTable::new(&weights)
+            });
+        let seed = population.map_or(0, |population| population.seed);
+        Self {
+            table,
+            rng: crate::realism::Rng::new(seed, &format!("offers:{phase}")),
+            redirected: 0,
+        }
+    }
+
+    pub fn is_weighted(&self) -> bool {
+        self.table.is_some()
+    }
+
+    fn offer(
+        &mut self,
+        sessions: &[SessionHandle],
+        cursor: &AtomicUsize,
+        limit: usize,
+        phase: &Arc<str>,
+    ) -> bool {
+        let Some(table) = &self.table else {
+            return offer_round_robin(sessions, cursor, limit, phase);
+        };
+        for _ in 0..4 {
+            let index = table.sample(&mut self.rng);
+            if sessions[index].try_offer(limit, phase) {
+                return true;
+            }
+        }
+        self.redirected += 1;
+        offer_round_robin(sessions, cursor, limit, phase)
+    }
+}
+
+/// [`drive_phase_with_population`] with round-robin offers.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_phase(
+    args: &Args,
+    plan: &PhasePlan,
+    sessions: &[SessionHandle],
+    frontends: &mut [Frontend],
+    samplers: &[ProcessSampler],
+    node_state: &crate::node::NodeState,
+    external_tips: &mut Vec<crate::node::TipChange>,
+    remaining_blocks: &mut usize,
+    remaining_tips: &mut usize,
+    collected: &Arc<Mutex<Collected>>,
+    kill_fence: &Arc<AtomicU64>,
+) -> Result<PhaseOutcome> {
+    drive_phase_with_population(
+        args,
+        plan,
+        None,
+        sessions,
+        frontends,
+        samplers,
+        node_state,
+        external_tips,
+        remaining_blocks,
+        remaining_tips,
+        collected,
+        kill_fence,
+    )
+    .await
 }
 
 /// Drive one phase: the open-loop schedule from `plan`, with the phase's
@@ -2022,10 +2227,16 @@ pub struct PhaseOutcome {
 /// restart or kill still in flight then is completed before this returns,
 /// with nothing scheduled meanwhile, so the next phase never offers to a
 /// session that is still paused or pointed at a dead process.
+///
+/// `population` places each offer by the sessions' share rates
+/// ([`OfferPicker`]); `None` is round-robin. The offered rate follows
+/// `--arrival`, which is the constant `plan.rate` unless the run asked for
+/// bursts.
 #[allow(clippy::too_many_arguments)]
-pub async fn drive_phase(
+pub async fn drive_phase_with_population(
     args: &Args,
     plan: &PhasePlan,
+    population: Option<&crate::realism::Population>,
     sessions: &[SessionHandle],
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
@@ -2063,7 +2274,13 @@ pub async fn drive_phase(
         slots_over_budget: 0,
         ended: started,
         ended_wall: chrono::Utc::now(),
+        per_second: PerSecond::default(),
+        offers_redirected: 0,
+        offers_weighted: false,
     };
+    let mut offers = OfferPicker::new(population, sessions.len(), &plan.name);
+    outcome.offers_weighted = offers.is_weighted();
+    let arrival = args.arrival()?.clock(args.seed, &plan.name, plan.seconds);
     // Event schedule inside the phase.
     let reconnect_interval = if plan.reconnects {
         Some(duration.as_secs_f64() / (args.reconnect_target as f64 + 2.0))
@@ -2134,14 +2351,19 @@ pub async fn drive_phase(
         // Open-loop token bucket: the clock decides how many shares were
         // offered, and any that cannot be placed are counted as a shortfall
         // rather than deferred into a backlog.
-        let want = (seconds * plan.rate).floor() as u64;
+        // With `--arrival bursty` the clock runs faster and slower than the
+        // wall around the phase's rate; smooth, it is the wall.
+        let want = (arrival.elapsed(seconds) * plan.rate).floor() as u64;
+        let second = seconds as usize;
         while outcome.tokens < want {
             outcome.tokens += 1;
-            if offer_round_robin(sessions, &cursor, args.max_outstanding_per_session, &phase) {
+            let placed = offers.offer(sessions, &cursor, args.max_outstanding_per_session, &phase);
+            if placed {
                 outcome.dispatched += 1;
             } else {
                 outcome.shortfall += 1;
             }
+            outcome.per_second.record(second, placed);
         }
         if seconds >= next_reconnect {
             next_reconnect += reconnect_interval.unwrap_or(f64::INFINITY);
@@ -2291,6 +2513,7 @@ pub async fn drive_phase(
     // was (EP-OBSERVABILITY).
     outcome.ended = Instant::now();
     outcome.ended_wall = chrono::Utc::now();
+    outcome.offers_redirected = offers.redirected;
     // A restart or a kill still in flight at the phase boundary is seen
     // through, so its sessions are retargeted -- and, for the kill, its
     // re-offers sent -- before the next phase offers to them. Their own
@@ -3278,6 +3501,215 @@ pub struct AchievedRate {
     pub unavailable_reason: Option<String>,
 }
 
+/// The arrival process a phase actually drove: offers minted and placed per
+/// second, and their variation over 1 s and 60 s windows (#521). A window
+/// count that cannot support a figure reports it as `null`, never 0.
+fn arrival_report(phase: &PhaseRun) -> Value {
+    let cv = |series: &[u64], window: usize| crate::realism::windowed_cv(series, window);
+    let max_second = |series: &[u64]| series.iter().copied().max();
+    json!({
+        "offer_placement": if phase.offers_weighted { "weighted by session share rate" }
+            else { "round-robin" },
+        "offers_redirected_to_round_robin": phase.offers_redirected,
+        "offered_per_second_cv_1s": cv(&phase.per_second.tokens, 1),
+        "offered_per_second_cv_60s": cv(&phase.per_second.tokens, 60),
+        "offered_max_1s": max_second(&phase.per_second.tokens),
+        "dispatched_per_second_cv_1s": cv(&phase.per_second.dispatched, 1),
+        "dispatched_per_second_cv_60s": cv(&phase.per_second.dispatched, 60),
+        "dispatched_max_1s": max_second(&phase.per_second.dispatched),
+        "offered_per_second": phase.per_second.tokens,
+        "definition": "offers the scheduler minted (offered) and placed on a session \
+                       (dispatched) in each whole second of the phase; cv_Ns is the \
+                       coefficient of variation of the counts summed over consecutive N-second \
+                       windows, a trailing partial window dropped, null when fewer than two \
+                       windows fit",
+    })
+}
+
+/// A session's share difficulty and Stratum password. At the configured
+/// difficulty it is the password every run before #521 sent; otherwise the
+/// password asks for the session's difficulty with `d=`, which the server
+/// honours with vardiff off (`vardiff::password_difficulties`), and the
+/// client mines and checks `mining.set_difficulty` against the same value.
+pub fn session_difficulty(configured: f64, multiplier: f64) -> (f64, String) {
+    if multiplier == 1.0 {
+        return (configured, "x".into());
+    }
+    let difficulty = configured * multiplier;
+    (difficulty, format!("x,d={difficulty}"))
+}
+
+/// 2^-32: the least difficulty a share target can express, since its target
+/// is already 2^256 (`codec::difficulty_target` caps there).
+pub const MINIMUM_SHARE_DIFFICULTY: f64 = 1.0 / 4_294_967_296.0;
+
+/// The frontends' `PRISM_STRATUM_VARDIFF_MAX_DIFF`, which caps what `d=`
+/// can ask for.
+pub const FRONTEND_MAX_DIFFICULTY: f64 = 1024.0;
+
+/// The configured share difficulty the frontends run and multiplier-1
+/// sessions mine. It is the window's solved difficulty unless sessions mine
+/// their own: then it is that over the average offered share's multiplier,
+/// so the average live share weighs what a seeded share does and the window
+/// stays `--window-shares` long in expectation. Without that, a vardiff
+/// whale's shares, up to the ratio times heavier than a seeded share,
+/// displace the seeded window within a minute and the run measures a window
+/// a few thousand shares long, which production never serves.
+pub fn live_base_difficulty(solution: &window::WindowSolution, mean_multiplier: f64) -> f64 {
+    if mean_multiplier == 1.0 {
+        solution.share_difficulty
+    } else {
+        solution.share_difficulty / mean_multiplier
+    }
+}
+
+/// Refuse a per-session difficulty spread the run cannot serve as asked: one
+/// above the frontends' maximum would be clamped (and contradict the premise
+/// at exit 8 after the whole setup), and one whose share target comes within
+/// eight times the network target would make one share in eight a block the
+/// client has to discard, measuring block-solution churn rather than shares.
+pub fn check_session_difficulties(
+    solution: &window::WindowSolution,
+    max_multiplier: f64,
+    mean_multiplier: f64,
+) -> Result<()> {
+    if max_multiplier <= 1.0 {
+        return Ok(());
+    }
+    // The hardest session's multiplier over the average share's.
+    let relative = max_multiplier / mean_multiplier;
+    let base = live_base_difficulty(solution, mean_multiplier);
+    ensure!(
+        base >= MINIMUM_SHARE_DIFFICULTY,
+        "the configured share difficulty would be {base:e}, below 2^-32, the least a share \
+         target can express; the server would serve 2^-32 instead. Raise --template-bits \
+         (the network difficulty) by at least {:.0} times, or narrow --session-difficulty",
+        (MINIMUM_SHARE_DIFFICULTY / base).ceil()
+    );
+    let highest = base * max_multiplier;
+    ensure!(
+        highest <= FRONTEND_MAX_DIFFICULTY,
+        "the hardest session would ask for share difficulty {highest}, above the frontends' \
+         maximum {FRONTEND_MAX_DIFFICULTY}; lower the --session-difficulty ratio"
+    );
+    let heaviest = solution.scaled_share_difficulty as f64 * relative;
+    let ceiling = solution.scaled_network_difficulty as f64 / 8.0;
+    ensure!(
+        heaviest <= ceiling,
+        "the hardest session's shares would weigh {heaviest:.0}, above an eighth of the \
+         network difficulty ({ceiling:.0}), so it would find a block every few shares; lower \
+         the --session-difficulty ratio or raise --window-shares (the hardest session can \
+         weigh at most {:.0} average shares in this window)",
+        ceiling / solution.scaled_share_difficulty as f64
+    );
+    Ok(())
+}
+
+/// The side report's record of the population the run generated and drove
+/// (#521): the distributions it was asked for, and per address the sessions,
+/// seeded window shares and accepted live shares and work it actually got.
+pub fn population_report(
+    population: &crate::realism::Population,
+    seed_counts: Option<&[u64]>,
+    solution: &window::WindowSolution,
+    collected: &Collected,
+    legacy_window_recipients: u64,
+) -> Value {
+    let recipients = population.addresses.len();
+    let mut sessions_per = vec![0f64; recipients];
+    for session in &population.sessions {
+        sessions_per[session.recipient] += 1.0;
+    }
+    let mut live_shares = vec![0f64; recipients];
+    let mut live_work = vec![0f64; recipients];
+    for record in &collected.submits {
+        if !matches!(record.outcome, client::Outcome::Accepted) {
+            continue;
+        }
+        if let Some(session) = population.sessions.get(record.session) {
+            live_shares[session.recipient] += 1.0;
+            live_work[session.recipient] += session.difficulty_multiplier;
+        }
+    }
+    let window: Option<Vec<f64>> =
+        seed_counts.map(|counts| counts.iter().map(|c| *c as f64).collect());
+    let mut ranked: Vec<usize> = (0..recipients).collect();
+    ranked.sort_by(|a, b| population.weights[*b].total_cmp(&population.weights[*a]));
+    let top: Vec<Value> = ranked
+        .iter()
+        .take(10)
+        .map(|index| {
+            json!({
+                "address": population.addresses[*index],
+                "weight": population.weights[*index],
+                "sessions": sessions_per[*index],
+                "window_shares": window.as_ref().map(|w| w[*index]),
+                "live_accepted_shares": live_shares[*index],
+                "live_accepted_work_share": live_work[*index]
+                    / live_work.iter().sum::<f64>().max(f64::MIN_POSITIVE),
+            })
+        })
+        .collect();
+    let summary =
+        |values: Vec<f64>| measure::summarize(values, "ratio", "generated before the run");
+    let multipliers: Vec<f64> = population
+        .sessions
+        .iter()
+        .map(|s| s.difficulty_multiplier)
+        .collect();
+    let spread = multipliers.iter().copied().fold(1.0, f64::max)
+        / multipliers.iter().copied().fold(f64::INFINITY, f64::min);
+    json!({
+        "seed": population.seed,
+        "recipients": recipients,
+        "recipients_flag": if population.legacy { Value::Null } else { json!(recipients) },
+        "recipient_weights": population.weight_dist.render(),
+        "session_hashrate_sigma": population.hashrate_sigma,
+        "session_difficulty": population.difficulty.render(),
+        "legacy_single_address": population.legacy,
+        "window_recipients_note": if population.legacy {
+            json!(format!("the seeded window keeps its {legacy_window_recipients} round-robin \
+                           recipients, which are not the live sessions' address"))
+        } else {
+            json!("the seeded window's recipients are the live sessions' addresses, drawn per \
+                   share by weight from the seed's own stream")
+        },
+        "generated_weight_concentration": crate::realism::concentration(&population.weights),
+        "sessions_per_recipient_concentration": crate::realism::concentration(&sessions_per),
+        "window_shares_per_recipient_concentration": window.as_ref()
+            .map(|w| crate::realism::concentration(w)),
+        "live_accepted_shares_per_recipient_concentration":
+            crate::realism::concentration(&live_shares),
+        "live_accepted_work_per_recipient_concentration":
+            crate::realism::concentration(&live_work),
+        "top_recipients": top,
+        "session_hashrate": summary(population.sessions.iter().map(|s| s.hashrate).collect()),
+        "session_difficulty_multiplier": summary(multipliers),
+        "session_difficulty_spread_ratio": spread,
+        "session_difficulty_spread_orders_of_magnitude": spread.log10(),
+        "configured_share_difficulty": live_base_difficulty(
+            solution,
+            population.mean_offered_multiplier(),
+        ),
+        "window_share_difficulty": solution.share_difficulty,
+        "mean_offered_difficulty_multiplier": population.mean_offered_multiplier(),
+        "window_note": "the seeded window's shares carry the solved window difficulty; the \
+                        configured difficulty is that over the mean offered multiplier, so the \
+                        average live share weighs what a seeded share does and the window stays \
+                        --window-shares long in expectation",
+        "offer_weight": summary(population.sessions.iter().map(|s| s.offer_weight).collect()),
+        "definitions": "weight is an address's generated share of the work; sessions are \
+                        apportioned by weight (largest remainder, one each first when there are \
+                        at least as many sessions as addresses); a session's hashrate is its \
+                        address's weight over its session count times the lognormal jitter, \
+                        normalised to a mean of 1; its difficulty multiplier is 1 under fixed \
+                        and its hashrate over the slowest session's, capped at the ratio, under \
+                        vardiff; its offer weight, the share rate the scheduler places offers \
+                        by, is hashrate over difficulty multiplier. Live work counts each \
+                        accepted share at its session's multiplier.",
+    })
+}
+
 fn phase_report(
     phase: &PhaseRun,
     collected: &Collected,
@@ -3303,6 +3735,7 @@ fn phase_report(
         "dispatched": phase.dispatched,
         "shortfall": phase.shortfall,
         "offer_accounting": offer_accounting(&phase.plan.name, phase.dispatched, collected),
+        "arrival": arrival_report(phase),
         "achieved_rate_shares_per_second": achieved.shares_per_second,
         "achieved_rate_unavailable_reason": achieved.unavailable_reason,
         "offered_rate_shares_per_second": phase.dispatched as f64 / seconds.max(f64::MIN_POSITIVE),

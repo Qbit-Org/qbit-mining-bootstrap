@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "qbit-prism-load"
 path = "src/main.rs"
 
+[[bin]]
+name = "qbit-prism-load-gate"
+path = "src/gate_main.rs"
+
 [dependencies]
 qbit-prism = { path = "../qbit-prism" }
 qbit-prism-server = { path = "../qbit-prism-server" }
