@@ -411,7 +411,10 @@ async fn seed_legacy_history(fixture: &Fixture, root: &Path) -> Result<Legacy> {
     // Three days of history, ending an hour before the cutover.
     let start_ms = now_ms - 3 * 86_400_000;
     let step_ms = (3 * 86_400_000 - 3_600_000) / LEGACY_SHARES as i64;
+    // The first `LEGACY_SHARES % LEGACY_BLOCKS` blocks take one more row, so
+    // every configured row is written.
     let per_block = LEGACY_SHARES / LEGACY_BLOCKS;
+    let longer_blocks = LEGACY_SHARES % LEGACY_BLOCKS;
 
     let coinbase_key = ManifestSigningKey::from_seed_hex(&COINBASE_SEED.repeat(32))?;
     let ledger_key = ManifestSigningKey::from_seed_hex(&LEDGER_SEED.repeat(32))?;
@@ -420,10 +423,11 @@ async fn seed_legacy_history(fixture: &Fixture, root: &Path) -> Result<Legacy> {
     let mut accepted_shares = 0i64;
     let mut seq = 0u64;
     for (block_index, (height, hash, parent)) in blocks.iter().enumerate() {
-        let mut window: Vec<AcceptedShare> = Vec::with_capacity(per_block);
+        let block_shares = per_block + usize::from(block_index < longer_blocks);
+        let mut window: Vec<AcceptedShare> = Vec::with_capacity(block_shares);
         let mut credited: BTreeMap<usize, u64> = BTreeMap::new();
         let mut transaction = fixture.pool.begin().await?;
-        for _ in 0..per_block {
+        for _ in 0..block_shares {
             seq += 1;
             let mut pick = rng.gen::<f64>() * total_weight;
             let recipient = weights
@@ -583,6 +587,10 @@ async fn seed_legacy_history(fixture: &Fixture, root: &Path) -> Result<Legacy> {
         .bind("88".repeat(32))
         .execute(&fixture.pool)
         .await?;
+    ensure!(
+        seq as usize == LEGACY_SHARES,
+        "seeded {seq} ledger rows, not {LEGACY_SHARES}"
+    );
     let last_share_seq = seq as i64;
     sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
         .bind(last_share_seq + SEQUENCE_HEADROOM)
