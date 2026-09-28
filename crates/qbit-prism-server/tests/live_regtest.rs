@@ -39,6 +39,9 @@ mod two_node_tests;
 #[path = "support/live_weighted_recipients.rs"]
 mod weighted_recipients_tests;
 
+#[path = "support/live_dense_soak.rs"]
+mod dense_soak_tests;
+
 /// Each fixture starts a regtest `qbitd` and two servers, and a server binds
 /// its listeners only after coordinator startup: the schema migrations, which
 /// the second server of a fixture waits for under the migrations table lock,
