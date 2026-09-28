@@ -27,6 +27,9 @@ mod highdiff_tests;
 #[path = "support/live_ctv_cpfp.rs"]
 mod cpfp_tests;
 
+#[path = "support/live_node_outage.rs"]
+mod node_outage_tests;
+
 /// Each fixture starts a regtest `qbitd` and two servers, and a server binds
 /// its listeners only after coordinator startup: the schema migrations, which
 /// the second server of a fixture waits for under the migrations table lock,
