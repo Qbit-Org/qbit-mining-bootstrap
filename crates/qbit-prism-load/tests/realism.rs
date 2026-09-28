@@ -754,22 +754,23 @@ fn a_preset_flag_cannot_be_given_again_on_the_command_line() -> Result<()> {
     let args = Args::try_parse_from(&argv)?;
     assert_eq!(args.sessions, 100);
     assert_eq!(args.recipients, Some(20));
-    let (argv, _) = preset::expand_command_line(
-        [
-            "qbit-prism-load",
-            "--preset",
-            path.to_str().unwrap(),
-            "--sessions",
-            "5",
-        ]
-        .into_iter()
-        .map(Into::into)
-        .collect(),
-    )?;
-    assert!(
-        Args::try_parse_from(&argv).is_err(),
-        "--sessions given twice"
-    );
+    // Any flag the preset pins is refused on the command line, whatever the
+    // preset's value: one it sets, one it pins off, one it leaves null.
+    for extra in [
+        vec!["--sessions", "5"],
+        vec!["--mid-flight-kill"],
+        vec!["--burst-seconds", "60"],
+        vec!["--database-url=postgresql://u@h/db"],
+    ] {
+        let mut words = vec!["qbit-prism-load", "--preset", path.to_str().unwrap()];
+        words.extend(extra.iter().copied());
+        let error =
+            preset::expand_command_line(words.into_iter().map(Into::into).collect()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is pinned by preset smoke"),
+            "{extra:?}: {error:#}"
+        );
+    }
     let (unchanged, none) =
         preset::expand_command_line(vec!["qbit-prism-load".into(), "--sessions".into()])?;
     assert_eq!(unchanged.len(), 2);
@@ -846,6 +847,14 @@ fn the_gate_passes_a_clean_run_and_fails_each_way_a_run_can_fall_short() {
     let mut missing = passing_report();
     missing["phases"][0]["reconciliation"]["missing"] = json!(1);
     fails(missing, Some(0), &budgets, "reconciliation");
+    // A commit whose answer the drain window cut off is explained, and the
+    // harness exits 0 for it: reported, not failed.
+    let mut explained = passing_report();
+    explained["phases"][0]["reconciliation"]["unexpected"] = json!(1);
+    explained["no_response_commits"] = json!({"count": 1});
+    let checks = gate::evaluate(&explained, Some(0), &budgets);
+    assert!(gate::passed(&checks), "{}", gate::markdown("x", &checks));
+    assert!(gate::markdown("x", &checks).contains("| 1 (1 / 0 / 0) |"));
     let mut short = passing_report();
     short["phases"][0]["shortfall"] = json!(3);
     fails(short, Some(0), &budgets, "shortfall");

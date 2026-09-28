@@ -204,13 +204,28 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         (missing, unexpected) = (None, None);
     }
     checks.push(Check::gate(
-        "reconciliation: acknowledged missing / committed unexpected",
-        match (missing, unexpected) {
-            (Some(m), Some(u)) => format!("{m} / {u}"),
-            _ => "not reported".into(),
-        },
-        "0 / 0".into(),
-        missing == Some(0) && unexpected == Some(0),
+        "reconciliation: acknowledged shares missing from PostgreSQL",
+        missing.map_or("not reported".into(), |m| m.to_string()),
+        "0".into(),
+        missing == Some(0),
+    ));
+    // A committed share the client holds no acknowledgement for is not a
+    // loss. The harness explains each one -- an answer that never came back
+    // before the drain ended, or one the server refused as unconfirmed --
+    // and one it cannot explain is a durability finding, gated above, while
+    // a divergence inside the run exits 5, gated by the exit code. So the
+    // count is reported beside the explanations, not gated a second time.
+    let explained = |key: &str| report[key]["count"].as_u64().unwrap_or(0);
+    checks.push(Check::info(
+        "reconciliation: committed without an acknowledgement (no-response / divergence / \
+         unknown-outcome)",
+        format!(
+            "{} ({} / {} / {})",
+            unexpected.map_or("not reported".into(), |u| u.to_string()),
+            explained("no_response_commits"),
+            explained("ack_commit_divergence"),
+            explained("unknown_outcome_commits"),
+        ),
     ));
     let gated: Vec<&Value> = match &budgets.phases {
         None => phases.iter().collect(),

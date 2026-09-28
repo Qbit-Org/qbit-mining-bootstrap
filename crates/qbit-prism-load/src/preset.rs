@@ -340,6 +340,21 @@ pub fn expand_command_line(argv: Vec<OsString>) -> Result<(Vec<OsString>, Option
         return Ok((argv, None));
     };
     let preset = Preset::load(&path)?;
+    // Every flag the preset pins belongs to the preset, whatever its value: a
+    // flag pinned false or null is left off the expanded line, so clap would
+    // never see it twice, and the command line could change the workload
+    // under the preset's name.
+    for word in argv.iter().skip(1) {
+        let text = word.to_string_lossy();
+        let flag = text.split_once('=').map_or(text.as_ref(), |(flag, _)| flag);
+        ensure!(
+            !preset.args.contains_key(flag),
+            "{flag} is pinned by preset {}; the command line may add only the operational \
+             flags ({})",
+            preset.name,
+            OPERATIONAL_FLAGS.join(", ")
+        );
+    }
     let mut expanded = argv;
     expanded.extend(preset.argv()?.into_iter().map(OsString::from));
     Ok((expanded, Some(preset)))

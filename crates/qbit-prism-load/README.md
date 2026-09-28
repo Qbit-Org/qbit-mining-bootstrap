@@ -598,7 +598,8 @@ every flag a result depends on, `null` only where omitting the flag is itself
 the choice (`--database-url`, the short and tips plans' `--burst-seconds` and
 `--burst-rate`, and `--recipients`); the operational flags (`--server-bin`,
 `--pg-bin-dir`, `--out`, `--keep-artifacts` and the `--allow-*` overrides)
-stay on the command line. The harness refuses a preset that omits a flag or
+stay on the command line, and only they: the harness refuses any flag the
+preset pins, whether it sets it, pins it off or leaves it null. The harness refuses a preset that omits a flag or
 leaves one to a default, and a test holds every checked-in preset to the same
 rule against the harness's own flag list, so a new flag cannot be added
 without every preset stating it. `--preset <file>` adds the preset's flags to
@@ -610,7 +611,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 
 | Gate | Meaning |
 |---|---|
-| (always) | the harness exited 0 (completed and reconciled exactly), no durability finding, nothing missing or unexpected in reconciliation |
+| (always) | the harness exited 0 (completed and reconciled exactly), no durability finding, no acknowledged share missing from PostgreSQL. A committed share without an acknowledgement is reported beside its explanation (a no-response the drain cut off, a divergence, an unknown outcome); an unexplained one is a durability finding and a divergence inside the run exits 5 |
 | `phases` | the phases the per-phase checks gate; `null` is every phase driven. The rest are reported, not gated |
 | `max_shortfall` | offers no session could take, per gated phase |
 | `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
