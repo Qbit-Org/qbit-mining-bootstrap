@@ -137,7 +137,7 @@ pub enum CandidateState {
     /// claim that finds a row here did not take the reservation: the call
     /// may or may not have happened, so it never offers. Only the attempt
     /// that holds the reservation may return it to `pending`, and only when
-    /// its call provably never left the frontend (#522, see
+    /// its call provably never ran on the node (#522, #526, see
     /// [`Ledger::release_unsent_offer`]).
     OfferReserved,
     /// The node's answer is recorded; the audit is still to be landed.
@@ -193,9 +193,10 @@ pub fn adoption_evidence(block_hash: &str, height: u64, tip: &str) -> String {
 pub const LANDING_FAILED_REASON_PREFIX: &str = "landing failed after the offer";
 
 /// The `last_error` prefix of a `pending` row whose reservation was returned
-/// because its `submitblock` call provably never reached the node: the
+/// because its `submitblock` call provably never ran on the node: the
 /// connection the request would have been written to was never established
-/// (#522). Such a row was never offered; its offer columns are empty again,
+/// (#522), or the node answered it from its warmup, before dispatching it
+/// (#526). Such a row was never offered; its offer columns are empty again,
 /// and the next claim offers it after the ordinary pending backoff.
 pub const OFFER_NOT_SENT_REASON_PREFIX: &str = "offer not sent";
 
@@ -946,9 +947,10 @@ impl Ledger {
     }
 
     /// Return the reservation this live claim holds to `pending` after its
-    /// one `submitblock` call provably never left this frontend: the
-    /// connection the request would have been written to was never
-    /// established (`rpc::RpcNotSentError`, #522). The reservation and every
+    /// one `submitblock` call provably never ran on the node: the connection
+    /// the request would have been written to was never established
+    /// (`rpc::RpcNotSentError`, #522), or the node answered it from its
+    /// warmup (`RPC_IN_WARMUP`, #526). The reservation and every
     /// offer column are cleared, because no offer was made, and `pending` is
     /// again what it always means: never offered. The attempt is recorded in
     /// `last_error` under [`OFFER_NOT_SENT_REASON_PREFIX`], the claim is
@@ -960,7 +962,7 @@ impl Ledger {
     ///
     /// One transaction, fenced on the live token and on a reservation that
     /// recorded no call. Nothing else ever returns a reservation: a crash or
-    /// a lost claim between the failed connect and this commit leaves
+    /// a lost claim between that answer and this commit leaves
     /// `offer_reserved`, which recovery treats as delivery unknown and never
     /// offers again, because nothing durable proves that the call was not
     /// made.
