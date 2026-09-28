@@ -54,20 +54,24 @@ pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetric
         // unless the reply names a side-chain block, which is a lost tip
         // race. A node-accepted lost race awaiting its orphan proof is
         // unfinished but acknowledged. The landing-failed age is the oldest
-        // reconciliation row whose audit landing has not committed (the
-        // landing transaction is the only writer of the pool-block row, so
-        // its absence is the durable fact) or whose last error names a
+        // offered or reconciliation row whose audit landing has not committed
+        // (the landing transaction is the only writer of the pool-block row,
+        // so its absence is the durable fact) or whose last error names a
         // landing refusal: a retry that fails for a transient reason
-        // overwrites the error but not the fact. It is measured from the
-        // offer reservation, the start of the post-offer lifecycle, so
-        // pre-offer backoff never counts toward it.
+        // overwrites the error but not the fact. An offered row still waiting
+        // for build capacity or its rebuild counts too (#510): each rebuild
+        // is bounded by the 60 s deadline, so a healthy one lands well inside
+        // the warning's dwell and only a landing that hangs waiting for build
+        // capacity before its first outcome reaches it. It is
+        // measured from the offer reservation, the start of the post-offer
+        // lifecycle, so pre-offer backoff never counts toward it.
         let age = |since: &str, rows: &str| format!(
             "COALESCE(GREATEST(0,extract(epoch FROM transaction_timestamp()-min({since}){rows})),0)::double precision"
         );
         const UNACKNOWLEDGED: &str = " FILTER (WHERE state IN ('pending','offer_reserved') \
             OR (offer_outcome='unknown' AND COALESCE(offer_reply,'') NOT LIKE $1) \
             OR (offer_outcome='rejected' AND COALESCE(offer_reply,'') <> ALL($3)))";
-        const LANDING_FAILED: &str = " FILTER (WHERE state='reconciliation' \
+        const LANDING_FAILED: &str = " FILTER (WHERE state IN ('offered','reconciliation') \
             AND (COALESCE(last_error,'') LIKE $2 \
                  OR NOT EXISTS (SELECT 1 FROM qbit_pool_blocks landed WHERE landed.block_hash=outbox.block_hash)))";
         let census = format!(

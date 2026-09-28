@@ -1089,6 +1089,11 @@ async fn candidate_collector_keeps_an_acknowledged_lost_race_out_of_the_paging_a
                 census.candidate_oldest_unacknowledged == Duration::ZERO,
                 "a node-accepted lost race counted as unacknowledged"
             );
+            // Its audit landed before the chain verdict (#510).
+            ensure!(
+                census.candidate_oldest_landing_failed == Duration::ZERO,
+                "a landed lost race counted as landing failed"
+            );
             // A found block the node has not been offered yet is unacknowledged.
             f.b.refresh_once().await?;
             let waiting = queue_block(&f.b).await?;
@@ -1428,6 +1433,108 @@ async fn persistently_failing_post_offer_observation_is_reported_from_the_offer_
             ensure!(landed);
             let census =
                 qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
+            ensure!(census.candidate_oldest > Duration::ZERO);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #510 item 1: a won block whose landing hangs in `offered` before its first
+/// landing outcome (here every build permit is held, so the rebuild waits
+/// with no deadline while the heartbeat keeps the claim) has no pool-block
+/// row and no reconciliation reason, and it is neither unacknowledged nor a
+/// pending delivery. The landing-failed age reports it from the offer
+/// reservation and keeps growing; once build capacity returns the audit
+/// lands and the age reads zero again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_offer_waiting_for_build_capacity_is_reported_from_the_offer_reservation(
+) -> Result<()> {
+    run(gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let claim = queue_block(&f.a).await?;
+            let hash = claim.candidate.block_hash.clone();
+            f.node.set_reply(
+                "submitblock",
+                serde_json::json!([hex::encode(&claim.candidate.block_bytes)]),
+                serde_json::Value::Null,
+            );
+            let held =
+                f.a.build_slots
+                    .clone()
+                    .acquire_many_owned(u32::try_from(f.a.config.build_workers)?)
+                    .await?;
+            ensure!(
+                f.a.build_slots.available_permits() == 0,
+                "the builders are not saturated"
+            );
+            let frontend = f.a.clone();
+            let process = tokio::spawn(async move { frontend.process_candidate(&claim).await });
+            timeout(Duration::from_secs(10), async {
+                while row_state(f, &hash).await? != "offered" {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("the accepted offer was never recorded")??;
+            let outcome: Option<String> = sqlx::query_scalar(
+                "SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(outcome.as_deref() == Some("accepted"), "{outcome:?}");
+            let first =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(first.candidates == 1);
+            ensure!(
+                first.candidate_oldest_landing_failed > Duration::ZERO,
+                "an accepted block whose landing hangs in offered was silent"
+            );
+            ensure!(first.candidate_oldest_landing_failed <= first.candidate_oldest);
+            ensure!(first.candidate_oldest_unacknowledged == Duration::ZERO);
+            ensure!(sample(&f.a.metrics, PENDING) == 0.);
+            ensure!(
+                sample(&f.a.metrics, UNLANDED) > 0.,
+                "the identity did not stay unlanded"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            ensure!(
+                row_state(f, &hash).await? == "offered" && !process.is_finished(),
+                "the landing did not wait for build capacity"
+            );
+            let second =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(
+                second.candidate_oldest_landing_failed > first.candidate_oldest_landing_failed,
+                "the landing-failed age did not keep growing while the row stayed offered"
+            );
+            ensure!(second.candidate_oldest_unacknowledged == Duration::ZERO);
+            f.a.metrics.publish_database(Some(second));
+            ensure!(
+                sample(
+                    &f.a.metrics,
+                    "qbit_prism_block_candidate_oldest_landing_failed_seconds"
+                ) > 0.
+            );
+            // Build capacity returns: the audit lands, and the block, not on
+            // the node's active chain, waits for its verdict in reconciliation.
+            drop(held);
+            timeout(Duration::from_secs(10), process).await???;
+            ensure!(row_state(f, &hash).await? == "reconciliation");
+            let landed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1)",
+            )
+            .bind(&hash)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(landed);
+            let census =
+                qbit_prism_server::metrics::collectors::database(f.pool(), &f.a.metrics).await?;
+            ensure!(census.candidates == 1);
             ensure!(census.candidate_oldest_landing_failed == Duration::ZERO);
             ensure!(census.candidate_oldest > Duration::ZERO);
             Ok(())
