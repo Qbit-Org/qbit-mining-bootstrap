@@ -432,6 +432,10 @@ qbit-prism-server::live_regtest::highdiff_tests::observability_grace_counter_mov
 qbit-prism-server::live_regtest::highdiff_tests::observed_tip_advance_fences_old_prepared_jobs_and_health
 qbit-prism-server::live_regtest::highdiff_tests::real_highdiff_block_only_proof_waits_for_active_chain_credit
 qbit-prism-server::live_regtest::highdiff_tests::real_share_height_queries_use_template_parent_height
+qbit-prism-server::live_regtest::node_outage_tests::node_killed_after_accepting_reconciles_the_lost_block_once
+qbit-prism-server::live_regtest::node_outage_tests::node_killed_before_submitblock_never_reoffers_the_unsent_block_known_defect
+qbit-prism-server::live_regtest::node_outage_tests::node_stopped_after_accepting_lands_the_block_once_after_resume
+qbit-prism-server::live_regtest::node_outage_tests::node_stopped_before_submitblock_lands_the_block_once_after_resume
 qbit-prism-server::live_regtest::real_ctv_maturity_broadcast_and_confirmation
 qbit-prism-server::live_regtest::real_two_server_mining_failover_audit_and_reorg
 qbit-prism-server::lost_race_pin::a_failed_observation_never_settles_a_row_as_orphaned
