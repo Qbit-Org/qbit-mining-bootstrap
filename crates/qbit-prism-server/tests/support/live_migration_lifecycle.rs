@@ -8,8 +8,10 @@
 //! 1. the drained source's evidence and a `pg_dump` backup (step 2);
 //! 2. the backup restored into an isolated database, reconciling exactly
 //!    with the source before any native acknowledgement (step 3);
-//! 3. `migrate` and `import-audits` on the source, reconciling exactly again
-//!    and serving every historical artifact byte for byte (steps 4 and 5);
+//! 3. `migrate` and `import-audits` rehearsed on a second isolated restore
+//!    (step 4), then run on the source for the cutover, each reconciling
+//!    exactly with the source and serving every historical artifact byte for
+//!    byte (step 5);
 //! 4. both native servers started on the migrated ledger, mining on the real
 //!    node until their own blocks land, with the history untouched and
 //!    continued: sequences, publication order and carry integrity (step 7's
@@ -85,20 +87,25 @@ async fn weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation() 
     let database = inputs.remove(1);
     let qbitd = inputs.remove(0);
     let mut fixture = Fixture::open_with_inputs(qbitd, &database, false, false).await?;
+    // Two isolated restores of the backup: one stays the pre-migration
+    // database for the rollback, the other rehearses the migration.
     let restored = recovery::Database::open(&database).await;
-    let result = match &restored {
-        Ok(restored) => run(&mut fixture, restored, &pg_bin).await,
-        Err(error) => Err(anyhow::anyhow!("isolated restore database: {error:#}")),
+    let rehearsal = recovery::Database::open(&database).await;
+    let result = match (&restored, &rehearsal) {
+        (Ok(restored), Ok(rehearsal)) => run(&mut fixture, restored, rehearsal, &pg_bin).await,
+        (Err(error), _) | (_, Err(error)) => {
+            Err(anyhow::anyhow!("isolated restore database: {error:#}"))
+        }
     };
     if result.is_err() {
         eprintln!("{}", fixture.diagnostics());
     }
     let cleanup = fixture.cleanup().await;
-    let restored = match restored {
-        Ok(restored) => restored.close().await,
-        Err(_) => Ok(()),
-    };
-    result.and(cleanup).and(restored)
+    let mut closed = Ok(());
+    for database in [restored, rehearsal].into_iter().flatten() {
+        closed = closed.and(database.close().await);
+    }
+    result.and(cleanup).and(closed)
 }
 
 /// The phases' wall times, printed as the rehearsal records them.
@@ -113,7 +120,12 @@ impl Timings {
     }
 }
 
-async fn run(fixture: &mut Fixture, restored: &recovery::Database, pg_bin: &Path) -> Result<()> {
+async fn run(
+    fixture: &mut Fixture,
+    restored: &recovery::Database,
+    rehearsal: &recovery::Database,
+    pg_bin: &Path,
+) -> Result<()> {
     let mut timings = Timings::default();
     let artifacts_dir = tempfile::tempdir()?;
     let legacy = timings
@@ -159,29 +171,36 @@ async fn run(fixture: &mut Fixture, restored: &recovery::Database, pg_bin: &Path
         "the isolated restore must be the pre-migration database"
     );
 
-    // Steps 4 and 5: forward migration and the audit import, reconciled
-    // before any native traffic, and canonical reads of every artifact.
-    let migrated = timings.time("migrate", fixture.tool(&["migrate"])).await?;
-    ensure!(
-        migrated.contains("database source:") && !migrated.contains("unrecorded"),
-        "migrate did not record the 2.x.x source: {migrated}"
-    );
-    let imported = timings
+    // Step 4: the forward migration and the audit import rehearsed on a
+    // second isolated restore of the same backup, reconciled exactly, with
+    // canonical reads of every artifact (step 5).
+    timings
         .time(
-            "import-audits",
-            fixture.tool(&[
-                "import-audits",
-                "--root",
-                &artifacts_dir.path().to_string_lossy(),
-            ]),
+            "rehearsal restore",
+            recovery::restore(&archive, &source, rehearsal, pg_bin),
+        )
+        .await?;
+    let artifacts_root = artifacts_dir.path().to_string_lossy().into_owned();
+    timings
+        .time(
+            "rehearsal migrate and import",
+            migrate_and_import(fixture, &rehearsal.url, &artifacts_root),
         )
         .await?;
     ensure!(
-        imported.contains(&format!("Imported {LEGACY_BLOCKS} audit bodies"))
-            && imported.contains("\"missing_stored_bodies\":0")
-            && imported.contains("\"missing_canonical_bytes\":0"),
-        "import-audits left history incomplete: {imported}"
+        recovery::evidence(rehearsal, pg_bin).await? == source_evidence,
+        "the rehearsed migration and import changed the reconciled history"
     );
+    recovery::assert_artifacts(&rehearsal.pool, &legacy.artifacts).await?;
+
+    // The cutover: the same commands on the source, reconciled again before
+    // any native traffic.
+    timings
+        .time(
+            "migrate and import",
+            migrate_and_import(fixture, &fixture.database_url, &artifacts_root),
+        )
+        .await?;
     ensure!(
         recovery::evidence(&source, pg_bin).await? == source_evidence,
         "migration and import changed the reconciled history"
@@ -259,7 +278,10 @@ async fn run(fixture: &mut Fixture, restored: &recovery::Database, pg_bin: &Path
         verify_native_audit(fixture, hash).await?;
     }
     let self_check = timings
-        .time("self-check", fixture.tool(&["self-check"]))
+        .time(
+            "self-check",
+            fixture.tool(&fixture.database_url, &["self-check"]),
+        )
         .await?;
     let self_check: Value = serde_json::from_str(&self_check)?;
     ensure!(
@@ -338,6 +360,26 @@ async fn run(fixture: &mut Fixture, restored: &recovery::Database, pg_bin: &Path
         tail.len(),
         native.len(),
         phases.join(", ")
+    );
+    Ok(())
+}
+
+/// `migrate` then `import-audits` against `database_url`, as the runbook
+/// runs them, requiring the recorded 2.x.x source and complete history.
+async fn migrate_and_import(fixture: &Fixture, database_url: &str, root: &str) -> Result<()> {
+    let migrated = fixture.tool(database_url, &["migrate"]).await?;
+    ensure!(
+        migrated.contains("database source:") && !migrated.contains("unrecorded"),
+        "migrate did not record the 2.x.x source: {migrated}"
+    );
+    let imported = fixture
+        .tool(database_url, &["import-audits", "--root", root])
+        .await?;
+    ensure!(
+        imported.contains(&format!("Imported {LEGACY_BLOCKS} audit bodies"))
+            && imported.contains("\"missing_stored_bodies\":0")
+            && imported.contains("\"missing_canonical_bytes\":0"),
+        "import-audits left history incomplete: {imported}"
     );
     Ok(())
 }
@@ -704,16 +746,19 @@ async fn assert_legacy_revert_refuses(fixture: &Fixture) -> Result<()> {
 
 impl Fixture {
     /// Runs an operator subcommand of the server binary with server 0's
-    /// settings, as the runbook runs it beside the frontends, and returns
-    /// its standard output. The migrated ledger's writer key is the one the
-    /// history was signed with.
-    async fn tool(&self, args: &[&str]) -> Result<String> {
+    /// settings against `database_url`, as the runbook runs it beside the
+    /// frontends, and returns its standard output. The migrated ledger's
+    /// writer key is the one the history was signed with.
+    async fn tool(&self, database_url: &str, args: &[&str]) -> Result<String> {
         let ledger_public_key =
             ManifestSigningKey::from_seed_hex(&LEDGER_SEED.repeat(32))?.public_key_hex();
         let mut command = self.server_command(
             0,
             None,
-            &[("PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX", ledger_public_key)],
+            &[
+                ("PRISM_DATABASE_URL", database_url.to_owned()),
+                ("PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX", ledger_public_key),
+            ],
         );
         command.args(args).stdin(Stdio::null());
         let output = tokio::time::timeout(
