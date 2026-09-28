@@ -756,3 +756,4 @@ qbit-prism-server::window_reference::payout_state::timeout_and_cancelled_balance
 qbit-prism-server::window_reference::payout_state::unavailable_read_only_and_corrupt_balances_remain_errors
 qbit-prism-server::window_reference::revision_balances_and_pages_use_one_repeatable_read_snapshot
 qbit-prism-server::window_reference::window_sql_check_accepts_exactly_the_three_null_states
+qbit-prism-server::work_refresh_metric::failing_refreshes_grow_the_refresh_stall_gauge_while_coverage_reads_one

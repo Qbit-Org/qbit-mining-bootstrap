@@ -29,8 +29,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 64);
-    assert_eq!(startup_census.series.len(), 244);
+    assert_eq!(startup_census.families.len(), 65);
+    assert_eq!(startup_census.series.len(), 245);
     assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
     assert_eq!(
         sample(&startup, "qbit_prism_node_observation_age_seconds"),
@@ -139,8 +139,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 64);
-        assert_eq!(populated.series.len(), 679);
+        assert_eq!(populated.families.len(), 65);
+        assert_eq!(populated.series.len(), 680);
         assert_eq!(
             sample(&body, "qbit_prism_node_peers"),
             if known {

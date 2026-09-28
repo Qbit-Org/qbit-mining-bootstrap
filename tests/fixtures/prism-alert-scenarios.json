@@ -2993,5 +2993,116 @@
       "PrismDatabaseAdvisoryLockWaitHigh": 2,
       "PrismDatabaseAdvisoryLockFailuresCritical": 2
     }
+  },
+  {
+    "name": "#525 a refresh that keeps failing pages while semantic coverage reads one",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x59 0+1x600",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "4m30s",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": 1,
+      "PrismSemanticWorkCoverageLossCritical": 0
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismSemanticWorkCoverageLossCritical": []
+    }
+  },
+  {
+    "name": "#525 a refresh that keeps failing is pending inside the paging dwell",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x59 0+1x600",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "3m30s",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": 1,
+      "PrismSemanticWorkCoverageLossCritical": 0
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": []
+    }
+  },
+  {
+    "name": "#525 a successful refresh resolves the page",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x59 0+1x200 0x400",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "8m",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": 0
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": []
+    }
+  },
+  {
+    "name": "#525 refreshes that succeed within 120 seconds never page",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x110 0+1x110 0+1x110 0+1x110 0x160",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": 0
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": []
+    }
+  },
+  {
+    "name": "#525 an unpublished refresh age never pages",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "-1x600",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": 0
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": []
+    }
+  },
+  {
+    "name": "#525 a stale snapshot leaves the refresh rule to the snapshot rules",
+    "series": {
+      "qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x600",
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismWorkRefreshStalledCritical": null
+    },
+    "alerts": {
+      "PrismWorkRefreshStalledCritical": []
+    }
   }
 ]

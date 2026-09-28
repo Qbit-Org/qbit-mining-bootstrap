@@ -340,6 +340,32 @@
       ]
     },
     {
+      "uid": "qbit-prism-work-refresh-stalled-critical",
+      "title": "PrismWorkRefreshStalledCritical",
+      "role": "run",
+      "expr": "(qbit_prism_work_refresh_stalled_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 120) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismWorkRefreshStalledCritical",
+      "description": "This frontend's template refresh has not succeeded for 120 seconds, so it has neither published nor revalidated work: share and block admission already refuse once readiness is older than the health timeout, so every miner on it is stalled whatever the cause. That covers #525 on either settlement path, where a pool without a fee cannot settle sub-floor dust and every build fails with PayoutExceedsCandidateBalance, whether the dust meets a new tip or a same-parent rebuild; it also covers a refresh that fails before its tip observation or hangs. Semantic coverage cannot see this: it compares sessions with the latest published generation, which stays put while every refresh fails. A healthy refresh succeeds every poll interval (2 s by default, and within the health timeout for the frontend to be ready at all); 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS). One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend without working refreshes is stalled for every miner that connects. A node still syncing or short of peers also pages here, since it builds no work. -1 (not yet published) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements, and a draining process stops its snapshot. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "This frontend's template refresh has not succeeded for 120 seconds, so it has neither published nor revalidated work: share and block admission already refuse once readiness is older than the health timeout, so every miner on it is stalled whatever the cause. That covers #525 on either settlement path, where a pool without a fee cannot settle sub-floor dust and every build fails with PayoutExceedsCandidateBalance, whether the dust meets a new tip or a same-parent rebuild; it also covers a refresh that fails before its tip observation or hangs. Semantic coverage cannot see this: it compares sessions with the latest published generation, which stays put while every refresh fails. A healthy refresh succeeds every poll interval (2 s by default, and within the health timeout for the frontend to be ready at all); 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS). One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend without working refreshes is stalled for every miner that connects. A node still syncing or short of peers also pages here, since it builds no work. -1 (not yet published) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements, and a draining process stops its snapshot. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/coordinator.rs",
+        "crates/qbit-prism-server/src/server.rs"
+      ]
+    },
+    {
       "uid": "qbit-prism-work-metrics-unavailable",
       "title": "PrismWorkMetricsUnavailable",
       "role": "run",

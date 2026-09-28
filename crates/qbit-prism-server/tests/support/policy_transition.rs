@@ -22,6 +22,15 @@ async fn setup_ctv(db: &Database, ctv: bool) -> Result<(Ledger, Ledger, fake::Fa
     config.ctv_enabled = ctv;
     if ctv {
         config.ctv_fee = Some(qbit_prism::FanoutFeeRatePolicy::new(1, 12000));
+        // #525: CTV settlement runs only with a pool fee; `CTV_POOL_FEE_ENV`
+        // configures this same 0 bps fee in the CLI's environment.
+        let [_, _, (_, recipient), (_, program)] = CTV_POOL_FEE_ENV;
+        config.payout_policy.pool_fee_policy = Some(qbit_prism::PoolFeePolicy {
+            fee_bps: 0,
+            recipient_id: recipient.into(),
+            order_key: recipient.into(),
+            p2mr_program_hex: program.into(),
+        });
     }
     let a = db.ledger("frontend-a").await?;
     let b = db.ledger("frontend-b").await?;
@@ -35,6 +44,16 @@ async fn setup_ctv(db: &Database, ctv: bool) -> Result<(Ledger, Ledger, fake::Fa
     }
     Ok((a, b, node, config))
 }
+
+const CTV_POOL_FEE_ENV: [(&str, &str); 4] = [
+    ("PRISM_POOL_FEE_ENABLED", "1"),
+    ("PRISM_POOL_FEE_BPS", "0"),
+    ("PRISM_POOL_FEE_RECIPIENT_ID", "ctv-pool-fee"),
+    (
+        "PRISM_POOL_FEE_P2MR_PROGRAM_HEX",
+        "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe",
+    ),
+];
 
 fn changed_fee(config: &Config) -> Config {
     let mut next = config.clone();
@@ -66,7 +85,8 @@ async fn ctv_fee_transition_can_repair_a_rate_below_the_live_floor() -> Result<(
         let mut command = cli(&db, &node, &path);
         command
             .env("PRISM_CTV_SETTLEMENT_ENABLED", "1")
-            .env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", "1");
+            .env("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT", "1")
+            .envs(CTV_POOL_FEE_ENV);
         command
     };
     let output = run().output().await?;

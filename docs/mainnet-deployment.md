@@ -441,6 +441,16 @@ For a 1 bit/vbyte launch floor, set the market-rate input to `1000`; the default
 preflight also rejects a configured rate below the node's relay or mempool fee
 floor.
 
+CTV settlement requires a pool fee (#525), `PRISM_POOL_FEE_BPS=0` included;
+without one the first sub-floor balance stops all work, so the frontend
+refuses to start:
+
+```dotenv
+PRISM_POOL_FEE_ENABLED=1
+PRISM_POOL_FEE_BPS=0
+PRISM_POOL_FEE_ADDRESS=<reviewed P2MR fee address>
+```
+
 When the committed parent transaction already pays its fee, broadcasting is
 walletless:
 

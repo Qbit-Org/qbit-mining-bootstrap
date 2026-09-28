@@ -120,10 +120,23 @@ These are pool/miner compatibility policies. The hard settlement ceiling is
 `PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION`, and
 `PRISM_CTV_FANOUT_FEE_PREMIUM_BPS`.
 
-An optional explicit pool fee is governed by `PRISM_POOL_FEE_*`. Output order is
+An explicit pool fee is governed by `PRISM_POOL_FEE_*`. Output order is
 `canonical` by default; `PRISM_COINBASE_OUTPUT_POLICY=pool-fee-first` requires a
 configured pool fee. Fee policy and output order are part of the shared cluster
 fingerprint and signed audit evidence.
+
+The pool fee is also what settles dust. Only balances that reach the payout
+floor are paid, so any positive balance below it leaves the paid balances short
+of the coinbase, and only a pool fee, at any rate, can take the difference.
+Without one, every work build fails from the first sub-floor balance until it
+reaches the floor or its shares leave the window, and mining stops (#525).
+`PRISM_CTV_SETTLEMENT_ENABLED=1` therefore requires `PRISM_POOL_FEE_ENABLED=1`;
+`PRISM_POOL_FEE_BPS=0` is allowed and pays nothing until dust must be swept.
+`run`, `check-config`, `self-check` and `make doctor` refuse the combination.
+Direct settlement has the same exposure and is not yet refused (#535), so
+enable a fee there as well. Whatever the cause, a frontend whose template refresh has not
+succeeded for two minutes, so it serves no current work, pages through
+`PrismWorkRefreshStalledCritical`.
 
 Coinbase maturity is 1,000 blocks. Immature disconnected blocks stop
 contributing to current balances and can reactivate. Terminal reversal retains

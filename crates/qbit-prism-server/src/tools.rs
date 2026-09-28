@@ -295,6 +295,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         Command::CheckConfig => {
             config::check_environment()?;
             let config = Config::from_env()?;
+            config.ensure_pool_fee_settles_dust()?;
             crate::rollups::settings_from_env()?;
             crate::partitions::settings_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
@@ -1511,8 +1512,13 @@ async fn self_check() -> Result<()> {
                 completeness.require_complete()?;
             }
         }
+        // #525: a refused payout policy fails the check, but only after the
+        // local checks have filled in the report.
+        let pool_fee = config.ensure_pool_fee_settles_dust();
         // A failed heartbeat sample must not suppress the remaining local checks.
-        self_check_local(config, &mut report).await?;
+        let local = self_check_local(config, &mut report).await;
+        pool_fee?;
+        local?;
         completeness?;
         ensure!(
             report.live_instances.status != "failed",

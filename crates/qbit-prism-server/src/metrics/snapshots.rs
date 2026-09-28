@@ -102,6 +102,13 @@ impl Metrics {
             registry.set(family, vec![], value);
         }
     }
+    /// #525: how long this frontend's template refresh has kept failing.
+    /// Coverage cannot show this: it compares sessions with the latest
+    /// published generation, which stays put while every refresh fails.
+    pub fn publish_work_refresh_stalled(&self, age: Duration) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(Family::WorkRefreshStalled, vec![], age.as_secs_f64());
+    }
     /// Stratum delivery observations cannot overwrite the refresh owner's state.
     pub fn publish_delivery(&self, snapshot: DeliveryMetrics) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());

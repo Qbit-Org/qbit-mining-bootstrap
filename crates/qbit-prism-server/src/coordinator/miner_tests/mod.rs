@@ -345,6 +345,7 @@ impl Fixture {
             })),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
+            refreshed_at: std::sync::Mutex::new(Instant::now()),
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
             refresh_lock: Mutex::new(RefreshState::default()),

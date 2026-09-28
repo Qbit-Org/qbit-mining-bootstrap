@@ -146,6 +146,7 @@ pub fn expected(populated: bool) -> Census {
         "node_peers",
         "node_initial_block_download",
         "node_observation_age_seconds",
+        "work_refresh_stalled_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }

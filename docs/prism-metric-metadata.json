@@ -146,6 +146,9 @@
     "hashrate_rollup_watermark_lag_seconds": {
       "status": "The stored watermark is a share sequence, not a time; a caught-up pass is one that advanced the watermark within its batch bound, leaving no unfolded share. A pass that lost the race to another frontend leaves the stamp unchanged, so a frontend that keeps losing reads high: alert on the minimum across instances. -1 runs from loop start until its first such pass, and PRISM_HASHRATE_ROLLUP_ENABLED=0 leaves the family declared with no sample at all."
     },
+    "work_refresh_stalled_seconds": {
+      "status": "Stamped when Coordinator::refresh_once succeeds (#525), whether it published new work or revalidated the current work; that success is also the only thing that renews readiness, which share and block admission require within the health timeout. A healthy frontend reads at most about one poll interval. A refresh that keeps failing, on a new tip or the same parent (for example PayoutExceedsCandidateBalance when sub-floor dust exists without a pool fee, on either settlement path), or that hangs, grows it without bound, while semantic coverage keeps reading one because sessions still hold the latest published generation. Counted from coordinator start until the first success, so a restart into a stall still grows; -1 only before the health publisher first runs. Pages through PrismWorkRefreshStalledCritical."
+    },
     "share_ledger_partition_lead_rows": {
       "status": "max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it."
     },
