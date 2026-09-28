@@ -119,7 +119,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
 | `--window-shares` | 20000 | Shares pre-seeded into the payout window |
 | `--seed-share-bytes` | 581 | Serialized size of one seeded share |
-| `--plan` | `short` | `d1` or `short` |
+| `--plan` | `short` | `d1`, `short`, or `tips`: warm-up only, where the external tips are minted, with no artifact phase and so no artifact (the per-PR smoke run's plan; see [Presets and the nightly run](#presets-and-the-nightly-run)) |
 | `--rate` | 50 | Offered shares per second for the `short` plan |
 | `--max-outstanding-per-session` | 1 | The server answers one request per session at a time |
 | `--warmup-seconds` | 30 | Warm-up before the first artifact phase; not in the artifact |
@@ -149,6 +149,14 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--lock-sample-interval-ms` | 10 | PRISM advisory-lock sampling cadence, 1..1000 ms. One poll covers both sampled locks |
 | `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence, 50..60000 ms |
 | `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this. A floor the host cannot measure (no readable `MemAvailable` in `/proc/meminfo`, as on macOS) is refused at entry; `0` asks for no floor |
+| `--seed` | 1 | Seed for every random draw the realism flags below make. The same seed and flags generate the same population, window and schedule |
+| `--recipients` | none | Distinct payout addresses across the live sessions and the seeded window. Omitted, every live session uses one address and the window keeps its five round-robin recipients, as every earlier run did. See [Population realism](#population-realism-521) |
+| `--recipient-weights` | `uniform` | How work is spread over the addresses: `uniform`, `zipf:<s>`, `pareto:<alpha>`, or `whale:<fraction>+<one of those>`. Needs `--recipients` unless `uniform` |
+| `--session-hashrate-sigma` | 0 | Lognormal spread of hashrate between sessions (sigma of the log) |
+| `--session-difficulty` | `fixed` | `fixed`, or `vardiff:<max ratio>`: each session's share difficulty in proportion to its hashrate, asked for with `d=` in its Stratum password |
+| `--pool-fee-bps` | 0 | Launch every frontend with the pool fee on at this many basis points and a fee address of the run's own, as mainnet runs; dust below the payout floor is then swept to the fee rather than refusing the template (#525). 0 leaves the fee off, as every earlier run had it |
+| `--arrival` | `smooth` | `smooth`, or `bursty:cv1=<x>,cv60=<y>,max=<m>`: the offered rate varies per second and per minute around each phase's rate |
+| `--preset` | none | A checked-in preset whose flags join the command line; a flag it sets cannot be given again |
 | `--out` | `load-out` | Output directory |
 | `--keep-artifacts` | off | Keep cluster data directories and logs |
 
@@ -519,6 +527,147 @@ target/release/qbit-prism-load \
   --cadence dense --scheduled-blocks 12 \
   --out load-out
 ```
+
+## Population realism (#521)
+
+By default every live session mines for one payout address, the seeded window
+holds five round-robin recipients that are not that address, every session
+mines one share difficulty, the scheduler places offers round-robin, and the
+offered rate is a smooth token bucket. Production is none of those: on mainnet
+2.x.x between 2026-07-15 and 2026-09-28, 11-126 payout identities a day
+mined, one whale often held 82-98% of the work, worker difficulty spanned about
+three orders of magnitude, and the pool's share rate had a coefficient of
+variation of 0.65-1.24. The realism flags model that, and every one of them
+defaults to the old shape: a run that names none takes the old code paths,
+so its usernames, passwords, window rows and schedule are byte-for-byte what
+they were.
+
+- **Addresses.** `--recipients N` gives the run N addresses,
+  `<run address>rNNNNN`, each valid at the fake node, weighted by
+  `--recipient-weights`. Sessions are apportioned by weight (largest
+  remainder, one each first when there are at least as many sessions as
+  addresses), so the whale holds most sessions.
+- **The window is the live sessions' recipients.** Each seeded share's
+  recipient is drawn by weight from the seed's own stream, its miner and order
+  key are the address, and its program is the one the server derives from the
+  address, so a payout merges window and live shares per recipient as
+  production does. Shares stay the production size (`--seed-share-bytes`),
+  padded in the share id.
+- **Hashrate and difficulty.** A session's hashrate is its address's weight
+  over its session count, times the `--session-hashrate-sigma` jitter,
+  normalised to a mean of 1. Under `--session-difficulty vardiff:<ratio>` its
+  difficulty is its hashrate over the slowest session's, capped at the ratio,
+  and the session asks for it with `d=<difficulty>` in its password, which the
+  server honours with vardiff off; the client mines against it and checks
+  `mining.set_difficulty` against it, so a server that ignored the request
+  contradicts the premise (exit 8). The configured difficulty is the
+  window's solved difficulty over the average offered share's multiplier, so
+  the average live share weighs what a seeded share does and the window stays
+  `--window-shares` long; without that a whale's shares, up to the ratio
+  times heavier, displace the seeded window within a minute. A ratio the run
+  cannot serve is refused at entry: one above the frontends' `PRISM_STRATUM_VARDIFF_MAX_DIFF` (1024), or
+  one whose hardest share would weigh over an eighth of a block, which would
+  make the client discard a block solution every few shares.
+- **Offer placement.** Offers are placed by each session's share rate,
+  hashrate over difficulty, from a seeded stream, and fall back to the
+  round-robin scan when the drawn session is at its outstanding limit, so an
+  offer is a shortfall only when every session is busy, as before. A converged
+  vardiff gives every unclamped session the same share rate, so under vardiff
+  the placement stays round-robin and the skew is in the work each share
+  carries; `fixed` difficulty with skewed hashrates places by hashrate.
+- **Bursty arrival.** `--arrival bursty:cv1=<x>,cv60=<y>,max=<m>` multiplies
+  each phase's rate by a mean-1 factor that changes every second: a per-minute
+  lognormal factor with coefficient of variation `cv60` times a per-second one
+  with `cv1`, capped at `m` times the rate (the preset's peak). The cap lowers
+  the realised mean a little; the report states what was realised.
+
+The side report's `population` block records the seed, the distributions
+asked for, and what was generated and driven: per-address concentration
+(top-1 and top-10 shares and the Gini coefficient) of the generated weights,
+the sessions, the seeded window shares, and the accepted live shares and work;
+the ten heaviest addresses; and the session hashrate, difficulty multiplier and
+offer weight, with the difficulty spread in orders of magnitude. Each phase's
+`arrival` block records the offers minted and placed per second, their
+coefficient of variation over 1 s and 60 s windows (`null` when fewer than two
+windows fit), and the peak second.
+
+## Presets and the nightly run
+
+`crates/qbit-prism-load/presets/*.json` pins runs by name. A preset states
+every flag a result depends on, `null` only where omitting the flag is itself
+the choice (`--database-url`, the short and tips plans' `--burst-seconds` and
+`--burst-rate`, and `--recipients`); the operational flags (`--server-bin`,
+`--pg-bin-dir`, `--out`, `--keep-artifacts` and the `--allow-*` overrides)
+stay on the command line, and only they: the harness refuses any flag the
+preset pins, whether it sets it, pins it off or leaves it null. The harness refuses a preset that omits a flag or
+leaves one to a default, and a test holds every checked-in preset to the same
+rule against the harness's own flag list, so a new flag cannot be added
+without every preset stating it. `--preset <file>` adds the preset's flags to
+the command line, where clap refuses any of them given again, and the side
+report's `preset` block records its name, path, SHA-256 and gates.
+
+A preset also names the runner it needs, its timeout, when it runs, and its
+`gates`, every key stated (`null` where it does not gate):
+
+| Gate | Meaning |
+|---|---|
+| (always) | the harness exited 0 (completed and reconciled exactly), no durability finding, no acknowledged share missing from PostgreSQL. A committed share without an acknowledgement is reported beside its explanation (a no-response the drain cut off, a divergence, an unknown outcome); an unexplained one is a durability finding and a divergence inside the run exits 5 |
+| `phases` | the phases the per-phase checks gate; `null` is every phase driven. The rest are reported, not gated |
+| `max_shortfall` | offers no session could take, per gated phase |
+| `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
+| `tip_last_notify_p99_budget_ms` | per external tip, the slowest session's time to usable work (`time_to_usable_work.tips[].all_sessions_milliseconds`); the p99 over the tips, nearest rank. A tip some session never got work on fails |
+| `d1_verdict_table` | print #473's D1 verdict table, in its columns, for `steady_state` and `burst` |
+
+| Preset | Runs | Runner | What it is |
+|---|---|---|---|
+| `d1-20k`, `d1-20k-realistic` | nightly | 8 vCPU | #271's D1 20k fixture (`w11-20k-fe1-async`, its pre-#497 admission 2,016), and the same with 500 addresses under Zipf(1.1) |
+| `tip-275`, `tip-275-realistic` | nightly | 8 vCPU | #275's tip-delivery benchmark in realistic mode (2 frontends, 2,000 sessions, 400k window, 8 retargeting tips 45 s apart over 133 shares/s), and the same with 500 Zipf(1.1) addresses |
+| `d1-473-400k-fe1-async` | nightly | 8 vCPU | PR #473's production-window D1 baseline cell, exactly as it ran it on `a1937054` (admission `sessions_per_frontend + 16`, from before #497) |
+| `d1-473-400k-fe{2,4}-async`, `d1-473-400k-fe2-sync`, `d1-473-200k-fe1-async`, `d1-473-500k-fe{1,2,4}-async` | manual | 16 vCPU | #473's other cells, likewise |
+| `mainnet-floor` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
+| `growth-5x` | nightly | 8 vCPU | mainnet-floor with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
+| `growth-20x` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
+| `smoke` | every PR | 2 vCPU | the per-PR smoke run below |
+
+The realism presets (`mainnet-floor`, `growth-5x`, `growth-20x`) run
+mainnet's 200 bps pool fee; every legacy preset runs with the fee off, as it
+was measured. The nightly schedule runs on 8 vCPU runners only.
+
+The D1 presets hold the 500 shares/s phase to #473's rule and report the
+2,000 shares/s burst in the verdict table without gating it: #473 found no
+configuration that meets it. Their tip times are reported, not gated, as in
+#473. The other presets gate warm-up, `steady_state` and `reconnect`;
+`slow_database` is the deliberately degraded database, whose backlog is its
+measurement, and is reported.
+
+`.github/workflows/prism-load-nightly.yml` runs the nightly presets every
+night and any selection on demand (`preset`: names, `nightly` or `all`;
+`ref`; and overrides of the tip budget and the shortfall budget). Each preset
+runs on its own runner through `.github/scripts/prism-load-run.sh`, which
+records `pg_test_fsync` on the filesystem the harness builds its cluster on,
+runs the preset, and gates it with `qbit-prism-load-gate`; the verdict table
+goes to the job summary and the reports to an artifact. The same script
+reproduces a nightly run anywhere:
+
+```sh
+cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+.github/scripts/prism-load-run.sh mainnet-floor load-out
+```
+
+The same workflow's `live-nightly` job runs the opt-in `#[ignore]`
+`live_regtest` variants listed in `test/prism-nightly-gated-tests.txt`
+(#523's qbitd `-reindex` crash variant and #524's 130-payee weighted
+recipients today) with `--ignored --exact`
+against a real qbitd and PostgreSQL 16, and proves each executed with
+`scripts/check_gate_manifest.py`, as the PR suite proves its own list.
+
+The per-PR smoke run is the gated test `tests/load_smoke.rs`: the `smoke`
+preset (a debug frontend, 100 sessions over 20 addresses under a 60% whale
+and a Zipf tail with a two-order difficulty spread, a 20k window, 3
+retargeting tips 4.8 s apart in the tips plan) held to its gates, every
+session served on every tip within 5 s. It builds the debug server itself
+and adds about a minute to its CI shard (22 s to build the server beside the
+test's own build, 30 s to run).
 
 ## Exit codes
 
@@ -1156,11 +1305,16 @@ generator and its entry validation, the attribution of synthetic rejections and
 bumps to landings (including the unattributed ones), the no-landing
 report, the entry refusal of a memory floor the host cannot measure, the
 `pg_stat_statements` library under either suffix, and the refusal of a cluster
-root too deep for PostgreSQL's socket.
+root too deep for PostgreSQL's socket. `tests/realism.rs` covers the realism
+flags' parsing and refusals, the default population's byte-for-byte legacy
+shape, the generated skew, windows and bursts, every checked-in preset's
+completeness and validity, #473's cells and rule, and the gate and its
+#473-format table.
 
 The gated tests start the managed cluster against real PostgreSQL 16 server
 binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
 skip without them: the quorum-standby detection in `tests/quorum_replication.rs`,
-and in `tests/harness.rs` a cluster that fails to start, whose error has to
-carry PostgreSQL's own reason. Run them with
+in `tests/harness.rs` a cluster that fails to start, whose error has to
+carry PostgreSQL's own reason, and the per-PR smoke run in
+`tests/load_smoke.rs`. Run them with
 `test/prism-native-tests.sh cargo-args --locked -p qbit-prism-load --test <name>`.

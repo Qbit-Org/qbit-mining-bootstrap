@@ -42,6 +42,8 @@ pub const DEFAULT_SEED_SHARE_BYTES: usize = 581;
 const JOB_ISSUED_AT_BASE_MS: i64 = 1_700_000_000_000;
 const ACCEPTED_AT_OFFSET_MS: i64 = 1;
 const RECIPIENTS: u64 = 5;
+/// The seeded window's recipients when the run names no `--recipients`.
+pub const LEGACY_RECIPIENTS: u64 = RECIPIENTS;
 /// Display metadata on the row; unrelated to the window weight.
 const ROW_NETWORK_DIFFICULTY: u128 = 1000;
 const TEMPLATE_HEIGHT: u64 = 100;
@@ -222,6 +224,43 @@ fn refine(seed: f64, scaled: u128, network_target: &BigUint) -> Result<Option<f6
     Ok(None)
 }
 
+/// The seeded window's payout addresses under `--recipients` (#521): each
+/// share's miner and order key are its address, and its program is the one
+/// the server derives from the address, so the window's recipients are the
+/// live sessions' recipients and a payout merges them as production does.
+#[derive(Clone, Debug)]
+pub struct SeedRecipients {
+    pub addresses: Vec<String>,
+    /// `p2mr_program_hex` for each address: the fake node's `scriptPubKey`
+    /// without its `5220` prefix, as `coordinator.rs` strips it.
+    pub programs: Vec<String>,
+    /// The recipient of share `i` (1-based) at position `i - 1`.
+    pub assignments: Vec<u32>,
+}
+
+impl SeedRecipients {
+    pub fn new(addresses: Vec<String>, assignments: Vec<u32>) -> Self {
+        let programs = addresses
+            .iter()
+            .map(|address| crate::node::NodeState::payout_script_hex(address)[4..].to_owned())
+            .collect();
+        Self {
+            addresses,
+            programs,
+            assignments,
+        }
+    }
+
+    /// Seeded shares per address, in address order.
+    pub fn counts(&self) -> Vec<u64> {
+        let mut counts = vec![0u64; self.addresses.len()];
+        for recipient in &self.assignments {
+            counts[*recipient as usize] += 1;
+        }
+        counts
+    }
+}
+
 /// A window of exactly `share_count` production-shaped shares, all carrying the
 /// live scaled share difficulty.
 #[derive(Clone, Debug)]
@@ -230,7 +269,11 @@ pub struct SeedPlan {
     share_difficulty: u128,
     network_difficulty: u128,
     target_share_bytes: usize,
+    /// Padding that brings a share to `target_share_bytes`: in the miner id
+    /// for the legacy five recipients, in the share id under `--recipients`,
+    /// whose miner id has to be the address itself.
     miner_pad: usize,
+    recipients: Option<std::sync::Arc<SeedRecipients>>,
 }
 
 /// Throughput of one [`SeedPlan::load`].
@@ -249,7 +292,39 @@ impl SeedPlan {
         network_difficulty: u128,
         target_share_bytes: usize,
     ) -> Result<Self> {
+        Self::with_recipients(
+            share_count,
+            share_difficulty,
+            network_difficulty,
+            target_share_bytes,
+            None,
+        )
+    }
+
+    /// [`SeedPlan::new`] with the window's recipients drawn per share, or the
+    /// legacy five when `recipients` is `None`.
+    pub fn with_recipients(
+        share_count: u64,
+        share_difficulty: u128,
+        network_difficulty: u128,
+        target_share_bytes: usize,
+        recipients: Option<SeedRecipients>,
+    ) -> Result<Self> {
         ensure!(share_count > 0, "seed share count must be positive");
+        if let Some(recipients) = &recipients {
+            ensure!(
+                recipients.assignments.len() as u64 == share_count,
+                "{} recipient assignments for {share_count} seeded shares",
+                recipients.assignments.len()
+            );
+            ensure!(
+                recipients
+                    .assignments
+                    .iter()
+                    .all(|r| (*r as usize) < recipients.addresses.len()),
+                "a seeded share names a recipient that does not exist"
+            );
+        }
         ensure!(
             share_difficulty > 0,
             "seed share difficulty must be positive"
@@ -264,6 +339,7 @@ impl SeedPlan {
             network_difficulty,
             target_share_bytes,
             miner_pad: 0,
+            recipients: recipients.map(std::sync::Arc::new),
         };
         let bare = serde_json::to_vec(&plan.share(1))?.len();
         ensure!(
@@ -285,6 +361,21 @@ impl SeedPlan {
 
     pub fn target_share_bytes(&self) -> usize {
         self.target_share_bytes
+    }
+
+    pub fn recipients(&self) -> Option<&SeedRecipients> {
+        self.recipients.as_deref()
+    }
+
+    /// A seeded share's id under `--recipients`: the recipient, the padding
+    /// and the index, keeping the legacy id's non-ASCII character.
+    fn recipient_share_id(&self, recipient: u32, index: u64) -> String {
+        format!(
+            "{SEED_SHARE_ID_PREFIX}{recipient:05}:{}é{:0width$}",
+            "x".repeat(self.miner_pad),
+            index,
+            width = SHARE_ID_INDEX_WIDTH
+        )
     }
 
     fn miner_id(&self, index: u64) -> String {
@@ -310,6 +401,21 @@ impl SeedPlan {
 
     /// The share the seed writes at `share_seq == index` (1-based).
     pub fn share(&self, index: u64) -> AcceptedShare {
+        if let Some(recipients) = &self.recipients {
+            let recipient = recipients.assignments[(index - 1) as usize];
+            let address = recipients.addresses[recipient as usize].clone();
+            return AcceptedShare {
+                share_id: self.recipient_share_id(recipient, index),
+                miner_id: address.clone(),
+                order_key: address,
+                p2mr_program_hex: recipients.programs[recipient as usize].clone(),
+                ..self.legacy_share(index)
+            };
+        }
+        self.legacy_share(index)
+    }
+
+    fn legacy_share(&self, index: u64) -> AcceptedShare {
         AcceptedShare {
             share_seq: index,
             share_id: Self::share_id(index),
@@ -355,6 +461,97 @@ impl SeedPlan {
             "the window seed needs an empty qbit_share_ledger, found {existing} rows"
         );
         let started = Instant::now();
+        if let Some(recipients) = &self.recipients {
+            self.load_recipients(pool, writer_id, recipients).await?;
+        } else {
+            self.load_legacy(pool, writer_id).await?;
+        }
+        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
+            .bind(i64::try_from(self.share_count)?)
+            .execute(pool)
+            .await?;
+        let seconds = started.elapsed().as_secs_f64();
+        let serialized_bytes =
+            (self.average_share_bytes()? * self.share_count as f64).round() as u64;
+        Ok(SeedStats {
+            rows: self.share_count,
+            seconds,
+            rows_per_second: self.share_count as f64 / seconds.max(f64::MIN_POSITIVE),
+            serialized_bytes,
+        })
+    }
+
+    /// The rows [`SeedPlan::share`] describes under `--recipients`, in the
+    /// same batches as the legacy load, each row's recipient read out of the
+    /// batch's slice of the assignment.
+    async fn load_recipients(
+        &self,
+        pool: &PgPool,
+        writer_id: &str,
+        recipients: &SeedRecipients,
+    ) -> Result<()> {
+        let mut first = 1u64;
+        while first <= self.share_count {
+            let last = (first + LOAD_BATCH_ROWS - 1).min(self.share_count);
+            let slice: Vec<i32> = recipients.assignments[(first - 1) as usize..last as usize]
+                .iter()
+                .map(|recipient| *recipient as i32)
+                .collect();
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,\
+                 p2mr_program,share_difficulty,network_difficulty,template_height,job_id,\
+                 job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
+                 SELECT i,\
+                 $13||lpad(r::text,5,'0')||':'||$4||'é'||lpad(i::text,$3,'0'),\
+                 ($15::text[])[r+1],($15::text[])[r+1],\
+                 decode(($16::text[])[r+1],'hex'),\
+                 $5::text::numeric,$6::text::numeric,$7,$8,\
+                 to_timestamp(($9+i)::double precision/1000),$10,\
+                 to_timestamp(($11+i)::double precision/1000),\
+                 NULL,true,$12,0 \
+                 FROM generate_series($1::bigint,$2::bigint) AS g(i) \
+                 CROSS JOIN LATERAL (SELECT ($14::int4[])[i-$1+1] AS r) AS a",
+            )
+            .bind(i64::try_from(first)?)
+            .bind(i64::try_from(last)?)
+            .bind(i32::try_from(SHARE_ID_INDEX_WIDTH)?)
+            .bind("x".repeat(self.miner_pad))
+            .bind(self.share_difficulty.to_string())
+            .bind(ROW_NETWORK_DIFFICULTY.to_string())
+            .bind(i64::try_from(TEMPLATE_HEIGHT)?)
+            .bind(JOB_ID)
+            .bind(JOB_ISSUED_AT_BASE_MS)
+            .bind(1_700_000_000i64)
+            .bind(JOB_ISSUED_AT_BASE_MS + ACCEPTED_AT_OFFSET_MS)
+            .bind(writer_id)
+            .bind(SEED_SHARE_ID_PREFIX)
+            .bind(&slice)
+            .bind(&recipients.addresses)
+            .bind(&recipients.programs)
+            .execute(pool)
+            .await
+            .with_context(|| format!("loading seeded shares {first}..={last}"))?;
+            self.load_hashes(pool, first, last).await?;
+            first = last + 1;
+        }
+        Ok(())
+    }
+
+    async fn load_hashes(&self, pool: &PgPool, first: u64, last: u64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) \
+             SELECT encode(sha256(convert_to(share_id,'UTF8')),'hex'),share_id \
+             FROM qbit_share_ledger WHERE share_seq BETWEEN $1 AND $2 \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(i64::try_from(first)?)
+        .bind(i64::try_from(last)?)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_legacy(&self, pool: &PgPool, writer_id: &str) -> Result<()> {
         let mut first = 1u64;
         while first <= self.share_count {
             let last = (first + LOAD_BATCH_ROWS - 1).min(self.share_count);
@@ -391,31 +588,10 @@ impl SeedPlan {
             .execute(pool)
             .await
             .with_context(|| format!("loading seeded shares {first}..={last}"))?;
-            sqlx::query(
-                "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) \
-                 SELECT encode(sha256(convert_to(share_id,'UTF8')),'hex'),share_id \
-                 FROM qbit_share_ledger WHERE share_seq BETWEEN $1 AND $2 \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(i64::try_from(first)?)
-            .bind(i64::try_from(last)?)
-            .execute(pool)
-            .await?;
+            self.load_hashes(pool, first, last).await?;
             first = last + 1;
         }
-        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
-            .bind(i64::try_from(self.share_count)?)
-            .execute(pool)
-            .await?;
-        let seconds = started.elapsed().as_secs_f64();
-        let serialized_bytes =
-            (self.average_share_bytes()? * self.share_count as f64).round() as u64;
-        Ok(SeedStats {
-            rows: self.share_count,
-            seconds,
-            rows_per_second: self.share_count as f64 / seconds.max(f64::MIN_POSITIVE),
-            serialized_bytes,
-        })
+        Ok(())
     }
 }
 

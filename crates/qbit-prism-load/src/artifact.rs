@@ -298,6 +298,25 @@ pub fn write_or_withhold(
     })
 }
 
+/// No artifact for a run whose plan asks for none (`--plan tips`, #521):
+/// the same removal of an earlier run's artifact as a withheld run gets, and
+/// the reason, but no [`Withhold`], because nothing went wrong and the exit
+/// code is the reconciliation's.
+pub fn not_requested(out: &std::path::Path, reason: &str) -> Result<Evidence> {
+    let path = out.join("capacity-evidence.json");
+    let stale_artifact_removed = match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing stale {}", path.display()))
+        }
+    };
+    Ok(Evidence::Withheld {
+        reason: reason.to_owned(),
+        stale_artifact_removed,
+    })
+}
+
 /// The options the harness validates its own artifact with: the exact
 /// configuration, subject, forecast and limit the run used.
 pub fn validation_options(inputs: &ArtifactInputs) -> ValidationOptions {

@@ -15,6 +15,11 @@ pub enum Plan {
     D1,
     /// Every artifact phase for 60 s at `--rate`.
     Short,
+    /// Warm-up only: the external tips at `--background-shares-per-second`
+    /// (or `--rate`) and no artifact phase, so no artifact. The per-PR smoke
+    /// run's plan (#521): time to new-tip work and reconciliation in about a
+    /// minute.
+    Tips,
 }
 
 impl Plan {
@@ -22,13 +27,15 @@ impl Plan {
         match value {
             "d1" => Ok(Self::D1),
             "short" => Ok(Self::Short),
-            other => bail!("unknown plan {other:?}; use d1 or short"),
+            "tips" => Ok(Self::Tips),
+            other => bail!("unknown plan {other:?}; use d1, short or tips"),
         }
     }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::D1 => "d1",
             Self::Short => "short",
+            Self::Tips => "tips",
         }
     }
 }
@@ -253,6 +260,58 @@ pub struct Args {
     #[arg(long, default_value_t = 4096)]
     pub min_mem_available_mib: u64,
 
+    /// Seed for every random draw the realism options make: recipient
+    /// weights, window order, session hashrates, offer placement and arrival
+    /// bursts. The same seed and flags generate the same population.
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+    /// Distinct payout addresses across the live sessions and the seeded
+    /// window. Omitted, every live session uses one address and the window
+    /// keeps its five round-robin recipients, as before.
+    #[arg(long)]
+    pub recipients: Option<usize>,
+    /// How work is spread over the `--recipients` addresses: `uniform`,
+    /// `zipf:<s>`, `pareto:<alpha>` or `whale:<fraction>+<one of those>`.
+    /// Skews both how many sessions each address has and how many window
+    /// shares it holds.
+    #[arg(long, default_value = "uniform")]
+    pub recipient_weights: String,
+    /// Lognormal spread of hashrate between sessions (sigma of the log);
+    /// 0 gives every session of an address the same hashrate.
+    #[arg(long, default_value_t = 0.0)]
+    pub session_hashrate_sigma: f64,
+    /// `fixed`, or `vardiff:<max ratio>`: each session's share difficulty in
+    /// proportion to its hashrate, as a converged vardiff sets it.
+    #[arg(long, default_value = "fixed")]
+    pub session_difficulty: String,
+    /// `smooth`, or `bursty:cv1=<x>,cv60=<y>,max=<m>`: the offered rate varies
+    /// per second and per minute around each phase's rate.
+    #[arg(long, default_value = "smooth")]
+    pub arrival: String,
+
+    /// Compact network bits the fake node serves (before any retarget walk).
+    /// The default is every earlier run's. A harder target (a smaller
+    /// exponent or mantissa) raises the window's weight and with it every
+    /// share's difficulty, which a wide `--session-difficulty` spread over a
+    /// production-sized window needs: no share difficulty can go below
+    /// 2^-32, whose target is already 2^256. At most 1,024 times the default
+    /// difficulty, as each scheduled block costs that many more hashes.
+    #[arg(long, default_value = crate::window::TEMPLATE_BITS)]
+    pub template_bits: String,
+
+    /// Pool fee in basis points, as mainnet runs one: every frontend is
+    /// launched with `PRISM_POOL_FEE_ENABLED=1`, this `PRISM_POOL_FEE_BPS` and
+    /// a fee address of its own, and dust below the payout floor is swept to
+    /// the fee as production sweeps it. 0 (the default) runs with the fee
+    /// off, as every run before this flag did.
+    #[arg(long, default_value_t = 0)]
+    pub pool_fee_bps: u16,
+
+    /// A checked-in preset (`crates/qbit-prism-load/presets/*.json`) whose
+    /// flags are added to the command line; any flag it sets cannot be given
+    /// again. The side report records its name and SHA-256.
+    #[arg(long)]
+    pub preset: Option<PathBuf>,
     /// Output directory.
     #[arg(long, default_value = "load-out")]
     pub out: PathBuf,
@@ -389,8 +448,26 @@ impl Args {
                 );
             }
         }
-        self.plan()?;
+        if self.plan()? == Plan::Tips {
+            ensure!(
+                self.warmup_seconds > 0 && self.external_tips > 0,
+                "--plan tips mints its tips in warm-up, so it needs --warmup-seconds and \
+                 --external-tips above 0"
+            );
+            ensure!(
+                !self.mid_flight_kill && !self.cadence()?.is_dense(),
+                "--plan tips runs warm-up only, so it cannot hold --mid-flight-kill or \
+                 --cadence dense"
+            );
+        }
         crate::cluster::Replication::parse(&self.replication)?;
+        self.template_bits()?;
+        ensure!(
+            self.pool_fee_bps <= 10_000,
+            "--pool-fee-bps must be 0..10000, as PRISM_POOL_FEE_BPS is"
+        );
+        self.population_spec()?;
+        self.arrival()?;
         // The gap pattern and the phase length are checked against each other
         // here, at the entry boundary, because a pattern that cannot hold ten
         // landings measures nothing and the run must say so before it starts
@@ -440,6 +517,64 @@ impl Args {
         }
     }
 
+    /// `--template-bits`, parsed and range-checked: 8 hex digits, no easier
+    /// than the default and at most 1,024 times harder (EP-VALIDATION).
+    pub fn template_bits(&self) -> Result<u32> {
+        let text = self.template_bits.trim();
+        ensure!(
+            text.len() == 8 && text.bytes().all(|b| b.is_ascii_hexdigit()),
+            "--template-bits must be 8 hex digits, not {text:?}"
+        );
+        let bits = qbit_prism_server::codec::parse_u32_hex(text)?;
+        let difficulty = crate::window::scaled_network_difficulty(bits)?;
+        let default = crate::window::scaled_network_difficulty(
+            qbit_prism_server::codec::parse_u32_hex(crate::window::TEMPLATE_BITS)?,
+        )?;
+        ensure!(
+            difficulty >= default && difficulty <= default.saturating_mul(1024),
+            "--template-bits {text} must be at least the default {} and at most 1,024 times \
+             harder",
+            crate::window::TEMPLATE_BITS
+        );
+        Ok(bits)
+    }
+
+    /// The population the realism flags ask for, parsed and range-checked.
+    pub fn population_spec(&self) -> Result<crate::realism::PopulationSpec> {
+        let weights = crate::realism::WeightDist::parse(&self.recipient_weights)?;
+        if self.recipients.is_none() {
+            ensure!(
+                weights.is_uniform(),
+                "--recipient-weights skews work over --recipients addresses, so it needs \
+                 --recipients"
+            );
+        }
+        if let Some(count) = self.recipients {
+            ensure!(
+                (1..=crate::realism::MAX_RECIPIENTS).contains(&count),
+                "--recipients must be 1..{}",
+                crate::realism::MAX_RECIPIENTS
+            );
+        }
+        ensure!(
+            self.session_hashrate_sigma.is_finite()
+                && (0.0..=5.0).contains(&self.session_hashrate_sigma),
+            "--session-hashrate-sigma must be finite and 0..5"
+        );
+        Ok(crate::realism::PopulationSpec {
+            recipients: self.recipients,
+            weights,
+            difficulty: crate::realism::SessionDifficulty::parse(&self.session_difficulty)?,
+            hashrate_sigma: self.session_hashrate_sigma,
+            sessions: self.sessions,
+            seed: self.seed,
+        })
+    }
+
+    pub fn arrival(&self) -> Result<crate::realism::Arrival> {
+        crate::realism::Arrival::parse(&self.arrival)
+    }
+
     pub fn cadence(&self) -> Result<crate::cadence::Cadence> {
         crate::cadence::Cadence::parse(&self.cadence)
     }
@@ -486,7 +621,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             args.reconnect_seconds.unwrap_or(60),
             args.slow_database_seconds.unwrap_or(60),
         ),
-        Plan::Short => (
+        Plan::Short | Plan::Tips => (
             args.steady_state_seconds.unwrap_or(60),
             args.steady_state_rate.unwrap_or(args.rate),
             args.burst_seconds
@@ -507,6 +642,9 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             mid_flight_kill: false,
             dense_cadence: false,
         });
+    }
+    if plan == Plan::Tips {
+        return Ok(plans);
     }
     plans.push(PhasePlan {
         name: "steady_state".into(),
