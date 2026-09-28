@@ -20,6 +20,27 @@ pub struct RpcReplyError {
     pub error: Value,
 }
 
+/// The JSON-RPC error code qbitd answers every call with while it is still
+/// warming up after a start (`RPC_IN_WARMUP`).
+pub const RPC_IN_WARMUP: i64 = -28;
+
+impl RpcReplyError {
+    /// The node's JSON-RPC error code, when the error object carries an
+    /// integer one.
+    pub fn code(&self) -> Option<i64> {
+        self.error["code"].as_i64()
+    }
+
+    /// The node answered that it is still warming up. qbitd (like the Bitcoin
+    /// Core it derives from) checks its warmup flag first in
+    /// `CRPCTable::execute`, before it looks the method up, and nothing else
+    /// raises this code; the flag is cleared once, at the end of startup. So
+    /// this reply proves that the node did not run the call (#526).
+    pub fn in_warmup(&self) -> bool {
+        self.code() == Some(RPC_IN_WARMUP)
+    }
+}
+
 /// A call that provably never reached the node: the client failed to
 /// establish the connection the request would have been written to (the
 /// connection was refused, the name did not resolve, no route, the connect

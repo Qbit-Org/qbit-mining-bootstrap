@@ -19,6 +19,14 @@
 //! the restarted node has finished its warmup, so the servers see only refused
 //! connections, never a warmup reply.
 //!
+//! The warmup case (#526) faults the same way, then restarts the node held in
+//! its warmup and reopens the port: the retry reaches the real node, which
+//! answers `RPC_IN_WARMUP` (-28) without running the call. The row must go
+//! back to `pending` again, and the block lands once the node is warm. The
+//! hold is deterministic: the node's fee-estimates file is a FIFO, which qbitd
+//! opens during startup after its RPC server is up and before its warmup ends,
+//! and that open blocks until the test opens the other end.
+//!
 //! Each case asserts: both servers report the node unavailable on /healthz
 //! and /metrics and recover; every block is offered exactly once; the held block lands
 //! (the node resumed with it, reindexed it, or, when the offer was never
@@ -60,6 +68,15 @@ async fn node_killed_before_submitblock_lands_the_block_once_after_restart() -> 
     outage_case(Fault::Kill, Hold::Reservation, false).await
 }
 
+/// #526: as above, but the retry reaches the restarted node while it is
+/// still warming up. The node answers -28 without running the call, the row
+/// returns to `pending` again, and once the node is warm the block lands:
+/// exactly one `submitblock` the node ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_restarted_into_warmup_before_submitblock_lands_the_block_once() -> Result<()> {
+    outage_case(Fault::Kill, Hold::Warmup, false).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_killed_after_accepting_reconciles_the_lost_block_once() -> Result<()> {
     outage_case(Fault::Kill, Hold::Reply, false).await
@@ -93,6 +110,9 @@ enum Hold {
     /// waits on a database trigger, and the proxy refuses connections from
     /// the fault until the node is back.
     Reservation,
+    /// As `Reservation`, but the port reopens while the restarted node is
+    /// held in its warmup, so a retry is answered -28 (#526).
+    Warmup,
 }
 
 async fn outage_case(fault: Fault, hold: Hold, reindex: bool) -> Result<()> {
@@ -149,10 +169,12 @@ async fn outage_steps(
     let mut client = BlockClient::current(fixture, 0, &json!(before)).await?;
     let outcome = match hold {
         Hold::Request => "unknown",
-        Hold::Reply | Hold::Reservation => "accepted",
+        Hold::Reply | Hold::Reservation | Hold::Warmup => "accepted",
     };
     let held = match hold {
-        Hold::Reservation => unsent_offer(fixture, proxy, &mut client, fault, pid, &before).await?,
+        Hold::Reservation | Hold::Warmup => {
+            unsent_offer(fixture, proxy, &mut client, fault, pid, &before).await?
+        }
         Hold::Request | Hold::Reply => {
             held_offer(fixture, proxy, &mut client, fault, pid, hold, outcome).await?
         }
@@ -177,6 +199,9 @@ async fn outage_steps(
 
     match fault {
         Fault::Stop => signal(pid, libc::SIGCONT)?,
+        Fault::Kill if hold == Hold::Warmup => {
+            restart_node_in_warmup(fixture, proxy, &held).await?
+        }
         Fault::Kill => restart_node(fixture, reindex).await?,
     }
     if hold == Hold::Reservation {
@@ -201,7 +226,7 @@ async fn outage_steps(
     // Otherwise the node lost the accepted block in the crash, and the row
     // reconciles to a proven orphan once a competing block has the orphan
     // confirmations; an offered row is never offered again.
-    let lands = fault == Fault::Stop || reindex || hold == Hold::Reservation;
+    let lands = fault == Fault::Stop || reindex || matches!(hold, Hold::Reservation | Hold::Warmup);
     if lands {
         wait_state(fixture, &held, "submitted", 90).await?;
         let header = fixture.rpc("getblockheader", json!([held])).await?;
@@ -243,16 +268,32 @@ async fn outage_steps(
     .fetch_one(&fixture.pool)
     .await?;
     ensure!(stuck == 0, "{stuck} candidate row(s) stuck before landing");
+    // A call the node answered from its warmup never ran (#526): only the
+    // warmup case sees one, and only for the held block.
     let submitted = proxy.submitted();
+    let warmup = proxy.warmup_answered();
+    ensure!(
+        if hold == Hold::Warmup {
+            !warmup.is_empty() && warmup.iter().all(|block| *block == held)
+        } else {
+            warmup.is_empty()
+        },
+        "unexpected submitblock calls answered in warmup: {warmup:?}"
+    );
     let mut offers = HashMap::<&str, usize>::new();
     for block in &submitted {
         *offers.entry(block.as_str()).or_default() += 1;
+    }
+    for block in &warmup {
+        *offers
+            .get_mut(block.as_str())
+            .context("a warmup answer without its call")? -= 1;
     }
     let expected = [before.as_str(), held.as_str(), after.as_str()];
     ensure!(
         offers.len() == expected.len()
             && expected.iter().all(|block| offers.get(block) == Some(&1)),
-        "each block must be offered exactly once; submitblock calls: {submitted:?}"
+        "each block must be run by the node exactly once; submitblock calls: {submitted:?}, answered in warmup: {warmup:?}"
     );
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT block_hash,state,offer_outcome FROM qbit_block_candidate_outbox ORDER BY created_at",
@@ -290,8 +331,9 @@ async fn outage_steps(
     .await?;
     fixture.integrity().await?;
     eprintln!(
-        "live node outage ({fault:?}, held {hold:?}, reindex {reindex}): held block {held} ended {held_state} after {} submitblock call(s) in all",
-        submitted.len()
+        "live node outage ({fault:?}, held {hold:?}, reindex {reindex}): held block {held} ended {held_state} after {} submitblock call(s) in all, {} answered in warmup",
+        submitted.len(),
+        warmup.len()
     );
     Ok(())
 }
@@ -363,7 +405,7 @@ async fn unsent_offer(
     inject(fixture, fault, pid)?;
     proxy.refuse().await?;
     gate.open(fixture).await?;
-    wait_unsent(fixture, &held).await?;
+    wait_unsent(fixture, &held, "connection refused").await?;
     until("a second unsent offer while the port refuses", 30, || async {
         Ok(sqlx::query_scalar::<_, bool>(
             "SELECT attempt_count>=2 AND state='pending' AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1",
@@ -394,6 +436,14 @@ fn signal(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
 /// Restart the killed node on its data directory and RPC port, as the CPFP
 /// cases restart theirs.
 async fn restart_node(fixture: &mut Fixture, reindex: bool) -> Result<()> {
+    spawn_node(fixture, reindex)?;
+    until("qbit restarted after the crash", 60, || async {
+        Ok(fixture.rpc("getblockcount", json!([])).await?.is_u64())
+    })
+    .await
+}
+
+fn spawn_node(fixture: &mut Fixture, reindex: bool) -> Result<()> {
     let mut node = Command::new(&fixture.qbitd);
     node.args([
         "-regtest",
@@ -417,10 +467,85 @@ async fn restart_node(fixture: &mut Fixture, reindex: bool) -> Result<()> {
         &mut node,
         fixture.directory.path().join("qbit-restarted.log"),
     )?;
-    until("qbit restarted after the crash", 60, || async {
+    Ok(())
+}
+
+/// Restart the killed node held in its warmup and reopen the proxy's port
+/// (#526). qbitd opens its fee-estimates file in startup step 6, after its
+/// RPC server is up (step 4a) and before its warmup ends (step 13); as a
+/// FIFO, that open blocks until the test opens the other end, and until then
+/// the node answers every call -28. The held block's retry reaches the node
+/// and is answered from the warmup; the row must be back in `pending` with
+/// that answer as its reason, and only then is the node released.
+async fn restart_node_in_warmup(fixture: &mut Fixture, proxy: &RpcProxy, held: &str) -> Result<()> {
+    let fifo = fixture
+        .directory
+        .path()
+        .join("regtest")
+        .join("fee_estimates.dat");
+    match std::fs::remove_file(&fifo) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `path` is a valid NUL-terminated string for the call's duration.
+    ensure!(
+        unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0,
+        "mkfifo {}: {}",
+        fifo.display(),
+        std::io::Error::last_os_error()
+    );
+    spawn_node(fixture, false)?;
+    until(
+        "the restarted qbit answering from its warmup",
+        60,
+        || async { Ok(warmup_code(fixture).await == Some(-28)) },
+    )
+    .await?;
+    proxy.reopen().await?;
+    until("the held block's retry answered in warmup", 60, || async {
+        Ok(proxy.warmup_answered().iter().any(|block| block == held))
+    })
+    .await?;
+    wait_unsent(fixture, held, "\"code\":-28").await?;
+    ensure!(
+        warmup_code(fixture).await == Some(-28),
+        "the node left its warmup while it was held"
+    );
+    // Release the startup: an empty fee-estimates file is read, rejected and
+    // ignored. The node still reads the file's time after its open returns,
+    // so the FIFO goes only once the warmup has ended; the node's later flush
+    // then writes a plain file.
+    let writer = fifo.clone();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(writer)),
+    )
+    .await
+    .context("the held node never opened its fee-estimates file")???;
+    until("qbit out of its warmup", 60, || async {
         Ok(fixture.rpc("getblockcount", json!([])).await?.is_u64())
     })
-    .await
+    .await?;
+    std::fs::remove_file(&fifo)?;
+    Ok(())
+}
+
+/// The JSON-RPC error code of a direct `getblockcount`, `None` when it
+/// succeeded or the node did not answer.
+async fn warmup_code(fixture: &Fixture) -> Option<i64> {
+    let reply: Value = fixture
+        .client
+        .post(format!("http://127.0.0.1:{}/", fixture.rpc_port))
+        .basic_auth("prismtest", Some("prismtest"))
+        .json(&json!({"jsonrpc":"1.0","id":"live-test","method":"getblockcount","params":[]}))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    reply["error"]["code"].as_i64()
 }
 
 /// Holds every offer reservation on the fixture's outbox: a trigger waits on
@@ -480,9 +605,10 @@ impl ReservationGate {
 }
 
 /// Until the held block's offer is recorded as not sent: back in `pending`
-/// with no outcome and the refusal as its reason. A recorded outcome fails
-/// at once: the refused offer would never be offered again.
-async fn wait_unsent(fixture: &Fixture, block: &str) -> Result<()> {
+/// with no outcome and `answer` (the refusal, or the warmup reply) in its
+/// reason. A recorded outcome fails at once: the offer would never be
+/// offered again.
+async fn wait_unsent(fixture: &Fixture, block: &str, answer: &str) -> Result<()> {
     let started = Instant::now();
     loop {
         let (state, outcome, error): (String, Option<String>, Option<String>) = sqlx::query_as(
@@ -493,18 +619,18 @@ async fn wait_unsent(fixture: &Fixture, block: &str) -> Result<()> {
         .await?;
         ensure!(
             outcome.is_none(),
-            "the refused offer was recorded with outcome {outcome:?} ({state}): {error:?}"
+            "the offer not sent ({answer}) was recorded with outcome {outcome:?} ({state}): {error:?}"
         );
         if state == "pending"
-            && error.as_deref().is_some_and(|error| {
-                error.starts_with("offer not sent") && error.contains("connection refused")
-            })
+            && error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("offer not sent") && error.contains(answer))
         {
             return Ok(());
         }
         ensure!(
             started.elapsed() < Duration::from_secs(30),
-            "the refused offer was not returned to pending: {state}, {error:?}"
+            "the offer not sent ({answer}) was not returned to pending: {state}, {error:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -761,6 +887,9 @@ struct Hit {
 struct ProxyState {
     upstream: u16,
     submitted: Mutex<Vec<String>>,
+    /// Blocks whose `submitblock` the node answered -28 from its warmup:
+    /// calls it never ran (#526).
+    warmup_answered: Mutex<Vec<String>>,
     trap: Mutex<Option<(Hold, oneshot::Sender<Hit>)>>,
     /// Closed while a held call waits for its release: every connection
     /// pauses before its next forward, so nothing reaches the node or the
@@ -785,6 +914,7 @@ impl RpcProxy {
         let state = Arc::new(ProxyState {
             upstream,
             submitted: Mutex::new(Vec::new()),
+            warmup_answered: Mutex::new(Vec::new()),
             trap: Mutex::new(None),
             open: watch::Sender::new(true),
             connections: Mutex::new(Vec::new()),
@@ -861,6 +991,10 @@ impl RpcProxy {
     fn submitted(&self) -> Vec<String> {
         self.state.submitted.lock().unwrap().clone()
     }
+
+    fn warmup_answered(&self) -> Vec<String> {
+        self.state.warmup_answered.lock().unwrap().clone()
+    }
 }
 
 /// Relays one client connection, one request and reply at a time, as
@@ -893,16 +1027,22 @@ async fn relay(state: Arc<ProxyState>, downstream: TcpStream) -> Result<()> {
             Some((block, Hold::Request, sender)) => (Some((block.clone(), sender)), None),
             Some((block, Hold::Reply, sender)) => (None, Some((block.clone(), sender))),
             // Never armed: a reservation is held in the database.
-            Some((_, Hold::Reservation, _)) | None => (None, None),
+            Some((_, Hold::Reservation | Hold::Warmup, _)) | None => (None, None),
         };
         if let Some((block, sender)) = before {
             hold_here(&state, block, sender).await;
         }
         open.wait_for(|open| *open).await?;
         up_write.write_all(&request).await?;
-        let Some((reply, _)) = read_http(&mut up_read).await? else {
+        let Some((reply, reply_body)) = read_http(&mut up_read).await? else {
             return Ok(());
         };
+        if let Some(block) = &submitted {
+            let answer: Value = serde_json::from_slice(&reply_body).unwrap_or_default();
+            if answer["error"]["code"] == -28 {
+                state.warmup_answered.lock().unwrap().push(block.clone());
+            }
+        }
         if let Some((block, sender)) = after {
             hold_here(&state, block, sender).await;
         }

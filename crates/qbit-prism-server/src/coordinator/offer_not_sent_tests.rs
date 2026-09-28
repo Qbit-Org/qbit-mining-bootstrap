@@ -11,6 +11,9 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "offer_warmup_tests.rs"]
+mod offer_warmup_tests;
+
 /// What the relay does with a `submitblock` request.
 #[derive(Clone, Copy, PartialEq)]
 enum Submit {
@@ -19,11 +22,19 @@ enum Submit {
     /// instead of relaying the reply: the node acted on the request and the
     /// offering frontend cannot know.
     ResetAfterReply,
+    /// Answer it as qbitd does while it is still warming up after a restart,
+    /// without forwarding it: the node never sees the block (#526).
+    Warmup,
+    /// Forward it, relay the node's reply, and from then on answer every
+    /// call as a node that restarted into its warmup (#526).
+    WarmupAfterReply,
 }
 
 struct RelayState {
     upstream: SocketAddr,
     submit: std::sync::Mutex<Submit>,
+    /// Every call is answered with the warmup reply (#526).
+    warming: std::sync::atomic::AtomicBool,
     connections: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -44,6 +55,7 @@ impl Relay {
         let state = Arc::new(RelayState {
             upstream,
             submit: std::sync::Mutex::new(Submit::Forward),
+            warming: std::sync::atomic::AtomicBool::new(false),
             connections: std::sync::Mutex::new(Vec::new()),
         });
         let mut relay = Self {
@@ -71,6 +83,14 @@ impl Relay {
 
     fn submit(&self, submit: Submit) {
         *self.state.submit.lock().unwrap() = submit;
+    }
+
+    /// The node finished its warmup: calls are forwarded again.
+    fn warm(&self) {
+        self.submit(Submit::Forward);
+        self.state
+            .warming
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn refuse(&mut self) -> Result<()> {
@@ -150,15 +170,34 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
     let mut client = BufReader::new(client);
     let mut upstream = BufReader::new(upstream);
     while let Ok(Some((request, body))) = read_http(&mut client).await {
-        let submit = serde_json::from_slice::<Value>(&body)
-            .is_ok_and(|request| request["method"] == "submitblock");
+        let call = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+        let submit = call["method"] == "submitblock";
+        let mode = *state.submit.lock().unwrap();
+        if state.warming.load(std::sync::atomic::Ordering::SeqCst)
+            || (submit && mode == Submit::Warmup)
+        {
+            if client
+                .get_mut()
+                .write_all(&warmup_reply(&call["id"]))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
         if upstream.get_mut().write_all(&request).await.is_err() {
             return;
         }
         let Ok(Some((reply, _))) = read_http(&mut upstream).await else {
             return;
         };
-        if submit && *state.submit.lock().unwrap() == Submit::ResetAfterReply {
+        if submit && mode == Submit::WarmupAfterReply {
+            state
+                .warming
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if submit && mode == Submit::ResetAfterReply {
             let client = client.into_inner();
             let _ = client.set_zero_linger();
             return;
@@ -167,6 +206,20 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
             return;
         }
     }
+}
+
+/// qbitd's answer to a JSON-RPC 1.0 call while it is still warming up, as
+/// its HTTP server writes it: status 500 and the `RPC_IN_WARMUP` error.
+fn warmup_reply(id: &Value) -> Vec<u8> {
+    let body = format!(
+        "{}\n",
+        json!({"result": null, "error": {"code": crate::rpc::RPC_IN_WARMUP, "message": "Loading banlist…"}, "id": id})
+    );
+    format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 impl Fixture {
