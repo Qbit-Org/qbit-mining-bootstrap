@@ -102,17 +102,12 @@ impl Metrics {
             registry.set(family, vec![], value);
         }
     }
-    /// #525: how long the observed tip has gone without published work, from
-    /// the coordinator's tip state. Coverage cannot show this: it compares
-    /// sessions with the latest published generation, which stays on the old
-    /// parent while every refresh fails. `None`, no tip observed yet, is -1.
-    pub fn publish_parent_work(&self, missing: Option<Duration>) {
+    /// #525: how long this frontend's template refresh has kept failing.
+    /// Coverage cannot show this: it compares sessions with the latest
+    /// published generation, which stays put while every refresh fails.
+    pub fn publish_work_refresh_stalled(&self, age: Duration) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        registry.set(
-            Family::ParentWorkMissing,
-            vec![],
-            missing.map_or(-1., |age| age.as_secs_f64()),
-        );
+        registry.set(Family::WorkRefreshStalled, vec![], age.as_secs_f64());
     }
     /// Stratum delivery observations cannot overwrite the refresh owner's state.
     pub fn publish_delivery(&self, snapshot: DeliveryMetrics) {

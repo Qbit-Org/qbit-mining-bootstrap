@@ -111,7 +111,7 @@ def main():
             assert {"qbit-prism-candidate-oldest-critical", "qbit-prism-semantic-coverage-critical",
                     "qbit-prism-revision-work-pending-critical",
                     "qbit-prism-candidate-landing-failed-critical",
-                    "qbit-prism-parent-work-missing-critical"} <= set(paging), sorted(paging)
+                    "qbit-prism-work-refresh-stalled-critical"} <= set(paging), sorted(paging)
             for uid, rule in paging.items():
                 assert rule["for"] != "0s", uid
                 assert rule["noDataState"] == "OK", uid
@@ -122,8 +122,8 @@ def main():
                 scraped = "up{" in expr and "== 1" in expr
                 assert fresh or scraped, uid
             assert paging["qbit-prism-revision-work-pending-critical"]["for"] == "1m"
-            # #525: a new tip without published work pages on this frontend's own gauge.
-            assert paging["qbit-prism-parent-work-missing-critical"]["for"] == "1m"
+            # #525: a refresh that keeps failing pages on this frontend's own gauge.
+            assert paging["qbit-prism-work-refresh-stalled-critical"]["for"] == "1m"
             # #493: the tracking-unknown and unlanded warnings dwell and never page.
             for uid, dwell in [("qbit-prism-revision-work-unknown", "2m"),
                                ("qbit-prism-accepted-block-unlanded", "3m"),

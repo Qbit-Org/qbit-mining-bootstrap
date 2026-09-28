@@ -365,7 +365,7 @@ async fn publish_health(
                 coordinator.blocks.load(Ordering::Relaxed),
             );
             registry.publish_delivery(stats.delivery_metrics());
-            registry.publish_parent_work(coordinator.observed_tip.read().await.unpublished_for());
+            registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
             state.publish_metrics(registry.render())?;
             Ok(health)
         })

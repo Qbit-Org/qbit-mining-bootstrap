@@ -115,7 +115,7 @@ impl Metrics {
             Family::InitialAge,
             Family::CoverageGap,
             Family::Coverage,
-            Family::ParentWorkMissing,
+            Family::WorkRefreshStalled,
             Family::Candidates,
             Family::CandidateAge,
             Family::CandidateUnacknowledgedAge,

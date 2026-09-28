@@ -234,6 +234,11 @@ pub struct Coordinator {
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     issued_batcher: issued_batcher::IssuedBatcher,
     pub last_error: RwLock<Option<String>>,
+    /// #525: when `refresh_once` last succeeded, publishing or revalidating
+    /// work, or when this coordinator started before the first success. Only
+    /// a success renews readiness, so its age is how long this frontend has
+    /// been unable to serve current work, whatever the cause.
+    refreshed_at: std::sync::Mutex<Instant>,
     /// The builder admission permits, `PRISM_JOB_BUILD_EXECUTOR_WORKERS` of
     /// them. Public so a test can saturate build capacity and prove the offer
     /// never waits for it.
@@ -757,6 +762,7 @@ impl Coordinator {
             readiness: Arc::new(RwLock::new(ReadinessState::default())),
             observed_tip: Arc::new(RwLock::new(TipState::default())),
             last_error: RwLock::new(None),
+            refreshed_at: std::sync::Mutex::new(Instant::now()),
             refresh_lock: Mutex::new(RefreshState::default()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
@@ -962,8 +968,20 @@ impl Coordinator {
         let result = self.refresh_once_inner().await;
         if result.is_ok() {
             observation.succeeded();
+            *self
+                .refreshed_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
         }
         result
+    }
+
+    /// Time since the last successful refresh, or since start before one.
+    pub fn work_refresh_age(&self) -> Duration {
+        self.refreshed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
     }
 
     async fn refresh_once_inner(&self) -> Result<()> {

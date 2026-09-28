@@ -577,7 +577,8 @@ impl Config {
     /// can take that dust. Without one every work build on the new tip fails
     /// with `PayoutExceedsCandidateBalance` and mining stops. The non-CTV
     /// builder applies the same policy and is equally exposed; it is not
-    /// refused here, and the current-parent work alert is its safety net.
+    /// refused here until #535 decides how, and the refresh-stall alert is
+    /// its safety net.
     ///
     /// Checked where a process would run or validate this policy (`run`,
     /// `check-config`, `self-check` and a policy-transition target), not in
@@ -726,8 +727,8 @@ mod tests {
     }
 
     /// Only CTV settlement is refused (#525). The direct builder applies the
-    /// same policy and is equally exposed; until it is refused too, the
-    /// current-parent work alert is its safety net.
+    /// same policy and is equally exposed; #535 owns flipping this, and until
+    /// then the refresh-stall alert is its safety net.
     #[test]
     fn direct_settlement_without_a_pool_fee_is_not_refused_here() {
         let mut config = automatic_ctv_config();

@@ -294,24 +294,6 @@ impl TipState {
                 .is_some_and(|at| at.elapsed() <= build_budget)
     }
 
-    /// #525: how long the observed tip has had no published work on it,
-    /// measured like the replacement lease from the first departure a refresh
-    /// observed, which retries never renew. Zero while the published work is
-    /// on the observed tip, or before a refresh has seen the departure;
-    /// `None` before any tip observation.
-    pub(crate) fn unpublished_for(&self) -> Option<Duration> {
-        let current = self.current.as_ref()?;
-        let diverged = self
-            .published
-            .as_ref()
-            .is_none_or(|published| published.hash != current.hash);
-        Some(
-            self.divergence_started
-                .filter(|_| diverged)
-                .map_or(Duration::ZERO, |at| at.elapsed()),
-        )
-    }
-
     /// Whether a tip recorded after `since` differs from `hash`. Only evidence
     /// newer than a pass's own chain view can supersede that view. An older
     /// observation is stale, not a newer tip: yielding to it would hold
@@ -874,66 +856,5 @@ impl Coordinator {
             .filter(|tip| tip.hash == hash)
             .context("tip observation superseded")?;
         self.tip_parent(&selected).await
-    }
-}
-
-#[cfg(test)]
-mod unpublished_tests {
-    use super::*;
-
-    const A: &str = "aa";
-    const B: &str = "bb";
-    const C: &str = "cc";
-
-    fn refresh(state: &mut TipState, hash: &str) {
-        let sequence = state.reserve();
-        state.observe(hash, sequence, true);
-    }
-
-    /// #525: a refresh that keeps failing on a new tip leaves the published
-    /// work on the old parent; the age runs from the first departure, newer
-    /// tips and retries never renew it, and publication on the tip clears it.
-    #[tokio::test(start_paused = true)]
-    async fn unpublished_age_runs_from_the_first_departure_until_publication() {
-        let mut state = TipState::default();
-        assert_eq!(state.unpublished_for(), None, "no tip observed yet");
-        refresh(&mut state, A);
-        tokio::time::advance(Duration::from_secs(3)).await;
-        // An unpublished startup tip counts from its first refresh.
-        assert_eq!(state.unpublished_for(), Some(Duration::from_secs(3)));
-        state.publish(A).unwrap();
-        assert_eq!(state.unpublished_for(), Some(Duration::ZERO));
-        tokio::time::advance(Duration::from_secs(30)).await;
-        refresh(&mut state, A);
-        assert_eq!(state.unpublished_for(), Some(Duration::ZERO));
-        refresh(&mut state, B);
-        tokio::time::advance(Duration::from_secs(90)).await;
-        refresh(&mut state, B);
-        refresh(&mut state, C);
-        tokio::time::advance(Duration::from_secs(60)).await;
-        refresh(&mut state, C);
-        assert_eq!(state.unpublished_for(), Some(Duration::from_secs(150)));
-        state.publish(C).unwrap();
-        assert_eq!(state.unpublished_for(), Some(Duration::ZERO));
-    }
-
-    /// A departure only a non-refresh probe has seen has not started the
-    /// clock yet, and a return to the published tip reads zero even before a
-    /// refresh clears the departure.
-    #[tokio::test(start_paused = true)]
-    async fn only_a_current_departure_counts() {
-        let mut state = TipState::default();
-        refresh(&mut state, A);
-        state.publish(A).unwrap();
-        let sequence = state.reserve();
-        state.observe(B, sequence, false);
-        tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(state.unpublished_for(), Some(Duration::ZERO));
-        refresh(&mut state, B);
-        tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(state.unpublished_for(), Some(Duration::from_secs(10)));
-        let sequence = state.reserve();
-        state.observe(A, sequence, false);
-        assert_eq!(state.unpublished_for(), Some(Duration::ZERO));
     }
 }

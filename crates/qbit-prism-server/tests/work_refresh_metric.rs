@@ -1,19 +1,25 @@
-//! #525: a work build that keeps failing on a new tip must be visible to the
-//! paging rule, not only as a `template refresh deferred` WARN line.
+//! #525: a template refresh that keeps failing must be visible to the paging
+//! rule, not only as a `template refresh deferred` WARN line.
 //!
 //! The child is the real server binary (`run`) against the in-process fake
 //! node (`support/fake_qbitd.rs`) and a PostgreSQL database of its own. One
-//! miner holds the published job on tip A. The node then moves to tip B and
-//! keeps answering a template for A, so every refresh observes B and fails
-//! after the observation, as a `PayoutExceedsCandidateBalance` refresh does:
-//! no job is ever published on B. The published generation does not change,
-//! so the miner still holds "current" work and semantic coverage reads 1 for
-//! the whole stall; `qbit_prism_current_parent_work_missing_seconds` is the
-//! signal that grows. A template for B then publishes and it returns to 0.
+//! miner holds the published job on tip A. Two stalls follow, each ended by a
+//! good template:
+//!
+//! - on the same parent: the node stays on A and answers a template for
+//!   another parent, so every refresh fails with the tip unchanged, as a
+//!   `PayoutExceedsCandidateBalance` rebuild on the same parent does;
+//! - on a new tip: the node moves to B and keeps answering a template for A,
+//!   so every refresh observes B and fails after the observation.
+//!
+//! Neither stall changes the published generation, so the miner still holds
+//! "current" work and semantic coverage reads 1 throughout;
+//! `qbit_prism_work_refresh_stalled_seconds` is the signal that grows, and it
+//! returns to about zero once a refresh succeeds.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
-//!   cargo test --locked -p qbit-prism-server --test parent_work_metric
+//!   cargo test --locked -p qbit-prism-server --test work_refresh_metric
 //! ```
 use anyhow::{ensure, Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
@@ -41,40 +47,37 @@ use fake_qbitd::{FakeNode, TEMPLATE_BITS};
 mod ledger_database;
 use ledger_database::FixtureDatabase;
 
-const MISSING: &str = "qbit_prism_current_parent_work_missing_seconds";
+const STALLED: &str = "qbit_prism_work_refresh_stalled_seconds";
 const COVERAGE: &str = "qbit_prism_stratum_semantic_current_work_ratio";
 const AUTHORIZED: &str = "qbit_prism_authorized_clients";
 const HEALTH: &str = "qbit_prism_health_state";
+/// A healthy frontend refreshes every 0.2 s here and republishes the gauge
+/// every second, so it reads well below this.
+const HEALTHY: f64 = 3.;
 /// The hang guard for one wait; no property is decided by comparing to it.
 const DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(200);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failing_refresh_on_a_new_tip_grows_the_parent_work_gauge_while_coverage_reads_one(
-) -> Result<()> {
+async fn failing_refreshes_grow_the_refresh_stall_gauge_while_coverage_reads_one() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let database = FixtureDatabase::open(&raw, "prism_parent_work_").await?;
+    let database = FixtureDatabase::open(&raw, "prism_work_refresh_").await?;
     // The parent initializes the schema and registers no instance.
-    let ledger = match Ledger::connect_tool(
-        &database.url,
-        "parent-work-fixture".into(),
-        4,
-        true,
-        None,
-    )
-    .await
-    {
-        Ok(ledger) => ledger,
-        Err(error) => return Err(database.abandon(error).await),
-    };
-    let outcome = stall(&database.url).await;
+    let ledger =
+        match Ledger::connect_tool(&database.url, "work-refresh-fixture".into(), 4, true, None)
+            .await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
+    let outcome = stalls(&database.url).await;
     ledger.pool.close().await;
     database.close(outcome).await
 }
 
-async fn stall(database_url: &str) -> Result<()> {
+async fn stalls(database_url: &str) -> Result<()> {
     let node = FakeNode::open().await?;
     let (stratum, api) = (free_port()?, free_port()?);
     let log = tempfile::NamedTempFile::new()?;
@@ -83,48 +86,35 @@ async fn stall(database_url: &str) -> Result<()> {
         let client = reqwest::Client::new();
         let metrics = format!("http://127.0.0.1:{api}/metrics");
         let _miner = Miner::connect(stratum, &mut server).await?;
-
-        // Work on tip A reaches the miner.
-        wait(&client, &metrics, &mut server, "work on tip A", |body| {
-            sample(body, MISSING) == Some(0.)
+        let serving = |body: &str| {
+            sample(body, STALLED).is_some_and(|age| (0. ..HEALTHY).contains(&age))
                 && sample(body, HEALTH) == Some(1.)
                 && sample(body, AUTHORIZED) == Some(1.)
                 && sample(body, COVERAGE) == Some(1.)
-        })
-        .await?;
+        };
+        let (tip_a, tip_b) = ("ab".repeat(32), "bc".repeat(32));
 
-        // Tip B, whose every work build fails after the tip observation.
-        let tip_a = "ab".repeat(32);
-        node.set_template(Some(template(&tip_a, 101)));
-        node.set_tip(&"bc".repeat(32), &tip_a, 101, "02");
-        let first = wait(&client, &metrics, &mut server, "the stall", |body| {
-            sample(body, MISSING).is_some_and(|age| age >= 2.)
-        })
-        .await?;
+        wait(&client, &metrics, &mut server, "work on tip A", serving).await?;
+        // Healthy refreshes keep renewing it.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let later = scrape(&client, &metrics).await?;
-        let (before, after) = (
-            sample(&first, MISSING).unwrap(),
-            sample(&later, MISSING).context("gauge vanished")?,
-        );
         ensure!(
-            after >= before + 2.,
-            "the gauge must keep growing through the stall: {before} then {after}"
+            serving(&scrape(&client, &metrics).await?),
+            "healthy frontend drifted"
         );
-        // The published generation never changed, so the connected miner
-        // still counts as covered: the coverage rules cannot see this stall.
-        for body in [&first, &later] {
-            ensure!(sample(body, COVERAGE) == Some(1.), "coverage moved: {body}");
-            ensure!(sample(body, AUTHORIZED) == Some(1.), "miner left: {body}");
-            ensure!(sample(body, HEALTH) == Some(0.), "health stayed ready");
-        }
 
-        // A template on B publishes, and the gauge returns to zero.
+        // Same parent: a template for another parent fails every refresh
+        // while the node's tip stays the published one.
+        node.set_template(Some(template(&"cd".repeat(32), 101)));
+        stalled(&client, &metrics, &mut server, "the same-parent stall").await?;
         node.set_template(None);
-        wait(&client, &metrics, &mut server, "work on tip B", |body| {
-            sample(body, MISSING) == Some(0.) && sample(body, HEALTH) == Some(1.)
-        })
-        .await?;
+        wait(&client, &metrics, &mut server, "recovery on tip A", serving).await?;
+
+        // New tip: B, whose every refresh fails after the tip observation.
+        node.set_template(Some(template(&tip_a, 101)));
+        node.set_tip(&tip_b, &tip_a, 101, "02");
+        stalled(&client, &metrics, &mut server, "the new-tip stall").await?;
+        node.set_template(None);
+        wait(&client, &metrics, &mut server, "work on tip B", serving).await?;
         Ok(())
     }
     .await;
@@ -135,6 +125,36 @@ async fn stall(database_url: &str) -> Result<()> {
         let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]).into_owned();
         error.context(format!("server stderr tail:\n{tail}"))
     })
+}
+
+/// The gauge grows through a stall while the published generation, so
+/// semantic coverage, stays put. `health_state` is not asserted: on the same
+/// parent it stays ready until the health timeout.
+async fn stalled(
+    client: &reqwest::Client,
+    url: &str,
+    server: &mut Child,
+    what: &str,
+) -> Result<()> {
+    let first = wait(client, url, server, what, |body| {
+        sample(body, STALLED).is_some_and(|age| age >= 5.)
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let later = scrape(client, url).await?;
+    let (before, after) = (
+        sample(&first, STALLED).unwrap(),
+        sample(&later, STALLED).context("gauge vanished")?,
+    );
+    ensure!(
+        after >= before + 2.,
+        "{what}: the gauge must keep growing: {before} then {after}"
+    );
+    for body in [&first, &later] {
+        ensure!(sample(body, COVERAGE) == Some(1.), "{what}: coverage moved");
+        ensure!(sample(body, AUTHORIZED) == Some(1.), "{what}: miner left");
+    }
+    Ok(())
 }
 
 fn template(parent: &str, height: u64) -> serde_json::Value {
@@ -172,7 +192,7 @@ fn spawn(
         .stderr(Stdio::from(log.reopen()?))
         .env("RUST_LOG", "warn")
         .env("PRISM_DATABASE_URL", database_url)
-        .env("PRISM_INSTANCE_ID", "parent-work-frontend")
+        .env("PRISM_INSTANCE_ID", "work-refresh-frontend")
         .env("PRISM_DATABASE_MAX_CONNECTIONS", "8")
         .env("PRISM_RUNTIME_WORKERS", "2")
         .env("PRISM_JOB_BUILD_EXECUTOR_WORKERS", "2")
@@ -220,8 +240,8 @@ impl Miner {
         };
         let (read, mut write) = stream.into_split();
         for request in [
-            json!({"id":1,"method":"mining.subscribe","params":["parent-work/1"]}),
-            json!({"id":2,"method":"mining.authorize","params":["parent-work.rig","x"]}),
+            json!({"id":1,"method":"mining.subscribe","params":["work-refresh/1"]}),
+            json!({"id":2,"method":"mining.authorize","params":["work-refresh.rig","x"]}),
         ] {
             write.write_all(format!("{request}\n").as_bytes()).await?;
         }
@@ -273,7 +293,7 @@ async fn wait(
             started.elapsed() < DEADLINE,
             "timed out waiting for {what}; last scrape:\n{}",
             last.lines()
-                .filter(|line| [MISSING, COVERAGE, AUTHORIZED, HEALTH]
+                .filter(|line| [STALLED, COVERAGE, AUTHORIZED, HEALTH]
                     .iter()
                     .any(|name| line.starts_with(name)))
                 .collect::<Vec<_>>()

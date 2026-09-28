@@ -639,7 +639,8 @@ services:
       PRISM_CTV_BROADCASTER_FEE_BITS: ${PRISM_CTV_BROADCASTER_FEE_BITS:-0}
       PRISM_CTV_BROADCASTER_LIMIT: ${PRISM_CTV_BROADCASTER_LIMIT:-100}
       # #525: a fee-off pool stalls on the first sub-floor balance; CTV
-      # settlement refuses to start without one (0 bps is allowed).
+      # settlement refuses to start without one (0 bps is allowed). Direct
+      # settlement is equally exposed and not yet refused (#535).
       PRISM_POOL_FEE_ENABLED: ${PRISM_POOL_FEE_ENABLED:-0}
       PRISM_POOL_FEE_BPS: ${PRISM_POOL_FEE_BPS:-}
       PRISM_POOL_FEE_ADDRESS: ${PRISM_POOL_FEE_ADDRESS:-}

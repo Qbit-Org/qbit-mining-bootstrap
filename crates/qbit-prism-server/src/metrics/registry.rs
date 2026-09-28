@@ -105,7 +105,7 @@ families! {
     NodeIbd: Gauge, "node_initial_block_download", "Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown.";
     NodeObservationAge: Gauge, "node_observation_age_seconds", "Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable.";
     RollupLag: Gauge, "hashrate_rollup_watermark_lag_seconds", "Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled.";
-    ParentWorkMissing: Gauge, "current_parent_work_missing_seconds", "Monotonic time since the node tip this frontend observes first departed from the tip its published work builds on, while no work is published on the observed tip; zero while it is, -1 before a tip observation.";
+    WorkRefreshStalled: Gauge, "work_refresh_stalled_seconds", "Monotonic time since this frontend's last successful template refresh, which publishes or revalidates its work, or since start before the first; -1 before the coordinator publishes it.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.

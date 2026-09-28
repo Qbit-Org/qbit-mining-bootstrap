@@ -1498,6 +1498,26 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 )
                 self.assertNotIn("docker is required", result.stderr)
 
+    def test_process_environment_disables_a_pool_fee_the_env_file_enables(self) -> None:
+        # Compose prefers the shell value over the env file; so must the doctor.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "deploy.env"
+            deploy_env.write_text(
+                "MINING_LANES=prism\nPRISM_CTV_SETTLEMENT_ENABLED=1\n"
+                "PRISM_POOL_FEE_ENABLED=1\nPRISM_POOL_FEE_BPS=0\n",
+                encoding="utf-8",
+            )
+            accepted = self.run_check_env(DEPLOY_ENV_FILE=str(deploy_env))
+            refused = self.run_check_env(
+                DEPLOY_ENV_FILE=str(deploy_env), PRISM_POOL_FEE_ENABLED="0"
+            )
+
+        self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", accepted.stderr)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1", refused.stderr
+        )
+
     def test_ctv_settlement_accepts_any_enabled_pool_fee(self) -> None:
         for fee_enabled in ("1", "True", "on"):
             with self.subTest(fee_enabled=fee_enabled):

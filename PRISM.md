@@ -133,10 +133,10 @@ reaches the floor or its shares leave the window, and mining stops (#525).
 `PRISM_CTV_SETTLEMENT_ENABLED=1` therefore requires `PRISM_POOL_FEE_ENABLED=1`;
 `PRISM_POOL_FEE_BPS=0` is allowed and pays nothing until dust must be swept.
 `run`, `check-config`, `self-check` and `make doctor` refuse the combination.
-Direct settlement has the same exposure and is not yet refused, so enable a fee
-there as well. Whatever the cause, a frontend whose observed tip has had no
-published work for two minutes pages through
-`PrismCurrentParentWorkMissingCritical`.
+Direct settlement has the same exposure and is not yet refused (#535), so
+enable a fee there as well. Whatever the cause, a frontend whose template refresh has not
+succeeded for two minutes, so it serves no current work, pages through
+`PrismWorkRefreshStalledCritical`.
 
 Coinbase maturity is 1,000 blocks. Immature disconnected blocks stop
 contributing to current balances and can reactivate. Terminal reversal retains

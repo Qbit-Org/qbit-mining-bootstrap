@@ -24,11 +24,12 @@ async fn setup_ctv(db: &Database, ctv: bool) -> Result<(Ledger, Ledger, fake::Fa
         config.ctv_fee = Some(qbit_prism::FanoutFeeRatePolicy::new(1, 12000));
         // #525: CTV settlement runs only with a pool fee; `CTV_POOL_FEE_ENV`
         // configures this same 0 bps fee in the CLI's environment.
+        let [_, _, (_, recipient), (_, program)] = CTV_POOL_FEE_ENV;
         config.payout_policy.pool_fee_policy = Some(qbit_prism::PoolFeePolicy {
             fee_bps: 0,
-            recipient_id: "ctv-pool-fee".into(),
-            order_key: "ctv-pool-fee".into(),
-            p2mr_program_hex: "fe".repeat(32),
+            recipient_id: recipient.into(),
+            order_key: recipient.into(),
+            p2mr_program_hex: program.into(),
         });
     }
     let a = db.ledger("frontend-a").await?;
