@@ -622,9 +622,10 @@ reports it as unknown and reconciles rather than retrying.
 connection is established, the request provably never reached the node. That
 covers connection refused (the node or its RPC server restarting), a name or
 route failure, and the 5-second connect timeout. The attempt that holds the
-reservation returns the row to `pending`, and the next claim runs the whole
-pre-offer phase again, abandoning the block if its parent was superseded
-meanwhile. Nothing else is treated this way. A reset, closed connection, lost
+reservation returns the row to `pending`, and the next claim runs the
+pre-offer phase again: an ordinary candidate whose parent was superseded
+meanwhile is abandoned there, and a leased candidate is offered without that
+screen, as every leased candidate is (#350). Nothing else is treated this way. A reset, closed connection, lost
 reply or timeout after the connection was established, and any HTTP or
 JSON-RPC error, stay unknown and are never offered again, because the request
 may have been written. A crash or a lost claim between the failed connect and

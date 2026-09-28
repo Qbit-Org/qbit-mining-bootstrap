@@ -953,9 +953,10 @@ impl Ledger {
     /// again what it always means: never offered. The attempt is recorded in
     /// `last_error` under [`OFFER_NOT_SENT_REASON_PREFIX`], the claim is
     /// released, and the row backs off `min(60, attempt_count)` seconds like
-    /// any pending retry. The next claim runs the full pre-offer phase again,
-    /// so a block whose parent was superseded meanwhile is abandoned there
-    /// and never offered.
+    /// any pending retry. The next claim runs the pre-offer phase again: an
+    /// ordinary candidate whose parent was superseded meanwhile is abandoned
+    /// there and never offered, and a leased candidate is offered without
+    /// that screen, as every leased candidate is (#350).
     ///
     /// One transaction, fenced on the live token and on a reservation that
     /// recorded no call. Nothing else ever returns a reservation: a crash or

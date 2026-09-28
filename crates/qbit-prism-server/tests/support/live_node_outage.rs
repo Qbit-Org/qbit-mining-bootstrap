@@ -141,59 +141,22 @@ async fn outage_steps(
         fixture.rpc("gettxoutsetinfo", json!([])).await?;
     }
 
-    // The held block, on current work that builds on the first one.
+    // The held block, on current work that builds on the first one. It
+    // ends with one outcome: a request the node read and answered after its
+    // resume, the node's acceptance, or (never sent while the port refused)
+    // the acceptance of its one offer after the restart.
     let pid = libc::pid_t::try_from(fixture.node.child.lock().id())?;
     let mut client = BlockClient::current(fixture, 0, &json!(before)).await?;
-    let held = if hold == Hold::Reservation {
-        let gate = ReservationGate::close(fixture).await?;
-        let held = client.mine().await?;
-        gate.wait_for_reservation(fixture).await?;
-        match fault {
-            Fault::Stop => signal(pid, libc::SIGSTOP)?,
-            Fault::Kill => fixture.node.stop(),
-        }
-        proxy.refuse().await?;
-        gate.open(fixture).await?;
-        wait_unsent(fixture, &held).await?;
-        held
-    } else {
-        let hit = proxy.arm(hold);
-        let held = client.mine().await?;
-        let hit = tokio::time::timeout(Duration::from_secs(30), hit)
-            .await
-            .context("no submitblock reached the proxy")??;
-        ensure!(
-            hit.block == held,
-            "held submitblock was for {}, not the mined block {held}",
-            hit.block
-        );
-        match fault {
-            Fault::Stop => signal(pid, libc::SIGSTOP)?,
-            Fault::Kill => fixture.node.stop(),
-        }
-        let _ = hit.release.send(());
-        held
-    };
-    // The one outcome the held row ends with: a request the node read and
-    // answered after its resume, the node's acceptance, or (never sent while
-    // the port refused) the acceptance of the one offer after the restart.
     let outcome = match hold {
         Hold::Request => "unknown",
         Hold::Reply | Hold::Reservation => "accepted",
     };
-    if hold != Hold::Reservation {
-        until("the held offer's outcome recorded", 30, || async {
-            Ok(sqlx::query_scalar::<_, Option<String>>(
-                "SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
-            )
-            .bind(&held)
-            .fetch_one(&fixture.pool)
-            .await?
-            .as_deref()
-                == Some(outcome))
-        })
-        .await?;
-    }
+    let held = match hold {
+        Hold::Reservation => unsent_offer(fixture, proxy, &mut client, fault, pid, &before).await?,
+        Hold::Request | Hold::Reply => {
+            held_offer(fixture, proxy, &mut client, fault, pid, hold, outcome).await?
+        }
+    };
     wait_health(fixture, false, 60).await?;
     for index in 0..2 {
         let label = format!("server {index} metrics showing the node unavailable");
@@ -211,25 +174,6 @@ async fn outage_steps(
         (unlanded(fixture).await? > 0.0) == (hold == Hold::Reply),
         "accepted-unlanded signal disagrees with the node's answer"
     );
-
-    if hold == Hold::Reservation {
-        // The row keeps retrying while the port refuses, and nothing reaches
-        // the node.
-        until("a second unsent offer while the port refuses", 30, || async {
-            Ok(sqlx::query_scalar::<_, bool>(
-                "SELECT attempt_count>=2 AND state='pending' AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1",
-            )
-            .bind(&held)
-            .fetch_one(&fixture.pool)
-            .await?)
-        })
-        .await?;
-        ensure!(
-            proxy.submitted() == vec![before.clone()],
-            "a submitblock reached the node while its port refused: {:?}",
-            proxy.submitted()
-        );
-    }
 
     match fault {
         Fault::Stop => signal(pid, libc::SIGCONT)?,
@@ -350,6 +294,91 @@ async fn outage_steps(
         submitted.len()
     );
     Ok(())
+}
+
+/// The fault itself: `SIGSTOP` the node, or kill it.
+fn inject(fixture: &mut Fixture, fault: Fault, pid: libc::pid_t) -> Result<()> {
+    match fault {
+        Fault::Stop => signal(pid, libc::SIGSTOP),
+        Fault::Kill => {
+            fixture.node.stop();
+            Ok(())
+        }
+    }
+}
+
+/// Mine the held block with its `submitblock` held in the proxy (`hold`),
+/// inject the fault, release the call, and wait for its recorded outcome.
+async fn held_offer(
+    fixture: &mut Fixture,
+    proxy: &RpcProxy,
+    client: &mut BlockClient,
+    fault: Fault,
+    pid: libc::pid_t,
+    hold: Hold,
+    outcome: &str,
+) -> Result<String> {
+    let hit = proxy.arm(hold);
+    let held = client.mine().await?;
+    let hit = tokio::time::timeout(Duration::from_secs(30), hit)
+        .await
+        .context("no submitblock reached the proxy")??;
+    ensure!(
+        hit.block == held,
+        "held submitblock was for {}, not the mined block {held}",
+        hit.block
+    );
+    inject(fixture, fault, pid)?;
+    let _ = hit.release.send(());
+    until("the held offer's outcome recorded", 30, || async {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        )
+        .bind(&held)
+        .fetch_one(&fixture.pool)
+        .await?
+        .as_deref()
+            == Some(outcome))
+    })
+    .await?;
+    Ok(held)
+}
+
+/// Mine the held block with its offer reservation held in the database,
+/// inject the fault, close the proxy's port, and release the reservation:
+/// the one `submitblock` finds the connection refused (#522). The row must
+/// return to `pending` unsent and keep retrying, with nothing reaching the
+/// node, while the port refuses.
+async fn unsent_offer(
+    fixture: &mut Fixture,
+    proxy: &RpcProxy,
+    client: &mut BlockClient,
+    fault: Fault,
+    pid: libc::pid_t,
+    before: &str,
+) -> Result<String> {
+    let gate = ReservationGate::close(fixture).await?;
+    let held = client.mine().await?;
+    gate.wait_for_reservation(fixture).await?;
+    inject(fixture, fault, pid)?;
+    proxy.refuse().await?;
+    gate.open(fixture).await?;
+    wait_unsent(fixture, &held).await?;
+    until("a second unsent offer while the port refuses", 30, || async {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT attempt_count>=2 AND state='pending' AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        )
+        .bind(&held)
+        .fetch_one(&fixture.pool)
+        .await?)
+    })
+    .await?;
+    ensure!(
+        proxy.submitted() == [before],
+        "a submitblock reached the node while its port refused: {:?}",
+        proxy.submitted()
+    );
+    Ok(held)
 }
 
 fn signal(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
