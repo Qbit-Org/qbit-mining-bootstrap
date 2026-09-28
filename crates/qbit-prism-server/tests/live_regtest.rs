@@ -225,21 +225,79 @@ fn fixture_ports_stay_reserved_until_their_child_starts() -> Result<()> {
     for port in &ports {
         assert!(TcpListener::bind(("127.0.0.1", *port)).is_err());
     }
+    // A released port goes back to the host, where a concurrent test or
+    // process can bind it at once (#533). So the release is checked on the
+    // reservation's own sockets, not by binding the port again.
+    #[cfg(target_os = "linux")]
+    let sockets = reserved_sockets(&reservations)?;
     // Starting one child releases only its ports; later children stay protected.
     reservations.release(&ports[..2]);
-    let child = ports[..2]
+    let held: Vec<u16> = reservations
+        .0
+        .lock()
+        .unwrap()
         .iter()
-        .map(|port| TcpListener::bind(("127.0.0.1", *port)))
-        .collect::<std::io::Result<Vec<_>>>()?;
+        .map(|(port, _)| *port)
+        .collect();
+    assert_eq!(held, ports[2..]);
     for port in &ports[2..] {
         assert!(TcpListener::bind(("127.0.0.1", *port)).is_err());
     }
-    drop(reservations);
-    for port in &ports[2..] {
-        let _listener = TcpListener::bind(("127.0.0.1", *port))?;
+    #[cfg(target_os = "linux")]
+    {
+        let open = open_socket_inodes()?;
+        for (port, inode) in &sockets {
+            assert_eq!(
+                open.contains(inode),
+                !ports[..2].contains(port),
+                "port {port}"
+            );
+        }
     }
-    drop(child);
+    drop(reservations);
+    #[cfg(target_os = "linux")]
+    {
+        let open = open_socket_inodes()?;
+        assert!(sockets.iter().all(|(_, inode)| !open.contains(inode)));
+    }
     Ok(())
+}
+
+/// Each reserved port with the inode of the listening socket that holds it.
+#[cfg(target_os = "linux")]
+fn reserved_sockets(reservations: &PortReservations) -> Result<Vec<(u16, u64)>> {
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+    reservations
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(port, listener)| {
+            let fd = format!("/proc/self/fd/{}", listener.as_raw_fd());
+            Ok((*port, std::fs::metadata(fd)?.ino()))
+        })
+        .collect()
+}
+
+/// The inodes of every socket this process has open. Socket inodes come from
+/// a counter, while a closed descriptor number is reused by the next open.
+#[cfg(target_os = "linux")]
+fn open_socket_inodes() -> Result<std::collections::HashSet<u64>> {
+    let mut inodes = std::collections::HashSet::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        // Other tests' threads open and close descriptors meanwhile.
+        let Ok(target) = std::fs::read_link(entry?.path()) else {
+            continue;
+        };
+        if let Some(inode) = target
+            .to_str()
+            .and_then(|target| target.strip_prefix("socket:["))
+            .and_then(|target| target.strip_suffix(']'))
+        {
+            inodes.insert(inode.parse()?);
+        }
+    }
+    Ok(inodes)
 }
 
 fn free_port() -> Result<u16> {
@@ -1266,12 +1324,23 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         let before=fixture.count(0).await?;fixture.start_miner(0)?;
         until("restarted server mining",20,||async {Ok(fixture.count(0).await?>before+2)}).await?;
         fixture.quiesce().await?;
-        let count:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted").fetch_one(&fixture.pool).await?;
-        let unique:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes").fetch_one(&fixture.pool).await?;ensure!(count==unique,"duplicate headers credited");
-        for index in 0..2 {
-            let latest:Value=fixture.client.get(format!("http://127.0.0.1:{}/audit/latest",fixture.api[index])).send().await?.error_for_status()?.json().await?;
-            ensure!(latest["accepted_share_count"].as_i64()==Some(count),"API does not expose cluster share count: {latest}");
-        }
+        // A share a server read before its miner was killed can still commit
+        // (#533). Read both counts in one snapshot, and compare each API with a
+        // count that is the same before and after the API reads.
+        let started=Instant::now();
+        let count=loop {
+            let (count,unique):(i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM qbit_share_ledger WHERE accepted),(SELECT count(*) FROM qbit_prism_share_hashes)").fetch_one(&fixture.pool).await?;
+            ensure!(count==unique,"duplicate headers credited: {count} accepted shares, {unique} credited headers");
+            let mut latest=Vec::new();
+            for index in 0..2 {
+                let body:Value=fixture.client.get(format!("http://127.0.0.1:{}/audit/latest",fixture.api[index])).send().await?.error_for_status()?.json().await?;
+                latest.push(body);
+            }
+            let after:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted").fetch_one(&fixture.pool).await?;
+            if after==count && latest.iter().all(|body| body["accepted_share_count"].as_i64()==Some(count)) { break count; }
+            ensure!(started.elapsed()<Duration::from_secs(30),"API does not expose cluster share count {count} (then {after}): {latest:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
         let hash:String=sqlx::query_scalar("SELECT block_hash FROM qbit_pool_blocks WHERE chain_state='confirmed' ORDER BY block_height DESC LIMIT 1").fetch_one(&fixture.pool).await?;
         let body:Value=fixture.client.get(format!("http://127.0.0.1:{}/audit/blocks/{hash}/bundle",fixture.api[1])).send().await?.error_for_status()?.json().await?;
         let bundle:AuditBundle=serde_json::from_value(body["audit_bundle"].clone())?;
