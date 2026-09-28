@@ -30,6 +30,9 @@ mod cpfp_tests;
 #[path = "support/live_node_outage.rs"]
 mod node_outage_tests;
 
+#[path = "support/live_weighted_recipients.rs"]
+mod weighted_recipients_tests;
+
 /// Each fixture starts a regtest `qbitd` and two servers, and a server binds
 /// its listeners only after coordinator startup: the schema migrations, which
 /// the second server of a fixture waits for under the migrations table lock,
@@ -110,6 +113,9 @@ struct Fixture {
     client: reqwest::Client,
     address: String,
     ctv: bool,
+    /// Settings applied after every other server setting, so a case can
+    /// override one of them. Empty unless a case sets them before a start.
+    server_env: Vec<(String, String)>,
     /// Declared last, so it is released after the processes and pools above.
     _serial: tokio::sync::MutexGuard<'static, ()>,
 }
@@ -374,6 +380,7 @@ impl Fixture {
             client,
             address: String::new(),
             ctv: launch.ctv,
+            server_env: Vec::new(),
             _serial: serial,
         });
         until("qbit RPC", 30, || async {
@@ -471,6 +478,7 @@ impl Fixture {
                 .env("PRISM_CTV_BROADCASTER_WALLET", "prism")
                 .env("PRISM_CTV_BROADCASTER_FEE_BITS", fee.to_string());
         }
+        command.envs(self.server_env.iter().map(|(name, value)| (name, value)));
         // Release only this child's ports immediately before spawn. Later
         // servers remain reserved through node startup and migrations.
         self.ports
