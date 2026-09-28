@@ -31,6 +31,12 @@ pub struct Budgets {
     pub tip_last_notify_p99_ms: Option<f64>,
     /// Print #473's D1 verdict table for `steady_state` and `burst`.
     pub d1_verdict_table: bool,
+    /// The churn phase's tip delivery, over the sessions connected at each
+    /// tip; `None` does not gate on it.
+    pub churn_tip_last_notify_p99_ms: Option<f64>,
+    /// The churn phase's new sessions' time to first job; `None` does not
+    /// gate on it.
+    pub new_session_first_job_p99_ms: Option<f64>,
 }
 
 impl From<&crate::preset::Gates> for Budgets {
@@ -42,6 +48,8 @@ impl From<&crate::preset::Gates> for Budgets {
             max_unanswered_submits: gates.max_unanswered_submits,
             tip_last_notify_p99_ms: gates.tip_last_notify_p99_budget_ms,
             d1_verdict_table: gates.d1_verdict_table,
+            churn_tip_last_notify_p99_ms: gates.churn_tip_last_notify_p99_budget_ms,
+            new_session_first_job_p99_ms: gates.new_session_first_job_p99_budget_ms,
         }
     }
 }
@@ -329,6 +337,7 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         )),
         (Err(reason), None) => checks.push(Check::info(name, format!("unmeasured: {reason}"))),
     }
+    churn_checks(report, budgets, &mut checks);
     let population = &report["population"];
     checks.push(Check::info(
         "payout addresses / sessions",
@@ -366,6 +375,115 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         ));
     }
     checks
+}
+
+/// Every churn tip's slowest served session among those connected at the
+/// tip, or why a tip has none.
+pub fn churn_tip_last_notify(report: &Value) -> Result<Vec<f64>, String> {
+    let churn = &report["churn"];
+    if churn["ran"] != true {
+        return Err(format!(
+            "the churn phase did not run: {}",
+            churn["reason"].as_str().unwrap_or("no churn section")
+        ));
+    }
+    let Some(tips) = churn["tip_delivery"]["tips"].as_array() else {
+        return Err("the churn section has no tip_delivery.tips".into());
+    };
+    if tips.is_empty() {
+        return Err("the churn phase minted no tip".into());
+    }
+    let mut times = Vec::new();
+    let mut missing = Vec::new();
+    for (index, tip) in tips.iter().enumerate() {
+        match tip["last_served_milliseconds"].as_f64() {
+            Some(millis) => times.push(millis),
+            None => missing.push(format!(
+                "tip {index}: {} of {} connected sessions unserved",
+                tip["unserved"], tip["connected_at_tip"]
+            )),
+        }
+    }
+    if missing.is_empty() {
+        Ok(times)
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
+fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
+    let churn = &report["churn"];
+    if churn["ran"] != true
+        && budgets.churn_tip_last_notify_p99_ms.is_none()
+        && budgets.new_session_first_job_p99_ms.is_none()
+    {
+        return;
+    }
+    let name = "churn: tip to last notify, sessions connected at the tip, p99 over tips";
+    let budget = budgets
+        .churn_tip_last_notify_p99_ms
+        .map_or("not gated".into(), |ms| format!("<= {ms} ms"));
+    let (observed, pass) = match churn_tip_last_notify(report) {
+        Ok(times) => {
+            let p99 = nearest_rank(&times, 0.99);
+            (
+                p99.map_or("no tips".into(), |p| {
+                    format!(
+                        "{p:.0} ms over {} tips (max {:.0} ms)",
+                        times.len(),
+                        max(&times)
+                    )
+                }),
+                p99.zip(budgets.churn_tip_last_notify_p99_ms)
+                    .is_some_and(|(p, limit)| p <= limit),
+            )
+        }
+        Err(reason) => (format!("unmeasured: {reason}"), false),
+    };
+    checks.push(match budgets.churn_tip_last_notify_p99_ms {
+        Some(_) => Check::gate(name, observed, budget, pass),
+        None => Check::info(name, observed),
+    });
+    let first = &churn["time_to_first_job"]["new_sessions"];
+    let p99 = first["p99"].as_f64();
+    let observed = match p99 {
+        Some(p) => format!(
+            "{p:.0} ms over {} connections (max {:.0} ms)",
+            first["samples"],
+            first["max"].as_f64().unwrap_or(p)
+        ),
+        None => format!(
+            "unmeasured: {}",
+            first["unavailable_reason"]
+                .as_str()
+                .unwrap_or("the churn phase did not run")
+        ),
+    };
+    let name = "churn: new session time to first job, p99";
+    checks.push(match budgets.new_session_first_job_p99_ms {
+        Some(limit) => Check::gate(
+            name,
+            observed,
+            format!("<= {limit} ms"),
+            p99.is_some_and(|p| p <= limit),
+        ),
+        None => Check::info(name, observed),
+    });
+    let realised = &churn["realised"];
+    if churn["ran"] == true {
+        checks.push(Check::info(
+            "churn: connects/s max, concurrent sessions min-max, storms, rentals",
+            format!(
+                "{} / {}-{} / {} / {} spawned, {} departed",
+                realised["connects_per_second_max"],
+                realised["concurrent_sessions_min"],
+                realised["concurrent_sessions_max"],
+                realised["storms"].as_array().map_or(0, Vec::len),
+                realised["rentals_spawned"],
+                realised["rentals_departed"],
+            ),
+        ));
+    }
 }
 
 fn opt(value: Option<u64>) -> String {

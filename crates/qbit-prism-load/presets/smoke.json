@@ -1,7 +1,7 @@
 {
   "schema": "qbit.prism.load-preset.v1",
   "name": "smoke",
-  "description": "The per-PR smoke run: one debug frontend, 100 sessions over 20 skewed payout addresses, a 20k window and 3 retargeting tips in a tips-only plan.",
+  "description": "The per-PR smoke run: one debug frontend, 100 sessions over 20 skewed payout addresses, a 20k window and 3 retargeting tips in a tips-only plan, then 30 s of rental churn (bursts of 20 and 40 sessions, abrupt departures, a 30% reconnect storm, 2 tips).",
   "issues": [
     "#521"
   ],
@@ -14,7 +14,9 @@
     "max_rejected_valid_shares": null,
     "max_unanswered_submits": null,
     "tip_last_notify_p99_budget_ms": 5000,
-    "d1_verdict_table": false
+    "d1_verdict_table": false,
+    "churn_tip_last_notify_p99_budget_ms": 5000,
+    "new_session_first_job_p99_budget_ms": 5000
   },
   "args": {
     "--ack-p99-limit-ms": 1000,
@@ -27,6 +29,9 @@
     "--cadence-gaps": "9,19,9,18,20",
     "--cadence-rate": 20,
     "--cadence-seconds": 240,
+    "--churn-rate": 20,
+    "--churn-seconds": 30,
+    "--churn-tips": 2,
     "--database-url": null,
     "--db-max-connections": 16,
     "--external-tips": 3,
@@ -43,7 +48,13 @@
     "--recipient-weights": "whale:0.6+zipf:1.1",
     "--recipients": 20,
     "--reconnect-seconds": 60,
+    "--reconnect-storms": "0.3",
     "--reconnect-target": 12,
+    "--rental-burst-interval-seconds": 10,
+    "--rental-burst-window-seconds": 4,
+    "--rental-bursts": "20,40",
+    "--rental-hashrate": 5,
+    "--rental-lifetime": "pareto:xm=5,alpha=1.2,max=60",
     "--replication": "none",
     "--retarget-bits": true,
     "--runtime-workers": 2,
@@ -58,6 +69,8 @@
     "--slow-db-delay-ms": 10,
     "--steady-state-rate": 20,
     "--steady-state-seconds": 60,
+    "--storm-interval-seconds": 20,
+    "--storm-reconnect-seconds": 3,
     "--stratum-max-pending-initial-jobs": 128,
     "--template-bits": "1e7fffff",
     "--warmup-seconds": 24,

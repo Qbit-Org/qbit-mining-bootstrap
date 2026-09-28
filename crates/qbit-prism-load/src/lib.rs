@@ -15,6 +15,7 @@
 
 pub mod artifact;
 pub mod cadence;
+pub mod churn;
 pub mod classify;
 pub mod cli;
 pub mod client;

@@ -156,6 +156,17 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--session-difficulty` | `fixed` | `fixed`, or `vardiff:<max ratio>`: each session's share difficulty in proportion to its hashrate, asked for with `d=` in its Stratum password |
 | `--pool-fee-bps` | 0 | Launch every frontend with the pool fee on at this many basis points and a fee address of the run's own, as mainnet runs; dust below the payout floor is then swept to the fee rather than refusing the template (#525). 0 leaves the fee off, as every earlier run had it |
 | `--arrival` | `smooth` | `smooth`, or `bursty:cv1=<x>,cv60=<y>,max=<m>`: the offered rate varies per second and per minute around each phase's rate |
+| `--churn-seconds` | 0 | Length of the `churn` side phase; 0 runs none. See [Connection churn](#connection-churn-521) |
+| `--churn-rate` | the steady-state rate | Offered shares per second during `churn` |
+| `--churn-tips` | 0 | External tips minted evenly through `churn` |
+| `--rental-bursts` | `none` | Rental burst sizes in order (`100,500,2000`), or `pareto:xm=<x>,alpha=<a>,max=<m>;count=<n>` seeded draws |
+| `--rental-burst-window-seconds` | 10 | Seconds over which one burst's sessions connect |
+| `--rental-burst-interval-seconds` | 60 | Seconds between burst starts; the first starts 5 s into the phase |
+| `--rental-lifetime` | `pareto:xm=30,alpha=1.5,max=3600` | A rental session's lifetime, `pareto:` or `lognormal:median=<s>,sigma=<x>,max=<s>`; it then leaves abruptly |
+| `--rental-hashrate` | 20 | A rental session's hashrate over a mean base session's |
+| `--reconnect-storms` | `none` | Storm fractions in order (`0.1,0.25,0.5`): each drops that share of the connected sessions abruptly |
+| `--storm-interval-seconds` | 60 | Seconds between storms |
+| `--storm-reconnect-seconds` | 5 | A stormed session reconnects after a uniform delay up to this |
 | `--preset` | none | A checked-in preset whose flags join the command line; a flag it sets cannot be given again |
 | `--out` | `load-out` | Output directory |
 | `--keep-artifacts` | off | Keep cluster data directories and logs |
@@ -591,6 +602,52 @@ offer weight, with the difficulty spread in orders of magnitude. Each phase's
 coefficient of variation over 1 s and 60 s windows (`null` when fewer than two
 windows fit), and the peak second.
 
+## Connection churn (#521)
+
+Production does not hold a fixed set of sessions. Hash rental arrives as a
+burst of sessions connecting within seconds, mines for a heavy-tailed
+lifetime and leaves by dropping its sockets; a rental failing over between
+pools drops and reconnects many sessions at once. Mainnet records no
+connection velocity, so the churn flags are a parameter sweep, every one off
+by default and pinned by a preset.
+
+`--churn-seconds` adds a side phase, `churn`, after `slow_database` (after
+warm-up under `--plan tips`), with no proxy delay and outside the artifact.
+Inside it, from a plan generated once from `--seed`:
+
+- **Rental bursts.** Each burst connects its sessions at seeded offsets
+  within the burst window. Rentals mine for the heaviest address at
+  `--rental-hashrate` times a mean session (under vardiff, at that multiple
+  of the slowest session's difficulty, capped at the ratio).
+- **Abrupt departures.** Each rental leaves after a seeded lifetime by
+  closing its socket with no quiesce; its outstanding submits are recorded
+  as abandoned (`churn close`). A share the server committed anyway is
+  reported under `no_response_commits` with `churn_closed: true`, never as an
+  ACK/commit divergence. A lifetime past the phase is cut by its end, which
+  quiesces as every phase end does.
+- **Reconnect storms.** Each storm drops a seeded fraction of the sessions
+  then connected, base and rental, abruptly, and each reconnects after a
+  seeded delay.
+- **Tips.** `--churn-tips` tips are minted through the phase.
+
+The frontends' connection cap and the file-descriptor limit are sized for
+`--sessions` plus every rental the bursts could connect.
+
+The side report's `churn` block records the parameters, the plan, and what
+was realised: rentals spawned and departed, abrupt closes, each storm's
+connected and dropped counts, completed reconnects, connects per second and
+concurrent sessions per second with their extremes, and:
+
+- `time_to_first_job`: connection attempt to first job for the phase's new
+  connections (rental arrivals and storm reconnects), p50/p99/max; a storm's
+  deliberate reconnect delay is not in it.
+- `tip_delivery`: per churn tip, the sessions with a connection open at the
+  tip, how many got work on it while it was the tip, how many left first
+  (excluded), and how many stayed and never got it; the slowest served
+  session, `null` while any stayed unserved.
+
+The run-wide `time_to_usable_work` stays over the run's own `--sessions`.
+
 ## Presets and the nightly run
 
 `crates/qbit-prism-load/presets/*.json` pins runs by name. A preset states
@@ -617,6 +674,8 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
 | `tip_last_notify_p99_budget_ms` | per external tip, the slowest session's time to usable work (`time_to_usable_work.tips[].all_sessions_milliseconds`); the p99 over the tips, nearest rank. A tip some session never got work on fails |
 | `d1_verdict_table` | print #473's D1 verdict table, in its columns, for `steady_state` and `burst` |
+| `churn_tip_last_notify_p99_budget_ms` | per churn tip, the slowest served session of those connected at the tip; the p99 over the tips. A tip with a connected session never served fails |
+| `new_session_first_job_p99_budget_ms` | the churn phase's new connections' time to first job, p99 |
 
 | Preset | Runs | Runner | What it is |
 |---|---|---|---|
@@ -627,6 +686,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `mainnet-floor` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
 | `growth-5x` | nightly | 8 vCPU | mainnet-floor with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
 | `growth-20x` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
+| `rental-churn` | nightly | 8 vCPU | mainnet-floor's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
 | `smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 
 The realism presets (`mainnet-floor`, `growth-5x`, `growth-20x`) run
@@ -664,10 +724,11 @@ against a real qbitd and PostgreSQL 16, and proves each executed with
 The per-PR smoke run is the gated test `tests/load_smoke.rs`: the `smoke`
 preset (a debug frontend, 100 sessions over 20 addresses under a 60% whale
 and a Zipf tail with a two-order difficulty spread, a 20k window, 3
-retargeting tips 4.8 s apart in the tips plan) held to its gates, every
-session served on every tip within 5 s. It builds the debug server itself
-and adds about a minute to its CI shard (22 s to build the server beside the
-test's own build, 30 s to run).
+retargeting tips 4.8 s apart in the tips plan, then 30 s of churn: rental
+bursts of 20 and 40, abrupt departures, a 30% storm and 2 tips) held to its
+gates, every session served on every tip within 5 s. It builds the debug
+server itself and adds about a minute and a half to its CI shard (22 s to
+build the server beside the test's own build, 71 s to run).
 
 ## Exit codes
 

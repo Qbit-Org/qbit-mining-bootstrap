@@ -526,6 +526,10 @@ pub struct Collected {
     /// `Disconnected`. A session that connected, dropped and reconnected is
     /// in here once, so this is what the startup gate reads (EP-STATE).
     pub holding_work: BTreeSet<usize>,
+    /// Every connection that reached work, and every one that ended, with
+    /// their times (#521's churn measurements).
+    pub opened: Vec<client::ConnectionOpened>,
+    pub closed: Vec<client::ConnectionClosed>,
 }
 
 impl Collected {
@@ -563,6 +567,8 @@ impl Collected {
                 self.disconnects.push((session, frontend, reason));
             }
             Event::Failure(failure) => self.failures.push(failure),
+            Event::Opened(opened) => self.opened.push(opened),
+            Event::Closed(closed) => self.closed.push(closed),
         }
     }
 
@@ -614,9 +620,61 @@ struct PhaseRun {
     ended: Instant,
     /// Set only for the `dense_cadence` phase.
     dense: Option<DensePhase>,
+    /// Set only for the `churn` phase.
+    churn: Option<ChurnPhase>,
     per_second: PerSecond,
     offers_redirected: u64,
     offers_weighted: bool,
+}
+
+/// The churn phase's driver, kept for its report, and the rental submits
+/// still outstanding when its quiesce limit ran out.
+struct ChurnPhase {
+    driver: crate::churn::ChurnDriver,
+    undrained: usize,
+}
+
+/// The churn phase's driver: the plan from the validated flags, and rental
+/// sessions shaped like the run's own, mining for its heaviest address.
+fn churn_driver(
+    args: &Args,
+    ctx: &RunContext,
+    solution: &window::WindowSolution,
+    frontends: &[Frontend],
+    shared: &Arc<SessionShared>,
+    quiesce_limit: Duration,
+) -> Result<crate::churn::ChurnDriver> {
+    let population = &ctx.population;
+    let multiplier = crate::churn::rental_difficulty_multiplier(population, args.rental_hashrate);
+    let base = live_base_difficulty(solution, population.mean_offered_multiplier());
+    let (share_difficulty, password) = session_difficulty(base, multiplier);
+    let base_offer_weight: f64 = population.sessions.iter().map(|s| s.offer_weight).sum();
+    let template = crate::churn::RentalTemplate {
+        address: population.addresses[0].clone(),
+        share_difficulty,
+        password,
+        difficulty_multiplier: multiplier,
+        offer_weight: args.rental_hashrate / multiplier,
+        config: SessionConfig {
+            index: 0,
+            username: String::new(),
+            password: String::new(),
+            share_difficulty,
+            version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
+            connect_timeout: Duration::from_secs(20),
+            handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
+            quiesce_limit,
+        },
+    };
+    Ok(crate::churn::ChurnDriver::new(
+        args.churn_spec()?,
+        template,
+        frontends.iter().map(Frontend::stratum_address).collect(),
+        shared.clone(),
+        args.max_outstanding_per_session,
+        args.sessions,
+        base_offer_weight,
+    ))
 }
 
 /// What the dense-cadence phase collected beyond the usual per-phase numbers.
@@ -732,7 +790,12 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     // the output directory or a cluster is touched (EP-VALIDATION).
     check_session_difficulties(
         &window::solve_window(args.template_bits()?, args.window_shares)?,
-        population.max_difficulty_multiplier(),
+        population
+            .max_difficulty_multiplier()
+            .max(crate::churn::rental_difficulty_multiplier(
+                &population,
+                args.rental_hashrate,
+            )),
         population.mean_offered_multiplier(),
     )?;
 
@@ -794,7 +857,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     .to_owned();
 
     // --- file descriptors -------------------------------------------------
-    let needed = (args.sessions as u64) * 4 + 1024;
+    let needed = (args.peak_sessions() as u64) * 4 + 1024;
     let (fd_before, fd_after) = measure::raise_file_descriptor_limit(needed)?;
 
     // --- fake node --------------------------------------------------------
@@ -1322,10 +1385,23 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .store(plan.dense_cadence, std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
         let started_wall = chrono::Utc::now();
+        let mut churn_driver = (plan.name == crate::churn::PHASE)
+            .then(|| {
+                churn_driver(
+                    args,
+                    &ctx,
+                    &solution,
+                    &frontends,
+                    &shared_session,
+                    quiesce_limit,
+                )
+            })
+            .transpose()?;
         let outcome = drive_phase_with_population(
             args,
             plan,
             Some(&ctx.population),
+            churn_driver.as_mut(),
             &sessions,
             &mut frontends,
             &process_samplers,
@@ -1342,6 +1418,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         // `drive_phase` after that, as boundary time.
         let ended = outcome.ended;
         let ended_wall = outcome.ended_wall;
+        // The rentals still connected quiesce and stop at the phase's end, as
+        // every session does at the run's; their numbers stay the phase's.
+        let churn = match churn_driver {
+            Some(mut driver) => {
+                let undrained = driver.finish(settle_limit).await;
+                Some(ChurnPhase { driver, undrained })
+            }
+            None => None,
+        };
         shared_session
             .record_notifies
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1439,6 +1524,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             started,
             ended,
             dense,
+            churn,
             per_second: outcome.per_second,
             offers_redirected: outcome.offers_redirected,
             offers_weighted: outcome.offers_weighted,
@@ -1943,6 +2029,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &external_tips, &tip_changes, &collected, args.sessions,
         ),
         "dense_cadence": dense_cadence,
+        "churn": churn_report(args, &runs, &collected, &tip_changes),
         "node": {
             "url": ctx.node_url,
             "template_bits": format!("{:08x}", args.template_bits()?),
@@ -2055,7 +2142,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         no_response_commits: no_response_commits.len(),
         no_response_commits_mid_run: no_response_commits
             .iter()
-            .filter(|share| share["window_ended"] != serde_json::Value::Bool(true))
+            .filter(|share| {
+                share["window_ended"] != serde_json::Value::Bool(true)
+                    && share["churn_closed"] != serde_json::Value::Bool(true)
+            })
             .count(),
     };
     if let Some(line) = outcome.explanation(&report_path) {
@@ -2167,7 +2257,7 @@ impl OfferPicker {
         self.table.is_some()
     }
 
-    fn offer(
+    pub(crate) fn offer(
         &mut self,
         sessions: &[SessionHandle],
         cursor: &AtomicUsize,
@@ -2207,6 +2297,7 @@ pub async fn drive_phase(
         args,
         plan,
         None,
+        None,
         sessions,
         frontends,
         samplers,
@@ -2237,6 +2328,7 @@ pub async fn drive_phase_with_population(
     args: &Args,
     plan: &PhasePlan,
     population: Option<&crate::realism::Population>,
+    mut churn: Option<&mut crate::churn::ChurnDriver>,
     sessions: &[SessionHandle],
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
@@ -2357,13 +2449,25 @@ pub async fn drive_phase_with_population(
         let second = seconds as usize;
         while outcome.tokens < want {
             outcome.tokens += 1;
-            let placed = offers.offer(sessions, &cursor, args.max_outstanding_per_session, &phase);
+            let limit = args.max_outstanding_per_session;
+            let placed = match churn.as_deref_mut() {
+                Some(driver) => driver.offer(
+                    sessions,
+                    &mut |base| offers.offer(base, &cursor, limit, &phase),
+                    limit,
+                    &phase,
+                ),
+                None => offers.offer(sessions, &cursor, limit, &phase),
+            };
             if placed {
                 outcome.dispatched += 1;
             } else {
                 outcome.shortfall += 1;
             }
             outcome.per_second.record(second, placed);
+        }
+        if let Some(driver) = churn.as_deref_mut() {
+            driver.tick(seconds, sessions, node_state);
         }
         if seconds >= next_reconnect {
             next_reconnect += reconnect_interval.unwrap_or(f64::INFINITY);
@@ -3223,6 +3327,13 @@ pub fn time_to_usable_work(
                 if sighting.tip != tip.hash || sighting.at < tip.monotonic {
                     continue;
                 }
+                // The figure is over the run's own sessions, `0..sessions`:
+                // a churn phase's rental connecting later first sees work on
+                // whatever tip is current, which is not delivery of it
+                // (#521). Its tips are measured in the churn section.
+                if sighting.session >= sessions {
+                    continue;
+                }
                 if replaced_at.is_some_and(|end| sighting.at >= end) {
                     continue;
                 }
@@ -3395,6 +3506,44 @@ fn dense_cadence_report(
         dense.session_frontend.len(),
     );
     document
+}
+
+/// The `churn` section of the side report; says so when the run asked for
+/// none, rather than emitting an empty table (EP-OBSERVABILITY).
+fn churn_report(
+    args: &Args,
+    runs: &[PhaseRun],
+    collected: &Collected,
+    tip_changes: &[crate::node::TipChange],
+) -> Value {
+    let Some((phase, churn)) = runs
+        .iter()
+        .find_map(|phase| phase.churn.as_ref().map(|churn| (phase, churn)))
+    else {
+        return json!({
+            "ran": false,
+            "reason": if args.churn_seconds == 0 {
+                "the run did not ask for --churn-seconds"
+            } else {
+                "the run ended before the churn phase could run"
+            },
+        });
+    };
+    let Ok(spec) = args.churn_spec() else {
+        return json!({"ran": false, "reason": "the churn flags did not parse"});
+    };
+    crate::churn::report(&crate::churn::ReportInputs {
+        spec: &spec,
+        driver: &churn.driver,
+        phase_started: phase.started,
+        phase_ended: phase.ended,
+        opened: &collected.opened,
+        closed: &collected.closed,
+        sightings: &collected.tips,
+        all_tip_changes: tip_changes,
+        reconnects: &collected.reconnects,
+        rentals_undrained: churn.undrained,
+    })
 }
 
 /// Failure counts by kind, for the side report.
@@ -3990,6 +4139,11 @@ pub fn classify_gaps(
                         "no_response_reason": reason.clone(),
                         "classification": "transport-indeterminate",
                         "window_ended": reason.as_deref() == Some(client::RUN_ENDED),
+                        // Abandoned by the churn model's abrupt close: the
+                        // miner left, and the lost answer is the scenario.
+                        "churn_closed": reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.starts_with(client::CHURN_CLOSED)),
                     }));
                 }
                 GapKind::DurabilityLoss => unexplained.push(share.clone()),

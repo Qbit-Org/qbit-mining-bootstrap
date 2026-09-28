@@ -487,6 +487,7 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
         "growth-5x",
         "growth-20x",
         "smoke",
+        "rental-churn",
         "d1-473-200k-fe1-async",
         "d1-473-400k-fe1-async",
         "d1-473-400k-fe2-async",
@@ -551,7 +552,8 @@ fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
         let mut argv = vec!["qbit-prism-load".to_owned()];
         argv.extend(loaded.argv()?);
         let args = Args::try_parse_from(&argv)?;
-        let realism = ["mainnet-floor", "growth-5x", "growth-20x"].contains(&loaded.name.as_str());
+        let realism = ["mainnet-floor", "growth-5x", "growth-20x", "rental-churn"]
+            .contains(&loaded.name.as_str());
         assert_eq!(
             args.pool_fee_bps,
             if realism { 200 } else { 0 },
@@ -817,6 +819,8 @@ fn the_gate_passes_a_clean_run_and_fails_each_way_a_run_can_fall_short() {
         max_unanswered_submits: None,
         tip_last_notify_p99_ms: Some(5000.0),
         d1_verdict_table: false,
+        churn_tip_last_notify_p99_ms: None,
+        new_session_first_job_p99_ms: None,
     };
     let clean = gate::evaluate(&passing_report(), Some(0), &budgets);
     assert!(gate::passed(&clean), "{}", gate::markdown("clean", &clean));
@@ -904,6 +908,8 @@ fn the_473_rule_gates_only_the_named_phases_and_each_of_its_three_figures() {
         max_unanswered_submits: Some(0),
         tip_last_notify_p99_ms: None,
         d1_verdict_table: true,
+        churn_tip_last_notify_p99_ms: None,
+        new_session_first_job_p99_ms: None,
     };
     let checks = gate::evaluate(&report, Some(0), &rule);
     assert!(gate::passed(&checks), "{}", gate::markdown("x", &checks));
