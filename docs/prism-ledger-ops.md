@@ -1086,7 +1086,9 @@ pool loses those blocks as it did before #478.
   `floor(coinbase_value_sats × PRISM_CAPTURE_OVERPAY_CEILING_BPS / 10000)`.
   Work issued now can be captured if `positive_float_sats` is at most that.
   The smallest setting that admits it is
-  `ceil(positive_float_sats × 10000 / coinbase_value_sats)` bps. The line
+  `max(1, ceil(positive_float_sats × 10000 / coinbase_value_sats))` bps,
+  because 0 turns capture off. If that exceeds 10000, the largest accepted
+  setting, no setting admits the float. The line
   shows no headroom because the ceiling depends on the next block's coinbase
   value, subsidy plus fees, and on each frontend's setting, and the database
   holds neither. Use the lowest coinbase value you expect, since a block with
