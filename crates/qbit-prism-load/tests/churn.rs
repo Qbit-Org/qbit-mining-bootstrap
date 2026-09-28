@@ -1,6 +1,6 @@
 //! The connection-churn model (#521): parsing, the seeded plan, and the
 //! realised-churn and tip-delivery measurements over synthetic timelines.
-//! Pure unit tests; the end-to-end churn run is the `rental-churn` preset.
+//! Pure unit tests; the end-to-end churn run is the `rental-churn-bursts-and-storms` preset.
 
 use clap::Parser;
 use qbit_prism_load::{
@@ -105,6 +105,35 @@ fn every_churn_flag_defaults_to_off_and_needs_the_phase() {
         &["--churn-seconds", "60", "--churn-rate=-1"],
         "--churn-rate",
     );
+    // A reconnect window as long as the storm interval would let a storm
+    // pick sessions the previous one left offline; one storm has no
+    // previous one.
+    refused(
+        &[
+            "--churn-seconds",
+            "300",
+            "--reconnect-storms",
+            "0.1,0.5",
+            "--storm-interval-seconds",
+            "30",
+            "--storm-reconnect-seconds",
+            "30",
+        ],
+        "shorter than --storm-interval-seconds",
+    );
+    Args::parse_from([
+        "qbit-prism-load",
+        "--churn-seconds",
+        "300",
+        "--reconnect-storms",
+        "0.5",
+        "--storm-interval-seconds",
+        "30",
+        "--storm-reconnect-seconds",
+        "30",
+    ])
+    .validate()
+    .unwrap();
 }
 
 #[test]

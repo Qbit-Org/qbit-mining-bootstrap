@@ -678,6 +678,20 @@ impl Args {
                 "{name} must be finite and {low}..{high}"
             );
         }
+        // A storm picks from the sessions it counts as connected: every one
+        // not paused. A session still waiting out the previous storm's
+        // reconnect delay is not paused, so it could be picked again, its
+        // close would be ignored, and `dropped` would overstate the storm.
+        // Refused here rather than measured wrong (#539 review).
+        if storms.len() > 1 {
+            ensure!(
+                self.storm_reconnect_seconds < self.storm_interval_seconds,
+                "--storm-reconnect-seconds ({}) must be shorter than --storm-interval-seconds \
+                 ({}), or a storm could pick sessions the previous one left offline",
+                self.storm_reconnect_seconds,
+                self.storm_interval_seconds
+            );
+        }
         ensure!(
             bursts.upper_bound() <= crate::churn::MAX_RENTAL_SESSIONS,
             "--rental-bursts could add {} sessions, over {}",

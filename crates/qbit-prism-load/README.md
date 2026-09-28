@@ -679,17 +679,25 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 
 | Preset | Runs | Runner | What it is |
 |---|---|---|---|
-| `d1-20k`, `d1-20k-realistic` | nightly | 8 vCPU | #271's D1 20k fixture (`w11-20k-fe1-async`, its pre-#497 admission 2,016), and the same with 500 addresses under Zipf(1.1) |
-| `tip-275`, `tip-275-realistic` | nightly | 8 vCPU | #275's tip-delivery benchmark in realistic mode (2 frontends, 2,000 sessions, 400k window, 8 retargeting tips 45 s apart over 133 shares/s), and the same with 500 Zipf(1.1) addresses |
-| `d1-473-400k-fe1-async` | nightly | 8 vCPU | PR #473's production-window D1 baseline cell, exactly as it ran it on `a1937054` (admission `sessions_per_frontend + 16`, from before #497) |
-| `d1-473-400k-fe{2,4}-async`, `d1-473-400k-fe2-sync`, `d1-473-200k-fe1-async`, `d1-473-500k-fe{1,2,4}-async` | manual | 16 vCPU | #473's other cells, likewise |
-| `mainnet-floor` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
-| `growth-5x` | nightly | 8 vCPU | mainnet-floor with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
-| `growth-20x` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
-| `rental-churn` | nightly | 8 vCPU | mainnet-floor's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
-| `smoke` | every PR | 2 vCPU | the per-PR smoke run below |
+| `throughput-20k-window-1fe`, `throughput-20k-window-1fe-500-addresses` | nightly | 8 vCPU | #271's D1 20k fixture (`w11-20k-fe1-async`, its pre-#497 admission 2,016), and the same with 500 addresses under Zipf(1.1) |
+| `tip-delivery-2000-miners-400k-2fe-retarget` | nightly | 8 vCPU | #275's tip-delivery benchmark in realistic mode (2 frontends, 2,000 sessions, 400k window, 8 retargeting tips 45 s apart over 133 shares/s) |
+| `tip-delivery-2000-miners-400k-2fe-retarget-500-addresses` | manual | 8 vCPU | the same with 500 Zipf(1.1) addresses |
+| `throughput-400k-window-1fe-async` | nightly | 8 vCPU | PR #473's production-window D1 baseline cell, exactly as it ran it on `a1937054` (admission `sessions_per_frontend + 16`, from before #497) |
+| `throughput-400k-window-{2,4}fe-async`, `throughput-400k-window-2fe-sync`, `throughput-200k-window-1fe-async`, `throughput-500k-window-{1,2,4}fe-async` | manual | 16 vCPU | #473's other cells, likewise |
+| `mainnet-shape-130-addresses` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
+| `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
+| `mainnet-shape-2600-addresses` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
+| `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
+| `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 
-The realism presets (`mainnet-floor`, `growth-5x`, `growth-20x`) run
+The names say what a preset measures. The names they replaced (`d1-20k`,
+`d1-20k-realistic`, `tip-275`, `tip-275-realistic`, `d1-473-*`,
+`mainnet-floor`, `growth-5x`, `growth-20x`, `rental-churn`, `smoke`) still
+select their presets for one release, through `presets/aliases.txt`, in the
+workflow's `preset` input and in `prism-load-run.sh`, with a deprecation
+warning.
+
+The realism presets (`mainnet-shape-130-addresses`, `mainnet-shape-650-addresses`, `mainnet-shape-2600-addresses`) run
 mainnet's 200 bps pool fee; every legacy preset runs with the fee off, as it
 was measured. The nightly schedule runs on 8 vCPU runners only.
 
@@ -703,7 +711,10 @@ measurement, and is reported.
 `.github/workflows/prism-load-nightly.yml` runs the nightly presets every
 night and any selection on demand (`preset`: names, `nightly` or `all`;
 `ref`; and overrides of the tip budget and the shortfall budget). Each preset
-runs on its own runner through `.github/scripts/prism-load-run.sh`, which
+runs on its own runner, all of them on one commit pinned by the plan job and
+on release binaries a single build job makes and shares with them (with
+their Cargo dep-info, so the harness still ties the server to the
+checkout), through `.github/scripts/prism-load-run.sh`, which
 records `pg_test_fsync` on the filesystem the harness builds its cluster on,
 runs the preset, and gates it with `qbit-prism-load-gate`; the verdict table
 goes to the job summary and the reports to an artifact. The same script
@@ -711,7 +722,7 @@ reproduces a nightly run anywhere:
 
 ```sh
 cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
-.github/scripts/prism-load-run.sh mainnet-floor load-out
+.github/scripts/prism-load-run.sh mainnet-shape-130-addresses load-out
 ```
 
 The same workflow's `live-nightly` job runs the opt-in `#[ignore]`
@@ -721,7 +732,7 @@ recipients today) with `--ignored --exact`
 against a real qbitd and PostgreSQL 16, and proves each executed with
 `scripts/check_gate_manifest.py`, as the PR suite proves its own list.
 
-The per-PR smoke run is the gated test `tests/load_smoke.rs`: the `smoke`
+The per-PR smoke run is the gated test `tests/load_smoke.rs`: the `pr-smoke`
 preset (a debug frontend, 100 sessions over 20 addresses under a 60% whale
 and a Zipf tail with a two-order difficulty spread, a 20k window, 3
 retargeting tips 4.8 s apart in the tips plan, then 30 s of churn: rental

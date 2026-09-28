@@ -1,7 +1,7 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "growth-5x",
-  "description": "mainnet-floor scaled five times: 650 payout addresses, 2,000 sessions, a 250/s mean peaking at 2,000/s, the 200 bps pool fee.",
+  "name": "mainnet-shape-650-addresses",
+  "description": "mainnet-shape-130-addresses scaled five times: 650 payout addresses, 2,000 sessions, a 250/s mean peaking at 2,000/s, the 200 bps pool fee.",
   "issues": [
     "#521"
   ],

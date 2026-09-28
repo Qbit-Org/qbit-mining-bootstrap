@@ -1,14 +1,13 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "d1-473-500k-fe1-async",
-  "description": "PR #473's D1 cell d1-500k-fe1-async: 500k window, 2,000 sessions on 1 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 2016, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase.",
+  "name": "throughput-20k-window-1fe-500-addresses",
+  "description": "throughput-20k-window-1fe with 500 payout addresses whose sessions and window shares follow Zipf(1.1) (#271).",
   "issues": [
-    "#447",
-    "#473",
+    "#271",
     "#521"
   ],
-  "schedule": "manual",
-  "runner": "blacksmith-16vcpu-ubuntu-2404",
+  "schedule": "nightly",
+  "runner": "blacksmith-8vcpu-ubuntu-2404",
   "timeout_minutes": 60,
   "gates": {
     "phases": [
@@ -49,8 +48,8 @@
     "--pool-fee-bps": 0,
     "--process-sample-interval-ms": 1000,
     "--rate": 50,
-    "--recipient-weights": "uniform",
-    "--recipients": null,
+    "--recipient-weights": "zipf:1.1",
+    "--recipients": 500,
     "--reconnect-seconds": 60,
     "--reconnect-storms": "none",
     "--reconnect-target": 12,
@@ -78,7 +77,7 @@
     "--stratum-max-pending-initial-jobs": 2016,
     "--template-bits": "1e7fffff",
     "--warmup-seconds": 30,
-    "--window-shares": 500000,
+    "--window-shares": 20000,
     "--work-timeout": 120
   }
 }

@@ -1,7 +1,7 @@
 {
   "schema": "qbit.prism.load-preset.v1",
-  "name": "d1-473-400k-fe4-async",
-  "description": "PR #473's D1 cell d1-400k-fe4-async: 400k window, 2,000 sessions on 4 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 516, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase.",
+  "name": "throughput-500k-window-1fe-async",
+  "description": "PR #473's D1 cell d1-500k-fe1-async: 500k window, 2,000 sessions on 1 frontend(s), async standby, the D1 plan, every flag as #473 ran it on a1937054 (initial-job admission 2016, sessions per frontend + 16, from before #497). Gated by #473's rule on the 500 shares/s phase (#447).",
   "issues": [
     "#447",
     "#473",
@@ -40,7 +40,7 @@
     "--db-max-connections": 16,
     "--external-tips": 3,
     "--forecast-peak-shares-per-second": 2000,
-    "--frontends": 4,
+    "--frontends": 1,
     "--lock-sample-interval-ms": 10,
     "--max-outstanding-per-session": 1,
     "--mid-flight-kill": false,
@@ -75,10 +75,10 @@
     "--steady-state-seconds": 300,
     "--storm-interval-seconds": 60,
     "--storm-reconnect-seconds": 5,
-    "--stratum-max-pending-initial-jobs": 516,
+    "--stratum-max-pending-initial-jobs": 2016,
     "--template-bits": "1e7fffff",
     "--warmup-seconds": 30,
-    "--window-shares": 400000,
+    "--window-shares": 500000,
     "--work-timeout": 120
   }
 }
