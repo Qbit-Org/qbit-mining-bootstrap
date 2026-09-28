@@ -701,6 +701,10 @@ The realism presets (`mainnet-shape-130-addresses`, `mainnet-shape-650-addresses
 mainnet's 200 bps pool fee; every legacy preset runs with the fee off, as it
 was measured. The nightly schedule runs on 8 vCPU runners only.
 
+Every preset is also named by a scenario in `test/e2e-scenarios.toml`, the
+checked list of end-to-end and load scenarios; CI's
+`scripts/check_e2e_scenarios.py` fails on a preset no scenario names (#543).
+
 The D1 presets hold the 500 shares/s phase to #473's rule and report the
 2,000 shares/s burst in the verdict table without gating it: #473 found no
 configuration that meets it. Their tip times are reported, not gated, as in
