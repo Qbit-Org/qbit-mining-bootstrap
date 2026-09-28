@@ -79,11 +79,17 @@ jobs:
       fsync: ${{ steps.plan.outputs.fsync }}
       fsync_enabled: ${{ steps.plan.outputs.fsync_enabled }}
       duration_minutes: ${{ steps.duration.outputs.minutes }}
+      sha: ${{ steps.pin.outputs.sha }}
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+      - name: Pin the ref to one commit
+        id: pin
+        # Every later job checks out this commit, so a push to the ref while
+        # runners are queued cannot make classes measure different code.
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
       - name: Select runner classes and target caches
         id: plan
         env:
@@ -121,7 +127,7 @@ jobs:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
       - name: Name the probe's directories
         run: |
           set -euo pipefail
@@ -299,7 +305,7 @@ jobs:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
       - name: Install PostgreSQL 16 server binaries
         uses: ./.github/actions/apt-install
         with:
@@ -362,7 +368,7 @@ jobs:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
       - name: Download every row
         uses: actions/download-artifact@v8
         with:
