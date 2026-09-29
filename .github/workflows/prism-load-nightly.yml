@@ -25,12 +25,19 @@ name: PRISM load harness (nightly)
 # being measured. Rates are only comparable run to run on the same runner
 # class, which is why the runner is part of the preset.
 #
+# Once a week the `live-weekly` job runs the longer live regtest scenarios
+# listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
+# today #545's 2.x.x migration lifecycle. The weekly schedule runs only that
+# job; the nightly jobs keep their own schedule.
+#
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
 
 on:
   schedule:
     - cron: "17 2 * * *"
+    # Weekly, on Sunday. The jobs' `if` conditions compare against both crons.
+    - cron: "43 3 * * 0"
   workflow_dispatch:
     inputs:
       preset:
@@ -65,6 +72,13 @@ on:
         type: boolean
         required: false
         default: true
+      weekly:
+        description: >-
+          Also run the weekly live regtest scenarios listed in
+          test/prism-weekly-gated-tests.txt (the weekly schedule always does).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -76,6 +90,7 @@ concurrency:
 jobs:
   plan:
     name: Plan the preset matrix
+    if: ${{ github.event.schedule != '43 3 * * 0' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -203,7 +218,7 @@ jobs:
   # weighted-recipients variant and scenario 5's dense-cadence soak.
   live-nightly:
     name: Live regtest nightly variants
-    if: ${{ github.event_name == 'schedule' || inputs.live }}
+    if: ${{ github.event.schedule == '17 2 * * *' || inputs.live }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
     services:
@@ -265,6 +280,83 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: prism-live-nightly
+          overwrite: true
+          retention-days: 30
+          path: |
+            ${{ env.PRISM_TEST_GATE_MANIFEST }}
+            ${{ env.PRISM_TEST_LOG }}
+          if-no-files-found: error
+
+  # The weekly #[ignore] live_regtest scenarios (#487 L4): each id in
+  # test/prism-weekly-gated-tests.txt, run as live-nightly runs its list, with
+  # PostgreSQL's client tools for the scenarios' pg_dump and psql. Today that
+  # is #545's migration lifecycle: a scaled 2.x.x ledger through migrate,
+  # import-audits, native mining on the real node, exact reconciliation and
+  # the isolated-restore rollback of docs/prism-rust-migration.md.
+  live-weekly:
+    name: Live regtest weekly scenarios
+    if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: prism_test
+          POSTGRES_USER: prism_test
+          POSTGRES_PASSWORD: prism_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prism_test -d prism_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Name the gate manifest and the test log
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-weekly-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-weekly-tests.log\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Run the listed scenarios
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-weekly-gated-tests.txt \
+            | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
+          cargo test --locked -p qbit-prism-server --test live_regtest -- \
+            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+      - name: Prove every listed scenario executed
+        run: |
+          python3 scripts/check_gate_manifest.py \
+            --manifest "${PRISM_TEST_GATE_MANIFEST}" \
+            --expected test/prism-weekly-gated-tests.txt \
+            --log "${PRISM_TEST_LOG}"
+      - name: Upload the gate manifest and the test log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-live-weekly
           overwrite: true
           retention-days: 30
           path: |
