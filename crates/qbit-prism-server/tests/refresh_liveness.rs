@@ -701,7 +701,7 @@ async fn ctv_releases_the_claim_when_a_revision_bump_refuses_a_successful_attemp
                 format!("{error:#}").contains("payout revision changed"),
                 "completion failed for another reason: {error:#}"
             );
-            let row = sqlx::query("SELECT claim_token IS NULL AND claim_instance_id IS NULL AND claim_expires_at IS NULL AS released,broadcast_attempt_count,next_broadcast_attempt_at IS NULL AS due FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
+            let row = sqlx::query("SELECT claim_token IS NULL AND claim_instance_id IS NULL AND claim_expires_at IS NULL AS released,broadcast_attempt_count,next_broadcast_attempt_at<=clock_timestamp() AS due FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
                 .bind(&fanout).fetch_one(f.pool()).await?;
             ensure!(
                 row.try_get::<bool, _>("released")?,
@@ -709,7 +709,7 @@ async fn ctv_releases_the_claim_when_a_revision_bump_refuses_a_successful_attemp
             );
             ensure!(
                 row.try_get::<i64, _>("broadcast_attempt_count")? == 0
-                    && row.try_get::<bool, _>("due")?,
+                    && row.try_get::<Option<bool>, _>("due")? == Some(true),
                 "releasing the claim recorded an attempt or deferred the recheck"
             );
             // Claimable at once: the next pass settles every row, this one too.

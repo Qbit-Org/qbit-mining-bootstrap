@@ -12,7 +12,7 @@ pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bo
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        if let Err(error) = run_once(&coordinator).await {
+        if let Err(error) = run_pass(&coordinator, &shutdown).await {
             tracing::warn!(%error,"CTV broadcaster attempt deferred");
         }
     }
@@ -20,6 +20,25 @@ pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bo
 }
 
 pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
+    let (_running, never) = watch::channel(false);
+    run_pass(coordinator, &never).await
+}
+
+/// Resolves once `shutdown` is set. A closed channel that was never set
+/// never resolves: `run_once` has no shutdown, and `run` ends at its own
+/// `changed()` before starting another pass.
+async fn stopping(shutdown: &watch::Receiver<bool>) {
+    if shutdown.clone().wait_for(|stop| *stop).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// One pass over due fanouts that stops at `shutdown`: between fanouts, and
+/// inside an attempt by abandoning it and handing its claim back (#573).
+pub async fn run_pass(
+    coordinator: &Coordinator,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<usize> {
     // Tip observations recorded from here on can supersede this chain view.
     let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.
@@ -64,28 +83,64 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
             break;
         }
         drop(tip);
+        if *shutdown.borrow() {
+            break;
+        }
         let Some(claim) = coordinator.ledger.claim_fanout(120).await? else {
             break;
         };
         let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            process(coordinator, &claim),
-        )
-        .await;
+        let outcome = tokio::select! {
+            biased;
+            outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(90),
+                process(coordinator, &claim),
+            ) => outcome,
+            () = stopping(shutdown) => {
+                // #573: a shutdown abandons the attempt, as its deadline
+                // would, and hands the claim back at once instead of making
+                // another frontend wait for the lease. Nothing is recorded:
+                // the next claim re-verifies the chain from scratch, as after
+                // an expiry, and anything this attempt sent is already known
+                // to the node. A failed release falls back to the expiry.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    coordinator.ledger.release_fanout_claim(&claim),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(release)) => tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release at shutdown failed; the claim waits for its expiry"),
+                    Err(_) => tracing::warn!(fanout=%claim.fanout_txid,"CTV claim release at shutdown timed out; the claim waits for its expiry"),
+                }
+                break;
+            }
+        };
         let finished = match outcome {
             Ok(Ok((status, result))) => {
+                let attempted = result.clone();
                 let finished = coordinator
                     .ledger
                     .finish_fanout(&claim, status, Some(result), None)
                     .await;
                 // #569: a completion refused after a good attempt, such as a
                 // landing that moved the payout revision, must not hold the
-                // claim for its whole lease. Releasing is an early expiry: the
-                // next claim re-verifies the chain from scratch, and anything
-                // this attempt sent is already known to the node.
-                if finished.is_err() {
-                    if let Err(release) = coordinator.ledger.release_fanout_claim(&claim).await {
+                // claim for its whole lease. Handing it back is an early
+                // expiry: the next claim re-verifies the chain from scratch,
+                // and anything this attempt sent is already known to the
+                // node. #573: it is due again behind the rows already due, so
+                // a row refused on every attempt cannot hold up the others,
+                // and a send is recorded as an attempt.
+                if let Err(refused) = &finished {
+                    if let Err(release) = coordinator
+                        .ledger
+                        .requeue_refused_fanout(
+                            &claim,
+                            &attempted,
+                            &format!("completion not persisted: {refused:#}"),
+                        )
+                        .await
+                    {
                         tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release deferred");
                     }
                 }
@@ -102,6 +157,16 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
                     .await
                 {
                     tracing::warn!(%finish,"CTV claim completion deferred");
+                    // #573: the failed attempt and its backoff must not be
+                    // lost with the completion, or the row is retried as soon
+                    // as the claim expires.
+                    if let Err(release) = coordinator
+                        .ledger
+                        .release_failed_fanout(&claim, &error.to_string())
+                        .await
+                    {
+                        tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release deferred");
+                    }
                 }
                 tracing::warn!(%error,fanout=%claim.fanout_txid,"CTV broadcast deferred");
                 Ok(())

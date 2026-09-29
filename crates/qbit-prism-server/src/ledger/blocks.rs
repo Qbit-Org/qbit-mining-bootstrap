@@ -677,7 +677,7 @@ impl Ledger {
     ) -> Result<()> {
         if submit_result
             .as_ref()
-            .is_some_and(|r| r["check_only"] == true)
+            .is_some_and(super::fanout::is_check_only)
         {
             return self
                 .observe_fanout(claim, status, submit_result.unwrap())
@@ -704,11 +704,16 @@ impl Ledger {
             "failed" => "failed",
             _ => "planned",
         };
-        sqlx::query("INSERT INTO qbit_ctv_fanout_broadcast_attempts(fanout_txid,attempt_status,submit_result,error) VALUES($1,$2,$3,$4)")
-            .bind(&claim.fanout_txid).bind(attempt_status).bind(&submit_result).bind(error).execute(&mut *tx).await?;
-        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status=CASE WHEN $3='failed' AND settlement_status='confirmed' THEN settlement_status ELSE $3 END,broadcast_attempt_count=broadcast_attempt_count+1,broadcast_attempt_detail_count=LEAST(32,broadcast_attempt_detail_count+1),first_broadcast_attempt_at=COALESCE(first_broadcast_attempt_at,clock_timestamp()),last_broadcast_attempt_at=clock_timestamp(),last_broadcast_attempt_status=$4,last_broadcast_submit_result=$5,last_broadcast_error=$6,broadcast_attempt_status_counts=jsonb_set(broadcast_attempt_status_counts,ARRAY[$4],to_jsonb(COALESCE((broadcast_attempt_status_counts->>$4)::bigint,0)+1)),next_broadcast_attempt_at=clock_timestamp()+LEAST(3600,10*(broadcast_attempt_count+1))*interval '1 second',broadcast_retry_backoff_seconds=LEAST(3600,10*(broadcast_attempt_count+1)),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2")
+        sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET settlement_status=CASE WHEN $3='failed' AND settlement_status='confirmed' THEN settlement_status ELSE $3 END,{},{},claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2", super::fanout::attempt_columns("$4", "$5", "$6"), super::fanout::ATTEMPT_BACKOFF))
             .bind(&claim.fanout_txid).bind(&claim.claim_token).bind(status).bind(attempt_status).bind(&submit_result).bind(error).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1 AND attempt_seq NOT IN (SELECT attempt_seq FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1 ORDER BY attempt_seq DESC LIMIT 32)").bind(&claim.fanout_txid).execute(&mut *tx).await?;
+        super::fanout::record_attempt_history(
+            &mut tx,
+            &claim.fanout_txid,
+            attempt_status,
+            submit_result.as_ref(),
+            error,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
