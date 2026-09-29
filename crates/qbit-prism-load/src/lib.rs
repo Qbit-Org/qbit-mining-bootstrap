@@ -30,6 +30,7 @@ pub mod preset;
 pub mod profile;
 pub mod provenance;
 pub mod proxy;
+pub mod qbitd;
 pub mod realism;
 pub mod report;
 pub mod restart;

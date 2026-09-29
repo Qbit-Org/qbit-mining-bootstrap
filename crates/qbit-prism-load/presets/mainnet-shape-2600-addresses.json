@@ -45,6 +45,7 @@
     "--max-outstanding-per-session": 1,
     "--mid-flight-kill": false,
     "--min-mem-available-mib": 6144,
+    "--node": "fake",
     "--plan": "short",
     "--pool-fee-bps": 200,
     "--process-sample-interval-ms": 1000,

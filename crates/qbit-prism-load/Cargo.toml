@@ -22,6 +22,8 @@ path = "src/gate_main.rs"
 [dependencies]
 qbit-prism = { path = "../qbit-prism" }
 qbit-prism-server = { path = "../qbit-prism-server" }
+# The name of the qbitd variable, which the gate owns (`--qbitd-bin`'s default).
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
 anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,6 +41,3 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[dev-dependencies]
-qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
