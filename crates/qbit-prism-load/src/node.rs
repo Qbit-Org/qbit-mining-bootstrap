@@ -38,6 +38,36 @@ pub enum TipOrigin {
     Pool,
     /// Minted in process, i.e. somebody else's block.
     External,
+    /// A real node's block that is neither a recorded mint nor a recorded
+    /// pool submission (#547). The fake node never produces one.
+    Unattributed,
+}
+
+/// Why an external tip was minted (#547).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MintPurpose {
+    /// `--external-tips`, in warm-up.
+    WarmUp,
+    /// `--churn-tips`, in the churn phase.
+    Churn,
+    /// A real node's keepalive, so its template never ages past regtest's
+    /// minimum-difficulty gap. The fake node never mints one.
+    Keepalive,
+}
+
+/// Something that can put an external tip on the frontends' node.
+pub trait ExternalMint: Send + Sync {
+    /// The fake node mints in place and returns the tip. A real node asks its
+    /// peer and returns `None`: the tip reaches the pool node later, and the
+    /// report takes it from there.
+    fn mint_external(&self, purpose: MintPurpose) -> Option<TipChange>;
+}
+
+impl ExternalMint for NodeState {
+    fn mint_external(&self, _purpose: MintPurpose) -> Option<TipChange> {
+        Some(self.mint_external_block())
+    }
 }
 
 /// A tip transition, stamped on both clocks.
@@ -55,7 +85,10 @@ pub struct TipChange {
 pub struct SubmissionRecord {
     pub block_hash: String,
     pub parent: String,
-    pub height: u64,
+    /// The height the block would take. `None` when it cannot be known: a
+    /// real node's block on a parent the node does not hold (#547). The fake
+    /// node always knows it.
+    pub height: Option<u64>,
     pub accepted: bool,
     pub rejection: Option<String>,
     pub received_at: DateTime<Utc>,
@@ -256,7 +289,7 @@ impl NodeState {
         let record = SubmissionRecord {
             block_hash: hash.clone(),
             parent,
-            height: height + 1,
+            height: Some(height + 1),
             accepted,
             rejection: (!accepted).then(|| PARENT_MISMATCH.to_owned()),
             received_at: Utc::now(),

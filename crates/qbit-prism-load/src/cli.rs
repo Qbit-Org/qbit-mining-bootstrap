@@ -3,7 +3,7 @@
 //! EP-VALIDATION: every numeric input is range-checked here, at the entry
 //! boundary, against the semantics its consumer applies downstream.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -184,7 +184,8 @@ pub struct Args {
     /// SIGKILL a frontend while submits are outstanding, in a side phase.
     #[arg(long)]
     pub mid_flight_kill: bool,
-    /// Scheduled own-block submissions during the run.
+    /// Scheduled own-block submissions during the run: in `steady_state`, or
+    /// in warm-up under `--plan tips`, whose only phase it is.
     #[arg(long, default_value_t = 0)]
     pub scheduled_blocks: usize,
     /// External tips minted during warm-up, for time to usable work.
@@ -298,6 +299,17 @@ pub struct Args {
     /// difficulty, as each scheduled block costs that many more hashes.
     #[arg(long, default_value = crate::window::TEMPLATE_BITS)]
     pub template_bits: String,
+
+    /// The node behind the frontends: `fake`, the in-process node every
+    /// earlier run used, or `qbitd`, a managed real regtest pool node and
+    /// peer whose chain is ramped to the fake node's difficulty first
+    /// (#547). See `qbitd.rs`.
+    #[arg(long, default_value = "fake")]
+    pub node: String,
+    /// The `qbitd` executable for `--node qbitd`. Defaults to `QBITD_BIN`,
+    /// the variable the live fixtures read.
+    #[arg(long)]
+    pub qbitd_bin: Option<PathBuf>,
 
     /// Pool fee in basis points, as mainnet runs one: every frontend is
     /// launched with `PRISM_POOL_FEE_ENABLED=1`, this `PRISM_POOL_FEE_BPS` and
@@ -520,7 +532,71 @@ impl Args {
         if self.cadence()?.is_dense() {
             crate::cadence::validate(&self.cadence_gaps, self.cadence_seconds)?;
         }
+        match self.node_mode()? {
+            NodeMode::Fake => ensure!(
+                self.qbitd_bin.is_none(),
+                "--qbitd-bin names the node for --node qbitd; this run uses the fake node"
+            ),
+            NodeMode::Qbitd => self.validate_real_node()?,
+        }
         Ok(())
+    }
+
+    pub fn node_mode(&self) -> Result<NodeMode> {
+        NodeMode::parse(&self.node)
+    }
+
+    /// `--qbitd-bin`, else `QBITD_BIN`.
+    pub fn qbitd_bin(&self) -> Result<PathBuf> {
+        self.qbitd_bin
+            .clone()
+            .or_else(|| {
+                std::env::var_os(qbit_prism_test_gate::Input::QbitdBin.name()).map(PathBuf::from)
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+            .context("--node qbitd needs --qbitd-bin or QBITD_BIN")
+    }
+
+    /// What `--node qbitd` can run, refused at entry (EP-VALIDATION): the
+    /// ramp produces one difficulty, so the bits are the default's; the
+    /// per-height walk is the fake node's; recipients need wallet-issued
+    /// addresses (#553); every phase's rate must imply an own-block cadence
+    /// inside the band; and the run must fit in the ramped epoch. Where the
+    /// node's executable is, like `--server-bin`, is checked when the run
+    /// starts, not here.
+    fn validate_real_node(&self) -> Result<()> {
+        ensure!(
+            self.template_bits
+                .trim()
+                .eq_ignore_ascii_case(crate::window::TEMPLATE_BITS),
+            "--node qbitd ramps the chain to the default difficulty ({}), so --template-bits \
+             must be the default",
+            crate::window::TEMPLATE_BITS
+        );
+        ensure!(
+            !self.retarget_bits,
+            "--retarget-bits walks the fake node's bits; a real node's bits are its chain's, so \
+             --node qbitd refuses it"
+        );
+        ensure!(
+            self.recipients.is_none(),
+            "--node qbitd does not take --recipients yet: the addresses have to be issued by the \
+             node and the share filter has to cover them (#553)"
+        );
+        let plans = phases(self)?;
+        crate::qbitd::check_cadence_band(
+            self.window_shares,
+            &plans
+                .iter()
+                .map(|plan| (plan.name.clone(), plan.rate))
+                .collect::<Vec<_>>(),
+        )?;
+        let phase_seconds: u64 = plans.iter().map(|plan| plan.seconds).sum();
+        crate::qbitd::check_headroom(crate::qbitd::planned_block_ceiling(
+            (self.external_tips + self.churn_tips) as u64,
+            self.scheduled_blocks as u64,
+            phase_seconds + REAL_NODE_SETUP_ALLOWANCE_SECONDS,
+        ))
     }
 
     /// The Stratum listener limits every frontend is launched with. This is
@@ -742,6 +818,27 @@ impl Args {
             crate::cadence::parse_gaps(&self.cadence_gaps)
         } else {
             Ok(Vec::new())
+        }
+    }
+}
+
+/// Seconds of keepalive tips budgeted for a real-node run's setup and
+/// teardown on top of its phases: seeding, frontend startup, the drain.
+pub const REAL_NODE_SETUP_ALLOWANCE_SECONDS: u64 = 1_800;
+
+/// The node behind the frontends (`--node`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeMode {
+    Fake,
+    Qbitd,
+}
+
+impl NodeMode {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "fake" => Ok(Self::Fake),
+            "qbitd" => Ok(Self::Qbitd),
+            other => bail!("unknown --node {other:?}; use fake or qbitd"),
         }
     }
 }

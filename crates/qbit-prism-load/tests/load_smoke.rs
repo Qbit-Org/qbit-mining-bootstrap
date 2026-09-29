@@ -96,6 +96,17 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     eprintln!("{table}\nserver build {built:?}, harness run {ran:?}");
     assert!(gate::passed(&checks), "{table}");
 
+    // Fake-node mode is unchanged by real-node mode (#547): the report's
+    // schema-level key sets are the ones origin/3.x.x wrote.
+    let key_sets = report_key_sets(&report);
+    let golden_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/fake_side_report_keys.json");
+    let golden: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&golden_path)?)?;
+    assert_eq!(
+        key_sets, golden,
+        "the fake-node side report's keys moved from what origin/3.x.x wrote"
+    );
+
     // The run is the preset's, and the skew it asked for is the skew it drove.
     assert_eq!(report["preset"]["name"], "pr-smoke");
     assert_eq!(report["preset"]["sha256"], loaded.sha256.as_str());
@@ -190,6 +201,26 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         0
     );
     Ok(())
+}
+
+/// The side report's top-level keys, and the keys of the blocks whose shape
+/// is fixed by the harness rather than by what the run saw.
+fn report_key_sets(report: &serde_json::Value) -> serde_json::Value {
+    let keys = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    serde_json::json!({
+        "top_level": keys(report),
+        "versions": keys(&report["versions"]),
+        "topology": keys(&report["topology"]),
+        "window": keys(&report["window"]),
+        "node": keys(&report["node"]),
+    })
 }
 
 /// A scratch directory removed on drop.

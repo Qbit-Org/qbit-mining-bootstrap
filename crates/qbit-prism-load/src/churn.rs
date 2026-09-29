@@ -520,7 +520,12 @@ impl ChurnDriver {
 
     /// Everything due by `seconds` into the phase: arrivals, departures,
     /// storms and tips, in that order.
-    pub fn tick(&mut self, seconds: f64, base: &[SessionHandle], node: &crate::node::NodeState) {
+    pub fn tick(
+        &mut self,
+        seconds: f64,
+        base: &[SessionHandle],
+        node: &dyn crate::node::ExternalMint,
+    ) {
         while self.next_arrival < self.arrivals.len()
             && self.plan.rentals[self.arrivals[self.next_arrival]].arrive_at <= seconds
         {
@@ -561,7 +566,9 @@ impl ChurnDriver {
         }
         while self.next_tip < self.plan.tips.len() && self.plan.tips[self.next_tip] <= seconds {
             self.next_tip += 1;
-            self.tips.push(node.mint_external_block());
+            if let Some(tip) = node.mint_external(crate::node::MintPurpose::Churn) {
+                self.tips.push(tip);
+            }
         }
     }
 

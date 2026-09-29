@@ -25,6 +25,11 @@ name: PRISM load harness (nightly)
 # being measured. Rates are only comparable run to run on the same runner
 # class, which is why the runner is part of the preset.
 #
+# The bridging pair (short-plan-real-node and short-plan-fake-node, #547,
+# #552) runs the same short plan on a managed regtest qbitd and on the fake
+# node, on the same runner class, so their difference is what the real node
+# costs.
+#
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
 # today #545's 2.x.x migration lifecycle and #575's measured cutover of a
@@ -269,6 +274,19 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # A `--node qbitd` preset (#547) drives the pinned qbit release; the
+      # install script exports QBITD_BIN, which the harness reads when the
+      # command line gives no --qbitd-bin. A fake-node preset ignores it.
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
       - name: Download the binaries built once
         uses: actions/download-artifact@v8
         with:
