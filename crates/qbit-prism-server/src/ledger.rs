@@ -50,8 +50,10 @@ mod fatal_state;
 mod instances;
 mod policy_transition;
 mod signing_transition;
+mod standby_durability;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
+pub use standby_durability::{OfferStandbyReport, OfferStandbyWait, StandbyDurability};
 mod jobs;
 pub use jobs::{
     BlobPruneCursor, BlobPruneResult, CompactBatchAttempt, CompactDependency, CompactIssuedJob,

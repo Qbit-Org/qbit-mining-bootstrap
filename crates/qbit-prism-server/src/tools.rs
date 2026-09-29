@@ -305,6 +305,15 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
             );
+            match &config.offer_standby {
+                Some(wait) => println!(
+                    "found-block offers wait up to {} ms for standby {}; self-check verifies the \
+                     role can read its position (pg_monitor)",
+                    wait.bound.as_millis(),
+                    wait.application_name
+                ),
+                None => println!("found-block offers do not wait for a failover standby"),
+            }
             Ok(())
         }
         Command::CheckPublicDatabaseConfig => {
@@ -1474,6 +1483,9 @@ struct SelfCheckReport {
     health: Option<Value>,
     carry_forward_integrity: Option<Value>,
     durability: Option<Vec<(String, String)>>,
+    /// #529: the found-block offer's failover standby, when its wait is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offer_standby: Option<crate::ledger::OfferStandbyReport>,
     audit_completeness: Option<AuditCompleteness>,
     live_instances: LiveInstancesReport,
 }
@@ -1486,6 +1498,7 @@ async fn self_check() -> Result<()> {
         health: None,
         carry_forward_integrity: None,
         durability: None,
+        offer_standby: None,
         audit_completeness: None,
         live_instances: unavailable_live_instances(
             "unknown",
@@ -1580,6 +1593,15 @@ async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Resul
     report.durability = Some(durability.clone());
     for (name, value) in &durability {
         ensure!(value != "off", "PostgreSQL {name} is disabled");
+    }
+    // #529: a configured wait needs a role that can read the standby's
+    // position and exactly one streaming standby by that name, or it never
+    // protects a found block.
+    if let Some(wait) = &coordinator.config.offer_standby {
+        let standby = coordinator.ledger.offer_standby_report(wait).await?;
+        let usable = standby.ensure_usable();
+        report.offer_standby = Some(standby);
+        usable?;
     }
     healthcheck(None, false).await?;
     let stratum = crate::stratum::StratumConfig::from_env()?;

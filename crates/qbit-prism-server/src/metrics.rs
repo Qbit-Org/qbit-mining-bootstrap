@@ -157,6 +157,13 @@ impl Metrics {
                 0.,
             );
         }
+        for outcome in StandbyWaitOutcome::ALL {
+            registry.register(
+                Family::OfferStandbyWaits,
+                label("outcome", outcome.as_str()),
+                0.,
+            );
+        }
         for cause in StaleJobCause::ALL {
             registry.register(
                 Family::StaleJobRejections,

@@ -97,7 +97,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 73
+            assert len(before) == 78 and len(after) == 74
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -134,6 +134,13 @@ def main():
             assert after["qbit-prism-revision-work-unknown"]["noDataState"] == "Alerting"
             assert after["qbit-prism-accepted-block-unlanded"]["noDataState"] == "OK"
             assert after["qbit-prism-revision-work-pending"]["for"] == "0s"
+            # #529: a found block offered without a confirmed standby copy
+            # warns at once, never pages, and is quiet on no data.
+            standby = after["qbit-prism-block-offer-standby-unconfirmed"]
+            assert "qbit-prism-block-offer-standby-unconfirmed" not in paging
+            assert standby["labels"]["severity"] == "warning" and standby["labels"].get("page") is None
+            assert standby["for"] == "0s" and standby["noDataState"] == "OK"
+            assert 'outcome=~\\"absent|lagging|failed\\"' in json.dumps(standby), json.dumps(standby)
             # #493: the candidate paging rule reads the unacknowledged age, not the all-unfinished age.
             critical = json.dumps(after["qbit-prism-candidate-oldest-critical"])
             assert "qbit_prism_block_candidate_oldest_unacknowledged_seconds{" in critical
@@ -155,7 +162,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 73 proposed rules; 34 external definitions preserved; "
+          "78 original / 74 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 

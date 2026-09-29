@@ -8,8 +8,10 @@ The selected policy is **one primary plus one dedicated asynchronous failover
 standby**, separate from the public-read replica. Writer sessions use
 `synchronous_commit=on` and the primary uses `synchronous_standby_names=''`:
 positive share ACKs require local WAL durability and do not wait for the standby.
-Primary loss can lose acknowledged shares in the replication gap; this is
-**not lossless failover and has no guaranteed lag bound**.
+Primary loss can lose acknowledged shares in the replication gap, and the
+rows of blocks found in it; this is **not lossless failover and has no
+guaranteed lag bound**. An optional bounded wait keeps a found block's rows on
+the standby before its offer; see [Found blocks](#found-blocks-a-bounded-standby-flush-before-the-offer-529).
 
 This separate document owns the complete frontend-to-database architecture.
 [prism-postgres-replica.md](prism-postgres-replica.md) remains the detailed guide
@@ -29,7 +31,7 @@ operator load-balancer behavior. Those live #281/#291 gates remain open in the
 | 1 | Two active mining frontends | `prism-coordinator` and `prism-coordinator-2`; `PRISM_INSTANCE_ID=prism-frontend-1` / `prism-frontend-2`; identical `PRISM_DATABASE_URL`, payout configuration and signing keys; shared database job/extranonce authority. | **Provided here:** runtime, compact resume and two-service overlay. **Operator-supplied:** placement in independent failure domains and matching secret distribution. Real-overlay resume qualification remains open. |
 | 2 | Highly available Stratum TCP endpoint | Operator endpoint sends TCP to frontend ports `3340` / `3343` on the Compose host by default; probe each frontend's own `/healthz`, with the hysteresis below. Publish that endpoint in `PRISM_PUBLIC_STRATUM_URL`. | **Operator-supplied:** TCP load balancer, endpoint redundancy, routing and firewall. No LB service is shipped. |
 | 3 | A separate node per frontend | Set `PRISM_HA_RPC_HOST_1=node-1` and `PRISM_HA_RPC_HOST_2=node-2`, or set each `PRISM_HA_RPC_URL_1/2` to its node's complete HTTP(S) URL. Same chain/genesis and consensus policy on both. | **Provided here:** independent per-service RPC wiring. **Operator-supplied:** both independent production nodes, authentication and placement. Both lab defaults use bundled `qbitd`. |
-| 4 | PostgreSQL primary plus one dedicated asynchronous failover standby, with separate public reads | Primary: `fsync=on`, `full_page_writes=on`, `wal_level=replica`, `max_wal_senders=10`, `max_replication_slots=10`, `synchronous_standby_names=''`; writer sessions: `synchronous_commit=on`. HA standby: `hot_standby=on`, its own physical slot and `application_name=prism_standby_1`. `prism-public-api` uses the separate public-read DSN in `PRISM_PUBLIC_DATABASE_URL` with `PRISM_PUBLIC_REPLICA_MODE=require`. | **Provided here:** lab primary, asynchronous **public-read** replica, slot bootstrap and checked public API. **Operator-supplied:** dedicated HA standby, D3 configuration/monitoring, independent storage/failure domains, backups and capacity. |
+| 4 | PostgreSQL primary plus one dedicated asynchronous failover standby, with separate public reads | Primary: `fsync=on`, `full_page_writes=on`, `wal_level=replica`, `max_wal_senders=10`, `max_replication_slots=10`, `synchronous_standby_names=''`; writer sessions: `synchronous_commit=on`. HA standby: `hot_standby=on`, its own physical slot and `application_name=prism_standby_1`. Optional found-block standby wait: `PRISM_OFFER_STANDBY_APPLICATION_NAME=prism_standby_1` on both frontends and `GRANT pg_monitor TO prism_writer` ([#529](#found-blocks-a-bounded-standby-flush-before-the-offer-529)). `prism-public-api` uses the separate public-read DSN in `PRISM_PUBLIC_DATABASE_URL` with `PRISM_PUBLIC_REPLICA_MODE=require`. | **Provided here:** lab primary, asynchronous **public-read** replica, slot bootstrap and checked public API. **Operator-supplied:** dedicated HA standby, D3 configuration/monitoring, independent storage/failure domains, backups and capacity. |
 | 5 | Promotion | After fencing and checking the eligible standby, `SELECT pg_promote(wait => true, wait_seconds => 60)`; verify `pg_is_in_recovery() = false` and the required history before moving the writer endpoint. | **Operator-supplied:** decision authority, failure detection, promotion execution and rehearsal. Procedure below; no automatic promotion service. |
 | 6 | Fence the old primary | Power/storage fencing or enforced network isolation that stops **all existing and new** writer connections, including both frontends and settlement workers; disable old-primary restart automation. Keep the fence until rejoin as a standby. | **Operator-supplied:** fencing mechanism and positive confirmation. Changing DNS or stopping one frontend is insufficient. |
 | 7 | Stable authoritative writer endpoint | Both frontends use the same `PRISM_DATABASE_URL=postgresql://prism_writer:<secret>@prism-writer.internal:5432/qbit?sslmode=verify-full`; the endpoint routes only to the unfenced primary. | **Provided here:** shared DSN pass-through and external-DB overlay. **Operator-supplied:** endpoint ownership, TLS, failover routing, connection draining and fencing. The bundled `prism-postgres` name is not a failover endpoint. |
@@ -218,6 +220,64 @@ This experiment does not establish strict no-unreplicated-ACK durability or
 change the approved production policy. PostgreSQL documents the
 [reloadable standby-name setting](https://www.postgresql.org/docs/16/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES).
 
+### Found blocks: a bounded standby flush before the offer (#529)
+
+The replication gap can hold a found block's candidate row and its offer
+reservation as well as shares. A block offered to the node whose rows are then
+lost with the primary is on chain with no candidate, audit or `qbit_pool_blocks`
+record on the promoted primary, and no code path lands an on-chain block without
+its candidate row ([#529](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/529)).
+
+Set `PRISM_OFFER_STANDBY_APPLICATION_NAME=prism_standby_1` on every frontend to
+close the window between the offer and the standby copy, without changing D3:
+
+- After a found block's offer reservation commits, the offering frontend reads
+  the primary's `pg_current_wal_flush_lsn()`, which covers the candidate row and
+  the reservation. It then polls `pg_stat_replication` until the named standby's
+  `flush_lsn`, in state `streaming`, reaches it, and only then calls
+  `submitblock`. `flush_lsn` is what `synchronous_commit=on` would wait for:
+  everything the standby flushed survives its promotion. `sent_lsn` or
+  `write_lsn` would not.
+- The wait is bounded by `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` (default 250, `0`
+  turns it off, at most 10000). It never holds the block: a standby that is not
+  streaming is not waited for, and at the bound the block is offered anyway.
+  Every offer without a confirmed copy logs the block hash at WARN
+  (`block offer standby wait unconfirmed`, with its `outcome`, `waited_us` and,
+  when lagging, `lag_bytes`) for the reconciliation in
+  [promotion step 6](#promotion-fencing-and-the-stable-writer-endpoint).
+- `synchronous_standby_names` stays `''`: no commit waits for the standby, and
+  share appends and their ACKs are unchanged. Block-only proofs are the one
+  exception: their ACK already waits for their candidate's disposition, so a
+  lagging standby delays those ACKs by the bound.
+- The writer role must read other sessions' replication positions:
+  `GRANT pg_monitor TO prism_writer;` (`pg_read_all_stats` alone is enough).
+  Without it PostgreSQL shows only the WAL sender's pid, and every wait reports
+  `failed`. `self-check` refuses a configured wait whose role cannot read the
+  positions, or whose name does not match exactly one streaming standby;
+  `check-config` prints the effective setting.
+- `qbit_prism_block_offer_standby_wait_total{outcome=confirmed|absent|lagging|failed}`
+  counts the waits, and `PrismBlockOfferStandbyUnconfirmed` warns for 30 minutes
+  after any offer that was not `confirmed`.
+
+Measured with the prototype on loopback PostgreSQL 16, a debug build and a noisy
+shared host, so read as relative A/B: a healthy standby confirmed in 0.9 ms p50
+and at most 4 ms p99; proof-to-`submitblock` latency and share ACK latency were
+unchanged; a standby that was down cost at most 2.5 ms per offer; a standby
+lagging past a 250 ms bound held every offer for the bound (251 to 262 ms). The
+gated drill `a_found_block_offered_after_the_standby_flush_survives_a_replication_cut_at_submitblock`
+in [`live_pg_offer_standby.rs`](../crates/qbit-prism-server/tests/support/live_pg_offer_standby.rs)
+cuts replication the moment the block reaches the node, then fences, promotes
+and moves the endpoint: the promoted primary holds the reservation and the block
+lands once. Without the wait, or polling `sent_lsn`, the standby has no row for
+the offered block at the cut.
+
+With the wait on, the accepted asynchronous loss is: acknowledged shares in the
+last replication gap; found blocks whose offer logged an unconfirmed standby
+wait (standby down, behind at the bound, or unreadable); and found blocks never
+offered before the primary was lost, since no frontend can reserve an offer on a
+dead primary. The wait does not make D3 synchronous and is not a strict
+durability claim.
+
 ### Current timeout/cancellation behavior and remaining limits
 
 The ledger sets `statement_timeout=15000` ms by default
@@ -247,6 +307,30 @@ they wait up to `block_only_ack_timeout` and use the same result classifier.
 Block-only proofs instead wait for their credit/candidate disposition up to that
 bound. See the [commit reconciliation tests](../crates/qbit-prism-server/src/coordinator/miner_tests/commit_reconcile.rs)
 and [writer session setup](../crates/qbit-prism-server/src/ledger/connect.rs).
+
+**`statement_timeout` never ends a synchronous-replication wait (#529).**
+PostgreSQL disables the statement timeout before it commits:
+`finish_xact_command()` calls `disable_statement_timeout()` and only then
+`CommitTransactionCommand()`, whose `SyncRepWaitForLSN()` does the waiting. Only
+a query cancel (`pg_cancel_backend`), a backend termination, a configuration
+reload that empties `synchronous_standby_names`, or the standby's return ends
+it. Measured on PostgreSQL 16 with `synchronous_standby_names='FIRST 1 (prism_standby_1)'`,
+the standby stopped and `statement_timeout=2s`: a transaction that ran
+`SET LOCAL synchronous_commit=on` waited in COMMIT on `IPC/SyncRep` for 1124 s
+(18.7 minutes) until `pg_cancel_backend`, then returned the "canceling wait for
+synchronous replication" warning and `COMMIT`. Its row stayed invisible to other
+sessions for the whole wait. So the duration guard above describes a
+cancellation that `statement_timeout` never makes: in the optional #291 sync
+experiment with the standby down, writer backends block with their locks held
+until something cancels them. The share-ACK path still answers within
+`PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` plus `share_commit_grace`
+(`ledger-outcome-unknown`), but the backend does not return. **A statement
+timeout cannot be the duration guard.** Bound a synchronous experiment with an
+explicit cancel (for example an operator watchdog that cancels backends whose
+`wait_event` is `SyncRep` past a limit) or by returning to async. For the same
+reason, `SET LOCAL synchronous_commit` for found blocks alone is not a safe
+alternative to the bounded wait above: it also needs a non-empty
+`synchronous_standby_names`, which changes D3.
 
 **Remaining limits:** a block-only ACK can follow a locally visible credit whose
 sync-rep wait was cancelled; its poll does not observe the crediting transaction's
@@ -379,13 +463,32 @@ primary/failover pair; the pair alone does not supply a partition-safe election.
    pools as needed; DNS changes do not retarget established sockets. Verify both
    frontends use the same writer, matching keys/fingerprint and preserved share
    history, then resume admission under the approved policy.
-6. Rejoin the fenced former primary only after a verified rewind or fresh base
+6. **Reconcile found blocks offered without a standby copy.** Collect every
+   `block offer standby wait unconfirmed` hash that either frontend logged
+   before the primary was lost, at least back to the last time the standby was
+   known to be caught up (all of them when unsure; there are few). For each,
+   read its candidate on the new primary
+   (`SELECT state FROM qbit_block_candidate_outbox WHERE block_hash = '<hash>'`)
+   and ask the node whether the block is on its active chain
+   (`getblockheader <hash>`, `confirmations` of at least 1). A candidate that
+   survived needs nothing: the ordinary recovery lands it once. A block with no
+   candidate that is not on the active chain lost only its reward, like a block
+   found in the gap and never offered; record it. A block **with no candidate
+   that is on the active chain** paid the balances its coinbase commits to while
+   the promoted ledger still carries them, so the next landing would pay them
+   again: treat it as the explicit accounting-loss reconciliation of step 3,
+   with the frontend log line, the block and its coinbase as evidence.
+   `recover` cannot land it; it refuses a hash with no candidate row. The same
+   check covers blocks found while `PRISM_OFFER_STANDBY_APPLICATION_NAME` was
+   unset, whose offers log nothing: compare the node's recent blocks carrying
+   the pool's coinbase tag with `qbit_block_candidate_outbox` instead.
+7. Rejoin the fenced former primary only after a verified rewind or fresh base
    backup of the new primary. Create/reconcile the physical slot on the new
    primary; PostgreSQL 16 physical slots are not automatically transferred by
    this Compose setup. Re-establish the single named standby and verify its
    async streaming/replay status and monitoring. Keep `synchronous_standby_names=''`
    under approved D3; record the interval without a caught-up failover copy.
-7. Reconfigure or rebuild the **separate public-read replica** to follow the new
+8. Reconfigure or rebuild the **separate public-read replica** to follow the new
    primary, and verify its read endpoint and freshness. Do not direct public reads
    to the dedicated failover standby. With `PRISM_PUBLIC_REPLICA_MODE=require`,
    the public process refuses a promoted writer. Deliberately choosing `off` to
@@ -557,7 +660,7 @@ reconciliation. No live gate is completed by documentation or issue closure alon
 | Compose config validated in CI | #304; [CI's `Validate PRISM HA Compose stacks`](../.github/workflows/ci.yml) renders all four combinations and asserts distinct IDs/ports, one writer DSN and reachable health bindings. | **Landed.** Rendering does not establish healthy containers, RPC reachability or production placement. |
 | Seven requirements, exact settings and provided/operator markings | #304 and the [requirements table](#seven-deployment-requirements), reconciled here with the approved D3 comments. | **Landed documentation.** Production provisioning and effective configuration still require verification. |
 | Self-check lists live instance count and IDs | #304; [#362](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/362) consolidates the reader/heartbeat contract; #412 removes tool heartbeats. [`live_instance_tests`](../crates/qbit-prism-server/src/ledger/instances.rs), including `heartbeat_sql_observes_empty_stale_and_missing_table`; [#408](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/408) hardens the qualification command. | **Landed.** Capture two distinct fresh frontend IDs in the actual overlay drill; count alone is not proof of separate failure domains. |
-| #291 failover drill on this overlay under D3 | Procedure above; [#333](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/333) (`e13051cf`) supplies commit reconciliation/guard coverage. [`postgres_failover.rs`](../crates/qbit-prism-server/tests/postgres_failover.rs) has `acknowledged_shares_survive_synchronous_primary_loss_and_pool_reconnect`, a disposable **synchronous** fixture. [`live_pg_failover.rs`](../crates/qbit-prism-server/tests/support/live_pg_failover.rs) (#521) runs this procedure against a disposable **asynchronous** D3 pair under real regtest mining with a found block mid-landing: a cut replication link loses exactly the unreplicated shares, counted and printed, and the held block lands once on the promoted primary. | **Open:** actual async promotion/fencing/writer-endpoint drill on the overlay under mining load, measured replication gap/loss and promotion/recovery time, accounting reconciliation, dedicated-standby alert checks, and the qualified sync flip/back experiment. The disposable fixtures cannot qualify the real overlay, fencing or endpoint. |
+| #291 failover drill on this overlay under D3 | Procedure above; [#333](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/333) (`e13051cf`) supplies commit reconciliation/guard coverage. [`postgres_failover.rs`](../crates/qbit-prism-server/tests/postgres_failover.rs) has `acknowledged_shares_survive_synchronous_primary_loss_and_pool_reconnect`, a disposable **synchronous** fixture. [`live_pg_failover.rs`](../crates/qbit-prism-server/tests/support/live_pg_failover.rs) (#521) runs this procedure against a disposable **asynchronous** D3 pair under real regtest mining with a found block mid-landing: a cut replication link loses exactly the unreplicated shares, counted and printed, and the held block lands once on the promoted primary. [`live_pg_offer_standby.rs`](../crates/qbit-prism-server/tests/support/live_pg_offer_standby.rs) (#529) cuts replication at a found block's `submitblock` with the bounded standby flush wait on: the block survives promotion and lands once. | **Open:** actual async promotion/fencing/writer-endpoint drill on the overlay under mining load, measured replication gap/loss and promotion/recovery time, accounting reconciliation, dedicated-standby alert checks, and the qualified sync flip/back experiment. The disposable fixtures cannot qualify the real overlay, fencing or endpoint. |
 | LB preserves ordinary rebuilds and ejects prolonged unavailability within the stated bound | #304 documents readiness/hysteresis; [#331](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/331) (`2914a629`) supplies the [deterministic simulator](prism-ha-readiness-probe-harness.md) and [`test_prism_ha_readiness_probe.py`](../tests/test_prism_ha_readiness_probe.py). | **Open:** real operator TCP load balancer under tip/revision churn and prolonged unavailability; record routing, ejection and recovery timings. The simulator neither deploys nor qualifies that load balancer. |
 
 #291 must report observed acknowledged-share loss (including zero if observed),

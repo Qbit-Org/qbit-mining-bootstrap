@@ -14,6 +14,9 @@ mod checkout_tests;
 #[path = "offer_not_sent_tests.rs"]
 mod offer_not_sent_tests;
 
+#[path = "offer_standby_tests.rs"]
+mod offer_standby_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn landing_transaction_renews_across_expiries_and_terminal_contention_finishes_once(
 ) -> Result<()> {
@@ -217,6 +220,7 @@ impl Fixture {
             block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: 6,
             capture_overpay_ceiling_bps: 100,
+            offer_standby: None,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),

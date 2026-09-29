@@ -96,6 +96,16 @@ impl Metrics {
                 Labels::One(("decision", decision.as_str())),
             );
     }
+    /// #529: one found block's standby flush wait, ended just before its offer.
+    pub fn record_offer_standby_wait(&self, outcome: StandbyWaitOutcome) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::OfferStandbyWaits,
+                Labels::One(("outcome", outcome.as_str())),
+            );
+    }
     /// #478: one committed divergent confirmation (a landed block's rows
     /// started to count on balances other than its as-issued ones) and the
     /// debt it created.

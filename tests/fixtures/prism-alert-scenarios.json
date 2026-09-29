@@ -3104,5 +3104,160 @@
     "alerts": {
       "PrismWorkRefreshStalledCritical": []
     }
+  },
+  {
+    "name": "#529 a block offered while the standby was not streaming warns at once",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0+1x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x300 1x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 1
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#529 one unconfirmed offer keeps warning for its 30-minute window",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0+1x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x300 1x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "30m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 1
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#529 offers the standby confirmed never warn",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0+1x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "20m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 0
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": []
+    }
+  },
+  {
+    "name": "#529 the warning clears once its 30-minute window passes the offer",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x300 1x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "40m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 0
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": []
+    }
+  },
+  {
+    "name": "#529 lagging and failed waits warn on the frontend that offered",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x300 1x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",outcome=\"confirmed\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",outcome=\"absent\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",outcome=\"failed\"}": "0x300 2x3000",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 2
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        },
+        {
+          "job": "qbit-prism",
+          "instance": "two",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#529 a restart that resets the counter does not warn by itself",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "1x300 0x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x3300"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": 0
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": []
+    }
+  },
+  {
+    "name": "#529 a stale snapshot leaves the standby warning to the snapshot rules",
+    "series": {
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"confirmed\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"absent\"}": "0x300 1x3000",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"lagging\"}": "0x3300",
+      "qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",outcome=\"failed\"}": "0x3300",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x3300"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockOfferStandbyUnconfirmed": null
+    },
+    "alerts": {
+      "PrismBlockOfferStandbyUnconfirmed": []
+    }
   }
 ]
