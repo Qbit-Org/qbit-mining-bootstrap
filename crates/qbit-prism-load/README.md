@@ -688,6 +688,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
 | `mainnet-shape-2600-addresses` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
 | `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
+| `short-plan-20k-window-1fe` | manual | 8 vCPU | the short plan over `throughput-20k-window-1fe`'s fixture (2,000 sessions, one frontend, async standby, 20k window) at 50 shares/s with no burst; with `throughput-20k-window-1fe`, what the runner probe below runs on each class |
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 
 The names say what a preset measures. The names they replaced (`d1-20k`,
@@ -729,6 +730,21 @@ reproduces a nightly run anywhere:
 cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
 .github/scripts/prism-load-run.sh mainnet-shape-130-addresses load-out
 ```
+
+`.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
+schedule) measures the Blacksmith runner classes themselves before a lane
+depends on them. On each chosen class (8, 16 and 32 vCPU by default) it builds
+and runs `short-plan-20k-window-1fe` and `throughput-20k-window-1fe` in one job and checkout, with no `--allow-*`
+override, and records `pg_test_fsync` where the clusters live, the kernel's
+view of that block device, the build, seeding and run wall times, peak host
+memory over each, shortfall per phase, the tip-to-last-notify p99 and whether
+every provenance check passed. One job per class keeps the Cargo target
+directory on a sticky disk and another in the Actions cache; dispatch twice
+to compare warm restores with cold builds. `pg_test_fsync`-only jobs on
+several VMs per class give the VM-to-VM disk spread, and an optional job holds
+a 2 vCPU runner for a given time to find the maximum job duration. A collate
+job writes the per-class table (`scripts/prism_load_probe.py table`) to its
+summary and to the `prism-probe-table` artifact.
 
 The same workflow's `live-nightly` job runs the opt-in `#[ignore]`
 `live_regtest` variants listed in `test/prism-nightly-gated-tests.txt`
