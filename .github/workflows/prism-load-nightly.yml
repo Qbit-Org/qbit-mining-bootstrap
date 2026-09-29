@@ -27,8 +27,9 @@ name: PRISM load harness (nightly)
 #
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
-# today #545's 2.x.x migration lifecycle. The weekly schedule runs only that
-# job; the nightly jobs keep their own schedule.
+# today #545's 2.x.x migration lifecycle and #575's measured cutover of a
+# mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
+# nightly jobs keep their own schedule.
 #
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
@@ -76,6 +77,13 @@ on:
         description: >-
           Also run the weekly live regtest scenarios listed in
           test/prism-weekly-gated-tests.txt (the weekly schedule always does).
+        type: boolean
+        required: false
+        default: false
+      fuzz:
+        description: >-
+          Also run the time-boxed Stratum fuzz targets (#575; the nightly
+          schedule always does).
         type: boolean
         required: false
         default: false
@@ -215,7 +223,8 @@ jobs:
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
   # That is #523's qbitd -reindex crash variant, #524's 130-payee
-  # weighted-recipients variant and scenario 5's dense-cadence soak.
+  # weighted-recipients variant, scenario 5's dense-cadence soak, and #575's
+  # PostgreSQL disk-exhaustion and wall-clock-jump variants.
   live-nightly:
     name: Live regtest nightly variants
     if: ${{ github.event.schedule == '17 2 * * *' || inputs.live }}
@@ -252,6 +261,12 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # #575: the disk-exhaustion variant mounts a small ext4 image with
+      # fuse2fs (no root), the clock-jump variant preloads libfaketime.
+      - name: Install the disk-full and clock-jump tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fuse2fs fuse3 faketime libfaketime
       - name: Restore the pinned qbit release from the cache
         uses: actions/cache/restore@v6
         with:
@@ -297,7 +312,14 @@ jobs:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    # #575's scenario writes mainnet's 13,566 blocks and about 2M of its 65.5M
+    # share rows (1x at 1/32 until #582 lands, then 1/16 at 4.1M rows), keeps
+    # two copies of that ledger (about 8 GB at 1/32, 15 GB at 1/16)
+    # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
+    # of the rows on a 22-core host in release, and its row-proportional
+    # phases put 1/16 near 20 minutes there, so the job builds in release and
+    # allows two hours.
+    timeout-minutes: 120
     services:
       postgres:
         image: postgres:16
@@ -344,7 +366,7 @@ jobs:
           set -euo pipefail
           mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-weekly-gated-tests.txt \
             | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
-          cargo test --locked -p qbit-prism-server --test live_regtest -- \
+          cargo test --locked --release -p qbit-prism-server --test live_regtest -- \
             --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
       - name: Prove every listed scenario executed
         run: |
@@ -362,4 +384,47 @@ jobs:
           path: |
             ${{ env.PRISM_TEST_GATE_MANIFEST }}
             ${{ env.PRISM_TEST_LOG }}
+          if-no-files-found: error
+
+  # #575: the Stratum cargo-fuzz targets in crates/qbit-prism-server/fuzz
+  # (line codec, per-connection session state machine, codec parsers), all
+  # three at once for 20 minutes, from the checked-in seeds plus the corpus
+  # the previous night kept. Gated on no crash, leak, timeout or OOM input;
+  # the corpus is saved either way, and any finding is uploaded with the logs.
+  # .github/scripts/prism-stratum-fuzz.sh pins the nightly toolchain and
+  # cargo-fuzz and says how to reproduce a finding.
+  stratum-fuzz:
+    name: Stratum fuzzing (20 min)
+    if: ${{ github.event.schedule == '17 2 * * *' || inputs.fuzz }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Restore the kept corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/stratum-fuzz-corpus
+          key: prism-stratum-fuzz-corpus-v1-${{ github.run_id }}
+          restore-keys: prism-stratum-fuzz-corpus-v1-
+      - name: Run the fuzz targets and gate on no crash
+        run: |
+          bash .github/scripts/prism-stratum-fuzz.sh \
+            "${RUNNER_TEMP}/stratum-fuzz-corpus" "${RUNNER_TEMP}/stratum-fuzz-out" 1200
+      - name: Keep the corpus for the next night
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/stratum-fuzz-corpus
+          key: prism-stratum-fuzz-corpus-v1-${{ github.run_id }}
+      - name: Upload the logs and any crashing inputs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-stratum-fuzz
+          overwrite: true
+          retention-days: 30
+          path: ${{ runner.temp }}/stratum-fuzz-out
           if-no-files-found: error
