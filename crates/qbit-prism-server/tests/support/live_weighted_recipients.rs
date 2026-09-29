@@ -393,11 +393,36 @@ async fn mine(fixture: &Fixture, address: &str, count: u64) -> Result<()> {
         fixture
             .rpc("setmocktime", json!([tip_time.max(now)]))
             .await?;
-        fixture
-            .rpc("generatetoaddress", json!([batch, address]))
-            .await?;
+        generate(fixture, batch, address).await?;
         left -= batch;
     }
+    Ok(())
+}
+
+/// The deadline of this file's node-heavy RPCs: ramp mining and the wallet's
+/// many-input `sendall`. Both finish in seconds on an idle host, but a
+/// 250-block batch outran the fixture client's 45 s timeout at a host load
+/// average of 50 (#533). Neither call is idempotent, so they are never
+/// retried, only given time to finish.
+const HEAVY_RPC_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `generatetoaddress`, under `HEAVY_RPC_TIMEOUT`.
+async fn generate(fixture: &Fixture, batch: u64, address: &str) -> Result<()> {
+    let payload: Value = fixture
+        .client
+        .post(format!("http://127.0.0.1:{}/", fixture.rpc_port))
+        .basic_auth("prismtest", Some("prismtest"))
+        .timeout(HEAVY_RPC_TIMEOUT)
+        .json(&json!({"jsonrpc":"1.0","id":"live-test","method":"generatetoaddress","params":[batch, address]}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    ensure!(
+        payload["error"].is_null(),
+        "RPC generatetoaddress: {}",
+        payload["error"]
+    );
     Ok(())
 }
 
@@ -417,6 +442,8 @@ fn block_weight(bits: &str) -> Result<u128> {
     u128::try_from(limit * 1_000_000_u32 / target).context("block weight exceeds u128")
 }
 
+/// A wallet RPC under `HEAVY_RPC_TIMEOUT`: the payees' `sendall` signs every
+/// input it spends.
 async fn wallet_rpc(fixture: &Fixture, wallet: &str, method: &str, params: Value) -> Result<Value> {
     let payload: Value = fixture
         .client
@@ -425,6 +452,7 @@ async fn wallet_rpc(fixture: &Fixture, wallet: &str, method: &str, params: Value
             fixture.rpc_port
         ))
         .basic_auth("prismtest", Some("prismtest"))
+        .timeout(HEAVY_RPC_TIMEOUT)
         .json(&json!({"jsonrpc":"1.0","id":"live-test","method":method,"params":params}))
         .send()
         .await?
