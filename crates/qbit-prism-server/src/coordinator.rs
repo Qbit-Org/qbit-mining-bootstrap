@@ -2587,20 +2587,21 @@ impl Coordinator {
                             // heartbeat; hand the claim back instead of making
                             // another frontend wait out the lease on every
                             // rolling restart. The release keeps the state and
-                            // schedule, exactly as an expiry would leave the
-                            // row: a reservation or an offer this attempt made
-                            // is recovered, never offered again, by whoever
-                            // claims it next. Fenced on the token and on an
-                            // unfinished state, so a terminal commit that won
-                            // the race is left alone. A failed release falls
-                            // back to the expiry.
-                            let released = tokio::time::timeout(
+                            // schedule, so it changes only when a successor may
+                            // take the row, not what it then does: exactly
+                            // what it would do after the expiry. Fenced on the
+                            // token and on an unfinished state, so a terminal
+                            // commit that won the race is left alone. A failed
+                            // release falls back to the expiry.
+                            match tokio::time::timeout(
                                 CANDIDATE_LEASE.timeout,
                                 self.ledger.release_recovery_claim(&claim, "claim released at shutdown"),
                             )
-                            .await;
-                            if !matches!(released, Ok(Ok(_))) {
-                                tracing::warn!(block=%claim.candidate.block_hash,"candidate claim release at shutdown deferred to its expiry");
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(release)) => tracing::warn!(%release,block=%claim.candidate.block_hash,"candidate claim release at shutdown failed; the claim waits for its expiry"),
+                                Err(_) => tracing::warn!(block=%claim.candidate.block_hash,"candidate claim release at shutdown timed out; the claim waits for its expiry"),
                             }
                             break;
                         }

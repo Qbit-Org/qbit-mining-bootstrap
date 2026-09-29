@@ -24,7 +24,9 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
     run_pass(coordinator, &never).await
 }
 
-/// Resolves once `shutdown` is set; never for a closed channel still unset.
+/// Resolves once `shutdown` is set. A closed channel that was never set
+/// never resolves: `run_once` has no shutdown, and `run` ends at its own
+/// `changed()` before starting another pass.
 async fn stopping(shutdown: &watch::Receiver<bool>) {
     if shutdown.clone().wait_for(|stop| *stop).await.is_err() {
         std::future::pending::<()>().await;
@@ -101,22 +103,22 @@ pub async fn run_pass(
                 // the next claim re-verifies the chain from scratch, as after
                 // an expiry, and anything this attempt sent is already known
                 // to the node. A failed release falls back to the expiry.
-                let released = tokio::time::timeout(
+                match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     coordinator.ledger.release_fanout_claim(&claim),
                 )
-                .await;
-                if !matches!(released, Ok(Ok(_))) {
-                    tracing::warn!(fanout=%claim.fanout_txid,"CTV claim release at shutdown deferred to its expiry");
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(release)) => tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release at shutdown failed; the claim waits for its expiry"),
+                    Err(_) => tracing::warn!(fanout=%claim.fanout_txid,"CTV claim release at shutdown timed out; the claim waits for its expiry"),
                 }
                 break;
             }
         };
         let finished = match outcome {
             Ok(Ok((status, result))) => {
-                // Only an attempt that sent the fanout has a result that is
-                // not a check-only observation.
-                let sent = (result["check_only"] != true).then(|| result.clone());
+                let attempted = result.clone();
                 let finished = coordinator
                     .ledger
                     .finish_fanout(&claim, status, Some(result), None)
@@ -134,8 +136,8 @@ pub async fn run_pass(
                         .ledger
                         .requeue_refused_fanout(
                             &claim,
-                            sent.as_ref(),
-                            &format!("completion refused: {refused:#}"),
+                            &attempted,
+                            &format!("completion not persisted: {refused:#}"),
                         )
                         .await
                     {

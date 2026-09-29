@@ -198,6 +198,12 @@ async fn a_refused_completion_requeues_its_fanout_behind_the_rows_already_due() 
         Box::pin(async move {
             f.refresh(true).await?;
             let count = mature_fanouts(f, true).await?;
+            // Every row has been due for a while, as rows rescheduled by
+            // earlier passes are: the requeue must order the refused row
+            // after all of them, not merely after never-attempted rows.
+            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at=clock_timestamp()-interval '1 minute'")
+                .execute(f.pool())
+                .await?;
             let mut held = f.node.pause_next("getbestblockhash")?;
             let a = f.a.clone();
             let pass = tokio::spawn(async move { broadcaster::run_once(&a).await });
@@ -318,7 +324,7 @@ async fn a_failed_attempt_whose_failure_is_lost_keeps_its_backoff() -> Result<()
             ensure!(taken.fanout_txid == stale.fanout_txid, "fixture took over another row");
             ensure!(
                 !f.a.ledger.release_failed_fanout(&stale, "late").await?
-                    && !f.a.ledger.requeue_refused_fanout(&stale, Some(&json!({})), "late").await?,
+                    && !f.a.ledger.requeue_refused_fanout(&stale, &json!({}), "late").await?,
                 "a stale token handed back another frontend's claim"
             );
             let row = sqlx::query("SELECT claim_token,broadcast_attempt_count,(SELECT count(*) FROM qbit_ctv_fanout_broadcast_attempts t WHERE t.fanout_txid=a.fanout_txid) AS history FROM qbit_ctv_fanout_artifacts a WHERE fanout_txid=$1")
@@ -433,7 +439,7 @@ async fn a_send_whose_completion_is_refused_is_recorded_as_an_attempt() -> Resul
             );
             ensure!(
                 row.try_get::<Option<String>, _>("last_broadcast_error")?
-                    .is_some_and(|error| error.contains("completion refused") && error.contains("payout revision changed")),
+                    .is_some_and(|error| error.contains("completion not persisted") && error.contains("payout revision changed")),
                 "the refusal was not recorded as the attempt's error"
             );
             ensure!(
