@@ -48,6 +48,9 @@ before migration.
    it does not depend on #174/#176 or mutate historical public content on the
    source. Record restore, migrate, import, verification times and history size
    on a production-sized copy; #291 supplies the release rehearsal evidence.
+   [`make prism-cutover-rehearsal`](#rehearse-the-cutover-on-a-snapshot) runs
+   this rehearsal on a `pg_dump` and records those times, the longest lock
+   each step held, and a pass/fail check of every invariant below.
 
 ## Drain and migrate
 
@@ -1397,3 +1400,135 @@ restore still equals the source, and the legacy revert refuses). The scenario
 is `migration_lifecycle_tests` in `crates/qbit-prism-server/tests/live_regtest.rs`,
 listed in `test/prism-weekly-gated-tests.txt`. It does not replace #291's
 rehearsal on production-sized history.
+
+## Rehearse the cutover on a snapshot
+
+`make prism-cutover-rehearsal` rehearses the whole cutover on a `pg_dump` of
+the drained `2.x.x` database, on a private host, and prints a pass/fail
+report (#575). It never connects to the database the dump came from, or to any
+database but the one it creates:
+
+1. It creates a private PostgreSQL cluster with `initdb` under `WORKDIR`
+   (`fsync`, `full_page_writes` and `synchronous_commit` on, listening on
+   loopback only) and restores the dump into it: a custom, directory or tar
+   archive with `pg_restore --no-owner --no-privileges`, a plain dump with
+   `psql`. The cluster is stopped and removed at the end.
+2. On the restored source it takes the [recovery evidence](#recovery-and-rollback)
+   (`scripts/prism-recovery-evidence.{sql,py}`) and the invariants below.
+3. It runs `check-config`, `migrate` and `import-audits --root <AUDIT_ROOT>`
+   with this build's `qbit-prism-server`, exactly as
+   [Drain and migrate](#drain-and-migrate) runs them, timing each and
+   sampling `pg_locks` for the statements they run.
+4. It takes the evidence and the invariants again and compares them with the
+   source's. Then it starts one frontend on the migrated ledger and checks
+   readiness, every address's balances through `/public/v1/miners/<address>`,
+   a first Stratum job (`mining.subscribe`, `mining.authorize` with an
+   address from the ledger, `mining.notify`) and `self-check`.
+
+The checks, each reported as PASS or FAIL:
+
+| Check | Holds when |
+| --- | --- |
+| source drained | the source evidence has no unfinished candidate |
+| check-config, migrate | the command exits 0; a refusal is reported with its error line |
+| import-audits complete | the import exits 0 with `missing_stored_bodies` and `missing_canonical_bytes` both 0 |
+| recovery evidence unchanged | the evidence summary after `migrate` and `import-audits` equals the source's, record for record, including `audit_head_sha256` |
+| row counts and sums unchanged | every `2.x.x` table has the same row count and the same sums: accepted shares and their difficulty, the highest `share_seq`, stale-grace rows, blocks by chain and maturity state, audit identities, gross, on-chain and carried sats, payout entries, outbox states, CTV rows, the hashrate rollups and their watermark, and retained worker difficulty |
+| balances unchanged (SQL) | every address's owed, lifetime and pending-maturity balance, computed with the public API's own SQL, is unchanged |
+| payout window unchanged | the native snapshot a frontend builds its next job from holds exactly the shares `2.x.x`'s `qbit_prism_window` held, at the latest network difficulty the ledger records |
+| window prior balances unchanged | the snapshot's prior balances equal `2.x.x`'s `qbit_current_carry_forward_balances()` |
+| frontend ready, first job issued | `/healthz` answers 200 and the frontend sends `mining.notify` |
+| API balances equal the source | every address's balances served by the running frontend equal the source's |
+| self-check, audit completeness | `self-check` exits 0 and reports both completeness counts 0 |
+
+Run it from a checkout of the release to be deployed, with a Rust toolchain
+and PostgreSQL 16's server binaries:
+
+```sh
+make prism-cutover-rehearsal \
+  DUMP=pre-native.dump \
+  LEDGER_KEY=<the trusted PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX> \
+  AUDIT_ROOT=/var/lib/qbit-prism/audit \
+  STATEMENT_TIMEOUT_MS=<the PRISM_DATABASE_STATEMENT_TIMEOUT_MS migrate will use> \
+  REPORT=rehearsal.json WORKDIR=/srv/rehearsal
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `DUMP` | required: the dump to rehearse |
+| `LEDGER_KEY` | required: the trusted ledger public key the history was signed with, which `import-audits` verifies every body against |
+| `AUDIT_ROOT` | the external audit bodies, segments and canonical sidecars, mounted at their recorded paths as for the real import; without it only inline history can import, and the completeness check fails on any external body |
+| `SCHEMA` | the ledger schema; by default the one schema holding `qbit_share_ledger` |
+| `STATEMENT_TIMEOUT_MS` | the statement timeout the real `migrate` will run with; a statement that exceeds it fails the rehearsal as it would fail the cutover. Default: the server's 15000 |
+| `NODE_RPC`, `NODE_USER`, `NODE_PASSWORD`, `NODE_CHAIN` | a synced qbitd on the dump's chain for the frontend (`NODE_CHAIN` defaults to `main`). By default the frontend runs against a node the rehearsal serves from the dump itself: each confirmed pool block at its height and a synthetic hash at every other height, with the highest confirmed block as the tip, so the reconciler sees the recorded chain and matures nothing `2.x.x` had not |
+| `REPORT` | also write the report as JSON: steps, locks, the longest statements, checks, row counts and database sizes |
+| `WORKDIR` | where the private cluster lives while it runs (default `TMPDIR`); budget the restored database twice over, plus the audit root |
+| `PG_BIN_DIR` | PostgreSQL 16 server binaries (default `pg_config --bindir`) |
+
+The frontend runs with test signing keys and pins its own cluster fingerprint
+on the restored copy, which is discarded; nothing it signs leaves the host and
+no miner connects to it but the rehearsal's one Stratum session. The report
+can name addresses and balances: keep it with the rest of the rehearsal
+evidence. It exits non-zero when any check fails.
+
+**Reading the report.** Each step has its wall time and the longest lock it
+held. The lock sampler polls `pg_locks` every 10 ms on a side connection for
+the commands' own sessions (`application_name=prism-cutover-rehearsal`), so a
+hold shorter than one interval shows as 0 ms and a very short one can be
+missed. `migrate` is split by what it was running: the migration transaction
+(`001` and native `002` to `020`), 013's concurrent index builds, and 017's
+prepare, validate and swap. The transaction holds the cutover locks, ACCESS
+EXCLUSIVE on `qbit_share_ledger` among them, for its whole length; the report
+also lists the statements `migrate` spent the most sampled time in.
+
+**Rehearsing without a snapshot.** `make prism-cutover-rehearsal-dump
+OUT=mainnet.dump SCALE=1 DENSITY=0.0625` writes a mainnet-shaped `2.x.x`
+database from the frozen release SQL and dumps it, with its audit bodies in
+`mainnet.audits` and the ledger key to pass as `LEDGER_KEY` printed in its
+summary. Its shape is #521's aggregates of mainnet `2.x.x` from 2026-07-15 to
+2026-09-28, seeded and deterministic:
+
+- 257 payout identities over 76 days in three eras, from 4 to about 130 of
+  them a day;
+- a whale holding 82-98% of a day's work on most days over a Zipf(1.1) tail;
+  worker difficulty over three orders of magnitude; hobby rigs whose credit
+  accrues under the payout floor;
+- 5-minute share rates with mean, maximum and coefficient of variation per
+  era of 8/92/1.24, 25/394/0.65 and 1.3/17/0.77 shares per second;
+- 13,566 blocks at mainnet's work per block, with signed audit bundles in the
+  three historical body layouts, PPLNS carry-forward chains and payout
+  entries, the newest blocks immature (pending payouts) and some inactive,
+  reversed and rejected;
+- CTV fanout rows for the last 40 days, terminal v1 and (after the #258
+  upgrade) v2 outbox rows, abandoned candidates, caught-up hashrate rollups,
+  retained worker difficulty, an expired writer lease, and the
+  `qbit_share_ledger_credit_policy_check` left NOT VALID as on a ledger
+  upgraded from before that column.
+
+`make prism-cutover-rehearsal-generated SCALE=1 DENSITY=0.0625` does both in
+one command: it writes the dump under `WORKDIR` (a temporary directory,
+removed afterwards unless `KEEP=1`) and rehearses it with the generator's
+ledger key, taking `STATEMENT_TIMEOUT_MS` and `REPORT` as above. Use it to
+rehearse a branch that changes a migration.
+
+`SCALE=3` multiplies the identities, the rate and the blocks, which is #521's
+growth shape. `DENSITY` keeps that fraction of the share rows, and each kept
+row carries `1/DENSITY` times a share's difficulty. The work per identity per
+5 minutes, the window weight and every balance therefore keep mainnet's
+shape, while the row-proportional costs (the 013 and 017 scans, 002's
+share-hash backfill and the evidence export) scale with the rows the report
+states. At `DENSITY=1` it is mainnet's 65.5M rows, about 105 GB before
+migrating.
+
+In CI, `migration_rollback`'s
+`cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance`
+runs this path on every pull request: a mainnet-shaped ledger of about 25,000
+rows and 60 blocks, dumped with `pg_dump` and rehearsed as above. The weekly
+`live_regtest` scenario
+`migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation`
+writes the mainnet shape at 1/16 of the rows over a real regtest chain. It
+cuts over with the same measured steps and checks, then mines and reconciles
+as the scenario above does. Until #582 is fixed, it runs `migrate` with a
+600 s statement timeout. It first checks that `migrate` at the default
+timeout still refuses the ledger in 002's share-hash backfill and changes
+nothing.

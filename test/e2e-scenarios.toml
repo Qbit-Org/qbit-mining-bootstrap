@@ -605,6 +605,16 @@ runs = false
 reason = "Not built; #545."
 
 [[scenario]]
+id = "cutover-rehearsal"
+title = "A mainnet-shaped 2.x.x ledger cut over as the migration guide runs it, measured"
+owner = "#575"
+lanes = ["pr"]
+criteria = "Recovery evidence, every 2.x.x table's counts and sums, every address's balances (SQL and the running API) and the payout window are unchanged; a frontend on the result is ready, issues a first job and passes self-check; each step's wall time and longest lock are reported."
+runs = true
+tests = ["qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance"]
+notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant in test/prism-weekly-gated-tests.txt cuts over 1x at 1/16 of the rows on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+
+[[scenario]]
 id = "shipped-image-lane"
 title = "The Compose prism profile with the HA overlay under modest real-miner load"
 owner = "#544"
