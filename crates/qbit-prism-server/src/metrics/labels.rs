@@ -121,6 +121,11 @@ labels!(CaptureDecision {
     Offered => "offered", AbandonedCeiling => "abandoned_ceiling",
     AbandonedDisabled => "abandoned_disabled"
 });
+// #529: how a found block's wait for the failover standby's flush ended
+// before its offer; the block is offered in every case.
+labels!(StandbyWaitOutcome {
+    Confirmed => "confirmed", Absent => "absent", Lagging => "lagging", Failed => "failed"
+});
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.

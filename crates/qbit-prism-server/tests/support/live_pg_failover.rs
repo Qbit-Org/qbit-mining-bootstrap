@@ -45,11 +45,16 @@ use std::{
     collections::BTreeSet,
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         Arc,
     },
 };
 use tokio::{sync::watch, task::JoinHandle};
+
+/// #529: the found-block offer's standby flush wait under a replication cut;
+/// it reuses this module's pair, relays and node gate.
+#[path = "live_pg_offer_standby.rs"]
+mod offer_standby;
 
 /// The dedicated standby's `application_name` and physical slot.
 const STANDBY: &str = "prism_standby_1";
@@ -815,6 +820,9 @@ struct Relay {
     port: u16,
     target: Arc<AtomicU16>,
     fenced: Arc<AtomicBool>,
+    /// Milliseconds each target-to-client chunk is held, for connections
+    /// accepted while it is non-zero: replication lag, for the #529 drills.
+    delay_ms: Arc<AtomicU64>,
     severed: watch::Sender<u64>,
     task: JoinHandle<()>,
 }
@@ -825,9 +833,15 @@ impl Relay {
         let port = listener.local_addr()?.port();
         let target = Arc::new(AtomicU16::new(target));
         let fenced = Arc::new(AtomicBool::new(false));
+        let delay_ms = Arc::new(AtomicU64::new(0));
         let (severed, _) = watch::channel(0u64);
         let task = tokio::spawn({
-            let (target, fenced, severed) = (target.clone(), fenced.clone(), severed.clone());
+            let (target, fenced, severed, delay_ms) = (
+                target.clone(),
+                fenced.clone(),
+                severed.clone(),
+                delay_ms.clone(),
+            );
             async move {
                 while let Ok((mut client, _)) = listener.accept().await {
                     // Subscribe before reading the fence: a fence set after
@@ -837,6 +851,7 @@ impl Relay {
                         continue;
                     }
                     let target = target.load(Ordering::SeqCst);
+                    let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = generation.changed() => {}
@@ -844,7 +859,14 @@ impl Relay {
                                 if let Ok(mut upstream) =
                                     tokio::net::TcpStream::connect(("127.0.0.1", target)).await
                                 {
-                                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                                    // PostgreSQL disables Nagle on its own sockets; the
+                                    // relay does too, or its small replies wait ~40 ms.
+                                    let _ = (client.set_nodelay(true), upstream.set_nodelay(true));
+                                    if delay.is_zero() {
+                                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                                    } else {
+                                        offer_standby::delayed_pump(client, upstream, delay).await;
+                                    }
                                 }
                             } => {}
                         }
@@ -856,6 +878,7 @@ impl Relay {
             port,
             target,
             fenced,
+            delay_ms,
             severed,
             task,
         })

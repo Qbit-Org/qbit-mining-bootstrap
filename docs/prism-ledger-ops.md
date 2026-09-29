@@ -1623,6 +1623,40 @@ standby containing acknowledged commits. An HA endpoint does not establish this
 by itself. Test primary failure and client reconnection using the actual
 replication, proxy, and storage configuration.
 
+### Found blocks and the failover standby (#529)
+
+Under asynchronous D3 a found block's candidate row and offer reservation can
+be lost with the primary after the block was offered, leaving it on chain with
+no ledger record. With `PRISM_OFFER_STANDBY_APPLICATION_NAME` set to the
+dedicated failover standby's `application_name` (and `pg_monitor` granted to the
+writer role), each frontend waits after the reservation commits, up to
+`PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` (default 250 ms), for that standby's
+`flush_lsn` to cover the block's rows, then offers it. Shares are unaffected.
+The wait never holds the block: when the standby is not connected, is still
+behind at the bound, or its position cannot be read, the block is offered at
+once or at the bound, and the frontend logs a WARN line whose message starts
+`block offer standby wait unconfirmed`, with the fields `block` (the hash),
+`standby`, `outcome` (`absent`, `lagging` or `failed`), `waited_us`, and
+`lag_bytes` or `error`. A confirmed wait is logged at INFO with its `waited_us`.
+
+`qbit_prism_block_offer_standby_wait_total{outcome}` counts every wait and
+`PrismBlockOfferStandbyUnconfirmed` warns on any that did not confirm.
+`self-check` refuses the setting when the writer role cannot read replication
+positions or the name matches no single connected standby reporting its flush
+position.
+
+**After a failover, reconcile the logged hashes.** Collect every hash logged
+`block offer standby wait unconfirmed` before the primary was lost, and follow
+[promotion step 6](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint):
+a hash whose candidate survived on the promoted primary needs nothing; one with
+no candidate that is not on the node's active chain lost only its reward; one
+with no candidate that **is** on the active chain is an accounting-loss
+reconciliation, because its coinbase paid balances the promoted ledger still
+carries. `candidates recover` cannot land it: it refuses a hash with no
+candidate row. The HA reference's
+[found-block section](prism-ha-reference-architecture.md#found-blocks-a-bounded-standby-flush-before-the-offer-529)
+has the measurements and the accepted-loss statement.
+
 SIGTERM closes listener admission and asks tasks to drain before the database
 pool closes. The native server bounds shutdown drain to 30 seconds; unfinished
 candidate/CTV intents remain in PostgreSQL and become reclaimable after their

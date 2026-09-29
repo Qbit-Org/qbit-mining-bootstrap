@@ -101,6 +101,8 @@
     "ledger/divergence.rs::payout_divergence_line#1::fetch_one(pool)": [1,"divergence-line"],
     "ledger/fatal_state.rs::inspect_fatal_state#1::read_fatal_state(pool . acquire ( ))": [1,"operator"],
     "ledger/fatal_state.rs::fatal_state#1::read_fatal_state(self . acquire ( ))": [1,"ledger"],
+    "ledger/standby_durability.rs::await_standby_flush#1::self .acquire()": [2,"ledger"],
+    "ledger/standby_durability.rs::offer_standby_report#1::self .acquire()": [1,"ledger"],
     "api.rs::audit#1::fetch_one(& state . pool)": [3,"public"],
     "api.rs::audit#1::payout_divergence_line(& state . pool)": [1,"public"],
     "api/charts.rs::hashrate_series#1::fetch_one(& state . pool)": [2,"public"],

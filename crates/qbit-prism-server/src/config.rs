@@ -78,6 +78,13 @@ pub struct Config {
     /// fingerprint: every frontend should run the same value. Default 100
     /// (1%), 0 to 10000.
     pub capture_overpay_ceiling_bps: u16,
+    /// `PRISM_OFFER_STANDBY_APPLICATION_NAME` and
+    /// `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` (#529): before a found block's
+    /// `submitblock`, wait up to the bound for the named failover standby to
+    /// flush its candidate row and offer reservation. `None` (no name, or a
+    /// 0 ms bound) offers without waiting. Per frontend, not in the cluster
+    /// fingerprint.
+    pub offer_standby: Option<crate::ledger::OfferStandbyWait>,
     pub extranonce2_size: usize,
     pub coinbase_tag: String,
     pub manifest_seed: String,
@@ -235,6 +242,48 @@ fn seconds_allow_zero(name: &str, default: f64) -> Result<Duration> {
         "{name} must be between 0 and 86400 seconds"
     );
     Ok(Duration::from_secs_f64(n))
+}
+
+/// The default `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS`: two orders of magnitude
+/// above a healthy standby's p99 wait (#529), 0.4% of a 60 s block interval.
+const OFFER_STANDBY_FLUSH_WAIT_MS: u64 = 250;
+/// The largest accepted bound: a lagging standby delays every found block's
+/// offer, and the block-only acknowledgements waiting on it, by the bound.
+const OFFER_STANDBY_FLUSH_WAIT_MAX_MS: u64 = 10_000;
+
+/// #529: the found-block offer's standby wait, on when a standby name is set
+/// and the bound is positive. PostgreSQL keeps at most 63 bytes of an
+/// `application_name` and replaces non-printable ASCII, so a name it could
+/// never report is refused rather than never matched.
+fn offer_standby(
+    name: Option<String>,
+    wait_ms: Option<String>,
+) -> Result<Option<crate::ledger::OfferStandbyWait>> {
+    let wait_ms = match wait_ms {
+        None => OFFER_STANDBY_FLUSH_WAIT_MS,
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms <= OFFER_STANDBY_FLUSH_WAIT_MAX_MS)
+            .with_context(|| {
+                format!(
+                    "PRISM_OFFER_STANDBY_FLUSH_WAIT_MS must be 0..{OFFER_STANDBY_FLUSH_WAIT_MAX_MS} milliseconds"
+                )
+            })?,
+    };
+    let Some(name) = name.map(|name| name.trim().to_owned()) else {
+        return Ok(None);
+    };
+    ensure!(
+        name.len() <= 63 && name.bytes().all(|byte| (0x20..=0x7e).contains(&byte)),
+        "PRISM_OFFER_STANDBY_APPLICATION_NAME must be at most 63 printable ASCII bytes, \
+         the failover standby's application_name"
+    );
+    Ok((wait_ms > 0).then(|| crate::ledger::OfferStandbyWait {
+        application_name: name,
+        bound: Duration::from_millis(wait_ms),
+    }))
 }
 
 impl Config {
@@ -525,6 +574,10 @@ impl Config {
             bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
         let capture_overpay_ceiling_bps =
             bounded_usize("PRISM_CAPTURE_OVERPAY_CEILING_BPS", 100, 0, 10_000)? as u16;
+        let offer_standby = offer_standby(
+            optional("PRISM_OFFER_STANDBY_APPLICATION_NAME"),
+            optional("PRISM_OFFER_STANDBY_FLUSH_WAIT_MS"),
+        )?;
         Ok(Self {
             database_url,
             instance_id,
@@ -553,6 +606,7 @@ impl Config {
             block_only_ack_timeout,
             candidate_orphan_confirmations,
             capture_overpay_ceiling_bps,
+            offer_standby,
             extranonce2_size,
             coinbase_tag,
             manifest_seed,
@@ -684,6 +738,7 @@ mod tests {
             block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: 6,
             capture_overpay_ceiling_bps: 100,
+            offer_standby: None,
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),
@@ -757,6 +812,62 @@ mod tests {
                 config.ensure_pool_fee_settles_dust().unwrap();
             }
         }
+    }
+
+    /// #529: the wait is on only with a standby name and a positive bound;
+    /// the bound defaults to 250 ms and is refused outside 0..10000 ms.
+    #[test]
+    fn offer_standby_wait_needs_a_name_and_a_positive_bound() {
+        let parse = |name: Option<&str>, wait: Option<&str>| {
+            offer_standby(name.map(str::to_owned), wait.map(str::to_owned))
+        };
+        let on = |name: &str, ms: u64| {
+            Some(crate::ledger::OfferStandbyWait {
+                application_name: name.into(),
+                bound: Duration::from_millis(ms),
+            })
+        };
+        assert_eq!(parse(None, None).unwrap(), None);
+        assert_eq!(parse(None, Some("400")).unwrap(), None);
+        assert_eq!(
+            parse(Some(" prism_standby_1 "), None).unwrap(),
+            on("prism_standby_1", 250)
+        );
+        assert_eq!(
+            parse(Some("prism_standby_1"), Some("0")).unwrap(),
+            None,
+            "0 ms turns the wait off"
+        );
+        assert_eq!(
+            parse(Some("prism_standby_1"), Some("10000")).unwrap(),
+            on("prism_standby_1", 10_000)
+        );
+        for bad in ["10001", "-1", "0.5", "250ms", "18446744073709551616"] {
+            let error = parse(Some("prism_standby_1"), Some(bad)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("PRISM_OFFER_STANDBY_FLUSH_WAIT_MS must be 0..10000"),
+                "{bad:?}: {error}"
+            );
+            assert!(
+                parse(None, Some(bad)).is_err(),
+                "a malformed bound is refused even without a name: {bad:?}"
+            );
+        }
+        for bad in ["x".repeat(64), "stand\u{e9}by".into(), "a\tb".into()] {
+            let error = parse(Some(&bad), None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("PRISM_OFFER_STANDBY_APPLICATION_NAME"),
+                "{bad:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse(Some(&"x".repeat(63)), Some("1")).unwrap(),
+            on(&"x".repeat(63), 1)
+        );
     }
 
     #[test]

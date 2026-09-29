@@ -2264,6 +2264,18 @@ impl Coordinator {
                 return Ok(());
             }
         }
+        // #529: the reservation, and the candidate row before it, reach the
+        // failover standby before the block leaves this frontend, within the
+        // bound. The wait never holds the block: an unconfirmed one is logged
+        // with the block hash, which the post-failover reconciliation reads,
+        // and the block is offered anyway. It runs before the strictly-live
+        // renewal, so that fence stays immediately before the send. It also
+        // widens the reserved-but-unsent window (a crash here is delivery
+        // unknown, never offered) to at most the bound; see
+        // `ledger/standby_durability.rs`.
+        if let Some(wait) = &self.config.offer_standby {
+            self.await_offer_standby(wait, &candidate.block_hash).await;
+        }
         #[cfg(test)]
         self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.
@@ -2304,6 +2316,35 @@ impl Coordinator {
             .await?;
         self.settle_offered_candidate(claim, lease, outcome, reply)
             .await
+    }
+
+    /// #529: wait for the failover standby's flush before a found block's
+    /// offer, then count and log how the wait ended.
+    async fn await_offer_standby(&self, wait: &crate::ledger::OfferStandbyWait, block_hash: &str) {
+        let crate::ledger::StandbyWait { waited, durability } =
+            self.ledger.await_standby_flush(wait).await;
+        let outcome = durability.outcome();
+        let (standby, waited_us) = (wait.application_name.as_str(), waited.as_micros() as u64);
+        if matches!(durability, crate::ledger::StandbyDurability::Confirmed) {
+            tracing::info!(
+                block = %block_hash,
+                standby,
+                outcome = outcome.as_str(),
+                waited_us,
+                "block offer standby wait confirmed: the failover standby holds the reservation"
+            );
+        } else {
+            tracing::warn!(
+                block = %block_hash,
+                standby,
+                outcome = outcome.as_str(),
+                waited_us,
+                lag_bytes = durability.lag_bytes(),
+                error = durability.error(),
+                "block offer standby wait unconfirmed: offering without a confirmed failover copy; reconcile this block after a failover"
+            );
+        }
+        self.metrics.record_offer_standby_wait(outcome);
     }
 
     /// A pending block the chain already holds, found by the pre-offer

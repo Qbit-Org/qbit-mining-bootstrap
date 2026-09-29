@@ -22,6 +22,9 @@ use tokio::{
 #[path = "support/public_replica.rs"]
 mod public_replica;
 
+#[path = "support/offer_standby_flush.rs"]
+mod offer_standby_flush;
+
 struct Cluster {
     bin: PathBuf,
     data: PathBuf,
