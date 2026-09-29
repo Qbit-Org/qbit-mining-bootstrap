@@ -354,6 +354,15 @@ runs = true
 presets = ["tip-delivery-2000-miners-400k-2fe-retarget-500-addresses"]
 
 [[scenario]]
+id = "load-runner-probe-short-plan"
+title = "#541's runner probe: the short plan over the 20k-window fixture on one frontend"
+owner = "#541"
+lanes = ["dispatch"]
+criteria = "The preset's gates on the runner under probe: exact reconciliation, no acknowledged share missing, zero shortfall in each gated phase."
+runs = true
+presets = ["short-plan-20k-window-1fe"]
+
+[[scenario]]
 id = "load-mainnet-floor"
 title = "Mainnet-shaped floor: 130 recipients, one whale, bursty arrivals"
 owner = "#521"
