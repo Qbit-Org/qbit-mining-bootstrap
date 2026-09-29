@@ -175,6 +175,12 @@ pub fn expected(populated: bool) -> Census {
         &[],
     );
     result.family(
+        "block_proof_ack_capped_total",
+        "counter",
+        &labels("path", "share,block_only"),
+        &[],
+    );
+    result.family(
         "block_offer_standby_wait_total",
         "counter",
         &labels("outcome", "confirmed,absent,lagging,failed"),

@@ -6,11 +6,14 @@
 //! COMMIT already in flight and waits `share_commit_grace` for its reply. An
 //! outcome still unknown at the deadline is answered `ledger-outcome-unknown`,
 //! never as a failure. Block-only proofs wait for their candidate's
-//! disposition up to `block_only_ack_timeout` instead.
+//! disposition up to `block_only_ack_timeout` instead, which is
+//! `share_commit_timeout` itself (#574): a proof still pending there is
+//! answered `ledger-outcome-unknown` and counted in
+//! `block_proof_ack_capped_total`, while its append or landing runs on.
 use super::submit_ledger::{CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
-use crate::metrics::StaleJobCause;
+use crate::metrics::{BlockAckPath, StaleJobCause};
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -571,6 +574,7 @@ impl Coordinator {
                     path,
                     phase,
                     detail,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
                     "share outcome unknown at the acknowledgement deadline"
                 );
                 Err(protocol_error(
@@ -645,6 +649,9 @@ impl Coordinator {
         };
         let Some(joined) = joined else {
             task.follow(share_id, "share", phase);
+            if !refusable {
+                self.metrics.record_block_ack_capped(BlockAckPath::Share);
+            }
             return SaveOutcome::Unknown {
                 phase,
                 detail: "the append had not finished by the acknowledgement deadline".into(),
@@ -767,6 +774,8 @@ impl Coordinator {
             }
             Err(_) => {
                 follow_enqueue(enqueue, share.share_id.clone(), block_hash.to_string());
+                self.metrics
+                    .record_block_ack_capped(BlockAckPath::BlockOnly);
                 return SaveOutcome::Unknown {
                     phase: "enqueue-pending",
                     detail: "the candidate enqueue had not finished by the acknowledgement bound"
@@ -863,6 +872,10 @@ impl Coordinator {
                 break;
             }
         }
+        // The landing runs on without this wait: its confirmation credits the
+        // deferred share once, whenever it commits.
+        self.metrics
+            .record_block_ack_capped(BlockAckPath::BlockOnly);
         SaveOutcome::Unknown {
             phase,
             detail: "the block candidate had no disposition by block_only_ack_timeout".into(),

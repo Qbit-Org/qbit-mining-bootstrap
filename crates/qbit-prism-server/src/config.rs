@@ -51,8 +51,11 @@ pub struct Config {
     /// `share_commit_timeout` may still be confirmed. Not an environment
     /// variable.
     pub share_commit_grace: Duration,
-    /// The acknowledgement bound for block-only proofs, measured from the same
-    /// instant as `share_commit_timeout`. Not an environment variable.
+    /// The acknowledgement bound for a submission that carries a found block:
+    /// a block-only, deferred or captured proof waiting for its enqueue and
+    /// landing, or a share-pass append carrying the block. Measured from the
+    /// same instant as `share_commit_timeout`; see [`block_only_ack_timeout`].
+    /// Not an environment variable.
     pub block_only_ack_timeout: Duration,
     /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (#415): how many confirmations
     /// a DIFFERENT block active at an offered candidate's height needs, on
@@ -227,6 +230,17 @@ fn alias(primary: &str, legacy: &str, default: u64) -> Result<u64> {
         positive(legacy, default)
     }
 }
+/// The acknowledgement bound for a block-bearing submission (#574): the share
+/// commit deadline itself. A captured proof's answer used to wait up to
+/// `max(share_commit_timeout, 60 s)` for its own frontend's landing, and the
+/// miner's session can submit nothing else meanwhile. At the bound the proof
+/// is answered `ledger-outcome-unknown`, as any share still pending at its
+/// deadline is; the block and any deferred share are still landed and credited
+/// once, because only the wait ends there.
+pub fn block_only_ack_timeout(share_commit_timeout: Duration) -> Duration {
+    share_commit_timeout
+}
+
 pub(crate) fn seconds(name: &str, default: f64) -> Result<Duration> {
     let n = number(name, default)?;
     ensure!(
@@ -562,14 +576,13 @@ impl Config {
         )
         .context("invalid PRISM_VERSION_ROLLING_MASK")?;
         let share_commit_timeout = seconds("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", 15.0)?;
-        // Neither bound below is an environment variable. A block-only bound
-        // never undercuts a raised share deadline.
+        // Neither bound below is an environment variable.
         let share_commit_grace = Duration::from_secs(5);
         ensure!(
             share_commit_grace > Duration::ZERO,
             "share commit grace must be positive"
         );
-        let block_only_ack_timeout = share_commit_timeout.max(Duration::from_secs(60));
+        let block_only_ack_timeout = block_only_ack_timeout(share_commit_timeout);
         let candidate_orphan_confirmations =
             bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
         let capture_overpay_ceiling_bps =

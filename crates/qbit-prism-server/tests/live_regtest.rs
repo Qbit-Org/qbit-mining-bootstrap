@@ -1340,12 +1340,14 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         fixture.servers[0].stop();fixture.miners[0].stop();
         let before=fixture.count(1).await?;
         // Every regtest share is also a block. A proof on work whose payout
-        // revision a landing superseded is captured (#478), and its answer
-        // waits for this server's own landing of that block, up to
-        // block_only_ack_timeout: max(share_commit_timeout, 60 s), 60 s here.
-        // Under load a landing takes seconds, so three credited shares can
-        // outlast a fixed 20 s (#562). Allow each its whole answer bound,
-        // here and after the restart below.
+        // revision a landing superseded is captured (#478): its share is
+        // credited by this server's own landing of that block, and its answer
+        // waits for that credit up to block_only_ack_timeout, which #574 cut
+        // from 60 s to share_commit_timeout (15 s here). Under load a landing
+        // takes seconds, so three credited shares can outlast a fixed 20 s
+        // (#562). This counts credits, which still follow the landing rather
+        // than the answer, so each keeps the 60 s allowance, here and after
+        // the restart below.
         let block_only_ack_seconds=60;
         until("surviving server mining",20+3*block_only_ack_seconds,||async {Ok(fixture.count(1).await?>before+2)}).await?;
         fixture.servers[0]=fixture.start_server(0)?;

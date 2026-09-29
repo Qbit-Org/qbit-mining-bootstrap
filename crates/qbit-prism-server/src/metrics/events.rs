@@ -96,6 +96,13 @@ impl Metrics {
                 Labels::One(("decision", decision.as_str())),
             );
     }
+    /// #574: one block-bearing submission answered at its acknowledgement cap.
+    pub fn record_block_ack_capped(&self, path: BlockAckPath) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::BlockAckCapped, Labels::One(("path", path.as_str())));
+    }
     /// #529: one found block's standby flush wait, ended just before its offer.
     pub fn record_offer_standby_wait(&self, outcome: StandbyWaitOutcome) {
         self.inner

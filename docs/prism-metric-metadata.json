@@ -19,6 +19,12 @@
       },
       "status": "#478 block capture. `offered`: the block's positive as-issued float (the most debt its confirmation can create, in any order) was within `PRISM_CAPTURE_OVERPAY_CEILING_BPS` of the coinbase value, and the block was reserved for its one offer, decided in the reservation's transaction. `abandoned_ceiling`: the float exceeded the ceiling and the pending block was abandoned; the WARN log names the bound and the ceiling, and `qbit_prism_payout_divergences` keeps both. `abandoned_disabled`: the ceiling is 0, so the block was abandoned as before #478 (recorded as decision `disabled`). The miner of an abandoned capture is answered `stale-job`, never `ledger-confirmation-failed`. A bound that cannot be computed abandons nothing: the offer fails and is retried. Process-local; every series starts at zero. No firing rule."
     },
+    "block_proof_ack_capped_total": {
+      "labels": {
+        "path": "BlockAckPath"
+      },
+      "status": "Counted once per block-bearing submission whose acknowledgement reached its cap before its outcome was known (#574). The cap is `block_only_ack_timeout`, which is `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` itself (15 s by default; it was at least 60 s before #574), measured from the same instant as the share commit deadline. `block_only`: a captured (#478) or below-target block proof whose deferred share waits for its own frontend's landing, or its candidate enqueue, past the cap. `share`: a share-pass append carrying a found block that had not committed by the cap; it is never refused, so it runs on. Either is answered `ledger-outcome-unknown` (Stratum error 20, \"share outcome is not yet known\"), the same reply as any share still pending at its deadline, so it also counts in `qbit_prism_rejections_total{reason_id=\"ledger-outcome-unknown\"}` and feeds PrismShareAppendFailures; the WARN log names the block hash, share id, phase and elapsed_ms. Only the wait ends at the cap: the block is still offered and landed, and its share is credited once when the append or landing commits. A candidate-existence probe that runs out the cap before the enqueue is a definite `ledger-confirmation-failed` and is not counted. Process-local; both series start at zero. No firing rule of its own."
+    },
     "block_offer_standby_wait_total": {
       "labels": {
         "outcome": "StandbyWaitOutcome"

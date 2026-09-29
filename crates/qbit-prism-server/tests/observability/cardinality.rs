@@ -5,10 +5,10 @@ use super::{
 use qbit_prism_server::{
     api::router,
     metrics::{
-        AckResult, CaptureDecision, Collector, ConnectionRefusalReason, DatabaseMetrics,
-        DeliveryMetrics, LockKind, Metrics, NodeObservation, Outcome, ProcessMetrics,
-        RefreshAcquisition, RefreshTrigger, RejectReason, StaleJobCause, StandbyWaitOutcome,
-        TaskKind, WindowAcquisition,
+        AckResult, BlockAckPath, CaptureDecision, Collector, ConnectionRefusalReason,
+        DatabaseMetrics, DeliveryMetrics, LockKind, Metrics, NodeObservation, Outcome,
+        ProcessMetrics, RefreshAcquisition, RefreshTrigger, RejectReason, StaleJobCause,
+        StandbyWaitOutcome, TaskKind, WindowAcquisition,
     },
     stratum::StratumStats,
 };
@@ -29,8 +29,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 66);
-    assert_eq!(startup_census.series.len(), 249);
+    assert_eq!(startup_census.families.len(), 67);
+    assert_eq!(startup_census.series.len(), 251);
     assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
     assert_eq!(
         sample(&startup, "qbit_prism_node_observation_age_seconds"),
@@ -74,6 +74,9 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         }
         for decision in CaptureDecision::ALL {
             metrics.record_capture_decision(*decision);
+        }
+        for path in BlockAckPath::ALL {
+            metrics.record_block_ack_capped(*path);
         }
         for outcome in StandbyWaitOutcome::ALL {
             metrics.record_offer_standby_wait(*outcome);
@@ -142,8 +145,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 66);
-        assert_eq!(populated.series.len(), 684);
+        assert_eq!(populated.families.len(), 67);
+        assert_eq!(populated.series.len(), 686);
         assert_eq!(
             sample(&body, "qbit_prism_node_peers"),
             if known {
