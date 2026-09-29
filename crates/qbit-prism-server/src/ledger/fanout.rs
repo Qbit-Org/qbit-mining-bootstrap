@@ -21,6 +21,19 @@ impl Ledger {
         Ok(())
     }
 
+    /// Hand back a claim whose completion failed to persist, as its expiry
+    /// would, without recording an attempt (#569). Only the holder's token
+    /// matches: a completion that did commit, or a claim another instance
+    /// already took over, is left alone. Returns whether a claim was released.
+    pub async fn release_fanout_claim(&self, claim: &FanoutClaim) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        let released = sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2")
+            .bind(&claim.fanout_txid).bind(&claim.claim_token).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(released == 1)
+    }
+
     pub async fn record_fanout_scan(
         &self,
         claim: &FanoutClaim,

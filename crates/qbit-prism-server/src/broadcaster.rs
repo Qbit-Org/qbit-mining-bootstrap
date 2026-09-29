@@ -75,10 +75,21 @@ pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
         .await;
         let finished = match outcome {
             Ok(Ok((status, result))) => {
-                coordinator
+                let finished = coordinator
                     .ledger
                     .finish_fanout(&claim, status, Some(result), None)
-                    .await
+                    .await;
+                // #569: a completion refused after a good attempt, such as a
+                // landing that moved the payout revision, must not hold the
+                // claim for its whole lease. Releasing is an early expiry: the
+                // next claim re-verifies the chain from scratch, and anything
+                // this attempt sent is already known to the node.
+                if finished.is_err() {
+                    if let Err(release) = coordinator.ledger.release_fanout_claim(&claim).await {
+                        tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release deferred");
+                    }
+                }
+                finished
             }
             result => {
                 let error = match result {

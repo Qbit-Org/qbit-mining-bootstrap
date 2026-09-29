@@ -214,6 +214,7 @@
     "ledger/difficulty.rs::prune_worker_difficulties#1::self .begin()": [1,"ledger"],
     "ledger/difficulty.rs::share_accepted_at_ms#1::self .acquire()": [1,"ledger"],
     "ledger/fanout.rs::renew_fanout_claim#1::self .begin()": [1,"ledger"],
+    "ledger/fanout.rs::release_fanout_claim#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::record_fanout_scan#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::observe_fanout#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::halt_fanout_reorg#1::self .begin()": [1,"ledger"],
