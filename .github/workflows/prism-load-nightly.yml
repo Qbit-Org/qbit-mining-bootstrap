@@ -321,10 +321,11 @@ jobs:
           PRESET: ${{ matrix.preset }}
           RUNNER_LABEL: ${{ matrix.runner }}
         run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
-      # prism-load-run.sh writes gate.md only once the gate has read the
-      # harness's result, pass or fail. The report job records a nightly's
-      # commit as tested only if every planned preset left this marker, so a
-      # setup or runner failure before the gate is retried the next night.
+      # prism-load-run.sh writes gate-exit-code after the gate returns; 0
+      # (pass) or 1 (fail) is a verdict on the harness's result. The report
+      # job records a nightly's commit as tested only if every planned preset
+      # left this marker, so a setup or runner failure, or a gate that could
+      # not read its inputs or did not run, is retried the next night.
       - name: Mark the preset as gated
         if: ${{ !cancelled() }}
         env:
@@ -332,7 +333,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/gated"
-          if [[ -f "${RUNNER_TEMP}/prism-load-out/gate.md" ]]; then
+          code="$(cat "${RUNNER_TEMP}/prism-load-out/gate-exit-code" 2>/dev/null || true)"
+          if [[ "${code}" == 0 || "${code}" == 1 ]]; then
             touch "${RUNNER_TEMP}/gated/${PRESET}"
           fi
       - name: Upload the gated marker

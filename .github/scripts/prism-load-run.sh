@@ -22,6 +22,8 @@
 #                            the harness builds its cluster on
 #   harness-exit-code        the harness's exit code
 #   gate.md                  the gate's verdict table
+#   gate-exit-code           the gate's exit code: 0 or 1 is a verdict, anything
+#                            else (2, a panic, a binary that would not start) is not
 #   everything the harness writes (load-harness-report.json, logs/, ...)
 #
 # Optional overrides of the preset's gates: PRISM_LOAD_MAX_SHORTFALL and
@@ -92,6 +94,7 @@ set +e
 "${gate[@]}" > "${out}/gate.md"
 status=$?
 set -e
+echo "${status}" > "${out}/gate-exit-code"
 cat "${out}/gate.md"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
