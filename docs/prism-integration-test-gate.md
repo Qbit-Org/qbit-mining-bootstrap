@@ -54,6 +54,17 @@ such as the full-size ratchet and baseline sweep in `jsonb_ceiling_gate`, stay
 130-recipient nightly case of `live_regtest`'s weighted-recipient module is
 opt-in the same way until a nightly job selects it.
 
+The nightly `live-nightly` job in `prism-load-nightly.yml` runs the
+`live_regtest` `#[ignore]` variants listed in
+[test/prism-nightly-gated-tests.txt](../test/prism-nightly-gated-tests.txt)
+with `--ignored --exact`, and proves each executed with the same checker. Two
+of them need host tools besides the gate's inputs, found on `PATH` and failing
+the test when absent: the disk-exhaustion variant (#575) mounts a small ext4
+image without root, so it needs `fuse2fs`, `mkfs.ext4`, `fusermount3` and
+`/dev/fuse`; the clock-jump variant runs the servers and its own PostgreSQL
+under libfaketime, found next to the `faketime` wrapper (the `faketime` and
+`libfaketime` packages). Its private clusters use `PRISM_TEST_PG_BIN_DIR`.
+
 The table is a pure function, `qbit_prism_test_gate::decide`, over injected
 values, with unit tests for every row in the crate itself.
 

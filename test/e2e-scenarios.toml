@@ -312,6 +312,37 @@ criteria = "As scenario 7, at the mainnet-floor recipient shape."
 runs = true
 tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::nightly_mainnet_floor_weighted_recipients_share_to_spend"]
 
+# #575's pre-release gaps on a real node: resource exhaustion (item 5) and
+# the replay of recorded Stratum transcripts (item 3's automatable half).
+
+[[scenario]]
+id = "b575-5-postgres-disk-full"
+title = "#575 item 5: PostgreSQL's data volume fills under mining and is freed"
+owner = "#575"
+lanes = ["nightly"]
+criteria = "Every acknowledged share is durable; the full state is refused explicitly and a paging rule's condition holds for its `for` on every server; once space is freed the same server processes accept shares and land a block with clean carry integrity."
+runs = true
+tests = ["qbit-prism-server::live_regtest::disk_exhaustion_tests::postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_freed"]
+
+[[scenario]]
+id = "b575-5-wall-clock-jumps"
+title = "#575 item 5: server and database wall clocks jump minutes and hours, including mid-landing"
+owner = "#575"
+lanes = ["nightly"]
+criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; the one outbox row #581 tracks is the only unfinished one."
+runs = true
+tests = ["qbit-prism-server::live_regtest::clock_jump_tests::wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_once"]
+
+[[scenario]]
+id = "b575-3-stratum-transcript-replay"
+title = "#575 item 3: recorded Stratum client transcripts replayed against a live server"
+owner = "#575"
+lanes = ["pr"]
+criteria = "Every replayed request of every corpus transcript gets an answer the recorded client accepts, every notification has the shape miners parse, and every accepted replayed share is in the ledger."
+runs = true
+tests = ["qbit-prism-server::live_regtest::transcript_replay_tests::recorded_stratum_transcripts_replay_compatibly_against_a_live_server"]
+unit_tests = ["crates/qbit-prism-server/tests/support/live_transcript_replay.rs::stratum_transcript_corpus_is_well_formed_and_labelled"]
+
 # The load-harness presets #521 item 6 runs (fake node). Each preset states
 # its own gates; #549 turns the nightly set into L2 with repeats and a trend.
 

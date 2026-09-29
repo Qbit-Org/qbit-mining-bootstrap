@@ -1,0 +1,13 @@
+{"transcript":{"name":"bmminer-version-rolling","source":"synthetic","dialect":"bmminer (Antminer) with version rolling: mining.configure before subscribe, BIP 310 mask 1fffe000 and min-bit-count 2, six-field submits carrying the rolled version bits","notes":"Synthetic: written from BIP 310 and the bmminer/cgminer ASICBoost conventions, not captured from a device."}}
+{"direction":"c2s","timestamp":0.0,"message":{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]}}
+{"direction":"s2c","timestamp":0.038,"message":{"id":1,"result":{"version-rolling":true,"version-rolling.mask":"1fffe000"},"error":null}}
+{"direction":"c2s","timestamp":0.041,"message":{"id":2,"method":"mining.subscribe","params":["bmminer/2.0.0"]}}
+{"direction":"s2c","timestamp":0.077,"message":{"id":2,"result":[[["mining.set_difficulty","b4b6693b72a50c7116db18d6497cac52"],["mining.notify","ae6812eb4cd7735a302a8a9dd95cf71f"]],"0800000a",4],"error":null}}
+{"direction":"c2s","timestamp":0.079,"message":{"id":3,"method":"mining.authorize","params":["bc1qsyntheticpayoutaddress0000000000000000.rig1","123"]}}
+{"direction":"s2c","timestamp":0.119,"message":{"id":3,"result":true,"error":null}}
+{"direction":"s2c","timestamp":0.12,"message":{"id":null,"method":"mining.set_difficulty","params":[65536]}}
+{"direction":"s2c","timestamp":0.121,"message":{"id":null,"method":"mining.notify","params":["5b01","4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6c0440b921e00000000","01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008","072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000",[],"20000000","1d00ffff","66f9b0c1",true]}}
+{"direction":"c2s","timestamp":0.935,"message":{"id":4,"method":"mining.submit","params":["bc1qsyntheticpayoutaddress0000000000000000.rig1","5b01","00000000","66f9b0c1","5c3e19a0","00002000"]}}
+{"direction":"s2c","timestamp":0.962,"message":{"id":4,"result":true,"error":null}}
+{"direction":"c2s","timestamp":1.484,"message":{"id":5,"method":"mining.submit","params":["bc1qsyntheticpayoutaddress0000000000000000.rig1","5b01","00000001","66f9b0c1","0a7b44c2","00006000"]}}
+{"direction":"s2c","timestamp":1.513,"message":{"id":5,"result":true,"error":null}}

@@ -48,6 +48,27 @@ mod dense_soak_tests;
 #[path = "support/pool_fee.rs"]
 mod pool_fee;
 
+#[path = "support/live_share_client.rs"]
+mod share_client;
+
+#[path = "support/live_private_postgres.rs"]
+mod private_postgres;
+
+#[path = "support/disk_full_injector.rs"]
+mod disk_full_injector;
+
+#[path = "support/live_alert_rules.rs"]
+mod alert_rules;
+
+#[path = "support/live_disk_exhaustion.rs"]
+mod disk_exhaustion_tests;
+
+#[path = "support/live_clock_jump.rs"]
+mod clock_jump_tests;
+
+#[path = "support/live_transcript_replay.rs"]
+mod transcript_replay_tests;
+
 /// The payout policy of the 0-bps fee every live server runs unless a case
 /// sets its own (#535). An in-process coordinator sharing a fixture's cluster
 /// must pin it, or its configuration fingerprint differs from the servers'.
