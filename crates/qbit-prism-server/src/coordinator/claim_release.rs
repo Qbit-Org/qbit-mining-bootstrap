@@ -29,6 +29,12 @@ use super::*;
 /// the lease's heartbeat interval when that is shorter.
 const RETRY_SPACING: Duration = Duration::from_secs(1);
 
+/// Everything the submit loop does after a shutdown signal (an offer in
+/// flight, #578; the hand-back, #573; the deferred releases) finishes
+/// within this. The server joins its tasks for 30 s; this leaves room for
+/// one bounded retry already running when the signal came.
+pub(super) const SHUTDOWN_BUDGET: Duration = Duration::from_secs(20);
+
 /// The local instant a claim's heartbeat treats as its lease's end: the
 /// start of the last renewal (or of the claim) plus the lease, which is never
 /// later than the database's own expiry.
@@ -104,10 +110,10 @@ impl Attempt {
     /// does: exactly what it would do after the expiry. Fenced on the token
     /// and on an unfinished state, so a terminal commit that won the race is
     /// left alone. A failed release falls back to the expiry.
-    pub(super) async fn hand_back_at_shutdown(self, ledger: &Ledger, lease: CandidateLease) {
+    pub(super) async fn hand_back_at_shutdown(self, ledger: &Ledger, budget: Duration) {
         let block = &self.claim.candidate.block_hash;
         match tokio::time::timeout(
-            lease.timeout,
+            budget,
             ledger.release_recovery_claim(&self.claim, "claim released at shutdown"),
         )
         .await
@@ -135,19 +141,25 @@ impl FailedAttempt {
     }
 
     /// The bound of one release attempt: the lease's own, and never past
-    /// the lease's local end.
-    fn budget(&self, lease: CandidateLease) -> Duration {
-        lease.timeout.min(
-            self.lease_end
-                .saturating_duration_since(tokio::time::Instant::now()),
-        )
+    /// the lease's local end or the loop's stop.
+    fn budget(&self, lease: CandidateLease, stop_by: Option<tokio::time::Instant>) -> Duration {
+        let now = tokio::time::Instant::now();
+        let bound = lease
+            .timeout
+            .min(self.lease_end.saturating_duration_since(now));
+        stop_by.map_or(bound, |stop| bound.min(stop.saturating_duration_since(now)))
     }
 
     /// One bounded release: `Ok(true)` released, `Ok(false)` no longer held
     /// by this claim, an error when the database did not answer in time.
-    async fn try_release(&self, ledger: &Ledger, lease: CandidateLease) -> Result<bool> {
+    async fn try_release(
+        &self,
+        ledger: &Ledger,
+        lease: CandidateLease,
+        stop_by: Option<tokio::time::Instant>,
+    ) -> Result<bool> {
         tokio::time::timeout(
-            self.budget(lease),
+            self.budget(lease, stop_by),
             ledger.release_candidate_claim(&self.claim, &self.reason),
         )
         .await
@@ -161,9 +173,10 @@ impl FailedAttempt {
         &self,
         ledger: &Ledger,
         lease: CandidateLease,
+        stop_by: Option<tokio::time::Instant>,
     ) -> Result<bool> {
         tokio::time::timeout(
-            self.budget(lease),
+            self.budget(lease, stop_by),
             ledger.release_recovery_claim(&self.claim, &self.reason),
         )
         .await
@@ -178,7 +191,12 @@ struct Deferred {
 
 /// The failed attempts whose claims this loop has not managed to release.
 #[derive(Default)]
-pub(super) struct Unreleased(Vec<Deferred>);
+pub(super) struct Unreleased {
+    deferred: Vec<Deferred>,
+    /// Set once the loop is stopping: nothing it does after the shutdown
+    /// signal runs past this.
+    stop_by: Option<tokio::time::Instant>,
+}
 
 impl Unreleased {
     /// Release a failed attempt's claim now, and defer it when the database
@@ -189,7 +207,7 @@ impl Unreleased {
         failed: Box<FailedAttempt>,
         lease: CandidateLease,
     ) {
-        match failed.try_release(ledger, lease).await {
+        match failed.try_release(ledger, lease, self.stop_by).await {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
                 block = %failed.block(),
@@ -202,7 +220,7 @@ impl Unreleased {
                     lease_remaining_ms = failed.lease_remaining_ms(),
                     "candidate claim release deferred: retrying until the database answers or the lease ends"
                 );
-                self.0.push(Deferred {
+                self.deferred.push(Deferred {
                     failed,
                     next_try: tokio::time::Instant::now() + lease.interval.min(RETRY_SPACING),
                 });
@@ -215,7 +233,7 @@ impl Unreleased {
     /// one bounded attempt.
     pub(super) async fn retry_one(&mut self, ledger: &Ledger, lease: CandidateLease) {
         let now = tokio::time::Instant::now();
-        self.0.retain(|deferred| {
+        self.deferred.retain(|deferred| {
             let live = now < deferred.failed.lease_end;
             if !live {
                 tracing::warn!(
@@ -225,12 +243,20 @@ impl Unreleased {
             }
             live
         });
-        let Some(index) = self.0.iter().position(|deferred| deferred.next_try <= now) else {
+        let Some(index) = self
+            .deferred
+            .iter()
+            .position(|deferred| deferred.next_try <= now)
+        else {
             return;
         };
-        match self.0[index].failed.try_release(ledger, lease).await {
+        match self.deferred[index]
+            .failed
+            .try_release(ledger, lease, self.stop_by)
+            .await
+        {
             Ok(released) => {
-                let deferred = self.0.remove(index);
+                let deferred = self.deferred.remove(index);
                 if released {
                     tracing::warn!(
                         block = %deferred.failed.block(),
@@ -245,11 +271,19 @@ impl Unreleased {
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, block = %self.0[index].failed.block(), "deferred candidate claim release failed; retrying");
-                self.0[index].next_try =
+                tracing::debug!(%error, block = %self.deferred[index].failed.block(), "deferred candidate claim release failed; retrying");
+                self.deferred[index].next_try =
                     tokio::time::Instant::now() + lease.interval.min(RETRY_SPACING);
             }
         }
+    }
+
+    /// The loop is stopping: the instant, fixed by the first call, that
+    /// everything it still does must finish by ([`SHUTDOWN_BUDGET`]).
+    pub(super) fn stop_deadline(&mut self) -> tokio::time::Instant {
+        *self
+            .stop_by
+            .get_or_insert_with(|| tokio::time::Instant::now() + SHUTDOWN_BUDGET)
     }
 
     /// Wait until the next deferred release is due, or its lease ends, and
@@ -257,7 +291,7 @@ impl Unreleased {
     /// deferred.
     pub(super) async fn retry_when_due(&mut self, ledger: &Ledger, lease: CandidateLease) {
         let Some(due) = self
-            .0
+            .deferred
             .iter()
             .map(|deferred| deferred.next_try.min(deferred.failed.lease_end))
             .min()
@@ -271,13 +305,14 @@ impl Unreleased {
     /// At shutdown, one bounded attempt for each deferred release whose lease
     /// has not ended; whatever is left waits for its lease.
     pub(super) async fn release_at_shutdown(&mut self, ledger: &Ledger, lease: CandidateLease) {
-        for deferred in self.0.drain(..) {
+        let stop_by = Some(self.stop_deadline());
+        for deferred in self.deferred.drain(..) {
             let failed = deferred.failed;
             if tokio::time::Instant::now() >= failed.lease_end {
                 tracing::warn!(block = %failed.block(), "deferred candidate claim release expired with its lease at shutdown");
                 continue;
             }
-            match failed.try_release_at_shutdown(ledger, lease).await {
+            match failed.try_release_at_shutdown(ledger, lease, stop_by).await {
                 Ok(true) => tracing::warn!(
                     block = %failed.block(),
                     "deferred candidate claim release succeeded at shutdown"

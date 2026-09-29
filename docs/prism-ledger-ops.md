@@ -634,8 +634,12 @@ with the old primary still waits for its 120 s lease.
 until the node's answer is recorded (or an unsent reservation is returned to
 `pending`), a graceful shutdown does not drop the attempt: the submit loop
 keeps driving it, bounded by the send's deadline, the standby wait's bound
-and the lease's bound for the reservation and the recording, and logs
-`shutdown waits for a found block's offer in flight`. Only then does it stop;
+and the lease's bound for each of the reservation, the renewal before the
+send and the recording, and logs `shutdown waits for a found block's offer
+in flight`. Everything the submit loop does after the shutdown signal
+(this wait, handing back its claim and the deferred releases) finishes
+within 20 s, inside the server's 30 s shutdown, and no new row is claimed
+once the signal arrived. Only then does it stop;
 the landing that follows is left to the next claim, which lands the `offered`
 row without another offer. Without this, a restart between the reservation
 and the call left an `offer_reserved` row that was never sent and is never

@@ -51,8 +51,8 @@ impl OfferSections {
 impl Coordinator {
     /// How long a shutdown waits for an open offer section: the send's own
     /// deadline, the standby wait's bound, and the lease's bound each for
-    /// the reservation and the recording. The server's shutdown gives every
-    /// task 30 s.
+    /// the reservation, the strictly-live renewal before the send and the
+    /// recording. The submit loop caps it by its shutdown budget.
     pub(super) fn offer_section_bound(&self, lease: CandidateLease) -> Duration {
         self.config.block_submit_timeout
             + self
@@ -60,7 +60,7 @@ impl Coordinator {
                 .offer_standby
                 .as_ref()
                 .map_or(Duration::ZERO, |wait| wait.bound)
-            + lease.timeout * 2
+            + lease.timeout * 3
     }
 
     /// At shutdown: when `attempt` is inside its offer section, keep driving

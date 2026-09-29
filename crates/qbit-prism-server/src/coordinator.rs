@@ -2647,6 +2647,10 @@ impl Coordinator {
         'claims: loop {
             tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
             unreleased.retry_one(&self.ledger, lease).await;
+            // A shutdown signalled meanwhile claims nothing new.
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
+            }
             let claimed_at = tokio::time::Instant::now();
             match self.ledger.claim_candidate(lease.seconds).await {
                 Ok(Some(claim)) => {
@@ -2660,7 +2664,10 @@ impl Coordinator {
                                 _ = shutdown.changed() => {
                                     // #578: an offer in flight is sent and
                                     // recorded before the attempt is dropped.
-                                    let bound = self.offer_section_bound(lease);
+                                    let left = unreleased
+                                        .stop_deadline()
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    let bound = self.offer_section_bound(lease).min(left);
                                     let finished =
                                         self.finish_offer_section(running.as_mut(), bound).await;
                                     break (finished, true);
@@ -2680,7 +2687,14 @@ impl Coordinator {
                                 .await
                         }
                         // #573: dropped mid-attempt by the shutdown.
-                        None => attempt.hand_back_at_shutdown(&self.ledger, lease).await,
+                        None => {
+                            let left = unreleased
+                                .stop_deadline()
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            attempt
+                                .hand_back_at_shutdown(&self.ledger, lease.timeout.min(left))
+                                .await
+                        }
                     }
                     if stopping {
                         break 'claims;
