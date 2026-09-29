@@ -30,6 +30,9 @@ mod cpfp_tests;
 #[path = "support/live_pg_failover.rs"]
 mod pg_failover_tests;
 
+#[path = "support/live_migration_lifecycle.rs"]
+mod migration_lifecycle_tests;
+
 #[path = "support/live_node_outage.rs"]
 mod node_outage_tests;
 
@@ -359,6 +362,19 @@ impl Fixture {
             return Ok(None);
         };
         let database = database.unwrap_or(&default_database);
+        Self::open_with_inputs(qbitd, database, ctv, start_servers)
+            .await
+            .map(Some)
+    }
+
+    /// Opens a fixture on inputs the caller has already taken through the
+    /// gate, for a case that needs an input beyond `qbitd` and the database.
+    async fn open_with_inputs(
+        qbitd: String,
+        database: &str,
+        ctv: bool,
+        start_servers: bool,
+    ) -> Result<Self> {
         let launch = Launch {
             qbitd,
             server: env!("CARGO_BIN_EXE_qbit-prism-server").into(),
@@ -370,7 +386,7 @@ impl Fixture {
             ..Startup::default()
         };
         let result = Self::start(database, launch, &mut startup).await;
-        startup.finish(result).map(Some)
+        startup.finish(result)
     }
 
     async fn start(database: &str, launch: Launch, startup: &mut Startup) -> Result<()> {
@@ -523,6 +539,25 @@ impl Fixture {
         fee: Option<u64>,
         overrides: &[(&str, String)],
     ) -> Result<Process> {
+        let mut command = self.server_command(index, fee, overrides);
+        // Release only this child's ports immediately before spawn. Later
+        // servers remain reserved through node startup and migrations.
+        self.ports
+            .release(&[self.stratum[index], self.highdiff[index], self.api[index]]);
+        Process::spawn(
+            &mut command,
+            self.directory.path().join(format!("server-{index}.log")),
+        )
+    }
+
+    /// The command and environment server `index` is started with, so an
+    /// operator subcommand can run with exactly the settings a frontend has.
+    fn server_command(
+        &self,
+        index: usize,
+        fee: Option<u64>,
+        overrides: &[(&str, String)],
+    ) -> Command {
         let mut command = Command::new(&self.server);
         // Inherited operator PRISM settings must not alter a disposable test.
         for (name, _) in std::env::vars()
@@ -578,14 +613,7 @@ impl Fixture {
         for (name, value) in overrides {
             command.env(name, value);
         }
-        // Release only this child's ports immediately before spawn. Later
-        // servers remain reserved through node startup and migrations.
-        self.ports
-            .release(&[self.stratum[index], self.highdiff[index], self.api[index]]);
-        Process::spawn(
-            &mut command,
-            self.directory.path().join(format!("server-{index}.log")),
-        )
+        command
     }
 
     fn start_miner(&mut self, index: usize) -> Result<()> {
