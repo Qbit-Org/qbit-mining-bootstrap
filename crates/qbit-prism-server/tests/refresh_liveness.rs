@@ -11,6 +11,7 @@ use qbit_prism_server::{
     stratum::MiningBackend,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet, time::timeout};
 
@@ -647,18 +648,100 @@ async fn ctv_chunk_metrics_count_an_attempt_whose_completion_failed_to_persist()
             )
             .fetch_one(f.pool())
             .await?;
+            // #569: the aborted completion hands its claim back rather than
+            // fencing the row until it expires, so a later pass finishes all.
             ensure!(
-                fenced == 1,
+                fenced == 0,
                 "aborted completion left {fenced} fenced claims"
             );
-            // The fenced row waits for its claim to expire; the rest finish now.
             let later = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
             ensure!(
-                later == count - 1,
-                "later pass finished {later} of {} unclaimed rows",
-                count - 1
+                later == count,
+                "later pass finished {later} of {count} rows"
             );
-            ensure!(metric(&f.a.metrics.render(), "chunk_rows_count")? == count as f64);
+            ensure!(metric(&f.a.metrics.render(), "chunk_rows_count")? == (count + 1) as f64);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #569: a landing between a successful attempt and its completion moves the
+/// payout revision, so the completion is refused. The claim must not stay
+/// held for its 120-second lease: the fanout is claimable at once, with no
+/// attempt recorded, and the next pass settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctv_releases_the_claim_when_a_revision_bump_refuses_a_successful_attempt() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f).await?;
+            // The attempt has read its chain view and payout revision when it
+            // re-checks the tip; hold it there.
+            let mut held = f.node.pause_next("getbestblockhash")?;
+            let a = f.a.clone();
+            let pass = tokio::spawn(async move { broadcaster::run_once(&a).await });
+            timeout(BOUND, held.entered()).await??;
+            let fanout: String = sqlx::query_scalar(
+                "SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE claim_token IS NOT NULL",
+            )
+            .fetch_one(f.pool())
+            .await?;
+            sqlx::query(
+                "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton",
+            )
+            .execute(f.pool())
+            .await?;
+            held.release();
+            let error = timeout(BOUND, pass)
+                .await??
+                .err()
+                .context("a completion at a moved revision reported success")?;
+            ensure!(
+                format!("{error:#}").contains("payout revision changed"),
+                "completion failed for another reason: {error:#}"
+            );
+            let row = sqlx::query("SELECT claim_token IS NULL AND claim_instance_id IS NULL AND claim_expires_at IS NULL AS released,broadcast_attempt_count,next_broadcast_attempt_at IS NULL AS due FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
+                .bind(&fanout).fetch_one(f.pool()).await?;
+            ensure!(
+                row.try_get::<bool, _>("released")?,
+                "the refused completion left its claim held"
+            );
+            ensure!(
+                row.try_get::<i64, _>("broadcast_attempt_count")? == 0
+                    && row.try_get::<bool, _>("due")?,
+                "releasing the claim recorded an attempt or deferred the recheck"
+            );
+            // Claimable at once: the next pass settles every row, this one too.
+            let later = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
+            ensure!(later == count, "later pass settled {later} of {count} rows");
+            let settled: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND claim_token IS NULL AND next_broadcast_attempt_at IS NOT NULL")
+                .fetch_one(f.pool()).await?;
+            ensure!(
+                settled == count as i64,
+                "{settled} of {count} fanouts ended confirmed and unclaimed"
+            );
+            // The release is fenced by the holder's token: a late release of an
+            // expired claim leaves the frontend that took it over alone.
+            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at=NULL")
+                .execute(f.pool())
+                .await?;
+            let stale = f.a.ledger.claim_fanout(120).await?.context("claim")?;
+            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp() WHERE fanout_txid=$1")
+                .bind(&stale.fanout_txid).execute(f.pool()).await?;
+            let taken = f.b.ledger.claim_fanout(120).await?.context("takeover")?;
+            ensure!(
+                taken.fanout_txid == stale.fanout_txid,
+                "fixture took over another row"
+            );
+            ensure!(
+                !f.a.ledger.release_fanout_claim(&stale).await?,
+                "a stale token released another frontend's claim"
+            );
+            ensure!(
+                f.b.ledger.release_fanout_claim(&taken).await?,
+                "the holder could not release its own claim"
+            );
             Ok(())
         })
     })
