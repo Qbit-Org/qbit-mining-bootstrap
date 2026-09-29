@@ -5,3 +5,4 @@
 # the prism-native-postgres PR job nor live-nightly runs these; the job proves
 # each executed with scripts/check_gate_manifest.py (#487 L4).
 qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation
+qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation

@@ -27,8 +27,9 @@ name: PRISM load harness (nightly)
 #
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
-# today #545's 2.x.x migration lifecycle. The weekly schedule runs only that
-# job; the nightly jobs keep their own schedule.
+# today #545's 2.x.x migration lifecycle and #575's measured cutover of a
+# mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
+# nightly jobs keep their own schedule.
 #
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
@@ -304,7 +305,13 @@ jobs:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    # #575's scenario writes mainnet's 13,566 blocks and 4.1M of its 65.5M
+    # share rows (1x at 1/16), keeps two copies of that ledger (about 15 GB)
+    # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
+    # of the rows on a 22-core host in release, and its row-proportional
+    # phases put 1/16 near 20 minutes there, so the job builds in release and
+    # allows two hours.
+    timeout-minutes: 120
     services:
       postgres:
         image: postgres:16
@@ -351,7 +358,7 @@ jobs:
           set -euo pipefail
           mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-weekly-gated-tests.txt \
             | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
-          cargo test --locked -p qbit-prism-server --test live_regtest -- \
+          cargo test --locked --release -p qbit-prism-server --test live_regtest -- \
             --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
       - name: Prove every listed scenario executed
         run: |
