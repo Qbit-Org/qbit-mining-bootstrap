@@ -99,10 +99,13 @@ async fn weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation() 
     result.and(cleanup).and(closed)
 }
 
-/// #575: the share density of the weekly mainnet-shaped ledger. At 1/16 it
-/// holds about 4.1M of mainnet's 65.5M shares, each carrying 16 times a
+/// #575: the share density of the weekly mainnet-shaped ledger. At 1/32 it
+/// holds about 2.05M of mainnet's 65.5M shares, each carrying 32 times a
 /// share's difficulty; every block, address and payout row is mainnet's.
-const WEEKLY_DENSITY: f64 = 1.0 / 16.0;
+/// 1/32 rather than 1/16 until #582 lands: at 4.13M rows 002's backfill
+/// alone took 321 s of the 600 s statement-timeout cap on a 22-core host, too
+/// close for a slower runner. Return to 1/16 once `migrate` runs on defaults.
+const WEEKLY_DENSITY: f64 = 1.0 / 32.0;
 /// The statement timeout the weekly cutover's `migrate` runs with, the
 /// highest the server accepts. At the default 15 s, 002's share-hash
 /// backfill, one statement inside the migration transaction, times out on
@@ -110,9 +113,9 @@ const WEEKLY_DENSITY: f64 = 1.0 / 16.0;
 const WEEKLY_STATEMENT_TIMEOUT_MS: &str = "600000";
 /// From this many ledger rows, 002's backfill outlasts the default 15 s
 /// statement timeout with a wide margin whatever the runner (#582: 26-38 s
-/// at 1.03M rows and 321 s at 4.13M on a 22-core host), so the weekly 1x/16
-/// ledger checks it and a smaller local run does not.
-const KNOWN_582_ROWS: u64 = 2_000_000;
+/// at 1.03M rows and 321 s at 4.13M on a 22-core host), so the weekly 1x/32
+/// ledger (about 2.05M rows) checks it and a smaller local run does not.
+const KNOWN_582_ROWS: u64 = 1_500_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "weekly: #575's mainnet-shaped 2.x.x ledger through the measured cutover, mining and rollback; run with --ignored"]
