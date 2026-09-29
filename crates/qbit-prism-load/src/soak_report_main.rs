@@ -63,10 +63,6 @@ struct Args {
     /// Take one sample, write the report and exit with the verdict.
     #[arg(long)]
     once: bool,
-    /// Seconds before the soak's start that committed shares are counted
-    /// from, covering the lag of the first sample's Prometheus scrape.
-    #[arg(long, default_value_t = 120.0)]
-    scrape_slack_seconds: f64,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -86,10 +82,6 @@ async fn run(args: &Args) -> Result<bool> {
     ensure!(
         args.interval_seconds >= 60,
         "--interval-seconds must be at least 60"
-    );
-    ensure!(
-        args.scrape_slack_seconds.is_finite() && args.scrape_slack_seconds >= 0.0,
-        "--scrape-slack-seconds must be finite and not negative"
     );
     let gates = match &args.gates {
         Some(path) => Gates::load(path)?,
@@ -278,38 +270,65 @@ async fn take_sample(
         }
         Err(error) => unknown_everywhere.push(format!("open_fds: {error:#}")),
     }
-    // The acknowledged-share counter, raw: its resets are the processes'
-    // restarts, which also number their lifetimes (in `pid`, as the PID
-    // itself is not exported).
-    let mut acked_delta: Option<u64> = Some(0);
-    match query(
-        http,
-        base,
-        &format!(
-            "qbit_prism_accepted_shares_total{}",
-            matchers(&args.selector, "")
-        ),
-    )
-    .await
-    {
-        Ok(rows) => {
-            for (labels, value) in rows {
-                let instance = labels.get(label).cloned().unwrap_or_default();
+    // The acknowledged-share counter, raw, with the time Prometheus scraped
+    // it and whether it reset since the last reading: a reset is a restart,
+    // which also numbers the process's lifetimes (in `pid`, as the PID itself
+    // is not exported).
+    let since = earlier
+        .iter()
+        .rev()
+        .find_map(|s| s.ledger.as_ref()?.committed_through)
+        .map_or(args.interval_seconds as i64, |through| {
+            (at - through).num_seconds().max(60) + 60
+        });
+    let counter = format!(
+        "qbit_prism_accepted_shares_total{}",
+        matchers(&args.selector, "")
+    );
+    let readings = async {
+        let values = query(http, base, &counter).await?;
+        let stamps = query(http, base, &format!("timestamp({counter})")).await?;
+        let resets = query(http, base, &format!("resets({counter}[{since}s])")).await?;
+        let by = |rows: Vec<(BTreeMap<String, String>, f64)>| -> BTreeMap<String, f64> {
+            rows.into_iter()
+                .map(|(labels, value)| (labels.get(label).cloned().unwrap_or_default(), value))
+                .collect()
+        };
+        anyhow::Ok((by(values), by(stamps), by(resets)))
+    }
+    .await;
+    let mut acked_delta: Option<u64> = None;
+    let mut restarts_uncounted = 0u64;
+    let mut read_at: Option<(f64, f64)> = None;
+    match readings {
+        Ok((values, stamps, resets)) => {
+            acked_delta = Some(0);
+            for (instance, value) in values {
                 let point = processes
                     .entry(instance.clone())
                     .or_insert_with(|| note(&instance));
                 let now = value.max(0.0) as u64;
                 point.accepted_total = Some(now);
+                if let Some(stamp) = stamps.get(&instance) {
+                    read_at = Some(read_at.map_or((*stamp, *stamp), |(low, high)| {
+                        (low.min(*stamp), high.max(*stamp))
+                    }));
+                }
+                let reset = resets.get(&instance).is_some_and(|n| *n > 0.0);
                 match last_counter.get(&instance) {
                     // The counter is continuous across samples that missed
                     // it, so the whole stretch is counted.
-                    Some(&(lifetime, then)) if now >= then => {
+                    Some(&(lifetime, then)) if now >= then && !reset => {
                         point.pid = Some(lifetime);
                         acked_delta = acked_delta.map(|sum| sum + (now - then));
                     }
+                    // Restarted: the new process's count is all new, and
+                    // what the old one acknowledged after its last reading
+                    // is not knowable.
                     Some(&(lifetime, _)) => {
                         point.pid = Some(lifetime + 1);
                         acked_delta = acked_delta.map(|sum| sum + now);
+                        restarts_uncounted += 1;
                     }
                     // First seen: its count so far predates the soak.
                     None => {
@@ -318,10 +337,19 @@ async fn take_sample(
                 }
             }
         }
-        Err(error) => {
-            unknown_everywhere.push(format!("accepted_shares_total: {error:#}"));
-            acked_delta = None;
-        }
+        Err(error) => unknown_everywhere.push(format!("accepted_shares_total: {error:#}")),
+    }
+    // A process seen before and missing now is a process gone dark, not one
+    // that left the soak: it stays, every figure unknown.
+    for (instance, lifetime) in &last_lifetime {
+        processes
+            .entry(instance.clone())
+            .or_insert_with(|| ProcessPoint {
+                instance: instance.clone(),
+                pid: Some(*lifetime),
+                unknown: vec!["no series for this process in this sample".into()],
+                ..ProcessPoint::default()
+            });
     }
     for point in processes.values_mut() {
         // A process whose counter this sample could not read stays in the
@@ -369,44 +397,73 @@ async fn take_sample(
         p99_ms: scalar(query(http, base, &quantile(0.99)).await),
     };
     let database = soak::database_point(pool, None).await;
-    // Committed rows are counted per interval, while the interval's rows are
-    // still in the live ledger, and added up: a partition the operator's
-    // retention later detaches or drops takes old rows out of the ledger,
-    // not out of the count. The first interval starts the scrape slack
-    // before the soak does.
-    let counted = earlier.iter().rev().find_map(|s| {
+    // Committed rows are counted per interval, over the span the counter
+    // readings themselves cover: from the previous reading's scrape time to
+    // this one's (the earliest scrape among the processes). Counted while the
+    // interval's rows are still in the live ledger, and added up, so a
+    // partition the operator's retention later removes takes old rows out of
+    // the ledger, not out of the count. The first reading is the baseline.
+    let prior = earlier.iter().rev().find_map(|s| {
         let ledger = s.ledger.as_ref()?;
-        Some((ledger.committed_since_start?, ledger.committed_through?))
+        Some((
+            ledger.acknowledged_since_start?,
+            ledger.committed_since_start?,
+            ledger.committed_through?,
+            ledger.acknowledged_gaps,
+        ))
     });
-    let slack = chrono::Duration::milliseconds((args.scrape_slack_seconds * 1000.0) as i64);
-    let (committed_before, from) = counted.unwrap_or((0, started - slack));
-    let count = |from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>| {
+    let count = |from: f64, to: f64| {
+        let stamp = |seconds: f64| {
+            chrono::DateTime::from_timestamp_millis((seconds * 1000.0) as i64).unwrap_or(at)
+        };
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*)::bigint FROM qbit_share_ledger \
              WHERE accepted AND accepted_at > $1 AND accepted_at <= $2",
         )
-        .bind(from)
-        .bind(to)
+        .bind(stamp(from))
+        .bind(stamp(to))
         .fetch_one(pool)
     };
-    let interval = count(from, at).await.ok().map(|n| n as u64);
-    let committed = interval.map(|n| committed_before + n);
-    let committed_through = if interval.is_some() {
-        Some(at)
-    } else {
-        counted.map(|(_, through)| through)
+    let (mut acknowledged, mut committed, mut through, mut gaps) = match prior {
+        Some((acked, committed, through, gaps)) => {
+            (Some(acked), Some(committed), Some(through), gaps)
+        }
+        None => (Some(0), Some(0), None, 0),
     };
-    let slack_rows = match earlier.first().and_then(|s| s.ledger.as_ref()) {
-        Some(first) => first.tolerance_rows,
-        None => count(started - slack, started).await.ok().map(|n| n as u64),
-    };
-    let prior = earlier.last().and_then(|s| s.ledger.as_ref());
-    let prior_total = prior.and_then(|l| l.acknowledged_since_start).unwrap_or(0);
-    let prior_gaps = prior.map_or(0, |l| l.acknowledged_gaps);
-    let (acknowledged, gaps) = match acked_delta {
-        Some(delta) => (prior_total + delta, prior_gaps),
-        None => (prior_total, prior_gaps + 1),
-    };
+    let mut tolerance = (Some(0u64), 0.0f64);
+    let mut advanced = false;
+    if let (Some((low, high)), Some(delta)) = (read_at, acked_delta) {
+        let interval = match through {
+            Some(from) => count(from.timestamp_millis() as f64 / 1000.0, low)
+                .await
+                .ok()
+                .map(|n| n as u64),
+            None => Some(0),
+        };
+        let spread = count(low, high).await.ok().map(|n| n as u64);
+        if let Some(n) = interval {
+            committed = committed.map(|c| c + n);
+            acknowledged = acknowledged.map(|a| a + delta);
+            through = chrono::DateTime::from_timestamp_millis((low * 1000.0) as i64);
+            gaps += restarts_uncounted;
+            tolerance = (spread, high - low);
+            advanced = true;
+        } else {
+            // The ledger could not be read: the verdict reads unknown until
+            // a sample can count the interval.
+            committed = None;
+        }
+    }
+    if !advanced {
+        // Neither side advanced, so this sample's readings are not the
+        // baseline the next one counts from: both sides then cover the
+        // stretch together.
+        for point in processes.values_mut() {
+            point.accepted_total = None;
+        }
+    }
+    let committed_through = through;
+    let (tolerance_rows, tolerance_seconds) = tolerance;
     Sample {
         schema: soak::SAMPLE_SCHEMA.into(),
         at,
@@ -417,12 +474,12 @@ async fn take_sample(
         database,
         latency: Some(latency),
         ledger: Some(LedgerPoint {
-            acknowledged_since_start: Some(acknowledged),
+            acknowledged_since_start: acknowledged,
             acknowledged_gaps: gaps,
             committed_since_start: committed,
             committed_through,
-            tolerance_rows: slack_rows,
-            tolerance_seconds: args.scrape_slack_seconds,
+            tolerance_rows,
+            tolerance_seconds,
         }),
     }
 }

@@ -223,16 +223,56 @@ fn a_deployment_ledger_must_hold_every_acknowledged_share() {
         committed_since_start: Some(committed),
         committed_through: None,
         tolerance_rows: Some(3),
-        tolerance_seconds: 120.0,
+        tolerance_seconds: 4.0,
     };
     samples.last_mut().unwrap().ledger = Some(point(1000, 1000));
     assert!(failed(&evaluate(&samples, &gates())).is_empty());
-    samples.last_mut().unwrap().ledger = Some(point(1000, 999));
+    // Processes scraped a few seconds after the earliest may be ahead by the
+    // rows of that spread, and no more.
+    samples.last_mut().unwrap().ledger = Some(point(1000, 997));
+    assert!(failed(&evaluate(&samples, &gates())).is_empty());
+    samples.last_mut().unwrap().ledger = Some(point(1000, 996));
     let failed = failed(&evaluate(&samples, &gates()));
     assert!(
         failed[0].starts_with("acknowledged shares in the ledger"),
         "{failed:?}"
     );
+}
+
+#[test]
+fn a_process_gone_dark_at_the_end_fails_its_trends() {
+    let mut samples = series(120, 0.0);
+    // Its last hour of samples name it but read nothing, as the deployment
+    // sampler records a process whose series vanished.
+    for sample in samples.iter_mut().skip(60) {
+        sample.processes[0].rss_bytes = None;
+        sample.processes[0].open_fds = None;
+    }
+    let failures = failed(&evaluate(&samples, &gates()));
+    for name in ["resident memory slope", "open file descriptors slope"] {
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.starts_with(name) && line.contains("latest sample")),
+            "{name}: {failures:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_divergence_table_fails_rather_than_passes() {
+    let mut samples = series(120, 0.0);
+    samples[119].database.payout_divergences = None;
+    let failures = failed(&evaluate(&samples, &gates()));
+    assert!(
+        failures[0].starts_with("payout divergences recorded during the soak")
+            && failures[0].contains("unknown in 1 of 120"),
+        "{failures:?}"
+    );
+    for sample in &mut samples {
+        sample.database.payout_divergences = None;
+    }
+    assert!(!failed(&evaluate(&samples, &gates())).is_empty());
 }
 
 #[test]

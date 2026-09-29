@@ -78,36 +78,39 @@ pub struct LatencyPoint {
 }
 
 /// Acknowledged against committed shares, for a soak that cannot see its
-/// miners' side (a deployment). Cumulative from the first sample.
+/// miners' side (a deployment). Cumulative from the first sample, which is
+/// the baseline.
 ///
-/// A Prometheus counter is as old as its last scrape, so the acknowledged
-/// count lags the moment it is read, never leads it: committed rows are
-/// counted up to the sample's own time, and from `tolerance_seconds` before
-/// the first sample, which covers the first reading's lag. Every share a
-/// server acknowledged inside the span is then a committed row inside it,
-/// and `committed >= acknowledged` is the check. A counter that could not be
-/// read, or restarted between two readings, drops that stretch from the
-/// acknowledged side only, which can hide a loss but never invent one.
+/// Both sides cover the same span: the acknowledged side is the servers'
+/// counters from one reading to the next, and the committed side is the
+/// accepted ledger rows between the two readings' scrape times (the earliest
+/// scrape among the processes). Processes scraped a little later than the
+/// earliest acknowledged a few more shares than that span holds; those rows
+/// are `tolerance_rows`, and the check is `committed + tolerance >=
+/// acknowledged`. A counter that reset since its last reading is a restart,
+/// and what the old process acknowledged after that reading cannot be
+/// counted: `acknowledged_gaps` counts those, which can hide a loss but never
+/// invent one.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LedgerPoint {
     /// Shares the servers counted as accepted (acknowledged to the miner)
-    /// since the first sample, summed over processes and across restarts.
+    /// since the baseline, summed over processes and across restarts.
     pub acknowledged_since_start: Option<u64>,
-    /// Samples whose counters could not be read, so their stretch is missing
-    /// from `acknowledged_since_start`.
+    /// Restarts whose old process's last acknowledgements could not be
+    /// counted.
     #[serde(default)]
     pub acknowledged_gaps: u64,
-    /// Accepted rows the ledger held with `accepted_at` in the span, counted
-    /// interval by interval while each interval's rows were live, so rows
-    /// the operator's retention later removes stay counted.
+    /// Accepted rows the ledger held with `accepted_at` in the same span,
+    /// counted interval by interval while each interval's rows were live,
+    /// so rows the operator's retention later removes stay counted.
     pub committed_since_start: Option<u64>,
-    /// The end of the span `committed_since_start` covers; the next sample
-    /// counts from here.
+    /// The scrape time the span ends at; the next sample counts from here.
     #[serde(default)]
     pub committed_through: Option<DateTime<Utc>>,
-    /// Of those, the rows from the `tolerance_seconds` before the first
-    /// sample.
+    /// Accepted rows between this sample's earliest and latest counter
+    /// scrape: the most the processes scraped later can be ahead by.
     pub tolerance_rows: Option<u64>,
+    /// That spread, in seconds.
     pub tolerance_seconds: f64,
 }
 

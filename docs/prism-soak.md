@@ -297,16 +297,26 @@ so on a deployment one client is one server host's role; raise
 **Acknowledged shares in the ledger.** The reporter cannot see the miners'
 side, so it compares the servers' own count of acknowledged shares
 (`qbit_prism_accepted_shares_total`, summed over processes, across restarts)
-with the accepted rows the ledger holds for the same span. A counter is as
-old as its last scrape, so the acknowledged count can only lag; the
-committed rows are counted up to the sample's own time and from
-`--scrape-slack-seconds` (120) before the first sample, which covers the
-first reading's lag, and the check is `committed >= acknowledged`. A
-Prometheus read that fails, or a restart between two readings, drops that
-stretch from the acknowledged side only; the report counts such samples.
-This can hide a loss inside the dropped stretch; it cannot invent one. The
-regtest soak's reconciliation, which knows every share each client was
-told was accepted, is the exact version.
+with the accepted rows the ledger holds for the same span. The first
+sample's readings are the baseline. Each later sample adds the counters'
+growth since the previous reading to the acknowledged side, and the ledger's
+accepted rows between the two readings' scrape times (Prometheus's
+`timestamp()`, the earliest among the processes) to the committed side,
+counted while those rows are still live, so retention cannot take them out
+of the count. Processes scraped a little after the earliest may be ahead by
+the rows of that spread, so the check is `committed + spread >=
+acknowledged`. A counter that reset since its last reading
+(`resets()`) is a restart: the new process's count is all new, and what the
+old one acknowledged after its last reading cannot be counted; the report
+counts such restarts. That can hide a loss inside the uncounted stretch; it
+cannot invent one. A sample that could not read the counters or the ledger
+advances neither side, and the next one covers the stretch. The regtest
+soak's reconciliation, which knows every share each client was told was
+accepted, is the exact version.
+
+A process whose series stops appearing stays in the samples with every
+figure unknown, and its trends fail on the first sample that cannot read
+it: a process gone dark is not judged on what it did before.
 
 When the soak ends, attach `soak-report.md`, `soak-samples.jsonl`, the image
 ID and the deploy environment to the release's tracking issue.

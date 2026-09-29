@@ -140,6 +140,21 @@ fn trend_check<F: Fn(&ProcessPoint) -> Option<u64>>(
             None => unknown += 1,
         }
     }
+    // A process that has gone dark is judged on nothing it did since.
+    let dark_at_end = gated.last().is_some_and(|sample| {
+        sample
+            .processes
+            .iter()
+            .find(|p| p.instance == instance)
+            .is_none_or(|p| value(p).is_none())
+    });
+    if dark_at_end {
+        return fail(
+            name,
+            "unknown: the latest sample could not read it".into(),
+            budget,
+        );
+    }
     if (points.len() as u64) < gates.min_gated_samples {
         return fail(
             name,
@@ -536,24 +551,22 @@ fn ledger_checks(samples: &[Sample], gates: &Gates) -> Vec<Check> {
     ];
     if let Some(ledger) = samples.iter().rev().find_map(|s| s.ledger.as_ref()) {
         let name = "acknowledged shares in the ledger";
-        let budget = "committed >= acknowledged".to_owned();
+        let budget = "committed + scrape spread >= acknowledged".to_owned();
         checks.push(
             match (
                 ledger.acknowledged_since_start,
                 ledger.committed_since_start,
+                ledger.tolerance_rows,
             ) {
-                (Some(acked), Some(committed)) => verdict(
+                (Some(acked), Some(committed), Some(tolerance)) => verdict(
                     name,
                     format!(
-                        "{committed} committed ({} from the {} s before the start) of {acked} \
-                         acknowledged{}",
-                        ledger
-                            .tolerance_rows
-                            .map_or("unknown".into(), |rows| rows.to_string()),
+                        "{committed} committed of {acked} acknowledged (+{tolerance} rows of a \
+                         {:.0} s scrape spread){}",
                         ledger.tolerance_seconds,
                         if ledger.acknowledged_gaps > 0 {
                             format!(
-                                "; {} sample(s) could not read the counters",
+                                "; {} restart(s) whose last acknowledgements are uncounted",
                                 ledger.acknowledged_gaps
                             )
                         } else {
@@ -561,7 +574,7 @@ fn ledger_checks(samples: &[Sample], gates: &Gates) -> Vec<Check> {
                         }
                     ),
                     budget,
-                    committed >= acked,
+                    committed + tolerance >= acked,
                 ),
                 _ => fail(
                     name,
@@ -571,18 +584,36 @@ fn ledger_checks(samples: &[Sample], gates: &Gates) -> Vec<Check> {
             },
         );
     }
-    let divergences: Vec<u64> = samples
-        .iter()
-        .filter_map(|s| s.database.payout_divergences)
-        .collect();
-    if let (Some(first), Some(last)) = (divergences.first(), divergences.last()) {
-        checks.push(verdict(
-            "payout divergences recorded during the soak",
-            format!("{}", last.saturating_sub(*first)),
-            "0".into(),
-            last <= first,
-        ));
-    }
+    checks.push(
+        match samples
+            .iter()
+            .map(|s| s.database.payout_divergences)
+            .collect::<Option<Vec<u64>>>()
+        {
+            Some(counts) => {
+                let first = counts.first().copied().unwrap_or(0);
+                let last = counts.last().copied().unwrap_or(0);
+                verdict(
+                    "payout divergences recorded during the soak",
+                    format!("{}", last.saturating_sub(first)),
+                    "0".into(),
+                    last <= first,
+                )
+            }
+            None => fail(
+                "payout divergences recorded during the soak",
+                format!(
+                    "unknown in {} of {} sample(s)",
+                    samples
+                        .iter()
+                        .filter(|s| s.database.payout_divergences.is_none())
+                        .count(),
+                    samples.len()
+                ),
+                "0".into(),
+            ),
+        },
+    );
     checks
 }
 
