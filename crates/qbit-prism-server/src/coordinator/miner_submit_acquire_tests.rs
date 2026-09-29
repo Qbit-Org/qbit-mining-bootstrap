@@ -183,6 +183,23 @@ fn state_values(state: crate::ledger::ChainObservationState) -> (i64, i64, Optio
     )
 }
 
+/// Wait for the followed enqueue's commit, which lands after its checkout.
+async fn outbox_rows(h: &Harness, expected: i64) -> Result<()> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_block_candidate_outbox")
+                .fetch_one(&h.side)
+                .await?;
+            if rows == expected {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("outbox row count not reached")?
+}
+
 async fn wait_counts(metrics: &Metrics, expected: (f64, f64)) -> Result<()> {
     tokio::time::timeout(WAIT, async {
         while counts(metrics) != expected {
@@ -235,11 +252,22 @@ async fn clock_and_block_only_duplicate_checkouts_are_lazy_and_cancel_once() -> 
                 tokio::time::advance(Duration::from_millis(75)).await;
                 drop(acquiring);
                 drop(resume);
-                assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
-                assert!((sample(h.metrics(), "failure", "sum") - sum - 0.075).abs() < 0.000001);
-                drop(held);
-                tokio::time::timeout(WAIT, run()).await??;
-                assert_eq!(counts(h.metrics()), (before.0 + 1., before.1 + 1.));
+                if clock {
+                    assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+                    assert!((sample(h.metrics(), "failure", "sum") - sum - 0.075).abs() < 0.000001);
+                    drop(held);
+                    tokio::time::timeout(WAIT, run()).await??;
+                    assert_eq!(counts(h.metrics()), (before.0 + 1., before.1 + 1.));
+                } else {
+                    // #574: the probe runs in a task the submission does not
+                    // own, so a cancelled submission leaves its checkout
+                    // waiting, not failed, and the probe still completes.
+                    assert_eq!(counts(h.metrics()), before);
+                    drop(held);
+                    wait_counts(h.metrics(), (before.0 + 1., before.1)).await?;
+                    tokio::time::timeout(WAIT, run()).await??;
+                    assert_eq!(counts(h.metrics()), (before.0 + 2., before.1));
+                }
                 drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
             }
             h.ledger().pool.close().await;
@@ -348,6 +376,13 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
             drop(persist);
             assert_eq!(family(h.metrics()), acquired);
             lock.rollback().await?;
+            // #574: cancelling the submission does not stop its probe and
+            // enqueue, so the found block still reaches the outbox (one more
+            // checkout, the enqueue's).
+            wait_counts(h.metrics(), (before.0 + 2., before.1)).await?;
+            outbox_rows(h, 1)
+                .await
+                .context("a cancelled submission dropped its block")?;
             sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN share_id TO hidden_share_id")
                 .execute(&h.side)
                 .await?;
@@ -360,7 +395,8 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
             sqlx::query("ALTER TABLE qbit_share_ledger RENAME COLUMN hidden_share_id TO share_id")
                 .execute(&h.side)
                 .await?;
-            // Spend time in checkout, then in SQL, under the original bound.
+            // Spend time in checkout, then in SQL, past the original bound: the
+            // answer is unknown at the bound and the probe runs on (#574).
             let held = h.ledger().pool.acquire().await?;
             let mut lock = h.side.begin().await?;
             sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
@@ -387,16 +423,18 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
             tokio::time::advance(remaining - Duration::from_millis(1)).await;
             assert!(futures_util::poll!(&mut persist).is_pending());
             tokio::time::advance(Duration::from_millis(1)).await;
-            let SaveOutcome::Failed(error) = persist.await else {
-                panic!("SQL timeout before enqueue must be definite")
-            };
-            assert_eq!(
-                error.to_string(),
-                "block-only acknowledgement bound passed before the candidate was enqueued"
-            );
+            assert!(matches!(
+                persist.await,
+                SaveOutcome::Unknown {
+                    phase: "enqueue-pending",
+                    ..
+                }
+            ));
             assert_eq!(family(h.metrics()), acquired);
             drop(resume);
             lock.rollback().await?;
+            // The followed probe resumes and the enqueue finds the block.
+            wait_counts(h.metrics(), (before.0 + 2., before.1)).await?;
             let held = h.ledger().pool.acquire().await?;
             let before = counts(h.metrics());
             tokio::time::pause();
@@ -406,20 +444,19 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
             let mut persist = Box::pin(h.persist(start));
             assert!(futures_util::poll!(&mut persist).is_pending());
             tokio::time::advance(Duration::from_millis(75)).await;
-            let SaveOutcome::Failed(error) = persist.await else {
-                panic!("checkout deadline before enqueue must be definite")
-            };
-            assert_eq!(
-                error.to_string(),
-                "block-only acknowledgement bound passed before the candidate was enqueued"
-            );
+            assert!(matches!(
+                persist.await,
+                SaveOutcome::Unknown {
+                    phase: "enqueue-pending",
+                    ..
+                }
+            ));
             drop(resume);
-            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+            // The checkout is still waiting, not cancelled at the bound.
+            assert_eq!(counts(h.metrics()), before);
             drop(held);
-            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_block_candidate_outbox")
-                .fetch_one(&h.side)
-                .await?;
-            assert_eq!(rows, 0);
+            wait_counts(h.metrics(), (before.0 + 2., before.1)).await?;
+            outbox_rows(h, 1).await?;
             Ok(())
         })
     })

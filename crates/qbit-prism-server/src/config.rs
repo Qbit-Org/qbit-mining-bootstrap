@@ -51,11 +51,11 @@ pub struct Config {
     /// `share_commit_timeout` may still be confirmed. Not an environment
     /// variable.
     pub share_commit_grace: Duration,
-    /// The acknowledgement bound for a submission that carries a found block:
-    /// a block-only, deferred or captured proof waiting for its enqueue and
-    /// landing, or a share-pass append carrying the block. Measured from the
-    /// same instant as `share_commit_timeout`; see [`block_only_ack_timeout`].
-    /// Not an environment variable.
+    /// The acknowledgement bound for a block-only proof (a captured, deferred
+    /// or below-target block) waiting for its enqueue and landing. Measured
+    /// from the same instant as `share_commit_timeout`; see
+    /// [`block_only_ack_timeout`]. A share-pass append carrying a block uses
+    /// the share deadline and grace instead. Not an environment variable.
     pub block_only_ack_timeout: Duration,
     /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (#415): how many confirmations
     /// a DIFFERENT block active at an offered candidate's height needs, on
@@ -230,8 +230,8 @@ fn alias(primary: &str, legacy: &str, default: u64) -> Result<u64> {
         positive(legacy, default)
     }
 }
-/// The acknowledgement bound for a block-bearing submission (#574): the share
-/// commit deadline itself. A captured proof's answer used to wait up to
+/// The acknowledgement bound for a block-only proof (#574): the share commit
+/// deadline itself. A captured proof's answer used to wait up to
 /// `max(share_commit_timeout, 60 s)` for its own frontend's landing, and the
 /// miner's session can submit nothing else meanwhile. At the bound the proof
 /// is answered `ledger-outcome-unknown`, as any share still pending at its

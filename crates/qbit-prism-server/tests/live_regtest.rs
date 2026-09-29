@@ -1348,13 +1348,13 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         // (#562). This counts credits, which still follow the landing rather
         // than the answer, so each keeps the 60 s allowance, here and after
         // the restart below.
-        let block_only_ack_seconds=60;
-        until("surviving server mining",20+3*block_only_ack_seconds,||async {Ok(fixture.count(1).await?>before+2)}).await?;
+        let landing_credit_seconds=60;
+        until("surviving server mining",20+3*landing_credit_seconds,||async {Ok(fixture.count(1).await?>before+2)}).await?;
         fixture.servers[0]=fixture.start_server(0)?;
         until("restarted Stratum listener",20,||async {Ok(tokio::net::TcpStream::connect(("127.0.0.1",fixture.stratum[0])).await.is_ok())}).await?;
         let restarted=fixture.subscription(0).await?;ensure!(restarted!=a&&restarted!=b,"restart reused session extranonce");
         let before=fixture.count(0).await?;fixture.start_miner(0)?;
-        until("restarted server mining",20+3*block_only_ack_seconds,||async {Ok(fixture.count(0).await?>before+2)}).await?;
+        until("restarted server mining",20+3*landing_credit_seconds,||async {Ok(fixture.count(0).await?>before+2)}).await?;
         fixture.quiesce().await?;
         // A share a server read before its miner was killed can still commit
         // (#533). Read both counts in one snapshot, and compare each API with a
