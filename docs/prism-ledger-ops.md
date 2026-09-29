@@ -222,7 +222,7 @@ accounting after it, and the row records where the block is between them:
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
 | `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
 | `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
-| `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. |
+| `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. A recovered reservation, whose call's answer was never recorded, lands with `offer_outcome = unknown` (#529). |
 | `abandoned` | Reachable from `pending` only. |
 
 ### Candidate commands
@@ -617,6 +617,29 @@ over it, and is finished once the block is active. A duplicate offer is
 therefore impossible across crashes and takeovers. The price is that a crash
 between the reservation commit and the call loses that delivery; the row
 reports it as unknown and reconciles rather than retrying.
+
+A frontend whose attempt fails releases its claim at once, so the row does
+not wait for the lease. When that release fails too, because the database
+stopped answering (a PostgreSQL failover drops the pool's connections with
+the old primary), the frontend retries the same token-fenced release about
+once a second, alongside its other work, until the database answers or the
+lease ends, and once more at shutdown (#529). The release runs only after the
+failed attempt has stopped, and changes nothing once another frontend has
+taken the row. The frontend logs `candidate claim release deferred` when it
+starts retrying, and `deferred candidate claim release succeeded` or
+`... expired with its lease` when it stops. A claim whose frontend was lost
+with the old primary still waits for its 120 s lease.
+
+**A graceful shutdown mid-offer (#578).** From just before the reservation
+until the node's answer is recorded (or an unsent reservation is returned to
+`pending`), a graceful shutdown does not drop the attempt: the submit loop
+keeps driving it, bounded by the send's deadline, the standby wait's bound
+and the lease's bound for the reservation and the recording, and logs
+`shutdown waits for a found block's offer in flight`. Only then does it stop;
+the landing that follows is left to the next claim, which lands the `offered`
+row without another offer. Without this, a restart between the reservation
+and the call left an `offer_reserved` row that was never sent and is never
+offered again. A crash in the same window still recovers as delivery unknown.
 
 **A call that never connected (#522).** When `submitblock` fails before its
 connection is established, the request provably never reached the node. That

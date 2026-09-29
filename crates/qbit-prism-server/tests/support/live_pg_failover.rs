@@ -29,6 +29,10 @@
 //!   survives, the shares committed in the gap are lost and are counted and
 //!   printed, and the reservation, which was replicated, is recovered as an
 //!   unknown outcome and landed on the new primary without a second call.
+//!   The offering frontend's claim release fails with the old primary's
+//!   connections; it retries the release once the new primary answers
+//!   (#529), so the landing follows within [`LANDING_BOUND`] of the
+//!   promotion instead of after the 120 s candidate lease.
 //! - [`Drill::Fenced`] is the planned switch: after the fence, the standby
 //!   replays through the old primary's flush LSN before promotion, so no
 //!   acknowledged share may be lost, and the held call returns only after the
@@ -58,6 +62,13 @@ mod offer_standby;
 
 /// The dedicated standby's `application_name` and physical slot.
 const STANDBY: &str = "prism_standby_1";
+
+/// How soon after the promotion the found block must land on the new
+/// primary, in both drills. Before #529's deferred claim release the async
+/// drill waited out the 120 s candidate lease; now it waits for the
+/// offering frontend's pool to reach the moved endpoint and for one retried
+/// release.
+const LANDING_BOUND: Duration = Duration::from_secs(30);
 
 /// The two drills start their clusters before `Fixture::open_on_database`
 /// takes the fixture's `SERIAL` guard; this keeps a second pair from idling
@@ -377,10 +388,9 @@ async fn failover(
     if drill == Drill::AsyncLoss {
         // Move the endpoint only once the offering attempt has failed, so it
         // cannot record the answer on the new primary. Its claim release
-        // usually fails on the same dead connections, and the recovery then
-        // waits for the candidate lease (120 s) to expire; a release that
-        // reaches the new primary lets it start sooner. Either way the row is
-        // recovered from offer_reserved.
+        // fails on the same dead connections and is retried until the moved
+        // endpoint answers (#529); the row is then recovered from
+        // offer_reserved.
         until(
             "the offering attempt to fail on the fenced endpoint",
             60,
@@ -408,6 +418,12 @@ async fn failover(
     .await?;
     let landed_after = promoted_at.elapsed();
     timeline.mark("landed");
+    ensure!(
+        landed_after <= LANDING_BOUND,
+        "the found block landed {:.1} s after the promotion, beyond {} s: the recovery waited for the candidate lease",
+        landed_after.as_secs_f64(),
+        LANDING_BOUND.as_secs()
+    );
     let (outcome, offered_at, reserved_by): (Option<String>, Option<i64>, Option<String>) =
         sqlx::query_as(
             "SELECT offer_outcome,offered_at_ms,offer_reserved_by FROM qbit_block_candidate_outbox WHERE block_hash=$1",
@@ -421,10 +437,10 @@ async fn failover(
     );
     match drill {
         // The answer was lost with the old primary: the recovered reservation
-        // lands without an outcome or a call time ever being recorded.
+        // lands with an unknown outcome and no call time (#529).
         Drill::AsyncLoss => ensure!(
-            outcome.is_none() && offered_at.is_none(),
-            "the lost answer was recorded as {outcome:?} at {offered_at:?}"
+            outcome.as_deref() == Some("unknown") && offered_at.is_none(),
+            "the lost answer was recorded as {outcome:?} at {offered_at:?}, expected an unknown outcome"
         ),
         // The same attempt recorded the node's answer on the new primary.
         Drill::Fenced => ensure!(
