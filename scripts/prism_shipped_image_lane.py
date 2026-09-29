@@ -128,6 +128,10 @@ CPUMINER_RESULT = re.compile(
     r"\b(?:A|Accepted )(\d+) (?:S|Stale )(\d+) (?:R|Rejected )(\d+) (?:B|BLOCK SOLVED )(\d+),"
 )
 CPUMINER_SUBMIT = re.compile(r"\b\d+ Submitted Diff ")
+# Client logs kept in the artifact, and lines echoed to the job log, per client.
+CLIENT_LOG_BYTES = 32 * 1024 * 1024
+CLIENT_ECHO_LINES = 400
+
 # Addresses go into SQL literals, so hold them to the bech32 alphabet first.
 ADDRESS = re.compile(r"^[a-z0-9]{8,120}$")
 
@@ -218,39 +222,69 @@ class ClientTally:
         return max(0, self.submitted - self.accepted - self.rejected - self.stale)
 
 
-def parse_cpuminer(output: str) -> ClientTally:
-    tally = ClientTally()
-    tally.submitted = len(CPUMINER_SUBMIT.findall(output))
-    results = CPUMINER_RESULT.findall(output)
-    if results:
-        accepted, stale, rejected, blocks = (int(value) for value in results[-1])
-        tally.accepted, tally.stale, tally.rejected, tally.blocks = accepted, stale, rejected, blocks
-    return tally
+class CpuminerOutput:
+    """cpuminer-opt's totals, read a line at a time (its output can be large)."""
+
+    def __init__(self) -> None:
+        self.tally = ClientTally()
+
+    def feed(self, line: str) -> None:
+        if CPUMINER_SUBMIT.search(line):
+            self.tally.submitted += 1
+            return
+        result = CPUMINER_RESULT.search(line)
+        if result:
+            # Each result line carries the running totals.
+            (self.tally.accepted, self.tally.stale, self.tally.rejected,
+             self.tally.blocks) = (int(value) for value in result.groups())
+
+    def result(self) -> ClientTally:
+        return self.tally
 
 
-def parse_prism_miner(output: str) -> ClientTally:
-    summary = None
-    blocks = 0
-    for line in output.splitlines():
+class PrismMinerOutput:
+    """qbit-prism-miner's JSON events: its summary has the totals."""
+
+    def __init__(self) -> None:
+        self.summary: dict | None = None
+        self.blocks = 0
+
+    def feed(self, line: str) -> None:
         line = line.strip()
         if not line.startswith("{"):
-            continue
+            return
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return
         if event.get("event") == "summary":
-            summary = event
+            self.summary = event
         elif event.get("event") == "submit" and event.get("block_target_met") is True:
-            blocks += 1
-    if summary is None:
-        raise LaneFailure("qbit-prism-miner printed no summary")
-    return ClientTally(
-        submitted=int(summary["submitted"]),
-        accepted=int(summary["accepted"]),
-        rejected=int(summary["rejected"]),
-        blocks=blocks,
-    )
+            self.blocks += 1
+
+    def result(self) -> ClientTally:
+        if self.summary is None:
+            raise LaneFailure("qbit-prism-miner printed no summary")
+        return ClientTally(
+            submitted=int(self.summary["submitted"]),
+            accepted=int(self.summary["accepted"]),
+            rejected=int(self.summary["rejected"]),
+            blocks=self.blocks,
+        )
+
+
+def parse_cpuminer(output: str) -> ClientTally:
+    parser = CpuminerOutput()
+    for line in output.splitlines():
+        parser.feed(line)
+    return parser.result()
+
+
+def parse_prism_miner(output: str) -> ClientTally:
+    parser = PrismMinerOutput()
+    for line in output.splitlines():
+        parser.feed(line)
+    return parser.result()
 
 
 def reconcile_client(name: str, tally: ClientTally, ledger_rows: int) -> list[str]:
@@ -446,6 +480,7 @@ class Lane:
     project: str
     load_seconds: int
     cpuminer_threads: int
+    cpuminer_diff_multiplier: float
     prism_miner_hashes_per_second: int
     env_file: Path = field(init=False)
     env: dict[str, str] = field(init=False)
@@ -519,6 +554,7 @@ class Lane:
             raise LaneFailure(f"{service} self-check printed no JSON report (exit {process.returncode}): "
                               f"{process.stderr.strip()[-2000:]}") from error
         report["_exit"] = process.returncode
+        report["_stderr_tail"] = process.stderr.strip()[-2000:]
         return report
 
     def check_frontends(self, self_checks: dict[str, dict]) -> None:
@@ -536,7 +572,8 @@ class Lane:
             live = report.get("live_instances") or {}
             observed[service] = {"status": live.get("status"), "count": live.get("count"),
                                  "instance_ids": live.get("instance_ids"), "ok": report.get("ok"),
-                                 "exit": report.get("_exit"), "error": report.get("_error")}
+                                 "exit": report.get("_exit"), "error": report.get("_error"),
+                                 "stderr_tail": report.get("_stderr_tail")}
             if live.get("status") != "observed" or live.get("count") != 2 or \
                     sorted(live.get("instance_ids") or []) != sorted(INSTANCE_IDS):
                 problems.append(f"{service} self-check observes {observed[service]}, not both frontends")
@@ -601,7 +638,7 @@ class Lane:
         for problem in problems:
             log(f"FAIL cross-frontend-resume: {problem}")
 
-    def load(self, addresses: dict[str, str]) -> dict[str, str]:
+    def load(self, addresses: dict[str, str]) -> dict[str, ClientTally]:
         started = time.monotonic()
         network = f"{self.project}_default"
         seconds = str(self.load_seconds)
@@ -611,6 +648,7 @@ class Lane:
                 REAL_MINER_IMAGE, "timeout", "-s", "INT", seconds, "cpuminer", "-a", "sha256d",
                 "-o", "stratum+tcp://prism-coordinator:3340", "-u", f"{addresses['cpuminer']}.cpuminer",
                 "-p", "x", "-t", str(self.cpuminer_threads), "--no-color",
+                "--diff-multiplier", f"{self.cpuminer_diff_multiplier:g}",
             ],
             "prism-miner": [
                 "docker", "run", "--rm", "--name", f"{self.project}-prism-miner", "--network", network,
@@ -621,19 +659,29 @@ class Lane:
             ],
         }
         processes = {}
-        outputs: dict[str, list[str]] = {}
+        parsers = {"cpuminer": CpuminerOutput(), "prism-miner": PrismMinerOutput()}
         readers = []
         for name, command in clients.items():
             log(f"starting {name} for {seconds}s")
             process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1)
             processes[name] = process
-            outputs[name] = []
 
-            def pump(process=process, sink=outputs[name], name=name):
-                for line in process.stdout:
-                    sink.append(line)
-                    print(f"[{name}] {line.rstrip()}", flush=True)
+            def pump(process=process, parser=parsers[name], name=name):
+                # Parse every line, but keep the job log and the artifact
+                # bounded: a client that floods its pool must not fill either.
+                logged = echoed = 0
+                with (self.out / f"{name}.log").open("w", encoding="utf-8") as sink:
+                    for line in process.stdout:
+                        parser.feed(line)
+                        if logged < CLIENT_LOG_BYTES:
+                            sink.write(line)
+                            logged += len(line)
+                            if logged >= CLIENT_LOG_BYTES:
+                                sink.write(f"[{PREFIX}: log truncated at {CLIENT_LOG_BYTES} bytes]\n")
+                        if echoed < CLIENT_ECHO_LINES:
+                            print(f"[{name}] {line.rstrip()}", flush=True)
+                            echoed += 1
 
             reader = threading.Thread(target=pump, daemon=True)
             reader.start()
@@ -655,10 +703,7 @@ class Lane:
                 process.kill()
                 codes[name] = process.wait()
         for reader in readers:
-            reader.join(timeout=10)
-        texts = {name: "".join(lines) for name, lines in outputs.items()}
-        for name, text in texts.items():
-            (self.out / f"{name}.log").write_text(text, encoding="utf-8")
+            reader.join(timeout=30)
         self.report["client_exit"] = codes
         self.phase("load", started)
         # timeout(1) exits 124 when it stopped cpuminer at the deadline; any
@@ -668,7 +713,7 @@ class Lane:
         if codes["prism-miner"] != 0:
             raise LaneFailure(f"qbit-prism-miner exited {codes['prism-miner']}")
         self.check_frontends(self_checks)
-        return texts
+        return {name: parser.result() for name, parser in parsers.items()}
 
     def quiesce(self) -> int:
         """The ledger's accepted count once it holds still and both frontends report it."""
@@ -686,9 +731,7 @@ class Lane:
         self.phase("quiesce", started)
         return count
 
-    def check_ledger(self, addresses: dict[str, str], texts: dict[str, str], accepted: int) -> None:
-        tallies = {"cpuminer": parse_cpuminer(texts["cpuminer"]),
-                   "prism-miner": parse_prism_miner(texts["prism-miner"])}
+    def check_ledger(self, addresses: dict[str, str], tallies: dict[str, ClientTally], accepted: int) -> None:
         rows = {role: self.scalar(f"SELECT count(*) FROM qbit_share_ledger WHERE accepted AND miner_id='{address}'")
                 for role, address in addresses.items()}
         credited = self.scalar("SELECT count(*) FROM qbit_prism_share_hashes")
@@ -831,9 +874,9 @@ class Lane:
         try:
             addresses = self.start()
             self.check_resume(addresses)
-            texts = self.load(addresses)
+            tallies = self.load(addresses)
             accepted = self.quiesce()
-            self.check_ledger(addresses, texts, accepted)
+            self.check_ledger(addresses, tallies, accepted)
             self.check_blocks(addresses)
         except (LaneFailure, subprocess.TimeoutExpired, OSError, KeyError, ValueError) as caught:
             error = f"{type(caught).__name__}: {caught}"
@@ -912,6 +955,14 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--out", type=Path, required=True)
             command.add_argument("--load-seconds", type=int, default=240)
             command.add_argument("--cpuminer-threads", type=int, default=2)
+            # cpuminer submits every hash that meets the pool's difficulty
+            # without waiting for answers. At the lab's 1e-9 floor that is
+            # most hashes: its connection floods, it never reads the next
+            # job and it mines a stale one for the rest of the run. Hashing
+            # locally to a harder target keeps it to a few shares a second
+            # until vardiff takes over; every share still meets regtest's
+            # network target, so each accepted one is a block.
+            command.add_argument("--cpuminer-diff-multiplier", type=float, default=1e7)
             command.add_argument("--prism-miner-hashes-per-second", type=int, default=20000)
     args = parser.parse_args(argv)
     if args.command == "changed":
@@ -929,6 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     out.chmod(0o755)
     lane = Lane(work=work, out=out, project=args.project, load_seconds=args.load_seconds,
                 cpuminer_threads=args.cpuminer_threads,
+                cpuminer_diff_multiplier=args.cpuminer_diff_multiplier,
                 prism_miner_hashes_per_second=args.prism_miner_hashes_per_second)
     return 0 if lane.execute() else 1
 
