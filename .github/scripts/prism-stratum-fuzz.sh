@@ -78,7 +78,7 @@ for target in "${TARGETS[@]}"; do
 done
 
 status=0
-declare -A EXIT
+declare -A EXIT MERGE
 for i in "${!TARGETS[@]}"; do
   code=0
   wait "${pids[${i}]}" || code=$?
@@ -100,12 +100,19 @@ for target in "${TARGETS[@]}"; do
   ft="$(sed -nE 's/.* ft: ([0-9]+).*/\1/p' <<< "${last}")"
   findings="$(find "${out}/artifacts/${target}" -type f | wc -l)"
   # Keep only inputs that add coverage, so the cache does not grow nightly.
+  # A merge that fails keeps the whole grown corpus instead of a partial one.
   merged="$(mktemp -d)"
+  MERGE[${target}]=0
   "${bin_dir}/${target}" -merge=1 -max_len="${MAX_LEN[${target}]}" -rss_limit_mb=2048 \
     -malloc_limit_mb=512 -timeout=30 -artifact_prefix="${out}/artifacts/${target}/merge-" \
-    "${merged}" "${corpus}/${target}" > "${out}/${target}.merge.log" 2>&1 || status=1
-  rm -rf "${corpus:?}/${target}"
-  mv "${merged}" "${corpus}/${target}"
+    "${merged}" "${corpus}/${target}" > "${out}/${target}.merge.log" 2>&1 || MERGE[${target}]=$?
+  if [[ "${MERGE[${target}]}" == 0 ]]; then
+    rm -rf "${corpus:?}/${target}"
+    mv "${merged}" "${corpus}/${target}"
+  else
+    status=1
+    rm -rf "${merged}"
+  fi
   size="$(find "${corpus}/${target}" -type f | wc -l)"
   echo "| ${target} | ${EXIT[${target}]} | $(final_stat number_of_executed_units) | $(final_stat average_exec_per_sec) | ${cov:-?} | ${ft:-?} | ${size} | ${findings} |" \
     >> "${out}/summary.md"
@@ -118,6 +125,10 @@ for target in "${TARGETS[@]}"; do
   if [[ "${EXIT[${target}]}" != 0 ]]; then
     echo "::error::${target} failed; its input is under artifacts/${target} and its log is ${target}.log"
     grep -m 5 -E 'invariant violated|panicked at|SUMMARY|ERROR' "${out}/${target}.log" || true
+  fi
+  if [[ "${MERGE[${target}]}" != 0 ]]; then
+    echo "::error::${target}'s corpus merge failed (exit ${MERGE[${target}]}); its corpus was kept unmerged, see ${target}.merge.log and artifacts/${target}/merge-*"
+    grep -m 5 -E 'invariant violated|panicked at|SUMMARY|ERROR' "${out}/${target}.merge.log" || true
   fi
 done
 exit "${status}"
