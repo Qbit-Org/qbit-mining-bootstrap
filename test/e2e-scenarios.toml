@@ -245,9 +245,10 @@ id = "r521-3-postgres-failover-mid-landing"
 title = "#521 scenario 3: PostgreSQL failover with a found block mid-landing"
 owner = "#521"
 lanes = ["pr"]
-criteria = "Fenced failover keeps every acknowledged share; async failover loses only the replication gap, and the block lands."
+criteria = "Fenced failover keeps every acknowledged share; async failover loses only the replication gap, and the block lands; with the standby flush wait (#529), a block offered at a replication cut survives the promotion and lands once."
 runs = true
 tests = [
+  "qbit-prism-server::live_regtest::pg_failover_tests::offer_standby::a_found_block_offered_after_the_standby_flush_survives_a_replication_cut_at_submitblock",
   "qbit-prism-server::live_regtest::pg_failover_tests::real_async_failover_mid_landing_loses_only_the_replication_gap",
   "qbit-prism-server::live_regtest::pg_failover_tests::real_fenced_failover_mid_landing_keeps_every_acknowledged_share",
 ]
@@ -262,6 +263,7 @@ runs = true
 tests = [
   "qbit-prism-server::live_regtest::node_outage_tests::node_killed_after_accepting_reconciles_the_lost_block_once",
   "qbit-prism-server::live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart",
+  "qbit-prism-server::live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once",
   "qbit-prism-server::live_regtest::node_outage_tests::node_stopped_after_accepting_lands_the_block_once_after_resume",
   "qbit-prism-server::live_regtest::node_outage_tests::node_stopped_before_submitblock_lands_the_block_once_after_resume",
 ]
@@ -350,6 +352,15 @@ lanes = ["dispatch"]
 criteria = "The preset's gates, with the tip-to-last-notify p99 within 2,500 ms."
 runs = true
 presets = ["tip-delivery-2000-miners-400k-2fe-retarget-500-addresses"]
+
+[[scenario]]
+id = "load-runner-probe-short-plan"
+title = "#541's runner probe: the short plan over the 20k-window fixture on one frontend"
+owner = "#541"
+lanes = ["dispatch"]
+criteria = "The preset's gates on the runner under probe: exact reconciliation, no acknowledged share missing, zero shortfall in each gated phase."
+runs = true
+presets = ["short-plan-20k-window-1fe"]
 
 [[scenario]]
 id = "load-mainnet-floor"

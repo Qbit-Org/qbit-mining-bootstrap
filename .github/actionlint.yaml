@@ -7,3 +7,6 @@ self-hosted-runner:
     # the runner each preset names.
     - blacksmith-8vcpu-ubuntu-2404
     - blacksmith-16vcpu-ubuntu-2404
+    # The runner probe (prism-load-runner-probe.yml, #541) also measures the
+    # 32 vCPU class.
+    - blacksmith-32vcpu-ubuntu-2404
