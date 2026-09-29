@@ -5,12 +5,17 @@
 //! acknowledgement either closes the gate, so COMMIT is never sent, or finds
 //! COMMIT already in flight and waits `share_commit_grace` for its reply. An
 //! outcome still unknown at the deadline is answered `ledger-outcome-unknown`,
-//! never as a failure. Block-only proofs wait for their candidate's
-//! disposition up to `block_only_ack_timeout` instead.
+//! never as a failure. An append carrying a found block follows the same
+//! deadline and grace but is never refused, so it runs on past an unknown
+//! answer. Block-only proofs wait for their candidate's disposition up to
+//! `block_only_ack_timeout`, which is `share_commit_timeout` itself (#574).
+//! A block-bearing submission still pending at its bound is answered
+//! `ledger-outcome-unknown` and counted in `block_proof_ack_capped_total`; the
+//! bound only ends the wait, never the probe, enqueue, append or landing.
 use super::submit_ledger::{CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
-use crate::metrics::StaleJobCause;
+use crate::metrics::{BlockAckPath, StaleJobCause};
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -41,17 +46,30 @@ pub(super) enum SaveOutcome {
     },
 }
 
-/// Classify a finished share-pass append by how far its gate got.
-///
-/// Leave a candidate enqueue that outlived the acknowledgement bound running,
-/// and log its outcome once it resolves. Cancelling it could strand a COMMIT
-/// that was already sent.
-fn follow_enqueue(handle: JoinHandle<Result<bool>>, share_id: String, block_hash: String) {
+/// How a block-only proof's spawned duplicate probe and candidate enqueue
+/// ended. The task runs to completion whatever happens to the submission
+/// (#574), so an acknowledgement bound or a cancelled session never stops a
+/// found block short of the outbox.
+enum EnqueueStep {
+    /// The share is already in the ledger; nothing was enqueued.
+    Recorded,
+    /// The probe failed before anything was written: a definite failure.
+    ProbeFailed(anyhow::Error),
+    /// The enqueue's own result: `true` enqueued, `false` already enqueued.
+    Enqueue(Result<bool>),
+}
+
+/// Leave a probe and candidate enqueue that outlived the acknowledgement
+/// bound running, and log its outcome once it resolves. Cancelling it could
+/// strand a COMMIT that was already sent, or leave the block unenqueued.
+fn follow_enqueue(handle: JoinHandle<EnqueueStep>, share_id: String, block_hash: String) {
     tokio::spawn(async move {
         let (outcome, error) = match handle.await {
-            Ok(Ok(true)) => ("enqueued", None),
-            Ok(Ok(false)) => ("already-enqueued", None),
-            Ok(Err(error)) => ("error", Some(format!("{error:#}"))),
+            Ok(EnqueueStep::Enqueue(Ok(true))) => ("enqueued", None),
+            Ok(EnqueueStep::Enqueue(Ok(false))) => ("already-enqueued", None),
+            Ok(EnqueueStep::Recorded) => ("already-recorded", None),
+            Ok(EnqueueStep::ProbeFailed(error)) => ("probe-error", Some(format!("{error:#}"))),
+            Ok(EnqueueStep::Enqueue(Err(error))) => ("error", Some(format!("{error:#}"))),
             Err(error) => ("task-ended", Some(error.to_string())),
         };
         tracing::warn!(
@@ -571,6 +589,7 @@ impl Coordinator {
                     path,
                     phase,
                     detail,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
                     "share outcome unknown at the acknowledgement deadline"
                 );
                 Err(protocol_error(
@@ -582,9 +601,10 @@ impl Coordinator {
     }
 
     /// Append a share-pass submission under a commit gate. The only
-    /// acknowledgement deadline is `share_commit_timeout` plus
-    /// `share_commit_grace`, or `block_only_ack_timeout` for an append that
-    /// carries a block candidate.
+    /// acknowledgement deadline is `share_commit_timeout`, plus
+    /// `share_commit_grace` once COMMIT is in flight. An append that carries a
+    /// block candidate gets the same deadline and grace (#574: never less than
+    /// a plain share) but is never refused, so it runs on past the answer.
     async fn persist_share_pass(
         &self,
         share: AcceptedShare,
@@ -620,31 +640,28 @@ impl Coordinator {
             gate: gate.clone(),
             refusable,
         };
-        let (joined, phase) = if refusable {
-            let deadline = start + self.config.share_commit_timeout;
-            match task.finish_by(deadline).await {
-                Some(joined) => (Some(joined), "commit-in-flight"),
-                None if gate.close() => {
-                    task.abort();
-                    return SaveOutcome::Failed(anyhow::anyhow!(
-                        "share commit deadline passed before COMMIT was sent"
-                    ));
-                }
-                None => (
-                    task.finish_by(deadline + self.config.share_commit_grace)
-                        .await,
-                    "commit-in-flight",
-                ),
+        let deadline = start + self.config.share_commit_timeout;
+        let (joined, phase) = match task.finish_by(deadline).await {
+            Some(joined) => (Some(joined), "commit-in-flight"),
+            None if refusable && gate.close() => {
+                task.abort();
+                return SaveOutcome::Failed(anyhow::anyhow!(
+                    "share commit deadline passed before COMMIT was sent"
+                ));
             }
-        } else {
-            (
-                task.finish_by(start + self.config.block_only_ack_timeout)
+            // A refusable gate that would not close is already committing.
+            None if refusable || gate.state() == GateState::Committing => (
+                task.finish_by(deadline + self.config.share_commit_grace)
                     .await,
-                "candidate-pending",
-            )
+                "commit-in-flight",
+            ),
+            None => (None, "candidate-pending"),
         };
         let Some(joined) = joined else {
             task.follow(share_id, "share", phase);
+            if !refusable {
+                self.metrics.record_block_ack_capped(BlockAckPath::Share);
+            }
             return SaveOutcome::Unknown {
                 phase,
                 detail: "the append had not finished by the acknowledgement deadline".into(),
@@ -697,8 +714,12 @@ impl Coordinator {
         // so once its block is captured the share is refused at once rather
         // than acknowledged at confirmation.
         let defers_share = candidate.deferred_share.is_some();
-        // Nothing is written before the enqueue, so every failure up to it is
-        // definite.
+        // The probe and the enqueue run in one spawned task that the bound
+        // never cancels: only the wait for it is bounded (#574). A probe cut
+        // off at the bound would answer before anything was written and
+        // never enqueue the block. Past the bound the task is followed, so a
+        // slow probe or a degraded database delays the block's offer, never
+        // drops it.
         //
         // The ledger is partitioned by `share_seq` (migration 016) and holds
         // no global `share_id` index, so an unbounded probe descends one
@@ -709,43 +730,44 @@ impl Coordinator {
         // `share_seq` lands in, which prunes the probe to at most three
         // leaves holding rows at executor start, whatever width each
         // partition was created with.
-        let exists = tokio::time::timeout_at(bound, async {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
-            )
-            .bind(&share.share_id)
-            .fetch_one(&mut *self.ledger.acquire().await?)
-            .await
-        })
-        .await;
-        match exists {
-            Err(_) => {
-                return SaveOutcome::Failed(anyhow::anyhow!(
-                    "block-only acknowledgement bound passed before the candidate was enqueued"
-                ))
-            }
-            Ok(Err(error)) => return SaveOutcome::Failed(error.into()),
-            Ok(Ok(true)) => return SaveOutcome::Duplicate,
-            Ok(Ok(false)) => {}
-        }
+        //
         // The enqueue commits the pending outbox row and the deferred share
-        // together, so it is never cut off: dropping it could discard the reply
-        // to a COMMIT that was already sent. Only the wait for it is bounded,
-        // so a degraded database cannot hold the acknowledgement past `bound`.
+        // together, so it is never cut off either: dropping it could discard
+        // the reply to a COMMIT that was already sent.
         let mut phase = "candidate-pending";
         let ledger = self.ledger.clone();
+        let share_id = share.share_id.clone();
         let mut enqueue = tokio::spawn(async move {
-            ledger
-                .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+            let probed = async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
+                )
+                .bind(&share_id)
+                .fetch_one(&mut *ledger.acquire().await?)
                 .await
+            }
+            .await;
+            match probed {
+                Ok(true) => EnqueueStep::Recorded,
+                Ok(false) => EnqueueStep::Enqueue(
+                    ledger
+                        .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+                        .await,
+                ),
+                Err(error) => EnqueueStep::ProbeFailed(error.into()),
+            }
         });
         match tokio::time::timeout_at(bound, &mut enqueue).await {
-            Ok(Ok(Ok(true))) => {}
-            Ok(Ok(Ok(false))) => return SaveOutcome::Duplicate,
-            Ok(Ok(Err(error))) if enqueue_failed_before_commit(&error) => {
+            Ok(Ok(EnqueueStep::Recorded)) => return SaveOutcome::Duplicate,
+            // Nothing is written before the enqueue, so every failure up to
+            // it is definite.
+            Ok(Ok(EnqueueStep::ProbeFailed(error))) => return SaveOutcome::Failed(error),
+            Ok(Ok(EnqueueStep::Enqueue(Ok(true)))) => {}
+            Ok(Ok(EnqueueStep::Enqueue(Ok(false)))) => return SaveOutcome::Duplicate,
+            Ok(Ok(EnqueueStep::Enqueue(Err(error)))) if enqueue_failed_before_commit(&error) => {
                 return SaveOutcome::Failed(error)
             }
-            Ok(Ok(Err(error))) => {
+            Ok(Ok(EnqueueStep::Enqueue(Err(error)))) => {
                 tracing::warn!(
                     share_id = %share.share_id,
                     block_hash,
@@ -767,9 +789,11 @@ impl Coordinator {
             }
             Err(_) => {
                 follow_enqueue(enqueue, share.share_id.clone(), block_hash.to_string());
+                self.metrics
+                    .record_block_ack_capped(BlockAckPath::BlockOnly);
                 return SaveOutcome::Unknown {
                     phase: "enqueue-pending",
-                    detail: "the candidate enqueue had not finished by the acknowledgement bound"
+                    detail: "the duplicate probe or candidate enqueue had not finished by the acknowledgement bound"
                         .into(),
                 };
             }
@@ -863,6 +887,10 @@ impl Coordinator {
                 break;
             }
         }
+        // The landing runs on without this wait: its confirmation credits the
+        // deferred share once, whenever it commits.
+        self.metrics
+            .record_block_ack_capped(BlockAckPath::BlockOnly);
         SaveOutcome::Unknown {
             phase,
             detail: "the block candidate had no disposition by block_only_ack_timeout".into(),

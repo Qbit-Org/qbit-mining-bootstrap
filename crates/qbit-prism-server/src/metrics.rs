@@ -157,6 +157,9 @@ impl Metrics {
                 0.,
             );
         }
+        for path in BlockAckPath::ALL {
+            registry.register(Family::BlockAckCapped, label("path", path.as_str()), 0.);
+        }
         for outcome in StandbyWaitOutcome::ALL {
             registry.register(
                 Family::OfferStandbyWaits,

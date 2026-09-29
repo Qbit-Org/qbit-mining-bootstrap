@@ -216,33 +216,34 @@ async fn commit_reconcile_indeterminate_commit_error_is_unknown() {
 
 #[tokio::test]
 async fn commit_reconcile_candidate_bearing_append_is_never_refused() {
-    // Held before COMMIT past the share deadline, then released before the
-    // block-only bound: accepted late, found block kept.
+    // #574: the same deadline and grace as a plain share. COMMIT in flight at
+    // the share deadline, then confirmed within the grace: accepted late,
+    // found block kept.
     let fixture_ = fixture(
         |config| {
             config.share_commit_timeout = MS(200);
-            config.block_only_ack_timeout = MS(1000);
+            config.share_commit_grace = MS(800);
         },
         None,
     )
     .await;
-    let append = Arc::new(Gate::default());
-    *fixture_.store.append_gate.lock().unwrap() = Some(append.clone());
+    let commit = Arc::new(Gate::default());
+    *fixture_.store.commit_gate.lock().unwrap() = Some(commit.clone());
     // Keep slow setup outside the append hold: under load, proof construction
     // or task scheduling can consume more than the old 350ms-200ms margin.
     // This delay makes an anchor moved before submission fail deterministically.
     tokio::time::sleep(MS(250)).await;
     let (submitted, _log) = submit(&fixture_, proof(&fixture_, true));
-    append.entered.notified().await;
-    // The runtime acknowledgement clock has started by append entry. Hold the
+    commit.entered.notified().await;
+    // The runtime acknowledgement clock has started by COMMIT entry. Hold the
     // same 350ms from that observed event, not from earlier fixture/proof work.
     let started = TokioInstant::now();
     tokio::time::sleep_until(started + MS(350)).await;
     assert!(
         !submitted.is_finished(),
-        "a found block was refused at the share deadline"
+        "a found block's in-flight COMMIT was answered at the share deadline"
     );
-    append.release.notify_one();
+    commit.release.notify_one();
     submitted
         .await
         .unwrap()
@@ -254,11 +255,12 @@ async fn commit_reconcile_candidate_bearing_append_is_never_refused() {
         assert!(records[0].1.is_some(), "the found block was discarded");
     }
 
-    // Held past the block-only bound: unknown, and the append runs on.
+    // Held before COMMIT past the share deadline: unknown there, not at the
+    // block-only bound, and the append runs on.
     let fixture = fixture(
         |config| {
             config.share_commit_timeout = MS(200);
-            config.block_only_ack_timeout = MS(400);
+            config.block_only_ack_timeout = MS(1000);
         },
         None,
     )
@@ -273,8 +275,13 @@ async fn commit_reconcile_candidate_bearing_append_is_never_refused() {
         "ledger-outcome-unknown",
         "share outcome is not yet known",
     );
-    assert!(started.elapsed() >= MS(400));
+    assert!(started.elapsed() >= MS(200) && started.elapsed() < MS(1000));
     assert!(log.text().contains("candidate-pending"), "{}", log.text());
+    assert!(fixture
+        .coordinator
+        .metrics
+        .render()
+        .contains("qbit_prism_block_proof_ack_capped_total{path=\"share\"} 1\n"));
     append.release.notify_one();
     eventually("the candidate-bearing append to land", || {
         records(&fixture) == 1

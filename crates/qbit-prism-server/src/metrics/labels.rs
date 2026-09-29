@@ -126,6 +126,10 @@ labels!(CaptureDecision {
 labels!(StandbyWaitOutcome {
     Confirmed => "confirmed", Absent => "absent", Lagging => "lagging", Failed => "failed"
 });
+// #574: which wait a block-bearing submission's acknowledgement cap ended: the
+// share-pass append that carries the block, or a block-only, deferred or
+// captured proof's wait for its enqueue and landing.
+labels!(BlockAckPath { Share => "share", BlockOnly => "block_only" });
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.
