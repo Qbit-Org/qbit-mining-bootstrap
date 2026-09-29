@@ -215,7 +215,8 @@ jobs:
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
   # That is #523's qbitd -reindex crash variant, #524's 130-payee
-  # weighted-recipients variant and scenario 5's dense-cadence soak.
+  # weighted-recipients variant, scenario 5's dense-cadence soak, and #575's
+  # PostgreSQL disk-exhaustion and wall-clock-jump variants.
   live-nightly:
     name: Live regtest nightly variants
     if: ${{ github.event.schedule == '17 2 * * *' || inputs.live }}
@@ -252,6 +253,12 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # #575: the disk-exhaustion variant mounts a small ext4 image with
+      # fuse2fs (no root), the clock-jump variant preloads libfaketime.
+      - name: Install the disk-full and clock-jump tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fuse2fs fuse3 faketime libfaketime
       - name: Restore the pinned qbit release from the cache
         uses: actions/cache/restore@v6
         with:
