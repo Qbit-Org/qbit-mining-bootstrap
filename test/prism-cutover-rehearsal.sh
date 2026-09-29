@@ -6,7 +6,8 @@
 #   test/prism-cutover-rehearsal.sh generated  both: write a mainnet-shaped dump
 #                                              under WORKDIR and rehearse it
 #
-# rehearse restores DUMP (custom, directory, tar or plain format) into a
+# rehearse restores DUMP (custom, directory, tar or plain format; a plain dump
+# must be taken with --no-owner --no-privileges) into a
 # private PostgreSQL cluster it creates under WORKDIR and removes afterwards,
 # runs check-config, migrate and import-audits exactly as
 # docs/prism-rust-migration.md does, checks the recovery evidence, balances,
@@ -19,9 +20,12 @@
 #   AUDIT_ROOT=<dir>       external audit bodies and canonical sidecars, mounted
 #                          at their recorded paths (default: none)
 #   SCHEMA=<name>          the ledger schema (default: the one holding qbit_share_ledger)
-#   NODE_RPC=<url>         an operator's synced qbitd for the frontend, with
-#                          NODE_USER, NODE_PASSWORD and NODE_CHAIN (default main);
-#                          default: a node serving the dump's own chain
+#   ENV_FILE=<file>        the reviewed production environment the real cutover
+#                          uses (NAME=value lines): its synced node, chain,
+#                          genesis pin, signing keys and pool fee. Only the
+#                          database URL, listen ports and instance ID are
+#                          replaced. Default: a lab configuration with test
+#                          keys and a node serving the dump's own chain
 #   STATEMENT_TIMEOUT_MS=<ms>  the PRISM_DATABASE_STATEMENT_TIMEOUT_MS the real
 #                          migrate will run with (default: the server's 15000)
 #   REPORT=<file>          also write the report as JSON
@@ -75,7 +79,7 @@ export_optional() {
 GENERATED_LEDGER_KEY=a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0
 
 if [[ "${mode}" == generated ]]; then
-  workdir="${WORKDIR:-}"
+  workdir="${WORKDIR:+$(realpath -m "${WORKDIR}")}"
   if [[ -z "${workdir}" ]]; then
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/prism-cutover-rehearsal.XXXXXX")"
     if [[ "${KEEP:-0}" != 1 ]]; then
@@ -97,18 +101,16 @@ case "${mode}" in
     PRISM_REHEARSAL_DUMP="$(realpath "${DUMP}")"
     export PRISM_REHEARSAL_DUMP
     export PRISM_REHEARSAL_LEDGER_PUBLIC_KEY_HEX="${LEDGER_KEY}"
-    export_optional PRISM_REHEARSAL_AUDIT_ROOT "${AUDIT_ROOT:-}"
+    # cargo runs the test from the crate directory: every path is absolute.
+    export_optional PRISM_REHEARSAL_AUDIT_ROOT "${AUDIT_ROOT:+$(realpath -m "${AUDIT_ROOT}")}"
     export_optional PRISM_REHEARSAL_SCHEMA "${SCHEMA:-}"
-    export_optional PRISM_REHEARSAL_NODE_RPC "${NODE_RPC:-}"
-    export_optional PRISM_REHEARSAL_NODE_USER "${NODE_USER:-}"
-    export_optional PRISM_REHEARSAL_NODE_PASSWORD "${NODE_PASSWORD:-}"
-    export_optional PRISM_REHEARSAL_NODE_CHAIN "${NODE_CHAIN:-}"
+    export_optional PRISM_REHEARSAL_ENV_FILE "${ENV_FILE:+$(realpath -m "${ENV_FILE}")}"
     report_path=""
     if [[ -n "${REPORT:-}" ]]; then
       report_path="$(realpath -m "${REPORT}")"
     fi
     export_optional PRISM_REHEARSAL_REPORT "${report_path}"
-    export_optional PRISM_REHEARSAL_WORKDIR "${WORKDIR:-}"
+    export_optional PRISM_REHEARSAL_WORKDIR "${WORKDIR:+$(realpath -m "${WORKDIR}")}"
     export_optional PRISM_REHEARSAL_STATEMENT_TIMEOUT_MS "${STATEMENT_TIMEOUT_MS:-}"
     test_name=cutover_rehearsal_tests::operator_dump_rehearsal
     ;;

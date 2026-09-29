@@ -89,9 +89,15 @@ impl Target {
 /// The node a rehearsal frontend starts against.
 #[derive(Clone, Debug)]
 pub enum NodeChoice {
-    /// [`node::RehearsalNode`], serving the ledger's own chain.
+    /// [`node::RehearsalNode`], serving the ledger's own chain, with a lab
+    /// configuration and test signing keys.
     Ledger { tag: String },
-    /// An operator's synced node, for a snapshot of its chain.
+    /// The operator's reviewed production environment (`ENV_FILE`): its
+    /// synced node, chain, genesis pin, signing keys and pool fee, as the
+    /// real cutover runs with them. The rehearsal replaces only the database
+    /// URL, the listen addresses and ports, and the instance ID.
+    Operator { env: Vec<(String, String)> },
+    /// A lab node the caller runs, such as the weekly scenario's regtest.
     External {
         url: String,
         user: String,
@@ -108,9 +114,12 @@ pub struct Options {
     pub ledger_public_key: String,
     pub node: NodeChoice,
     pub start_frontend: bool,
-    /// Settings the operator's reviewed environment adds to every command,
-    /// such as `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`.
+    /// Settings added to every command, such as
+    /// `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`.
     pub extra_env: Vec<(String, String)>,
+    /// The evidence of the database the dump was taken from, when the caller
+    /// has it: the restore must reproduce it.
+    pub source_evidence: Option<Value>,
 }
 
 /// One lock a rehearsal step held, as the sampler saw it.
@@ -241,13 +250,36 @@ impl Report {
 // Lock sampling.
 // ---------------------------------------------------------------------------
 
+/// One lock of one session: its object and mode.
+type LockKey = (i32, String, String);
+
 #[derive(Default)]
 struct Samples {
     /// Sampled time each tool statement was seen running, by its text.
     statements: HashMap<String, Duration>,
-    holds: HashMap<(i32, String, String), (Duration, Duration, bool)>,
+    /// Locks seen in the latest sample: when the continuous hold began, when
+    /// it was last seen, and whether it was ever waited for.
+    open: HashMap<LockKey, (Duration, Duration, bool)>,
+    /// Holds that ended: a lock no longer seen closes its interval, so a lock
+    /// released and taken again is two holds, not one.
+    closed: Vec<(LockKey, Duration, Duration, bool)>,
     /// (elapsed, step) at each change of step.
     timeline: Vec<(Duration, String)>,
+}
+
+impl Samples {
+    fn close_unseen(&mut self, seen: &std::collections::HashSet<LockKey>) {
+        let ended: Vec<LockKey> = self
+            .open
+            .keys()
+            .filter(|key| !seen.contains(*key))
+            .cloned()
+            .collect();
+        for key in ended {
+            let (first, last, waited) = self.open.remove(&key).expect("listed above");
+            self.closed.push((key, first, last, waited));
+        }
+    }
 }
 
 /// A side connection sampling the tool's locks and statements.
@@ -257,24 +289,42 @@ struct LockSampler {
     started: Instant,
 }
 
-/// The migration step a tool statement belongs to.
+/// The step an online migration statement belongs to. The migration
+/// transaction sends each migration file whole, and those files name these
+/// functions in their definitions, so only a statement that *is* the call
+/// counts: the online runners send each on its own.
 fn classify(query: &str, previous: &str) -> String {
-    let query = query.to_ascii_lowercase();
-    let online = if query.contains("share_ledger_convert_swap") {
-        Some("migrate: 017 swap")
-    } else if query.contains("share_ledger_convert_validate")
-        || query.contains("validate constraint")
-    {
-        Some("migrate: 017 validate")
-    } else if query.contains("share_ledger_convert_prepare") {
-        Some("migrate: 017 prepare")
-    } else if query.contains("index concurrently") {
-        Some("migrate: 013 concurrent indexes")
-    } else if query.contains("share_partition_ensure") {
-        Some("migrate: 017 lead partitions")
-    } else {
-        None
-    };
+    let query = query.trim_start().to_ascii_lowercase();
+    let online = [
+        (
+            "select qbit_prism_share_ledger_convert_swap(",
+            "migrate: 017 swap",
+        ),
+        (
+            "select qbit_prism_share_ledger_convert_validate(",
+            "migrate: 017 validate",
+        ),
+        (
+            "select qbit_prism_share_ledger_convert_prepare(",
+            "migrate: 017 prepare",
+        ),
+        (
+            "alter table qbit_share_ledger validate constraint",
+            "migrate: 017 validate",
+        ),
+        (
+            "select qbit_prism_share_partition_ensure(",
+            "migrate: 017 lead partitions",
+        ),
+        (
+            "create index concurrently",
+            "migrate: 013 concurrent indexes",
+        ),
+        ("drop index concurrently", "migrate: 013 concurrent indexes"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| query.starts_with(prefix))
+    .map(|(_, step)| step);
     match online {
         Some(step) => step.to_owned(),
         None if previous.is_empty() => "migrate: transaction (001, 002-020)".to_owned(),
@@ -298,17 +348,21 @@ impl LockSampler {
                 let since = at - previous;
                 previous = at;
                 let mut running = std::collections::HashSet::new();
-                let rows = sqlx::query("SELECT a.pid,COALESCE(a.query,'') AS query,a.state,l.locktype,l.mode,l.granted,CASE WHEN l.locktype='relation' THEN c.relname ELSE l.locktype||':'||COALESCE(l.objid::text,'') END AS object FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid AND l.locktype IN ('relation','advisory') LEFT JOIN pg_class c ON c.oid=l.relation LEFT JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.application_name=$1 AND a.pid<>pg_backend_pid() AND (l.locktype IS NULL OR l.locktype='advisory' OR n.nspname=$2)")
+                let mut seen = std::collections::HashSet::new();
+                // A relation is named with its OID, so the release table and
+                // the partitioned parent that takes its name stay apart; an
+                // advisory lock by its full key.
+                let rows = sqlx::query("SELECT a.pid,COALESCE(a.query,'') AS query,a.state,l.mode,l.granted,CASE WHEN l.locktype='relation' THEN c.relname||'#'||l.relation::text ELSE 'advisory:'||l.classid::text||':'||l.objid::text||':'||l.objsubid::text END AS object FROM pg_stat_activity a LEFT JOIN pg_locks l ON l.pid=a.pid AND l.locktype IN ('relation','advisory') LEFT JOIN pg_class c ON c.oid=l.relation LEFT JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.application_name=$1 AND a.pid<>pg_backend_pid() AND (l.locktype IS NULL OR l.locktype='advisory' OR n.nspname=$2)")
                     .bind(TOOL_APPLICATION)
                     .bind(&schema)
                     .fetch_all(&mut connection)
                     .await?;
                 for row in &rows {
+                    let pid: i32 = row.try_get("pid")?;
                     let active =
                         row.try_get::<Option<String>, _>("state")?.as_deref() == Some("active");
                     if active {
                         let query: String = row.try_get("query")?;
-                        let pid: i32 = row.try_get("pid")?;
                         if running.insert((pid, query.clone())) {
                             let text = query.split_whitespace().collect::<Vec<_>>().join(" ");
                             *samples
@@ -329,15 +383,16 @@ impl LockSampler {
                         continue;
                     };
                     let granted = row.try_get::<Option<bool>, _>("granted")?.unwrap_or(true);
-                    let entry = samples
-                        .holds
-                        .entry((row.try_get("pid")?, object, mode))
-                        .or_insert((at, at, false));
+                    let key = (pid, object, mode);
+                    seen.insert(key.clone());
+                    let entry = samples.open.entry(key).or_insert((at, at, false));
                     entry.1 = at;
                     entry.2 |= !granted;
                 }
+                samples.close_unseen(&seen);
                 tokio::time::sleep(LOCK_SAMPLE).await;
             }
+            samples.close_unseen(&std::collections::HashSet::new());
             connection.close().await?;
             Ok(samples)
         });
@@ -348,8 +403,9 @@ impl LockSampler {
         })
     }
 
-    /// Stops sampling and returns, per step, the locks first seen in it,
-    /// longest first, with each step's wall time.
+    /// Stops sampling and returns, per step, the continuous lock holds that
+    /// began in it, longest first, with each step's wall time; and the
+    /// statements the tool spent the most sampled time in.
     async fn finish(
         self,
         fallback: &str,
@@ -371,12 +427,17 @@ impl LockSampler {
                 None => steps.push((name.clone(), to - *from, Vec::new())),
             }
         }
-        for ((_, object, mode), (first, last, waited)) in samples.holds {
+        for ((_, object, mode), first, last, waited) in samples.closed {
             let step = timeline
                 .iter()
                 .rev()
                 .find(|(at, _)| *at <= first)
                 .map_or(&timeline[0].1, |(_, name)| name);
+            // The OID only keeps relations apart while sampling.
+            let object = object
+                .split_once('#')
+                .map_or(object.as_str(), |(name, _)| name)
+                .to_owned();
             let hold = LockHold {
                 object,
                 mode,
@@ -441,7 +502,45 @@ fn free_port() -> Result<u16> {
 
 /// The environment of the rehearsal's frontend and of every operator
 /// command, cleared of anything inherited (EP-CONFIG).
-fn frontend_env(
+/// [`lab_env`], or for [`NodeChoice::Operator`] the operator's own
+/// environment with only what must be the rehearsal's replaced.
+fn command_env(
+    database_url: &str,
+    node: &NodeChoice,
+    lab_node: &(String, String, String, String),
+    ports: &Ports,
+) -> Vec<(String, String)> {
+    let NodeChoice::Operator { env } = node else {
+        return lab_env(database_url, lab_node, ports);
+    };
+    let replaced = [
+        ("PRISM_DATABASE_URL", database_url.to_owned()),
+        ("PRISM_PUBLIC_DATABASE_URL", database_url.to_owned()),
+        ("PRISM_POSTGRES_INIT_SCHEMA", "0".to_owned()),
+        ("PRISM_INSTANCE_ID", "cutover-rehearsal".to_owned()),
+        ("PRISM_STRATUM_BIND", "127.0.0.1".to_owned()),
+        ("PRISM_STRATUM_PORT", ports.stratum.to_string()),
+        ("PRISM_STRATUM_HIGHDIFF_PORT", ports.highdiff.to_string()),
+        ("PRISM_AUDIT_BIND", "127.0.0.1".to_owned()),
+        ("PRISM_AUDIT_PORT", ports.api.to_string()),
+        ("PRISM_PUBLIC_CACHE_ENABLED", "0".to_owned()),
+        ("PRISM_CTV_BROADCASTER_ENABLED", "0".to_owned()),
+    ];
+    let mut merged: Vec<(String, String)> = env
+        .iter()
+        .filter(|(name, _)| !replaced.iter().any(|(replace, _)| replace == name))
+        .cloned()
+        .collect();
+    merged.extend(
+        replaced
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
+    merged
+}
+
+/// A lab frontend's environment: test signing keys, a 200 bps pool fee.
+fn lab_env(
     database_url: &str,
     node: &(String, String, String, String),
     ports: &Ports,
@@ -587,11 +686,18 @@ const TABLE_FACTS: &[(&str, &str)] = &[
     ("qbit_ctv_fanout_sets", "count(*)::text||'/'||COALESCE(sum(fanout_output_sum_sats),0)::text"),
     ("qbit_ctv_fanout_artifacts", "count(*)::text||'/'||COALESCE(string_agg(settlement_status,',' ORDER BY fanout_txid),'')"),
     ("qbit_ctv_fanout_broadcast_attempts", "count(*)::text"),
-    ("qbit_hashrate_rollup_pool", "count(*)::text||'/'||COALESCE(sum(accepted_share_count),0)::text||'/'||COALESCE(sum(accepted_share_difficulty),0)::text"),
+    ("qbit_hashrate_rollup_pool", "count(*)::text||'/'||COALESCE(sum(accepted_share_count),0)::text||'/'||COALESCE(sum(accepted_share_difficulty),0)::text||'/'||COALESCE(md5(string_agg(grain_seconds||':'||bucket_epoch||':'||accepted_share_count||':'||accepted_share_difficulty,',' ORDER BY grain_seconds,bucket_epoch)),'')"),
     ("qbit_hashrate_rollup_miner", "count(*)::text||'/'||COALESCE(sum(accepted_share_count),0)::text||'/'||COALESCE(sum(accepted_share_difficulty),0)::text||'/'||COALESCE(md5(string_agg(grain_seconds||':'||bucket_epoch||':'||miner_id||':'||accepted_share_count||':'||accepted_share_difficulty,',' ORDER BY grain_seconds,bucket_epoch,miner_id)),'')"),
     ("qbit_hashrate_rollup_progress", "COALESCE(max(last_share_seq),-1)::text"),
-    ("qbit_worker_difficulty", "count(*)::text||'/'||COALESCE(md5(string_agg(listener||':'||worker_username||':'||difficulty||':'||evidence_at,',' ORDER BY listener,worker_username)),'')"),
+    ("qbit_worker_difficulty", "count(*)::text||'/'||COALESCE(md5(string_agg(listener||':'||worker_username||':'||difficulty||':'||evidence_at||':'||updated_at,',' ORDER BY listener,worker_username)),'')"),
+    ("qbit_ledger_writer_lease", "COALESCE(string_agg(writer_id||':'||writer_epoch||':'||writer_session_token||':'||lease_expires_at||':'||updated_at,','),'')"),
+    // An independent recomputation of every balance from the carry rows,
+    // not from the summary table the owed balances read.
+    ("qbit_recomputed_carry_forward_balances()", "count(*)::text||'/'||COALESCE(md5(string_agg(miner_id||':'||payout_order_key||':'||encode(p2mr_program,'hex')||':'||balance_sats,',' ORDER BY p2mr_program)),'')"),
 ];
+/// The facts a running frontend may change without touching history: it
+/// prunes retained vardiff past its evidence TTL.
+const FRONTEND_MAY_CHANGE: &[&str] = &["qbit_worker_difficulty"];
 
 /// Every address's balances as the public API computes them
 /// (`src/api/public.rs`, `miner`): owed, lifetime and pending maturity.
@@ -639,8 +745,9 @@ pub async fn table_facts(pool: &PgPool) -> Result<BTreeMap<String, String>> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Window {
     pub network_difficulty: u128,
-    /// (share_seq, share_id, miner_id, share_difficulty), newest first.
-    pub shares: Vec<(i64, String, String, String)>,
+    /// (share_seq, share_id, miner_id, share_difficulty, credit_policy),
+    /// newest first.
+    pub shares: Vec<(i64, String, String, String, Option<String>)>,
     /// (recipient, order key, program hex, balance).
     pub prior_balances: Vec<(String, String, String, String)>,
 }
@@ -656,7 +763,7 @@ async fn latest_network_difficulty(pool: &PgPool) -> Result<u128> {
 pub async fn legacy_window(pool: &PgPool) -> Result<Window> {
     let network_difficulty = latest_network_difficulty(pool).await?;
     let weight = network_difficulty * qbit_prism::PRISM_WINDOW_MULTIPLIER;
-    let shares = sqlx::query_as("SELECT share_seq,share_id,miner_id,share_difficulty::text FROM qbit_prism_window(clock_timestamp(),$1::numeric) ORDER BY share_seq DESC")
+    let shares = sqlx::query_as("SELECT share_seq,share_id,miner_id,share_difficulty::text,credit_policy FROM qbit_prism_window(clock_timestamp(),$1::numeric) ORDER BY share_seq DESC")
         .bind(weight.to_string())
         .fetch_all(pool)
         .await?;
@@ -671,9 +778,12 @@ pub async fn legacy_window(pool: &PgPool) -> Result<Window> {
     })
 }
 
-/// The native snapshot a frontend builds its next job from.
+/// The native snapshot a frontend builds its next job from, read as an
+/// operator tool: a tool registers no frontend heartbeat, so the ledger a
+/// frontend later starts on is the one the real cutover leaves.
 pub async fn native_window(url: &str, network_difficulty: u128) -> Result<Window> {
-    let ledger = Ledger::connect(url, "cutover-rehearsal".into(), 2, false).await?;
+    let ledger =
+        Ledger::connect_tool(url, "cutover-rehearsal-window".into(), 2, false, None).await?;
     let snapshot = ledger.snapshot(network_difficulty).await;
     ledger.pool.close().await;
     let snapshot = snapshot?;
@@ -686,10 +796,13 @@ pub async fn native_window(url: &str, network_difficulty: u128) -> Result<Window
                 share.share_id,
                 share.miner_id,
                 share.share_difficulty.to_string(),
+                share.credit_policy,
             )
         })
         .collect();
-    shares.sort_by_key(|share| std::cmp::Reverse(share.0));
+    // The snapshot's own order is its contract with the payout engine;
+    // compare it as returned, newest first.
+    shares.reverse();
     let mut prior_balances: Vec<_> = snapshot
         .prior_balances
         .into_iter()
@@ -777,6 +890,20 @@ pub async fn rehearse(
         "pending_payout_addresses": before.balances.values().filter(|b| b.2 != "0").count(),
     });
     report.rows["bytes_before"] = sizes(&target.pool).await?;
+    if let Some(source) = &options.source_evidence {
+        report.check(
+            "restore reproduces the source",
+            *source == before.evidence,
+            if *source == before.evidence {
+                "evidence equal".to_owned()
+            } else {
+                first_difference(
+                    &json_map(&source["records"]),
+                    &json_map(&before.evidence["records"]),
+                )
+            },
+        );
+    }
     report.check(
         "source drained",
         before.evidence["unfinished_candidates"] == 0,
@@ -808,18 +935,26 @@ pub async fn rehearse(
             rehearsal_node = None;
             (url.clone(), user.clone(), password.clone(), chain.clone())
         }
+        NodeChoice::Operator { .. } => {
+            rehearsal_node = None;
+            Default::default()
+        }
     };
     let ports = Ports {
         stratum: free_port()?,
         highdiff: free_port()?,
         api: free_port()?,
     };
-    let mut env = frontend_env(&target.tool_url()?, &node, &ports);
+    let mut env = command_env(&target.tool_url()?, &options.node, &node, &ports);
     env.extend(options.extra_env.iter().cloned());
-    // The import verifies history against the trusted key and needs no
-    // signing seed; with one, the key would have to be the seed's own.
+    // The import verifies history against the trusted key. A lab run's test
+    // seeds are not that key's, and the import needs no seed; the operator's
+    // own seeds are.
     let mut import_env = env.clone();
-    import_env.retain(|(name, _)| !name.contains("SIGNING_SEED"));
+    if !matches!(options.node, NodeChoice::Operator { .. }) {
+        import_env.retain(|(name, _)| !name.contains("SIGNING_SEED"));
+    }
+    import_env.retain(|(name, _)| name != "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX");
     import_env.push((
         "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX".into(),
         options.ledger_public_key.clone(),
@@ -899,7 +1034,7 @@ pub async fn rehearse(
     let window = native_window(&target.url, before.window.network_difficulty).await?;
     report.check(
         "payout window unchanged",
-        window.shares == before.window.shares,
+        !before.window.shares.is_empty() && window.shares == before.window.shares,
         format!(
             "native {} shares, 2.x.x {} shares, digest {}",
             window.shares.len(),
@@ -924,7 +1059,30 @@ pub async fn rehearse(
     report.rows["bytes_after"] = sizes(&target.pool).await?;
 
     if options.start_frontend {
-        frontend(report, &env, &ports, &before.balances).await?;
+        // A synced node's tip is past the snapshot's, so the frontend may
+        // mature blocks the source left immature: their pending balance then
+        // moves, legitimately.
+        let exact_pending = !matches!(options.node, NodeChoice::Operator { .. });
+        frontend(report, &env, &ports, &before.balances, exact_pending).await?;
+        // What the frontend's startup and reconciliation left of history.
+        let after_run = table_facts(&target.pool).await?;
+        let unchanged = |facts: &BTreeMap<String, String>| {
+            facts
+                .iter()
+                .filter(|(table, _)| !FRONTEND_MAY_CHANGE.contains(&table.as_str()))
+                .map(|(table, fact)| (table.clone(), fact.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (expected, found) = (unchanged(&before.facts), unchanged(&after_run));
+        report.check(
+            "history unchanged after the frontend ran",
+            !exact_pending || expected == found,
+            if expected == found {
+                format!("{} tables", found.len())
+            } else {
+                first_difference(&expected, &found)
+            },
+        );
     }
     drop(rehearsal_node);
     report.finish();
@@ -971,6 +1129,7 @@ async fn frontend(
     env: &[(String, String)],
     ports: &Ports,
     before: &Balances,
+    exact_pending: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let log = tempfile::NamedTempFile::new()?;
@@ -1018,15 +1177,29 @@ async fn frontend(
     }
 
     let started = Instant::now();
-    let api = api_balances(&client, ports.api, before).await?;
+    let mut api = api_balances(&client, ports.api, before).await?;
     report.step("API balances", started.elapsed(), Vec::new());
+    let mut expected = before.clone();
+    if !exact_pending {
+        for balances in expected.values_mut().chain(api.values_mut()) {
+            balances.2.clear();
+        }
+    }
     report.check(
         "API balances equal the source",
-        &api == before,
-        if &api == before {
-            format!("{} addresses", api.len())
+        api == expected,
+        if api == expected {
+            format!(
+                "{} addresses{}",
+                api.len(),
+                if exact_pending {
+                    ""
+                } else {
+                    ", owed and lifetime"
+                }
+            )
         } else {
-            first_difference(before, &api)
+            first_difference(&expected, &api)
         },
     );
 
@@ -1051,7 +1224,12 @@ async fn frontend(
     // The highdiff probe authorizes as a ledger address, as an operator
     // names one with PRISM_SELF_CHECK_ADDRESS.
     let mut env = env.to_vec();
-    env.push(("PRISM_SELF_CHECK_ADDRESS".into(), username.clone()));
+    if !env
+        .iter()
+        .any(|(name, _)| name == "PRISM_SELF_CHECK_ADDRESS")
+    {
+        env.push(("PRISM_SELF_CHECK_ADDRESS".into(), username.clone()));
+    }
     let (ok, output, errors) = run_tool(&env, &["self-check"]).await?;
     let parsed: Value = serde_json::from_str(&output).unwrap_or(Value::Null);
     report.step("self-check", started.elapsed(), Vec::new());
@@ -1163,41 +1341,64 @@ async fn first_job(port: u16, username: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// A private PostgreSQL cluster: created with `initdb`, `fsync` on, listening
-/// on loopback only, stopped and removed when dropped.
+/// on loopback only with a random password (a shared host's other users
+/// cannot reach the snapshot), stopped and removed when dropped, even after
+/// a start that failed half way.
 pub struct PrivateCluster {
     pg_bin: PathBuf,
     data: tempfile::TempDir,
+    password: String,
+    running: bool,
     pub port: u16,
 }
 
 impl PrivateCluster {
-    pub fn start(pg_bin: &Path, parent: &Path) -> Result<Self> {
+    pub async fn start(pg_bin: &Path, parent: &Path) -> Result<Self> {
+        let (pg_bin, parent) = (pg_bin.to_owned(), parent.to_owned());
+        tokio::task::spawn_blocking(move || Self::start_blocking(pg_bin, &parent)).await?
+    }
+
+    fn start_blocking(pg_bin: PathBuf, parent: &Path) -> Result<Self> {
         let data = tempfile::Builder::new()
             .prefix("prism-rehearsal-pg-")
             .tempdir_in(parent)?;
-        let status = std::process::Command::new(pg_bin.join("initdb"))
+        let password = uuid::Uuid::new_v4().simple().to_string();
+        let password_file = data.path().join("password");
+        std::fs::write(&password_file, &password)?;
+        let mut cluster = Self {
+            pg_bin,
+            data,
+            password,
+            running: false,
+            port: free_port()?,
+        };
+        let status = std::process::Command::new(cluster.pg_bin.join("initdb"))
             .args([
                 "-U",
                 "rehearsal",
-                "--auth=trust",
+                "--auth=scram-sha-256",
                 "-E",
                 "UTF8",
                 "--no-sync",
-                "-D",
             ])
-            .arg(data.path().join("data"))
+            .arg(format!("--pwfile={}", password_file.display()))
+            .arg("-D")
+            .arg(cluster.data.path().join("data"))
             .stdout(Stdio::null())
             .status()?;
+        std::fs::remove_file(&password_file)?;
         ensure!(status.success(), "initdb failed");
-        let port = free_port()?;
-        let status = std::process::Command::new(pg_bin.join("pg_ctl"))
+        // Marked first, so a start that fails half way is still stopped.
+        cluster.running = true;
+        let status = std::process::Command::new(cluster.pg_bin.join("pg_ctl"))
             .arg("-D")
-            .arg(data.path().join("data"))
+            .arg(cluster.data.path().join("data"))
             .arg("-l")
-            .arg(data.path().join("postgres.log"))
+            .arg(cluster.data.path().join("postgres.log"))
             .arg("-o")
             .arg(format!(
-                "-p {port} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c fsync=on -c full_page_writes=on -c synchronous_commit=on -c max_connections=100"
+                "-p {} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c fsync=on -c full_page_writes=on -c synchronous_commit=on -c max_connections=100",
+                cluster.port
             ))
             .args(["-w", "start"])
             .stdout(Stdio::null())
@@ -1205,29 +1406,46 @@ impl PrivateCluster {
         ensure!(
             status.success(),
             "pg_ctl start failed: {}",
-            std::fs::read_to_string(data.path().join("postgres.log")).unwrap_or_default()
+            std::fs::read_to_string(cluster.data.path().join("postgres.log")).unwrap_or_default()
         );
-        Ok(Self {
-            pg_bin: pg_bin.to_owned(),
-            data,
-            port,
-        })
+        Ok(cluster)
     }
 
+    /// A URL for `database`, with the cluster's password.
     pub fn url(&self, database: &str) -> String {
-        format!("postgresql://rehearsal@127.0.0.1:{}/{database}", self.port)
+        format!(
+            "postgresql://rehearsal:{}@127.0.0.1:{}/{database}",
+            self.password, self.port
+        )
     }
 }
 
 impl Drop for PrivateCluster {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
-            .arg("-D")
-            .arg(self.data.path().join("data"))
-            .args(["-m", "immediate", "-w", "stop"])
-            .stdout(Stdio::null())
-            .status();
+        if self.running {
+            let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
+                .arg("-D")
+                .arg(self.data.path().join("data"))
+                .args(["-m", "immediate", "-w", "stop"])
+                .stdout(Stdio::null())
+                .status();
+        }
     }
+}
+
+/// How a dump was written: `pg_restore` reads the archive formats, `psql` a
+/// plain SQL script.
+fn is_archive(dump: &Path) -> Result<bool> {
+    if dump.is_dir() {
+        return Ok(true);
+    }
+    use std::io::Read;
+    let mut header = Vec::with_capacity(512);
+    std::fs::File::open(dump)?
+        .take(512)
+        .read_to_end(&mut header)?;
+    // Custom format starts with PGDMP; a tar archive has `ustar` at 257.
+    Ok(header.starts_with(b"PGDMP") || header.get(257..262) == Some(b"ustar".as_slice()))
 }
 
 /// A rehearsal of a supplied dump.
@@ -1246,20 +1464,31 @@ pub async fn rehearse_dump(rehearsal: &DumpRehearsal, report: &mut Report) -> Re
     let metadata = std::fs::metadata(&rehearsal.dump)
         .with_context(|| format!("reading the dump {}", rehearsal.dump.display()))?;
     ensure!(metadata.len() > 0, "the dump is empty");
+    if let Some(schema) = &rehearsal.schema {
+        ensure!(
+            !schema.is_empty()
+                && schema
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !schema.starts_with(|c: char| c.is_ascii_digit()),
+            "the schema must be a lower-case SQL identifier, not {schema:?}"
+        );
+    }
     let started = Instant::now();
-    let cluster = PrivateCluster::start(&rehearsal.options.pg_bin, &rehearsal.workdir)?;
+    let cluster = PrivateCluster::start(&rehearsal.options.pg_bin, &rehearsal.workdir).await?;
     let admin_url = cluster.url("postgres");
     let admin = PgPool::connect(&admin_url).await?;
     sqlx::query("CREATE DATABASE rehearsal")
         .execute(&admin)
         .await?;
     let database_url = cluster.url("rehearsal");
-    let mut header = [0u8; 5];
-    {
-        use std::io::Read;
-        std::fs::File::open(&rehearsal.dump)?.read_exact(&mut header)?;
-    }
-    let restore = if &header == b"PGDMP" || rehearsal.dump.is_dir() {
+    // The password reaches the clients through the environment, never
+    // their arguments.
+    let client_url = format!(
+        "postgresql://rehearsal@127.0.0.1:{}/rehearsal",
+        cluster.port
+    );
+    let restore = if is_archive(&rehearsal.dump)? {
         Command::new(rehearsal.options.pg_bin.join("pg_restore"))
             .args([
                 "--no-owner",
@@ -1267,16 +1496,20 @@ pub async fn rehearse_dump(rehearsal: &DumpRehearsal, report: &mut Report) -> Re
                 "--exit-on-error",
                 "--dbname",
             ])
-            .arg(&database_url)
+            .arg(&client_url)
             .arg(&rehearsal.dump)
+            .env("PGPASSWORD", &cluster.password)
             .output()
             .await?
     } else {
+        // A plain dump replays its own OWNER and GRANT statements: take it
+        // with --no-owner --no-privileges, or use an archive format.
         Command::new(rehearsal.options.pg_bin.join("psql"))
             .args(["-X", "-q", "-v", "ON_ERROR_STOP=1", "--dbname"])
-            .arg(&database_url)
+            .arg(&client_url)
             .arg("-f")
             .arg(&rehearsal.dump)
+            .env("PGPASSWORD", &cluster.password)
             .output()
             .await?
     };

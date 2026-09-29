@@ -561,10 +561,12 @@ impl MainnetShape {
     }
 
     /// The per-PR rehearsal: every mainnet feature at about 25,000 rows and
-    /// 60 blocks, each block state present, over the same 76 days.
+    /// 40 blocks, each block state present, over the same 76 days. At 40
+    /// blocks the payout window (eight blocks' work) spans more than one
+    /// 4,096-row page of both window readers.
     pub fn pull_request() -> Self {
         let mut shape = Self::mainnet(1, 1.0 / 2_600.0).expect("static shape");
-        shape.blocks = 60;
+        shape.blocks = 40;
         shape.inactive_every = 20;
         shape.reversed_every = 29;
         shape.rejected_every = 23;
@@ -1115,6 +1117,10 @@ impl MainnetPlan {
             .filter(|block| block.found_ms > self.end_ms - MATURITY_HEIGHTS as i64 * 60_000)
             .count();
         let immature = recent.max(self.shape.min_immature).min(self.blocks.len());
+        ensure!(
+            (immature as u64) < MATURITY_HEIGHTS,
+            "{immature} immature blocks do not fit under the maturity depth"
+        );
         let settled = self.blocks.len() - immature;
         for (index, block) in self.blocks.iter_mut().enumerate() {
             block.state = if index >= settled {

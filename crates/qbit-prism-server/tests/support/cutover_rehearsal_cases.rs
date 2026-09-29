@@ -42,7 +42,32 @@ async fn seed_and_dump(
     let (_, summary) = plan
         .write(&source.pool, artifacts, &chain, &coinbase_key, &ledger_key)
         .await?;
-    let output = tokio::process::Command::new(pg_bin.join("pg_dump"))
+    // The database URL without the search_path option the pool added, every
+    // other connection parameter kept; a password goes through the
+    // environment rather than pg_dump's arguments.
+    let mut url = url::Url::parse(&source.url)?;
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| name != "options")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !kept.is_empty() {
+        url.query_pairs_mut().extend_pairs(kept);
+    }
+    let password = url.password().map(str::to_owned);
+    url.set_password(None)
+        .map_err(|_| anyhow::anyhow!("the database URL cannot hold a password"))?;
+    let mut command = tokio::process::Command::new(pg_bin.join("pg_dump"));
+    if let Some(password) = password {
+        command.env(
+            "PGPASSWORD",
+            percent_encoding::percent_decode_str(&password)
+                .decode_utf8()?
+                .into_owned(),
+        );
+    }
+    let output = command
         .args([
             "--format=custom",
             "--no-owner",
@@ -53,7 +78,7 @@ async fn seed_and_dump(
         .arg("--file")
         .arg(dump)
         .arg("--dbname")
-        .arg(source.url.split('?').next().unwrap_or_default())
+        .arg(url.as_str())
         .output()
         .await?;
     ensure!(
@@ -107,6 +132,8 @@ async fn mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance() 
                 "no {state} block: {summary}"
             );
         }
+        // The restore in the private cluster must reproduce this exactly.
+        let source_evidence = recovery::evidence(&source, &pg_bin).await?;
         let mut report = rehearsal::Report::new(summary);
         rehearsal::rehearse_dump(
             &rehearsal::DumpRehearsal {
@@ -121,6 +148,7 @@ async fn mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance() 
                     },
                     start_frontend: true,
                     extra_env: Vec::new(),
+                    source_evidence: Some(source_evidence),
                 },
                 workdir: work.path().to_owned(),
             },
@@ -133,11 +161,11 @@ async fn mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance() 
             "the cutover rehearsal failed:\n{}",
             report.render()
         );
+        // The online steps take milliseconds at this size and may fall
+        // between two lock samples; the transaction and the commands cannot.
         for step in [
             "migrate: transaction (001, 002-020)",
-            "migrate: 013 concurrent indexes",
-            "migrate: 017 validate",
-            "migrate: 017 swap",
+            "migrate (total)",
             "import-audits",
             "first Stratum job",
         ] {
@@ -151,6 +179,15 @@ async fn mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance() 
                 .as_u64()
                 .is_some_and(|count| count > 0),
             "no pending payouts to carry across"
+        );
+        // Both window readers page 4,096 rows at a time: the window must span
+        // more than one page for the comparison to cover the paging.
+        ensure!(
+            report.rows["window_shares"]
+                .as_u64()
+                .is_some_and(|shares| shares > 4_096),
+            "the payout window is too small to span a page: {}",
+            report.rows["window_shares"]
         );
         anyhow::Ok(())
     }
@@ -172,6 +209,47 @@ fn setting(name: &str) -> Result<Option<String>> {
 
 fn required(name: &str) -> Result<String> {
     setting(name)?.with_context(|| format!("set {name}"))
+}
+
+/// An operator's reviewed environment file: `NAME=value` lines, `#`
+/// comments, an optional `export` and optional matching quotes. Values are
+/// never printed.
+fn env_file(path: &Path) -> Result<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading PRISM_REHEARSAL_ENV_FILE {}", path.display()))?;
+    let mut env = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (name, value) = line
+            .split_once('=')
+            .with_context(|| format!("{}:{}: not NAME=value", path.display(), number + 1))?;
+        ensure!(
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "{}:{}: {name:?} is not a variable name",
+            path.display(),
+            number + 1
+        );
+        let value = value.trim();
+        let value = ['"', '\'']
+            .into_iter()
+            .find_map(|quote| {
+                value
+                    .strip_prefix(quote)
+                    .and_then(|inner| inner.strip_suffix(quote))
+            })
+            .unwrap_or(value);
+        env.push((name.to_owned(), value.to_owned()));
+    }
+    ensure!(
+        !env.is_empty(),
+        "PRISM_REHEARSAL_ENV_FILE {} sets nothing",
+        path.display()
+    );
+    Ok(env)
 }
 
 /// `make prism-cutover-rehearsal DUMP=<pg_dump> LEDGER_KEY=<hex>`: rehearses
@@ -205,16 +283,10 @@ async fn operator_dump_rehearsal() -> Result<()> {
         }
         None => empty_root.path().to_owned(),
     };
-    let node = match setting("PRISM_REHEARSAL_NODE_RPC")? {
-        Some(url) => {
-            url::Url::parse(&url).context("PRISM_REHEARSAL_NODE_RPC is not a URL")?;
-            rehearsal::NodeChoice::External {
-                url,
-                user: required("PRISM_REHEARSAL_NODE_USER")?,
-                password: required("PRISM_REHEARSAL_NODE_PASSWORD")?,
-                chain: setting("PRISM_REHEARSAL_NODE_CHAIN")?.unwrap_or_else(|| "main".into()),
-            }
-        }
+    let node = match setting("PRISM_REHEARSAL_ENV_FILE")? {
+        Some(path) => rehearsal::NodeChoice::Operator {
+            env: env_file(Path::new(&path))?,
+        },
         None => rehearsal::NodeChoice::Ledger {
             tag: "operator".into(),
         },
@@ -235,7 +307,10 @@ async fn operator_dump_rehearsal() -> Result<()> {
     let mut report = rehearsal::Report::new(serde_json::json!({
         "dump": dump.file_name().map(|name| name.to_string_lossy().into_owned()),
         "dump_bytes": std::fs::metadata(&dump)?.len(),
-        "node": match &node { rehearsal::NodeChoice::Ledger { .. } => "rehearsal node", _ => "operator node" },
+        "configuration": match &node {
+            rehearsal::NodeChoice::Operator { .. } => "the operator's environment",
+            _ => "lab, with the rehearsal node",
+        },
     }));
     let result = rehearsal::rehearse_dump(
         &rehearsal::DumpRehearsal {
@@ -248,6 +323,7 @@ async fn operator_dump_rehearsal() -> Result<()> {
                 node,
                 start_frontend: true,
                 extra_env,
+                source_evidence: None,
             },
             workdir,
         },
@@ -290,7 +366,7 @@ async fn generate_mainnet_shaped_dump() -> Result<()> {
     let audits = out.with_extension("audits");
     std::fs::create_dir_all(&audits)?;
     let workdir = out.parent().unwrap_or(Path::new(".")).to_owned();
-    let cluster = rehearsal::PrivateCluster::start(&pg_bin, &workdir)?;
+    let cluster = rehearsal::PrivateCluster::start(&pg_bin, &workdir).await?;
     let source = recovery::Database::open(&cluster.url("postgres")).await?;
     let started = std::time::Instant::now();
     let summary = seed_and_dump(&source, shape, &audits, &pg_bin, &out).await;

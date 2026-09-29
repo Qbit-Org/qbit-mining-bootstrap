@@ -108,9 +108,11 @@ const WEEKLY_DENSITY: f64 = 1.0 / 16.0;
 /// backfill, one statement inside the migration transaction, times out on
 /// this ledger (#582); drop this once #582 lets `migrate` run on defaults.
 const WEEKLY_STATEMENT_TIMEOUT_MS: &str = "600000";
-/// From about this many ledger rows, 002's backfill outlasts the default
-/// 15 s statement timeout (#582: 26-38 s at 1.03M rows on a 22-core host).
-const KNOWN_582_ROWS: u64 = 1_000_000;
+/// From this many ledger rows, 002's backfill outlasts the default 15 s
+/// statement timeout with a wide margin whatever the runner (#582: 26-38 s
+/// at 1.03M rows and 321 s at 4.13M on a 22-core host), so the weekly 1x/16
+/// ledger checks it and a smaller local run does not.
+const KNOWN_582_ROWS: u64 = 2_000_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "weekly: #575's mainnet-shaped 2.x.x ledger through the measured cutover, mining and rollback; run with --ignored"]
@@ -355,7 +357,7 @@ async fn mine_and_reconcile(
     // report above replays that chain across both eras.
     if expect_continued_carry {
         let continued: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM qbit_payout_carry_forward WHERE carry_forward_seq>$1 AND miner_id LIKE 'legacy-%' AND prior_balance_sats<>0",
+            "SELECT count(*) FROM qbit_payout_carry_forward WHERE carry_forward_seq>$1 AND prior_balance_sats<>0 AND miner_id IN (SELECT miner_id FROM qbit_payout_carry_forward WHERE carry_forward_seq<=$1)",
         )
         .bind(legacy.last_carry_seq)
         .fetch_one(&fixture.pool)
@@ -536,7 +538,12 @@ async fn run_mainnet(
         // timeout refuses a ledger of this size, and changes nothing. When
         // #582 is fixed this fails: drop it and WEEKLY_STATEMENT_TIMEOUT_MS.
         let started_582 = Instant::now();
-        if summary["rows"].as_u64().unwrap_or(0) >= KNOWN_582_ROWS {
+        let rows = summary["rows"].as_u64().unwrap_or(0);
+        if rows < KNOWN_582_ROWS {
+            eprintln!(
+                "#582 expected-failure check skipped: {rows} rows, under the {KNOWN_582_ROWS} it needs"
+            );
+        } else {
             let refused = fixture
                 .tool(&fixture.database_url, &["migrate"])
                 .await
@@ -547,9 +554,13 @@ async fn run_mainnet(
                 refused.contains("canceling statement due to statement timeout"),
                 "migrate at the default statement timeout failed for another reason than #582: {refused}"
             );
+            // One transaction: its native tables, its scratch schema and its
+            // recorded versions all went with the rollback.
+            let leftovers: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'qbit_prism_scratch%')+(SELECT count(*) FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname IN ('qbit_prism_schema_migrations','qbit_prism_cluster','qbit_prism_migration_source','qbit_prism_share_hashes'))")
+                .fetch_one(&fixture.pool)
+                .await?;
             ensure!(
-                recovery::evidence(&source, pg_bin).await? == source_evidence
-                    && native_tables_absent(&fixture.pool).await?,
+                leftovers == 0 && recovery::evidence(&source, pg_bin).await? == source_evidence,
                 "the refused migrate changed the source"
             );
             timings.0.push(("#582 refusal at the default timeout", started_582.elapsed()));
@@ -583,6 +594,9 @@ async fn run_mainnet(
                     "PRISM_DATABASE_STATEMENT_TIMEOUT_MS".into(),
                     WEEKLY_STATEMENT_TIMEOUT_MS.into(),
                 )],
+                // The cutover runs on the source itself; the isolated
+                // restore is checked against it above.
+                source_evidence: None,
             },
             &mut report,
         )
@@ -616,7 +630,7 @@ async fn run_mainnet(
             &legacy_rows,
             &source_evidence,
             &mut timings,
-            false,
+            true,
             Some(&before_balances),
         )
         .await?;
