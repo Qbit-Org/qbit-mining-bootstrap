@@ -42,6 +42,18 @@ mod weighted_recipients_tests;
 #[path = "support/live_dense_soak.rs"]
 mod dense_soak_tests;
 
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
+
+/// The payout policy of the 0-bps fee every live server runs unless a case
+/// sets its own (#535). An in-process coordinator sharing a fixture's cluster
+/// must pin it, or its configuration fingerprint differs from the servers'.
+fn live_payout_policy() -> qbit_prism::PayoutPolicy {
+    let mut policy = qbit_prism::PayoutPolicy::day_one_default();
+    policy.pool_fee_policy = Some(pool_fee::zero_bps_policy());
+    policy
+}
+
 /// Each fixture starts a regtest `qbitd` and two servers, and a server binds
 /// its listeners only after coordinator startup: the schema migrations, which
 /// the second server of a fixture waits for under the migrations table lock,
@@ -551,22 +563,12 @@ impl Fixture {
                     "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
                     "1000",
                 );
-            // #525: CTV settlement refuses to start without a pool fee. A
-            // 0 bps fee pays nothing until sub-floor dust must be swept. A
-            // case that configures its own fee in `server_env` replaces this
-            // one whole: an address beside this program would be refused.
-            if !self
-                .server_env
-                .iter()
-                .any(|(name, _)| name.starts_with("PRISM_POOL_FEE_"))
-            {
-                command
-                    .env("PRISM_POOL_FEE_ENABLED", "1")
-                    .env("PRISM_POOL_FEE_BPS", "0")
-                    .env("PRISM_POOL_FEE_RECIPIENT_ID", "live-pool-fee")
-                    .env("PRISM_POOL_FEE_P2MR_PROGRAM_HEX", "fe".repeat(32));
-            }
         }
+        // #525, #535: every server refuses to start without a pool fee. A
+        // case that configures its own fee in `server_env` replaces this one.
+        let pool_fee =
+            pool_fee::default_pool_fee(self.server_env.iter().map(|(name, _)| name.as_str()));
+        command.envs(pool_fee.iter().copied());
         if let Some(fee) = fee {
             command
                 .env("PRISM_CTV_BROADCASTER_WALLET", "prism")

@@ -30,6 +30,9 @@ mod fake_qbitd;
 #[path = "support/fatal_state.rs"]
 mod fatal_state;
 
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
+
 #[path = "support/candidates_cli.rs"]
 mod candidates_cli;
 

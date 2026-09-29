@@ -302,8 +302,10 @@ pub struct Args {
     /// Pool fee in basis points, as mainnet runs one: every frontend is
     /// launched with `PRISM_POOL_FEE_ENABLED=1`, this `PRISM_POOL_FEE_BPS` and
     /// a fee address of its own, and dust below the payout floor is swept to
-    /// the fee as production sweeps it. 0 (the default) runs with the fee
-    /// off, as every run before this flag did.
+    /// the fee as production sweeps it. 0 (the default) still enables the
+    /// fee, which every server now requires (#535): it pays nothing and adds
+    /// no output until dust must be swept, where a fee-off run would have
+    /// stalled, so runs measured fee-off before #535 reproduce at 0.
     #[arg(long, default_value_t = 0)]
     pub pool_fee_bps: u16,
 

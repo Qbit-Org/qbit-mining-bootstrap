@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{process::Command, time::timeout};
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 async fn check(production: bool, settings: &[(&str, &str)]) -> Output {
     configured_command("check-config", production, settings).await
@@ -60,6 +62,9 @@ async fn configured_command(
             .env("PRISM_STRATUM_VARDIFF_MIN_DIFF", "1")
             .env("PRISM_STRATUM_VARDIFF_START_DIFF", "16")
             .env("PRISM_STRATUM_VARDIFF_MAX_DIFF", "1024");
+    }
+    for (name, value) in pool_fee::default_pool_fee(settings.iter().map(|(name, _)| *name)) {
+        command.env(name, value);
     }
     for (name, value) in settings {
         command.env(name, value);

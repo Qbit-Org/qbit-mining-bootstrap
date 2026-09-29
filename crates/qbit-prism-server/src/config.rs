@@ -14,6 +14,11 @@ pub use database::{public_database_options_from_env, DatabaseConfig};
 pub use environment::check_environment;
 pub(crate) use policy_transition::transition_configs;
 
+/// The pool fee recipient `.env.example` configures for a lab setup (#535):
+/// a synthetic program nobody holds a key for, refused in production.
+pub const DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX: &str =
+    "dfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfee";
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -370,7 +375,9 @@ impl Config {
         if flag("PRISM_POOL_FEE_ENABLED", false)? {
             ensure!(
                 fee_address.is_some() != fee_program.is_some(),
-                "configure exactly one pool fee address or P2MR program"
+                "configure exactly one pool fee address or P2MR program: PRISM_POOL_FEE_ENABLED=1 \
+                 needs PRISM_POOL_FEE_ADDRESS, or PRISM_POOL_FEE_P2MR_PROGRAM_HEX with \
+                 PRISM_POOL_FEE_RECIPIENT_ID, but not both"
             );
             let fee_bps = number("PRISM_POOL_FEE_BPS", 0u16)?;
             ensure!(fee_bps <= 10_000, "pool fee cannot exceed 10000 bps");
@@ -380,9 +387,16 @@ impl Config {
                 .context("pool fee recipient ID is required")?;
             let p2mr_program_hex = fee_program.unwrap_or_default();
             if !p2mr_program_hex.is_empty() {
+                let program = hex::decode(&p2mr_program_hex)?;
+                ensure!(program.len() == 32, "pool fee program must be 32 bytes");
+                // #535: .env.example ships this recipient so a fresh lab
+                // setup is valid; nobody holds its key, so a real pool must
+                // not sweep dust to it.
                 ensure!(
-                    hex::decode(&p2mr_program_hex)?.len() == 32,
-                    "pool fee program must be 32 bytes"
+                    !production || program != hex::decode(DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX)?,
+                    "production rejects the development pool fee recipient from .env.example; set \
+                     PRISM_POOL_FEE_ADDRESS (and clear PRISM_POOL_FEE_P2MR_PROGRAM_HEX) or your own \
+                     PRISM_POOL_FEE_P2MR_PROGRAM_HEX"
                 );
             }
             payout_policy.pool_fee_policy = Some(PoolFeePolicy {
@@ -397,7 +411,8 @@ impl Config {
                 fee_address.is_none()
                     && fee_program.is_none()
                     && optional("PRISM_POOL_FEE_BPS").is_none(),
-                "pool fee configuration requires PRISM_POOL_FEE_ENABLED=1"
+                "pool fee configuration requires PRISM_POOL_FEE_ENABLED=1, which every settlement \
+                 mode requires (PRISM_POOL_FEE_BPS=0 is allowed)"
             );
         }
         payout_policy.coinbase_output_policy =
@@ -569,27 +584,32 @@ impl Config {
         })
     }
 
-    /// #525: refuse a configuration that can build no work once a sub-floor
-    /// balance exists. `apply_payout_policy` selects only the accounts whose
-    /// candidate balance reaches the payout floor, so any positive sub-floor
-    /// balance leaves the selected balances short of the coinbase; only a
-    /// pool fee (`add_swept_dust_to_pool_fee`, at any rate, 0 bps included)
-    /// can take that dust. Without one every work build on the new tip fails
-    /// with `PayoutExceedsCandidateBalance` and mining stops. The non-CTV
-    /// builder applies the same policy and is equally exposed; it is not
-    /// refused here until #535 decides how, and the refresh-stall alert is
-    /// its safety net.
+    /// #525, #535: refuse a configuration that can build no work once a
+    /// sub-floor balance exists. `apply_payout_policy` selects only the
+    /// accounts whose candidate balance reaches the payout floor, so any
+    /// positive sub-floor balance leaves the selected balances short of the
+    /// coinbase; only a pool fee (`add_swept_dust_to_pool_fee`, at any rate,
+    /// 0 bps included) can take that dust. Without one every work build on
+    /// the new tip fails with `PayoutExceedsCandidateBalance` and mining
+    /// stops. CTV and direct settlement apply the same policy, so both
+    /// require a fee.
     ///
     /// Checked where a process would run or validate this policy (`run`,
     /// `check-config`, `self-check` and a policy-transition target), not in
     /// `from_env`: the operator tools, and the current side of the policy
     /// transition that leaves this configuration, must still read it.
     pub fn ensure_pool_fee_settles_dust(&self) -> Result<()> {
+        let mode = if self.ctv_enabled {
+            "PRISM_CTV_SETTLEMENT_ENABLED=1"
+        } else {
+            "direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"
+        };
         ensure!(
-            !self.ctv_enabled || self.payout_policy.pool_fee_policy.is_some(),
-            "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 \
-             is allowed): without a pool fee, sub-floor dust cannot be settled, so the first \
-             positive balance below the payout floor fails every work build and stops mining"
+            self.payout_policy.pool_fee_policy.is_some(),
+            "{mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed) with a \
+             pool fee recipient: without a pool fee, sub-floor dust cannot be settled, so the \
+             first positive balance below the payout floor fails every work build and stops \
+             mining"
         );
         Ok(())
     }
@@ -696,44 +716,47 @@ mod tests {
         })
     }
 
-    /// #525: CTV settlement without a pool fee stalls on the first sub-floor
-    /// balance, so it must be refused, naming both settings and the reason.
+    /// #525, #535: either settlement mode without a pool fee stalls on the
+    /// first sub-floor balance, so it must be refused, naming the mode, the
+    /// setting and the reason.
     #[test]
-    fn ctv_settlement_without_a_pool_fee_is_refused() {
-        let config = automatic_ctv_config();
-        assert!(config.payout_policy.pool_fee_policy.is_none());
-        let error = config
-            .ensure_pool_fee_settles_dust()
-            .unwrap_err()
-            .to_string();
-        for part in [
-            "PRISM_CTV_SETTLEMENT_ENABLED=1",
-            "PRISM_POOL_FEE_ENABLED=1",
-            "PRISM_POOL_FEE_BPS=0",
-            "sub-floor dust cannot be settled",
-            "stops mining",
+    fn settlement_without_a_pool_fee_is_refused_in_every_mode() {
+        for (ctv_enabled, mode) in [
+            (true, "PRISM_CTV_SETTLEMENT_ENABLED=1 requires"),
+            (
+                false,
+                "direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0) requires",
+            ),
         ] {
-            assert!(error.contains(part), "{part:?} missing from {error:?}");
-        }
-    }
-
-    #[test]
-    fn ctv_settlement_with_any_pool_fee_is_accepted() {
-        for fee_bps in [200, 0] {
             let mut config = automatic_ctv_config();
-            config.payout_policy.pool_fee_policy = pool_fee(fee_bps);
-            config.ensure_pool_fee_settles_dust().unwrap();
+            config.ctv_enabled = ctv_enabled;
+            assert!(config.payout_policy.pool_fee_policy.is_none());
+            let error = config
+                .ensure_pool_fee_settles_dust()
+                .unwrap_err()
+                .to_string();
+            for part in [
+                mode,
+                "PRISM_POOL_FEE_ENABLED=1",
+                "PRISM_POOL_FEE_BPS=0 is allowed",
+                "sub-floor dust cannot be settled",
+                "stops mining",
+            ] {
+                assert!(error.contains(part), "{part:?} missing from {error:?}");
+            }
         }
     }
 
-    /// Only CTV settlement is refused (#525). The direct builder applies the
-    /// same policy and is equally exposed; #535 owns flipping this, and until
-    /// then the refresh-stall alert is its safety net.
     #[test]
-    fn direct_settlement_without_a_pool_fee_is_not_refused_here() {
-        let mut config = automatic_ctv_config();
-        config.ctv_enabled = false;
-        config.ensure_pool_fee_settles_dust().unwrap();
+    fn settlement_with_any_pool_fee_is_accepted_in_every_mode() {
+        for ctv_enabled in [true, false] {
+            for fee_bps in [200, 0] {
+                let mut config = automatic_ctv_config();
+                config.ctv_enabled = ctv_enabled;
+                config.payout_policy.pool_fee_policy = pool_fee(fee_bps);
+                config.ensure_pool_fee_settles_dust().unwrap();
+            }
+        }
     }
 
     #[test]

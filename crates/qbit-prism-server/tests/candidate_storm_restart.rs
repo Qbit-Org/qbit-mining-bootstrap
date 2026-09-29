@@ -136,6 +136,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 #[allow(dead_code)]
 #[path = "support/storm_scale.rs"]
 mod storm_scale;
@@ -484,6 +486,7 @@ impl ServerChild {
             .env("QBIT_RPC_URL", node_url)
             .env("PRISM_MIN_PEERS", "1")
             .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1")
+            .envs(pool_fee::ZERO_BPS_POOL_FEE)
             .env("PRISM_MANIFEST_SIGNING_SEED_HEX", "11".repeat(32))
             .env("PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX", &ledger_seed)
             .env(

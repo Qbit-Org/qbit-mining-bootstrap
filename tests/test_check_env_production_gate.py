@@ -174,6 +174,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("QBIT_GIT_COMMIT", None)
         env["PATH"] = f"{self.docker_bin}:{env['PATH']}"
+        # A deployment names its own pool fee recipient: production refuses
+        # .env.example's lab program without one (#535). An empty override
+        # leaves the sourced files' value in place, as for every setting.
+        env["PRISM_POOL_FEE_ADDRESS"] = "qb1doctortestpoolfee"
         # Tests exercising successful Docker checks or a minimal PATH supply
         # their own controlled tool fixtures through overrides.
         env.update(overrides)
@@ -1481,22 +1485,40 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotIn("docker is required", result.stderr)
 
 
-    def test_ctv_settlement_requires_a_pool_fee_before_docker_check(self) -> None:
-        # #525: mirrors the server's startup refusal, including an explicit
-        # process-environment disable over the sourced defaults.
-        for fee_enabled in (None, "0", "false"):
-            with self.subTest(fee_enabled=fee_enabled):
-                overrides = {"MINING_LANES": "prism", "PRISM_CTV_SETTLEMENT_ENABLED": "1"}
-                if fee_enabled is not None:
-                    overrides["PRISM_POOL_FEE_ENABLED"] = fee_enabled
-                result = self.run_check_env(**overrides)
+    def test_settlement_requires_a_pool_fee_in_every_mode_before_docker_check(self) -> None:
+        # #525, #535: mirrors the server's startup refusal in both settlement
+        # modes, including an explicit process-environment disable over the
+        # sourced defaults.
+        for ctv, mode in (
+            ("1", "PRISM_CTV_SETTLEMENT_ENABLED=1"),
+            ("0", "direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"),
+        ):
+            for fee_enabled in ("0", "false", "OFF"):
+                with self.subTest(ctv=ctv, fee_enabled=fee_enabled):
+                    result = self.run_check_env(
+                        MINING_LANES="prism",
+                        PRISM_CTV_SETTLEMENT_ENABLED=ctv,
+                        PRISM_POOL_FEE_ENABLED=fee_enabled,
+                    )
 
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(
-                    "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1",
-                    result.stderr,
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        f"{mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed)",
+                        result.stderr,
+                    )
+                    self.assertNotIn("docker is required", result.stderr)
+
+    def test_env_example_defaults_enable_a_pool_fee_in_every_mode(self) -> None:
+        # #535: a fresh setup copied from .env.example passes the fee check
+        # in either mode and stops only at the Docker boundary.
+        for ctv in ("0", "1"):
+            with self.subTest(ctv=ctv):
+                result = self.run_check_env(
+                    MINING_LANES="prism", PRISM_CTV_SETTLEMENT_ENABLED=ctv
                 )
-                self.assertNotIn("docker is required", result.stderr)
+
+                self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
+                self.assertIn("docker", result.stderr)
 
     def test_process_environment_disables_a_pool_fee_the_env_file_enables(self) -> None:
         # Compose prefers the shell value over the env file; so must the doctor.
@@ -1518,17 +1540,59 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_CTV_SETTLEMENT_ENABLED=1 requires PRISM_POOL_FEE_ENABLED=1", refused.stderr
         )
 
-    def test_ctv_settlement_accepts_any_enabled_pool_fee(self) -> None:
-        for fee_enabled in ("1", "True", "on"):
-            with self.subTest(fee_enabled=fee_enabled):
-                result = self.run_check_env(
-                    MINING_LANES="prism",
-                    PRISM_CTV_SETTLEMENT_ENABLED="1",
-                    PRISM_POOL_FEE_ENABLED=fee_enabled,
-                    PRISM_POOL_FEE_BPS="0",
-                )
+    def test_an_enabled_pool_fee_needs_a_recipient(self) -> None:
+        # The lab program is sourced from .env.example; clearing it with no
+        # address leaves no recipient, which the server refuses.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "deploy.env"
+            deploy_env.write_text(
+                "MINING_LANES=prism\nPRISM_POOL_FEE_ENABLED=1\n"
+                "PRISM_POOL_FEE_P2MR_PROGRAM_HEX=\n",
+                encoding="utf-8",
+            )
+            refused = self.run_check_env(
+                DEPLOY_ENV_FILE=str(deploy_env), PRISM_POOL_FEE_ADDRESS=""
+            )
+            accepted = self.run_check_env(DEPLOY_ENV_FILE=str(deploy_env))
 
-                self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("PRISM_POOL_FEE_ENABLED=1 needs a pool fee recipient", refused.stderr)
+        self.assertNotIn("docker is required", refused.stderr)
+        self.assertNotIn("needs a pool fee recipient", accepted.stderr)
+
+    def test_production_rejects_the_lab_pool_fee_recipient(self) -> None:
+        # #535: .env.example's program is refused in production unless an
+        # address replaces it; lab mode keeps it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self.production_prism_env(Path(temp_dir))
+            refused = self.run_check_env(**env, PRISM_POOL_FEE_ADDRESS="")
+            with_address = self.run_check_env(**env)
+            own_program = self.run_check_env(
+                **env,
+                PRISM_POOL_FEE_ADDRESS="",
+                PRISM_POOL_FEE_P2MR_PROGRAM_HEX="ab" * 32,
+            )
+        lab = self.run_check_env(MINING_LANES="prism", PRISM_POOL_FEE_ADDRESS="")
+
+        message = "production rejects the development pool fee recipient"
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(message, refused.stderr)
+        self.assertNotIn("docker is required", refused.stderr)
+        for result in (with_address, own_program, lab):
+            self.assertNotIn(message, result.stderr)
+
+    def test_settlement_accepts_any_enabled_pool_fee_in_every_mode(self) -> None:
+        for ctv in ("0", "1"):
+            for fee_enabled in ("1", "True", "on"):
+                with self.subTest(ctv=ctv, fee_enabled=fee_enabled):
+                    result = self.run_check_env(
+                        MINING_LANES="prism",
+                        PRISM_CTV_SETTLEMENT_ENABLED=ctv,
+                        PRISM_POOL_FEE_ENABLED=fee_enabled,
+                        PRISM_POOL_FEE_BPS="0",
+                    )
+
+                    self.assertNotIn("requires PRISM_POOL_FEE_ENABLED=1", result.stderr)
 
 
 if __name__ == "__main__":

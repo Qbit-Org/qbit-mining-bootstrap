@@ -15,6 +15,8 @@ use qbit_prism_server::{
 };
 use std::{process::Command, time::Duration};
 use tower::ServiceExt;
+#[path = "support/pool_fee.rs"]
+mod pool_fee;
 
 const CASE: &str = "API_CONFIG_TEST_CASE";
 
@@ -371,6 +373,7 @@ fn public_role_never_opens_operator_credentials() {
             .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1")
             .env("PRISM_RUNTIME_WORKERS", "2")
             .env("QBIT_CHAIN", "regtest")
+            .envs(pool_fee::ZERO_BPS_POOL_FEE)
             .envs(settings.iter().copied())
             .output()
             .unwrap()

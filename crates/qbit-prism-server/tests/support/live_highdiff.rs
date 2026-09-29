@@ -418,7 +418,7 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         ledger_seed: "22".repeat(32),
         ledger_public_key: ManifestSigningKey::from_seed_hex(&"22".repeat(32))?.public_key_hex(),
         username_fallback: None,
-        payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+        payout_policy: super::live_payout_policy(),
         fee_address: None,
         ctv_enabled: false,
         ctv_config: qbit_prism::SettlementModeConfig::default(),

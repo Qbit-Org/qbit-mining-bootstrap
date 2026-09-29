@@ -211,14 +211,21 @@ async fn show_and_clear_cli_resume_appends_and_record_operator_decision() -> Res
 /// The four one-shot commands that write ordinary ledger rows. `self-check`
 /// exits nonzero here because nothing serves the audit API; PRISM_AUDIT_PORT=1
 /// keeps that probe failing deterministically instead of finding a listener.
+/// `self-check` refuses a configuration without a pool fee (#535), so the
+/// tools run a 0-bps one.
 const TOOLS: [&str; 4] = [
     "import-audits",
     "backfill-ctv",
     "broadcast-ctv",
     "self-check",
 ];
-const TOOL_ENV: [(&str, &str); 1] = [("PRISM_AUDIT_PORT", "1")];
-
+const TOOL_ENV: [(&str, &str); 5] = [
+    ("PRISM_AUDIT_PORT", "1"),
+    super::pool_fee::ZERO_BPS_POOL_FEE[0],
+    super::pool_fee::ZERO_BPS_POOL_FEE[1],
+    super::pool_fee::ZERO_BPS_POOL_FEE[2],
+    super::pool_fee::ZERO_BPS_POOL_FEE[3],
+];
 fn tool_stdout(tool: &str) -> Option<&'static str> {
     match tool {
         "import-audits" => Some("Imported 0 audit bodies"),
@@ -284,7 +291,14 @@ async fn one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard() -> Resul
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let (ledger, node, _) = setup(&db).await?;
+    let (ledger, node, mut config) = setup(&db).await?;
+    // #535: `self-check` refuses a configuration without a pool fee, so this
+    // cluster pins the 0-bps fee `TOOL_ENV` gives every tool.
+    config.payout_policy.pool_fee_policy = Some(super::pool_fee::zero_bps_policy());
+    sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1")
+        .bind(config.fingerprint(&"00".repeat(32))?)
+        .execute(&ledger.pool)
+        .await?;
     // 1. A generated instance ID leaves no row, on success and on failure:
     // `cli` sets no PRISM_INSTANCE_ID, so each command generates its own.
     for tool in TOOLS {
@@ -308,7 +322,10 @@ async fn one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard() -> Resul
         live_row["status"]["session_owner_token"].is_string(),
         "{live_row}"
     );
-    let shared = [("PRISM_INSTANCE_ID", "frontend-a"), TOOL_ENV[0]];
+    let shared: Vec<_> = [("PRISM_INSTANCE_ID", "frontend-a")]
+        .into_iter()
+        .chain(TOOL_ENV)
+        .collect();
     for tool in TOOLS {
         let output = cli_with_env(&db, &node, &[tool], &shared).await?;
         if let Some(live) = assert_tool_exit(tool, &output, false)? {
@@ -338,7 +355,8 @@ async fn one_shot_tools_register_no_heartbeat_and_keep_the_halt_guard() -> Resul
     // for `fatal-state clear` to refuse.
     stopped(&ledger).await?;
     let reason = "INC-381: operator tools ran while frontend-a was live";
-    let cleared = cli(&db, &node, &["fatal-state", "clear", "--reason", reason]).await?;
+    let clear = ["fatal-state", "clear", "--reason", reason];
+    let cleared = cli_with_env(&db, &node, &clear, &TOOL_ENV[1..]).await?;
     assert!(
         cleared.status.success(),
         "{}",

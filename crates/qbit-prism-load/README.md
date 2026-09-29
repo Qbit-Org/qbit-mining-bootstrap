@@ -154,7 +154,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--recipient-weights` | `uniform` | How work is spread over the addresses: `uniform`, `zipf:<s>`, `pareto:<alpha>`, or `whale:<fraction>+<one of those>`. Needs `--recipients` unless `uniform` |
 | `--session-hashrate-sigma` | 0 | Lognormal spread of hashrate between sessions (sigma of the log) |
 | `--session-difficulty` | `fixed` | `fixed`, or `vardiff:<max ratio>`: each session's share difficulty in proportion to its hashrate, asked for with `d=` in its Stratum password |
-| `--pool-fee-bps` | 0 | Launch every frontend with the pool fee on at this many basis points and a fee address of the run's own, as mainnet runs; dust below the payout floor is then swept to the fee rather than refusing the template (#525). 0 leaves the fee off, as every earlier run had it |
+| `--pool-fee-bps` | 0 | Launch every frontend with the pool fee on at this many basis points and a fee address of the run's own, as mainnet runs; dust below the payout floor is then swept to the fee rather than refusing the template (#525). Every server requires a fee (#535), so 0 still enables one: it pays nothing and adds no output until dust must be swept, where a fee-off run would have stalled, so runs measured fee-off before #535 reproduce at 0 |
 | `--arrival` | `smooth` | `smooth`, or `bursty:cv1=<x>,cv60=<y>,max=<m>`: the offered rate varies per second and per minute around each phase's rate |
 | `--churn-seconds` | 0 | Length of the `churn` side phase; 0 runs none. See [Connection churn](#connection-churn-521) |
 | `--churn-rate` | the steady-state rate | Offered shares per second during `churn` |
@@ -698,8 +698,9 @@ workflow's `preset` input and in `prism-load-run.sh`, with a deprecation
 warning.
 
 The realism presets (`mainnet-shape-130-addresses`, `mainnet-shape-650-addresses`, `mainnet-shape-2600-addresses`) run
-mainnet's 200 bps pool fee; every legacy preset runs with the fee off, as it
-was measured. The nightly schedule runs on 8 vCPU runners only.
+mainnet's 200 bps pool fee; every legacy preset runs a 0-bps fee, which
+reproduces its fee-off measurement (#535). The nightly schedule runs on 8 vCPU
+runners only.
 
 The D1 presets hold the 500 shares/s phase to #473's rule and report the
 2,000 shares/s burst in the verdict table without gating it: #473 found no
