@@ -420,12 +420,17 @@ def load_rows(directory: Path) -> list[dict]:
     return rows
 
 
-def spread(values: list[float]) -> str:
+def spread(samples: list[float | None]) -> str:
+    """The range over the VMs that measured, naming any that did not: a
+    failed pg_test_fsync is a missing sample, not a narrower range."""
+    values = [v for v in samples if v is not None]
+    unknown = len(samples) - len(values)
+    missing = f"; {unknown} of {len(samples)} VMs unknown (pg_test_fsync failed)" if unknown else ""
     if not values:
-        return "unknown"
+        return f"unknown{missing}"
     low, high = min(values), max(values)
     ratio = f", max/min {high / low:.2f}" if low > 0 else ""
-    return f"{cell(low)}–{cell(high)} over {len(values)} VMs{ratio}"
+    return f"{cell(low)}–{cell(high)} over {len(values)} VMs{ratio}{missing}"
 
 
 def table(rows: list[dict]) -> str:
@@ -490,13 +495,10 @@ def table(rows: list[dict]) -> str:
             f"{cell(target.get('save_seconds'), ' s')}.",
             "",
         ]
-    by_class: dict[int, list[float]] = {}
+    by_class: dict[int, list[float | None]] = {}
     for row in rows:
         if row.get("kind") == "fsync":
-            ops = row["fsync"].get("ops_per_second")
-            by_class.setdefault(row["class"], [])
-            if ops is not None:
-                by_class[row["class"]].append(ops)
+            by_class.setdefault(row["class"], []).append(row["fsync"].get("ops_per_second"))
     if by_class:
         lines += [
             "### fdatasync across VMs of one class",

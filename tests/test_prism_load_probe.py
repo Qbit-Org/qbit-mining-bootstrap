@@ -215,6 +215,14 @@ class Table(unittest.TestCase):
         self.assertIn("steady_state 2", text)
         self.assertIn("over 2 VMs, max/min 2.00", text)
 
+    def test_a_vm_whose_pg_test_fsync_failed_is_counted_as_unknown(self) -> None:
+        self.assertEqual(
+            probe.spread([2000.0, None, 1000.0]),
+            "1,000–2,000 over 2 VMs, max/min 2.00; 1 of 3 VMs unknown (pg_test_fsync failed)",
+        )
+        self.assertEqual(probe.spread([None, None]),
+                         "unknown; 2 of 2 VMs unknown (pg_test_fsync failed)")
+
     def test_the_run_argument_names_a_probe_preset(self) -> None:
         with self.assertRaises(probe.ProbeError):
             probe.parse_run("growth-20x=/tmp/x")
