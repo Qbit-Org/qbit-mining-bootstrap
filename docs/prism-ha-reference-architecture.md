@@ -233,14 +233,17 @@ close the window between the offer and the standby copy, without changing D3:
 
 - After a found block's offer reservation commits, the offering frontend reads
   the primary's `pg_current_wal_flush_lsn()`, which covers the candidate row and
-  the reservation. It then polls `pg_stat_replication` until the named standby's
-  `flush_lsn`, in state `streaming`, reaches it, and only then calls
-  `submitblock`. `flush_lsn` is what `synchronous_commit=on` would wait for:
-  everything the standby flushed survives its promotion. `sent_lsn` or
-  `write_lsn` would not.
+  the reservation. It then polls `pg_stat_replication` until the `flush_lsn`
+  of every standby connected under that name (`streaming`, or `catchup` after
+  a reconnect) reaches it, and only then calls `submitblock`. `flush_lsn` is
+  what `synchronous_commit=on` would wait for: everything the standby flushed
+  survives its promotion. `sent_lsn` would not (the drill and the pair test
+  fail with it); `write_lsn` differs only across a crash of the standby's own
+  host, which the tests do not exercise. A second standby sharing the name can
+  delay the wait to the bound, never confirm it.
 - The wait is bounded by `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` (default 250, `0`
   turns it off, at most 10000). It never holds the block: a standby that is not
-  streaming is not waited for, and at the bound the block is offered anyway.
+  connected is not waited for, and at the bound the block is offered anyway.
   Every offer without a confirmed copy logs the block hash at WARN
   (`block offer standby wait unconfirmed`, with its `outcome`, `waited_us` and,
   when lagging, `lag_bytes`) for the reconciliation in
@@ -253,7 +256,8 @@ close the window between the offer and the standby copy, without changing D3:
   `GRANT pg_monitor TO prism_writer;` (`pg_read_all_stats` alone is enough).
   Without it PostgreSQL shows only the WAL sender's pid, and every wait reports
   `failed`. `self-check` refuses a configured wait whose role cannot read the
-  positions, or whose name does not match exactly one streaming standby;
+  positions, or whose name does not match exactly one connected standby
+  reporting its flush position;
   `check-config` prints the effective setting.
 - `qbit_prism_block_offer_standby_wait_total{outcome=confirmed|absent|lagging|failed}`
   counts the waits, and `PrismBlockOfferStandbyUnconfirmed` warns for 30 minutes
@@ -275,7 +279,13 @@ With the wait on, the accepted asynchronous loss is: acknowledged shares in the
 last replication gap; found blocks whose offer logged an unconfirmed standby
 wait (standby down, behind at the bound, or unreadable); and found blocks never
 offered before the primary was lost, since no frontend can reserve an offer on a
-dead primary. The wait does not make D3 synchronous and is not a strict
+dead primary; and found blocks whose offering frontend crashed or lost its
+claim between the reservation and `submitblock`. The wait widens that last
+window from one database round trip to at most the bound (250 ms by default,
+10 s at most): recovery treats such a reservation as delivery unknown and never
+offers the block, as it always has. That is the price of keeping the
+reservation on the standby, which lets a held attempt record its outcome on
+the promoted primary. The wait does not make D3 synchronous and is not a strict
 durability claim.
 
 ### Current timeout/cancellation behavior and remaining limits

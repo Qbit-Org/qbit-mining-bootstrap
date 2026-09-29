@@ -1632,7 +1632,7 @@ dedicated failover standby's `application_name` (and `pg_monitor` granted to the
 writer role), each frontend waits after the reservation commits, up to
 `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` (default 250 ms), for that standby's
 `flush_lsn` to cover the block's rows, then offers it. Shares are unaffected.
-The wait never holds the block: when the standby is not streaming, is still
+The wait never holds the block: when the standby is not connected, is still
 behind at the bound, or its position cannot be read, the block is offered at
 once or at the bound, and the frontend logs a WARN line whose message starts
 `block offer standby wait unconfirmed`, with the fields `block` (the hash),
@@ -1642,7 +1642,8 @@ once or at the bound, and the frontend logs a WARN line whose message starts
 `qbit_prism_block_offer_standby_wait_total{outcome}` counts every wait and
 `PrismBlockOfferStandbyUnconfirmed` warns on any that did not confirm.
 `self-check` refuses the setting when the writer role cannot read replication
-positions or the name matches no single streaming standby.
+positions or the name matches no single connected standby reporting its flush
+position.
 
 **After a failover, reconcile the logged hashes.** Collect every hash logged
 `block offer standby wait unconfirmed` before the primary was lost, and follow
