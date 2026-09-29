@@ -1532,7 +1532,8 @@ rows and 40 blocks, dumped with `pg_dump` and rehearsed as above, with a
 payout window larger than one 4,096-row page. The weekly
 `live_regtest` scenario
 `migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation`
-writes the mainnet shape at 1/16 of the rows over a real regtest chain. It
+writes the mainnet shape at 1/32 of the rows (1/16 once #582 is fixed) over
+a real regtest chain. It
 cuts over with the same measured steps and checks, then mines and reconciles
 as the scenario above does. Until #582 is fixed, it runs `migrate` with a
 600 s statement timeout. It first checks that `migrate` at the default

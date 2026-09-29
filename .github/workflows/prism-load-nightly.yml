@@ -305,8 +305,9 @@ jobs:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    # #575's scenario writes mainnet's 13,566 blocks and 4.1M of its 65.5M
-    # share rows (1x at 1/16), keeps two copies of that ledger (about 15 GB)
+    # #575's scenario writes mainnet's 13,566 blocks and about 2M of its 65.5M
+    # share rows (1x at 1/32 until #582 lands, then 1/16 at 4.1M rows), keeps
+    # two copies of that ledger (about 8 GB at 1/32, 15 GB at 1/16)
     # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
     # of the rows on a 22-core host in release, and its row-proportional
     # phases put 1/16 near 20 minutes there, so the job builds in release and
