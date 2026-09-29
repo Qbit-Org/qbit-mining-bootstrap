@@ -1,0 +1,51 @@
+# cargo-fuzz targets for the Stratum line codec, the per-connection session
+# state machine and the codec's transaction parsers (#575). Not a member of
+# the repository workspace: `cargo test --workspace`, clippy and cargo-deny
+# never build it, and it keeps its own lock file. Run it with a nightly
+# toolchain, as docs/prism-stratum-fuzzing.md describes.
+[package]
+name = "qbit-prism-server-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+anyhow = "1"
+libfuzzer-sys = "0.4"
+qbit-prism-server = { path = ".." }
+qbit-pool-builder = { path = "../../qbit-pool-builder" }
+hex = "0.4"
+num-bigint = "0.4"
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+tokio = { version = "1", features = ["rt", "time", "io-util", "sync", "macros"] }
+
+[[bin]]
+name = "stratum_lines"
+path = "fuzz_targets/stratum_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stratum_session"
+path = "fuzz_targets/stratum_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_parsers"
+path = "fuzz_targets/codec_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

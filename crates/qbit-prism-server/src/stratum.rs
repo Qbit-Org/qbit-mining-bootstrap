@@ -18,12 +18,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
     sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::{interval, timeout, MissedTickBehavior},
 };
+// The in-crate session tests drive `request` and `deliver_job` over a socket.
+#[cfg(test)]
+use tokio::net::tcp::OwnedWriteHalf;
 
 mod retained_jobs;
 mod stale_grace;
@@ -1002,7 +1005,7 @@ async fn remember_difficulty<B: MiningBackend>(
 }
 
 async fn write_json(
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     payload: Value,
     config: &StratumConfig,
 ) -> Result<()> {
@@ -1018,7 +1021,7 @@ async fn write_json(
 }
 
 async fn result(
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     id: Value,
     value: Value,
     config: &StratumConfig,
@@ -1029,7 +1032,7 @@ async fn result(
 async fn deliver_job<B: MiningBackend>(
     backend: &B,
     session: &mut Session<B::Context>,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     config: &StratumConfig,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
@@ -1177,7 +1180,7 @@ async fn deliver_job<B: MiningBackend>(
 async fn request<B: MiningBackend>(
     backend: &B,
     session: &mut Session<B::Context>,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     config: &StratumConfig,
     request: Value,
     received_at: tokio::time::Instant,
@@ -1633,14 +1636,33 @@ async fn session<B: MiningBackend>(
     stream: TcpStream,
     backend: Arc<B>,
     config: StratumConfig,
+    refresh: watch::Receiver<u64>,
+    shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let (reader, writer) = stream.into_split();
+    serve_connection(reader, writer, backend, config, refresh, shutdown, metrics).await
+}
+
+/// One Stratum connection's request loop over any byte stream (#575).
+/// `run_listener` calls it with an accepted socket's halves; the fuzz targets
+/// and property tests call it over an in-memory pipe, so the line framing and
+/// session state machine they exercise are exactly the production ones.
+/// Admission (the global, per-source and per-username limits taken at
+/// accept) and `StratumConfig::validate` stay with the caller.
+#[doc(hidden)]
+pub async fn serve_connection<B: MiningBackend>(
+    reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    backend: Arc<B>,
+    config: StratumConfig,
     mut refresh: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
-    stream.set_nodelay(true)?;
     let observation = SessionObservation::new(config.stats.clone());
     let mut session = Session::new(&config, observation);
-    let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     let mut timer = interval(Duration::from_secs(1));

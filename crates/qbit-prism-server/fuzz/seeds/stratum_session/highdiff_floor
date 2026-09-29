@@ -1,0 +1,4 @@
+#cfg min=500000 start=1024 bits=207fffff txs=4
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}

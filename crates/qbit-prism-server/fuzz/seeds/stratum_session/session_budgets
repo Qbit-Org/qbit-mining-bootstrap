@@ -1,0 +1,11 @@
+#cfg mb=2 ab=2 ub=1
+garbage
+{"id":1,"method":"mining.authorize","params":["nobody","x"]}
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":3,"method":"mining.submit","params":["$user","gone-1","$en2","$ntime","$nonce"]}
+{"id":4,"method":"mining.submit","params":["$user","gone-2","$en2","$ntime","$nonce"]}
+#reconnect
+{
+}
+[]
