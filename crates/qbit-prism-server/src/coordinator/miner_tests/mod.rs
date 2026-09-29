@@ -355,6 +355,8 @@ impl Fixture {
             chain_cache: Mutex::new(None),
             statement_timeout,
             offer_probe: Default::default(),
+            offer_reserved_probe: Default::default(),
+            offer_sections: Default::default(),
         });
         let fixture = Self {
             coordinator,

@@ -6,6 +6,14 @@ use sqlx::PgPool;
 #[path = "support/recovery.rs"]
 mod recovery;
 
+// #575: the cutover rehearsal, run per PR on a mainnet-shaped 2.x.x dump,
+// and its operator mode.
+#[path = "support/cutover_rehearsal.rs"]
+#[allow(dead_code)]
+mod cutover_rehearsal;
+#[path = "support/cutover_rehearsal_cases.rs"]
+mod cutover_rehearsal_tests;
+
 #[tokio::test]
 async fn legacy_ordinal_revert_refuses_native_schema_without_removing_columns() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
