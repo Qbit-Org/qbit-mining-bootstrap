@@ -744,7 +744,7 @@ applied again.
 
 The nightly schedule skips a night when `3.x.x`'s head is the commit the last
 scheduled nightly tested (recorded in its `prism-load-tested-commit`
-artifact once its presets ran to a verdict); the skipped run is cancelled so
+artifact once every preset reached its gate); the skipped run is cancelled so
 it never shows as a pass. The weekly schedule and dispatches always run. A
 failed scheduled run, nightly or weekly, opens the `prism-load-nightly-failure`
 issue, or comments on it while it is open.

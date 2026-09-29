@@ -43,8 +43,8 @@ name: PRISM load harness (nightly)
 #   - The guard job ends the nightly schedule early when 3.x.x's head is the
 #     commit the last scheduled nightly tested, and cancels the run so the
 #     skip shows as cancelled, never as passed. A nightly records the commit
-#     it tested in its `prism-load-tested-commit` artifact once its preset
-#     jobs ran to a verdict, pass or fail. The weekly schedule and dispatches
+#     it tested in its `prism-load-tested-commit` artifact once every preset
+#     reached its gate, pass or fail. The weekly schedule and dispatches
 #     are never skipped.
 #   - Each preset's artifact carries host.json (runner label, filesystem mount
 #     options, block device write cache and FUA) and is kept for 90 days
@@ -142,26 +142,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           head="$(gh api "repos/${REPO}/commits/3.x.x" --jq .sha)" || head=""
-          # Newest first. A skipped night was cancelled before it recorded a
-          # commit and a weekly run records none, so the first run with the
-          # artifact is the last nightly that tested something. Any failure
-          # to find one runs the night: a skip needs positive evidence.
+          # Only a scheduled nightly's report job uploads the artifact, and
+          # the artifacts API lists it newest first however many skipped
+          # (cancelled) or weekly runs came since, so the first unexpired one
+          # from the default branch is what the last nightly tested. Any
+          # failure to find or read it runs the night: a skip needs positive
+          # evidence.
           tested="" tested_run=""
-          runs="$(gh api "repos/${REPO}/actions/workflows/prism-load-nightly.yml/runs?event=schedule&status=completed&per_page=30" \
-            --jq '.workflow_runs[].id')" || runs=""
-          for id in ${runs}; do
-            [[ "${id}" == "${RUN_ID}" ]] && continue
-            dir="${RUNNER_TEMP}/tested/${id}"
-            if gh run download "${id}" --repo "${REPO}" -n prism-load-tested-commit -D "${dir}" 2>/dev/null \
-              && [[ -s "${dir}/commit" ]]; then
-              tested="$(tr -d '[:space:]' < "${dir}/commit")"
-              tested_run="${id}"
-              break
-            fi
-          done
+          tested_run="$(gh api "repos/${REPO}/actions/artifacts?name=prism-load-tested-commit&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false
+                    and .workflow_run.head_branch == \"${DEFAULT_BRANCH}\"
+                    and .workflow_run.id != ${RUN_ID})][0].workflow_run.id // empty")" || tested_run=""
+          dir="${RUNNER_TEMP}/tested"
+          if [[ -n "${tested_run}" ]] \
+            && gh run download "${tested_run}" --repo "${REPO}" -n prism-load-tested-commit -D "${dir}" \
+            && [[ -s "${dir}/commit" ]]; then
+            tested="$(tr -d '[:space:]' < "${dir}/commit")"
+          fi
           echo "3.x.x is at ${head}; the last nightly tested ${tested:-nothing found} (run ${tested_run:-none})"
           if [[ -n "${head}" && "${tested}" == "${head}" ]]; then
             printf 'skip=true\n' >> "${GITHUB_OUTPUT}"
@@ -302,6 +303,29 @@ jobs:
           PRESET: ${{ matrix.preset }}
           RUNNER_LABEL: ${{ matrix.runner }}
         run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
+      # prism-load-run.sh writes gate.md only once the gate has read the
+      # harness's result, pass or fail. The report job records a nightly's
+      # commit as tested only if every planned preset left this marker, so a
+      # setup or runner failure before the gate is retried the next night.
+      - name: Mark the preset as gated
+        if: ${{ !cancelled() }}
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gated"
+          if [[ -f "${RUNNER_TEMP}/prism-load-out/gate.md" ]]; then
+            touch "${RUNNER_TEMP}/gated/${PRESET}"
+          fi
+      - name: Upload the gated marker
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-gated-${{ matrix.preset }}
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/gated
+          if-no-files-found: ignore
       - name: Upload the harness reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -540,19 +564,38 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Write the tested commit
-        id: tested
+      - name: Download the gated markers
+        id: gated
         if: >-
           ${{ github.event.schedule == '17 2 * * *'
           && (needs.run.result == 'success' || needs.run.result == 'failure') }}
+        # No preset reaching its gate means no markers to download.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-load-gated-*
+          path: ${{ runner.temp }}/gated
+          merge-multiple: true
+      - name: Write the tested commit if every preset reached its gate
+        id: tested
+        if: ${{ steps.gated.conclusion == 'success' }}
         env:
           SHA: ${{ needs.plan.outputs.sha }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/tested"
+          mkdir -p "${RUNNER_TEMP}/gated" "${RUNNER_TEMP}/tested"
+          missing="$(jq -r '.include[].preset' <<<"${MATRIX}" | while read -r preset; do
+            [[ -f "${RUNNER_TEMP}/gated/${preset}" ]] || echo "${preset}"
+          done)"
+          if [[ -n "${missing}" ]]; then
+            echo "Not recorded as tested; these presets never reached their gate:" "${missing}"
+            exit 0
+          fi
           printf '%s\n' "${SHA}" > "${RUNNER_TEMP}/tested/commit"
+          printf 'recorded=true\n' >> "${GITHUB_OUTPUT}"
       - name: Upload the tested commit
-        if: ${{ steps.tested.outcome == 'success' }}
+        if: ${{ steps.tested.outputs.recorded == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: prism-load-tested-commit
