@@ -7751,7 +7751,7 @@ fn node_submission(hash: &str, height: u64, accepted: bool) -> node::SubmissionR
     node::SubmissionRecord {
         block_hash: hash.to_owned(),
         parent: HASH_ZERO.to_owned(),
-        height,
+        height: Some(height),
         accepted,
         rejection: (!accepted).then(|| node::PARENT_MISMATCH.to_owned()),
         received_at: chrono::Utc::now(),

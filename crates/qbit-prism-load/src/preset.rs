@@ -34,6 +34,7 @@ pub const OPERATIONAL_FLAGS: &[&str] = &[
     "--allow-dirty-tree",
     "--allow-unverified-server-revision",
     "--example-artifact",
+    "--qbitd-bin",
 ];
 
 /// Result flags whose `null` (flag omitted) is itself an explicit choice

@@ -130,7 +130,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
 | `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
 | `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase. That phase runs under the same proxy delay as `slow_database` and the kill waits for the target frontend to actually hold work, because with no delay an acknowledgement takes a few milliseconds and the scenario would quietly not happen. The report carries `submits_outstanding_at_kill`, and zero there means it did not exercise. Only the shares the kill made indeterminate are exempt from reconciliation; an acknowledged share this phase loses is a durability finding (exit 4) as in every other phase. The kill, the relaunch, the readiness wait and the re-offers are driven from the scheduler loop without stalling it, as the `reconnect` phase's restart is, so the other frontends keep receiving their scheduled load throughout; a relaunch that exits or never answers `/healthz` within `--work-timeout` aborts the run (exit 6) |
-| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of rebuild-pending rejections on every frontend afterwards. With `--cadence dense` this is instead the dense phase's landing budget, and `steady_state` schedules none |
+| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`, or during warm-up under `--plan tips`, whose only phase it is. Each one bumps the payout revision, so expect a burst of rebuild-pending rejections on every frontend afterwards. With `--cadence dense` this is instead the dense phase's landing budget, and `steady_state` schedules none |
 | `--cadence` | `none` | `none`, or `dense` for the dense-cadence side phase (#271 criterion 6) |
 | `--cadence-seconds` | 240 | Length of the `dense_cadence` phase |
 | `--cadence-rate` | the steady-state rate | Offered shares per second during `dense_cadence` |
@@ -167,6 +167,8 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--reconnect-storms` | `none` | Storm fractions in order (`0.1,0.25,0.5`): each drops that share of the connected sessions abruptly |
 | `--storm-interval-seconds` | 60 | Seconds between storms |
 | `--storm-reconnect-seconds` | 5 | A stormed session reconnects after a uniform delay up to this |
+| `--node` | `fake` | `fake`, the in-process node, or `qbitd`: a managed real regtest pool node and peer. See [Real-node mode](#real-node-mode-547) |
+| `--qbitd-bin` | `QBITD_BIN` | The `qbitd` executable for `--node qbitd` |
 | `--preset` | none | A checked-in preset whose flags join the command line; a flag it sets cannot be given again |
 | `--out` | `load-out` | Output directory |
 | `--keep-artifacts` | off | Keep cluster data directories and logs |
@@ -648,6 +650,121 @@ concurrent sessions per second with their extremes, and:
 
 The run-wide `time_to_usable_work` stays over the run's own `--sessions`.
 
+## Real-node mode (#547)
+
+`--node qbitd` drives a real regtest `qbitd` instead of the in-process fake
+node, with the same phases, the same reconciliation and the same exit codes.
+It is an extension of this harness, not a second load generator (#474).
+
+**Topology.** The harness starts two nodes from `--qbitd-bin` (or
+`QBITD_BIN`) with the `live_regtest` fixtures' arguments plus
+`-legacyretarget` and a very large `-peertimeout` (qbit's peer timeouts
+compare the wall clock with message stamps, some taken under the ramp's mock
+clock): pool node A (`-listen=0`), which the frontends reach
+through a recording JSON-RPC relay, and peer B (`-listen=1`), which A
+connects to as #530's `PeerNode` does and which stands for the rest of the
+network. `PRISM_MIN_PEERS=1` is met by a real peer. The frontends run with
+`QBIT_CHAIN=regtest`; every other key is the fake-node run's. The data
+directories live under `$TMPDIR` and go with the run unless
+`--keep-artifacts`; both nodes' `debug.log` are kept under `logs/`, with
+peer-to-peer logging switched on after the ramp.
+
+**The ramp.** Regtest's proof-of-work limit makes every share a block, so the
+chain is ramped first, as #524 does: B mines under a mock clock shared with A
+until eight 1,440-block epochs, each clamped to 4x, have lowered the target to
+`1e7fffc0` at height 12,960. That is the fake node's `1e7fffff` to 0.0008%, so
+the window, the share difficulty and the hashes per share are the fake run's,
+and a real-node run compares directly with its fake twin. It takes 25-40 s on
+a loaded 2-vCPU-class host (13,000 block connections; the hashing is 63M
+double-SHA-256). Two node rules shape the clock. qbit refuses a block more
+than about ten minutes ahead of its own clock, so the ramp's clock starts in
+the past and ends at wall time rather than running ahead of the peer. And a
+regtest template more than 150 s after its tip is served at the regtest
+limit, so after the ramp the clocks are cleared and B mints a keepalive tip
+once the tip's own timestamp is 120 s old. The tip's timestamp, not when it
+was seen: a pool block carries its job's template time. A mint that would
+still land past the gap is timestamped 120 s after its parent. The 1,439
+blocks before the next retarget are headroom, and a run whose tips, own
+blocks and keepalives could exceed it is refused at entry. `--template-bits`
+must be the default, and `--retarget-bits` and `--recipients` are refused
+(recipients need node-issued addresses and a share filter over them, #553).
+The run pays derived regtest P2MR addresses that nobody holds a key for,
+checked with the node's `validateaddress` before anything runs.
+
+**The cadence band.** The window weighs 8 network difficulties, so a share is
+a block with probability 8 / `--window-shares` whatever the ramp, and a phase
+offering R shares/s implies an own block every W / (8R) seconds. Real-node
+mode refuses any phase outside 9-600 s (9 s is #224's minimum
+accepted-candidate interarrival), which for a 20k window is 4.2-278 shares/s:
+D1's 500 shares/s over 20k would land a block every 5 s, which is why there is
+no real-node D1 lane (#487 decision 1). `--plan short` at its defaults (20k,
+50 shares/s) implies one every 50 s, at 52.4 hashes a share and 131,080 a
+block. Own blocks stay scheduled, as in fake-node runs. The side report's
+`node.cadence_band` states the band, each phase's implied interval, the
+network tips' maximum gap, and the block solutions the clients stepped over
+against the number the band rule expects: the node's target seen from the
+miners' side.
+
+**What the node did.** Tips are taken from the node, not assumed. External
+tips (`--external-tips`, `--churn-tips` and keepalives) are B's
+`generatetoaddress`, and B first waits (10 s at most) to hold A's tip, so a
+mint never forks a pool block that is still on its way; a B that never
+catches up fails the mint and names the nodes' connection counts. A watcher
+on A stamps every tip change on both clocks
+with a `waitfornewblock` long-poll given the tip it last saw, then a walk over
+the heights so no block is skipped, and classifies each block as the pool's
+(an accepted relay submission), external (one of B's mints) or unattributed.
+Time to usable work is measured from the tip's own moment when that is
+earlier than the watcher's wake-up: when B's `generatetoaddress` returned for
+a mint, as the fake node stamps its own mints, and when A answered the
+relay's `submitblock` for a pool block. The relay forwards in a task of its
+own, so a frontend that gives up on a request cannot lose the record of a
+block A already took.
+The relay forwards every request byte for byte and records each `submitblock`
+with the node's verdict verbatim, in the fake node's submission shape, so the
+dense-cadence and landing reports read it unchanged. It also records
+per-method latency and the bits of every template it passed. After the
+frontends stop, the chain is reconciled against those records
+(`node.chain_reconciliation`): every block above the ramp is exactly one of
+B's mints or one accepted submission; every accepted submission and every mint
+is on A's active chain; every tip asked of B was minted; no submission drew a
+verdict other than acceptance, `duplicate` or `inconclusive`, and none was
+unreadable; A and B end on one tip; and every block and every template kept
+`1e7fffc0`. Any disagreement is a contradicted premise (exit 8), never a
+share finding, and the block then carries a `diagnosis` (both nodes' peers
+and chain tips, and what A knows of each missing mint). A node that exits,
+or that the watcher can no longer reach, aborts the run instead (exit 6).
+The share reconciliation against PostgreSQL is unchanged.
+
+**What stays the same.** Provenance checks and their overrides, the phases,
+the share reconciliation, the gates and the exit codes. The artifact is still
+built and validated, but `artifact_kind` is always `example`, because
+real-node rates are not D1 evidence (#487 decision 1). The side report gains
+`versions.qbitd_binary_sha256` and `versions.qbitd_subversion`,
+`premise.node_reconciled` and `premise.node_failure`, and the real node's keys
+in `node` (`mode`, `qbitd`, `ramp`, `mints`, `relay`, `cadence_band`,
+`chain_reconciliation`), and only in a real-node run: a fake-node run writes
+exactly the keys it always wrote.
+
+**Per PR and nightly.** `tests/real_node.rs` runs the `real-node-smoke`
+preset on every PR in the `prism-native-postgres` shards: one debug
+frontend, 50 sessions, a 20k window at 20 shares/s, 3 external tips and 1
+scheduled own block in a tips-only plan. About 70 s of run (half of it the
+ramp) plus the debug server build `load_smoke` also pays for. The bridging
+pair `short-plan-real-node` and `short-plan-fake-node` is the short plan on
+either node with nothing else different, run nightly beside each other on
+the same runner class (#552).
+
+**Built to extend.** S15 (#553) and S16 (#554) add to this rather than
+beside it: the node handle mints on the peer at any moment and owns both
+processes, so partitioning the peer (`setnetworkactive`) and stopping,
+pausing or killing the pool node are calls on the same handle; the relay is
+the single path between the frontends and A, and so the place to delay, hold
+or refuse a call or drop a reply after forwarding it (#522, #523, #474 C);
+and a second pool node for two frontends on two nodes is a second relay and
+watcher. The epoch's headroom covers a two-hour soak (#556): about 60
+keepalives plus its tips and own blocks.
+
 ## Presets and the nightly run
 
 `crates/qbit-prism-load/presets/*.json` pins runs by name. A preset states
@@ -690,6 +807,8 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
 | `short-plan-20k-window-1fe` | manual | 8 vCPU | the short plan over `throughput-20k-window-1fe`'s fixture (2,000 sessions, one frontend, async standby, 20k window) at 50 shares/s with no burst; with `throughput-20k-window-1fe`, what the runner probe below runs on each class |
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
+| `real-node-smoke` | every PR | 2 vCPU | the per-PR real-node smoke run: [Real-node mode](#real-node-mode-547) |
+| `short-plan-real-node`, `short-plan-fake-node` | nightly | 8 vCPU | the bridging pair (#552): the same short plan on the real and the fake node, differing only in `--node` |
 | `soak-weekly` | weekly | 8 vCPU | the 5.5 h long soak; see [Long soak](#long-soak-575) |
 | `soak-short` | manual | 8 vCPU | a 19 min soak of the same cluster without block landings; the run the leak mutant must fail |
 | `soak-smoke` | manual | 2 vCPU | the soak smoke, run nightly by the opt-in gated test `tests/soak_smoke.rs` |
@@ -791,9 +910,9 @@ has the gates, the presets, the weekly job and the testnet4 procedure.
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load has stopped and every frontend has been stopped and reaped, so a rebuild still running when the sessions drained cannot log a refusal after the check has read the log: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, a committed share was never acknowledged and nothing explains it, or PostgreSQL holds a run-prefixed row that no phase offered |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share whose acknowledgement never reached the client, for a reason inside the run. The server refused it with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324), or the socket closed mid-run before its answer was read. Nothing was lost in any of the three. A submit still outstanding when the drain expires does **not** exit 5: see below |
-| 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus the 10 s drain margin, the `mid_flight_kill` phase's relaunched frontend exited or did not answer `/healthz` within `--work-timeout`, its session accounting or collector barriers did not finish within the share-commit timeout plus the 10 s drain margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
+| 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus the 10 s drain margin, the `mid_flight_kill` phase's relaunched frontend exited or did not answer `/healthz` within `--work-timeout`, its session accounting or collector barriers did not finish within the share-commit timeout plus the 10 s drain margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, a delayed phase's round trip through the proxied URL did not pay the delay, or, under `--node qbitd`, a node exited or its tip watcher lost it (seen at the next phase boundary). No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
-| 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
+| 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops; or, under `--node qbitd`, the node's chain does not reconcile with what the harness recorded (see [Real-node mode](#real-node-mode-547)). The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
 
 ## Outputs
 
@@ -1428,6 +1547,11 @@ The gated tests start the managed cluster against real PostgreSQL 16 server
 binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
 skip without them: the quorum-standby detection in `tests/quorum_replication.rs`,
 in `tests/harness.rs` a cluster that fails to start, whose error has to
-carry PostgreSQL's own reason, and the per-PR smoke run in
-`tests/load_smoke.rs`. Run them with
+carry PostgreSQL's own reason, the per-PR smoke run in
+`tests/load_smoke.rs`, and, also needing `QBITD_BIN`, the per-PR real-node
+smoke run in `tests/real_node.rs`. `tests/real_node.rs` also holds
+`fake_node_mode_is_unchanged`, which needs nothing: the fake node's answers to
+a fixed request corpus and a pr-smoke frontend's environment, against goldens
+taken on the commit before real-node mode existed (`tests/golden/`); the
+smoke run checks the fake side report's key sets against a third. Run them with
 `test/prism-native-tests.sh cargo-args --locked -p qbit-prism-load --test <name>`.

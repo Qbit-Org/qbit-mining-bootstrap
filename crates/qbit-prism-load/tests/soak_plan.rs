@@ -70,6 +70,16 @@ fn the_weekly_soak_loops_three_presets_for_twelve_cycles_in_one_lifetime() -> Re
         .find(|p| p.plan.kind == "churn")
         .context("churn")?;
     assert_eq!(churn.args.rental_bursts, "100,500,2000");
+    // The blocks land where each looped preset's own plan puts them (the
+    // phase kind, not the soak's phase name): mainnet shape's two per cycle
+    // in steady_state, none from the tips-plan churn or the tip delivery.
+    let mut landings = 0;
+    for phase in &plan.phases {
+        if qbit_prism_load::run::holds_scheduled_blocks(&phase.args, &phase.plan)? {
+            landings += phase.args.scheduled_blocks;
+        }
+    }
+    assert_eq!(landings, 26);
     // The rollovers and the retention the gates ask for fit in the soak.
     let spec = &plan.spec;
     assert!(spec.rollover_minutes.len() as u64 > spec.gates.min_rollovers);
@@ -136,6 +146,23 @@ fn a_soak_block_and_plan_soak_go_together() -> Result<()> {
     // --plan soak without a preset has no phases of its own.
     let args = Args::try_parse_from(["qbit-prism-load", "--plan", "soak"])?;
     assert!(qbit_prism_load::cli::phases(&args).is_err());
+    // The looped presets pin the fake node, so a real-node soak is refused
+    // by name rather than run on segments that disagree with it.
+    let error = Args::try_parse_from([
+        "qbit-prism-load",
+        "--plan",
+        "soak",
+        "--node",
+        "qbitd",
+        "--qbitd-bin",
+        "/bin/true",
+    ])?
+    .validate()
+    .expect_err("--node qbitd --plan soak");
+    assert!(
+        format!("{error:#}").contains("does not run --plan soak"),
+        "{error:#}"
+    );
     Ok(())
 }
 
