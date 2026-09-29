@@ -1,0 +1,409 @@
+name: PRISM load harness runner probe
+
+# #541 (S1 of #487): measure what the Blacksmith runners are before any lane
+# depends on them. Dispatch only: there is no schedule, so no standing spend.
+#
+# Each probe job builds qbit-prism-server and qbit-prism-load in release mode
+# and runs the short-plan-20k-window-1fe and throughput-20k-window-1fe presets in the same job and checkout, so
+# the harness's provenance checks see the binary its own tree built (#487
+# lesson 4); no --allow-* override is passed, and the row says whether every
+# check passed. It records, per runner class:
+#   - pg_test_fsync on the filesystem the harness puts its PostgreSQL
+#     clusters on (lesson 1), with the kernel's view of the block device
+#     under it (write cache, FUA) as the evidence on whether fsync reaches
+#     stable storage;
+#   - wall time for the build, seeding and each run;
+#   - peak host memory (MemTotal - MemAvailable, sampled every second) over
+#     the build and each run, the harness, frontends and both clusters
+#     together (lesson 3);
+#   - shortfall per phase and the tip-to-last-notify p99, which #521
+#     scenario 6's gates read.
+# The Cargo target directory is kept either on a Blacksmith sticky disk or
+# in the Actions cache, one job per backend per class; dispatch twice to
+# compare a warm restore against a cold build. The fsync-spread jobs run
+# pg_test_fsync alone on several VMs of each class, for VM-to-VM disk
+# consistency, and the optional duration job holds a 2 vCPU runner for the
+# given minutes to find the maximum job duration. The collate job writes the
+# per-class results table to its summary and to an artifact; the billing
+# multiplier is read off the usage dashboard against these jobs' minutes.
+#
+# The rates here are for this probe only: CI numbers are not compared with
+# another host class's (lesson 1) and are not D1 verdicts (lesson 2).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and run.
+        required: true
+        default: 3.x.x
+      classes:
+        description: Runner classes in vCPU, comma separated (2, 4, 8, 16, 32).
+        required: true
+        default: "8,16,32"
+      target_cache:
+        description: Where the Cargo target directory is kept between runs.
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - actions-cache
+          - sticky-disk
+      fsync_vms:
+        description: >-
+          pg_test_fsync-only VMs per class, for VM-to-VM disk consistency
+          (0 to skip, at most 10).
+        required: true
+        default: "3"
+      duration_probe_minutes:
+        description: >-
+          Hold one 2 vCPU runner this many minutes to find the maximum job
+          duration (0 to skip; 1500 tests a 24 h soak).
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prism-load-runner-probe
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the probe matrix
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      probe: ${{ steps.plan.outputs.probe }}
+      fsync: ${{ steps.plan.outputs.fsync }}
+      fsync_enabled: ${{ steps.plan.outputs.fsync_enabled }}
+      duration_minutes: ${{ steps.duration.outputs.minutes }}
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Pin the ref to one commit
+        id: pin
+        # Every later job checks out this commit, so a push to the ref while
+        # runners are queued cannot make classes measure different code.
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+      - name: Select runner classes and target caches
+        id: plan
+        env:
+          CLASSES: ${{ inputs.classes }}
+          TARGET_CACHE: ${{ inputs.target_cache }}
+          FSYNC_VMS: ${{ inputs.fsync_vms }}
+        run: |
+          set -euo pipefail
+          python3 scripts/prism_load_probe.py matrix \
+            --classes "${CLASSES}" --target-cache "${TARGET_CACHE}" --fsync-vms "${FSYNC_VMS}" \
+            | tee -a "${GITHUB_OUTPUT}"
+      - name: Check the duration probe's length
+        id: duration
+        env:
+          MINUTES: ${{ inputs.duration_probe_minutes }}
+        run: |
+          set -euo pipefail
+          # The duration job's own timeout is 4,320 minutes (72 h), so a
+          # longer hold would measure that and not the runner's limit.
+          # Read as decimal before the bound check: a leading zero would
+          # otherwise make bash compare the value as octal.
+          if [[ ! "${MINUTES}" =~ ^[0-9]{1,6}$ ]]; then
+            echo "duration_probe_minutes ${MINUTES@Q} is not a whole number 0..4200" >&2
+            exit 2
+          fi
+          minutes=$((10#${MINUTES}))
+          if (( minutes > 4200 )); then
+            echo "duration_probe_minutes ${MINUTES@Q} is not a whole number 0..4200" >&2
+            exit 2
+          fi
+          printf 'minutes=%d\n' "${minutes}" >> "${GITHUB_OUTPUT}"
+
+  probe:
+    name: ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.probe) }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Name the probe's directories
+        run: |
+          set -euo pipefail
+          # The target directory sits beside the checkout, not in it, so a
+          # restore or a mount never touches the tree the harness checks.
+          printf 'CARGO_TARGET_DIR=%s\n' "$(realpath -m "${GITHUB_WORKSPACE}/../prism-probe-target")" >> "${GITHUB_ENV}"
+          printf 'PROBE=%s/probe\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Name the target cache
+        id: key
+        env:
+          SIZE: ${{ matrix.class }}
+          HASH: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${PROBE}" "${CARGO_TARGET_DIR}"
+          # One key per class and backend, so a class's warm run restores
+          # its own previous build and never another class's.
+          printf 'prefix=prism-probe-target-v1-%svcpu-%s-\n' "${SIZE}" "${HASH}" >> "${GITHUB_OUTPUT}"
+          printf 'sticky=prism-probe-target-v1-%svcpu\n' "${SIZE}" >> "${GITHUB_OUTPUT}"
+          date +%s.%N > "${PROBE}/restore-started"
+      - name: Restore the target directory from the Actions cache
+        if: ${{ matrix.target_cache == 'actions-cache' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.key.outputs.prefix }}
+      - name: Mount the target directory's sticky disk
+        if: ${{ matrix.target_cache == 'sticky-disk' }}
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ steps.key.outputs.sticky }}
+          path: ${{ env.CARGO_TARGET_DIR }}
+      - name: Record the host and the restored target directory
+        run: |
+          set -euo pipefail
+          awk -v now="$(date +%s.%N)" -v then="$(cat "${PROBE}/restore-started")" \
+            'BEGIN { printf "%.1f\n", now - then }' > "${PROBE}/restore-seconds"
+          # Anything in the target directory before the build came from the
+          # backend. A fresh sticky disk is not empty (lost+found), so a warm
+          # target is one with an earlier release build in it.
+          du -sb "${CARGO_TARGET_DIR}" | cut -f1 > "${PROBE}/target-bytes-before"
+          if [[ -d "${CARGO_TARGET_DIR}/release" ]]; then echo true; else echo false; fi \
+            > "${PROBE}/target-restored"
+          mkdir -p "${RUNNER_TEMP}/pload"
+          python3 scripts/prism_load_probe.py host --out "${PROBE}/host.json" --dir "${RUNNER_TEMP}/pload"
+          {
+            echo "### ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}"
+            echo
+            echo '```'
+            git rev-parse HEAD
+            cat "${PROBE}/host.json"
+            echo "target directory before build: $(cat "${PROBE}/target-bytes-before") bytes"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Build the server, the harness and the gate in release mode
+        run: |
+          python3 scripts/prism_load_probe.py measure --out "${PROBE}/build.json" -- \
+            cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+      - name: Measure the target directory after the build
+        run: du -sb "${CARGO_TARGET_DIR}" | cut -f1 > "${PROBE}/target-bytes-after"
+      - name: Start timing the Actions cache save
+        if: ${{ matrix.target_cache == 'actions-cache' }}
+        run: date +%s.%N > "${PROBE}/save-started"
+      - name: Save the target directory to the Actions cache
+        if: ${{ matrix.target_cache == 'actions-cache' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+      - name: Time the Actions cache save
+        if: ${{ matrix.target_cache == 'actions-cache' }}
+        run: |
+          awk -v now="$(date +%s.%N)" -v then="$(cat "${PROBE}/save-started")" \
+            'BEGIN { printf "%.1f\n", now - then }' > "${PROBE}/save-seconds"
+      # The sticky disk is committed in the action's post step, after every
+      # step here, so its save time is in that step's log, not in the row.
+      - name: Run short-plan-20k-window-1fe
+        timeout-minutes: 60
+        env:
+          TARGET_DIR: ${{ env.CARGO_TARGET_DIR }}
+        run: |
+          set -uo pipefail
+          out="${PROBE}/short-plan-20k-window-1fe"
+          python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" -- \
+            bash .github/scripts/prism-load-run.sh short-plan-20k-window-1fe "${out}" || true
+      - name: Run throughput-20k-window-1fe
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        env:
+          TARGET_DIR: ${{ env.CARGO_TARGET_DIR }}
+        run: |
+          set -uo pipefail
+          out="${PROBE}/throughput-20k-window-1fe"
+          python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" -- \
+            bash .github/scripts/prism-load-run.sh throughput-20k-window-1fe "${out}" || true
+      - name: Write the class's row
+        if: ${{ !cancelled() }}
+        env:
+          SIZE: ${{ matrix.class }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+          TARGET_CACHE: ${{ matrix.target_cache }}
+          CACHE_ROW: ${{ matrix.class }}-${{ matrix.target_cache }}
+        run: |
+          set -euo pipefail
+          read_or_empty() { cat "$1" 2>/dev/null || true; }
+          before="$(read_or_empty "${PROBE}/target-bytes-before")"
+          restored="$(read_or_empty "${PROBE}/target-restored")"
+          mkdir -p "${PROBE}/row"
+          python3 scripts/prism_load_probe.py row --out "${PROBE}/row/${CACHE_ROW}.json" \
+            --class "${SIZE}" --runner "${RUNNER_LABEL}" --target-cache "${TARGET_CACHE}" \
+            --target-restored "${restored}" \
+            --target-bytes-before "${before}" \
+            --target-bytes-after "$(read_or_empty "${PROBE}/target-bytes-after")" \
+            --restore-seconds "$(read_or_empty "${PROBE}/restore-seconds")" \
+            --save-seconds "$(read_or_empty "${PROBE}/save-seconds")" \
+            --build "${PROBE}/build.json" --host "${PROBE}/host.json" \
+            --run "short-plan-20k-window-1fe=${PROBE}/short-plan-20k-window-1fe" --run "throughput-20k-window-1fe=${PROBE}/throughput-20k-window-1fe"
+          python3 scripts/prism_load_probe.py table "${PROBE}/row" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the class's row
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-probe-row-${{ matrix.class }}-${{ matrix.target_cache }}
+          overwrite: true
+          retention-days: 90
+          path: ${{ env.PROBE }}/row
+          if-no-files-found: error
+      - name: Upload the harness reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-probe-${{ matrix.class }}-${{ matrix.target_cache }}
+          overwrite: true
+          retention-days: 90
+          path: |
+            ${{ env.PROBE }}
+            !${{ env.PROBE }}/row
+          if-no-files-found: error
+      - name: Fail on the build's or a gate's exit code
+        # #487 lesson 5: the exit code is the verdict, after the reports are
+        # uploaded either way.
+        run: |
+          set -euo pipefail
+          python3 - "${PROBE}" <<'EOF'
+          import json, sys
+          from pathlib import Path
+          probe = Path(sys.argv[1])
+          failed = []
+          for name in ("build", "short-plan-20k-window-1fe/probe-measure", "throughput-20k-window-1fe/probe-measure"):
+              path = probe / f"{name}.json"
+              code = json.loads(path.read_text())["exit_code"] if path.exists() else None
+              if code != 0:
+                  failed.append(f"{name}: exit {code}")
+          if failed:
+              sys.exit("; ".join(failed))
+          EOF
+
+  fsync-spread:
+    name: pg_test_fsync, ${{ matrix.class }} vCPU, VM ${{ matrix.vm }}
+    needs: plan
+    if: ${{ needs.plan.outputs.fsync_enabled == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.fsync) }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Run pg_test_fsync where the harness puts its clusters
+        env:
+          SIZE: ${{ matrix.class }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+          VM: ${{ matrix.vm }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/pload"
+          out="${RUNNER_TEMP}/fsync"
+          mkdir -p "${dir}" "${out}/row"
+          python3 scripts/prism_load_probe.py host --out "${out}/host.json" --dir "${dir}"
+          /usr/lib/postgresql/16/bin/pg_test_fsync -s 2 -f "${dir}/pg_test_fsync.out" \
+            > "${out}/pg_test_fsync.txt" 2>&1 || echo "pg_test_fsync failed" >> "${out}/pg_test_fsync.txt"
+          python3 scripts/prism_load_probe.py fsync-row --out "${out}/row/fsync-${SIZE}-${VM}.json" \
+            --class "${SIZE}" --runner "${RUNNER_LABEL}" --vm "${VM}" \
+            --host "${out}/host.json" --fsync "${out}/pg_test_fsync.txt"
+          cat "${out}/pg_test_fsync.txt"
+      - name: Upload the VM's row
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-probe-row-fsync-${{ matrix.class }}-${{ matrix.vm }}
+          overwrite: true
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/fsync/row
+          if-no-files-found: error
+
+  duration:
+    name: Hold a runner for ${{ needs.plan.outputs.duration_minutes }} minutes
+    needs: plan
+    if: ${{ needs.plan.outputs.duration_minutes != '0' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Well above any hold the plan accepts, so a runner limit ends the job
+    # before this does.
+    timeout-minutes: 4320
+    steps:
+      - name: Hold the runner
+        env:
+          MINUTES: ${{ needs.plan.outputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          started="$(date +%s)"
+          for ((minute = 1; minute <= MINUTES; minute++)); do
+            sleep 60
+            echo "held $(( ($(date +%s) - started) / 60 )) of ${MINUTES} minutes at $(date -u +%FT%TZ)"
+          done
+          echo "Held a 2 vCPU runner for ${MINUTES} minutes without the runner ending the job." \
+            >> "${GITHUB_STEP_SUMMARY}"
+
+  collate:
+    name: Collate the results table
+    needs: [plan, probe, fsync-spread]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Download every row
+        # A run in which every job failed before its row has nothing to
+        # download; the table then names each job as missing.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-probe-row-*
+          path: ${{ runner.temp }}/rows
+          merge-multiple: true
+      - name: Write the table
+        env:
+          PROBE_MATRIX: ${{ needs.plan.outputs.probe }}
+          FSYNC_MATRIX: ${{ needs.plan.outputs.fsync }}
+          FSYNC_ENABLED: ${{ needs.plan.outputs.fsync_enabled }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/rows"
+          # What the plan asked for, so a job that wrote no row is counted.
+          python3 -c 'import json, os; print(json.dumps({"probe": json.loads(os.environ["PROBE_MATRIX"]), "fsync": json.loads(os.environ["FSYNC_MATRIX"]), "fsync_enabled": os.environ["FSYNC_ENABLED"] == "true"}))' \
+            > "${RUNNER_TEMP}/expected.json"
+          python3 scripts/prism_load_probe.py table "${RUNNER_TEMP}/rows" --expected "${RUNNER_TEMP}/expected.json" \
+            | tee "${RUNNER_TEMP}/rows/table.md" \
+            >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the table and the rows
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-probe-table
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/rows
+          if-no-files-found: error
