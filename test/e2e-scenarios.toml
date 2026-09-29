@@ -314,6 +314,26 @@ criteria = "As scenario 7, at the mainnet-floor recipient shape."
 runs = true
 tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::nightly_mainnet_floor_weighted_recipients_share_to_spend"]
 
+[[scenario]]
+id = "real-node-harness-smoke"
+title = "#547: the per-PR real-node harness smoke on a managed regtest qbitd pair"
+owner = "#547"
+lanes = ["pr"]
+criteria = "Exit 0: every share reconciled against PostgreSQL, every block above the ramp exactly one peer mint or one accepted relay submission at the ramped bits, and the cadence band stated; fake-node mode byte-identical to before real-node mode existed."
+runs = true
+tests = ["qbit-prism-load::real_node::real_node_smoke_reconciles_against_postgres_and_the_chain"]
+presets = ["real-node-smoke"]
+unit_tests = ["crates/qbit-prism-load/tests/real_node.rs::fake_node_mode_is_unchanged"]
+
+[[scenario]]
+id = "real-node-short-plan-pair"
+title = "#547: the short plan on the real and the fake node, differing only in --node"
+owner = "#547"
+lanes = ["nightly"]
+criteria = "Both exit 0 under the presets' gates; the real-node run's chain reconciles and its report states the cadence band."
+runs = true
+presets = ["short-plan-real-node", "short-plan-fake-node"]
+
 # The load-harness presets #521 item 6 runs (fake node). Each preset states
 # its own gates; #549 turns the nightly set into L2 with repeats and a trend.
 
@@ -514,7 +534,7 @@ owner = "#552"
 lanes = ["L2"]
 criteria = "The cost a real node adds is reported as a number."
 runs = false
-reason = "Needs the real-node harness mode (#547)."
+reason = "The pair of presets exists (real-node-short-plan-pair, #547); running it nightly on one runner and reporting the difference is #552."
 
 [[scenario]]
 id = "l3-production-window-matrix"

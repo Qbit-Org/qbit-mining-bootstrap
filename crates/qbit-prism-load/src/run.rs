@@ -5,7 +5,7 @@ use crate::{
     artifact::{self, ArtifactInputs, PhaseEvidence, Withhold},
     cadence::{self, FrontendHealth, Landing, RevisionSampler, RevisionSeries},
     classify::{self, BlockedLog, Rejection, RejectionClass},
-    cli::{phases, Args, PhasePlan},
+    cli::{phases, Args, NodeMode, PhasePlan},
     client::{
         self, ClientFailure, Event, FailureKind, NotifySighting, Outcome, SessionConfig,
         SessionHandle, SessionShared, SubmitRecord, TipSighting,
@@ -15,8 +15,10 @@ use crate::{
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     kill::KillDriver,
     measure::{self, LockSampler, ProcessSampler},
-    node::FakeNode,
-    profile, provenance, proxy, report,
+    node::{FakeNode, NodeState},
+    profile, provenance, proxy,
+    qbitd::Qbitd,
+    report,
     restart::{RestartDriver, RestartRecord},
     window,
 };
@@ -718,6 +720,116 @@ pub fn shared_environment(
     }
 }
 
+/// The exact environment one frontend is launched with: the shared and
+/// per-frontend keys, the pool fee, and for a real node its chain (#547).
+/// The one composition `run_inner` launches with, so what is recorded is
+/// what ran (EP-CONFIG).
+pub fn launch_environment(
+    shared: &SharedEnvironment,
+    spec: &FrontendSpec,
+    pool_fee_bps: u16,
+    pool_fee_address: &str,
+    node: NodeMode,
+) -> BTreeMap<String, String> {
+    let mut environment = frontend::frontend_environment(shared, spec);
+    frontend::apply_pool_fee(&mut environment, pool_fee_bps, pool_fee_address);
+    if node == NodeMode::Qbitd {
+        // The server checks this against the node's `getblockchaininfo`.
+        environment.insert("QBIT_CHAIN".into(), "regtest".into());
+    }
+    environment
+}
+
+/// Start the managed real pair and check it accepts the run's derived
+/// payout and fee addresses as the programs they were derived from.
+async fn start_qbitd(
+    args: &Args,
+    run_tag: &str,
+    log_dir: &std::path::Path,
+    payout_address: &str,
+    pool_fee_address: &str,
+) -> Result<Qbitd> {
+    let node = Qbitd::start(
+        &args.qbitd_bin()?,
+        run_tag,
+        &format!("load-{run_tag}"),
+        log_dir,
+        args.keep_artifacts,
+    )
+    .await?;
+    for (role, address) in [("payout", payout_address), ("fee", pool_fee_address)] {
+        let (derived, program) =
+            crate::qbitd::derived_address(&format!("prism-load-{role}-{run_tag}"));
+        ensure!(
+            derived == address,
+            "the {role} address was not derived for this run"
+        );
+        node.check_address(address, &program).await?;
+    }
+    Ok(node)
+}
+
+/// A real-node run's `node` block: the keys a fake-node run writes, from the
+/// node's own records, then the real node's own (#547).
+#[allow(clippy::too_many_arguments)]
+fn real_node_block(
+    args: &Args,
+    url: &str,
+    real: &Qbitd,
+    solution: &window::WindowSolution,
+    runs: &[PhaseRun],
+    submissions: &[crate::node::SubmissionRecord],
+    tip_changes: &[crate::node::TipChange],
+    chain_reconciliation: Option<Value>,
+    discarded_block_solutions: u64,
+    live_shares_committed: usize,
+) -> Result<Value> {
+    let mut block = real.report();
+    let phases: Vec<(String, f64, u64)> = runs
+        .iter()
+        .map(|run| (run.plan.name.clone(), run.plan.rate, run.plan.seconds))
+        .collect();
+    let mut band = crate::qbitd::cadence_band_block(
+        args.window_shares,
+        &phases,
+        solution.hashes_per_share,
+        solution.hashes_per_block,
+    );
+    // Every share that also met the network target was stepped over and
+    // counted; against the accepted shares that is the node's target seen
+    // from the miners' side.
+    let expected = live_shares_committed as f64 * crate::window::WINDOW_MULTIPLIER as f64
+        / args.window_shares as f64;
+    band["observed_block_solutions"] = json!({
+        "discarded_unscheduled": discarded_block_solutions,
+        "live_shares_committed": live_shares_committed,
+        "expected_at_the_band_rule": expected,
+        "note": "own blocks stay scheduled, as in fake-node runs: a share that also met the \
+                 network target is stepped over and counted, so this count against the \
+                 committed shares is the node's target seen from the miners' side (a Poisson \
+                 count around expected_at_the_band_rule)",
+    });
+    let fields = json!({
+        "url": url,
+        "template_bits": format!("{:08x}", args.template_bits()?),
+        "retarget_bits": false,
+        "background_shares_per_second": args.background_shares_per_second,
+        "submissions": submissions,
+        "tip_changes": tip_changes.iter().map(|change| json!({
+            "hash": change.hash, "height": change.height,
+            "origin": change.origin, "wall": change.wall.to_rfc3339(),
+            "next_template_bits": crate::qbitd::RAMP_BITS,
+        })).collect::<Vec<_>>(),
+        "rpc_call_counts": block["relay"]["rpc_calls"].clone(),
+        "cadence_band": band,
+        "chain_reconciliation": chain_reconciliation,
+    });
+    if let (Some(block), Value::Object(fields)) = (block.as_object_mut(), fields) {
+        block.extend(fields);
+    }
+    Ok(block)
+}
+
 /// The side report's record of one frontend's initial-job admission: the
 /// value the process was launched with, read back from its own environment
 /// rather than from the arguments, with where it came from and what
@@ -758,6 +870,20 @@ pub async fn execute(args: Args) -> Result<i32> {
 /// side report names (#521).
 pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Preset>) -> Result<i32> {
     args.validate()?;
+    let node_mode = args.node_mode()?;
+    // A real node's bits are the ramp's, which the window is solved against
+    // and the report states; the fake node serves what the flag says.
+    let args = match node_mode {
+        NodeMode::Fake => args,
+        NodeMode::Qbitd => {
+            let bin = args.qbitd_bin()?;
+            ensure!(bin.is_file(), "--qbitd-bin {} is not a file", bin.display());
+            Args {
+                template_bits: crate::qbitd::RAMP_BITS.into(),
+                ..args
+            }
+        }
+    };
     // A memory floor the host cannot measure is refused before anything is
     // created, rather than skipped once a second for the whole run (#485).
     measure::verify_memory_floor(args.min_mem_available_mib, measure::mem_available_kib())?;
@@ -777,7 +903,19 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     let run_id = uuid::Uuid::new_v4();
     let run_tag = run_id.simple().to_string()[..8].to_owned();
     let address_prefix = "pload1".to_owned();
-    let payout_address = format!("{address_prefix}{run_tag}");
+    // A real node validates addresses for real, so its run pays derived
+    // regtest P2MR programs; the fake node accepts its own prefix.
+    let (payout_address, pool_fee_address) = match node_mode {
+        NodeMode::Fake => {
+            let payout_address = format!("{address_prefix}{run_tag}");
+            let fee = frontend::pool_fee_address(&payout_address);
+            (payout_address, fee)
+        }
+        NodeMode::Qbitd => (
+            crate::qbitd::derived_address(&format!("prism-load-payout-{run_tag}")).0,
+            crate::qbitd::derived_address(&format!("prism-load-fee-{run_tag}")).0,
+        ),
+    };
     // The live sessions' addresses, usernames, hashrates and difficulties,
     // generated once from the validated flags (#521). A run that asked for
     // no realism gets exactly the one address and usernames it always had.
@@ -848,26 +986,64 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     let server_bytes =
         std::fs::read(&server_bin).with_context(|| format!("reading {}", server_bin.display()))?;
     let server_digest = format!("sha256:{}", hex::encode(Sha256::digest(&server_bytes)));
-    let artifact_kind = artifact_kind(
-        dirty,
-        args.example_artifact,
-        revision_evidence.is_established(),
-        server_profile,
-    )
+    let artifact_kind = match node_mode {
+        NodeMode::Fake => artifact_kind(
+            dirty,
+            args.example_artifact,
+            revision_evidence.is_established(),
+            server_profile,
+        ),
+        // Decision 1 (#487): real-node rates are never D1 evidence.
+        NodeMode::Qbitd => artifact::ARTIFACT_EXAMPLE,
+    }
     .to_owned();
 
     // --- file descriptors -------------------------------------------------
     let needed = (args.peak_sessions() as u64) * 4 + 1024;
     let (fd_before, fd_after) = measure::raise_file_descriptor_limit(needed)?;
 
-    // --- fake node --------------------------------------------------------
-    let node = FakeNode::open_with_retarget(
-        &format!("{:08x}", args.template_bits()?),
-        &address_prefix,
-        args.retarget_bits,
-    )
-    .await?;
-    let node_state = node.state.clone();
+    // --- node -------------------------------------------------------------
+    let mut fake_node: Option<FakeNode> = None;
+    let node = match node_mode {
+        NodeMode::Fake => {
+            let node = FakeNode::open_with_retarget(
+                &format!("{:08x}", args.template_bits()?),
+                &address_prefix,
+                args.retarget_bits,
+            )
+            .await?;
+            let state = node.state.clone();
+            fake_node = Some(node);
+            RunNode::Fake(state)
+        }
+        NodeMode::Qbitd => {
+            match start_qbitd(
+                &args,
+                &run_tag,
+                &log_dir,
+                &payout_address,
+                &pool_fee_address,
+            )
+            .await
+            {
+                Ok(node) => RunNode::Qbitd(Arc::new(node)),
+                Err(error) => {
+                    let _ = report::write_failure(
+                        &args.out,
+                        run_id,
+                        &format!("{error:#}"),
+                        &removed_at_entry,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    };
+    let node_url = match (&fake_node, &node) {
+        (Some(fake), _) => fake.url.clone(),
+        (None, RunNode::Qbitd(real)) => real.url().to_owned(),
+        (None, RunNode::Fake(_)) => unreachable!("a fake node run keeps its server"),
+    };
 
     // --- PostgreSQL -------------------------------------------------------
     let replication = Replication::parse(&args.replication)?;
@@ -905,8 +1081,9 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
             artifact_kind,
             fd_before,
             fd_after,
-            node_url: node.url.clone(),
-            node_state,
+            node_url,
+            node: node.clone(),
+            pool_fee_address,
             direct_url: direct_url.clone(),
             log_dir,
             stale_outputs_removed,
@@ -923,7 +1100,10 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     if let Some(mut cluster) = managed {
         cluster.stop();
     }
-    drop(node);
+    drop(fake_node);
+    if let Some(real) = node.qbitd() {
+        real.stop().await;
+    }
     // An error out of the run is the one exit that wrote no report of its
     // own. The directory was taken at entry, so it would otherwise be left
     // empty, as if nothing had run: the reason goes into it instead. The
@@ -939,6 +1119,44 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
         }
     }
     result
+}
+
+/// The node the run drives: the in-process fake, or the managed real pair
+/// (#547).
+#[derive(Clone)]
+enum RunNode {
+    Fake(Arc<NodeState>),
+    Qbitd(Arc<Qbitd>),
+}
+
+impl RunNode {
+    fn mint(&self) -> &dyn crate::node::ExternalMint {
+        match self {
+            Self::Fake(state) => state.as_ref(),
+            Self::Qbitd(node) => node.as_ref(),
+        }
+    }
+
+    fn qbitd(&self) -> Option<&Qbitd> {
+        match self {
+            Self::Fake(_) => None,
+            Self::Qbitd(node) => Some(node),
+        }
+    }
+
+    fn submissions(&self) -> Vec<crate::node::SubmissionRecord> {
+        match self {
+            Self::Fake(state) => state.submissions(),
+            Self::Qbitd(node) => node.submissions(),
+        }
+    }
+
+    fn tip_changes(&self) -> Vec<crate::node::TipChange> {
+        match self {
+            Self::Fake(state) => state.tip_changes(),
+            Self::Qbitd(node) => node.tip_changes(),
+        }
+    }
 }
 
 struct RunContext {
@@ -961,7 +1179,8 @@ struct RunContext {
     fd_before: u64,
     fd_after: u64,
     node_url: String,
-    node_state: Arc<crate::node::NodeState>,
+    node: RunNode,
+    pool_fee_address: String,
     direct_url: String,
     log_dir: PathBuf,
     /// The earlier run's outputs removed from `--out` at entry, by name.
@@ -1098,11 +1317,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             stratum_port: free_port()?,
             audit_port: free_port()?,
         };
-        let mut environment = frontend::frontend_environment(&shared_env, &spec);
-        frontend::apply_pool_fee(
-            &mut environment,
+        let environment = launch_environment(
+            &shared_env,
+            &spec,
             args.pool_fee_bps,
-            &frontend::pool_fee_address(&ctx.payout_address),
+            &ctx.pool_fee_address,
+            args.node_mode()?,
         );
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
         // Frontend 1 first: concurrent first-boot migrations wait inside a
@@ -1405,7 +1625,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &sessions,
             &mut frontends,
             &process_samplers,
-            &ctx.node_state,
+            ctx.node.mint(),
             &mut external_tips,
             &mut remaining_blocks,
             &mut remaining_tips,
@@ -1533,6 +1753,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             aborted = Some(reason);
             break;
         }
+        // A real node that failed is seen at the phase boundary: the run
+        // stops there, as it does for a frontend that exited (exit 6).
+        if let Some(reason) = ctx.node.qbitd().and_then(Qbitd::failure) {
+            aborted = Some(reason);
+            break;
+        }
     }
     *shared_session.phase.write().expect("phase lock") = "teardown".to_owned();
 
@@ -1598,6 +1824,38 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         difficulty_premise_contradiction(&collected.difficulty_mismatches),
         replication_premise.contradiction(),
     );
+    // A real node's chain has to say what the harness recorded: every block
+    // above the ramp one of the peer's mints or one accepted submission, and
+    // the ramped bits throughout. A disagreement is the node contradicting
+    // the run's premise (exit 8), never a share finding.
+    let mut chain_reconciliation = None;
+    let premise_contradiction = match ctx.node.qbitd() {
+        None => premise_contradiction,
+        Some(real) => {
+            real.quiesce().await;
+            if aborted.is_none() {
+                aborted = real.failure();
+            }
+            let (block, problems) = real.chain_reconciliation().await;
+            chain_reconciliation = Some(block);
+            // A node that is gone aborts the run (exit 6): the chain it can
+            // no longer answer for is in the report, not a contradiction.
+            let lost = real.lost();
+            if let Some(reason) = &lost {
+                aborted.get_or_insert_with(|| reason.clone());
+            }
+            let node_reason = (!problems.is_empty() && lost.is_none()).then(|| {
+                format!(
+                    "the real node disagrees with the run: {}",
+                    problems.join("; ")
+                )
+            });
+            match (premise_contradiction, node_reason) {
+                (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+                (first, second) => first.or(second),
+            }
+        }
+    };
     let mut withhold = withhold_decision(
         late_hard_block.as_deref(),
         premise_contradiction.as_deref(),
@@ -1896,8 +2154,19 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         unknown_outcome_commits,
         no_response_commits,
     } = gaps;
-    let node_submissions = ctx.node_state.submissions();
-    let tip_changes = ctx.node_state.tip_changes();
+    let node_submissions = ctx.node.submissions();
+    let tip_changes = ctx.node.tip_changes();
+    // A real node's external tips are the ones its pool node saw, taken from
+    // the watcher now that every mint has landed.
+    if let Some(real) = ctx.node.qbitd() {
+        external_tips = real.observed_mints(crate::node::MintPurpose::WarmUp);
+        let churn_tips = real.observed_mints(crate::node::MintPurpose::Churn);
+        for run in &mut runs {
+            if let Some(churn) = run.churn.as_mut() {
+                churn.driver.tips = churn_tips.clone();
+            }
+        }
+    }
     let dense_cadence = dense_cadence_report(
         args,
         &runs,
@@ -1907,7 +2176,34 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         &committed,
         aborted.as_deref(),
     );
-    let side_report = json!({
+    let node_block = match &ctx.node {
+        RunNode::Fake(state) => json!({
+            "url": ctx.node_url,
+            "template_bits": format!("{:08x}", args.template_bits()?),
+            "retarget_bits": state.retargets(),
+            "background_shares_per_second": args.background_shares_per_second,
+            "submissions": node_submissions,
+            "tip_changes": tip_changes.iter().map(|change| json!({
+                "hash": change.hash, "height": change.height,
+                "origin": change.origin, "wall": change.wall.to_rfc3339(),
+                "next_template_bits": state.template_bits(change.height + 1),
+            })).collect::<Vec<_>>(),
+            "rpc_call_counts": state.rpc_call_counts(),
+        }),
+        RunNode::Qbitd(real) => real_node_block(
+            args,
+            &ctx.node_url,
+            real,
+            &solution,
+            &runs,
+            &node_submissions,
+            &tip_changes,
+            chain_reconciliation.take(),
+            collected.discarded_block_solutions,
+            committed.len(),
+        )?,
+    };
+    let mut side_report = json!({
         "schema": report::SCHEMA,
         "run_id": ctx.run_id.to_string(),
         "run_tag": ctx.run_tag,
@@ -1938,7 +2234,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "payout_address": ctx.payout_address,
             "payout_addresses": ctx.population.addresses.len(),
             "pool_fee_bps": args.pool_fee_bps,
-            "pool_fee_address": frontend::pool_fee_address(&ctx.payout_address),
+            "pool_fee_address": ctx.pool_fee_address,
             "share_id_prefix": ctx.share_prefix,
             "writer_ids": writer_ids,
         },
@@ -2029,19 +2325,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         ),
         "dense_cadence": dense_cadence,
         "churn": churn_report(args, &runs, &collected, &tip_changes),
-        "node": {
-            "url": ctx.node_url,
-            "template_bits": format!("{:08x}", args.template_bits()?),
-            "retarget_bits": ctx.node_state.retargets(),
-            "background_shares_per_second": args.background_shares_per_second,
-            "submissions": node_submissions,
-            "tip_changes": tip_changes.iter().map(|change| json!({
-                "hash": change.hash, "height": change.height,
-                "origin": change.origin, "wall": change.wall.to_rfc3339(),
-                "next_template_bits": ctx.node_state.template_bits(change.height + 1),
-            })).collect::<Vec<_>>(),
-            "rpc_call_counts": ctx.node_state.rpc_call_counts(),
-        },
+        "node": node_block,
         "premise": premise_block(
             premise_contradiction.as_deref(),
             &collected.difficulty_mismatches,
@@ -2125,6 +2409,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "validator": validator_block(&evidence, args, slowest_rate, &worst_p99, &unrecognised),
         "stale_outputs_removed": ctx.stale_outputs_removed,
     });
+    // Real-node keys are added only to a real-node run's report, so a
+    // fake-node report keeps exactly the keys it always had (#547).
+    if let Some(real) = ctx.node.qbitd() {
+        let qbitd = side_report["node"]["qbitd"].clone();
+        side_report["versions"]["qbitd_binary_sha256"] = qbitd["binary_sha256"].clone();
+        side_report["versions"]["qbitd_subversion"] = qbitd["subversion"].clone();
+        side_report["premise"]["node_reconciled"] =
+            side_report["node"]["chain_reconciliation"]["reconciled"].clone();
+        side_report["premise"]["node_failure"] = json!(real.failure());
+    }
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
 
@@ -2285,7 +2579,7 @@ pub async fn drive_phase(
     sessions: &[SessionHandle],
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
-    node_state: &crate::node::NodeState,
+    node_state: &dyn crate::node::ExternalMint,
     external_tips: &mut Vec<crate::node::TipChange>,
     remaining_blocks: &mut usize,
     remaining_tips: &mut usize,
@@ -2331,7 +2625,7 @@ pub async fn drive_phase_with_population(
     sessions: &[SessionHandle],
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
-    node_state: &crate::node::NodeState,
+    node_state: &dyn crate::node::ExternalMint,
     external_tips: &mut Vec<crate::node::TipChange>,
     remaining_blocks: &mut usize,
     remaining_tips: &mut usize,
@@ -2392,15 +2686,21 @@ pub async fn drive_phase_with_population(
     // landing budget and `steady_state` schedules none, so the budget is not
     // spent before the phase that measures it. Without it, nothing changes.
     let dense_run = args.cadence()?.is_dense();
-    let block_times: Vec<f64> =
-        if plan.name == "steady_state" && !dense_run && *remaining_blocks > 0 {
-            let count = *remaining_blocks;
-            (0..count)
-                .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
-                .collect()
-        } else {
-            Vec::new()
-        };
+    // The tips plan's warm-up is its only phase, so it holds the scheduled
+    // blocks there; every other plan schedules them in `steady_state`.
+    let block_phase = if args.plan()? == crate::cli::Plan::Tips {
+        "warm_up"
+    } else {
+        "steady_state"
+    };
+    let block_times: Vec<f64> = if plan.name == block_phase && !dense_run && *remaining_blocks > 0 {
+        let count = *remaining_blocks;
+        (0..count)
+            .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut block_cursor = 0usize;
     let tip_times: Vec<f64> = if plan.name == "warm_up" && *remaining_tips > 0 {
         let count = *remaining_tips;
@@ -2541,7 +2841,9 @@ pub async fn drive_phase_with_population(
         if tip_cursor < tip_times.len() && seconds >= tip_times[tip_cursor] {
             tip_cursor += 1;
             *remaining_tips = remaining_tips.saturating_sub(1);
-            external_tips.push(node_state.mint_external_block());
+            if let Some(tip) = node_state.mint_external(crate::node::MintPurpose::WarmUp) {
+                external_tips.push(tip);
+            }
         }
         if !kill_done && seconds >= duration.as_secs_f64() / 3.0 {
             kill_done = true;
