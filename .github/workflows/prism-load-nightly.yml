@@ -80,6 +80,13 @@ on:
         type: boolean
         required: false
         default: false
+      fuzz:
+        description: >-
+          Also run the time-boxed Stratum fuzz targets (#575; the nightly
+          schedule always does).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -377,4 +384,47 @@ jobs:
           path: |
             ${{ env.PRISM_TEST_GATE_MANIFEST }}
             ${{ env.PRISM_TEST_LOG }}
+          if-no-files-found: error
+
+  # #575: the Stratum cargo-fuzz targets in crates/qbit-prism-server/fuzz
+  # (line codec, per-connection session state machine, codec parsers), all
+  # three at once for 20 minutes, from the checked-in seeds plus the corpus
+  # the previous night kept. Gated on no crash, leak, timeout or OOM input;
+  # the corpus is saved either way, and any finding is uploaded with the logs.
+  # .github/scripts/prism-stratum-fuzz.sh pins the nightly toolchain and
+  # cargo-fuzz and says how to reproduce a finding.
+  stratum-fuzz:
+    name: Stratum fuzzing (20 min)
+    if: ${{ github.event.schedule == '17 2 * * *' || inputs.fuzz }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Restore the kept corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/stratum-fuzz-corpus
+          key: prism-stratum-fuzz-corpus-v1-${{ github.run_id }}
+          restore-keys: prism-stratum-fuzz-corpus-v1-
+      - name: Run the fuzz targets and gate on no crash
+        run: |
+          bash .github/scripts/prism-stratum-fuzz.sh \
+            "${RUNNER_TEMP}/stratum-fuzz-corpus" "${RUNNER_TEMP}/stratum-fuzz-out" 1200
+      - name: Keep the corpus for the next night
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/stratum-fuzz-corpus
+          key: prism-stratum-fuzz-corpus-v1-${{ github.run_id }}
+      - name: Upload the logs and any crashing inputs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-stratum-fuzz
+          overwrite: true
+          retention-days: 30
+          path: ${{ runner.temp }}/stratum-fuzz-out
           if-no-files-found: error
