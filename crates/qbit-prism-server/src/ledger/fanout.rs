@@ -4,6 +4,12 @@ use super::*;
 // combined outpoint exclusion atomic across independently claimed fanouts.
 pub(super) const CPFP_FUNDING_LOCK: i64 = 0x505249534d000006;
 
+// How a handed-back claim is rescheduled (#573). Due at once, but ordered
+// behind every row already due; or the backoff `finish_fanout` gives a failed
+// attempt, from the attempt count before it.
+const REQUEUE_BEHIND_DUE: &str = "next_broadcast_attempt_at=clock_timestamp()";
+const FAILED_ATTEMPT_BACKOFF: &str = "next_broadcast_attempt_at=clock_timestamp()+LEAST(3600,10*(broadcast_attempt_count+1))*interval '1 second',broadcast_retry_backoff_seconds=LEAST(3600,10*(broadcast_attempt_count+1))";
+
 impl Ledger {
     /// Renew only a still-live token. An expired worker must not revive itself
     /// before wallet or network mutations after another instance takes over.
@@ -32,6 +38,70 @@ impl Ledger {
             .bind(&claim.fanout_txid).bind(&claim.claim_token).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(released == 1)
+    }
+
+    /// Hand back a claim whose successful attempt's completion was refused,
+    /// such as by a moved payout revision (#573). Like
+    /// [`Self::release_fanout_claim`], but the row is due again at once
+    /// *behind* every row already due, so a row refused on every attempt
+    /// cannot hold up the rows after it. An attempt that sent the fanout
+    /// (`sent` is its result, never a check-only observation) is recorded as
+    /// `submitted` with the refusal as its error, so the attempt history and
+    /// counters see it; the settlement status and chain evidence the refused
+    /// completion would have written are left alone, and the retry backoff is
+    /// not extended. Fenced by the holder's token; returns whether a claim
+    /// was released.
+    pub async fn requeue_refused_fanout(
+        &self,
+        claim: &FanoutClaim,
+        sent: Option<&Value>,
+        refusal: &str,
+    ) -> Result<bool> {
+        self.hand_back_fanout(
+            claim,
+            sent.map(|result| ("submitted", Some(result), refusal)),
+            REQUEUE_BEHIND_DUE,
+        )
+        .await
+    }
+
+    /// The fallback when a failed attempt's `finish_fanout(…, "failed")` did
+    /// not persist (#573): record the failed attempt and hand the claim back
+    /// with the backoff that completion would have set, rather than hold it
+    /// until expiry and then retry at once. It needs neither the settlement
+    /// lock nor an active parent, and leaves the settlement status alone.
+    /// Fenced by the holder's token; returns whether a claim was released.
+    pub async fn release_failed_fanout(&self, claim: &FanoutClaim, error: &str) -> Result<bool> {
+        self.hand_back_fanout(claim, Some(("failed", None, error)), FAILED_ATTEMPT_BACKOFF)
+            .await
+    }
+
+    async fn hand_back_fanout(
+        &self,
+        claim: &FanoutClaim,
+        attempt: Option<(&str, Option<&Value>, &str)>,
+        schedule: &str,
+    ) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        writable(&mut tx).await?;
+        // The attempt columns are the old row's: the backoff is computed from
+        // the count before this attempt, exactly as `finish_fanout` does.
+        let counted = if let Some((status, result, error)) = attempt {
+            sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET broadcast_attempt_count=broadcast_attempt_count+1,broadcast_attempt_detail_count=LEAST(32,broadcast_attempt_detail_count+1),first_broadcast_attempt_at=COALESCE(first_broadcast_attempt_at,clock_timestamp()),last_broadcast_attempt_at=clock_timestamp(),last_broadcast_attempt_status=$3,last_broadcast_submit_result=$4,last_broadcast_error=$5,broadcast_attempt_status_counts=jsonb_set(broadcast_attempt_status_counts,ARRAY[$3],to_jsonb(COALESCE((broadcast_attempt_status_counts->>$3)::bigint,0)+1)),{schedule},claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2"))
+                .bind(&claim.fanout_txid).bind(&claim.claim_token).bind(status).bind(result).bind(error).execute(&mut *tx).await?.rows_affected()
+        } else {
+            sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET {schedule},claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2"))
+                .bind(&claim.fanout_txid).bind(&claim.claim_token).execute(&mut *tx).await?.rows_affected()
+        };
+        // A stale token records nothing: a completion that did commit already
+        // recorded this attempt, and another holder owns the row's history.
+        if let (1, Some((status, result, error))) = (counted, attempt) {
+            sqlx::query("INSERT INTO qbit_ctv_fanout_broadcast_attempts(fanout_txid,attempt_status,submit_result,error) VALUES($1,$2,$3,$4)")
+                .bind(&claim.fanout_txid).bind(status).bind(result).bind(error).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1 AND attempt_seq NOT IN (SELECT attempt_seq FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1 ORDER BY attempt_seq DESC LIMIT 32)").bind(&claim.fanout_txid).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(counted == 1)
     }
 
     pub async fn record_fanout_scan(

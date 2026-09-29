@@ -2582,7 +2582,28 @@ impl Coordinator {
             match self.ledger.claim_candidate(CANDIDATE_LEASE.seconds).await {
                 Ok(Some(claim)) => {
                     let result = tokio::select! {
-                        _ = shutdown.changed() => break,
+                        _ = shutdown.changed() => {
+                            // #573: the in-flight work is dropped with its
+                            // heartbeat; hand the claim back instead of making
+                            // another frontend wait out the lease on every
+                            // rolling restart. The release keeps the state and
+                            // schedule, exactly as an expiry would leave the
+                            // row: a reservation or an offer this attempt made
+                            // is recovered, never offered again, by whoever
+                            // claims it next. Fenced on the token and on an
+                            // unfinished state, so a terminal commit that won
+                            // the race is left alone. A failed release falls
+                            // back to the expiry.
+                            let released = tokio::time::timeout(
+                                CANDIDATE_LEASE.timeout,
+                                self.ledger.release_recovery_claim(&claim, "claim released at shutdown"),
+                            )
+                            .await;
+                            if !matches!(released, Ok(Ok(_))) {
+                                tracing::warn!(block=%claim.candidate.block_hash,"candidate claim release at shutdown deferred to its expiry");
+                            }
+                            break;
+                        }
                         result = self.process_candidate(&claim) => result,
                     };
                     if let Err(error) = result {
