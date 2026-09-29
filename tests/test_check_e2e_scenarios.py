@@ -273,6 +273,28 @@ class CheckE2eScenarios(unittest.TestCase):
         self.replace('runs = false\nowner = "#553"', "runs = false")
         self.assertProblem("lane L4 does not run yet and names no owner issue")
 
+    def test_a_weekly_preset_runs_in_the_weekly_lane_only_while_it_is_wired(self) -> None:
+        self.fixture.write(
+            "crates/qbit-prism-load/presets/soak.json",
+            json.dumps({"schema": "qbit.prism.load-preset.v1", "name": "soak", "schedule": "weekly"}),
+        )
+        self.assertProblem("weekly runs preset soak, which no running scenario names")
+        self.fixture.manifest += (
+            '\n[lanes.weekly]\ntitle = "Weekly soak"\nruns = true\n'
+            'workflow = ".github/workflows/prism-load-nightly.yml"\n'
+            '\n[[scenario]]\nid = "soak"\ntitle = "Soak"\nowner = "#575"\nlanes = ["weekly"]\n'
+            'criteria = "Its gates."\nruns = true\npresets = ["soak"]\n'
+        )
+        self.assertProblem("lane weekly: .github/workflows/prism-load-nightly.yml no longer contains")
+        workflow = self.fixture.root / ".github/workflows/prism-load-nightly.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8")
+            + "    - cron: \"41 5 * * 6\"\n"
+            + "SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') }}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.fixture.problems(), [])
+
     def test_the_smoke_preset_runs_in_pr_only_through_the_load_smoke_test(self) -> None:
         self.fixture.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, COMPONENT])) + "\n")
         self.assertProblem("preset 'smoke' is unknown or runs in no lane")

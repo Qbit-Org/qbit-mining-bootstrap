@@ -58,6 +58,8 @@ pub enum Schedule {
     Manual,
     /// The per-PR smoke test's preset; not run by the nightly workflow.
     Smoke,
+    /// Once a week, and on demand: the long soak (#575).
+    Weekly,
 }
 
 /// What the gate holds a run of the preset to. See [`crate::gate`]. Every
@@ -116,6 +118,9 @@ struct PresetFile {
     timeout_minutes: u32,
     gates: serde_json::Map<String, Value>,
     args: BTreeMap<String, Value>,
+    /// Only a `--plan soak` preset has one, and it must.
+    #[serde(default)]
+    soak: Option<Value>,
 }
 
 /// One loaded preset.
@@ -131,6 +136,8 @@ pub struct Preset {
     pub timeout_minutes: u32,
     pub gates: Gates,
     pub args: BTreeMap<String, Value>,
+    /// The soak block of a `--plan soak` preset (#575).
+    pub soak: Option<crate::soak::Spec>,
 }
 
 impl Preset {
@@ -201,6 +208,14 @@ impl Preset {
             "preset {}: timeout_minutes must be 1..360",
             file.name
         );
+        let soak = crate::soak::from_preset_value(file.soak.as_ref())
+            .with_context(|| format!("preset {}", file.name))?;
+        let soak_plan = file.args.get("--plan").and_then(Value::as_str) == Some("soak");
+        ensure!(
+            soak_plan == soak.is_some(),
+            "preset {}: a soak block goes with --plan soak, and --plan soak needs one",
+            file.name
+        );
         let preset = Self {
             path: path.to_owned(),
             sha256: hex::encode(Sha256::digest(&bytes)),
@@ -212,6 +227,7 @@ impl Preset {
             timeout_minutes: file.timeout_minutes,
             gates,
             args: file.args,
+            soak,
         };
         preset.check_complete()?;
         Ok(preset)
@@ -298,7 +314,7 @@ impl Preset {
         // the tips plan has none; the D1 plan's runs either way, so there a
         // null would take the plan's default length and rate.
         let plan = self.args.get("--plan").and_then(Value::as_str);
-        if !matches!(plan, Some("short" | "tips")) {
+        if !matches!(plan, Some("short" | "tips" | "soak")) {
             for flag in ["--burst-seconds", "--burst-rate"] {
                 ensure!(
                     !self.args.get(flag).is_some_and(Value::is_null),

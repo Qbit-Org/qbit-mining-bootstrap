@@ -30,6 +30,19 @@ name: PRISM load harness (nightly)
 # today #545's 2.x.x migration lifecycle. The weekly schedule runs only that
 # job; the nightly jobs keep their own schedule.
 #
+# #575 item 2: the long soak has a third schedule, Saturday 05:41 UTC, whose
+# plan selects `weekly`: the soak-weekly preset, one server lifetime of about
+# 5.5 h looping the mainnet-shape-130-addresses, rental-churn-bursts-and-storms
+# and tip-delivery workloads, with forced share-partition rollovers and the
+# share-archive retention cycle under the load, sampled every minute and gated
+# on RSS and descriptor trends, connection drift, bounded WAL, zero lost
+# shares and exact reconciliation (docs/prism-soak.md). The preset's timeout
+# is 355 min, under the 6 h job limit. It has its own concurrency group, so it
+# never holds the nightly queue; neither live job runs on its schedule. Cost:
+# one 8 vCPU runner for about 5 h 40 min plus the shared release build, about
+# 350 runner-minutes a week, about $5.60 at $0.016 per 8 vCPU minute.
+# `preset: soak-weekly` (or `weekly`) dispatches it by hand.
+#
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
 
@@ -38,13 +51,17 @@ on:
     - cron: "17 2 * * *"
     # Weekly, on Sunday. The jobs' `if` conditions compare against both crons.
     - cron: "43 3 * * 0"
+    # The weekly soak (#575), on Saturday: only the plan, build and run jobs,
+    # with the plan selecting `weekly` by this exact string.
+    - cron: "41 5 * * 6"
   workflow_dispatch:
     inputs:
       preset:
         description: >-
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
-          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async).
+          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async),
+          `weekly` for the 5.5 h soak (soak-weekly).
         required: true
         default: nightly
       ref:
@@ -83,8 +100,13 @@ on:
 permissions:
   contents: read
 
+# The weekly soak holds its runner for most of six hours, so it queues only
+# behind another soak, never in front of a nightly.
 concurrency:
-  group: prism-load-nightly
+  group: >-
+    prism-load-${{ (github.event.schedule == '41 5 * * 6'
+    || contains(inputs.preset || '', 'soak-weekly')
+    || inputs.preset == 'weekly') && 'soak' || 'nightly' }}
   cancel-in-progress: false
 
 jobs:
@@ -103,7 +125,7 @@ jobs:
       - name: Select presets and pin the commit
         id: plan
         env:
-          SELECTION: ${{ inputs.preset || 'nightly' }}
+          SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') || 'nightly' }}
         run: |
           set -euo pipefail
           matrix="$(python3 scripts/prism_load_matrix.py "${SELECTION}")"
@@ -262,13 +284,25 @@ jobs:
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      # Each <package>::<binary> in the list runs once with its own ids
+      # (qbit-prism-server::live_regtest and #575's qbit-prism-load::soak_smoke
+      # today). Every binary runs even if an earlier one failed; the step
+      # fails if any did.
       - name: Run the listed variants
         run: |
           set -euo pipefail
-          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt \
-            | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
-          cargo test --locked -p qbit-prism-server --test live_regtest -- \
-            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+          mapfile -t ids < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt | grep -v '^$')
+          : > "${PRISM_TEST_LOG}"
+          failed=0
+          for target in $(printf '%s\n' "${ids[@]}" | awk -F'::' '{print $1 "::" $2}' | sort -u); do
+            package="${target%%::*}"
+            binary="${target#*::}"
+            mapfile -t tests < <(printf '%s\n' "${ids[@]}" | grep "^${target}::" | sed "s/^${target}:://")
+            cargo test --locked -p "${package}" --test "${binary}" -- \
+              --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee -a "${PRISM_TEST_LOG}" \
+              || failed=1
+          done
+          exit "${failed}"
       - name: Prove every listed variant executed
         run: |
           python3 scripts/check_gate_manifest.py \

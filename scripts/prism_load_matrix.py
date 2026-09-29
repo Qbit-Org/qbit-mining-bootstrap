@@ -4,9 +4,12 @@
 Reads `crates/qbit-prism-load/presets/*.json` and prints the GitHub Actions
 matrix for a selection:
 
-- `nightly` (the schedule's selection): every preset whose schedule is
-  `nightly`;
-- `all`: every `nightly` and `manual` preset;
+- `nightly` (the nightly schedule's selection): every preset whose schedule
+  is `nightly`;
+- `weekly` (the weekly schedule's selection): every preset whose schedule is
+  `weekly`, the long soak (#575);
+- `all`: every `nightly` and `manual` preset (not the weekly soak, which
+  takes most of a runner's six hours);
 - otherwise a comma-separated list of preset names, any schedule. A name
   listed in `presets/aliases.txt` (a preset's deprecated name) selects the
   preset it was renamed to, with a warning.
@@ -69,8 +72,8 @@ def select(
     presets: dict[str, dict], selection: str, aliases: dict[str, str] | None = None
 ) -> list[dict]:
     selection = selection.strip()
-    if selection == "nightly":
-        names = [name for name, p in presets.items() if p["schedule"] == "nightly"]
+    if selection in ("nightly", "weekly"):
+        names = [name for name, p in presets.items() if p["schedule"] == selection]
     elif selection == "all":
         names = [name for name, p in presets.items() if p["schedule"] in ("nightly", "manual")]
     else:

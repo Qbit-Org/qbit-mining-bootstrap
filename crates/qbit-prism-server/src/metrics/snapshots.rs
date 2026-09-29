@@ -9,6 +9,9 @@ pub struct DeliveryMetrics {
 }
 pub struct ProcessMetrics {
     pub resident_bytes: u64,
+    /// `None` when the descriptor directory could not be read, which leaves
+    /// the resident set published and the descriptor gauge unknown.
+    pub open_fds: Option<u64>,
 }
 #[derive(Default)]
 pub struct DatabaseMetrics {
@@ -167,6 +170,11 @@ impl Collection<'_> {
             |registry| {
                 if let Some(snapshot) = snapshot {
                     registry.set(Family::Rss, vec![], snapshot.resident_bytes as f64);
+                    registry.set(
+                        Family::OpenFds,
+                        vec![],
+                        snapshot.open_fds.map_or(-1., |fds| fds as f64),
+                    );
                 }
             },
         );
@@ -262,7 +270,7 @@ pub(super) fn invalidate(registry: &mut Registry, collector: Collector) {
             Family::CandidateLandingFailedAge,
             Family::PartitionLead,
         ],
-        Collector::Process => &[Family::Rss],
+        Collector::Process => &[Family::Rss, Family::OpenFds],
     };
     for family in families {
         registry.set(*family, vec![], -1.);
@@ -302,7 +310,10 @@ mod tests {
     #[test]
     fn collector_expiry_and_failure_preserve_last_success_time_without_fabricating_values() {
         let metrics = Metrics::default();
-        metrics.publish_process(Some(ProcessMetrics { resident_bytes: 0 }));
+        metrics.publish_process(Some(ProcessMetrics {
+            resident_bytes: 0,
+            open_fds: Some(0),
+        }));
         let at = Instant::now() - COLLECTOR_STALE_AFTER - Duration::from_secs(1);
         metrics
             .collections

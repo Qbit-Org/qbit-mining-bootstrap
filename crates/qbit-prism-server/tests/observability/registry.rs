@@ -417,6 +417,8 @@ async fn process_collector_reads_real_input_and_distinguishes_failure_from_zero(
         sample(&moved, "qbit_prism_process_resident_memory_bytes"),
         4_194_304.
     );
+    assert_eq!(sample(&zero, "qbit_prism_process_open_fds"), 0.);
+    assert_eq!(sample(&moved, "qbit_prism_process_open_fds"), 1.);
     std::fs::write(
         directory.path().join("status"),
         "VmRSS:\tbad kB\nThreads:\t3\n",

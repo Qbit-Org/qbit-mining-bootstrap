@@ -7177,6 +7177,7 @@ async fn a_restart_that_outruns_the_phase_deadline_is_completed_outside_the_meas
     ]);
     let plan = PhasePlan {
         name: "reconnect".into(),
+        kind: "reconnect".into(),
         seconds: 2,
         rate: 20.0,
         in_artifact: true,
@@ -7184,6 +7185,7 @@ async fn a_restart_that_outruns_the_phase_deadline_is_completed_outside_the_meas
         database_delay_ms: 0,
         mid_flight_kill: false,
         dense_cadence: false,
+        restart_frontend: true,
     };
     // The healthy frontend's session takes every offer it is given; the
     // restarted frontend's session holds one submit that settles 800 ms

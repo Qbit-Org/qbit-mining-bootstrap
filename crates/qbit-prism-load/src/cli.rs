@@ -20,6 +20,10 @@ pub enum Plan {
     /// run's plan (#521): time to new-tip work and reconciliation in about a
     /// minute.
     Tips,
+    /// The long soak (#575): the looped presets' phases from a soak
+    /// preset's `soak` block, over one server lifetime. See
+    /// [`crate::soak_driver`].
+    Soak,
 }
 
 impl Plan {
@@ -28,7 +32,8 @@ impl Plan {
             "d1" => Ok(Self::D1),
             "short" => Ok(Self::Short),
             "tips" => Ok(Self::Tips),
-            other => bail!("unknown plan {other:?}; use d1, short or tips"),
+            "soak" => Ok(Self::Soak),
+            other => bail!("unknown plan {other:?}; use d1, short, tips or soak"),
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -36,6 +41,7 @@ impl Plan {
             Self::D1 => "d1",
             Self::Short => "short",
             Self::Tips => "tips",
+            Self::Soak => "soak",
         }
     }
 }
@@ -749,7 +755,12 @@ impl Args {
 /// One phase of the run.
 #[derive(Clone, Debug)]
 pub struct PhasePlan {
+    /// Unique within the run: every offer is stamped with it.
     pub name: String,
+    /// What the phase is (`warm_up`, `steady_state`, `churn`, ...), which is
+    /// what decides where tips are minted and blocks scheduled. The name
+    /// outside a soak, whose phases are named per cycle.
+    pub kind: String,
     pub seconds: u64,
     pub rate: f64,
     /// Only the three required phases go into the artifact.
@@ -763,6 +774,9 @@ pub struct PhasePlan {
     /// Drive own-block landings on the `--cadence-gaps` pattern and measure
     /// the payout-revision bumps they cause.
     pub dense_cadence: bool,
+    /// With `reconnects` and two or more frontends, restart one frontend
+    /// a third of the way in. Off in a soak, which is one server lifetime.
+    pub restart_frontend: bool,
 }
 
 pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
@@ -778,6 +792,10 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             args.reconnect_seconds.unwrap_or(60),
             args.slow_database_seconds.unwrap_or(60),
         ),
+        Plan::Soak => bail!(
+            "a soak's phases come from its preset's soak block (soak_driver::plan), not from \
+             --plan alone"
+        ),
         Plan::Short | Plan::Tips => (
             args.steady_state_seconds.unwrap_or(60),
             args.steady_state_rate.unwrap_or(args.rate),
@@ -791,6 +809,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
     if args.warmup_seconds > 0 {
         plans.push(PhasePlan {
             name: "warm_up".into(),
+            kind: "warm_up".into(),
             seconds: args.warmup_seconds,
             rate: args.background_shares_per_second.unwrap_or(steady_rate),
             in_artifact: false,
@@ -798,6 +817,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             database_delay_ms: 0,
             mid_flight_kill: false,
             dense_cadence: false,
+            restart_frontend: false,
         });
     }
     if plan == Plan::Tips {
@@ -809,6 +829,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
     }
     plans.push(PhasePlan {
         name: "steady_state".into(),
+        kind: "steady_state".into(),
         seconds: steady_seconds,
         rate: steady_rate,
         in_artifact: true,
@@ -816,10 +837,12 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         database_delay_ms: 0,
         mid_flight_kill: false,
         dense_cadence: false,
+        restart_frontend: false,
     });
     if let Some((seconds, rate)) = burst {
         plans.push(PhasePlan {
             name: "burst".into(),
+            kind: "burst".into(),
             seconds,
             rate,
             in_artifact: false,
@@ -827,10 +850,12 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             database_delay_ms: 0,
             mid_flight_kill: false,
             dense_cadence: false,
+            restart_frontend: false,
         });
     }
     plans.push(PhasePlan {
         name: "reconnect".into(),
+        kind: "reconnect".into(),
         seconds: reconnect_seconds,
         rate: steady_rate,
         in_artifact: true,
@@ -838,9 +863,11 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         database_delay_ms: 0,
         mid_flight_kill: false,
         dense_cadence: false,
+        restart_frontend: true,
     });
     plans.push(PhasePlan {
         name: "slow_database".into(),
+        kind: "slow_database".into(),
         seconds: slow_seconds,
         rate: steady_rate,
         in_artifact: true,
@@ -848,6 +875,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         database_delay_ms: args.slow_db_delay_ms,
         mid_flight_kill: false,
         dense_cadence: false,
+        restart_frontend: false,
     });
     // The dense-cadence phase is a side phase, after `slow_database` and with
     // no proxy delay: the measurement is the frontends' rebuild latency, which
@@ -855,6 +883,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
     if args.cadence()?.is_dense() {
         plans.push(PhasePlan {
             name: crate::cadence::PHASE.into(),
+            kind: crate::cadence::PHASE.into(),
             seconds: args.cadence_seconds,
             rate: args.cadence_rate.unwrap_or(steady_rate),
             in_artifact: false,
@@ -862,12 +891,14 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             database_delay_ms: 0,
             mid_flight_kill: false,
             dense_cadence: true,
+            restart_frontend: false,
         });
     }
     plans.extend(churn_phase(args, steady_rate));
     if args.mid_flight_kill {
         plans.push(PhasePlan {
             name: "mid_flight_kill".into(),
+            kind: "mid_flight_kill".into(),
             seconds: 60,
             rate: steady_rate,
             in_artifact: false,
@@ -880,6 +911,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             database_delay_ms: args.slow_db_delay_ms,
             mid_flight_kill: true,
             dense_cadence: false,
+            restart_frontend: false,
         });
     }
     Ok(plans)
@@ -890,6 +922,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
 fn churn_phase(args: &Args, steady_rate: f64) -> Option<PhasePlan> {
     (args.churn_seconds > 0).then(|| PhasePlan {
         name: crate::churn::PHASE.into(),
+        kind: crate::churn::PHASE.into(),
         seconds: args.churn_seconds,
         rate: args.churn_rate.unwrap_or(steady_rate),
         in_artifact: false,
@@ -897,5 +930,6 @@ fn churn_phase(args: &Args, steady_rate: f64) -> Option<PhasePlan> {
         database_delay_ms: 0,
         mid_flight_kill: false,
         dense_cadence: false,
+        restart_frontend: false,
     })
 }

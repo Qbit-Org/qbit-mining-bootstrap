@@ -83,6 +83,7 @@ families! {
     CollectorSuccess: Gauge, "collector_success", "Whether the latest collector attempt succeeded, or -1 before an attempt.";
     CollectorAge: Gauge, "collector_age_seconds", "Monotonic age of the last successful collector observation, or -1 before success.";
     Rss: Gauge, "process_resident_memory_bytes", "Process resident memory bytes from procfs, or -1 when unknown.";
+    OpenFds: Gauge, "process_open_fds", "Process open file descriptors counted in procfs, the collector's own read included, or -1 when unknown.";
     RuntimeLag: Gauge, "runtime_lag_seconds", "Latest observed runtime sampler wake lateness, or -1 before the first observation.";
     PollLag: Gauge, "runtime_poll_lag_seconds", "Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task.";
     ProgressAge: Gauge, "runtime_progress_age_seconds", "Oldest active operation time since progress; zero when idle.";
@@ -166,6 +167,7 @@ impl Family {
                 | Self::CandidateLandingFailedAge
                 | Self::PartitionLead
                 | Self::Rss
+                | Self::OpenFds
                 | Self::CollectorAvailable
                 | Self::CollectorSuccess
                 | Self::CollectorAge

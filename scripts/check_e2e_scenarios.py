@@ -11,8 +11,9 @@ evidence, and the evidence decides its lanes:
   `prism-native-postgres` shards prove it executed); one in
   `test/prism-nightly-gated-tests.txt` runs in `nightly`.
 - `presets`: load-harness presets in `crates/qbit-prism-load/presets`. A
-  `nightly` preset runs in `nightly`, a `manual` one in `dispatch`, and the
-  `smoke` preset in `pr` through the gated `load_smoke` test.
+  `nightly` preset runs in `nightly`, a `weekly` one (the long soak, #575)
+  in `weekly`, a `manual` one in `dispatch`, and the `smoke` preset in `pr`
+  through the gated `load_smoke` test.
 - `unit_tests`: `<file>::<fn>` for an ungated `#[test]` or `#[tokio::test]`
   that is not `#[ignore]`d; `cargo test --workspace` runs it in `pr`.
 
@@ -66,7 +67,7 @@ SCENARIO_BINARIES = (
     "qbit-prism-server::live_regtest::",
     "qbit-prism-load::load_smoke::",
 )
-PRESET_LANES = {"nightly": "nightly", "manual": "dispatch", "smoke": "pr"}
+PRESET_LANES = {"nightly": "nightly", "weekly": "weekly", "manual": "dispatch", "smoke": "pr"}
 # The lanes this check can enumerate, and the workflow text that has to be
 # present for each to run at all. A lane marked running that is not here needs
 # this check taught how to read it.
@@ -86,6 +87,11 @@ LANE_WIRING = {
     "dispatch": (
         ".github/workflows/prism-load-nightly.yml",
         ("workflow_dispatch:", "scripts/prism_load_matrix.py"),
+    ),
+    # The long soak's schedule (#575), whose plan selects the `weekly` presets.
+    "weekly": (
+        ".github/workflows/prism-load-nightly.yml",
+        ('cron: "41 5 * * 6"', "github.event.schedule == '41 5 * * 6' && 'weekly'"),
     ),
 }
 LANE_KEYS = {"title", "runs", "owner", "workflow"}

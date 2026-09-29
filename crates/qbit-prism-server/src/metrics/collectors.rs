@@ -25,7 +25,15 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
     let resident_bytes = field("VmRSS:", Some("kB"))?
         .checked_mul(1024)
         .context("procfs RSS overflow")?;
-    Ok(ProcessMetrics { resident_bytes })
+    // The process reads its own descriptor directory, which it may even when
+    // it is not dumpable and no other process of its user may (#575).
+    let open_fds = std::fs::read_dir(proc_path.join("fd"))
+        .ok()
+        .map(|entries| entries.count() as u64);
+    Ok(ProcessMetrics {
+        resident_bytes,
+        open_fds,
+    })
 }
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:
