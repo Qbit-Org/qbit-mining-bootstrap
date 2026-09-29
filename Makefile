@@ -92,7 +92,7 @@ if [ "$${missing}" -ne 0 ]; then \
 fi;
 endef
 
-.PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+.PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-compose-prism-config prism-cutover-rehearsal prism-cutover-rehearsal-dump prism-cutover-rehearsal-generated up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
@@ -133,6 +133,20 @@ test-prism-postgres-throughput:
 
 test-prism-public-read-replica:
 	bash test/prism-native-tests.sh replica
+
+# The 2.x.x -> 3.x.x cutover rehearsal on an operator's pg_dump, in a private
+# PostgreSQL cluster (#575): make prism-cutover-rehearsal DUMP=... LEDGER_KEY=...
+# See docs/prism-rust-migration.md#rehearse-the-cutover-on-a-snapshot.
+prism-cutover-rehearsal:
+	bash test/prism-cutover-rehearsal.sh rehearse
+
+# A mainnet-shaped 2.x.x dump to rehearse: make prism-cutover-rehearsal-dump OUT=...
+prism-cutover-rehearsal-dump:
+	bash test/prism-cutover-rehearsal.sh dump
+
+# Both in one command, for any branch: make prism-cutover-rehearsal-generated DENSITY=0.0625
+prism-cutover-rehearsal-generated:
+	bash test/prism-cutover-rehearsal.sh generated
 
 test-compose-prism-config:
 	@QBIT_SRC_DIR="$(CURDIR)" \
