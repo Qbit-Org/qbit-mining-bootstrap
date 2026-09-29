@@ -37,17 +37,13 @@
 //! is `submitted`, except the one documented current behaviour (#581):
 //! phase 3's held block, recovered as an unknown offer while held, stays in
 //! reconciliation after phase 4, its retry two hours out.
-use super::alert_rules::{longest, rule, sample, scrape, Rule, Scrape};
+use super::alert_rules::{sample, scrape, snapshot_stale, Mirror, Verdict};
+use super::host_tools::program;
 use super::private_postgres::{ClusterOptions, PrivateCluster};
 use super::share_client::{start_share_only_servers, Proof, ShareClient, Submitted};
+use super::submit_proxy::SubmitProxy;
 use super::*;
-use qbit_prism_server::codec::{double_sha256, hash_display};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
-use tokio::{
-    io::AsyncReadExt,
-    net::TcpStream,
-    sync::{oneshot, watch},
-};
+use std::{collections::BTreeMap, path::Path};
 
 /// Shares each serving server mines per phase.
 const PHASE_SHARES: usize = 5;
@@ -120,8 +116,7 @@ async fn wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_o
 /// libfaketime, found next to the `faketime` wrapper on `PATH`, as the
 /// Debian/Ubuntu `faketime` and `libfaketime` packages install it.
 fn faketime_library() -> Result<PathBuf> {
-    let wrapper = super::private_postgres::program("faketime")
-        .context("install the faketime and libfaketime packages")?;
+    let wrapper = program("faketime").context("install the faketime and libfaketime packages")?;
     let prefix = wrapper
         .parent()
         .and_then(Path::parent)
@@ -240,18 +235,25 @@ async fn database_offset(f: &Fixture, offset: i64) -> Result<()> {
 }
 
 /// What one phase did on one server.
-#[derive(Default)]
-struct Served {
-    submitted: Vec<Submitted>,
-    blocks: Vec<String>,
-    /// Why the server served no current work in this phase, if it did not.
-    unserved: Option<String>,
+enum Served {
+    /// Its shares and the block, which landed.
+    Mined {
+        submitted: Vec<Submitted>,
+        block: String,
+    },
+    /// No current work reached a miner: why.
+    NoWork(String),
 }
 
+/// Refusals of ordinary shares that the phase after the database clock
+/// steps back may show (seen once in four runs; #581); every other phase
+/// must accept every share.
+const REFUSED_AFTER_STEP_BACK: [&str; 2] = ["stale-job", "ledger-confirmation-failed"];
+
 /// Mine `PHASE_SHARES` shares and one block on `server`, on the current
-/// tip, and wait for the block on the node.
-async fn mine_on(f: &Fixture, server: usize, label: &str) -> Result<Served> {
-    let mut served = Served::default();
+/// tip, and wait for the block on the node. Every share must be accepted,
+/// or refused for one of `refusable`; the block must be accepted.
+async fn mine_on(f: &Fixture, server: usize, label: &str, refusable: &[&str]) -> Result<Served> {
     let tip = f.rpc("getbestblockhash", json!([])).await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let username = format!("{}.clock-{server}", f.address);
@@ -264,30 +266,40 @@ async fn mine_on(f: &Fixture, server: usize, label: &str) -> Result<Served> {
     };
     let mut client = match current.await {
         Ok(client) => client,
-        Err(error) => {
-            served.unserved = Some(format!("{error:#}"));
-            return Ok(served);
-        }
+        Err(error) => return Ok(Served::NoWork(format!("{error:#}"))),
     };
+    let mut submitted = Vec::new();
     for _ in 0..PHASE_SHARES {
-        served.submitted.push(client.submit(Proof::Share).await?);
+        let share = client.submit(Proof::Share).await?;
+        ensure!(
+            share.answer.accepted()
+                || share
+                    .answer
+                    .reason_id()
+                    .is_some_and(|reason| refusable.contains(&reason)),
+            "{label}: server {server} answered a share {}",
+            share.answer
+        );
+        submitted.push(share);
     }
     let block = client.submit(Proof::Block).await?;
-    let accepted = block.answer.accepted();
-    served.submitted.push(block.clone());
     ensure!(
-        accepted,
-        "{label}: server {server} refused its block: {:?}",
+        block.answer.accepted(),
+        "{label}: server {server} refused its block: {}",
         block.answer
     );
-    served.blocks.push(block.hash.clone());
+    let hash = block.hash.clone();
+    submitted.push(block);
     until(
         &format!("{label}: server {server}'s block on the node"),
         60,
-        || async { Ok(f.rpc("getbestblockhash", json!([])).await? == json!(block.hash)) },
+        || async { Ok(f.rpc("getbestblockhash", json!([])).await? == json!(hash)) },
     )
     .await?;
-    Ok(served)
+    Ok(Served::Mined {
+        submitted,
+        block: hash,
+    })
 }
 
 /// Record of every phase, for the final checks and the report.
@@ -302,24 +314,27 @@ struct Run {
 }
 
 impl Run {
-    /// Keep what a server that must serve work did; fail if it served none.
-    fn add(&mut self, label: &str, server: usize, served: Served) -> Result<()> {
-        if let Some(why) = served.unserved {
-            bail!("{label}: server {server} served no current work: {why}");
+    /// Mine on `server` in a phase where it must serve work, and keep what
+    /// it did.
+    async fn mine(
+        &mut self,
+        f: &Fixture,
+        server: usize,
+        label: &str,
+        refusable: &[&str],
+    ) -> Result<()> {
+        match mine_on(f, server, label, refusable).await? {
+            Served::NoWork(why) => bail!("{label}: server {server} served no current work: {why}"),
+            Served::Mined { submitted, block } => {
+                self.submitted.extend(
+                    submitted
+                        .into_iter()
+                        .map(|submitted| (label.to_owned(), submitted)),
+                );
+                self.blocks.push((label.to_owned(), block));
+                Ok(())
+            }
         }
-        self.submitted.extend(
-            served
-                .submitted
-                .into_iter()
-                .map(|submitted| (label.to_owned(), submitted)),
-        );
-        self.blocks.extend(
-            served
-                .blocks
-                .into_iter()
-                .map(|block| (label.to_owned(), block)),
-        );
-        Ok(())
     }
 }
 
@@ -337,9 +352,63 @@ fn span(seconds: i64) -> String {
 const UNSERVED_WATCH: Duration = Duration::from_secs(200);
 
 /// While `server` serves no work, keep a miner connecting and authorizing
-/// to it (as a real one would) and report which paging rules fire on it:
-/// each rule's condition, mirrored here, held on every scrape for its `for`.
+/// to it (as a real one would) and report which paging rules fire on it.
+/// The refresh stall is what this state is, so its rule must.
 async fn unserved_alerts(f: &Fixture, server: usize) -> Result<String> {
+    let mirrors = [
+        Mirror::new(
+            "PrismWorkRefreshStalledCritical",
+            &["qbit_prism_work_refresh_stalled_seconds", ">= bool 120"],
+            |_, s| {
+                s.gate_open()
+                    && s.value("qbit_prism_work_refresh_stalled_seconds")
+                        .is_some_and(|stalled| stalled >= 120.0)
+            },
+        )?,
+        Mirror::new(
+            "PrismCurrentWorkGapHigh",
+            &[
+                "qbit_prism_stratum_current_tip_coverage_gap_seconds",
+                "> bool 15",
+            ],
+            |_, s| {
+                s.gate_open()
+                    && s.value("qbit_prism_stratum_current_tip_coverage_gap_seconds")
+                        .is_some_and(|gap| gap > 15.0)
+                    && s.value("qbit_prism_authorized_clients")
+                        .is_some_and(|n| n > 0.0)
+            },
+        )?,
+        Mirror::new(
+            "PrismSemanticWorkCoverageLoss",
+            &[
+                "qbit_prism_stratum_semantic_current_work_ratio",
+                "< bool 0.95",
+            ],
+            |_, s| {
+                s.gate_open()
+                    && s.value("qbit_prism_stratum_semantic_current_work_ratio")
+                        .is_some_and(|ratio| (0.0..0.95).contains(&ratio))
+                    && s.value("qbit_prism_authorized_clients")
+                        .is_some_and(|n| n > 0.0)
+            },
+        )?,
+        Mirror::new(
+            "PrismTimeToUsableWorkHigh",
+            &[
+                "qbit_prism_stratum_oldest_pending_initial_job_seconds",
+                "> bool 15",
+            ],
+            |_, s| {
+                s.gate_open()
+                    && s.value("qbit_prism_stratum_oldest_pending_initial_job_seconds")
+                        .is_some_and(|age| age > 15.0)
+                    && s.value("qbit_prism_stratum_pending_initial_jobs")
+                        .is_some_and(|n| n > 0.0)
+            },
+        )?,
+        snapshot_stale()?,
+    ];
     let port = f.stratum[server];
     let username = format!("{}.clock-waiting-{server}", f.address);
     let waiting = tokio::spawn(async move {
@@ -351,101 +420,85 @@ async fn unserved_alerts(f: &Fixture, server: usize) -> Result<String> {
     });
     let scrapes = sample(&f.client, &[(server, f.api[server])], UNSERVED_WATCH).await;
     waiting.abort();
-    type Condition = Box<dyn Fn(&Scrape) -> bool>;
-    let rules: Vec<(Rule, Condition)> = vec![
-        (
-            rule(
-                "PrismWorkRefreshStalledCritical",
-                &["qbit_prism_work_refresh_stalled_seconds", ">= bool 120"],
-            )?,
-            Box::new(|s| {
-                s.gate_open()
-                    && s.value("qbit_prism_work_refresh_stalled_seconds")
-                        .is_some_and(|stalled| stalled >= 120.0)
-            }),
-        ),
-        (
-            rule(
-                "PrismCurrentWorkGapHigh",
-                &[
-                    "qbit_prism_stratum_current_tip_coverage_gap_seconds",
-                    "> bool 15",
-                ],
-            )?,
-            Box::new(|s| {
-                s.gate_open()
-                    && s.value("qbit_prism_stratum_current_tip_coverage_gap_seconds")
-                        .is_some_and(|gap| gap > 15.0)
-                    && s.value("qbit_prism_authorized_clients")
-                        .is_some_and(|n| n > 0.0)
-            }),
-        ),
-        (
-            rule(
-                "PrismSemanticWorkCoverageLoss",
-                &[
-                    "qbit_prism_stratum_semantic_current_work_ratio",
-                    "< bool 0.95",
-                ],
-            )?,
-            Box::new(|s| {
-                s.gate_open()
-                    && s.value("qbit_prism_stratum_semantic_current_work_ratio")
-                        .is_some_and(|ratio| (0.0..0.95).contains(&ratio))
-                    && s.value("qbit_prism_authorized_clients")
-                        .is_some_and(|n| n > 0.0)
-            }),
-        ),
-        (
-            rule(
-                "PrismTimeToUsableWorkHigh",
-                &[
-                    "qbit_prism_stratum_oldest_pending_initial_job_seconds",
-                    "> bool 15",
-                ],
-            )?,
-            Box::new(|s| {
-                s.gate_open()
-                    && s.value("qbit_prism_stratum_oldest_pending_initial_job_seconds")
-                        .is_some_and(|age| age > 15.0)
-                    && s.value("qbit_prism_stratum_pending_initial_jobs")
-                        .is_some_and(|n| n > 0.0)
-            }),
-        ),
-        (
-            rule(
-                "PrismMetricsSnapshotStale",
-                &["qbit_prism_metrics_snapshot_stale", "> bool 0"],
-            )?,
-            Box::new(|s| {
-                s.value("qbit_prism_metrics_snapshot_stale")
-                    .is_some_and(|stale| stale > 0.0)
-            }),
-        ),
-    ];
-    let mut report = Vec::new();
-    let mut stalled_fires = false;
-    for (rule, condition) in &rules {
-        let held = longest(&scrapes, condition);
-        stalled_fires |= rule.title == "PrismWorkRefreshStalledCritical" && held >= rule.hold;
-        report.push(format!(
-            "{} (for {:?}) {:.0}s{}",
-            rule.title,
-            rule.hold,
-            held.as_secs_f64(),
-            if held >= rule.hold { " FIRES" } else { "" }
-        ));
-    }
+    let verdict = Verdict::of(&scrapes, &[server], &mirrors);
     let report = format!(
         "server {server} unserved for {UNSERVED_WATCH:?}: {}",
-        report.join(", ")
+        verdict.report.replace('\n', ", ")
     );
-    // The refresh stall is what this state is: the rule for it must page.
     ensure!(
-        stalled_fires,
+        verdict.fired[&server].contains("PrismWorkRefreshStalledCritical"),
         "no work-refresh page while a server served no work: {report}"
     );
     Ok(report)
+}
+
+/// Phases 3 and 4: hold `holder`'s next found block at the proxy, move the
+/// database clock to `offset` while it is held, then release it and wait
+/// for it on the node.
+async fn held_landing(
+    f: &Fixture,
+    clocks: &Clocks,
+    proxy: &SubmitProxy,
+    run: &mut Run,
+    holder: usize,
+    offset: i64,
+    label: &str,
+) -> Result<()> {
+    let held = proxy.arm();
+    let tip = f.rpc("getbestblockhash", json!([])).await?;
+    let tip = tip.as_str().context("tip missing")?.to_owned();
+    let username = format!("{}.clock-held-{holder}", f.address);
+    let mut client = ShareClient::connect(f.stratum[holder], &username).await?;
+    client
+        .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+        .await?;
+    // The block's answer waits for its landing, which the proxy holds:
+    // submit it concurrently.
+    let submit = tokio::spawn(async move { client.submit(Proof::Block).await });
+    let hit = tokio::time::timeout(Duration::from_secs(30), held)
+        .await
+        .context("no submitblock reached the proxy")??;
+    let reserved: String =
+        sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(&hit.block)
+            .fetch_one(&f.pool)
+            .await?;
+    Clocks::set(&clocks.database, offset)?;
+    database_offset(f, offset).await?;
+    tokio::time::sleep(HOLD_AFTER_JUMP).await;
+    let offers_while_held = proxy.offers(&hit.block);
+    let _ = hit.release.send(());
+    let block = submit.await??;
+    ensure!(
+        block.hash == hit.block,
+        "{label}: the held block {} is not the one submitted, {}",
+        hit.block,
+        block.hash
+    );
+    run.notes.push(format!(
+        "{label}: held block was {reserved} at the jump; {offers_while_held} submitblock call(s) while held; answer {}",
+        block.answer
+    ));
+    // The answer waits for the landing up to the share commit timeout
+    // (#577); a hold that outlasts it is answered ledger-outcome-unknown,
+    // and the block still lands and its share is credited once.
+    ensure!(
+        block.answer.accepted() || block.answer.reason_id() == Some("ledger-outcome-unknown"),
+        "{label}: the held block was refused: {}",
+        block.answer
+    );
+    if !block.answer.accepted() {
+        run.pending.push(block.share_id.clone());
+    }
+    let hash = block.hash.clone();
+    run.submitted.push((label.to_owned(), block));
+    run.blocks.push((label.to_owned(), hash.clone()));
+    until(
+        &format!("{label}: the held block on the node"),
+        60,
+        || async { Ok(f.rpc("getbestblockhash", json!([])).await? == json!(hash)) },
+    )
+    .await
 }
 
 async fn jumps(
@@ -476,7 +529,7 @@ async fn jumps(
     }
     database_offset(f, 0).await?;
     for server in 0..2 {
-        run.add("baseline", server, mine_on(f, server, "baseline").await?)?;
+        run.mine(f, server, "baseline", &[]).await?;
     }
 
     // 2. Each server alone, minutes then hours: behind, then ahead.
@@ -486,106 +539,48 @@ async fn jumps(
         let other = 1 - server;
         let behind = format!("server {server} {}", span(-seconds));
         move_server(f, clocks, &mut highest, server, -seconds).await?;
-        run.add(&behind, other, mine_on(f, other, &behind).await?)?;
-        run.add(&behind, server, mine_on(f, server, &behind).await?)?;
+        run.mine(f, other, &behind, &[]).await?;
+        run.mine(f, server, &behind, &[]).await?;
 
         // Ahead of the node by more than PRISM_TEMPLATE_MAX_AGE_SECONDS
         // (120 s), every template the server reads looks stale: it builds no
         // work on the new tip (fail-safe), until its clock is corrected.
         let ahead = format!("server {server} {}", span(seconds));
         move_server(f, clocks, &mut highest, server, seconds).await?;
-        run.add(&ahead, other, mine_on(f, other, &ahead).await?)?;
-        let refused = mine_on(f, server, &ahead).await?;
-        ensure!(
-            refused.unserved.is_some() && refused.submitted.is_empty(),
-            "{ahead}: server {server} served work on a template its clock calls stale"
-        );
+        run.mine(f, other, &ahead, &[]).await?;
+        let Served::NoWork(why) = mine_on(f, server, &ahead, &[]).await? else {
+            bail!("{ahead}: server {server} served work on a template its clock calls stale");
+        };
         run.notes.push(format!(
-            "{ahead}: server {server} served no current work, as expected: {}",
-            refused.unserved.as_deref().unwrap_or_default()
+            "{ahead}: server {server} served no current work, as expected: {why}"
         ));
         if sample_alerts {
             run.notes.push(unserved_alerts(f, server).await?);
         }
         move_server(f, clocks, &mut highest, server, 0).await?;
-        let corrected = format!("server {server} corrected");
-        run.add(&corrected, server, mine_on(f, server, &corrected).await?)?;
+        run.mine(f, server, &format!("server {server} corrected"), &[])
+            .await?;
     }
 
     // 3 and 4. The database clock jumps while a block is mid-landing.
-    for (holder, offset, label) in [(0usize, 2 * 3600i64, HELD_FORWARD), (1, 0, HELD_BACK)] {
-        let held = proxy.arm();
-        let tip = f.rpc("getbestblockhash", json!([])).await?;
-        let tip = tip.as_str().context("tip missing")?.to_owned();
-        let username = format!("{}.clock-held-{holder}", f.address);
-        let mut client = ShareClient::connect(f.stratum[holder], &username).await?;
-        client
-            .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+    held_landing(f, clocks, proxy, &mut run, 0, 2 * 3600, HELD_FORWARD).await?;
+    for server in 0..2 {
+        run.mine(f, server, HELD_FORWARD, &[]).await?;
+    }
+    held_landing(f, clocks, proxy, &mut run, 1, 0, HELD_BACK).await?;
+    for server in 0..2 {
+        run.mine(f, server, HELD_BACK, &REFUSED_AFTER_STEP_BACK)
             .await?;
-        // The block's answer waits for its landing, which the proxy holds:
-        // submit it concurrently.
-        let submit = tokio::spawn(async move { client.submit(Proof::Block).await });
-        let hit = tokio::time::timeout(Duration::from_secs(30), held)
-            .await
-            .context("no submitblock reached the proxy")??;
-        let reserved: String =
-            sqlx::query_scalar("SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
-                .bind(&hit.block)
-                .fetch_one(&f.pool)
-                .await?;
-        Clocks::set(&clocks.database, offset)?;
-        database_offset(f, offset).await?;
-        tokio::time::sleep(HOLD_AFTER_JUMP).await;
-        let offers_while_held = proxy.offers(&hit.block);
-        let _ = hit.release.send(());
-        let block = submit.await??;
-        ensure!(
-            block.hash == hit.block,
-            "{label}: the held block {} is not the one submitted, {}",
-            hit.block,
-            block.hash
-        );
-        run.notes.push(format!(
-            "{label}: held block was {reserved} at the jump; {offers_while_held} submitblock call(s) while held; answer {}",
-            block.answer.reason()
-        ));
-        // The answer waits for the landing up to the share commit timeout
-        // (#577); a hold that outlasts it is answered ledger-outcome-unknown,
-        // and the block still lands and its share is credited once.
-        let answered = block.answer.accepted() || block.answer.reason() == "ledger-outcome-unknown";
-        if !block.answer.accepted() {
-            run.pending.push(block.share_id.clone());
-        }
-        run.submitted.push((label.to_owned(), block.clone()));
-        ensure!(
-            answered,
-            "{label}: the held block was refused: {:?}",
-            block.answer
-        );
-        run.blocks.push((label.to_owned(), block.hash.clone()));
-        until(
-            &format!("{label}: the held block on the node"),
-            60,
-            || async { Ok(f.rpc("getbestblockhash", json!([])).await? == json!(block.hash)) },
-        )
-        .await?;
-        for server in 0..2 {
-            run.add(label, server, mine_on(f, server, label).await?)?;
-        }
     }
 
-    // 5. Every clock real again.
+    // 5. Every clock real again: every share is accepted again.
     for index in 0..2 {
         move_server(f, clocks, &mut highest, index, 0).await?;
     }
     Clocks::set(&clocks.database, 0)?;
     database_offset(f, 0).await?;
     for server in 0..2 {
-        run.add(
-            "real again",
-            server,
-            mine_on(f, server, "real again").await?,
-        )?;
+        run.mine(f, server, "real again", &[]).await?;
     }
     f.quiesce().await?;
     verify(f, &mut run, proxy).await
@@ -641,12 +636,36 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
     let key = ManifestSigningKey::from_seed_hex(&"22".repeat(32))?.public_key_hex();
     let mut offers = BTreeMap::new();
     for (label, hash) in &run.blocks {
-        let rows: Vec<(String, i32)> = sqlx::query_as(
-            "SELECT state, attempt_count FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        // A row the server released into reconciliation (a post-offer step
+        // that lost a race, say) finishes on its retry, 10 s per attempt
+        // later; quiesce does not wait for that. Only #581's row, below,
+        // stays unfinished, its retry two hours out.
+        let rows = || async {
+            Ok::<_, anyhow::Error>(
+                sqlx::query_as::<_, (String, i32, Option<String>)>(
+                    "SELECT state, attempt_count, offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+                )
+                .bind(hash)
+                .fetch_all(&f.pool)
+                .await?,
+            )
+        };
+        until(
+            &format!("{label}: block {hash}'s outbox row settled"),
+            120,
+            || async {
+                let rows = rows().await?;
+                Ok(rows.len() == 1
+                    && (rows[0].0 == "submitted"
+                        || (label == HELD_FORWARD && rows[0].2.as_deref() == Some("unknown"))))
+            },
         )
-        .bind(hash)
-        .fetch_all(&f.pool)
         .await?;
+        let rows: Vec<(String, i32)> = rows()
+            .await?
+            .into_iter()
+            .map(|(state, attempts, _)| (state, attempts))
+            .collect();
         let landed: Vec<String> =
             sqlx::query_scalar("SELECT chain_state FROM qbit_pool_blocks WHERE block_hash=$1")
                 .bind(hash)
@@ -741,7 +760,7 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
         .filter(|(_, submitted)| !submitted.answer.accepted())
         .fold(BTreeMap::new(), |mut counts, (label, submitted)| {
             *counts
-                .entry(format!("{label}: {}", submitted.answer.reason()))
+                .entry(format!("{label}: {}", submitted.answer))
                 .or_default() += 1;
             counts
         });
@@ -773,160 +792,4 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
         "blocks offered other than exactly once: {double:?}"
     );
     Ok(())
-}
-
-/// A held `submitblock`: its block and the release.
-struct Hit {
-    block: String,
-    release: oneshot::Sender<()>,
-}
-
-#[derive(Default)]
-struct ProxyState {
-    upstream: u16,
-    submitted: std::sync::Mutex<Vec<String>>,
-    trap: std::sync::Mutex<Option<oneshot::Sender<Hit>>>,
-    /// Flipped to release every held call at cleanup.
-    released: Option<watch::Sender<bool>>,
-}
-
-/// An HTTP/1.1 JSON-RPC proxy in front of the node that records every
-/// `submitblock` and, when armed, holds the next one until its release while
-/// every other call passes.
-struct SubmitProxy {
-    port: u16,
-    state: Arc<ProxyState>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl SubmitProxy {
-    async fn start(upstream: u16) -> Result<Self> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let state = Arc::new(ProxyState {
-            upstream,
-            released: Some(watch::Sender::new(false)),
-            ..ProxyState::default()
-        });
-        let shared = state.clone();
-        let task = tokio::spawn(async move {
-            while let Ok((downstream, _)) = listener.accept().await {
-                let state = shared.clone();
-                tokio::spawn(async move {
-                    let _ = relay(state, downstream).await;
-                });
-            }
-        });
-        Ok(Self { port, state, task })
-    }
-
-    /// Hold the next `submitblock`.
-    fn arm(&self) -> oneshot::Receiver<Hit> {
-        let (sender, receiver) = oneshot::channel();
-        *self.state.trap.lock().unwrap() = Some(sender);
-        receiver
-    }
-
-    /// How many `submitblock` calls for `block` reached the proxy.
-    fn offers(&self, block: &str) -> usize {
-        self.state
-            .submitted
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|submitted| *submitted == block)
-            .count()
-    }
-
-    fn release_all(&self) {
-        if let Some(released) = &self.state.released {
-            released.send_replace(true);
-        }
-    }
-}
-
-impl Drop for SubmitProxy {
-    fn drop(&mut self) {
-        self.release_all();
-        self.task.abort();
-    }
-}
-
-/// Relays one server connection, one request and reply at a time. Each
-/// request goes to the node on a new connection, opened after any hold: a
-/// held call can outlast qbitd's idle timeout, and must not be written into
-/// a connection the node has closed meanwhile.
-async fn relay(state: Arc<ProxyState>, downstream: TcpStream) -> Result<()> {
-    let (down_read, mut down_write) = downstream.into_split();
-    let mut down_read = BufReader::new(down_read);
-    loop {
-        let Some((request, body)) = read_http(&mut down_read).await? else {
-            return Ok(());
-        };
-        if let Some(block) = submitted_block(&body) {
-            state.submitted.lock().unwrap().push(block.clone());
-            let trap = state.trap.lock().unwrap().take();
-            if let Some(sender) = trap {
-                let (release, released) = oneshot::channel();
-                let mut cleanup = state
-                    .released
-                    .as_ref()
-                    .context("proxy release missing")?
-                    .subscribe();
-                if sender.send(Hit { block, release }).is_ok() {
-                    tokio::select! {
-                        _ = released => {}
-                        _ = cleanup.wait_for(|released| *released) => {}
-                    }
-                }
-            }
-        }
-        let upstream = TcpStream::connect(("127.0.0.1", state.upstream)).await?;
-        let (up_read, mut up_write) = upstream.into_split();
-        up_write.write_all(&request).await?;
-        let Some((reply, _)) = read_http(&mut BufReader::new(up_read)).await? else {
-            return Ok(());
-        };
-        down_write.write_all(&reply).await?;
-    }
-}
-
-/// The block hash of a `submitblock` request body, if it is one.
-fn submitted_block(body: &[u8]) -> Option<String> {
-    let request: Value = serde_json::from_slice(body).ok()?;
-    if request["method"] != "submitblock" {
-        return None;
-    }
-    let block = hex::decode(request["params"][0].as_str()?).ok()?;
-    Some(hash_display(&double_sha256(block.get(..80)?)))
-}
-
-/// One HTTP/1.1 message framed by `Content-Length`, as qbitd and the
-/// servers' client frame every message: the raw bytes and the body.
-async fn read_http<R>(reader: &mut BufReader<R>) -> Result<Option<(Vec<u8>, Vec<u8>)>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut raw = Vec::new();
-    let mut length = None;
-    loop {
-        let start = raw.len();
-        if reader.read_until(b'\n', &mut raw).await? == 0 {
-            ensure!(raw.is_empty(), "connection closed inside an HTTP header");
-            return Ok(None);
-        }
-        let line = std::str::from_utf8(&raw[start..])?.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = Some(value.trim().parse::<usize>()?);
-            }
-        }
-    }
-    let mut body = vec![0; length.context("HTTP message without Content-Length")?];
-    reader.read_exact(&mut body).await?;
-    raw.extend_from_slice(&body);
-    Ok(Some((raw, body)))
 }

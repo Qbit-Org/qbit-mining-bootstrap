@@ -51,6 +51,9 @@ mod pool_fee;
 #[path = "support/live_share_client.rs"]
 mod share_client;
 
+#[path = "support/live_host_tools.rs"]
+mod host_tools;
+
 #[path = "support/live_private_postgres.rs"]
 mod private_postgres;
 
@@ -62,6 +65,9 @@ mod alert_rules;
 
 #[path = "support/live_disk_exhaustion.rs"]
 mod disk_exhaustion_tests;
+
+#[path = "support/live_submit_proxy.rs"]
+mod submit_proxy;
 
 #[path = "support/live_clock_jump.rs"]
 mod clock_jump_tests;

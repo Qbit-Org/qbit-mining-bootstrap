@@ -8,11 +8,11 @@
 //!
 //! Test clients mine shares that are not blocks on both servers while the
 //! injector fills the filesystem to `ENOSPC`, keep mining through the full
-//! state for longer than the paging rules' `for`, then the injector frees the
-//! space. If PostgreSQL itself stopped (here it does: a `PANIC` on a WAL
-//! write, then a crash recovery that cannot write either), it is started
-//! again as its supervisor would; the PRISM servers are never restarted or
-//! repaired.
+//! state until a paging rule has fired on each server (bounded), then the
+//! injector frees the space. If PostgreSQL itself stopped (here it does: a
+//! `PANIC` on a WAL write, then a crash recovery that cannot write either),
+//! it is started again as its supervisor would; the PRISM servers are never
+//! restarted or repaired. Every phase is bounded.
 //!
 //! It asserts that:
 //! - every share a client saw acknowledged, before, during and after the full
@@ -31,7 +31,7 @@
 //! - once space is freed, both original server processes accept shares again
 //!   within a bound, a block found afterwards lands on the node, and the
 //!   carry-forward integrity report is clean.
-use super::alert_rules::{longest, rule, scrape, Rule, Scrape};
+use super::alert_rules::{rule, scrape, snapshot_stale, Mirror, Scrape, Verdict};
 use super::disk_full_injector::DiskFullInjector;
 use super::private_postgres::{ClusterOptions, PrivateCluster};
 use super::share_client::{start_share_only_servers, Answer, Proof, ShareClient, Submitted};
@@ -50,15 +50,18 @@ const VOLUME_MIB: u64 = 160;
 /// Test clients per server.
 const CLIENTS_PER_SERVER: usize = 2;
 /// Shares each client must have acknowledged before the fill and after the
-/// recovery.
+/// recovery, each within [`STEADY_BOUND`].
 const STEADY_SHARES: usize = 10;
-/// How long mining continues once the first refusal was seen.
-/// Longer than the 3-minute `for` of the rules that can page for it.
-const FULL_HOLD: Duration = Duration::from_secs(200);
-/// How long the fill may take to produce the first refusal.
+const STEADY_BOUND: Duration = Duration::from_secs(120);
+/// How long the fill may take to be refused on both servers.
 const FILL_BOUND: Duration = Duration::from_secs(180);
-/// How long both servers have to accept shares again once space is freed.
-const RECOVERY_BOUND: Duration = Duration::from_secs(120);
+/// How long the full state may last once both servers refuse, waiting for a
+/// paging rule to fire on each: its 3-minute `for`, plus time for
+/// PostgreSQL to go down after the first refusal.
+const FULL_BOUND: Duration = Duration::from_secs(360);
+
+const REJECTIONS: &str = "qbit_prism_rejections_total";
+const ACCEPTED: &str = "qbit_prism_accepted_shares_total";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "nightly #575: PostgreSQL's data volume fills under mining; needs fuse2fs and /dev/fuse"]
@@ -74,7 +77,9 @@ async fn postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_
         ],
     )?;
     let bin = PathBuf::from(&inputs[2]);
-    let reasons = alert_reasons()?;
+    let reasons = rule("PrismShareAppendFailures", &[REJECTIONS, "reason_id=~"])?
+        .label_alternatives("reason_id")?;
+    let mirrors = paging_mirrors(&reasons)?;
     // As in the failover drills: wait for the fixture guard once before the
     // cluster's loopback connections start.
     drop(SERIAL.lock().await);
@@ -95,7 +100,7 @@ async fn postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_
     else {
         bail!("the live fixture's inputs were required above");
     };
-    let result = exhaust(&mut fixture, &disk, &mut cluster, &reasons).await;
+    let result = exhaust(&mut fixture, &disk, &mut cluster, &reasons, &mirrors).await;
     if result.is_err() {
         eprintln!("{}", fixture.diagnostics());
         eprintln!("{}", cluster.diagnostics());
@@ -123,33 +128,38 @@ enum Phase {
     After,
 }
 
+/// A test client: its server, its worker, its live session if it has one,
+/// and the shares acknowledged in the current phase.
+struct Miner {
+    server: usize,
+    username: String,
+    session: Option<ShareClient>,
+    accepted: usize,
+}
+
 async fn exhaust(
     f: &mut Fixture,
     disk: &DiskFullInjector,
     cluster: &mut PrivateCluster,
     reasons: &BTreeSet<String>,
+    mirrors: &[Mirror],
 ) -> Result<()> {
     start_share_only_servers(f, &[(0, Vec::new()), (1, Vec::new())]).await?;
     let mut records = Vec::new();
-    let mut clients = Vec::new();
+    let mut miners = Vec::new();
     for server in 0..2 {
         for slot in 0..CLIENTS_PER_SERVER {
-            let username = format!("{}.disk-{server}-{slot}", f.address);
-            clients.push((server, username, None));
+            miners.push(Miner {
+                server,
+                username: format!("{}.disk-{server}-{slot}", f.address),
+                session: None,
+                accepted: 0,
+            });
         }
     }
 
     // Before: every client mines on a healthy database.
-    let stop = Arc::new(AtomicBool::new(false));
-    clients = mine(
-        f,
-        clients,
-        Phase::Before,
-        Some(STEADY_SHARES),
-        &stop,
-        &mut records,
-    )
-    .await?;
+    let miners = steady(f, miners, Phase::Before, &mut records).await?;
     let refused_before = alert_input(f, reasons).await?;
     ensure!(
         records
@@ -159,8 +169,8 @@ async fn exhaust(
         summary(&records)
     );
 
-    // Full: fill the volume, keep mining until the first refusal plus the
-    // hold, then stop.
+    // Full: fill the volume and keep mining until a paging rule fires on
+    // both servers.
     let mut baseline = Vec::new();
     for (server, port) in f.api.into_iter().enumerate() {
         baseline.push(scrape(&f.client, server, port).await?);
@@ -171,14 +181,13 @@ async fn exhaust(
         "disk exhaustion: {free_before} bytes were free; ballast {ballast} bytes; {} left",
         disk.free_bytes()?
     );
-    let (clients, samples) = mine_until_refused(f, clients, &stop, &mut records, baseline).await?;
+    let (miners, scrapes) = full(f, miners, mirrors, baseline, &mut records).await?;
     let refused_full = alert_input(f, reasons).await?;
     let postgres_alive_when_full = cluster.running()?;
 
     // After: free the space. PostgreSQL is started again only if it stopped.
     disk.stop()?;
     let restarted = cluster.ensure_running()?;
-    stop.store(false, Ordering::SeqCst);
     for (index, server) in f.servers.iter().enumerate() {
         ensure!(
             server.child.try_wait()?.is_none(),
@@ -186,47 +195,9 @@ async fn exhaust(
         );
     }
     let recovery_started = Instant::now();
-    // The bound stops the clients themselves, so none outlives the phase.
-    let bound = {
-        let stop = stop.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(RECOVERY_BOUND).await;
-            stop.store(true, Ordering::SeqCst);
-        })
-    };
-    let clients = mine(
-        f,
-        clients,
-        Phase::After,
-        Some(STEADY_SHARES),
-        &stop,
-        &mut records,
-    )
-    .await;
-    bound.abort();
-    let clients = clients?;
-    let accepted_after = |server: usize, username: &str| {
-        records
-            .iter()
-            .filter(|record| record.phase == Phase::After && record.server == server)
-            .filter(|record| {
-                record
-                    .submitted
-                    .share_id
-                    .starts_with(&format!("{username}:"))
-            })
-            .filter(|record| record.submitted.answer.accepted())
-            .count()
-    };
-    ensure!(
-        clients
-            .iter()
-            .all(|(server, username, _)| accepted_after(*server, username) >= STEADY_SHARES),
-        "servers did not accept shares within {RECOVERY_BOUND:?} of freeing space: {}",
-        summary(&records)
-    );
+    let miners = steady(f, miners, Phase::After, &mut records).await?;
     let recovered_in = recovery_started.elapsed();
-    drop(clients);
+    drop(miners);
 
     // A block found after the recovery lands.
     let mut miner =
@@ -234,7 +205,7 @@ async fn exhaust(
     let block = miner.submit(Proof::Block).await?;
     ensure!(
         block.answer.accepted(),
-        "post-recovery block: {:?}",
+        "post-recovery block: {}",
         block.answer
     );
     until("the post-recovery block on the node", 60, || async {
@@ -263,7 +234,7 @@ async fn exhaust(
     );
     let credited_failures: Vec<_> = records
         .iter()
-        .filter(|record| record.submitted.answer.reason() == "ledger-confirmation-failed")
+        .filter(|record| record.submitted.answer.reason_id() == Some("ledger-confirmation-failed"))
         .filter(|record| ledger.get(&record.submitted.share_id) == Some(&true))
         .map(|record| record.submitted.share_id.clone())
         .collect();
@@ -272,25 +243,24 @@ async fn exhaust(
         "shares refused as ledger-confirmation-failed were credited: {credited_failures:?}"
     );
 
-    // The full state was refused cleanly and the alert's input rose.
+    // The full state was refused cleanly, the alert's input rose, and a
+    // paging rule fired on every server.
     let full_records: Vec<_> = records
         .iter()
         .filter(|record| record.phase == Phase::Full)
         .collect();
-    let alerted = full_records
-        .iter()
-        .filter(|record| reasons.contains(&record.submitted.answer.reason()))
-        .count();
     ensure!(
-        alerted > 0,
+        full_records.iter().any(|record| record
+            .submitted
+            .answer
+            .reason_id()
+            .is_some_and(|reason| reasons.contains(reason))),
         "no share was refused with a reason {reasons:?} alerts on: {}",
         summary(&records)
     );
     let timed_out: Vec<_> = full_records
         .iter()
-        .filter(|record| {
-            matches!(&record.submitted.answer, Answer::Unanswered(why) if why.contains("no Stratum message"))
-        })
+        .filter(|record| matches!(record.submitted.answer, Answer::TimedOut))
         .map(|record| record.submitted.share_id.clone())
         .collect();
     ensure!(
@@ -301,9 +271,15 @@ async fn exhaust(
         refused_full > refused_before,
         "the PrismShareAppendFailures input did not rise: {refused_before} before, {refused_full} when full"
     );
-    let alerts = alert_conditions(&samples, reasons)?;
+    let verdict = Verdict::of(&scrapes, &[0, 1], mirrors);
+    ensure!(
+        verdict.every_server_paged(),
+        "no paging rule fires on every server for the full state:\n{}\n{}",
+        verdict.report,
+        gates(&scrapes)
+    );
     f.integrity().await?;
-    eprintln!("disk exhaustion alert conditions:\n{alerts}");
+    eprintln!("disk exhaustion alert conditions:\n{}", verdict.report);
     eprintln!(
         "disk exhaustion: {}; alert input {refused_before} -> {refused_full}; PostgreSQL {} when full{}; recovered in {:.1}s; {} ledger rows",
         summary(&records),
@@ -316,29 +292,32 @@ async fn exhaust(
     Ok(())
 }
 
-/// Every client mines on its server until it has `target` more
-/// acknowledgements (or, with `None`, until `stop`), reconnecting after a
-/// lost session. Returns the clients for the next phase.
+/// Every miner mines on its server until it has `target` acknowledgements
+/// in this phase (or, with `None`, until `stop`), reconnecting after a lost
+/// session, and stops at `deadline` whatever it has.
 async fn mine(
     f: &Fixture,
-    clients: Vec<(usize, String, Option<ShareClient>)>,
+    miners: Vec<Miner>,
     phase: Phase,
     target: Option<usize>,
+    deadline: Instant,
     stop: &Arc<AtomicBool>,
     records: &mut Vec<Record>,
-) -> Result<Vec<(usize, String, Option<ShareClient>)>> {
+) -> Result<Vec<Miner>> {
     let mut tasks = Vec::new();
-    for (server, username, client) in clients {
-        let port = f.stratum[server];
+    for mut miner in miners {
+        let port = f.stratum[miner.server];
         let stop = stop.clone();
         tasks.push(tokio::spawn(async move {
-            let mut client = client;
             let mut submitted = Vec::new();
-            let mut accepted = 0;
-            while !stop.load(Ordering::SeqCst) && target.is_none_or(|target| accepted < target) {
-                let mut session = match client.take() {
+            miner.accepted = 0;
+            while !stop.load(Ordering::SeqCst)
+                && Instant::now() < deadline
+                && target.is_none_or(|target| miner.accepted < target)
+            {
+                let mut session = match miner.session.take() {
                     Some(session) => session,
-                    None => match ShareClient::connect(port, &username).await {
+                    None => match ShareClient::connect(port, &miner.username).await {
                         Ok(session) => session,
                         Err(_) => {
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -347,102 +326,177 @@ async fn mine(
                     },
                 };
                 let outcome = session.submit(Proof::Share).await?;
-                if outcome.answer.accepted() {
-                    accepted += 1;
-                } else {
+                match outcome.answer {
+                    Answer::Accepted => miner.accepted += 1,
                     // A refused miner keeps mining; this only paces the log.
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
                 }
-                // A lost session is replaced; a live one is kept.
-                if !matches!(outcome.answer, Answer::Unanswered(_)) {
-                    client = Some(session);
+                // A session that answered is kept; a lost one is replaced.
+                if matches!(outcome.answer, Answer::Accepted | Answer::Rejected(_)) {
+                    miner.session = Some(session);
                 }
                 submitted.push(outcome);
             }
-            Ok::<_, anyhow::Error>((server, username, client, submitted))
+            Ok::<_, anyhow::Error>((miner, submitted))
         }));
     }
     let mut next = Vec::new();
     for task in tasks {
-        let (server, username, client, submitted) = task.await??;
+        let (miner, submitted) = task.await??;
         records.extend(submitted.into_iter().map(|submitted| Record {
-            server,
+            server: miner.server,
             phase,
             submitted,
         }));
-        next.push((server, username, client));
+        next.push(miner);
     }
     Ok(next)
 }
 
-/// Mine in the full phase until the servers' first refusal plus
-/// [`FULL_HOLD`], or fail after [`FILL_BOUND`] without one. Returns the
-/// clients and every scrape taken meanwhile, after one per server from
-/// before the fill.
-async fn mine_until_refused(
+/// A phase on a healthy database: every miner gets [`STEADY_SHARES`]
+/// acknowledged within [`STEADY_BOUND`].
+async fn steady(
     f: &Fixture,
-    clients: Vec<(usize, String, Option<ShareClient>)>,
-    stop: &Arc<AtomicBool>,
+    miners: Vec<Miner>,
+    phase: Phase,
     records: &mut Vec<Record>,
+) -> Result<Vec<Miner>> {
+    let never = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + STEADY_BOUND;
+    let miners = mine(
+        f,
+        miners,
+        phase,
+        Some(STEADY_SHARES),
+        deadline,
+        &never,
+        records,
+    )
+    .await?;
+    ensure!(
+        miners.iter().all(|miner| miner.accepted >= STEADY_SHARES),
+        "{phase:?}: not every miner had {STEADY_SHARES} shares acknowledged within {STEADY_BOUND:?}: {}",
+        summary(records)
+    );
+    Ok(miners)
+}
+
+/// The full state: mine while scraping both servers until a paging rule
+/// fires on each, bounded by [`FILL_BOUND`] for both to refuse and
+/// [`FULL_BOUND`] after that. Returns the miners and every scrape, after
+/// the pre-fill `baseline`.
+async fn full(
+    f: &Fixture,
+    miners: Vec<Miner>,
+    mirrors: &[Mirror],
     baseline: Vec<Scrape>,
-) -> Result<(Vec<(usize, String, Option<ShareClient>)>, Vec<Scrape>)> {
+    records: &mut Vec<Record>,
+) -> Result<(Vec<Miner>, Vec<Scrape>)> {
     let started = Instant::now();
-    // The refusal is observed on the servers' own counters, independent of
+    let stop = Arc::new(AtomicBool::new(false));
+    // Refusals are observed on the servers' own counters, independent of
     // the clients' answers.
-    let sampler = {
-        let stop = stop.clone();
-        let ports = f.api;
-        let client = f.client.clone();
-        tokio::spawn(async move {
-            // Each server's refusals before the fill, and when it first
-            // refused more: the hold runs from the later server's.
-            let before: Vec<f64> = (0..2)
-                .map(|server| {
-                    baseline
-                        .iter()
-                        .filter(|s| s.server == server)
-                        .map(|s| s.sum(REJECTIONS))
-                        .fold(0.0, f64::max)
-                })
-                .collect();
-            let mut scrapes = baseline;
-            let mut refused_at = [None; 2];
-            while !stop.load(Ordering::SeqCst) {
-                for (server, port) in ports.into_iter().enumerate() {
-                    if let Ok(scrape) = scrape(&client, server, port).await {
-                        if scrape.sum(REJECTIONS) > before[server] && refused_at[server].is_none() {
-                            refused_at[server] = Some(Instant::now());
-                        }
-                        scrapes.push(scrape);
-                    }
-                }
-                let last = refused_at[0].zip(refused_at[1]).map(|(a, b)| a.max(b));
-                let expired = last.is_some_and(|at| at.elapsed() >= FULL_HOLD)
-                    || (last.is_none() && started.elapsed() >= FILL_BOUND);
-                if expired {
-                    stop.store(true, Ordering::SeqCst);
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            (refused_at.iter().all(Option::is_some), scrapes)
+    let before: Vec<f64> = (0..2)
+        .map(|server| {
+            baseline
+                .iter()
+                .filter(|s| s.server == server)
+                .map(|s| s.sum(REJECTIONS))
+                .fold(0.0, f64::max)
         })
+        .collect();
+    let sampler = async {
+        let mut scrapes = baseline;
+        let mut refused_at = [None; 2];
+        for round in 0u64.. {
+            for (server, port) in f.api.into_iter().enumerate() {
+                if let Ok(scrape) = scrape(&f.client, server, port).await {
+                    if scrape.sum(REJECTIONS) > before[server] && refused_at[server].is_none() {
+                        refused_at[server] = Some(Instant::now());
+                    }
+                    scrapes.push(scrape);
+                }
+            }
+            let both = refused_at[0].zip(refused_at[1]).map(|(a, b)| a.max(b));
+            let done = match both {
+                None => started.elapsed() >= FILL_BOUND,
+                // Evaluated every five seconds: the rules' `for` is minutes.
+                Some(at) => {
+                    at.elapsed() >= FULL_BOUND
+                        || (round % 20 == 0
+                            && Verdict::of(&scrapes, &[0, 1], mirrors).every_server_paged())
+                }
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        stop.store(true, Ordering::SeqCst);
+        (refused_at.iter().all(Option::is_some), scrapes)
     };
-    let clients = mine(f, clients, Phase::Full, None, stop, records).await;
-    stop.store(true, Ordering::SeqCst);
-    let (refused, scrapes) = sampler.await?;
-    let clients = clients?;
+    let deadline = started + FILL_BOUND + FULL_BOUND + Duration::from_secs(60);
+    let (miners, (refused, scrapes)) = tokio::join!(
+        mine(f, miners, Phase::Full, None, deadline, &stop, records),
+        sampler
+    );
+    let miners = miners?;
     ensure!(
         refused,
         "both servers did not refuse within {FILL_BOUND:?} of filling the volume: {}",
         summary(records)
     );
-    Ok((clients, scrapes))
+    Ok((miners, scrapes))
 }
 
-const REJECTIONS: &str = "qbit_prism_rejections_total";
-/// The `[5m]` range of the rules' `increase`.
-const INCREASE_WINDOW: Duration = Duration::from_secs(300);
-const ACCEPTED: &str = "qbit_prism_accepted_shares_total";
+/// The rules that can page for this state, mirrored. With PostgreSQL down,
+/// only `PrismBlockCandidateMetricsUnavailable` holds: the metrics snapshot
+/// is published by the health probe, which still publishes when it fails, so
+/// its freshness flaps and every rule gated on a fresh snapshot flaps with
+/// it (#581).
+fn paging_mirrors(reasons: &BTreeSet<String>) -> Result<Vec<Mirror>> {
+    fn increase(base: &Scrape, s: &Scrape, reason: &str) -> f64 {
+        let count = |scrape: &Scrape| {
+            scrape
+                .by_label(REJECTIONS, "reason_id")
+                .get(reason)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        count(s) - count(base)
+    }
+    let reasons = reasons.clone();
+    Ok(vec![
+        Mirror::new(
+            "PrismShareAppendFailures",
+            &[REJECTIONS, "> bool 0", "qbit_prism_metrics_snapshot_stale"],
+            move |base, s| {
+                reasons.iter().any(|reason| increase(base, s, reason) > 0.0) && s.gate_open()
+            },
+        )?,
+        Mirror::new(
+            "PrismRejectRatioByReasonHigh",
+            &["> bool 0.05", ">= 100", "qbit_prism_metrics_snapshot_stale"],
+            |base, s| {
+                let total = (s.sum(ACCEPTED) - base.sum(ACCEPTED))
+                    + (s.sum(REJECTIONS) - base.sum(REJECTIONS));
+                total >= 100.0
+                    && s.gate_open()
+                    && s.by_label(REJECTIONS, "reason_id")
+                        .keys()
+                        .any(|reason| increase(base, s, reason) / total > 0.05)
+            },
+        )?,
+        snapshot_stale()?,
+        Mirror::new(
+            "PrismBlockCandidateMetricsUnavailable",
+            &["collector=\"database\"} == bool 0"],
+            |_, s| {
+                s.labelled("qbit_prism_collector_available", "collector", "database") == Some(0.0)
+            },
+        )?,
+    ])
+}
 
 /// How each server's snapshot gate and database collector changed.
 fn gates(scrapes: &[Scrape]) -> String {
@@ -470,118 +524,6 @@ fn gates(scrapes: &[Scrape]) -> String {
         .join("\n")
 }
 
-/// The rules that can page for this state, and whether each fires on each
-/// server: its condition, mirrored here and evaluated on every scrape, holds
-/// for at least its `for`. Their `[5m]` increases are measured over a
-/// sliding five minutes, from the pre-fill scrape at first. At least one
-/// must fire on every server.
-///
-/// With PostgreSQL down, only `PrismBlockCandidateMetricsUnavailable` holds:
-/// the metrics snapshot is published by the health probe, which still
-/// publishes when it fails, so its freshness flaps and every rule gated on a
-/// fresh snapshot flaps with it (#581).
-fn alert_conditions(scrapes: &[Scrape], reasons: &BTreeSet<String>) -> Result<String> {
-    type Condition<'a> = Box<dyn Fn(&Scrape, &Scrape) -> bool + 'a>;
-    let increase = |base: &Scrape, s: &Scrape, reason: &str| {
-        s.by_label(REJECTIONS, "reason_id")
-            .get(reason)
-            .copied()
-            .unwrap_or(0.0)
-            - base
-                .by_label(REJECTIONS, "reason_id")
-                .get(reason)
-                .copied()
-                .unwrap_or(0.0)
-    };
-    let rules: Vec<(Rule, Condition)> = vec![
-        (
-            rule(
-                "PrismShareAppendFailures",
-                &[REJECTIONS, "> bool 0", "qbit_prism_metrics_snapshot_stale"],
-            )?,
-            Box::new(|base, s| {
-                reasons.iter().any(|reason| increase(base, s, reason) > 0.0) && s.gate_open()
-            }),
-        ),
-        (
-            rule(
-                "PrismRejectRatioByReasonHigh",
-                &["> bool 0.05", ">= 100", "qbit_prism_metrics_snapshot_stale"],
-            )?,
-            Box::new(|base, s| {
-                let refused = s.by_label(REJECTIONS, "reason_id");
-                let total = (s.sum(ACCEPTED) - base.sum(ACCEPTED))
-                    + (s.sum(REJECTIONS) - base.sum(REJECTIONS));
-                total >= 100.0
-                    && s.gate_open()
-                    && refused
-                        .keys()
-                        .any(|reason| increase(base, s, reason) / total > 0.05)
-            }),
-        ),
-        (
-            rule(
-                "PrismMetricsSnapshotStale",
-                &["qbit_prism_metrics_snapshot_stale", "> bool 0"],
-            )?,
-            Box::new(|_, s| {
-                s.value("qbit_prism_metrics_snapshot_stale")
-                    .is_some_and(|stale| stale > 0.0)
-            }),
-        ),
-        (
-            rule(
-                "PrismBlockCandidateMetricsUnavailable",
-                &["collector=\"database\"} == bool 0"],
-            )?,
-            Box::new(|_, s| {
-                s.labelled("qbit_prism_collector_available", "collector", "database") == Some(0.0)
-            }),
-        ),
-    ];
-    let mut report = Vec::new();
-    let mut firing = [false; 2];
-    for (rule, condition) in &rules {
-        let mut spans = Vec::new();
-        for (server, fired) in firing.iter_mut().enumerate() {
-            let series: Vec<_> = scrapes.iter().filter(|s| s.server == server).collect();
-            let first = *series
-                .first()
-                .with_context(|| format!("server {server} was never scraped"))?;
-            // `increase(...[5m])` at a scrape: from the last scrape at least
-            // five minutes older, or the pre-fill one while there is none.
-            let window_base = |s: &Scrape| {
-                series
-                    .iter()
-                    .copied()
-                    .take_while(|older| older.at + INCREASE_WINDOW <= s.at)
-                    .last()
-                    .unwrap_or(first)
-            };
-            let held = longest(series.iter().copied(), |s| condition(window_base(s), s));
-            *fired |= held >= rule.hold;
-            spans.push(format!(
-                "server-{server} {:.0}s{}",
-                held.as_secs_f64(),
-                if held >= rule.hold { " FIRES" } else { "" }
-            ));
-        }
-        report.push(format!(
-            "{} (for {:?}): {}",
-            rule.title,
-            rule.hold,
-            spans.join(", ")
-        ));
-    }
-    ensure!(
-        firing.iter().all(|fired| *fired),
-        "no paging rule fires on every server for the full state:\n{}\n{}",
-        report.join("\n"),
-        gates(scrapes)
-    );
-    Ok(report.join("\n"))
-}
-
 /// The `PrismShareAppendFailures` input across both servers.
 async fn alert_input(f: &Fixture, reasons: &BTreeSet<String>) -> Result<f64> {
     let mut total = 0.0;
@@ -597,36 +539,22 @@ async fn alert_input(f: &Fixture, reasons: &BTreeSet<String>) -> Result<f64> {
     Ok(total)
 }
 
-/// The rejection reasons `PrismShareAppendFailures` counts, from its rule.
-fn alert_reasons() -> Result<BTreeSet<String>> {
-    let rule = rule("PrismShareAppendFailures", &[REJECTIONS, "reason_id=~\""])?;
-    let (_, rest) = rule
-        .expr
-        .split_once("reason_id=~\"")
-        .context("PrismShareAppendFailures has no reason_id matcher")?;
-    let (alternatives, _) = rest.split_once('"').context("unterminated matcher")?;
-    Ok(alternatives.split('|').map(str::to_owned).collect())
-}
-
-/// Counts per phase and answer, for reports and failures.
+/// Counts per phase, server and answer, for reports and failures.
 fn summary(records: &[Record]) -> String {
     let mut counts: BTreeMap<(Phase, usize, String), usize> = BTreeMap::new();
     for record in records {
-        let reason = match &record.submitted.answer {
-            Answer::Unanswered(why) if why.contains("no Stratum message") => {
-                "unanswered: timeout".into()
-            }
-            Answer::Unanswered(_) => "unanswered: connection lost".into(),
-            answer => answer.reason(),
-        };
         *counts
-            .entry((record.phase, record.server, reason))
+            .entry((
+                record.phase,
+                record.server,
+                record.submitted.answer.to_string(),
+            ))
             .or_default() += 1;
     }
     counts
         .iter()
-        .map(|((phase, server, reason), count)| {
-            format!("{phase:?}/server-{server} {reason}={count}")
+        .map(|((phase, server, answer), count)| {
+            format!("{phase:?}/server-{server} {answer}={count}")
         })
         .collect::<Vec<_>>()
         .join(", ")

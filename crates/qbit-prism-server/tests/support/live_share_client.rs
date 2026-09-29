@@ -1,6 +1,12 @@
-//! A Stratum v1 client for the live suite that solves the current job in the
-//! test and records exactly what the server answered to each submission, so a
-//! scenario can compare every acknowledged share with the ledger (#575).
+//! Stratum v1 clients for the live suite that solve work in the test and
+//! record exactly what the server answered (#575).
+//!
+//! [`StratumSession`] is one connection and what the server has told it:
+//! extranonce, difficulty, latest job, version mask, and every notification
+//! in order, each checked for the shape miners parse. [`ShareClient`] is a
+//! scripted miner on top of it that submits shares or blocks and records the
+//! answer to each, so a scenario can compare every acknowledged share with
+//! the ledger. The transcript replay drives a session directly.
 //!
 //! Regtest's block target (`207fffff`) is easier than a difficulty-1 share, so
 //! a server left at its default share difficulty turns every share into a
@@ -13,9 +19,12 @@ use num_bigint::BigUint;
 use qbit_prism_server::codec::{
     difficulty_target, double_sha256, hash_display, parse_u32_hex, target_from_compact,
 };
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpStream,
+use tokio::{
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
+    time::error::Elapsed,
 };
 
 /// Server settings under which a share can miss the regtest block target:
@@ -25,10 +34,10 @@ pub(crate) const SHARE_ONLY_SETTINGS: [(&str, &str); 2] = [
     ("PRISM_STRATUM_SHARE_DIFF", "0.00000000025"),
 ];
 
-/// How long a submission waits for its answer: well past the server's own
+/// How long a request waits for its answer: well past the server's own
 /// bound, the share commit timeout plus grace (15 s by default), which also
 /// bounds a block whose answer waits for its landing (#577).
-const ANSWER_SECONDS: u64 = 70;
+pub(crate) const ANSWER: Duration = Duration::from_secs(70);
 
 /// Start `servers` with [`SHARE_ONLY_SETTINGS`] and each one's `overrides`,
 /// and wait until every one is ready.
@@ -73,8 +82,10 @@ pub(crate) enum Answer {
     Accepted,
     /// A JSON-RPC error or a `false` result: the full response.
     Rejected(Value),
-    /// The connection closed, or no answer came within [`ANSWER_SECONDS`].
-    Unanswered(String),
+    /// No answer within [`ANSWER`].
+    TimedOut,
+    /// The connection failed before the answer.
+    Lost(String),
 }
 
 impl Answer {
@@ -82,22 +93,32 @@ impl Answer {
         matches!(self, Answer::Accepted)
     }
 
-    /// The server's reason for a rejection: the `reason_id` of its
-    /// `[code, message, {"reason_id": ...}]` error when present, else the
-    /// whole error.
-    pub(crate) fn reason(&self) -> String {
+    /// The `reason_id` of a rejection's `[code, message, {"reason_id": ...}]`.
+    pub(crate) fn reason_id(&self) -> Option<&str> {
         match self {
-            Answer::Accepted => "accepted".into(),
-            Answer::Rejected(response) => {
-                let error = &response["error"];
-                error[2]["reason_id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| error.to_string())
-            }
-            Answer::Unanswered(why) => format!("unanswered: {why}"),
+            Answer::Rejected(response) => reason_id(response),
+            _ => None,
         }
     }
+}
+
+impl std::fmt::Display for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Answer::Accepted => f.write_str("accepted"),
+            Answer::Rejected(response) => match reason_id(response) {
+                Some(reason) => f.write_str(reason),
+                None => write!(f, "rejected {}", response["error"]),
+            },
+            Answer::TimedOut => f.write_str("unanswered: timed out"),
+            Answer::Lost(why) => write!(f, "unanswered: connection lost ({why})"),
+        }
+    }
+}
+
+/// The `reason_id` of a response's `[code, message, {"reason_id": ...}]` error.
+pub(crate) fn reason_id(response: &Value) -> Option<&str> {
+    response["error"][2]["reason_id"].as_str()
 }
 
 /// One submission and its answer. `share_id` is the ledger's identity for
@@ -124,7 +145,7 @@ pub(crate) struct Solution {
 /// A share that is not a block when the job's share target allows one; a
 /// block otherwise (a share difficulty at or above the network's, as a
 /// miner's `mining.suggest_difficulty` can ask for on regtest).
-pub(crate) fn easiest_proof(notify: &Value, difficulty: f64) -> Result<Proof> {
+fn easiest_proof(notify: &Value, difficulty: f64) -> Result<Proof> {
     let bits = notify["params"][6]
         .as_str()
         .context("notify bits missing")?;
@@ -139,7 +160,7 @@ pub(crate) fn easiest_proof(notify: &Value, difficulty: f64) -> Result<Proof> {
 /// Solve `notify` for `proof`. `counter` picks the extranonce2 (and so the
 /// merkle root); `version_mask`, when nonzero, rolls the lowest bit of the
 /// mask into the version, as a version-rolling miner does.
-pub(crate) fn solve(
+fn solve(
     notify: &Value,
     extranonce1: &str,
     extranonce2_size: usize,
@@ -219,22 +240,61 @@ pub(crate) fn solve(
     bail!("no {proof:?} solution in the nonce budget (share difficulty {difficulty})")
 }
 
-/// A subscribed and authorized session with the latest job and difficulty.
-pub(crate) struct ShareClient {
+/// A hex string of even length, of `length` digits when given.
+pub(crate) fn is_hex(value: &Value, length: Option<usize>) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() % 2 == 0
+            && length.is_none_or(|length| text.len() == length)
+            && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+/// A notification's parameters have the shape miners parse.
+fn check_notification(message: &Value) -> Result<()> {
+    let params = message["params"].as_array();
+    let method = message["method"].as_str().unwrap_or_default();
+    let valid = match method {
+        "mining.notify" => params.is_some_and(|p| {
+            p.len() == 9
+                && p[0].as_str().is_some_and(|job| !job.is_empty())
+                && is_hex(&p[1], Some(64))
+                && is_hex(&p[2], None)
+                && is_hex(&p[3], None)
+                && p[4]
+                    .as_array()
+                    .is_some_and(|branch| branch.iter().all(|node| is_hex(node, Some(64))))
+                && (5..=7).all(|index| is_hex(&p[index], Some(8)))
+                && p[8].is_boolean()
+        }),
+        "mining.set_difficulty" => {
+            params.is_some_and(|p| p.len() == 1 && p[0].as_f64().is_some_and(|d| d > 0.0))
+        }
+        "mining.set_version_mask" => params.is_some_and(|p| p.len() == 1 && is_hex(&p[0], Some(8))),
+        _ => true,
+    };
+    ensure!(valid, "malformed {method}: {message}");
+    Ok(())
+}
+
+/// One Stratum connection and what the server has told it so far.
+pub(crate) struct StratumSession {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
-    pub username: String,
-    extranonce1: String,
-    extranonce2_size: usize,
-    difficulty: Option<f64>,
-    notify: Value,
-    next_id: u64,
+    pub extranonce1: Option<String>,
+    pub extranonce2_size: Option<usize>,
+    pub difficulty: Option<f64>,
+    /// The latest `mining.notify`.
+    pub notify: Option<Value>,
+    /// The version-rolling mask granted by `mining.configure` or the latest
+    /// `mining.set_version_mask`; zero when none.
+    pub version_mask: u32,
+    /// Every notification method, in arrival order.
+    pub notifications: Vec<String>,
     counter: u64,
 }
 
-impl ShareClient {
-    /// Subscribe and authorize `username` on `port`, and wait for work.
-    pub(crate) async fn connect(port: u16, username: &str) -> Result<Self> {
+impl StratumSession {
+    pub(crate) async fn open(port: u16) -> Result<Self> {
         let stream = tokio::time::timeout(
             Duration::from_secs(10),
             TcpStream::connect(("127.0.0.1", port)),
@@ -242,70 +302,112 @@ impl ShareClient {
         .await
         .context("Stratum connect timed out")??;
         let (read, writer) = stream.into_split();
-        let mut client = Self {
+        Ok(Self {
             reader: BufReader::new(read),
             writer,
-            username: username.into(),
-            extranonce1: String::new(),
-            extranonce2_size: 0,
+            extranonce1: None,
+            extranonce2_size: None,
             difficulty: None,
-            notify: Value::Null,
-            next_id: 10,
+            notify: None,
+            version_mask: 0,
+            notifications: Vec::new(),
             counter: 0,
-        };
-        client
-            .send(&json!({"id":1,"method":"mining.subscribe","params":["prism-live-share-client"]}))
-            .await?;
-        let subscribed = client.response(1).await?;
-        client.extranonce1 = subscribed["result"][1]
-            .as_str()
-            .with_context(|| format!("subscribe: {subscribed}"))?
-            .into();
-        client.extranonce2_size = subscribed["result"][2]
-            .as_u64()
-            .context("extranonce2 size missing")?
-            .try_into()?;
-        client
-            .send(&json!({"id":2,"method":"mining.authorize","params":[client.username,"x"]}))
-            .await?;
-        let authorized = client.response(2).await?;
-        ensure!(authorized["result"] == true, "authorize: {authorized}");
-        while client.notify.is_null() || client.difficulty.is_none() {
-            client.read(Duration::from_secs(35)).await?;
-        }
-        Ok(client)
+        })
     }
 
-    async fn send(&mut self, payload: &Value) -> Result<()> {
+    pub(crate) async fn send(&mut self, message: &Value) -> Result<()> {
         self.writer
-            .write_all(format!("{payload}\n").as_bytes())
+            .write_all(format!("{message}\n").as_bytes())
             .await?;
         Ok(())
     }
 
-    async fn read(&mut self, limit: Duration) -> Result<Value> {
+    /// The next message within `limit`, keeping and checking every
+    /// notification. A timeout is an error that downcasts to [`Elapsed`].
+    async fn next(&mut self, limit: Duration) -> Result<Value> {
         let mut line = String::new();
         let read = tokio::time::timeout(limit, self.reader.read_line(&mut line))
             .await
+            .map_err(anyhow::Error::new)
             .with_context(|| format!("no Stratum message within {limit:?}"))??;
         ensure!(read > 0, "Stratum connection closed");
         let message: Value = serde_json::from_str(&line)?;
-        if message["method"] == "mining.set_difficulty" {
-            self.difficulty = message["params"][0].as_f64();
-        }
-        if message["method"] == "mining.notify" {
-            self.notify = message.clone();
+        if let Some(method) = message["method"].as_str() {
+            check_notification(&message)?;
+            self.notifications.push(method.to_owned());
+            match method {
+                "mining.set_difficulty" => self.difficulty = message["params"][0].as_f64(),
+                "mining.notify" => self.notify = Some(message.clone()),
+                "mining.set_version_mask" => {
+                    self.version_mask =
+                        parse_u32_hex(message["params"][0].as_str().context("mask missing")?)?;
+                }
+                _ => {}
+            }
         }
         Ok(message)
     }
 
-    async fn response(&mut self, id: u64) -> Result<Value> {
+    /// The response to request `id`, within `limit`.
+    pub(crate) async fn answer(&mut self, id: &Value, limit: Duration) -> Result<Value> {
+        let deadline = Instant::now() + limit;
         loop {
-            let message = self.read(Duration::from_secs(35)).await?;
-            if message["id"] == id {
+            let message = self
+                .next(deadline.saturating_duration_since(Instant::now()))
+                .await?;
+            if message.get("method").is_none() && &message["id"] == id {
                 return Ok(message);
             }
         }
+    }
+
+    /// Send `request` and wait for its response; a subscribe or configure
+    /// response also updates the session.
+    pub(crate) async fn request(&mut self, request: &Value) -> Result<Value> {
+        self.send(request).await?;
+        let answer = self.answer(&request["id"], ANSWER).await?;
+        self.learn(request["method"].as_str().unwrap_or_default(), &answer)?;
+        Ok(answer)
+    }
+
+    /// Keep what a response to `method` tells the session.
+    pub(crate) fn learn(&mut self, method: &str, answer: &Value) -> Result<()> {
+        match method {
+            "mining.subscribe" => {
+                self.extranonce1 = answer["result"][1].as_str().map(str::to_owned);
+                self.extranonce2_size = answer["result"][2].as_u64().map(|size| size as usize);
+            }
+            "mining.configure" => {
+                if let Some(mask) = answer["result"]["version-rolling.mask"].as_str() {
+                    self.version_mask = parse_u32_hex(mask)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Until a job and a share difficulty have arrived.
+    pub(crate) async fn work(&mut self) -> Result<()> {
+        while self.notify.is_none() || self.difficulty.is_none() {
+            self.next(ANSWER).await?;
+        }
+        Ok(())
+    }
+
+    /// Until a job other than the latest one arrives.
+    pub(crate) async fn newer_work(&mut self) -> Result<()> {
+        let job = |session: &Self| {
+            session
+                .notify
+                .as_ref()
+                .map(|notify| notify["params"][0].clone())
+        };
+        let latest = job(self);
+        while job(self) == latest {
+            self.next(ANSWER).await?;
+        }
+        Ok(())
     }
 
     /// Until the latest job builds on `parent` (display order).
@@ -317,61 +419,127 @@ impl ShareClient {
         }
         let expected = hex::encode(wire);
         let deadline = Instant::now() + limit;
-        while self.notify["params"][1].as_str() != Some(expected.as_str()) {
+        while self
+            .notify
+            .as_ref()
+            .and_then(|notify| notify["params"][1].as_str())
+            != Some(expected.as_str())
+        {
             let left = deadline.saturating_duration_since(Instant::now());
             ensure!(!left.is_zero(), "no work on {parent} within {limit:?}");
-            self.read(left).await?;
+            self.next(left).await?;
         }
         Ok(())
     }
 
-    /// Solve the latest job for `proof`, submit it, and wait for the answer.
-    /// An error means nothing was submitted; a lost connection after the
-    /// submission is [`Answer::Unanswered`].
-    pub(crate) async fn submit(&mut self, proof: Proof) -> Result<Submitted> {
+    /// Solve the latest job as `username`: for `proof`, or the easiest proof
+    /// the job allows when `None`; with version rolling when `rolls`. Returns
+    /// the `mining.submit` params and the ledger's share id.
+    pub(crate) async fn solve_latest(
+        &mut self,
+        username: &str,
+        proof: Option<Proof>,
+        rolls: bool,
+    ) -> Result<(Value, Submitted)> {
+        self.work().await?;
+        ensure!(
+            !rolls || self.version_mask != 0,
+            "version rolling needs a granted mask"
+        );
         self.counter += 1;
+        let notify = self.notify.as_ref().context("no job")?;
+        let difficulty = self.difficulty.context("no difficulty")?;
+        let proof = match proof {
+            Some(proof) => proof,
+            None => easiest_proof(notify, difficulty)?,
+        };
         let solution = solve(
-            &self.notify,
-            &self.extranonce1,
-            self.extranonce2_size,
-            self.difficulty.context("share difficulty missing")?,
-            0,
+            notify,
+            self.extranonce1.as_deref().context("no extranonce1")?,
+            self.extranonce2_size.context("no extranonce2 size")?,
+            difficulty,
+            if rolls { self.version_mask } else { 0 },
             self.counter,
             proof,
         )?;
-        let job = self.notify["params"][0]
-            .as_str()
-            .context("job id missing")?
-            .to_owned();
-        self.next_id += 1;
-        let id = self.next_id;
-        let share_id = format!("{}:{}", self.username, solution.hash);
-        let submitted = |answer| Submitted {
-            share_id: share_id.clone(),
-            hash: solution.hash.clone(),
-            answer,
+        let mut params = vec![
+            json!(username),
+            notify["params"][0].clone(),
+            json!(solution.extranonce2),
+            json!(solution.ntime),
+            json!(solution.nonce),
+        ];
+        if rolls {
+            params.push(json!(solution.version_bits.context("no version bits")?));
+        }
+        let submitted = Submitted {
+            share_id: format!("{username}:{}", solution.hash),
+            hash: solution.hash,
+            answer: Answer::TimedOut,
         };
-        let request = json!({"id":id,"method":"mining.submit","params":[
-            self.username, job, solution.extranonce2, solution.ntime, solution.nonce]});
-        if let Err(error) = self.send(&request).await {
-            return Ok(submitted(Answer::Unanswered(format!("write: {error}"))));
-        }
-        let deadline = Instant::now() + Duration::from_secs(ANSWER_SECONDS);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let message = match self.read(left).await {
-                Ok(message) => message,
-                Err(error) => return Ok(submitted(Answer::Unanswered(format!("{error:#}")))),
-            };
-            if message["id"] != id {
-                continue;
-            }
-            let answer = if message["result"] == true && message["error"].is_null() {
-                Answer::Accepted
-            } else {
-                Answer::Rejected(message)
-            };
-            return Ok(submitted(answer));
-        }
+        Ok((Value::Array(params), submitted))
+    }
+}
+
+/// A subscribed and authorized miner that submits one proof at a time.
+pub(crate) struct ShareClient {
+    session: StratumSession,
+    pub username: String,
+    next_id: u64,
+}
+
+impl ShareClient {
+    /// Subscribe and authorize `username` on `port`, and wait for work.
+    pub(crate) async fn connect(port: u16, username: &str) -> Result<Self> {
+        let mut session = StratumSession::open(port).await?;
+        let subscribed = session
+            .request(
+                &json!({"id":1,"method":"mining.subscribe","params":["prism-live-share-client"]}),
+            )
+            .await?;
+        ensure!(
+            session.extranonce1.is_some() && session.extranonce2_size.is_some(),
+            "subscribe: {subscribed}"
+        );
+        let authorized = session
+            .request(&json!({"id":2,"method":"mining.authorize","params":[username,"x"]}))
+            .await?;
+        ensure!(authorized["result"] == true, "authorize: {authorized}");
+        session.work().await?;
+        Ok(Self {
+            session,
+            username: username.into(),
+            next_id: 10,
+        })
+    }
+
+    /// Until the latest job builds on `parent` (display order).
+    pub(crate) async fn work_on(&mut self, parent: &str, limit: Duration) -> Result<()> {
+        self.session.work_on(parent, limit).await
+    }
+
+    /// Solve the latest job for `proof`, submit it, and wait for the answer.
+    /// An error means nothing was submitted; a failure after the submission
+    /// is [`Answer::TimedOut`] or [`Answer::Lost`].
+    pub(crate) async fn submit(&mut self, proof: Proof) -> Result<Submitted> {
+        let (params, mut submitted) = self
+            .session
+            .solve_latest(&self.username, Some(proof), false)
+            .await?;
+        self.next_id += 1;
+        let id = json!(self.next_id);
+        let request = json!({"id":id,"method":"mining.submit","params":params});
+        submitted.answer = match self.session.send(&request).await {
+            Err(error) => Answer::Lost(format!("write: {error}")),
+            Ok(()) => match self.session.answer(&id, ANSWER).await {
+                Ok(message) if message["result"] == true && message["error"].is_null() => {
+                    Answer::Accepted
+                }
+                Ok(message) => Answer::Rejected(message),
+                Err(error) if error.downcast_ref::<Elapsed>().is_some() => Answer::TimedOut,
+                Err(error) => Answer::Lost(format!("{error:#}")),
+            },
+        };
+        Ok(submitted)
     }
 }

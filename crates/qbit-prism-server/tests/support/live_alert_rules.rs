@@ -5,7 +5,7 @@
 //! every scrape for at least the rule's `for` duration: whether Prometheus,
 //! scraping as often, would have fired it.
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The rules the deployment renders.
 const ALERT_RULES: &str = include_str!("../../../../docs/prism-native-alert-rules.json");
@@ -137,23 +137,132 @@ pub(crate) fn rule(title: &'static str, fragments: &[&str]) -> Result<Rule> {
     Ok(Rule { title, expr, hold })
 }
 
-/// The longest run of consecutive scrapes on which `condition` held,
-/// measured from its first scrape to its last.
-pub(crate) fn longest<'a>(
-    scrapes: impl IntoIterator<Item = &'a Scrape>,
-    condition: impl Fn(&Scrape) -> bool,
-) -> Duration {
-    let mut longest = Duration::ZERO;
-    let mut since = None;
-    for scrape in scrapes {
-        if condition(scrape) {
-            let start = *since.get_or_insert(scrape.at);
-            longest = longest.max(scrape.at - start);
-        } else {
-            since = None;
+impl Rule {
+    /// The alternatives of the expression's `label=~"a|b"` matcher.
+    pub(crate) fn label_alternatives(&self, label: &str) -> Result<BTreeSet<String>> {
+        let matcher = format!("{label}=~\"");
+        let (_, rest) = self
+            .expr
+            .split_once(&matcher)
+            .with_context(|| format!("{} has no {label} matcher", self.title))?;
+        let (alternatives, _) = rest.split_once('"').context("unterminated matcher")?;
+        Ok(alternatives.split('|').map(str::to_owned).collect())
+    }
+}
+
+/// The `[5m]` range of the rules' `increase`.
+const INCREASE_WINDOW: Duration = Duration::from_secs(300);
+
+/// A mirrored condition: `holds(base, scrape)`, where `base` is the scrape
+/// an `increase(...[5m])` at `scrape` starts from.
+type Condition = Box<dyn Fn(&Scrape, &Scrape) -> bool + Send + Sync>;
+
+/// A rule and its condition mirrored in Rust.
+pub(crate) struct Mirror {
+    pub rule: Rule,
+    holds: Condition,
+}
+
+impl Mirror {
+    /// The rule titled `title`, pinned by `fragments` (see [`rule`]).
+    pub(crate) fn new(
+        title: &'static str,
+        fragments: &[&str],
+        holds: impl Fn(&Scrape, &Scrape) -> bool + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Ok(Self {
+            rule: rule(title, fragments)?,
+            holds: Box::new(holds),
+        })
+    }
+
+    /// The longest time the condition held on consecutive scrapes of one
+    /// server's `series`, oldest first, from its first scrape to its last.
+    /// An increase is measured from the last scrape at least five minutes
+    /// older, or from the series' first while there is none.
+    pub(crate) fn held(&self, series: &[&Scrape]) -> Duration {
+        let Some(first) = series.first() else {
+            return Duration::ZERO;
+        };
+        let base = |scrape: &Scrape| {
+            series
+                .iter()
+                .take_while(|older| older.at + INCREASE_WINDOW <= scrape.at)
+                .last()
+                .unwrap_or(first)
+        };
+        let mut longest = Duration::ZERO;
+        let mut since = None;
+        for scrape in series {
+            if (self.holds)(base(scrape), scrape) {
+                let start = *since.get_or_insert(scrape.at);
+                longest = longest.max(scrape.at - start);
+            } else {
+                since = None;
+            }
+        }
+        longest
+    }
+}
+
+/// `PrismMetricsSnapshotStale`, which every scenario here watches.
+pub(crate) fn snapshot_stale() -> Result<Mirror> {
+    Mirror::new(
+        "PrismMetricsSnapshotStale",
+        &["qbit_prism_metrics_snapshot_stale", "> bool 0"],
+        |_, s| {
+            s.value("qbit_prism_metrics_snapshot_stale")
+                .is_some_and(|stale| stale > 0.0)
+        },
+    )
+}
+
+/// Which `mirrors` fire on each of `servers`, and a report of how long each
+/// held: a rule fires when its condition held for at least its `for`.
+pub(crate) struct Verdict {
+    pub fired: BTreeMap<usize, BTreeSet<&'static str>>,
+    pub report: String,
+}
+
+impl Verdict {
+    pub(crate) fn of(scrapes: &[Scrape], servers: &[usize], mirrors: &[Mirror]) -> Self {
+        let mut fired: BTreeMap<usize, BTreeSet<&'static str>> = servers
+            .iter()
+            .map(|server| (*server, BTreeSet::new()))
+            .collect();
+        let mut lines = Vec::new();
+        for mirror in mirrors {
+            let mut spans = Vec::new();
+            for server in servers {
+                let series: Vec<_> = scrapes.iter().filter(|s| s.server == *server).collect();
+                let held = mirror.held(&series);
+                let fires = held >= mirror.rule.hold;
+                if fires {
+                    fired.entry(*server).or_default().insert(mirror.rule.title);
+                }
+                spans.push(format!(
+                    "server-{server} {:.0}s{}",
+                    held.as_secs_f64(),
+                    if fires { " FIRES" } else { "" }
+                ));
+            }
+            lines.push(format!(
+                "{} (for {:?}): {}",
+                mirror.rule.title,
+                mirror.rule.hold,
+                spans.join(", ")
+            ));
+        }
+        Self {
+            fired,
+            report: lines.join("\n"),
         }
     }
-    longest
+
+    /// Whether some rule fires on every server.
+    pub(crate) fn every_server_paged(&self) -> bool {
+        self.fired.values().all(|rules| !rules.is_empty())
+    }
 }
 
 /// Scrape every `(server, port)` every quarter second for `duration`.

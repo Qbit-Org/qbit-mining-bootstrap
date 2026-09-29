@@ -34,19 +34,16 @@
 //! the live server sends has the shape miners parse, the first difficulty
 //! precedes the first job, and each kind of work notification the recording
 //! holds is sent live. Every accepted replayed share is in the ledger.
-use super::share_client::{easiest_proof, solve, start_share_only_servers};
+use super::share_client::{is_hex, reason_id, start_share_only_servers, StratumSession, ANSWER};
 use super::*;
 use qbit_prism_server::codec::parse_u32_hex;
 use std::{collections::BTreeSet, path::Path};
-use tokio::{io::AsyncBufReadExt, net::TcpStream, sync::mpsc};
 
 /// The corpus, relative to this package.
 const CORPUS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/stratum_transcripts"
 );
-/// How long a replayed request waits for its answer, and for work.
-const ANSWER_SECONDS: u64 = 35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -264,157 +261,6 @@ struct Replayed {
     not_sent: BTreeSet<String>,
 }
 
-/// One live connection and what the server has told it so far.
-struct Live {
-    writer: tokio::net::tcp::OwnedWriteHalf,
-    incoming: mpsc::UnboundedReceiver<Result<Value>>,
-    reader: tokio::task::JoinHandle<()>,
-    /// Notification methods in arrival order.
-    notifications: Vec<String>,
-    extranonce1: Option<String>,
-    extranonce2_size: Option<usize>,
-    difficulty: Option<f64>,
-    notify: Option<Value>,
-    version_mask: u32,
-}
-
-impl Live {
-    async fn connect(port: u16) -> Result<Self> {
-        let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-        let (read, writer) = stream.into_split();
-        let (sender, incoming) = mpsc::unbounded_channel();
-        let reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(read).lines();
-            loop {
-                let message = match lines.next_line().await {
-                    Ok(Some(line)) => serde_json::from_str(&line).map_err(anyhow::Error::from),
-                    Ok(None) => Err(anyhow::anyhow!("the server closed the connection")),
-                    Err(error) => Err(error.into()),
-                };
-                let failed = message.is_err();
-                if sender.send(message).is_err() || failed {
-                    return;
-                }
-            }
-        });
-        Ok(Self {
-            writer,
-            incoming,
-            reader,
-            notifications: Vec::new(),
-            extranonce1: None,
-            extranonce2_size: None,
-            difficulty: None,
-            notify: None,
-            version_mask: 0,
-        })
-    }
-
-    async fn send(&mut self, message: &Value) -> Result<()> {
-        self.writer
-            .write_all(format!("{message}\n").as_bytes())
-            .await?;
-        Ok(())
-    }
-
-    /// The next message, checking and keeping every notification.
-    async fn next(&mut self) -> Result<Value> {
-        let message =
-            tokio::time::timeout(Duration::from_secs(ANSWER_SECONDS), self.incoming.recv())
-                .await
-                .context("no message from the live server")?
-                .context("the live connection's reader ended")??;
-        if let Some(method) = message["method"].as_str() {
-            check_notification(&message)?;
-            self.notifications.push(method.to_owned());
-            match method {
-                "mining.set_difficulty" => self.difficulty = message["params"][0].as_f64(),
-                "mining.notify" => self.notify = Some(message.clone()),
-                "mining.set_version_mask" => {
-                    self.version_mask =
-                        parse_u32_hex(message["params"][0].as_str().context("mask missing")?)?;
-                }
-                _ => {}
-            }
-        }
-        Ok(message)
-    }
-
-    async fn answer(&mut self, id: &Value) -> Result<Value> {
-        loop {
-            let message = self.next().await?;
-            if message.get("method").is_none() && &message["id"] == id {
-                return Ok(message);
-            }
-        }
-    }
-
-    /// Until a job other than the latest one arrives.
-    async fn newer_work(&mut self) -> Result<()> {
-        let job = self
-            .notify
-            .as_ref()
-            .map(|notify| notify["params"][0].clone());
-        while self
-            .notify
-            .as_ref()
-            .map(|notify| notify["params"][0].clone())
-            == job
-        {
-            self.next().await?;
-        }
-        Ok(())
-    }
-
-    async fn work(&mut self) -> Result<()> {
-        while self.notify.is_none() || self.difficulty.is_none() {
-            self.next().await?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.reader.abort();
-    }
-}
-
-fn is_hex(value: &Value, length: Option<usize>) -> bool {
-    value.as_str().is_some_and(|text| {
-        text.len() % 2 == 0
-            && length.is_none_or(|length| text.len() == length)
-            && text.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
-}
-
-/// A notification's parameters have the shape miners parse.
-fn check_notification(message: &Value) -> Result<()> {
-    let params = message["params"].as_array();
-    let method = message["method"].as_str().unwrap_or_default();
-    let valid = match method {
-        "mining.notify" => params.is_some_and(|p| {
-            p.len() == 9
-                && p[0].as_str().is_some_and(|job| !job.is_empty())
-                && is_hex(&p[1], Some(64))
-                && is_hex(&p[2], None)
-                && is_hex(&p[3], None)
-                && p[4]
-                    .as_array()
-                    .is_some_and(|branch| branch.iter().all(|node| is_hex(node, Some(64))))
-                && (5..=7).all(|index| is_hex(&p[index], Some(8)))
-                && p[8].is_boolean()
-        }),
-        "mining.set_difficulty" => {
-            params.is_some_and(|p| p.len() == 1 && p[0].as_f64().is_some_and(|d| d > 0.0))
-        }
-        "mining.set_version_mask" => params.is_some_and(|p| p.len() == 1 && is_hex(&p[0], Some(8))),
-        _ => true,
-    };
-    ensure!(valid, "malformed {method}: {message}");
-    Ok(())
-}
-
 /// The fixture's regtest address with the recorded worker suffix, which
 /// keeps only characters a worker name needs.
 fn live_username(fixture: &Fixture, recorded: &Value) -> String {
@@ -438,49 +284,7 @@ const STALE_RETRIES: usize = 3;
 /// Whether a refusal says the job was superseded, not that the share or the
 /// dialect was wrong.
 fn superseded(answer: &Value) -> bool {
-    matches!(
-        answer["error"][2]["reason_id"].as_str(),
-        Some("stale-job" | "unknown-job")
-    )
-}
-
-/// Solve the latest live job for a submit the recorded pool accepted, in the
-/// recorded shape: `mining.submit` params and the ledger's share id.
-async fn resolve(
-    live: &mut Live,
-    name: &str,
-    recorded: &Value,
-    counter: &mut u64,
-) -> Result<(Value, String)> {
-    live.work().await?;
-    let rolls = recorded["params"].as_array().map_or(0, Vec::len) >= 6;
-    ensure!(
-        !rolls || live.version_mask != 0,
-        "the recording rolls version bits but the live server granted no mask"
-    );
-    *counter += 1;
-    let notify = live.notify.as_ref().context("no job")?;
-    let difficulty = live.difficulty.context("no difficulty")?;
-    let solution = solve(
-        notify,
-        live.extranonce1.as_deref().context("no extranonce1")?,
-        live.extranonce2_size.context("no extranonce2 size")?,
-        difficulty,
-        if rolls { live.version_mask } else { 0 },
-        *counter,
-        easiest_proof(notify, difficulty)?,
-    )?;
-    let mut params = vec![
-        json!(name),
-        notify["params"][0].clone(),
-        json!(solution.extranonce2),
-        json!(solution.ntime),
-        json!(solution.nonce),
-    ];
-    if rolls {
-        params.push(json!(solution.version_bits.context("no version bits")?));
-    }
-    Ok((Value::Array(params), format!("{name}:{}", solution.hash)))
+    matches!(reason_id(answer), Some("stale-job" | "unknown-job"))
 }
 
 /// Until the server is ready on the node's current tip, so a transcript
@@ -502,13 +306,12 @@ async fn current(fixture: &Fixture) -> Result<()> {
 
 async fn replay(fixture: &Fixture, transcript: &Transcript) -> Result<Replayed> {
     current(fixture).await?;
-    let mut live = Live::connect(fixture.stratum[0]).await?;
+    let mut live = StratumSession::open(fixture.stratum[0]).await?;
     let mut replayed = Replayed {
         requests: 0,
         accepted: Vec::new(),
         not_sent: BTreeSet::new(),
     };
-    let mut counter = 0u64;
     let mut username = None;
     for line in transcript.client_lines() {
         let recorded = &line.message;
@@ -516,7 +319,9 @@ async fn replay(fixture: &Fixture, transcript: &Transcript) -> Result<Replayed> 
         let id = recorded["id"].clone();
         let expected = transcript.recorded_answer(&id).cloned();
         let mut message = recorded.clone();
-        let mut share_id = None;
+        // Set for a submit the recorded pool accepted: the worker name and
+        // whether it rolls versions. It is solved again on live work.
+        let mut resolve = None;
         match method {
             "mining.authorize" => {
                 let name = live_username(fixture, &recorded["params"][0]);
@@ -528,51 +333,47 @@ async fn replay(fixture: &Fixture, transcript: &Transcript) -> Result<Replayed> 
                     .clone()
                     .unwrap_or_else(|| live_username(fixture, &recorded["params"][0]));
                 message["params"][0] = json!(name);
-                let recorded_accepted = expected
+                if expected
                     .as_ref()
-                    .is_some_and(|answer| answer["result"] == true);
-                if recorded_accepted {
-                    let (params, id) = resolve(&mut live, &name, recorded, &mut counter).await?;
-                    message["params"] = params;
-                    share_id = Some(id);
+                    .is_some_and(|answer| answer["result"] == true)
+                {
+                    let rolls = recorded["params"].as_array().map_or(0, Vec::len) >= 6;
+                    resolve = Some((name, rolls));
                 }
             }
             _ => {}
+        }
+        let mut share_id = None;
+        if let Some((name, rolls)) = &resolve {
+            let (params, submitted) = live.solve_latest(name, None, *rolls).await?;
+            message["params"] = params;
+            share_id = Some(submitted.share_id);
         }
         live.send(&message).await?;
         if id.is_null() {
             continue;
         }
         replayed.requests += 1;
-        let mut answer = live.answer(&id).await?;
+        let mut answer = live.answer(&id, ANSWER).await?;
         // A re-solved submit whose job a new tip superseded in flight is
         // solved again on the newer work, as a miner's next share would be.
-        let mut retries = 0;
-        while share_id.is_some() && retries < STALE_RETRIES && superseded(&answer) {
-            retries += 1;
-            live.newer_work().await?;
-            let name = message["params"][0].as_str().unwrap_or_default().to_owned();
-            let (params, id_retry) = resolve(&mut live, &name, recorded, &mut counter).await?;
-            message["params"] = params;
-            share_id = Some(id_retry);
-            live.send(&message).await?;
-            answer = live.answer(&id).await?;
+        if let Some((name, rolls)) = &resolve {
+            for _ in 0..STALE_RETRIES {
+                if !superseded(&answer) {
+                    break;
+                }
+                live.newer_work().await?;
+                let (params, submitted) = live.solve_latest(name, None, *rolls).await?;
+                message["params"] = params;
+                share_id = Some(submitted.share_id);
+                live.send(&message).await?;
+                answer = live.answer(&id, ANSWER).await?;
+            }
         }
         let expected = expected.context("no recorded answer")?;
         compatible(method, recorded, &expected, &answer)
             .with_context(|| format!("{method} answered {answer}, recorded {expected}"))?;
-        match method {
-            "mining.subscribe" => {
-                live.extranonce1 = answer["result"][1].as_str().map(str::to_owned);
-                live.extranonce2_size = answer["result"][2].as_u64().map(|size| size as usize);
-            }
-            "mining.configure" => {
-                if let Some(mask) = answer["result"]["version-rolling.mask"].as_str() {
-                    live.version_mask = parse_u32_hex(mask)?;
-                }
-            }
-            _ => {}
-        }
+        live.learn(method, &answer)?;
         if let Some(share_id) = share_id {
             replayed.accepted.push(share_id);
         }

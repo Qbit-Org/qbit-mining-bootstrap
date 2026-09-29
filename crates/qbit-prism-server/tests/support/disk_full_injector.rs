@@ -15,9 +15,9 @@
 //! unmounts it and removes the image; stop whatever uses the volume first.
 //!
 //! Any test binary can include it with `#[path]`, next to
-//! `live_private_postgres.rs` as module `private_postgres` for its process
-//! helpers; it needs `anyhow`, `libc` and `tempfile`.
-use super::private_postgres::{program, run};
+//! `live_host_tools.rs` as module `host_tools`; it needs `anyhow`, `libc`
+//! and `tempfile`.
+use super::host_tools::{program, run};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
     ffi::CString,
@@ -32,7 +32,7 @@ use std::{
 pub(crate) struct DiskFullInjector {
     mount: PathBuf,
     ballast: PathBuf,
-    fuse: Option<Child>,
+    fuse: Child,
     unmount: PathBuf,
     /// Declared last, so the mount is gone before its files are removed.
     home: tempfile::TempDir,
@@ -72,13 +72,13 @@ impl DiskFullInjector {
         let mut injector = Self {
             ballast: mount.join("ballast"),
             mount,
-            fuse: Some(fuse),
+            fuse,
             unmount,
             home,
         };
         let started = Instant::now();
         while !injector.mounted()? {
-            if let Some(status) = injector.fuse.as_mut().context("fuse2fs")?.try_wait()? {
+            if let Some(status) = injector.fuse.try_wait()? {
                 bail!(
                     "fuse2fs exited with {status} before mounting: {}",
                     std::fs::read_to_string(injector.home.path().join("fuse2fs.log"))?
@@ -173,14 +173,13 @@ impl Drop for DiskFullInjector {
                 .arg(&self.mount)
                 .output();
         }
-        if let Some(mut fuse) = self.fuse.take() {
-            let started = Instant::now();
-            while matches!(fuse.try_wait(), Ok(None)) && started.elapsed() < Duration::from_secs(10)
-            {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let _ = fuse.kill();
-            let _ = fuse.wait();
+        let started = Instant::now();
+        while matches!(self.fuse.try_wait(), Ok(None))
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(100));
         }
+        let _ = self.fuse.kill();
+        let _ = self.fuse.wait();
     }
 }
