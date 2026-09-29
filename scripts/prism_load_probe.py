@@ -244,7 +244,12 @@ def parse_pg_test_fsync(text: str) -> dict:
     """The one-8kB-write section's fdatasync line: the WAL flush a commit pays.
 
     Returns ops_per_second and usecs_per_op, both None when the output has no
-    such line (pg_test_fsync failed, or the method is unsupported)."""
+    such line (the method is unsupported) or is marked failed: the probe and
+    prism-load-run.sh append a line starting `pg_test_fsync failed` when it
+    exits nonzero, and a VM whose run failed after printing the one-write
+    section is unknown, not a sample."""
+    if re.search(r"^pg_test_fsync failed", text, re.M):
+        return {"method": WAL_SYNC_METHOD, "ops_per_second": None, "usecs_per_op": None}
     section = re.search(
         r"Compare file sync methods using one 8kB write:(.*?)(?:\n\s*\n\S|\Z)", text, re.S
     )

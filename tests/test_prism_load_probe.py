@@ -86,6 +86,12 @@ class PgTestFsync(unittest.TestCase):
             {"method": "fdatasync", "ops_per_second": 2034.433, "usecs_per_op": 492.0},
         )
 
+    def test_a_run_marked_failed_after_the_one_write_section_is_unknown(self) -> None:
+        for marker in ("pg_test_fsync failed\n", "pg_test_fsync failed; see above\n"):
+            parsed = probe.parse_pg_test_fsync(PG_TEST_FSYNC + marker)
+            self.assertIsNone(parsed["ops_per_second"], marker)
+            self.assertIsNone(parsed["usecs_per_op"], marker)
+
     def test_a_failed_run_is_unknown_not_zero(self) -> None:
         parsed = probe.parse_pg_test_fsync("pg_test_fsync failed; see above\n")
         self.assertIsNone(parsed["ops_per_second"])
