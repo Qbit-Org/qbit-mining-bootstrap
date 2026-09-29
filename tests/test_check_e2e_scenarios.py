@@ -47,6 +47,11 @@ workflow = ".github/workflows/prism-load-nightly.yml"
 title = "Real node under load"
 runs = false
 owner = "#553"
+
+[lanes.L6]
+title = "Shipped images"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
 """
 
 SCENARIOS = f"""
@@ -106,6 +111,15 @@ runs = true
 unit_tests = ["{UNIT}"]
 
 [[scenario]]
+id = "images"
+title = "Images"
+owner = "#544"
+lanes = ["L6"]
+criteria = "Mines."
+runs = true
+lane_checks = ["found-block", "resume"]
+
+[[scenario]]
 id = "under-load"
 title = "Under load"
 owner = "#553"
@@ -147,9 +161,12 @@ class Fixture:
         )
         self.write(
             ".github/workflows/prism-load-nightly.yml",
-            "on:\n  schedule:\n    - cron: x\n  workflow_dispatch:\n"
-            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n",
+            'on:\n  schedule:\n    - cron: x\n    - cron: "43 3 * * 0"\n  pull_request:\n'
+            "  workflow_dispatch:\n"
+            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n"
+            "scripts/prism_shipped_image_lane.py run\n",
         )
+        self.write("scripts/prism_shipped_image_lane.py", 'CHECKS = ("found-block", "resume")\n')
         self.manifest = LANES + SCENARIOS
 
     def write(self, relative: str, text: str) -> None:
@@ -242,7 +259,7 @@ class CheckE2eScenarios(unittest.TestCase):
 
     def test_a_running_scenario_needs_evidence(self) -> None:
         self.replace(f'tests = ["{NIGHTLY}"]', "")
-        self.assertProblem("scenario reindex runs but cites no tests, presets or unit_tests")
+        self.assertProblem("scenario reindex runs but cites no tests, presets, unit_tests or lane_checks")
 
     def test_malformed_entries_are_refused(self) -> None:
         cases = (
@@ -294,6 +311,32 @@ class CheckE2eScenarios(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(self.fixture.problems(), [])
+
+    def test_l6_checks_run_in_l6_and_each_needs_a_scenario(self) -> None:
+        self.fixture.write("scripts/prism_shipped_image_lane.py", 'CHECKS = ("found-block", "resume", "new")\n')
+        self.assertProblem("L6 runs check new, which no running scenario names")
+        self.replace('lane_checks = ["found-block", "resume"]', 'lane_checks = ["found-block", "gone"]')
+        self.assertProblem("defines no check 'gone', so L6 does not run it")
+
+    def test_an_l6_check_claimed_on_another_lane_fails(self) -> None:
+        self.replace('lanes = ["L6"]\ncriteria = "Mines."', 'lanes = ["nightly"]\ncriteria = "Mines."')
+        self.assertProblem("claims lane 'nightly', but none of its evidence runs there")
+        self.assertProblem("its evidence runs in 'L6'; add it to lanes")
+
+    def test_l6_marked_running_needs_its_trigger_and_driver_in_the_workflow(self) -> None:
+        self.fixture.write(
+            ".github/workflows/prism-load-nightly.yml",
+            "on:\n  schedule:\n    - cron: x\n  workflow_dispatch:\n"
+            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n",
+        )
+        self.assertProblem("no longer contains 'cron: \"43 3 * * 0\"'")
+        self.assertProblem("no longer contains 'pull_request:'")
+        self.assertProblem("no longer contains 'scripts/prism_shipped_image_lane.py run'")
+
+    def test_a_driver_without_checks_is_refused(self) -> None:
+        self.fixture.write("scripts/prism_shipped_image_lane.py", "OTHER = 1\n")
+        with self.assertRaisesRegex(ValueError, "defines no CHECKS"):
+            self.fixture.problems()
 
     def test_the_smoke_preset_runs_in_pr_only_through_the_load_smoke_test(self) -> None:
         self.fixture.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, COMPONENT])) + "\n")

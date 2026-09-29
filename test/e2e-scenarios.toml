@@ -9,13 +9,16 @@
 #   its lanes: `tests` are gated test ids (test/prism-gated-tests.txt runs in
 #   `pr`, test/prism-nightly-gated-tests.txt in `nightly`), `presets` are
 #   crates/qbit-prism-load/presets (a nightly preset runs in `nightly`, a
-#   manual one in `dispatch`, `smoke` in `pr`), and `unit_tests` are
-#   `<file>::<fn>` ungated tests that `cargo test --workspace` runs in `pr`.
+#   manual one in `dispatch`, `smoke` in `pr`), `unit_tests` are
+#   `<file>::<fn>` ungated tests that `cargo test --workspace` runs in `pr`,
+#   and `lane_checks` are the named checks of scripts/prism_shipped_image_lane.py,
+#   which run in `L6`.
 # - A scenario with `runs = false` cites no evidence and gives a `reason`; its
 #   `owner` is the linked issue, and its `lanes` are the lanes it is planned
 #   for (#487's definition of done: nothing unexercised without both).
 # - Every live_regtest and load_smoke test in the PR gated list, every opt-in
-#   nightly test and every preset must be cited by a running scenario.
+#   nightly test, every preset and every L6 check must be cited by a running
+#   scenario.
 #
 # Scenarios whose fixtures belong to #521 or #474 are listed under those
 # issues; #487's lanes run them under load without redefining what they
@@ -24,8 +27,8 @@
 schema = "qbit.e2e-scenarios.v1"
 
 # ---------------------------------------------------------------------------
-# Lanes. `pr`, `nightly` and `dispatch` run today; L2 to L6 are #487's lanes
-# that do not exist yet, each owned by the sub-issue that builds it.
+# Lanes. `pr`, `nightly`, `dispatch` and L6 run today; L2 to L5 are #487's
+# lanes that do not exist yet, each owned by the sub-issue that builds it.
 # ---------------------------------------------------------------------------
 
 [lanes.pr]
@@ -69,9 +72,9 @@ runs = false
 owner = "#556"
 
 [lanes.L6]
-title = "Shipped images: the Compose prism profile with the HA overlay"
-runs = false
-owner = "#544"
+title = "Shipped images: the Compose prism profile with the HA overlay, weekly and on Dockerfile or Compose changes (#544)"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
 
 # ---------------------------------------------------------------------------
 # Real-node baseline in the PR shards (#487 "Where we are": live_regtest).
@@ -187,7 +190,7 @@ unit_tests = [
 id = "cross-frontend-authorisation"
 title = "Cross-frontend authorisation: a job issued by A submitted to B, a wrong worker, a duplicate on both (#281 criterion 1)"
 owner = "#281"
-lanes = ["pr"]
+lanes = ["pr", "L6"]
 criteria = "Work issued by frontend A is accepted once on B over a real socket; another worker cannot resume or submit it; the same share replayed on B, or appended through a second instance's ledger, is rejected as a duplicate and credited once."
 runs = true
 tests = [
@@ -196,7 +199,8 @@ tests = [
   "qbit-prism-server::ledger_postgres::global_duplicates_idempotence_and_config_fencing",
 ]
 unit_tests = ["crates/qbit-prism-server/tests/stratum_protocol.rs::reconnect_on_another_listener_preserves_original_entropy_mask_and_expiry"]
-notes = "#281's Compose exercise of the same criterion on the shipped images is by hand; L6 (shipped-image-lane) runs it."
+lane_checks = ["cross-frontend-resume"]
+notes = "L6 runs #281's Compose exercise of this criterion on the shipped images and the HA overlay: work issued by frontend 1 is accepted once on frontend 2, another worker's submission and a replay on either frontend are refused, and the ledger credits it once."
 
 [[scenario]]
 id = "vardiff-retarget-steps"
@@ -714,6 +718,15 @@ id = "shipped-image-lane"
 title = "The Compose prism profile with the HA overlay under modest real-miner load"
 owner = "#544"
 lanes = ["L6"]
-criteria = "The shipped images mine with cpuminer-opt and qbit-prism-miner clients, including #281 criterion 1 on the images."
-runs = false
-reason = "CI only validates the Compose configuration today; #544."
+criteria = "Built by `docker compose build`, the stack runs both overlay frontends ready with distinct IDs that each one's self-check observes; cpuminer-opt on one frontend and qbit-prism-miner on the other each solve a block the node keeps, whose audit bundle both frontends serve identically and which verifies against the node's coinbase and the ledger key; every acknowledged share is in the ledger once and no more than was submitted; the public API lists the verified blocks; and #281 criterion 1 holds on the images."
+runs = true
+lane_checks = [
+  "ha-frontends-ready",
+  "cross-frontend-resume",
+  "cpuminer-found-block",
+  "prism-miner-found-block",
+  "found-block-audit-verifies",
+  "ledger-reconciles",
+  "public-api-lists-found-blocks",
+]
+notes = "scripts/prism_shipped_image_lane.py; the report, client logs and Compose logs are the `prism-shipped-images` artifact."

@@ -16,20 +16,23 @@ evidence, and the evidence decides its lanes:
   through the gated `load_smoke` test.
 - `unit_tests`: `<file>::<fn>` for an ungated `#[test]` or `#[tokio::test]`
   that is not `#[ignore]`d; `cargo test --workspace` runs it in `pr`.
+- `lane_checks`: names from `CHECKS` in `scripts/prism_shipped_image_lane.py`,
+  the checks lane L6 (#544) holds the shipped images to; they run in `L6`.
 
 This check fails when:
 
 - the manifest is malformed: an unknown key, a missing or empty field, a
   duplicate id, an owner that is not `#<issue>`, or an undefined lane;
 - a running scenario cites evidence no lane runs (an id in no gated list, an
-  unknown preset, a missing or ignored test), or declares lanes other than
+  unknown preset, a missing or ignored test, an L6 check the lane does not
+  define), or declares lanes other than
   the ones its evidence runs in;
 - an unexercised scenario cites evidence, or lacks a reason (#487's
   definition of done: nothing unexercised without a linked issue and a
   reason; the owner is the linked issue);
 - a lane runs a scenario the manifest does not name: a gated test in one of
-  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly test, or
-  a preset that no running scenario cites;
+  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly test, a
+  preset, or an L6 check that no running scenario cites;
 - a lane the manifest marks as running no longer has the workflow wiring
   that runs it.
 
@@ -42,6 +45,7 @@ Usage: python3 scripts/check_e2e_scenarios.py [--manifest test/e2e-scenarios.tom
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
 from pathlib import Path
 import re
@@ -61,6 +65,7 @@ SCHEMA = "qbit.e2e-scenarios.v1"
 PR_LIST = Path("test/prism-gated-tests.txt")
 NIGHTLY_LIST = Path("test/prism-nightly-gated-tests.txt")
 PRESETS = Path("crates/qbit-prism-load/presets")
+L6_DRIVER = Path("scripts/prism_shipped_image_lane.py")
 # Gated test binaries whose every test is an end-to-end scenario and so must
 # be named in the manifest. The rest of the gated list is component tests.
 SCENARIO_BINARIES = (
@@ -93,13 +98,17 @@ LANE_WIRING = {
         ".github/workflows/prism-load-nightly.yml",
         ('cron: "41 5 * * 6"', "github.event.schedule == '41 5 * * 6' && 'weekly'"),
     ),
+    "L6": (
+        ".github/workflows/prism-load-nightly.yml",
+        ('cron: "43 3 * * 0"', "pull_request:", f"{L6_DRIVER} run"),
+    ),
 }
 LANE_KEYS = {"title", "runs", "owner", "workflow"}
 SCENARIO_KEYS = {
     "id", "title", "owner", "lanes", "criteria", "runs", "reason",
-    "tests", "presets", "unit_tests", "notes",
+    "tests", "presets", "unit_tests", "lane_checks", "notes",
 }
-EVIDENCE_KEYS = ("tests", "presets", "unit_tests")
+EVIDENCE_KEYS = ("tests", "presets", "unit_tests", "lane_checks")
 ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 ISSUE = re.compile(r"^#[1-9][0-9]*$")
 UNIT_TEST = re.compile(r"^(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*)$")
@@ -114,6 +123,7 @@ class Lanes:
         self.pr = read_expected(root / PR_LIST)
         self.nightly = read_expected(root / NIGHTLY_LIST)
         self.presets = load_presets(root / PRESETS)
+        self.l6_checks = read_lane_checks(root / L6_DRIVER)
 
     def test_lanes(self, test_id: str) -> set[str]:
         lanes = set()
@@ -158,6 +168,21 @@ class Lanes:
             if any(TEST_ATTRIBUTE.match(a) for a in attributes):
                 return None
         return f"{reference} is not a #[test] or #[tokio::test]"
+
+
+def read_lane_checks(path: Path) -> tuple[str, ...]:
+    """The driver's `CHECKS` tuple, read without importing the driver."""
+    if not path.is_file():
+        return ()
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "CHECKS" for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            if not (isinstance(value, tuple) and all(text(item) for item in value)):
+                raise ValueError(f"{path}: CHECKS must be a tuple of names")
+            return value
+    raise ValueError(f"{path} defines no CHECKS")
 
 
 def text(value: object) -> bool:
@@ -278,7 +303,7 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
         if "reason" in scenario:
             problems.append(f"{where} runs; reason is only for an unexercised scenario")
         if not any(evidence.values()):
-            problems.append(f"{where} runs but cites no tests, presets or unit_tests")
+            problems.append(f"{where} runs but cites no tests, presets, unit_tests or lane_checks")
             continue
         derived: set[str] = set()
         for test_id in evidence["tests"]:
@@ -300,6 +325,11 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
                 problems.append(f"{where}: {problem}")
             else:
                 derived.add("pr")
+        for name in evidence["lane_checks"]:
+            if name in lanes_run.l6_checks:
+                derived.add("L6")
+            else:
+                problems.append(f"{where}: {L6_DRIVER} defines no check {name!r}, so L6 does not run it")
         for key in EVIDENCE_KEYS:
             cited[key] |= set(evidence[key])
         for lane in sorted(set(declared) - derived):
@@ -316,6 +346,9 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
     for test_id in lanes_run.nightly:
         if test_id not in cited["tests"]:
             problems.append(f"nightly runs {test_id}, which no running scenario names")
+    for name in lanes_run.l6_checks:
+        if name not in cited["lane_checks"]:
+            problems.append(f"L6 runs check {name}, which no running scenario names")
     for name, preset in sorted(lanes_run.presets.items()):
         lane = PRESET_LANES.get(preset.get("schedule"))
         if lane and name not in cited["presets"]:
