@@ -164,7 +164,9 @@ class Rows(unittest.TestCase):
         self.assertEqual(result["gate_exit_code"], 1)
         self.assertEqual(result["seed_seconds"], 12.5)
         self.assertEqual(result["phases"]["steady_state"]["shortfall"], 2)
-        self.assertEqual(result["tip_last_notify_p99_ms"], 300)
+        # A tip some session never got work on leaves the p99 unmeasured,
+        # as the gate has it, while the missing count is kept.
+        self.assertIsNone(result["tip_last_notify_p99_ms"])
         self.assertEqual(result["tips_missing_a_session"], 1)
         self.assertEqual(result["fsync"]["usecs_per_op"], 492.0)
         self.assertEqual(result["provenance"], "pass")
@@ -176,6 +178,16 @@ class Rows(unittest.TestCase):
         self.assertIsNone(result["gate_exit_code"])
         self.assertIsNone(result["seed_seconds"])
         self.assertIsNone(result["tip_last_notify_p99_ms"])
+
+    def test_the_tip_p99_is_measured_when_every_tip_was_served(self) -> None:
+        served = {"tips": [{"all_sessions_milliseconds": 100},
+                           {"all_sessions_milliseconds": 300}]}
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "load-harness-report.json").write_text(
+                json.dumps(report(time_to_usable_work=served)))
+            result = probe.run_result(Path(directory))
+        self.assertEqual(result["tip_last_notify_p99_ms"], 300)
+        self.assertEqual(result["tips_missing_a_session"], 0)
 
     def test_nearest_rank_matches_the_gate(self) -> None:
         self.assertEqual(probe.nearest_rank([5, 1, 3], 0.99), 5)
@@ -224,10 +236,26 @@ class Table(unittest.TestCase):
     def test_a_vm_whose_pg_test_fsync_failed_is_counted_as_unknown(self) -> None:
         self.assertEqual(
             probe.spread([2000.0, None, 1000.0]),
-            "1,000–2,000 over 2 VMs, max/min 2.00; 1 of 3 VMs unknown (pg_test_fsync failed)",
+            "1,000–2,000 over 2 VMs, max/min 2.00; 1 of 3 VMs unknown (pg_test_fsync failed or "
+            "the job wrote no row)",
         )
         self.assertEqual(probe.spread([None, None]),
-                         "unknown; 2 of 2 VMs unknown (pg_test_fsync failed)")
+                         "unknown; 2 of 2 VMs unknown (pg_test_fsync failed or the job wrote no row)")
+
+    def test_a_planned_job_that_wrote_no_row_is_named_and_counted(self) -> None:
+        expected = probe.matrices("8,16", "sticky-disk", "3")
+        rows = [
+            {"schema": probe.ROW_SCHEMA, "kind": "fsync", "class": 8, "vm": vm,
+             "runner": "r", "host": {}, "fsync": {"ops_per_second": ops}}
+            for vm, ops in ((1, 2000.0), (2, 1000.0))
+        ]
+        text = probe.table(rows, expected)
+        for size in (8, 16):
+            self.assertIn(f"### {size} vCPU · sticky-disk: no row", text)
+        self.assertIn("| 8 vCPU | 1,000–2,000 over 2 VMs, max/min 2.00; 1 of 3 VMs unknown", text)
+        self.assertIn("| 16 vCPU | unknown; 3 of 3 VMs unknown", text)
+        # With no fsync jobs planned, none is expected.
+        self.assertNotIn("fdatasync across VMs", probe.table([], probe.matrices("8", "both", "0")))
 
     def test_the_run_argument_names_a_probe_preset(self) -> None:
         with self.assertRaises(probe.ProbeError):

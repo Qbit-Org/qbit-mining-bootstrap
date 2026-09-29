@@ -351,8 +351,12 @@ def run_result(directory: Path) -> dict:
     tips = ((report.get("time_to_usable_work") or {}).get("tips")) or []
     slowest = [t["all_sessions_milliseconds"] for t in tips
                if isinstance(t.get("all_sessions_milliseconds"), (int, float))]
-    result["tip_last_notify_p99_ms"] = nearest_rank(slowest, 0.99)
+    # As the gate does, a tip some session never got work on leaves the p99
+    # unmeasured: a percentile over the fully served tips alone would
+    # understate delivery.
     result["tips_missing_a_session"] = len(tips) - len(slowest)
+    if not result["tips_missing_a_session"]:
+        result["tip_last_notify_p99_ms"] = nearest_rank(slowest, 0.99)
     return result
 
 
@@ -430,7 +434,8 @@ def spread(samples: list[float | None]) -> str:
     failed pg_test_fsync is a missing sample, not a narrower range."""
     values = [v for v in samples if v is not None]
     unknown = len(samples) - len(values)
-    missing = f"; {unknown} of {len(samples)} VMs unknown (pg_test_fsync failed)" if unknown else ""
+    missing = (f"; {unknown} of {len(samples)} VMs unknown (pg_test_fsync failed or "
+               f"the job wrote no row)") if unknown else ""
     if not values:
         return f"unknown{missing}"
     low, high = min(values), max(values)
@@ -438,14 +443,24 @@ def spread(samples: list[float | None]) -> str:
     return f"{cell(low)}–{cell(high)} over {len(values)} VMs{ratio}{missing}"
 
 
-def table(rows: list[dict]) -> str:
+def table(rows: list[dict], expected: dict | None = None) -> str:
+    """The results table. `expected` is the plan job's `matrices()` output:
+    a job it lists that wrote no row (it failed before its row step, or its
+    upload did) is named as missing, never left out of the count."""
     probes = sorted(
         (r for r in rows if r.get("kind") == "probe"),
         key=lambda r: (r["class"], r["target_cache"]),
     )
     lines = ["## Runner probe (#541)", ""]
+    if expected:
+        present = {(r["class"], r["target_cache"]) for r in probes}
+        absent = [e for e in expected["probe"]["include"]
+                  if (e["class"], e["target_cache"]) not in present]
+        for entry in absent:
+            lines += [f"### {entry['class']} vCPU · {entry['target_cache']}: no row "
+                      "(the job failed before writing it; see its log)", ""]
     if not probes:
-        lines.append("No probe row was produced.")
+        lines += ["No probe row was produced.", ""]
     for row in probes:
         build = row.get("build") or {}
         target = row.get("target") or {}
@@ -500,10 +515,16 @@ def table(rows: list[dict]) -> str:
             f"{cell(target.get('save_seconds'), ' s')}.",
             "",
         ]
-    by_class: dict[int, list[float | None]] = {}
+    by_vm: dict[tuple[int, int], float | None] = {}
     for row in rows:
         if row.get("kind") == "fsync":
-            by_class.setdefault(row["class"], []).append(row["fsync"].get("ops_per_second"))
+            by_vm[(row["class"], row["vm"])] = row["fsync"].get("ops_per_second")
+    if expected and expected.get("fsync_enabled"):
+        for entry in expected["fsync"]["include"]:
+            by_vm.setdefault((entry["class"], entry["vm"]), None)
+    by_class: dict[int, list[float | None]] = {}
+    for (size, _vm), ops in sorted(by_vm.items()):
+        by_class.setdefault(size, []).append(ops)
     if by_class:
         lines += [
             "### fdatasync across VMs of one class",
@@ -570,6 +591,8 @@ def main(argv: list[str] | None = None) -> int:
 
     t = sub.add_parser("table")
     t.add_argument("directory", type=Path)
+    t.add_argument("--expected", type=Path, default=None,
+                   help="the plan job's matrices as JSON, so a job that wrote no row is counted")
 
     args = parser.parse_args(argv)
     try:
@@ -595,7 +618,12 @@ def main(argv: list[str] | None = None) -> int:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(row, indent=2) + "\n", encoding="utf-8")
             return 0
-        print(table(load_rows(args.directory)))
+        expected = None
+        if args.expected is not None:
+            expected = read_json(args.expected)
+            if expected is None:
+                raise ProbeError(f"--expected {args.expected} is not readable JSON")
+        print(table(load_rows(args.directory), expected))
         return 0
     except ProbeError as error:
         print(f"prism_load_probe: {error}", file=sys.stderr)

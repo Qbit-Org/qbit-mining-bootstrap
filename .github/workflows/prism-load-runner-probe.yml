@@ -377,15 +377,27 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.sha }}
       - name: Download every row
+        # A run in which every job failed before its row has nothing to
+        # download; the table then names each job as missing.
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           pattern: prism-probe-row-*
           path: ${{ runner.temp }}/rows
           merge-multiple: true
       - name: Write the table
+        env:
+          PROBE_MATRIX: ${{ needs.plan.outputs.probe }}
+          FSYNC_MATRIX: ${{ needs.plan.outputs.fsync }}
+          FSYNC_ENABLED: ${{ needs.plan.outputs.fsync_enabled }}
         run: |
           set -euo pipefail
-          python3 scripts/prism_load_probe.py table "${RUNNER_TEMP}/rows" | tee "${RUNNER_TEMP}/rows/table.md" \
+          mkdir -p "${RUNNER_TEMP}/rows"
+          # What the plan asked for, so a job that wrote no row is counted.
+          python3 -c 'import json, os; print(json.dumps({"probe": json.loads(os.environ["PROBE_MATRIX"]), "fsync": json.loads(os.environ["FSYNC_MATRIX"]), "fsync_enabled": os.environ["FSYNC_ENABLED"] == "true"}))' \
+            > "${RUNNER_TEMP}/expected.json"
+          python3 scripts/prism_load_probe.py table "${RUNNER_TEMP}/rows" --expected "${RUNNER_TEMP}/expected.json" \
+            | tee "${RUNNER_TEMP}/rows/table.md" \
             >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the table and the rows
         uses: actions/upload-artifact@v7
