@@ -4,6 +4,7 @@
 # that one binary. The prism-native-postgres PR job never runs these, so they
 # are listed here and not in test/prism-gated-tests.txt; the job proves each
 # executed with scripts/check_gate_manifest.py (#521).
+# Each id is also named in test/e2e-scenarios.toml (#543).
 qbit-prism-server::live_regtest::dense_soak_tests::dense_cadence_soak_lands_every_block_rebuilds_in_budget_and_holds_rss_flat
 qbit-prism-server::live_regtest::node_outage_tests::node_killed_after_accepting_and_reindexed_lands_the_block_once
 qbit-prism-server::live_regtest::weighted_recipients_tests::nightly_mainnet_floor_weighted_recipients_share_to_spend
