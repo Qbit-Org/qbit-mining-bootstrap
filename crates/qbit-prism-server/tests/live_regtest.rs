@@ -648,7 +648,9 @@ impl Fixture {
             .await?;
         let mut lines = BufReader::new(read).lines();
         loop {
-            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            // The server bounds session allocation by initial_job_timeout_seconds,
+            // 30 s by default, and a loaded database can use most of it (#562).
+            let line = tokio::time::timeout(Duration::from_secs(35), lines.next_line())
                 .await??
                 .context("subscription closed")?;
             let value: Value = serde_json::from_str(&line)?;
@@ -1337,12 +1339,20 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         until("accepted shares on both servers",30,||async {Ok(fixture.count(0).await?>2&&fixture.count(1).await?>2)}).await?;
         fixture.servers[0].stop();fixture.miners[0].stop();
         let before=fixture.count(1).await?;
-        until("surviving server mining",20,||async {Ok(fixture.count(1).await?>before+2)}).await?;
+        // Every regtest share is also a block. A proof on work whose payout
+        // revision a landing superseded is captured (#478), and its answer
+        // waits for this server's own landing of that block, up to
+        // block_only_ack_timeout: max(share_commit_timeout, 60 s), 60 s here.
+        // Under load a landing takes seconds, so three credited shares can
+        // outlast a fixed 20 s (#562). Allow each its whole answer bound,
+        // here and after the restart below.
+        let block_only_ack_seconds=60;
+        until("surviving server mining",20+3*block_only_ack_seconds,||async {Ok(fixture.count(1).await?>before+2)}).await?;
         fixture.servers[0]=fixture.start_server(0)?;
         until("restarted Stratum listener",20,||async {Ok(tokio::net::TcpStream::connect(("127.0.0.1",fixture.stratum[0])).await.is_ok())}).await?;
         let restarted=fixture.subscription(0).await?;ensure!(restarted!=a&&restarted!=b,"restart reused session extranonce");
         let before=fixture.count(0).await?;fixture.start_miner(0)?;
-        until("restarted server mining",20,||async {Ok(fixture.count(0).await?>before+2)}).await?;
+        until("restarted server mining",20+3*block_only_ack_seconds,||async {Ok(fixture.count(0).await?>before+2)}).await?;
         fixture.quiesce().await?;
         // A share a server read before its miner was killed can still commit
         // (#533). Read both counts in one snapshot, and compare each API with a
