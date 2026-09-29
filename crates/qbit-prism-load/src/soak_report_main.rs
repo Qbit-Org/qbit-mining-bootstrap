@@ -204,15 +204,22 @@ async fn take_sample(
     let elapsed = (at - started).num_milliseconds() as f64 / 1000.0;
     let base = &args.prometheus_url;
     let label = &args.instance_label;
-    let previous: BTreeMap<String, ProcessPoint> = earlier
-        .last()
-        .map(|s| {
-            s.processes
-                .iter()
-                .map(|p| (p.instance.clone(), p.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Per process, the lifetime last seen and the last counter reading with
+    // the lifetime it belongs to, from whichever earlier sample had them: a
+    // sample that could not read the counter neither ends a lifetime nor
+    // starts one.
+    let mut last_lifetime: BTreeMap<String, u32> = BTreeMap::new();
+    let mut last_counter: BTreeMap<String, (u32, u64)> = BTreeMap::new();
+    for sample in earlier {
+        for process in &sample.processes {
+            if let Some(pid) = process.pid {
+                last_lifetime.insert(process.instance.clone(), pid);
+                if let Some(total) = process.accepted_total {
+                    last_counter.insert(process.instance.clone(), (pid, total));
+                }
+            }
+        }
+    }
     let mut processes: BTreeMap<String, ProcessPoint> = BTreeMap::new();
     let note = |instance: &str| -> ProcessPoint {
         ProcessPoint {
@@ -293,19 +300,21 @@ async fn take_sample(
                     .or_insert_with(|| note(&instance));
                 let now = value.max(0.0) as u64;
                 point.accepted_total = Some(now);
-                let before = previous.get(&instance);
-                let lifetime = before.and_then(|p| p.pid).unwrap_or(1);
-                match before.and_then(|p| p.accepted_total) {
-                    Some(then) if now >= then => {
+                match last_counter.get(&instance) {
+                    // The counter is continuous across samples that missed
+                    // it, so the whole stretch is counted.
+                    Some(&(lifetime, then)) if now >= then => {
                         point.pid = Some(lifetime);
                         acked_delta = acked_delta.map(|sum| sum + (now - then));
                     }
-                    Some(_) => {
+                    Some(&(lifetime, _)) => {
                         point.pid = Some(lifetime + 1);
                         acked_delta = acked_delta.map(|sum| sum + now);
                     }
                     // First seen: its count so far predates the soak.
-                    None => point.pid = Some(lifetime),
+                    None => {
+                        point.pid = Some(*last_lifetime.get(&instance).unwrap_or(&1));
+                    }
                 }
             }
         }
@@ -315,6 +324,11 @@ async fn take_sample(
         }
     }
     for point in processes.values_mut() {
+        // A process whose counter this sample could not read stays in the
+        // lifetime it was last seen in.
+        if point.pid.is_none() {
+            point.pid = last_lifetime.get(&point.instance).copied();
+        }
         if point.open_fds.is_none() {
             point
                 .unknown
@@ -355,28 +369,37 @@ async fn take_sample(
         p99_ms: scalar(query(http, base, &quantile(0.99)).await),
     };
     let database = soak::database_point(pool, None).await;
-    let from =
-        started - chrono::Duration::milliseconds((args.scrape_slack_seconds * 1000.0) as i64);
-    let committed = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM qbit_share_ledger \
-         WHERE accepted AND accepted_at > $1 AND accepted_at <= $2",
-    )
-    .bind(from)
-    .bind(at)
-    .fetch_one(pool)
-    .await
-    .ok()
-    .map(|n| n as u64);
-    let slack_rows = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM qbit_share_ledger \
-         WHERE accepted AND accepted_at > $1 AND accepted_at <= $2",
-    )
-    .bind(from)
-    .bind(started)
-    .fetch_one(pool)
-    .await
-    .ok()
-    .map(|n| n as u64);
+    // Committed rows are counted per interval, while the interval's rows are
+    // still in the live ledger, and added up: a partition the operator's
+    // retention later detaches or drops takes old rows out of the ledger,
+    // not out of the count. The first interval starts the scrape slack
+    // before the soak does.
+    let counted = earlier.iter().rev().find_map(|s| {
+        let ledger = s.ledger.as_ref()?;
+        Some((ledger.committed_since_start?, ledger.committed_through?))
+    });
+    let slack = chrono::Duration::milliseconds((args.scrape_slack_seconds * 1000.0) as i64);
+    let (committed_before, from) = counted.unwrap_or((0, started - slack));
+    let count = |from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>| {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM qbit_share_ledger \
+             WHERE accepted AND accepted_at > $1 AND accepted_at <= $2",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(pool)
+    };
+    let interval = count(from, at).await.ok().map(|n| n as u64);
+    let committed = interval.map(|n| committed_before + n);
+    let committed_through = if interval.is_some() {
+        Some(at)
+    } else {
+        counted.map(|(_, through)| through)
+    };
+    let slack_rows = match earlier.first().and_then(|s| s.ledger.as_ref()) {
+        Some(first) => first.tolerance_rows,
+        None => count(started - slack, started).await.ok().map(|n| n as u64),
+    };
     let prior = earlier.last().and_then(|s| s.ledger.as_ref());
     let prior_total = prior.and_then(|l| l.acknowledged_since_start).unwrap_or(0);
     let prior_gaps = prior.map_or(0, |l| l.acknowledged_gaps);
@@ -397,6 +420,7 @@ async fn take_sample(
             acknowledged_since_start: Some(acknowledged),
             acknowledged_gaps: gaps,
             committed_since_start: committed,
+            committed_through,
             tolerance_rows: slack_rows,
             tolerance_seconds: args.scrape_slack_seconds,
         }),

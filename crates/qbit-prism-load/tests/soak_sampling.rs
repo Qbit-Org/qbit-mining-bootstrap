@@ -75,10 +75,13 @@ async fn soak_samples_a_prism_database_and_a_process_rolls_over_and_gates() -> R
 async fn run(url: &str) -> Result<()> {
     let ledger = Ledger::connect(url, "soak-sampling".into(), 4, true).await?;
     let pool = &ledger.pool;
+    // Only this test's own connections: the shard's database is shared with
+    // whatever else the shard runs, whose sessions this test does not own.
+    let own = vec!["soak-sampling".to_owned()];
 
     // Every part of the database sample reads on a fresh ledger: nothing is
     // unknown, and a fresh ledger's zeros are real zeros.
-    let first = soak::database_point(pool, None).await;
+    let first = soak::database_point(pool, Some(&own)).await;
     ensure!(first.unknown.is_empty(), "unknown: {:?}", first.unknown);
     ensure!(first.wal_bytes.is_some_and(|bytes| bytes > 0), "{first:?}");
     ensure!(first.connections.is_some(), "{first:?}");
@@ -107,7 +110,7 @@ async fn run(url: &str) -> Result<()> {
     let detail = soak_driver::rollover(pool, 100).await?;
     ensure!(detail["bound"] == bound, "{detail}");
     ensure!(detail["to_next_share_seq"] == bound - 100, "{detail}");
-    let rolled = soak::database_point(pool, None).await;
+    let rolled = soak::database_point(pool, Some(&own)).await;
     ensure!(rolled.next_share_seq == Some(bound - 100), "{rolled:?}");
     // It never moves the sequence down, and refuses to roll again while the
     // load has not yet crossed the bound it was brought to.
@@ -119,7 +122,7 @@ async fn run(url: &str) -> Result<()> {
     sqlx::query("SELECT nextval('qbit_share_ledger_share_seq_seq') FROM generate_series(1, 150)")
         .execute(pool)
         .await?;
-    let crossed = soak::database_point(pool, None).await;
+    let crossed = soak::database_point(pool, Some(&own)).await;
     ensure!(
         crossed.next_share_seq.is_some_and(|n| n > bound),
         "{crossed:?}"

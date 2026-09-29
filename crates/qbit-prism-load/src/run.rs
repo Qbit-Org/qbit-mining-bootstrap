@@ -2156,7 +2156,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "dense_cadence": dense_cadence,
         "churn": churn_report(args, &runs, &collected, &tip_changes),
         "soak": match (&ctx.soak, &soak_summary) {
-            (Some(plan), Some(summary)) => crate::soak_driver::report(plan, summary, &args.out),
+            (Some(plan), Some(summary)) => {
+                let mut soak = crate::soak_driver::report(plan, summary, &args.out);
+                soak["churn_phases"] =
+                    Value::Array(churn_phase_reports(&runs, &collected, &tip_changes));
+                soak
+            }
             (Some(_), None) => json!({"ran": false, "reason": "the soak driver failed; see aborted"}),
             _ => Value::Null,
         },
@@ -3675,6 +3680,36 @@ fn churn_report(
         reconnects: &collected.reconnects,
         rentals_undrained: churn.undrained,
     })
+}
+
+/// Every churn phase's report, by phase, each read with the flags its own
+/// driver was planned from: a soak drives one every cycle (#575), and the
+/// `churn` section above is only the first.
+fn churn_phase_reports(
+    runs: &[PhaseRun],
+    collected: &Collected,
+    tip_changes: &[crate::node::TipChange],
+) -> Vec<Value> {
+    runs.iter()
+        .filter_map(|phase| phase.churn.as_ref().map(|churn| (phase, churn)))
+        .map(|(phase, churn)| {
+            json!({
+                "phase": phase.plan.name,
+                "report": crate::churn::report(&crate::churn::ReportInputs {
+                    spec: churn.driver.spec(),
+                    driver: &churn.driver,
+                    phase_started: phase.started,
+                    phase_ended: phase.ended,
+                    opened: &collected.opened,
+                    closed: &collected.closed,
+                    sightings: &collected.tips,
+                    all_tip_changes: tip_changes,
+                    reconnects: &collected.reconnects,
+                    rentals_undrained: churn.undrained,
+                }),
+            })
+        })
+        .collect()
 }
 
 /// Failure counts by kind, for the side report.
