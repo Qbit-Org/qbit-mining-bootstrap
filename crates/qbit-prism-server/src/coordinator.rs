@@ -33,11 +33,13 @@ use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
 mod bundle_build;
 mod chain_observation;
+mod claim_release;
 mod clocked_flight;
 mod compact_resume;
 mod compact_runtime;
 mod issued_batcher;
 mod miner_submit;
+mod offer_shutdown;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
@@ -266,6 +268,13 @@ pub struct Coordinator {
     /// exactly the window the fence guards.
     #[cfg(test)]
     offer_probe: std::sync::Mutex<Option<Arc<OfferProbe>>>,
+    /// A test seam right after the offer reservation commits, before the
+    /// standby wait (#578).
+    #[cfg(test)]
+    offer_reserved_probe: std::sync::Mutex<Option<Arc<OfferProbe>>>,
+    /// Attempts between their offer reservation and its recorded answer,
+    /// which a graceful shutdown lets finish (#578).
+    offer_sections: offer_shutdown::OfferSections,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -274,6 +283,9 @@ pub struct Coordinator {
 pub(crate) struct OfferProbe {
     pub(crate) entered: Notify,
     pub(crate) release: Notify,
+    /// Set once an attempt that entered the probe has left it, by returning
+    /// or by being dropped.
+    pub(crate) left: std::sync::atomic::AtomicBool,
 }
 
 /// The wall clock as UNIX milliseconds. Every proof-to-first-offer sample is
@@ -788,6 +800,9 @@ impl Coordinator {
             statement_timeout,
             #[cfg(test)]
             offer_probe: Default::default(),
+            #[cfg(test)]
+            offer_reserved_probe: Default::default(),
+            offer_sections: Default::default(),
         }))
     }
 
@@ -1620,11 +1635,31 @@ impl Coordinator {
         lease: CandidateLease,
         work: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
+        self.with_tracked_heartbeat(claim, lease, None, work).await
+    }
+
+    /// [`Coordinator::with_candidate_heartbeat`], keeping `horizon` at the
+    /// local instant the heartbeat itself treats as the lease's end, so a
+    /// failed attempt's claim release knows how long it can still matter
+    /// (see `claim_release`).
+    async fn with_tracked_heartbeat(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        horizon: Option<&claim_release::LeaseHorizon>,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let track = |until: tokio::time::Instant| {
+            if let Some(horizon) = horizon {
+                horizon.set(until);
+            }
+        };
         // Establish ownership before even waiting for build capacity. Keep
         // renewal and processing independently polled: processing may hold a
         // database row lock while a renewal waits for that same transaction.
         let initially_renewed = tokio::time::Instant::now();
         self.renew_candidate(claim, lease).await?;
+        track(initially_renewed + Duration::from_secs(lease.seconds as u64));
         let live_token_query = format!(
             "SELECT CASE WHEN state IN {} AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1",
             CandidateState::UNFINISHED_SQL
@@ -1649,6 +1684,7 @@ impl Coordinator {
                 match self.renew_candidate(claim, bounded).await {
                     Ok(()) => {
                         valid_until = started + Duration::from_secs(lease.seconds as u64);
+                        track(valid_until);
                         delay = lease.interval;
                     }
                     Err(error) => {
@@ -1687,6 +1723,7 @@ impl Coordinator {
                         }
                         let remaining = Duration::from_millis(remaining as u64);
                         valid_until = observed + remaining;
+                        track(valid_until);
                         delay = lease
                             .interval
                             .min((remaining / 2).max(Duration::from_millis(1)));
@@ -2203,6 +2240,10 @@ impl Coordinator {
         // is still pending, rather than after the reservation.
         let params = json!([hex::encode(&candidate.block_bytes)]);
         unix_ms_now().context("the first-offer boundary needs the wall clock")?;
+        // #578: from here until the node's answer is recorded, a graceful
+        // shutdown finishes this attempt's offer instead of dropping it: a
+        // committed reservation is never offered again by anyone.
+        let section = self.offer_sections.open();
         // The durable reservation: once it commits, no claim on any
         // frontend, this one included after a crash, offers the block again.
         // A block whose payout revision was superseded is held to the
@@ -2273,6 +2314,8 @@ impl Coordinator {
         // widens the reserved-but-unsent window (a crash here is delivery
         // unknown, never offered) to at most the bound; see
         // `ledger/standby_durability.rs`.
+        #[cfg(test)]
+        Self::probe(&self.offer_reserved_probe).await;
         if let Some(wait) = &self.config.offer_standby {
             self.await_offer_standby(wait, &candidate.block_hash).await;
         }
@@ -2314,6 +2357,7 @@ impl Coordinator {
         self.ledger
             .record_offer(claim, offered_at_ms, outcome, reply.as_deref())
             .await?;
+        drop(section);
         self.settle_offered_candidate(claim, lease, outcome, reply)
             .await
     }
@@ -2550,8 +2594,20 @@ impl Coordinator {
 
     #[cfg(test)]
     async fn offer_probe(&self) {
-        let probe = self.offer_probe.lock().unwrap().clone();
+        Self::probe(&self.offer_probe).await;
+    }
+
+    #[cfg(test)]
+    async fn probe(seam: &std::sync::Mutex<Option<Arc<OfferProbe>>>) {
+        let probe = seam.lock().unwrap().clone();
         if let Some(probe) = probe {
+            struct Left<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Left<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _left = Left(&probe.left);
             probe.entered.notify_one();
             probe.release.notified().await;
         }
@@ -2574,54 +2630,81 @@ impl Coordinator {
         Ok((result, offered_at_ms))
     }
 
-    pub async fn submit_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+    pub async fn submit_loop(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
+        self.submit_loop_with(CANDIDATE_LEASE, shutdown).await
+    }
+
+    async fn submit_loop_with(
+        self: Arc<Self>,
+        lease: CandidateLease,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
+        // #529: claims whose failed attempt could not be released, retried
+        // here until the database answers or their lease ends.
+        let mut unreleased = claim_release::Unreleased::default();
+        'claims: loop {
             tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-            match self.ledger.claim_candidate(CANDIDATE_LEASE.seconds).await {
+            unreleased.retry_one(&self.ledger, lease).await;
+            // A shutdown signalled meanwhile claims nothing new.
+            if shutdown.has_changed().unwrap_or(true) {
+                break;
+            }
+            let claimed_at = tokio::time::Instant::now();
+            match self.ledger.claim_candidate(lease.seconds).await {
                 Ok(Some(claim)) => {
-                    let result = tokio::select! {
-                        _ = shutdown.changed() => {
-                            // #573: the in-flight work is dropped with its
-                            // heartbeat; hand the claim back instead of making
-                            // another frontend wait out the lease on every
-                            // rolling restart. The release keeps the state and
-                            // schedule, so it changes only when a successor may
-                            // take the row, not what it then does: exactly
-                            // what it would do after the expiry. Fenced on the
-                            // token and on an unfinished state, so a terminal
-                            // commit that won the race is left alone. A failed
-                            // release falls back to the expiry.
-                            match tokio::time::timeout(
-                                CANDIDATE_LEASE.timeout,
-                                self.ledger.release_recovery_claim(&claim, "claim released at shutdown"),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(release)) => tracing::warn!(%release,block=%claim.candidate.block_hash,"candidate claim release at shutdown failed; the claim waits for its expiry"),
-                                Err(_) => tracing::warn!(block=%claim.candidate.block_hash,"candidate claim release at shutdown timed out; the claim waits for its expiry"),
+                    let attempt = claim_release::Attempt::new(claim, claimed_at, lease);
+                    // The running future borrows `attempt`, so it is gone
+                    // before anything below releases the claim.
+                    let (outcome, stopping) = {
+                        let mut running = std::pin::pin!(attempt.run(&self, lease));
+                        loop {
+                            tokio::select! {
+                                _ = shutdown.changed() => {
+                                    // #578: an offer in flight is sent and
+                                    // recorded before the attempt is dropped.
+                                    let left = unreleased
+                                        .stop_deadline()
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    let bound = self.offer_section_bound(lease).min(left);
+                                    let finished =
+                                        self.finish_offer_section(running.as_mut(), bound).await;
+                                    break (finished, true);
+                                }
+                                result = &mut running => break (Some(result), false),
+                                // Deferred releases keep their schedule while
+                                // this attempt runs.
+                                () = unreleased.retry_when_due(&self.ledger, lease) => {}
                             }
-                            break;
                         }
-                        result = self.process_candidate(&claim) => result,
                     };
-                    if let Err(error) = result {
-                        tracing::warn!(%error,block=%claim.candidate.block_hash,"candidate remains recoverable");
-                        if let Err(retry) = self
-                            .ledger
-                            .retry_candidate(&claim, &error.to_string())
-                            .await
-                        {
-                            tracing::error!(%retry,"candidate retry persistence failed");
+                    match outcome {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            unreleased
+                                .release(&self.ledger, attempt.failed(error), lease)
+                                .await
                         }
+                        // #573: dropped mid-attempt by the shutdown.
+                        None => {
+                            let left = unreleased
+                                .stop_deadline()
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            attempt
+                                .hand_back_at_shutdown(&self.ledger, lease.timeout.min(left))
+                                .await
+                        }
+                    }
+                    if stopping {
+                        break 'claims;
                     }
                 }
                 Ok(None) => {}
                 Err(error) => tracing::warn!(%error,"candidate polling failed"),
             }
         }
+        unreleased.release_at_shutdown(&self.ledger, lease).await;
     }
 
     pub async fn health(&self) -> Value {

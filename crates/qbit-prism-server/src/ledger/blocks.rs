@@ -351,8 +351,10 @@ impl Ledger {
         // the outbox does not keep every submitted, abandoned or orphaned
         // block forever. The offer record (reservation, call time, outcome)
         // is small and stays on a submitted row as the evidence of its one
-        // offer.
-        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2"))
+        // offer. A recovered reservation whose call's answer was never
+        // recorded lands with an `unknown` outcome, as reconciliation and
+        // the orphan disposition record it (#529); a pending row keeps none.
+        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=CASE WHEN state IN {} THEN COALESCE(offer_outcome,'unknown') ELSE offer_outcome END,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
         // Shared by ordinary processing and operator recovery. Arm only at the
         // actual COMMIT attempt, after all proven precommit failures are past.

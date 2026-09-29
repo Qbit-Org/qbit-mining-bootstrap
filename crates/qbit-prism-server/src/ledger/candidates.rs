@@ -910,17 +910,33 @@ impl Ledger {
     /// `submitblock` until its block is proven active or an operator
     /// resolves it, backs off `min(3600, 10 * attempt_count)`.
     pub async fn retry_candidate(&self, claim: &CandidateClaim, error: &str) -> Result<()> {
+        ensure!(
+            self.release_candidate_claim(claim, error).await?,
+            "candidate claim was lost or expired"
+        );
+        Ok(())
+    }
+
+    /// [`Ledger::retry_candidate`]'s release, reporting instead of failing
+    /// when this claim no longer holds the row: `false` means the token was
+    /// replaced, the lease expired, or the row finished, and nothing changed.
+    /// An error means the database did not answer; the claim may still hold
+    /// the row (or, after a lost COMMIT reply, may already be released).
+    pub async fn release_candidate_claim(
+        &self,
+        claim: &CandidateClaim,
+        error: &str,
+    ) -> Result<bool> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
         let result = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+(CASE WHEN state='reconciliation' THEN LEAST(3600,10*attempt_count) ELSE LEAST(60,attempt_count) END)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::UNFINISHED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(error).execute(&mut *tx).await?;
-        ensure!(
-            result.rows_affected() == 1,
-            "candidate claim was lost or expired"
-        );
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
     /// Record how the reserved row's one `submitblock` call ended, moving it
     /// to `offered`. `offered_at_ms` is the offering frontend's wall clock
