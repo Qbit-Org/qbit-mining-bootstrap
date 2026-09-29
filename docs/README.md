@@ -59,6 +59,9 @@ This is useful for reviewers and operators who need implementation detail:
   shared gate every environment-dependent Rust test goes through, its
   required-mode switch, the execution manifest CI proves against, and how to
   add a gated test.
+- [prism-stratum-fuzzing.md](prism-stratum-fuzzing.md): the Stratum
+  cargo-fuzz targets, their invariants and nightly job, and the per-PR
+  property tests for the line codec and target conversions (#575).
 - [prism-deleted-test-map.md](prism-deleted-test-map.md): every 2.x.x test
   file absent on 3.x.x, grouped by area, with its native replacement or the
   open issue that closes the gap. `scripts/check_deleted_test_map.py` fails CI

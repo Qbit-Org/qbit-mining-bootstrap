@@ -153,6 +153,11 @@ runs the whole workspace against PostgreSQL, and proves from the gate's
 manifest that every gated test executed. See
 [the integration test gate](../../docs/prism-integration-test-gate.md).
 
+The Stratum line codec, session state machine and codec parsers also have
+cargo-fuzz targets in `fuzz/`, outside the workspace, run nightly, and property
+tests in `tests/stratum_properties.rs`, run on every PR. See
+[Stratum fuzzing](../../docs/prism-stratum-fuzzing.md).
+
 The [subscription admission reference](../../docs/prism-b4-stratum-admission.md)
 describes lazy session-ID allocation, failure behavior and its explicit
 PostgreSQL acceptance test.

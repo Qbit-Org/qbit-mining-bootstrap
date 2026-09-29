@@ -1,0 +1,20 @@
+{"id":1,"method":"mining.submit","params":["miner1","job-0","0000000000000000","6553f100","00000000"]}
+{"id":2,"method":"mining.unknown","params":[]}
+{"id":3,"params":[]}
+{"id":4,"method":"mining.subscribe","params":{"a":1}}
+{"id":5,"method":"mining.get_health","params":[1]}
+{"id":6,"method":"mining.extranonce.subscribe","params":[]}
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":7,"method":"mining.submit","params":["$user","$job"]}
+{"id":8,"method":"mining.submit","params":["$user","$job",1,"$ntime","$nonce"]}
+{"id":9,"method":"mining.submit","params":["miner9","$job","$en2","$ntime","$nonce"]}
+{"id":10,"method":"mining.submit","params":["$user","$job","00","$ntime","$nonce"]}
+{"id":11,"method":"mining.submit","params":["$user","$job","$en2","655","$nonce"]}
+{"id":12,"method":"mining.submit","params":["$user","never-issued","$en2","$ntime","$nonce"]}
+{"id":13,"method":"mining.submit","params":["$user","$job","zzzzzzzzzzzzzzzz","$ntime","$nonce"]}
+{"id":14,"method":"mining.submit","params":["$user","$job","$en2","00000001","$nonce"]}
+{"id":15,"method":"mining.authorize","params":["not-a-miner","x"]}
+{"method":"mining.get_health"}
+[1,2,3]
+not json at all

@@ -1,0 +1,4 @@
+{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":7}]}
+{"id":2,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"xyz"}]}
+{"id":3,"method":"mining.configure","params":[["version-rolling"],"not-an-object"]}
+{"id":4,"method":"mining.configure","params":[[1,null,"subscribe-extranonce"]]}

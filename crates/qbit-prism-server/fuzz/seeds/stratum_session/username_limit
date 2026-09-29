@@ -1,0 +1,8 @@
+#cfg user_limit=1
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":3,"method":"mining.authorize","params":["miner2","x"]}
+{"id":4,"method":"mining.authorize","params":["miner1.rig","x"]}
+#reconnect
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
