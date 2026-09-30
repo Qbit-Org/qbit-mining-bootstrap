@@ -15,7 +15,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 
 | #487 lane | Where it runs today | Manifest lane | Status |
 |---|---|---|---|
-| L0 existing CI | `ci.yml`, every PR and push | `pr` | running, required |
+| L0 existing CI | `ci.yml`, every PR and every push to `main`, `1.x.x`, `2.x.x`, `3.x.x` | `pr` | running, required |
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
 | L2 nightly load | `prism-load-nightly.yml`: `run`, `live-nightly`, `stratum-fuzz` | `nightly`, `dispatch` | running; repeats, trend and regression rule not yet (#549, #551, #542) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
@@ -31,7 +31,9 @@ required check.
 
 ## L0: existing CI
 
-**Runs:** `ci.yml` on every PR and push. The jobs are lint and compile, Python
+**Runs:** `ci.yml` on every PR, as its merge result, and on pushes to the
+long-lived branches (`main`, `1.x.x`, `2.x.x`, `3.x.x`); a push to a feature
+branch with no PR runs nothing. The jobs are lint and compile, Python
 unit tests in four shards (including `tests/test_check_e2e_scenarios.py`),
 `cargo test`, and the four required `prism-native-postgres` shards against a
 `postgres:16` service and the pinned regtest `qbitd`. The
@@ -291,9 +293,13 @@ yours is.
 
 To reproduce the other jobs:
 
-- **A gated or live test.** Run it the way the workflow does:
-  `PRISM_TEST_DATABASE_URL=… PRISM_TEST_PG_BIN_DIR=… PRISM_TEST_REQUIRE_INTEGRATION=1 cargo test -p qbit-prism-server --test live_regtest -- --ignored --exact <id>`.
-  Leave out `--ignored` for an id from the PR list.
+- **A gated or live test.** An id in the gated lists is
+  `<package>::<binary>::<test path>`. Split it the way the workflow does, and
+  pass only the test path to the filter:
+  `PRISM_TEST_DATABASE_URL=… PRISM_TEST_PG_BIN_DIR=… PRISM_TEST_REQUIRE_INTEGRATION=1 cargo test -p <package> --test <binary> -- --ignored --exact <test path>`.
+  Leave out `--ignored` for an id from `test/prism-gated-tests.txt`. Check
+  that the output says `1 passed`: a filter that matches nothing also exits
+  0.
 - **L6.** Run
   `python3 scripts/prism_shipped_image_lane.py prepare|build|run --work DIR [--out OUT]`,
   in that order. The script's docstring lists what it needs.
