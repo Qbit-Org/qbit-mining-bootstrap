@@ -656,6 +656,10 @@ pub const PINNED_REPORT_FIELDS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The PostgreSQL settings a durable commit needs, as `database.durability`
+/// reports them: every one must read `on`.
+const DURABILITY_SETTINGS: [&str; 3] = ["fsync", "full_page_writes", "synchronous_commit"];
+
 /// How far a counted run's seeded shares may sit, on average, from the
 /// pinned `--seed-share-bytes`, as a fraction of it: the seed plan pads its
 /// first share to the target exactly, and later shares' ids run a few digits
@@ -1701,7 +1705,9 @@ pub fn compare(
             findings.push(why);
         }
     }
-    // The database the run used: managed unless the preset names one, with
+    // The database the run used: durable (the harness refuses to load a
+    // cluster without all three settings on, and reports them), managed
+    // unless the preset names one, with
     // the observed replication agreeing with the declared one at entry and
     // after the load, each observation reported (the premise's `agreed`
     // skips one that was never made), and one launched frontend per pinned
@@ -1726,6 +1732,11 @@ pub fn compare(
                 .and_then(|block| block[key].as_str())
         };
         let declared = replication("declared");
+        let durability = |key: &str| {
+            report
+                .and_then(|r| r.pointer("/database/durability"))
+                .and_then(|block| block[key].as_str())
+        };
         let launched = report
             .and_then(|r| r["frontend_environment"].as_array())
             .map(|f| f.len() as u64);
@@ -1745,6 +1756,18 @@ pub fn compare(
             Some(format!(
                 "ran against a {} database, not the {mode} one the preset asks for",
                 reported_mode.unwrap_or("unreported")
+            ))
+        } else if DURABILITY_SETTINGS
+            .iter()
+            .any(|key| durability(key) != Some("on"))
+        {
+            Some(format!(
+                "ran with PostgreSQL {}, not every durability setting on",
+                DURABILITY_SETTINGS
+                    .iter()
+                    .map(|key| format!("{key}={}", durability(key).unwrap_or("unreported")))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ))
         } else if agreed != Some(true) {
             Some("does not report its observed replication agreeing with the declared one".into())
@@ -2319,6 +2342,67 @@ pub fn compare(
                     }
                 ));
                 break;
+            }
+        }
+    }
+    // The template bits the fake node served after every tip: the pinned
+    // `--template-bits`, retargeted by height under `--retarget-bits`, as
+    // `NodeState::template_bits` serves them (`node::retarget_bits`).
+    // `node.retarget_bits` alone only echoes the flag. A real node serves
+    // its own chain's bits, which its reconciliation holds. A build older
+    // than either flag reports no per-tip bits and is exempt.
+    if pinned
+        .get("--node")
+        .and_then(Value::as_str)
+        .unwrap_or("fake")
+        == "fake"
+    {
+        let base = format!("{:08x}", args.template_bits()?);
+        let served_after = |height: u64| -> Result<String> {
+            if args.retarget_bits {
+                crate::node::retarget_bits(&base, height + 1)
+            } else {
+                Ok(base.clone())
+            }
+        };
+        'bits: for run in runs.iter().filter(|r| r.excluded.is_none()) {
+            if ["--template-bits", "--retarget-bits"]
+                .iter()
+                .any(|flag| predates(manifest, run, flag))
+            {
+                continue;
+            }
+            let changes = run
+                .report
+                .as_ref()
+                .and_then(|r| r.pointer("/node/tip_changes"))
+                .and_then(Value::as_array)
+                .filter(|changes| !changes.is_empty());
+            let Some(changes) = changes else {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} reports no tip changes, so \
+                     the template bits it served cannot be checked",
+                    run.run.id
+                ));
+                break;
+            };
+            for change in changes {
+                let served = change["next_template_bits"].as_str();
+                let wanted = change["height"].as_u64().map(served_after).transpose()?;
+                if served.is_none() || served != wanted.as_deref() {
+                    passed = false;
+                    findings.push(format!(
+                        "**the runs did not drive the pinned workload**: {} served template bits \
+                         {} after the tip at height {}, not the {} the pinned `--template-bits` \
+                         and `--retarget-bits` call for",
+                        run.run.id,
+                        served.unwrap_or("unreported"),
+                        change["height"],
+                        wanted.as_deref().unwrap_or("unknown")
+                    ));
+                    break 'bits;
+                }
             }
         }
     }

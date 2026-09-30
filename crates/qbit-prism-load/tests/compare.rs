@@ -101,7 +101,22 @@ fn report(commit: &str, steady: Value, burst: Value) -> Value {
     for (pointer, value) in compare::expected_population(&d1_args()).unwrap() {
         set_pointer(&mut report, pointer, json!(value));
     }
+    // The fake node's tips, each followed by the pinned bits.
+    report["node"]["tip_changes"] = json!([
+        {"height": 100, "origin": "bootstrap", "next_template_bits": template_bits(&d1_args(), 101)},
+        {"height": 101, "origin": "external", "next_template_bits": template_bits(&d1_args(), 102)},
+    ]);
     report
+}
+
+/// The bits `pinned`'s fake node serves at `height`.
+fn template_bits(pinned: &std::collections::BTreeMap<String, Value>, height: u64) -> String {
+    let base = pinned["--template-bits"].as_str().unwrap().to_owned();
+    if pinned["--retarget-bits"] == true {
+        qbit_prism_load::node::retarget_bits(&base, height).unwrap()
+    } else {
+        base
+    }
 }
 
 /// Set `pointer` in `target`, creating objects on the way; a numeric key
@@ -165,7 +180,9 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
             {"all_sessions_milliseconds": 700.0},
             {"all_sessions_milliseconds": 800.0},
         ]},
-        "database": {"mode": "managed", "replication": {
+        "database": {"mode": "managed",
+            "durability": {"fsync": "on", "full_page_writes": "on", "synchronous_commit": "on"},
+            "replication": {
             "declared": "async",
             "observed": "async",
             "observed_after_load": "async",
@@ -916,6 +933,43 @@ fn an_external_database_other_than_the_pinned_url_fails() {
 }
 
 #[test]
+fn a_fake_node_serving_other_bits_than_pinned_fails() {
+    let manifest = manifest(288.0);
+    // Under `--retarget-bits` every tip is followed by its height's bits.
+    let mut pinned = d1_args();
+    pinned.insert("--retarget-bits".into(), json!(true));
+    let served = |bits: &dyn Fn(u64) -> String| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            report["node"]["retarget_bits"] = json!(true);
+            report["node"]["tip_changes"] = json!([
+                {"height": 100, "next_template_bits": bits(101)},
+                {"height": 101, "next_template_bits": bits(102)},
+            ]);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = served(&|height| template_bits(&pinned, height));
+    assert!(
+        !result
+            .markdown
+            .contains("the pinned `--template-bits` and `--retarget-bits` call for"),
+        "{}",
+        result.markdown
+    );
+    // The retarget marker on, the constant base bits served.
+    let base = pinned["--template-bits"].as_str().unwrap().to_owned();
+    let result = served(&|_| base.clone());
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains("after the tip at height 100"),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
 fn fewer_completed_reconnects_than_pinned_fails() {
     let manifest = manifest(288.0);
     let with_reconnects = |completed: u64| {
@@ -1231,6 +1285,11 @@ fn another_database_or_fewer_launched_frontends_than_pinned_fails() {
             "/database/replication/observed",
             json!("none"),
             "observed replication none at entry",
+        ),
+        (
+            "/database/durability/fsync",
+            json!("off"),
+            "ran with PostgreSQL fsync=off full_page_writes=on synchronous_commit=on",
         ),
         ("/frontend_environment", json!([]), "launched 0 frontends"),
         (

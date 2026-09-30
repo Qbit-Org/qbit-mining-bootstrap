@@ -163,7 +163,8 @@ each launched frontend by the harness's name for it, the seeded ledger's rows
 average share size, a connection for every pinned session, an external database's endpoint and
 connection options,
 the completed reconnects,
-the memory floor (every check of it read), and the samplers, each sampling at its pinned interval on
+the memory floor (every check of it read), a durable database, the
+template bits the fake node served after every tip, and the samplers, each sampling at its pinned interval on
 every launched frontend.
 
 **The verdict is PASS** when the candidate meets the rule in every gated

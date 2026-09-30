@@ -414,6 +414,32 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             .map(run::frontend_instance_id)
             .collect::<Vec<_>>()
     );
+    // Durable, and every tip followed by the bits the pinned template and
+    // retarget settings call for.
+    for key in ["fsync", "full_page_writes", "synchronous_commit"] {
+        assert_eq!(report["database"]["durability"][key], "on", "{key}");
+    }
+    let base = loaded.args["--template-bits"]
+        .as_str()
+        .context("template bits")?
+        .to_owned();
+    let retarget = loaded.args["--retarget-bits"] == true;
+    for change in report["node"]["tip_changes"]
+        .as_array()
+        .context("tip changes")?
+    {
+        let height = change["height"].as_u64().context("height")?;
+        let wanted = if retarget {
+            qbit_prism_load::node::retarget_bits(&base, height + 1)?
+        } else {
+            base.clone()
+        };
+        assert_eq!(
+            change["next_template_bits"].as_str(),
+            Some(wanted.as_str()),
+            "{change}"
+        );
+    }
     // Every pinned session connected at least once.
     assert!(
         report["client"]["connects"].as_u64()
