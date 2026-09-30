@@ -277,6 +277,7 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
         "epoch",
         "cached-refresh",
         "superseding-publication",
+        "balances-publication",
     ] {
         let f = Fixture::build(
             Duration::from_secs(10),
@@ -323,7 +324,10 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
                 f.detect(1).await;
                 f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
             }
-            "cached-refresh" | "superseding-publication" => {
+            "cached-refresh" | "superseding-publication" | "balances-publication" => {
+                if changed == "balances-publication" {
+                    change_balances(&f);
+                }
                 for _ in 0..2 {
                     tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
                         .await
@@ -333,11 +337,9 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
             }
             _ => {}
         }
+        let republished = matches!(changed, "superseding-publication" | "balances-publication");
         let current = f.coordinator.prepared.read().await.clone().unwrap();
-        assert_eq!(
-            Arc::ptr_eq(&current, &original),
-            changed != "superseding-publication"
-        );
+        assert_eq!(Arc::ptr_eq(&current, &original), !republished);
         assert_eq!(f.store.revision.load(Ordering::SeqCst), revision);
         assert_eq!(
             f.coordinator.readiness.read().await.generation != epoch,
@@ -345,12 +347,18 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
         );
         assert_eq!(
             f.coordinator.observed_tip.read().await.publication_stamp() != publication,
-            changed == "superseding-publication"
+            republished
         );
         let result = tokio::time::timeout(Duration::from_secs(5), persist(&f, &job))
             .await
             .unwrap();
-        let allowed = matches!(changed, "unchanged" | "cached-refresh");
+        // A same-tip republication that kept the parent, revision, prior
+        // balances and fee no longer revokes fresh work (#598); one that
+        // changed the prior balances still does.
+        let allowed = matches!(
+            changed,
+            "unchanged" | "cached-refresh" | "superseding-publication"
+        );
         assert_eq!(result.is_ok(), allowed, "{changed}");
         assert_eq!(
             f.store.jobs.lock().unwrap().contains_key(&job.wire.job_id),
@@ -376,11 +384,12 @@ async fn actual_build_to_persist_handoff_keeps_original_issuance_authority() {
 #[tokio::test]
 async fn ordinary_issuance_waits_distinguish_cached_refresh_from_superseding_publication() {
     for operation in ["issue", "persist", "resume"] {
-        for superseding in [false, true] {
+        for replacement in [None, Some("reanchor"), Some("balances")] {
+            let superseding = replacement.is_some();
             let f = Fixture::build(
                 Duration::from_secs(10),
                 |config| {
-                    if superseding {
+                    if replacement == Some("reanchor") {
                         config.snapshot_interval = Duration::ZERO;
                     }
                 },
@@ -423,6 +432,9 @@ async fn ordinary_issuance_waits_distinguish_cached_refresh_from_superseding_pub
             tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
                 .await
                 .unwrap();
+            if replacement == Some("balances") {
+                change_balances(&f);
+            }
             for _ in 0..2 {
                 tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
                     .await
@@ -441,10 +453,15 @@ async fn ordinary_issuance_waits_distinguish_cached_refresh_from_superseding_pub
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(
-                admitted, !superseding,
-                "{operation}, superseding={superseding}"
-            );
+            // Fresh work survives a same-tip republication that kept its
+            // parent, revision, prior balances and fee (#598); resumed work
+            // keeps the exact publication.
+            let expected = match replacement {
+                None => true,
+                Some("reanchor") => operation != "resume",
+                _ => false,
+            };
+            assert_eq!(admitted, expected, "{operation}, {replacement:?}");
             assert_eq!(
                 f.coordinator.observed_tip.read().await.publication_stamp() == stamp,
                 !superseding
