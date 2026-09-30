@@ -25,6 +25,17 @@ class CheckedInPresets(unittest.TestCase):
         self.assertNotIn("mainnet-shape-2600-addresses", names)
         self.assertNotIn("pr-smoke", names)
 
+    def test_the_weekly_schedule_runs_only_the_long_soak(self) -> None:
+        entries = matrix.select(self.presets, "weekly")
+        self.assertEqual([entry["preset"] for entry in entries], ["soak-weekly"])
+        # Under the six-hour job limit, with the soak's own minutes inside it.
+        [entry] = entries
+        self.assertLess(entry["timeout_minutes"], 360)
+        self.assertLess(self.presets["soak-weekly"]["soak"]["minutes"], entry["timeout_minutes"])
+        nightly = [entry["preset"] for entry in matrix.select(self.presets, "nightly")]
+        self.assertNotIn("soak-weekly", nightly)
+        self.assertNotIn("soak-weekly", [entry["preset"] for entry in matrix.select(self.presets, "all")])
+
     def test_all_adds_the_manual_presets(self) -> None:
         names = [entry["preset"] for entry in matrix.select(self.presets, "all")]
         self.assertIn("mainnet-shape-2600-addresses", names)

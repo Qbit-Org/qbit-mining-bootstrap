@@ -10,6 +10,12 @@ publish = false
 description = "Native multi-instance Stratum, accounting, and audit server for PRISM"
 default-run = "qbit-prism-server"
 
+[features]
+# Test-only (#575): retain 16 KiB per accepted share, to show the load
+# harness's soak fails its resident-memory gate on a leak. Never enabled by
+# any build or image of this repository.
+soak-leak-mutant = []
+
 [dependencies]
 qbit-prism = { path = "../qbit-prism" }
 qbit-pool-builder = { path = "../qbit-pool-builder" }

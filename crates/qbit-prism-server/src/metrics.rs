@@ -122,6 +122,7 @@ impl Metrics {
             Family::CandidateLandingFailedAge,
             Family::PartitionLead,
             Family::Rss,
+            Family::OpenFds,
             Family::ConnectionLimit,
             Family::CarryForwardDebt,
             Family::NodePeers,

@@ -530,10 +530,17 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
             population.mean_offered_multiplier(),
         )
         .map_err(|error| error.context(format!("preset {}", loaded.name)))?;
-        cli::phases(&args)?;
         assert!(loaded.runner.starts_with("blacksmith-"), "{}", loaded.name);
-        // A gated phase is one the preset's plan drives.
-        let driven: Vec<String> = cli::phases(&args)?.into_iter().map(|p| p.name).collect();
+        // A gated phase is one the preset's plan drives; a soak's phases are
+        // its looped presets', planned from its soak block (#575).
+        let driven: Vec<String> = match &loaded.soak {
+            Some(_) => qbit_prism_load::soak_driver::plan(&args, loaded)?
+                .phases
+                .into_iter()
+                .map(|p| p.plan.name)
+                .collect(),
+            None => cli::phases(&args)?.into_iter().map(|p| p.name).collect(),
+        };
         for phase in loaded.gates.phases.iter().flatten() {
             assert!(
                 driven.contains(phase),
@@ -559,6 +566,8 @@ fn realism_presets_run_mainnets_fee_and_legacy_ones_do_not() -> Result<()> {
             "mainnet-shape-650-addresses",
             "mainnet-shape-2600-addresses",
             "rental-churn-bursts-and-storms",
+            "soak-weekly",
+            "soak-short",
         ]
         .contains(&loaded.name.as_str());
         assert_eq!(

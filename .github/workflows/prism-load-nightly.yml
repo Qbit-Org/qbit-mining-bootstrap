@@ -36,6 +36,24 @@ name: PRISM load harness (nightly)
 # mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
 # nightly jobs keep their own schedule.
 #
+# #575 item 2: the long soak has a third schedule, Saturday 05:41 UTC, whose
+# plan selects `weekly`: the soak-weekly preset, one server lifetime of about
+# 5.5 h looping the mainnet-shape-130-addresses, rental-churn-bursts-and-storms
+# and tip-delivery workloads, with forced share-partition rollovers and the
+# share-archive retention cycle under the load, sampled every minute and gated
+# on RSS and descriptor trends, connection drift, bounded WAL, zero lost
+# shares and exact reconciliation (docs/prism-soak.md). The preset's timeout
+# is 355 min, under the 6 h job limit. It has its own concurrency group, so it
+# never holds the nightly queue; neither live job nor the fuzzing runs on its
+# schedule. #549's guard never skips it: the soak measures drift over a week
+# of commits and its bounds are still being calibrated, so a second lifetime
+# on an unchanged commit is evidence, not waste, and the commit the guard
+# compares against is the one the nightly presets tested, not the soak. A
+# failed soak opens or updates the failure issue like any scheduled run. Cost:
+# one 8 vCPU runner for about 5 h 40 min plus the shared release build, about
+# 350 runner-minutes a week, about $5.60 at $0.016 per 8 vCPU minute.
+# `preset: soak-weekly` (or `weekly`) dispatches it by hand.
+#
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
 #
@@ -49,8 +67,8 @@ name: PRISM load harness (nightly)
 #     commit the last scheduled nightly tested, and cancels the run so the
 #     skip shows as cancelled, never as passed. A nightly records the commit
 #     it tested in its `prism-load-tested-commit` artifact once every preset
-#     reached its gate, pass or fail. The weekly schedule and dispatches
-#     are never skipped.
+#     reached its gate, pass or fail. Neither weekly schedule (the Sunday
+#     live scenarios, the Saturday soak) nor a dispatch is ever skipped.
 #   - Each preset's artifact carries host.json (runner label, filesystem mount
 #     options, block device write cache and FUA) and is kept for 90 days
 #     (#487 decision 3).
@@ -63,6 +81,10 @@ on:
     - cron: "17 2 * * *"
     # Weekly, on Sunday. The jobs' `if` conditions compare against both crons.
     - cron: "43 3 * * 0"
+    # The weekly soak (#575), on Saturday: the plan, build and run jobs, with
+    # the plan selecting `weekly` by this exact string; the guard lets it
+    # through and the report job reports a failure.
+    - cron: "41 5 * * 6"
   pull_request:
     types: [labeled]
   workflow_dispatch:
@@ -71,7 +93,8 @@ on:
         description: >-
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
-          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async).
+          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async),
+          `weekly` for the 5.5 h soak (soak-weekly).
         required: true
         default: nightly
       ref:
@@ -117,17 +140,24 @@ on:
 permissions:
   contents: read
 
-# A labelled PR run gets a group per PR and label, so it never waits on or
-# cancels a nightly, and another label's (empty) run never cancels a pending
-# run-load run.
+# The weekly soak holds its runner for most of six hours, so it queues only
+# behind another soak, never in front of a nightly. A labelled PR run gets a
+# group per PR and label, so it never waits on or cancels a nightly or a soak,
+# and another label's (empty) run never cancels a pending run-load run.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('prism-load-pr-{0}-{1}', github.event.pull_request.number, github.event.label.name) || 'prism-load-nightly' }}
+  group: >-
+    ${{ github.event_name == 'pull_request'
+    && format('prism-load-pr-{0}-{1}', github.event.pull_request.number, github.event.label.name)
+    || format('prism-load-{0}', (github.event.schedule == '41 5 * * 6'
+    || contains(inputs.preset || '', 'soak-weekly')
+    || inputs.preset == 'weekly') && 'soak' || 'nightly') }}
   cancel-in-progress: false
 
 jobs:
   # Every job but live-weekly and report needs this one, so on a PR it is
   # the one place the label is checked, and on the nightly schedule it is the
-  # P4 cost lever: nothing starts when 3.x.x has not moved.
+  # P4 cost lever: nothing starts when 3.x.x has not moved. Only the nightly
+  # cron compares; the Saturday soak (#575) passes straight through.
   guard:
     name: Skip an unchanged night
     if: >-
@@ -214,7 +244,7 @@ jobs:
       - name: Select presets and pin the commit
         id: plan
         env:
-          SELECTION: ${{ inputs.preset || 'nightly' }}
+          SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') || 'nightly' }}
         run: |
           set -euo pipefail
           matrix="$(python3 scripts/prism_load_matrix.py "${SELECTION}")"
@@ -417,13 +447,25 @@ jobs:
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      # Each <package>::<binary> in the list runs once with its own ids
+      # (qbit-prism-server::live_regtest and #575's qbit-prism-load::soak_smoke
+      # today). Every binary runs even if an earlier one failed; the step
+      # fails if any did.
       - name: Run the listed variants
         run: |
           set -euo pipefail
-          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt \
-            | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
-          cargo test --locked -p qbit-prism-server --test live_regtest -- \
-            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+          mapfile -t ids < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt | grep -v '^$')
+          : > "${PRISM_TEST_LOG}"
+          failed=0
+          for target in $(printf '%s\n' "${ids[@]}" | awk -F'::' '{print $1 "::" $2}' | sort -u); do
+            package="${target%%::*}"
+            binary="${target#*::}"
+            mapfile -t tests < <(printf '%s\n' "${ids[@]}" | grep "^${target}::" | sed "s/^${target}:://")
+            cargo test --locked -p "${package}" --test "${binary}" -- \
+              --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee -a "${PRISM_TEST_LOG}" \
+              || failed=1
+          done
+          exit "${failed}"
       - name: Prove every listed variant executed
         run: |
           python3 scripts/check_gate_manifest.py \
@@ -572,9 +614,9 @@ jobs:
 
   # #549: what a scheduled run leaves behind. The nightly records the commit
   # its presets ran to a verdict on, for the guard's next comparison, and any
-  # failed scheduled run, nightly or weekly, opens or updates the one open
-  # `prism-load-nightly-failure` issue. A cancelled run (a skipped night)
-  # does neither.
+  # failed scheduled run, nightly, weekly or the Saturday soak, opens or
+  # updates the one open `prism-load-nightly-failure` issue. A cancelled run
+  # (a skipped night) does neither. The soak never records a tested commit.
   report:
     name: Record the tested commit and report a failure
     needs: [guard, plan, build, run, live-nightly, live-weekly, stratum-fuzz]
@@ -629,7 +671,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SCHEDULE: ${{ github.event.schedule == '43 3 * * 0' && 'weekly' || 'nightly' }}
+          SCHEDULE: >-
+            ${{ github.event.schedule == '43 3 * * 0' && 'weekly'
+            || github.event.schedule == '41 5 * * 6' && 'weekly soak'
+            || 'nightly' }}
           SHA: ${{ needs.plan.outputs.sha }}
           RESULTS: ${{ toJSON(needs) }}
         run: |

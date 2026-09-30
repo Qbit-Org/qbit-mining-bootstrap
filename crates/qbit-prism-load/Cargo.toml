@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "qbit-prism-load-gate"
 path = "src/gate_main.rs"
 
+[[bin]]
+name = "qbit-prism-soak-report"
+path = "src/soak_report_main.rs"
+
 [dependencies]
 qbit-prism = { path = "../qbit-prism" }
 qbit-prism-server = { path = "../qbit-prism-server" }
@@ -27,7 +31,7 @@ qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
 anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 libc = "0.2"
 num-bigint = { version = "0.4", features = ["serde"] }

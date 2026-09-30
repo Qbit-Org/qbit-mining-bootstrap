@@ -380,7 +380,11 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
 /// Every churn tip's slowest served session among those connected at the
 /// tip, or why a tip has none.
 pub fn churn_tip_last_notify(report: &Value) -> Result<Vec<f64>, String> {
-    let churn = &report["churn"];
+    churn_section_tip_last_notify(&report["churn"])
+}
+
+/// [`churn_tip_last_notify`] over one churn section.
+fn churn_section_tip_last_notify(churn: &Value) -> Result<Vec<f64>, String> {
     if churn["ran"] != true {
         return Err(format!(
             "the churn phase did not run: {}",
@@ -412,18 +416,31 @@ pub fn churn_tip_last_notify(report: &Value) -> Result<Vec<f64>, String> {
 }
 
 fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
-    let churn = &report["churn"];
+    churn_section_checks(&report["churn"], "churn", budgets, checks);
+    // A soak drives a churn phase every cycle (#575); the section above is
+    // the first, and each of them is held to the same budgets.
+    for phase in report["soak"]["churn_phases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let label = format!("{}: churn", phase["phase"].as_str().unwrap_or("?"));
+        churn_section_checks(&phase["report"], &label, budgets, checks);
+    }
+}
+
+fn churn_section_checks(churn: &Value, label: &str, budgets: &Budgets, checks: &mut Vec<Check>) {
     if churn["ran"] != true
         && budgets.churn_tip_last_notify_p99_ms.is_none()
         && budgets.new_session_first_job_p99_ms.is_none()
     {
         return;
     }
-    let name = "churn: tip to last notify, sessions connected at the tip, p99 over tips";
+    let name = format!("{label}: tip to last notify, sessions connected at the tip, p99 over tips");
     let budget = budgets
         .churn_tip_last_notify_p99_ms
         .map_or("not gated".into(), |ms| format!("<= {ms} ms"));
-    let (observed, pass) = match churn_tip_last_notify(report) {
+    let (observed, pass) = match churn_section_tip_last_notify(churn) {
         Ok(times) => {
             let p99 = nearest_rank(&times, 0.99);
             (
@@ -459,7 +476,7 @@ fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
                 .unwrap_or("the churn phase did not run")
         ),
     };
-    let name = "churn: new session time to first job, p99";
+    let name = format!("{label}: new session time to first job, p99");
     checks.push(match budgets.new_session_first_job_p99_ms {
         Some(limit) => Check::gate(
             name,
@@ -472,7 +489,7 @@ fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
     let realised = &churn["realised"];
     if churn["ran"] == true {
         checks.push(Check::info(
-            "churn: connects/s max, concurrent sessions min-max, storms, rentals",
+            format!("{label}: connects/s max, concurrent sessions min-max, storms, rentals"),
             format!(
                 "{} / {}-{} / {} / {} spawned, {} departed",
                 realised["connects_per_second_max"],

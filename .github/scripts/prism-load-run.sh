@@ -21,10 +21,12 @@
 #   pg_test_fsync.txt        the WAL volume's commit cost, on the filesystem
 #                            the harness builds its cluster on
 #   harness-exit-code        the harness's exit code
-#   gate.md                  the gate's verdict table
+#   gate.md                  the gate's verdict table (a soak preset's soak
+#                            gates included)
 #   gate-exit-code           the gate's exit code: 0 or 1 is a verdict, anything
 #                            else (2, a panic, a binary that would not start) is not
-#   everything the harness writes (load-harness-report.json, logs/, ...)
+#   everything the harness writes (load-harness-report.json, logs/, and for
+#   a soak preset soak-samples.jsonl, soak-events.jsonl, soak-report.md)
 #
 # Optional overrides of the preset's gates: PRISM_LOAD_MAX_SHORTFALL and
 # PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS (empty keeps the preset's). The
@@ -100,6 +102,14 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
     cat "${out}/gate.md"
     echo
+    if [[ -f "${out}/soak-report.md" ]]; then
+      echo "<details><summary>soak samples</summary>"
+      echo
+      sed -n '/^#### Samples/,$p' "${out}/soak-report.md"
+      echo
+      echo "</details>"
+      echo
+    fi
     echo "<details><summary>Host</summary>"
     echo
     echo '```json'

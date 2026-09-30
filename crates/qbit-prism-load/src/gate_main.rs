@@ -65,8 +65,21 @@ fn run(args: &GateArgs) -> anyhow::Result<bool> {
         .with_context(|| format!("reading {}", args.report.display()))?;
     let report: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parsing {}", args.report.display()))?;
-    let checks = gate::evaluate(&report, args.exit_code, &budgets);
+    let mut checks = gate::evaluate(&report, args.exit_code, &budgets);
     let mut table = gate::markdown(&format!("qbit-prism-load `{}`", preset.name), &checks);
+    // A soak preset is also held to its soak gates, over the samples beside
+    // the report (#575).
+    if let Some(spec) = &preset.soak {
+        let dir = args
+            .report
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let title = format!("qbit-prism-load soak `{}`", preset.name);
+        let soak_checks = qbit_prism_load::soak::gate_harness_run(&report, &dir, spec, &title);
+        table.push_str(&format!("\n{}", gate::markdown(&title, &soak_checks)));
+        checks.extend(soak_checks);
+    }
     if budgets.d1_verdict_table {
         table.push_str(&format!(
             "\n#### D1 verdict in #473's format\n\n{}",

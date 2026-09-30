@@ -119,7 +119,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
 | `--window-shares` | 20000 | Shares pre-seeded into the payout window |
 | `--seed-share-bytes` | 581 | Serialized size of one seeded share |
-| `--plan` | `short` | `d1`, `short`, or `tips`: warm-up only, where the external tips are minted, with no artifact phase and so no artifact (the per-PR smoke run's plan; see [Presets and the nightly run](#presets-and-the-nightly-run)) |
+| `--plan` | `short` | `d1`, `short`, or `tips`: warm-up only, where the external tips are minted, with no artifact phase and so no artifact (the per-PR smoke run's plan; see [Presets and the nightly run](#presets-and-the-nightly-run)); or `soak`, a soak preset's looped workloads over one server lifetime (see [Long soak](#long-soak-575)) |
 | `--rate` | 50 | Offered shares per second for the `short` plan |
 | `--max-outstanding-per-session` | 1 | The server answers one request per session at a time |
 | `--warmup-seconds` | 30 | Warm-up before the first artifact phase; not in the artifact |
@@ -809,6 +809,9 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 | `real-node-smoke` | every PR | 2 vCPU | the per-PR real-node smoke run: [Real-node mode](#real-node-mode-547) |
 | `short-plan-real-node`, `short-plan-fake-node` | nightly | 8 vCPU | the bridging pair (#552): the same short plan on the real and the fake node, differing only in `--node` |
+| `soak-weekly` | weekly | 8 vCPU | the 5.5 h long soak; see [Long soak](#long-soak-575) |
+| `soak-short` | manual | 8 vCPU | a 19 min soak of the same cluster without block landings; the run the leak mutant must fail |
+| `soak-smoke` | manual | 2 vCPU | the soak smoke, run nightly by the opt-in gated test `tests/soak_smoke.rs` |
 
 The names say what a preset measures. The names they replaced (`d1-20k`,
 `d1-20k-realistic`, `tip-275`, `tip-275-realistic`, `d1-473-*`,
@@ -864,9 +867,10 @@ applied again.
 The nightly schedule skips a night when `3.x.x`'s head is the commit the last
 scheduled nightly tested (recorded in its `prism-load-tested-commit`
 artifact once every preset reached its gate); the skipped run is cancelled so
-it never shows as a pass. The weekly schedule and dispatches always run. A
-failed scheduled run, nightly or weekly, opens the `prism-load-nightly-failure`
-issue, or comments on it while it is open.
+it never shows as a pass. Both weekly schedules (Sunday's live scenarios,
+Saturday's soak) and dispatches always run. A failed scheduled run, nightly,
+weekly or the soak, opens the `prism-load-nightly-failure` issue, or comments
+on it while it is open.
 
 `.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
 schedule) measures the Blacksmith runner classes themselves before a lane
@@ -901,6 +905,20 @@ bursts of 20 and 40, abrupt departures, a 30% storm and 2 tips) held to its
 gates, every session served on every tip within 5 s. It builds the debug
 server itself and adds about a minute and a half to its CI shard (22 s to
 build the server beside the test's own build, 71 s to run).
+
+## Long soak (#575)
+
+`--plan soak` runs a soak preset: one server lifetime, looping the workloads
+of the presets its `soak` block names over its own cluster and population,
+with no frontend restarted, the share ledger rolled into new partitions and
+the operator's `share-archive` retention run under the load, a sample of
+every frontend's resident memory and descriptors and of the database's
+connections, WAL, partitions and relation sizes every `sample_seconds`, and
+the dropped partitions restored from their archives for the final
+reconciliation. `qbit-prism-load-gate` holds the samples to the preset's
+soak gates beside its usual ones, and `qbit-prism-soak-report` holds a live
+deployment's hourly samples to the same gates. [docs/prism-soak.md](../../docs/prism-soak.md)
+has the gates, the presets, the weekly job and the testnet4 procedure.
 
 ## Exit codes
 

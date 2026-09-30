@@ -513,6 +513,11 @@ impl ChurnDriver {
         &self.template
     }
 
+    /// The churn flags this driver was planned from.
+    pub fn spec(&self) -> &ChurnSpec {
+        &self.spec
+    }
+
     /// The session index of rental `k`.
     pub fn session_index(&self, rental: usize) -> usize {
         self.first_index + rental

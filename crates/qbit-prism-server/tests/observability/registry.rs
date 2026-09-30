@@ -417,6 +417,33 @@ async fn process_collector_reads_real_input_and_distinguishes_failure_from_zero(
         sample(&moved, "qbit_prism_process_resident_memory_bytes"),
         4_194_304.
     );
+    assert_eq!(sample(&zero, "qbit_prism_process_open_fds"), 0.);
+    assert_eq!(sample(&moved, "qbit_prism_process_open_fds"), 1.);
+    // An unreadable descriptor directory leaves the resident set published
+    // and the descriptor count unknown, never zero (#575).
+    std::fs::rename(
+        directory.path().join("fd"),
+        directory.path().join("fd.gone"),
+    )
+    .unwrap();
+    publish();
+    let no_fds = scrape(&state).await;
+    assert_eq!(
+        sample(&no_fds, "qbit_prism_process_resident_memory_bytes"),
+        4_194_304.
+    );
+    assert_eq!(sample(&no_fds, "qbit_prism_process_open_fds"), -1.);
+    // Readable again, then a failed collection: both gauges go unknown.
+    std::fs::rename(
+        directory.path().join("fd.gone"),
+        directory.path().join("fd"),
+    )
+    .unwrap();
+    publish();
+    assert_eq!(
+        sample(&scrape(&state).await, "qbit_prism_process_open_fds"),
+        1.
+    );
     std::fs::write(
         directory.path().join("status"),
         "VmRSS:\tbad kB\nThreads:\t3\n",
@@ -428,6 +455,7 @@ async fn process_collector_reads_real_input_and_distinguishes_failure_from_zero(
         sample(&failed, "qbit_prism_process_resident_memory_bytes"),
         -1.
     );
+    assert_eq!(sample(&failed, "qbit_prism_process_open_fds"), -1.);
     assert_eq!(
         sample(
             &failed,

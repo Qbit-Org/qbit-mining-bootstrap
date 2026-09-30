@@ -1577,6 +1577,8 @@ async fn request<B: MiningBackend>(
                     .fetch_add(1, Ordering::Relaxed);
                 result(writer, id.clone(), json!(true), config).await?;
                 share_observation.acknowledged(crate::metrics::AckResult::Accepted);
+                #[cfg(feature = "soak-leak-mutant")]
+                soak_leak_mutant::retain();
                 if session
                     .jobs
                     .back()
@@ -1855,3 +1857,21 @@ pub async fn probe_first_difficulty(
 
 #[cfg(test)]
 mod stale_grace_tests;
+
+/// Test-only (#575): keeps 16 KiB per accepted share for the life of the
+/// process, so the load harness's soak can be shown to fail its resident
+/// memory gate within a short run. Compiled only with the `soak-leak-mutant`
+/// feature, which no build of this repository enables.
+#[cfg(feature = "soak-leak-mutant")]
+mod soak_leak_mutant {
+    static RETAINED: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn retain() {
+        // Written, not merely allocated, so the pages are resident.
+        let block = vec![0x5a_u8; 16 * 1024];
+        RETAINED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(block);
+    }
+}

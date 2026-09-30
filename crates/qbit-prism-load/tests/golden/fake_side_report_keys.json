@@ -42,6 +42,7 @@
     "run_id",
     "run_tag",
     "schema",
+    "soak",
     "stale_outputs_removed",
     "started_at",
     "time_to_usable_work",

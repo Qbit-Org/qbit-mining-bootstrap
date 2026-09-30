@@ -884,6 +884,17 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
             }
         }
     };
+    // A soak is planned in full, every looped preset read and validated over
+    // the soak preset, before anything is created (EP-VALIDATION).
+    let soak = match args.plan()? {
+        crate::cli::Plan::Soak => Some(crate::soak_driver::plan(
+            &args,
+            preset
+                .as_ref()
+                .context("--plan soak runs from a soak preset (--preset)")?,
+        )?),
+        _ => None,
+    };
     // A memory floor the host cannot measure is refused before anything is
     // created, rather than skipped once a second for the whole run (#485).
     measure::verify_memory_floor(args.min_mem_available_mib, measure::mem_available_kib())?;
@@ -1093,6 +1104,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
                 .as_ref()
                 .and_then(|m| m.pg_stat_statements.clone())
                 .unwrap_or_else(|| "unknown (external database)".into()),
+            soak,
         },
     )
     .await;
@@ -1188,6 +1200,8 @@ struct RunContext {
     declared_replication: Replication,
     managed_standby: Option<String>,
     pg_stat_statements: String,
+    /// `--plan soak`'s phases and spec (#575).
+    soak: Option<crate::soak_driver::SoakPlan>,
 }
 
 async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
@@ -1317,13 +1331,21 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             stratum_port: free_port()?,
             audit_port: free_port()?,
         };
-        let environment = launch_environment(
+        let mut environment = launch_environment(
             &shared_env,
             &spec,
             args.pool_fee_bps,
             &ctx.pool_fee_address,
             args.node_mode()?,
         );
+        if let Some(soak) = &ctx.soak {
+            // An existing setting, shortened so the lead partition a
+            // rollover consumed is replaced within seconds (#575).
+            environment.insert(
+                "PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS".into(),
+                soak.spec.partition_ensure_interval_seconds.to_string(),
+            );
+        }
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
         // Frontend 1 first: concurrent first-boot migrations wait inside a
         // transaction bounded by the 5 s lock_timeout.
@@ -1525,14 +1547,68 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     }
 
     // --- phases -----------------------------------------------------------
-    let plans = phases(args)?;
+    // Outside a soak every phase runs with the run's own arguments; a soak's
+    // phases each carry their looped preset's workload.
+    let plans: Vec<(PhasePlan, Option<Arc<Args>>)> = match &ctx.soak {
+        Some(soak) => soak
+            .phases
+            .iter()
+            .map(|phase| (phase.plan.clone(), Some(phase.args.clone())))
+            .collect(),
+        None => phases(args)?.into_iter().map(|plan| (plan, None)).collect(),
+    };
+    let soak_archive_dir = std::env::temp_dir().join(format!("prism-soak-archive-{}", ctx.run_tag));
+    let soak_driver = match &ctx.soak {
+        Some(soak) => Some(crate::soak_driver::SoakDriver::start(
+            crate::soak_driver::SoakInputs {
+                spec: soak.spec.clone(),
+                out: args.out.clone(),
+                archive_dir: soak_archive_dir.clone(),
+                frontends: frontends
+                    .iter()
+                    .map(|child| {
+                        (
+                            child.spec.instance_id.clone(),
+                            child.pid(),
+                            child.metrics_url(),
+                        )
+                    })
+                    .collect(),
+                side: side.clone(),
+                direct_url: ctx.direct_url.clone(),
+                server_bin: ctx.server_bin.clone(),
+                // The retargeting walk serves at most about 6.7 percent above
+                // the stock bits' difficulty; the retention floor is taken at
+                // the highest, so no tip's window reaches a partition it
+                // detached.
+                network_difficulty: if args.retarget_bits {
+                    (solution.scaled_network_difficulty / 100 * 107 + 1).to_string()
+                } else {
+                    solution.scaled_network_difficulty.to_string()
+                },
+                collected: collected.clone(),
+                phase: shared_session.clone(),
+            },
+        )?),
+        None => None,
+    };
     let mut runs: Vec<PhaseRun> = Vec::new();
     let mut aborted: Option<String> = None;
     let mut external_tips: Vec<crate::node::TipChange> = Vec::new();
     let mut remaining_blocks = args.scheduled_blocks;
     let mut remaining_tips = args.external_tips;
     let settle_limit = drain_limit(args.share_commit_timeout_seconds);
-    for plan in &plans {
+    for (plan, segment) in &plans {
+        let phase_args: &Args = segment.as_deref().unwrap_or(args);
+        if segment.is_some() {
+            // Each soak segment spends its own preset's tips and blocks.
+            if plan.kind == "warm_up" {
+                remaining_tips = phase_args.external_tips;
+            }
+            if holds_scheduled_blocks(phase_args, plan)? {
+                remaining_blocks = phase_args.scheduled_blocks;
+            }
+        }
         // The proxy's delay is changed only once nothing offered under the
         // previous delay is still in flight. The proxy reads its delay per
         // chunk, so a submit outstanding across the boundary would otherwise
@@ -1605,10 +1681,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .store(plan.dense_cadence, std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
         let started_wall = chrono::Utc::now();
-        let mut churn_driver = (plan.name == crate::churn::PHASE)
+        let mut churn_driver = (plan.kind == crate::churn::PHASE)
             .then(|| {
                 churn_driver(
-                    args,
+                    phase_args,
                     &ctx,
                     &solution,
                     &frontends,
@@ -1618,7 +1694,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             })
             .transpose()?;
         let outcome = drive_phase_with_population(
-            args,
+            phase_args,
             plan,
             Some(&ctx.population),
             churn_driver.as_mut(),
@@ -1655,7 +1731,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 let revisions = sampler.finish().await;
                 let aborted_text = outcome.aborted.clone().unwrap_or_default();
                 Some(DensePhase {
-                    gaps: args.cadence_gaps()?,
+                    gaps: phase_args.cadence_gaps()?,
                     offsets: outcome.dense_offsets.clone(),
                     landings: outcome.dense_landings.clone(),
                     slots_over_budget: outcome.slots_over_budget,
@@ -1761,6 +1837,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         }
     }
     *shared_session.phase.write().expect("phase lock") = "teardown".to_owned();
+    let mut soak_summary = match soak_driver {
+        Some(driver) => match driver.finish().await {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                aborted.get_or_insert_with(|| format!("{error:#}"));
+                None
+            }
+        },
+        None => None,
+    };
 
     // --- stop the load ----------------------------------------------------
     // Quiesce first: a socket closed with a submit outstanding manufactures an
@@ -1869,17 +1955,51 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .map(|child| child.spec.instance_id.clone())
         .collect();
-    let committed: BTreeSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT share_id FROM qbit_share_ledger \
-         WHERE accepted AND writer_id = ANY($1) AND share_id LIKE $2",
-    )
-    .bind(&writer_ids)
-    .bind(format!("{}%", ctx.share_prefix.replace('_', "\\_")))
-    .fetch_all(&side)
-    .await
-    .context("reading this run's committed shares")?
-    .into_iter()
-    .collect();
+    // A soak's retention dropped partitions under the load: their shares are
+    // read back from the archives, restored beside the ledger, so an
+    // acknowledged share has to be in PostgreSQL or in an archive that
+    // restores row for row (#575).
+    let mut ledger_tables = vec!["qbit_share_ledger".to_owned()];
+    if let Some(summary) = soak_summary.as_mut() {
+        match crate::soak_driver::restore_dropped(
+            &ctx.server_bin,
+            &ctx.direct_url,
+            &soak_archive_dir,
+            &side,
+        )
+        .await
+        {
+            Ok(restored) => {
+                ledger_tables.extend(restored.iter().cloned());
+                summary.restored = restored;
+            }
+            Err(error) => {
+                aborted.get_or_insert_with(|| format!("{error:#}"));
+                withhold = withhold_decision(
+                    late_hard_block.as_deref(),
+                    premise_contradiction.as_deref(),
+                    aborted.as_deref(),
+                );
+            }
+        }
+    }
+    let mut committed: BTreeSet<String> = BTreeSet::new();
+    for table in &ledger_tables {
+        committed.extend(
+            sqlx::query_scalar::<_, String>(&format!(
+                "SELECT share_id FROM {table} \
+                 WHERE accepted AND writer_id = ANY($1) AND share_id LIKE $2"
+            ))
+            .bind(&writer_ids)
+            .bind(format!("{}%", ctx.share_prefix.replace('_', "\\_")))
+            .fetch_all(&side)
+            .await
+            .with_context(|| format!("reading this run's committed shares from {table}"))?,
+        );
+    }
+    if ctx.soak.is_some() && !args.keep_artifacts {
+        let _ = std::fs::remove_dir_all(&soak_archive_dir);
+    }
 
     let mut phase_reconciliations: Vec<(String, digest::Reconciliation)> = Vec::new();
     for phase in &runs {
@@ -2099,6 +2219,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &args.out,
             "--plan tips runs warm-up only, so there is no artifact phase and no artifact; \
              the side report carries the run",
+        )?
+    } else if withhold.is_none() && args.plan()? == crate::cli::Plan::Soak {
+        artifact::not_requested(
+            &args.out,
+            "--plan soak holds one server lifetime to trends, not to the capacity artifact's \
+             phases, so there is no artifact; the side report and the soak samples carry the run",
         )?
     } else {
         artifact::write_or_withhold(
@@ -2325,6 +2451,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         ),
         "dense_cadence": dense_cadence,
         "churn": churn_report(args, &runs, &collected, &tip_changes),
+        "soak": match (&ctx.soak, &soak_summary) {
+            (Some(plan), Some(summary)) => {
+                let mut soak = crate::soak_driver::report(plan, summary, &args.out);
+                soak["churn_phases"] =
+                    Value::Array(churn_phase_reports(&runs, &collected, &tip_changes));
+                soak
+            }
+            (Some(_), None) => json!({"ran": false, "reason": "the soak driver failed; see aborted"}),
+            _ => Value::Null,
+        },
         "node": node_block,
         "premise": premise_block(
             premise_contradiction.as_deref(),
@@ -2604,6 +2740,20 @@ pub async fn drive_phase(
     .await
 }
 
+/// Whether `plan` is the phase that holds the run's scheduled blocks: the
+/// tips plan's warm-up is its only phase, and every other plan lands them in
+/// `steady_state` (#547). The rule is on the phase's kind, so a soak's
+/// `c<cycle>.<preset>.<kind>` phases hold their looped preset's blocks where
+/// that preset would (#575).
+pub fn holds_scheduled_blocks(args: &Args, plan: &PhasePlan) -> Result<bool> {
+    let kind = if args.plan()? == crate::cli::Plan::Tips {
+        "warm_up"
+    } else {
+        "steady_state"
+    };
+    Ok(plan.kind == kind)
+}
+
 /// Drive one phase: the open-loop schedule from `plan`, with the phase's
 /// events (reconnects, the drained restart, the mid-flight kill, scheduled
 /// blocks, tips and dense landings) placed on their offsets, until the
@@ -2672,7 +2822,8 @@ pub async fn drive_phase_with_population(
     } else {
         None
     };
-    let restart_at = (plan.reconnects && args.frontends >= 2).then(|| duration.as_secs_f64() / 3.0);
+    let restart_at = (plan.reconnects && plan.restart_frontend && args.frontends >= 2)
+        .then(|| duration.as_secs_f64() / 3.0);
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;
     let mut restart_done = restart_at.is_none();
@@ -2686,23 +2837,17 @@ pub async fn drive_phase_with_population(
     // landing budget and `steady_state` schedules none, so the budget is not
     // spent before the phase that measures it. Without it, nothing changes.
     let dense_run = args.cadence()?.is_dense();
-    // The tips plan's warm-up is its only phase, so it holds the scheduled
-    // blocks there; every other plan schedules them in `steady_state`.
-    let block_phase = if args.plan()? == crate::cli::Plan::Tips {
-        "warm_up"
-    } else {
-        "steady_state"
-    };
-    let block_times: Vec<f64> = if plan.name == block_phase && !dense_run && *remaining_blocks > 0 {
-        let count = *remaining_blocks;
-        (0..count)
-            .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let block_times: Vec<f64> =
+        if holds_scheduled_blocks(args, plan)? && !dense_run && *remaining_blocks > 0 {
+            let count = *remaining_blocks;
+            (0..count)
+                .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
+                .collect()
+        } else {
+            Vec::new()
+        };
     let mut block_cursor = 0usize;
-    let tip_times: Vec<f64> = if plan.name == "warm_up" && *remaining_tips > 0 {
+    let tip_times: Vec<f64> = if plan.kind == "warm_up" && *remaining_tips > 0 {
         let count = *remaining_tips;
         (0..count)
             .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 2.0))
@@ -3845,6 +3990,36 @@ fn churn_report(
         reconnects: &collected.reconnects,
         rentals_undrained: churn.undrained,
     })
+}
+
+/// Every churn phase's report, by phase, each read with the flags its own
+/// driver was planned from: a soak drives one every cycle (#575), and the
+/// `churn` section above is only the first.
+fn churn_phase_reports(
+    runs: &[PhaseRun],
+    collected: &Collected,
+    tip_changes: &[crate::node::TipChange],
+) -> Vec<Value> {
+    runs.iter()
+        .filter_map(|phase| phase.churn.as_ref().map(|churn| (phase, churn)))
+        .map(|(phase, churn)| {
+            json!({
+                "phase": phase.plan.name,
+                "report": crate::churn::report(&crate::churn::ReportInputs {
+                    spec: churn.driver.spec(),
+                    driver: &churn.driver,
+                    phase_started: phase.started,
+                    phase_ended: phase.ended,
+                    opened: &collected.opened,
+                    closed: &collected.closed,
+                    sightings: &collected.tips,
+                    all_tip_changes: tip_changes,
+                    reconnects: &collected.reconnects,
+                    rentals_undrained: churn.undrained,
+                }),
+            })
+        })
+        .collect()
 }
 
 /// Failure counts by kind, for the side report.

@@ -43,6 +43,11 @@ title = "On demand only: the manual presets through workflow_dispatch"
 runs = true
 workflow = ".github/workflows/prism-load-nightly.yml"
 
+[lanes.weekly]
+title = "Weekly on 3.x.x: the long soak's weekly presets (#575 item 2)"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
 [lanes.L2]
 title = "Nightly load regression with repeats, a trend and a regression rule"
 runs = false
@@ -647,6 +652,34 @@ lanes = ["L4"]
 criteria = "The read tier stays independent of mining load (#189's class, #469)."
 runs = false
 reason = "Not built; #554."
+
+[[scenario]]
+id = "soak-weekly-one-lifetime"
+title = "#575 item 2: a 5.5 h soak of one server lifetime looping the mainnet-shape, rental-churn and tip-delivery workloads"
+owner = "#575"
+lanes = ["weekly"]
+criteria = "No frontend restart; RSS window-peak slope at most 16 MiB/h after an hour and within 2x the warm-up peak; descriptors at most 2/h; connections at most 24 per frontend with no drift; pg_wal at most 2 GiB; at least three partition rollovers and two partitions archived and dropped by share-archive under the load; zero shortfall, tip delivery within budget, and exact reconciliation including the restored archives."
+runs = true
+presets = ["soak-weekly"]
+
+[[scenario]]
+id = "soak-short-leak-gate"
+title = "#575 item 2: a 25-minute soak whose RSS gate a leaking server fails"
+owner = "#575"
+lanes = ["dispatch"]
+criteria = "The preset's gates; a server built with the test-only soak-leak-mutant feature (16 KiB per accepted share) fails the RSS window-peak slope and the 2x warm-up-peak bound."
+runs = true
+presets = ["soak-short"]
+
+[[scenario]]
+id = "soak-smoke-rollover-retention"
+title = "#575 item 2: a four-minute soak smoke with forced rollovers and the full share-archive cycle under load"
+owner = "#575"
+lanes = ["nightly", "dispatch"]
+criteria = "Two rollovers; two partitions sealed, archived, verified, detached and dropped under load and restored for an exact reconciliation; every sample readable; every tip delivered."
+runs = true
+tests = ["qbit-prism-load::soak_smoke::the_soak_smoke_preset_rolls_over_archives_and_holds_its_gates"]
+presets = ["soak-smoke"]
 
 [[scenario]]
 id = "soak-two-hours"

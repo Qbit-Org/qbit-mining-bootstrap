@@ -1,10 +1,12 @@
 # Every opt-in (#[ignore]) gated test the nightly live-nightly job runs
 # explicitly with --ignored --exact, one `<package>::<binary>::<test path>` id
-# per line, sorted. Only qbit-prism-server::live_regtest ids: the job runs
-# that one binary. The prism-native-postgres PR job never runs these, so they
+# per line, sorted. The job runs each listed binary once, with its ids:
+# qbit-prism-server::live_regtest and qbit-prism-load::soak_smoke (#575)
+# today. The prism-native-postgres PR job never runs these, so they
 # are listed here and not in test/prism-gated-tests.txt; the job proves each
 # executed with scripts/check_gate_manifest.py (#521).
 # Each id is also named in test/e2e-scenarios.toml (#543).
+qbit-prism-load::soak_smoke::the_soak_smoke_preset_rolls_over_archives_and_holds_its_gates
 qbit-prism-server::live_regtest::clock_jump_tests::wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_once
 qbit-prism-server::live_regtest::dense_soak_tests::dense_cadence_soak_lands_every_block_rebuilds_in_budget_and_holds_rss_flat
 qbit-prism-server::live_regtest::disk_exhaustion_tests::postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_freed
