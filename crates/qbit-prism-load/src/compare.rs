@@ -1192,7 +1192,9 @@ fn frontend_env_mismatch(
 /// flag, while each frontend's environment is the fee the server applied,
 /// read as the server reads it (`PRISM_POOL_FEE_ENABLED` a boolean, off when
 /// unset; `PRISM_POOL_FEE_BPS` 0 when unset). A build whose harness predates the
-/// flag ran fee-off, which `legacy-flags.json` accepts for a pinned 0.
+/// flag ran fee-off, which `legacy-flags.json` accepts for a pinned 0, and so
+/// does a fee-off frontend at a pinned 0: from #536 to #568 the harness left
+/// the fee off at 0 rather than enabling it at 0 bps.
 fn pool_fee_mismatch(
     manifest: &Manifest,
     runs: &[LoadedRun],
@@ -1231,7 +1233,7 @@ fn pool_fee_mismatch(
                 None => Some(0),
                 Some(value) => value.parse::<u16>().ok(),
             };
-            if !enabled || applied.map(u64::from) != Some(bps) {
+            if (enabled && applied.map(u64::from) != Some(bps)) || (!enabled && bps != 0) {
                 return Some(format!(
                     "**the runs did not drive the pinned workload**: {} launched a frontend \
                      with the pool fee {}, not the pinned `--pool-fee-bps` {bps}",

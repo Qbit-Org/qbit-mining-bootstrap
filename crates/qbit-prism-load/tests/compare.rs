@@ -1119,31 +1119,53 @@ fn fewer_connections_than_pinned_sessions_or_another_pool_fee_fails() {
         result.markdown
     );
     // The pool fee each frontend ran, as the server reads its environment.
-    for (key, value, why) in [
+    for (key, value, pinned_bps, why) in [
         (
             "PRISM_POOL_FEE_ENABLED",
             json!("0"),
+            25,
             "with the pool fee off",
         ),
         (
             "PRISM_POOL_FEE_BPS",
             json!("25"),
+            0,
             "with the pool fee at 25 bps",
         ),
-        ("PRISM_POOL_FEE_BPS", json!("-1"), "at an unreadable rate"),
+        (
+            "PRISM_POOL_FEE_BPS",
+            json!("-1"),
+            0,
+            "at an unreadable rate",
+        ),
     ] {
+        let mut pinned = d1_args();
+        pinned.insert("--pool-fee-bps".into(), json!(pinned_bps));
         let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            run.report.as_mut().unwrap()["frontend_environment"][0]["environment"]
+                ["PRISM_POOL_FEE_BPS"] = json!(pinned_bps.to_string());
+        }
         runs[1].report.as_mut().unwrap()["frontend_environment"][0]["environment"][key] = value;
-        let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+        let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
         assert!(!result.passed, "{key}");
         assert!(
-            result
-                .markdown
-                .contains(&format!("{why}, not the pinned `--pool-fee-bps` 0")),
+            result.markdown.contains(&format!(
+                "{why}, not the pinned `--pool-fee-bps` {pinned_bps}"
+            )),
             "{key}: {}",
             result.markdown
         );
     }
+    // A build from #536 to #568 left the fee off at a pinned 0 rather than
+    // enabling it at 0 bps, the fee-off run `legacy-flags.json` accepts.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in runs.iter_mut().filter(|r| r.run.build == "base") {
+        run.report.as_mut().unwrap()["frontend_environment"][0]["environment"]
+            ["PRISM_POOL_FEE_ENABLED"] = json!("0");
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(result.passed, "{}", result.markdown);
     // `true` enables it as `1` does, and an unset rate is 0.
     let mut runs = loaded(&manifest, |_, _| met_steady());
     for run in &mut runs {
