@@ -199,7 +199,7 @@ async fn run(fixture: &mut Fixture) -> Result<()> {
          {payable} recipients paid {}..{} bits, direct outputs {}, fanout chunks {chunks:?}, {} bit pool \
          fee; the signed audit bundle matched the model; {} payee outputs (one per chunk) spent by {} \
          owning wallets; wall clock: chain ramp and wallets {:.1}s, seeding {:.1}s, verification, \
-         maturity and spend {:.1}s",
+         maturity and spend {:.1}s ({})",
         sources.seeded_shares,
         sources.seeded_recipients,
         sources.submitted_shares,
@@ -215,6 +215,7 @@ async fn run(fixture: &mut Fixture) -> Result<()> {
         chain_ready.as_secs_f64(),
         seeding.as_secs_f64(),
         verifying.as_secs_f64(),
+        verified.phases,
     );
     Ok(())
 }

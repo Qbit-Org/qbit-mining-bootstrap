@@ -169,7 +169,10 @@ async fn weighted_case(scenario: &Scenario) -> Result<()> {
 }
 
 async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
+    let mut phases = Phases::default();
+    let mut since = Instant::now();
     let ramp_address = harden_chain(fixture).await?;
+    phases.lap("chain ramp", &mut since);
     let template = fixture
         .rpc("getblocktemplate", json!([{"rules": ["segwit"]}]))
         .await?;
@@ -185,6 +188,7 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
     let payees = Payees::create(fixture, scenario.payees, scenario.wallets).await?;
     let plan = Plan::new(scenario, network, coinbase)?;
     start_servers(fixture, &policy).await?;
+    phases.lap("wallets and servers", &mut since);
 
     let mut sessions = Vec::with_capacity(plan.workers.len());
     for worker in &plan.workers {
@@ -241,6 +245,7 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
     }
     drop(sessions);
     fixture.quiesce().await?;
+    phases.lap("sessions and mining rounds", &mut since);
 
     let shares = ledger_shares(fixture).await?;
     let attribution = check_attribution(&shares, &accepted, &plan, &payees.ids)?;
@@ -248,6 +253,11 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
         verify_payouts(fixture, &ramp_address, &found, &shares, &policy, &payees).await?;
 
     let summary = Summary::new(&plan, &attribution, &verified, stale_retries);
+    phases.0.extend(verified.phases.0.iter().copied());
+    eprintln!(
+        "live weighted recipients ({}): wall clock by phase: {phases}",
+        scenario.name
+    );
     summary.check(scenario)?;
     eprintln!("live weighted recipients ({}): {summary}", scenario.name);
     Ok(())
@@ -278,6 +288,30 @@ struct Verified {
     /// Payee outputs spent, and how many wallets spent them.
     spent: usize,
     spending_wallets: usize,
+    phases: Phases,
+}
+
+/// Wall-clock seconds (the test process's monotonic clock) of each named
+/// phase, in order, so a slow run says where its time went.
+#[derive(Default)]
+struct Phases(Vec<(&'static str, f64)>);
+
+impl Phases {
+    /// Records the phase that ended now, begun at `*since`, and restarts it.
+    fn lap(&mut self, name: &'static str, since: &mut Instant) {
+        self.0.push((name, since.elapsed().as_secs_f64()));
+        *since = Instant::now();
+    }
+}
+
+impl std::fmt::Display for Phases {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (name, seconds)) in self.0.iter().enumerate() {
+            let separator = if index == 0 { "" } else { ", " };
+            write!(formatter, "{separator}{name} {seconds:.1}s")?;
+        }
+        Ok(())
+    }
 }
 
 /// Recomputes every found block's payout from the ledger's accepted shares
@@ -292,6 +326,8 @@ async fn verify_payouts(
     policy: &Policy,
     payees: &Payees,
 ) -> Result<Verified> {
+    let mut phases = Phases::default();
+    let mut since = Instant::now();
     let blocks = chain_blocks(fixture, found).await?;
     let mut prior = Carried::new();
     let mut expected = Vec::with_capacity(blocks.len());
@@ -316,6 +352,7 @@ async fn verify_payouts(
         expected.push((window, settled));
     }
     check_final_balances(fixture, &prior).await?;
+    phases.lap("model, ledger and audit bundles", &mut since);
 
     let last = blocks.last().context("no block found")?.height;
     mine(
@@ -324,6 +361,7 @@ async fn verify_payouts(
         last + qbit_prism::QBIT_COINBASE_MATURITY_BLOCKS - tip_height(fixture).await?,
     )
     .await?;
+    phases.lap("maturity mining", &mut since);
     // The server's fanout ids only say what to wait for; the outputs checked
     // below are found on the chain by the covenant outpoints they spend.
     let fanouts: Vec<String> =
@@ -362,15 +400,19 @@ async fn verify_payouts(
         Ok(usize::try_from(confirmed)? == fanouts.len())
     })
     .await?;
+    phases.lap("fanout broadcast and confirmation", &mut since);
     let paid = check_fanouts(fixture, &blocks, &expected, &bundle_fanouts, &payees.ids).await?;
     check_wallet_receipts(fixture, &expected, &paid, payees).await?;
+    phases.lap("chain and wallet receipts", &mut since);
     let (spent, spending_wallets) =
         spend_sample(fixture, ramp_address, blocks.len(), &paid, payees).await?;
     fixture.integrity().await?;
+    phases.lap("owner spends and integrity", &mut since);
     Ok(Verified {
         expected,
         spent,
         spending_wallets,
+        phases,
     })
 }
 
