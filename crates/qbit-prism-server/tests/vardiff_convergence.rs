@@ -185,7 +185,8 @@ struct Share {
 struct Trace {
     difficulties: Vec<(f64, f64)>,
     shares: Vec<Share>,
-    /// Shares still unsent when a new difficulty replaced them: seconds when
+    /// Shares still unsent when a new difficulty replaced them, including
+    /// one held back while the last share awaited its answer: seconds when
     /// it arrived, and how long past due the share was by then.
     overdue_at_change: Vec<(f64, f64)>,
     refusals: Vec<Value>,
@@ -298,7 +299,9 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
                         let sent = announced.expect("a job before any difficulty");
                         if sent != difficulty {
                             let now = Instant::now();
-                            if outstanding.is_none() && now > scheduled {
+                            // Past due whether or not the last share is still
+                            // unanswered: a slow answer delays the next share too.
+                            if now > scheduled {
                                 trace.overdue_at_change.push((
                                     seconds(now),
                                     now.duration_since(scheduled).as_secs_f64(),
