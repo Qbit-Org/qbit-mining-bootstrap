@@ -81,6 +81,12 @@ mod session_load;
 #[path = "support/live_chain_events_load.rs"]
 mod chain_events_load_tests;
 
+#[path = "support/live_fault_seams.rs"]
+mod fault_seams;
+
+#[path = "support/live_lost_reply.rs"]
+mod lost_reply_tests;
+
 /// The payout policy of the 0-bps fee every live server runs unless a case
 /// sets its own (#535). An in-process coordinator sharing a fixture's cluster
 /// must pin it, or its configuration fingerprint differs from the servers'.

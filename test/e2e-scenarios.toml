@@ -517,8 +517,14 @@ title = "#474 C: the node accepted the operation but its reply was lost"
 owner = "#474"
 lanes = ["pr"]
 criteria = "Set by #474: no fabricated rejection, duplicate credit or second payout after the owning frontend is killed."
-runs = false
-reason = "Not built."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_sendrawtransaction_reply_owner_killed_survivor_confirms_the_fanout_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitpackage_reply_owner_killed_survivor_confirms_the_cpfp_package_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::share_credited_but_ack_lost_retry_is_deduplicated_exactly",
+]
+notes = "A proxy withholds qbitd's reply to submitblock, sendrawtransaction or submitpackage after the node accepted it; the owning frontend is killed before it journals the outcome and the survivor reconciles. The miner case withholds a durably credited share's acknowledgement and closes the connection; the retry is a duplicate on both frontends."
 
 # ---------------------------------------------------------------------------
 # #487's catalogue entries that no lane runs yet, under the sub-issue that
