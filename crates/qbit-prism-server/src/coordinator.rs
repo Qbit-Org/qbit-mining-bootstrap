@@ -272,6 +272,10 @@ pub struct Coordinator {
     /// standby wait (#578).
     #[cfg(test)]
     offer_reserved_probe: std::sync::Mutex<Option<Arc<OfferProbe>>>,
+    /// A test seam in `build_job`, after the job is built and before its
+    /// admission is revalidated, so a test can publish in between (#598).
+    #[cfg(test)]
+    build_job_probe: std::sync::Mutex<Option<Arc<OfferProbe>>>,
     /// Attempts between their offer reservation and its recorded answer,
     /// which a graceful shutdown lets finish (#578).
     offer_sections: offer_shutdown::OfferSections,
@@ -802,6 +806,8 @@ impl Coordinator {
             offer_probe: Default::default(),
             #[cfg(test)]
             offer_reserved_probe: Default::default(),
+            #[cfg(test)]
+            build_job_probe: Default::default(),
             offer_sections: Default::default(),
         }))
     }
@@ -2896,27 +2902,21 @@ impl MiningBackend for Coordinator {
         minimum_difficulty: f64,
     ) -> Result<MiningJob<JobContext>, StratumError> {
         let build = async {
+            // Admission starts from the view the work was read with. A later
+            // same-tip publication that keeps its parent, revision and fee
+            // no longer discards it (#598); anything else still does.
             let initial = self.authority_view().await;
-            let readiness_epoch = initial.readiness.generation;
-            let published_tip = initial.tip.publication_stamp();
             let prepared = initial
                 .prepared
                 .as_ref()
                 .cloned()
                 .context("no current template")?;
+            let mut issuance_authority =
+                tip_observation::IssuanceAuthority::fresh(&prepared, &initial)?;
             drop(initial);
-            let mut issuance_authority = self
-                .begin_issuance_authority(
-                    tip_observation::PreparedIdentity::of(&prepared),
-                    readiness_epoch,
-                    None,
-                )
+            self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
                 .context("payout snapshot stale")?;
-            ensure!(
-                self.observed_tip.read().await.publication_stamp() == published_tip,
-                "work publication changed during work admission"
-            );
             self.ensure_job_fee_current(prepared.fee).await?;
             let (base, bundle, bootstrap_share) = self
                 .materialize_wire(
@@ -2933,6 +2933,8 @@ impl MiningBackend for Coordinator {
             let mut wire = base.reassign(id, extranonce1, difficulty, minimum_difficulty)?;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
+            #[cfg(test)]
+            Self::probe(&self.build_job_probe).await;
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
                 .context("payout snapshot stale")?;
@@ -3279,6 +3281,9 @@ mod d2_bootstrap_tests;
 mod d2_test_support;
 #[cfg(test)]
 mod test_serial;
+
+#[cfg(test)]
+mod same_tip_republish_tests;
 
 #[cfg(test)]
 mod window_ref_tests;

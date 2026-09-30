@@ -313,9 +313,9 @@ COMMIT took at least the ledger sessions' effective `statement_timeout`,
 because that may be a synchronous-replication wait cancelled after local
 commit. This is a duration-based guard, not a direct replica-confirmation check.
 Share-pass appends carrying a block candidate are never refused by the ACK deadline;
-they wait up to `block_only_ack_timeout` and use the same result classifier.
-Block-only proofs instead wait for their credit/candidate disposition up to that
-bound. See the [commit reconciliation tests](../crates/qbit-prism-server/src/coordinator/miner_tests/commit_reconcile.rs)
+they follow the same deadline and grace as a plain share and use the same result
+classifier. Block-only proofs instead wait for their credit/candidate disposition
+up to the share deadline. See the [commit reconciliation tests](../crates/qbit-prism-server/src/coordinator/miner_tests/commit_reconcile.rs)
 and [writer session setup](../crates/qbit-prism-server/src/ledger/connect.rs).
 
 **`statement_timeout` never ends a synchronous-replication wait (#529).**

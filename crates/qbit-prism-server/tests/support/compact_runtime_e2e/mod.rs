@@ -15,6 +15,8 @@ use tokio::time::timeout;
 
 pub mod assertions;
 mod audit;
+#[allow(dead_code)]
+pub mod ctv_fanout;
 #[path = "../ledger_execution_proxy.rs"]
 pub mod execution;
 #[allow(dead_code)]

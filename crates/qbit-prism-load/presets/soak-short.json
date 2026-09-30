@@ -99,6 +99,7 @@
       "rss_trend_window_minutes": 3,
       "min_trend_windows": 4,
       "rss_warmup_peak_multiple_max": 2.0,
+      "rss_expected_failure": null,
       "fd_slope_per_hour_max": 2,
       "pool_connections_max": 24,
       "pool_connections_drift_max": 2,

@@ -218,16 +218,37 @@ fn profile_dir() -> Result<PathBuf> {
 }
 
 /// Build the debug server beside this test binary, as `load_smoke` does: a
-/// `qbit-prism-load` test cannot ask Cargo for another package's binary.
+/// `qbit-prism-load` test cannot ask Cargo for another package's binary. Its
+/// environment and package selection match this test binary's build, so the
+/// server's library is not rebuilt; see `load_smoke`'s `build_server`.
 fn build_server() -> Result<PathBuf> {
     let profile = profile_dir()?;
     let target = profile
         .parent()
         .context("profile directory has no parent")?;
-    let status = std::process::Command::new(env!("CARGO"))
+    let mut command = std::process::Command::new(env!("CARGO"));
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().into_owned();
+        if [
+            "CARGO_PKG_",
+            "CARGO_MANIFEST_",
+            "CARGO_CRATE_",
+            "CARGO_BIN_",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        {
+            command.env_remove(name);
+        }
+    }
+    let status = command
         .args([
             "build",
             "--locked",
+            "-p",
+            "qbit-prism-load",
             "-p",
             "qbit-prism-server",
             "--bin",

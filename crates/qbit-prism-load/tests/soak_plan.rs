@@ -120,6 +120,23 @@ fn every_soak_preset_plans_and_the_short_ones_fit_their_timeouts() -> Result<()>
     Ok(())
 }
 
+/// #600's resident-memory ratchet is expected only where it was measured:
+/// the weekly soak's 400k-window lifetime. The shorter soaks keep a real
+/// resident-memory gate.
+#[test]
+fn only_the_weekly_soak_expects_600s_resident_memory_failure() -> Result<()> {
+    for (name, issue) in [
+        ("soak-weekly", Some("#600")),
+        ("soak-short", None),
+        ("soak-smoke", None),
+    ] {
+        let (loaded, _) = load(name)?;
+        let spec = loaded.soak.as_ref().context("no soak block")?;
+        assert_eq!(spec.gates.rss_expected_failure.as_deref(), issue, "{name}");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_soak_block_and_plan_soak_go_together() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("soak-plan-{}", uuid::Uuid::new_v4()));

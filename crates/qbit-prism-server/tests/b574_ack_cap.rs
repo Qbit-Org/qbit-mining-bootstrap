@@ -20,9 +20,9 @@
 //! - The same append held inside its COMMIT: like a plain share, it gets the
 //!   share grace and is accepted, never served worse than a plain share.
 //!
-//! Both frontends take the block-only bound from `config::block_only_ack_timeout`,
-//! the function `Config::from_env` uses, so restoring the 60 s floor there fails
-//! the block-only tests at the cap.
+//! The block-only bound is `share_commit_timeout` itself, read where the
+//! coordinator waits for the proof's disposition, so restoring the 60 s floor
+//! there fails the block-only tests at the cap.
 //!
 //! Run through: test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test b574_ack_cap -- --nocapture
@@ -30,7 +30,7 @@
 use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     codec,
-    config::{self, Config},
+    config::Config,
     coordinator::{Coordinator, JobContext},
     stratum::{MiningBackend, MiningJob, Worker},
 };
@@ -53,7 +53,6 @@ const GRACE: Duration = Duration::from_secs(5);
 
 fn tune(config: &mut Config) {
     config.share_commit_timeout = SHARE_COMMIT;
-    config.block_only_ack_timeout = config::block_only_ack_timeout(SHARE_COMMIT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

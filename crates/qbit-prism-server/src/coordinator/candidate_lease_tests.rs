@@ -226,7 +226,6 @@ impl Fixture {
             health_timeout: Duration::from_secs(15),
             share_commit_timeout: Duration::from_secs(15),
             share_commit_grace: Duration::from_secs(5),
-            block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: 6,
             capture_overpay_ceiling_bps: 100,
             offer_standby: None,
