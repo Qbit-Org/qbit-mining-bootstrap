@@ -3,9 +3,14 @@
 //!
 //! Exit 0 when the candidate meets #473's D1 rule in every phase the preset
 //! gates, 1 when it does not, 2 when the inputs cannot be read.
+//!
+//! `--collate <plan.json>` instead renders one build's L3 suite (#550): every
+//! preset of the plan in #473's document tables, from the run jobs'
+//! artifacts under `--runs-dir`. Exit 0 when every planned run reached its
+//! gate and passed it, 1 when not, 2 when the inputs cannot be read.
 
 use clap::Parser;
-use qbit_prism_load::{compare, gate, preset::Preset};
+use qbit_prism_load::{collate, compare, gate, preset::Preset};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -16,7 +21,7 @@ use std::path::PathBuf;
 )]
 struct CompareArgs {
     /// The series' `manifest.json`, as scripts/prism_load_ab.py writes it.
-    #[arg(long, required_unless_present = "validate_preset")]
+    #[arg(long, required_unless_present_any = ["validate_preset", "collate"])]
     manifest: Option<PathBuf>,
     /// Only check that `--preset` loads and that this harness can derive
     /// its settings and phase plan, then exit (0 valid, 2 not): the driver
@@ -26,8 +31,23 @@ struct CompareArgs {
     /// The preset the series ran; every run is held to its gates, its
     /// `gates.phases` choose the gated D1 rows, and its SHA-256 must be the
     /// manifest's.
-    #[arg(long)]
-    preset: PathBuf,
+    #[arg(long, required_unless_present = "collate")]
+    preset: Option<PathBuf>,
+    /// Collate an L3 suite's runs (#550): the plan job's `plan.json`
+    /// (`qbit.prism.l3-plan.v1`).
+    #[arg(long, conflicts_with_all = ["manifest", "validate_preset", "preset"])]
+    collate: Option<PathBuf>,
+    /// The directory the run jobs' `prism-l3-run-<id>` artifacts were
+    /// downloaded into, one directory each.
+    #[arg(long, requires = "collate")]
+    runs_dir: Option<PathBuf>,
+    /// The checked-in presets at the plan's commit.
+    #[arg(long, requires = "collate")]
+    presets_dir: Option<PathBuf>,
+    /// Where to write the verdict (`qbit.prism.l3-verdict.v1`) the tag's
+    /// promotion reads.
+    #[arg(long, requires = "collate")]
+    verdict_out: Option<PathBuf>,
 }
 
 fn main() {
@@ -42,9 +62,39 @@ fn main() {
     }
 }
 
+fn collate(args: &CompareArgs, plan_path: &std::path::Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let plan = collate::read_plan(plan_path)?;
+    let runs_dir = args
+        .runs_dir
+        .as_ref()
+        .context("--collate needs --runs-dir")?;
+    let presets_dir = args
+        .presets_dir
+        .as_ref()
+        .context("--collate needs --presets-dir")?;
+    let presets = qbit_prism_load::preset::load_all(presets_dir)?
+        .into_iter()
+        .map(|preset| (preset.name.clone(), preset))
+        .collect();
+    let collation = collate::collate(&plan, runs_dir, &presets)?;
+    if let Some(path) = &args.verdict_out {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&collation.verdict)? + "\n",
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
+    }
+    print!("{}", collation.markdown);
+    Ok(collation.passed)
+}
+
 fn run(args: &CompareArgs) -> anyhow::Result<bool> {
     use anyhow::ensure;
-    let preset = Preset::load(&args.preset)?;
+    if let Some(plan) = &args.collate {
+        return collate(args, plan);
+    }
+    let preset = Preset::load(args.preset.as_ref().expect("clap requires it"))?;
     if args.validate_preset {
         compare::expected_settings(&preset.args)?;
         let planned = compare::expected_phases(&preset.args)?;

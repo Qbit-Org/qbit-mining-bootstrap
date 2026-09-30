@@ -242,7 +242,7 @@ class CheckE2eScenarios(unittest.TestCase):
 
     def test_a_running_scenario_needs_evidence(self) -> None:
         self.replace(f'tests = ["{NIGHTLY}"]', "")
-        self.assertProblem("scenario reindex runs but cites no tests, presets or unit_tests")
+        self.assertProblem("scenario reindex runs but cites no tests, presets, unit_tests or suites")
 
     def test_malformed_entries_are_refused(self) -> None:
         cases = (
@@ -294,6 +294,41 @@ class CheckE2eScenarios(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(self.fixture.problems(), [])
+
+    def test_a_suite_runs_in_its_lane_and_is_cited_with_only_its_own_presets(self) -> None:
+        # #550: a suite (presets/suites.toml) runs in the lane it names.
+        self.fixture.write(
+            "crates/qbit-prism-load/presets/suites.toml",
+            'schema = "qbit.prism.load-suites.v1"\n[suites.l3]\ndescription = "L3"\n'
+            'lane = "L3"\nissues = ["#550"]\nrepeats = 3\npresets = ["d1-500k"]\n',
+        )
+        self.fixture.write(
+            ".github/workflows/prism-load-l3.yml",
+            "\n".join(needle for needle in scenarios.LANE_WIRING["L3"][1]) + "\n",
+        )
+        self.fixture.manifest += (
+            '\n[lanes.L3]\ntitle = "L3"\nruns = true\nowner = "#550"\n'
+            'workflow = ".github/workflows/prism-load-l3.yml"\n'
+        )
+        self.assertProblem("L3 runs suite l3, which no running scenario names")
+        entry = (
+            '\n[[scenario]]\nid = "matrix"\ntitle = "Matrix"\nowner = "#550"\n'
+            'lanes = ["dispatch", "L3"]\ncriteria = "Gates."\nruns = true\n'
+            'suites = ["l3"]\npresets = ["d1-500k"]\n'
+        )
+        base = self.fixture.manifest
+        self.fixture.manifest = base + entry
+        self.assertEqual(self.fixture.problems(), [])
+        self.fixture.manifest = base + entry.replace('presets = ["d1-500k"]', 'presets = ["d1-20k"]')
+        self.assertProblem("preset 'd1-20k' is in none of its suites (l3)")
+        self.fixture.manifest = base + entry.replace('suites = ["l3"]', 'suites = ["l3", "gone"]')
+        self.assertProblem("suite 'gone' is not in")
+        # A suite's lane is claimed like a preset's.
+        self.fixture.manifest = base + entry.replace('lanes = ["dispatch", "L3"]', 'lanes = ["dispatch"]')
+        self.assertProblem("its evidence runs in 'L3'; add it to lanes")
+        (self.fixture.root / ".github/workflows/prism-load-l3.yml").write_text("on: push\n")
+        self.fixture.manifest = base + entry
+        self.assertProblem("prism-load-l3.yml no longer contains")
 
     def test_the_smoke_preset_runs_in_pr_only_through_the_load_smoke_test(self) -> None:
         self.fixture.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, COMPONENT])) + "\n")
