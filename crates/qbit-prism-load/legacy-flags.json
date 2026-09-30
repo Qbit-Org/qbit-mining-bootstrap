@@ -67,6 +67,11 @@
       "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
+    "--faults": {
+      "equals": null,
+      "introduced": "b7bbbbecf9dc898db8433cc94f4788b7cd40a3ec",
+      "why": "Before #554 no run had a fault phase, and its frontends talked to the node directly, as a run with --faults omitted still does."
+    },
     "--node": {
       "equals": "fake",
       "introduced": "a3f1b1ce7fc37b13270ad479633d2f3fd2e487b5",
