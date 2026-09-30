@@ -25,27 +25,90 @@ name: PRISM load harness (nightly)
 # being measured. Rates are only comparable run to run on the same runner
 # class, which is why the runner is part of the preset.
 #
+# The bridging pair (short-plan-real-node and short-plan-fake-node, #547,
+# #552) runs the same short plan on a managed regtest qbitd and on the fake
+# node, on the same runner class, so their difference is what the real node
+# costs.
+#
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
 # today #545's 2.x.x migration lifecycle and #575's measured cutover of a
 # mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
 # nightly jobs keep their own schedule.
 #
+# #575 item 2: the long soak has a third schedule, Saturday 05:41 UTC, whose
+# plan selects `weekly`: the soak-weekly preset, one server lifetime of about
+# 5.5 h looping the mainnet-shape-130-addresses, rental-churn-bursts-and-storms
+# and tip-delivery workloads, with forced share-partition rollovers and the
+# share-archive retention cycle under the load, sampled every minute and gated
+# on RSS and descriptor trends, connection drift, bounded WAL, zero lost
+# shares and exact reconciliation (docs/prism-soak.md). The preset's timeout
+# is 355 min, under the 6 h job limit. It has its own concurrency group, so it
+# never holds the nightly queue; neither live job nor the fuzzing runs on its
+# schedule. #549's guard never skips it: the soak measures drift over a week
+# of commits and its bounds are still being calibrated, so a second lifetime
+# on an unchanged commit is evidence, not waste, and the commit the guard
+# compares against is the one the nightly presets tested, not the soak. A
+# failed soak opens or updates the failure issue like any scheduled run. Cost:
+# one 8 vCPU runner for about 5 h 40 min plus the shared release build, about
+# 350 runner-minutes a week, about $5.60 at $0.016 per 8 vCPU minute.
+# `preset: soak-weekly` (or `weekly`) dispatches it by hand.
+#
+# The `shipped-images` job is #487's lane L6 (#544): the images and the
+# Compose wiring operators run, under the `prism` profile with the HA overlay
+# on a real regtest node, mined by cpuminer-opt and qbit-prism-miner. It runs
+# with the Sunday schedule, on demand (`images`), and on a pull request into
+# 3.x.x or a 3.x.x push that changes a Dockerfile, a Compose file or what they
+# build from: the `changes` job applies that list, WATCHED_PATHS in
+# scripts/prism_shipped_image_lane.py, because a trigger-level `paths` filter
+# would also gate the `run-load` label below. Those events run nothing else.
+# It is not a required check.
+#
 # Schedules run from the default branch's copy of this file; the build and
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
+#
+# #549 (S3 of #487):
+#   - A maintainer applying the `run-load` label to a PR runs the nightly
+#     preset set against the PR's merge result, on `pull_request` (never
+#     `pull_request_target`), in a concurrency group of its own so it can
+#     never cancel a queued nightly. Only the `labeled` event starts it: a
+#     later push needs the label applied again. Other labels start nothing.
+#   - The guard job ends the nightly schedule early when 3.x.x's head is the
+#     commit the last scheduled nightly tested, and cancels the run so the
+#     skip shows as cancelled, never as passed. A nightly records the commit
+#     it tested in its `prism-load-tested-commit` artifact once every preset
+#     reached its gate, pass or fail. Neither weekly schedule (the Sunday
+#     live scenarios, the Saturday soak) nor a dispatch is ever skipped.
+#   - Each preset's artifact carries host.json (runner label, filesystem mount
+#     options, block device write cache and FUA) and is kept for 90 days
+#     (#487 decision 3).
+#   - A failed scheduled run opens, or comments on, the one open issue
+#     labelled `prism-load-nightly-failure`, until S6 (#551) has its own
+#     tracking issue. GitHub itself only emails whoever last edited the cron.
 
 on:
   schedule:
     - cron: "17 2 * * *"
     # Weekly, on Sunday. The jobs' `if` conditions compare against both crons.
     - cron: "43 3 * * 0"
+    # The weekly soak (#575), on Saturday: the plan, build and run jobs, with
+    # the plan selecting `weekly` by this exact string; the guard lets it
+    # through and the report job reports a failure.
+    - cron: "41 5 * * 6"
+  # `labeled` is #549's run-load trigger; the others let L6 see a PR's
+  # changes (the `changes` job decides whether it runs).
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [3.x.x]
   workflow_dispatch:
     inputs:
       preset:
         description: >-
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
-          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async).
+          (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async),
+          `weekly` for the 5.5 h soak (soak-weekly).
         required: true
         default: nightly
       ref:
@@ -87,31 +150,127 @@ on:
         type: boolean
         required: false
         default: false
+      images:
+        description: >-
+          Also run L6, the shipped images under the Compose prism profile
+          with the HA overlay (#544; the weekly schedule always does).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
+# The weekly soak holds its runner for most of six hours, so it queues only
+# behind another soak, never in front of a nightly. A labelled PR run gets a
+# group per PR and label, so it never waits on or cancels a nightly or a soak,
+# and another label's (empty) run never cancels a pending run-load run. A PR's
+# other events (L6 only) get a group per PR, where a newer commit cancels the
+# older run; a 3.x.x push (L6 only) gets its own.
 concurrency:
-  group: prism-load-nightly
-  cancel-in-progress: false
+  group: >-
+    ${{ github.event_name == 'pull_request'
+    && (github.event.action == 'labeled'
+      && format('prism-load-pr-{0}-{1}', github.event.pull_request.number, github.event.label.name)
+      || format('prism-shipped-images-pr-{0}', github.event.pull_request.number))
+    || github.event_name == 'push' && 'prism-shipped-images-push'
+    || format('prism-load-{0}', (github.event.schedule == '41 5 * * 6'
+    || contains(inputs.preset || '', 'soak-weekly')
+    || inputs.preset == 'weekly') && 'soak' || 'nightly') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' }}
 
 jobs:
+  # Every job but live-weekly and report needs this one, so on a PR it is
+  # the one place the label is checked, and on the nightly schedule it is the
+  # P4 cost lever: nothing starts when 3.x.x has not moved. Only the nightly
+  # cron compares; the Saturday soak (#575) passes straight through.
+  guard:
+    name: Skip an unchanged night
+    if: >-
+      ${{ github.event.schedule != '43 3 * * 0' && github.event_name != 'push'
+      && (github.event_name != 'pull_request' || github.event.label.name == 'run-load') }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      skip: ${{ steps.last.outputs.skip }}
+    steps:
+      - name: Compare 3.x.x's head with the commit the last nightly tested
+        id: last
+        if: ${{ github.event.schedule == '17 2 * * *' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          head="$(gh api "repos/${REPO}/commits/3.x.x" --jq .sha)" || head=""
+          # Only a scheduled nightly's report job uploads the artifact, and
+          # the artifacts API lists it newest first however many skipped
+          # (cancelled) or weekly runs came since, so the first unexpired one
+          # from the default branch is what the last nightly tested. Any
+          # failure to find or read it runs the night: a skip needs positive
+          # evidence.
+          tested="" tested_run=""
+          tested_run="$(gh api "repos/${REPO}/actions/artifacts?name=prism-load-tested-commit&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false
+                    and .workflow_run.head_branch == \"${DEFAULT_BRANCH}\"
+                    and .workflow_run.id != ${RUN_ID})][0].workflow_run.id // empty")" || tested_run=""
+          dir="${RUNNER_TEMP}/tested"
+          if [[ -n "${tested_run}" ]] \
+            && gh run download "${tested_run}" --repo "${REPO}" -n prism-load-tested-commit -D "${dir}" \
+            && [[ -s "${dir}/commit" ]]; then
+            tested="$(tr -d '[:space:]' < "${dir}/commit")"
+          fi
+          echo "3.x.x is at ${head}; the last nightly tested ${tested:-nothing found} (run ${tested_run:-none})"
+          if [[ -n "${head}" && "${tested}" == "${head}" ]]; then
+            printf 'skip=true\n' >> "${GITHUB_OUTPUT}"
+            {
+              echo "### Skipped: 3.x.x has not moved"
+              echo
+              echo "3.x.x is still at \`${head}\`, which [run ${tested_run}](${GITHUB_SERVER_URL}/${REPO}/actions/runs/${tested_run}) tested."
+              echo "This run is cancelled so the skip does not show as a pass."
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            printf 'skip=false\n' >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Cancel the run
+        if: ${{ steps.last.outputs.skip == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh run cancel "${RUN_ID}" --repo "${REPO}"
+          # The cancellation ends this job; if it has not within five
+          # minutes, fail rather than let the skip read as a pass. The other
+          # jobs are skipped on this job's output either way.
+          for _ in $(seq 30); do sleep 10; done
+          echo "the run was not cancelled within five minutes" >&2
+          exit 1
+
   plan:
     name: Plan the preset matrix
-    if: ${{ github.event.schedule != '43 3 * * 0' }}
+    needs: guard
+    if: ${{ needs.guard.outputs.skip != 'true' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       sha: ${{ steps.plan.outputs.sha }}
     steps:
+      # A labelled PR runs its merge result (refs/pull/N/merge), which is
+      # what would land; everything else runs `ref`, 3.x.x by default.
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || '3.x.x' }}
+          ref: ${{ github.event_name == 'pull_request' && github.ref || inputs.ref || '3.x.x' }}
       - name: Select presets and pin the commit
         id: plan
         env:
-          SELECTION: ${{ inputs.preset || 'nightly' }}
+          SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') || 'nightly' }}
         run: |
           set -euo pipefail
           matrix="$(python3 scripts/prism_load_matrix.py "${SELECTION}")"
@@ -171,6 +330,19 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # A `--node qbitd` preset (#547) drives the pinned qbit release; the
+      # install script exports QBITD_BIN, which the harness reads when the
+      # command line gives no --qbitd-bin. A fake-node preset ignores it.
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
       - name: Download the binaries built once
         uses: actions/download-artifact@v8
         with:
@@ -186,7 +358,7 @@ jobs:
           tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar"
           touch target/release/qbit-prism-server target/release/qbit-prism-load \
             target/release/qbit-prism-load-gate
-      - name: Record the host
+      - name: Name the run in the summary
         env:
           PRESET: ${{ matrix.preset }}
           RUNNER_LABEL: ${{ matrix.runner }}
@@ -195,26 +367,49 @@ jobs:
           {
             echo "### ${PRESET} on ${RUNNER_LABEL}"
             echo
-            echo '```'
-            git rev-parse HEAD
-            nproc
-            free -m
-            uname -r
-            echo '```'
+            echo "Commit \`$(git rev-parse HEAD)\`; the host, its disk and the runner label are in host.json below."
+            echo
           } >> "${GITHUB_STEP_SUMMARY}"
       - name: Run and gate the preset
         env:
           PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS: ${{ inputs.tip_last_notify_p99_budget_ms }}
           PRISM_LOAD_MAX_SHORTFALL: ${{ inputs.max_shortfall }}
           PRESET: ${{ matrix.preset }}
+          RUNNER_LABEL: ${{ matrix.runner }}
         run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
+      # prism-load-run.sh writes gate-exit-code after the gate returns; 0
+      # (pass) or 1 (fail) is a verdict on the harness's result. The report
+      # job records a nightly's commit as tested only if every planned preset
+      # left this marker, so a setup or runner failure, or a gate that could
+      # not read its inputs or did not run, is retried the next night.
+      - name: Mark the preset as gated
+        if: ${{ !cancelled() }}
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gated"
+          code="$(cat "${RUNNER_TEMP}/prism-load-out/gate-exit-code" 2>/dev/null || true)"
+          if [[ "${code}" == 0 || "${code}" == 1 ]]; then
+            touch "${RUNNER_TEMP}/gated/${PRESET}"
+          fi
+      - name: Upload the gated marker
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-gated-${{ matrix.preset }}
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/gated
+          if-no-files-found: ignore
       - name: Upload the harness reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: prism-load-${{ matrix.preset }}
           overwrite: true
-          retention-days: 30
+          # #487 decision 3: the load evidence is kept 90 days.
+          retention-days: 90
           path: ${{ runner.temp }}/prism-load-out
           if-no-files-found: error
 
@@ -227,7 +422,8 @@ jobs:
   # PostgreSQL disk-exhaustion and wall-clock-jump variants.
   live-nightly:
     name: Live regtest nightly variants
-    if: ${{ github.event.schedule == '17 2 * * *' || inputs.live }}
+    needs: guard
+    if: ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *' || inputs.live) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
     services:
@@ -277,13 +473,25 @@ jobs:
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      # Each <package>::<binary> in the list runs once with its own ids
+      # (qbit-prism-server::live_regtest and #575's qbit-prism-load::soak_smoke
+      # today). Every binary runs even if an earlier one failed; the step
+      # fails if any did.
       - name: Run the listed variants
         run: |
           set -euo pipefail
-          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt \
-            | grep -v '^$' | sed 's/^qbit-prism-server::live_regtest:://')
-          cargo test --locked -p qbit-prism-server --test live_regtest -- \
-            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+          mapfile -t ids < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-nightly-gated-tests.txt | grep -v '^$')
+          : > "${PRISM_TEST_LOG}"
+          failed=0
+          for target in $(printf '%s\n' "${ids[@]}" | awk -F'::' '{print $1 "::" $2}' | sort -u); do
+            package="${target%%::*}"
+            binary="${target#*::}"
+            mapfile -t tests < <(printf '%s\n' "${ids[@]}" | grep "^${target}::" | sed "s/^${target}:://")
+            cargo test --locked -p "${package}" --test "${binary}" -- \
+              --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee -a "${PRISM_TEST_LOG}" \
+              || failed=1
+          done
+          exit "${failed}"
       - name: Prove every listed variant executed
         run: |
           python3 scripts/check_gate_manifest.py \
@@ -395,7 +603,8 @@ jobs:
   # cargo-fuzz and says how to reproduce a finding.
   stratum-fuzz:
     name: Stratum fuzzing (20 min)
-    if: ${{ github.event.schedule == '17 2 * * *' || inputs.fuzz }}
+    needs: guard
+    if: ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *' || inputs.fuzz) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
@@ -427,4 +636,211 @@ jobs:
           overwrite: true
           retention-days: 30
           path: ${{ runner.temp }}/stratum-fuzz-out
+          if-no-files-found: error
+
+  # #549: what a scheduled run leaves behind. The nightly records the commit
+  # its presets ran to a verdict on, for the guard's next comparison, and any
+  # failed scheduled run, nightly, weekly or the Saturday soak, opens or
+  # updates the one open `prism-load-nightly-failure` issue. A cancelled run
+  # (a skipped night) does neither. The soak never records a tested commit.
+  report:
+    name: Record the tested commit and report a failure
+    needs: [guard, plan, build, run, live-nightly, live-weekly, stratum-fuzz, shipped-images]
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download the gated markers
+        id: gated
+        if: >-
+          ${{ github.event.schedule == '17 2 * * *'
+          && (needs.run.result == 'success' || needs.run.result == 'failure') }}
+        # No preset reaching its gate means no markers to download.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-load-gated-*
+          path: ${{ runner.temp }}/gated
+          merge-multiple: true
+      - name: Write the tested commit if every preset reached its gate
+        id: tested
+        if: ${{ steps.gated.conclusion == 'success' }}
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gated" "${RUNNER_TEMP}/tested"
+          missing="$(jq -r '.include[].preset' <<<"${MATRIX}" | while read -r preset; do
+            [[ -f "${RUNNER_TEMP}/gated/${preset}" ]] || echo "${preset}"
+          done)"
+          if [[ -n "${missing}" ]]; then
+            echo "Not recorded as tested; these presets never reached their gate:" "${missing}"
+            exit 0
+          fi
+          printf '%s\n' "${SHA}" > "${RUNNER_TEMP}/tested/commit"
+          printf 'recorded=true\n' >> "${GITHUB_OUTPUT}"
+      - name: Upload the tested commit
+        if: ${{ steps.tested.outputs.recorded == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-tested-commit
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/tested/commit
+          if-no-files-found: error
+      - name: Open or update the failure issue
+        if: ${{ contains(needs.*.result, 'failure') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCHEDULE: >-
+            ${{ github.event.schedule == '43 3 * * 0' && 'weekly'
+            || github.event.schedule == '41 5 * * 6' && 'weekly soak'
+            || 'nightly' }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          label=prism-load-nightly-failure
+          gh label create "${label}" --repo "${REPO}" --color B60205 \
+            --description "A scheduled prism-load-nightly.yml run failed (#549)" 2>/dev/null || true
+          # The backticks are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          failed="$(jq -r 'to_entries[] | select(.value.result == "failure") | "- `\(.key)`"' <<<"${RESULTS}")"
+          # shellcheck disable=SC2016
+          body="$(printf 'The %s scheduled run failed: %s\n\nCommit: `%s`\n\nFailed jobs:\n%s\n' \
+            "${SCHEDULE}" "${RUN_URL}" "${SHA:-3.x.x (the weekly job checks out the branch)}" "${failed}")"
+          issue="$(gh issue list --repo "${REPO}" --label "${label}" --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [[ -n "${issue}" ]]; then
+            gh issue comment "${issue}" --repo "${REPO}" --body "${body}"
+          else
+            gh issue create --repo "${REPO}" --label "${label}" \
+              --title "PRISM load nightly: a scheduled run failed" \
+              --body "${body}
+
+          Opened by the report job of .github/workflows/prism-load-nightly.yml (#549). Later failures comment here while it is open; close it once the cause is fixed."
+          fi
+
+  # L6's path filter (see the header). A PR's other events and a 3.x.x push
+  # land here; only a change to a watched path runs `shipped-images`. PRs into
+  # other branches (main's copy of this file) never run L6: their checkout
+  # has no lane to run.
+  changes:
+    name: Detect Dockerfile or Compose changes
+    if: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action != 'labeled'
+        && github.base_ref == '3.x.x')
+      || github.event_name == 'push' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      images: ${{ steps.match.outputs.images }}
+    steps:
+      - name: Check out the lane driver
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/prism_shipped_image_lane.py
+          sparse-checkout-cone-mode: false
+      - name: Match the changed files against the watched paths
+        id: match
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          files="${RUNNER_TEMP}/changed-files"
+          # The APIs list at most 3,000 files for a PR and 300 for a
+          # comparison. A list at its cap may omit a watched path, so it runs
+          # the lane, as does a new branch with nothing to compare.
+          if [[ -n "${PR}" ]]; then
+            cap=3000
+            gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .filename' > "${files}.names"
+            gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .previous_filename // empty' > "${files}.renames"
+          elif [[ "${BEFORE}" =~ ^0+$ ]]; then
+            cap=0
+            : > "${files}.names"
+            : > "${files}.renames"
+          else
+            cap=300
+            gh api "repos/${REPO}/compare/${BEFORE}...${AFTER}" --jq '.files[] | .filename' > "${files}.names"
+            gh api "repos/${REPO}/compare/${BEFORE}...${AFTER}" --jq '.files[] | .previous_filename // empty' > "${files}.renames"
+          fi
+          count="$(wc -l < "${files}.names")"
+          if (( count >= cap )); then
+            images=true
+            echo "The change list has ${count} files (cap ${cap}); running L6 in case it is truncated."
+          else
+            images="$(cat "${files}.names" "${files}.renames" | python3 scripts/prism_shipped_image_lane.py changed)"
+          fi
+          echo "L6 runs: ${images}"
+          printf 'images=%s\n' "${images}" >> "${GITHUB_OUTPUT}"
+
+  # #487 L6 (#544): scripts/prism_shipped_image_lane.py builds the images with
+  # `docker compose build` (Blacksmith's builder keeps the layer cache between
+  # runs), brings up compose.yaml + compose.prism-ha.yaml with the `prism`
+  # profile, and holds it to the checks its docstring lists: both frontends
+  # ready, #281 criterion 1 across them, a verified found block for each
+  # client, exact ledger reconciliation and the public API's block list. A
+  # cold build is most of the 45 minutes; the scenario itself takes about ten.
+  shipped-images:
+    name: Shipped images (Compose prism profile, HA overlay)
+    needs: changes
+    # `changes` is skipped on a schedule or dispatch, so accept that too.
+    if: >-
+      ${{ !cancelled() && (needs.changes.outputs.images == 'true'
+      || github.event.schedule == '43 3 * * 0' || inputs.images) }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (inputs.ref || '3.x.x') || '' }}
+      # The runner context is not available to a job's env, so name the
+      # directories here.
+      - name: Name the work and output directories
+        run: |
+          printf 'L6_WORK=%s/generated/l6\n' "${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+          printf 'L6_OUT=%s/prism-shipped-images\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Record the host and the Compose version
+        run: |
+          set -euo pipefail
+          {
+            echo "### L6 on blacksmith-8vcpu-ubuntu-2404"
+            echo
+            echo '```'
+            git rev-parse HEAD
+            nproc
+            free -m
+            docker compose version
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      # The qbit clone is the slow part of staging; key it on the pin.
+      - name: Restore the qbit source cache
+        uses: actions/cache@v6
+        with:
+          path: generated/qbit-git-cache
+          key: prism-shipped-images-qbit-src-v1-${{ hashFiles('config/upstream.env', 'config/upstream.env.example') }}
+      - name: Stage the qbit source and write the lane's env file
+        run: python3 scripts/prism_shipped_image_lane.py prepare --work "${L6_WORK}"
+      - name: Build the images with Compose
+        run: python3 scripts/prism_shipped_image_lane.py build --work "${L6_WORK}"
+      - name: Run the lane
+        run: python3 scripts/prism_shipped_image_lane.py run --work "${L6_WORK}" --out "${L6_OUT}"
+      - name: Upload the report, client logs and Compose logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-shipped-images
+          overwrite: true
+          retention-days: 30
+          path: ${{ runner.temp }}/prism-shipped-images
           if-no-files-found: error
