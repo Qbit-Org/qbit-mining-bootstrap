@@ -691,7 +691,11 @@ impl Ledger {
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
         let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        // Dropped on every path out: after the COMMIT or the gate's ROLLBACK
+        // below, or, on an error, just before the queued ROLLBACK runs.
+        let _order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::Append)
+            .await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {
             let revision:i64=sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL FOR SHARE").fetch_one(&mut *tx).await?;
@@ -892,7 +896,9 @@ impl Ledger {
         ensure!(weight > 0, "network difficulty must be positive");
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::Prepared)
+            .await?;
         writable(&mut tx).await?;
         let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
@@ -927,6 +933,7 @@ impl Ledger {
             })
             .await?;
         tx.commit().await?;
+        drop(order);
         let debt = debt.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(metrics) = self.metrics.as_deref().filter(|_| debt != u64::MAX) {
             metrics.record_carry_forward_debt(debt);

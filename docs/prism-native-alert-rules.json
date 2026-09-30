@@ -176,6 +176,58 @@
       ]
     },
     {
+      "uid": "qbit-prism-landing-ack-p99-slow",
+      "title": "PrismLandingAckP99Slow",
+      "role": "run",
+      "expr": "(qbit_prism_share_ack_slow_landing_windows{job=\"qbit-prism\",network=\"__NETWORK__\",p99_above_seconds=\"2\"} >= bool 3) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "ticket",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismLandingAckP99Slow",
+      "description": "Share acknowledgement p99 exceeded 2 seconds in three consecutive landing windows on this frontend. A landing window opens when this frontend first observes a pool block's acceptance (its own submitblock acceptance, or a peer frontend's block on the active chain, seen before it is confirmed or already confirmed at the tip) and admits every share submission that arrives within the next 30 seconds; settlement, which holds ORDER_LOCK while every share append waits for it, runs inside that window (#602). Each window is judged 30 seconds after it stops admitting submissions: its nearest-rank acknowledgement p99 is over a bound exactly when more than one percent of its acknowledgements took longer, counted exactly by the process rather than read from buckets. The gauge holds its value until the next verdict, so the alert stays active until a landing window at or under the bound; a window with no acknowledgement leaves it unchanged. Per frontend. -1 (no verdict since start) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements. #602 R1 asks for a landing-window p99 at or under 500 ms and no acknowledgement over 2 s; 2.x.x shows a block-minute p99 of about 4-5 s against about 0.2 s otherwise. Three consecutive windows keep one slow landing (a cold cache, a one-off settlement) from ticketing. Provisional, measure in #291 and #602 step 3.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "#602 R1 asks for a landing-window p99 at or under 500 ms and no acknowledgement over 2 s; 2.x.x shows a block-minute p99 of about 4-5 s against about 0.2 s otherwise. Three consecutive windows keep one slow landing (a cold cache, a one-off settlement) from ticketing. Provisional, measure in #291 and #602 step 3.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing_acks.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum/share_observation.rs"
+      ]
+    },
+    {
+      "uid": "qbit-prism-landing-ack-p99-high",
+      "title": "PrismLandingAckP99High",
+      "role": "run",
+      "expr": "(qbit_prism_share_ack_slow_landing_windows{job=\"qbit-prism\",network=\"__NETWORK__\",p99_above_seconds=\"10\"} >= bool 1) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismLandingAckP99High",
+      "description": "Share acknowledgement p99 exceeded 10 seconds in the latest landing window on this frontend. A landing window opens when this frontend first observes a pool block's acceptance (its own submitblock acceptance, or a peer frontend's block on the active chain, seen before it is confirmed or already confirmed at the tip) and admits every share submission that arrives within the next 30 seconds; settlement, which holds ORDER_LOCK while every share append waits for it, runs inside that window (#602). Each window is judged 30 seconds after it stops admitting submissions: its nearest-rank acknowledgement p99 is over a bound exactly when more than one percent of its acknowledgements took longer, counted exactly by the process rather than read from buckets. The gauge holds its value until the next verdict, so the alert stays active until a landing window at or under the bound; a window with no acknowledgement leaves it unchanged. Per frontend. -1 (no verdict since start) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements. 10 s is two thirds of the default share-commit timeout (PRISM_SHARE_COMMIT_TIMEOUT_SECONDS, 15 s), past which an append is answered ledger-outcome-unknown; rental proxies and some firmware resubmit or reconnect well before it. One window is enough. Provisional, measure in #291 and #602 step 3.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "10 s is two thirds of the default share-commit timeout (PRISM_SHARE_COMMIT_TIMEOUT_SECONDS, 15 s), past which an append is answered ledger-outcome-unknown; rental proxies and some firmware resubmit or reconnect well before it. One window is enough. Provisional, measure in #291 and #602 step 3.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/landing_acks.rs",
+        "crates/qbit-prism-server/src/metrics/landing.rs",
+        "crates/qbit-prism-server/src/stratum/share_observation.rs"
+      ]
+    },
+    {
       "uid": "qbit-prism-reject-ratio",
       "title": "PrismRejectRatioByReasonHigh",
       "role": "run",
@@ -201,6 +253,31 @@
         "crates/qbit-prism-server/src/metrics/registry.rs#L79",
         "crates/qbit-prism-server/src/metrics/labels.rs#L25",
         "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-pool-resubmission-reject-ratio",
+      "title": "PrismPoolResubmissionRejectRatioHigh",
+      "role": "run",
+      "expr": "((sum by (network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\",reason_id=~\"duplicate-share|unknown-job|stale-job\"}[5m]) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))) / sum by (network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)))) > bool 0.05) and on(network) (sum by (network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))) >= 500)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "5m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismPoolResubmissionRejectRatioHigh",
+      "description": "Pool-wide share rejections for duplicate-share, unknown-job and stale-job, summed over every frontend with a fresh metrics snapshot, as a share of all acceptance and rejection decisions. These are the rejections slow acknowledgements and slow work delivery produce: a rental proxy resubmits a share it got no answer for and the copy is a duplicate (#602), and a miner still working an old job after a stall submits unknown or stale jobs (#598). Unlike PrismRejectRatioByReasonHigh it judges the pool, not one frontend, and the three reasons together, so rejections spread thinly across frontends and reasons still warn. Frontends with a missing or stale snapshot are left out of both sides of the ratio; no-data and evaluation errors are OK. Five percent of the pool's acceptance/rejection decisions over five minutes, from at least 500 decisions, for five minutes; the per-frontend, per-reason rule uses the same five percent. Provisional, measure in #291 and against 2.x.x's post-block reject spikes.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Five percent of the pool's acceptance/rejection decisions over five minutes, from at least 500 decisions, for five minutes; the per-frontend, per-reason rule uses the same five percent. Provisional, measure in #291 and against 2.x.x's post-block reject spikes.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs",
+        "crates/qbit-prism-server/src/metrics/labels.rs",
+        "crates/qbit-prism-server/src/stratum/share_observation.rs"
       ]
     },
     {

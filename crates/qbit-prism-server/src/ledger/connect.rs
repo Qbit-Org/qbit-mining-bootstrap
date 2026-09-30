@@ -1,5 +1,5 @@
 use super::*;
-use crate::metrics::{time_pool_acquire, LockKind, Metrics, Outcome};
+use crate::metrics::{time_pool_acquire, LockKind, Metrics, OrderLockHolder, Outcome};
 use sqlx::pool::PoolConnection;
 use sqlx::PgConnection;
 
@@ -185,6 +185,17 @@ impl Ledger {
         key: i64,
     ) -> Result<(), sqlx::Error> {
         lock(tx, key, self.metrics.as_deref()).await
+    }
+
+    /// Take `ORDER_LOCK`, recording this ledger's wait for it and, through the
+    /// returned guard, how long `holder` then holds it (#602). Keep the guard
+    /// until the transaction has committed or rolled back.
+    pub(super) async fn lock_order(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        holder: OrderLockHolder,
+    ) -> Result<OrderHold<'_>, sqlx::Error> {
+        lock_order(tx, self.metrics.as_deref(), holder).await
     }
 
     /// Connect without native telemetry: nothing is recorded and behaviour is
@@ -523,6 +534,47 @@ impl Drop for WaitGuard<'_> {
             metrics.observe_advisory_lock(self.kind, Outcome::Failure, elapsed);
         }
     }
+}
+
+/// One `ORDER_LOCK` hold (#602): from the moment the lock was granted until
+/// the guard is dropped, which each holder does once its transaction has
+/// committed or rolled back. A transaction abandoned by an error drops the
+/// guard as it unwinds, a moment before its queued `ROLLBACK` releases the
+/// lock. Holds on an unattached ledger read no clock and record nothing; an
+/// attached one reads the clock once more, after the grant.
+pub(super) struct OrderHold<'a> {
+    started: Option<(&'a Metrics, std::time::Instant)>,
+    holder: OrderLockHolder,
+}
+
+impl OrderHold<'_> {
+    /// Name the holder by what its transaction turned out to do, such as a
+    /// settlement that confirmed its block for the first time.
+    pub(super) fn relabel(&mut self, holder: OrderLockHolder) {
+        self.holder = holder;
+    }
+}
+
+impl Drop for OrderHold<'_> {
+    fn drop(&mut self) {
+        if let Some((metrics, granted)) = self.started.take() {
+            metrics.observe_order_lock_hold(self.holder, granted.elapsed());
+        }
+    }
+}
+
+/// Take `ORDER_LOCK` in `connection`'s transaction as `holder`; see
+/// [`OrderHold`].
+pub(super) async fn lock_order<'a>(
+    connection: &mut PgConnection,
+    metrics: Option<&'a Metrics>,
+    holder: OrderLockHolder,
+) -> Result<OrderHold<'a>, sqlx::Error> {
+    lock(connection, ORDER_LOCK, metrics).await?;
+    Ok(OrderHold {
+        started: metrics.map(|metrics| (metrics, std::time::Instant::now())),
+        holder,
+    })
 }
 
 /// The `LockKind` each advisory lock key records under, or `None` for a key
