@@ -17,7 +17,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 |---|---|---|---|
 | L0 existing CI | `ci.yml`, every PR and every push to `main`, `1.x.x`, `2.x.x`, `3.x.x` | `pr` | running, required |
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
-| L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz` | `nightly`, `dispatch` | running; repeats, trend and regression rule not yet (#549, #551, #542) |
+| L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz`, `evidence` | `nightly`, `dispatch` | running; trend rows and a report-only regression rule with provisional thresholds (#551); repeats not yet (#549) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
 | L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
@@ -94,6 +94,9 @@ parts:
 - `guard` and `report`: a night on which `3.x.x` has not moved is cancelled,
   never passed. A failed scheduled run opens or comments on the one
   `prism-load-nightly-failure` issue.
+- `evidence` (scheduled runs only) and `evidence-preview` (a `run-load` PR or
+  a dispatch, read-only): the trend rows, the regression rule and evidence
+  promotion ([below](#trend-regression-rule-and-evidence-promotion-551)).
 
 **Proves:** each preset completes, reconciles exactly, loses no acknowledged
 share and has no durability finding. It has zero shortfall in each gated
@@ -102,10 +105,11 @@ of this is on one named runner class, on one commit.
 
 **Does not prove:**
 
-- **A regression.** Each preset runs once, and there is no trailing baseline
-  or noise floor yet. A rate that drifts while its gates hold goes unnoticed.
-  The repeats and the runner class are #549 and #542; the trend and the
-  regression rule are #551.
+- **A regression, as a gate.** The regression rule (#551) compares each
+  number with its trailing baseline and files one tracking issue, but it is
+  report-only and its thresholds are provisional until #542's measured
+  variance is checked in. Each preset still runs once a night; the repeats
+  are #549.
 - **A D1 verdict** (#487 decision 5). The rates hold only on the runner class
   they ran on, and CI runners are not the rehearsal host (#477).
 
@@ -144,10 +148,110 @@ difference carries the run-to-run noise, which #542 measures.
 
 ### Trend, regression rule and evidence promotion (#551)
 
-**Not yet running; owner #551.** The plan is one JSON row per run on an orphan
-`ci-evidence` branch, a regression rule against the trailing same-class
-baseline, and raw bundles promoted to release assets. See
-[Where evidence lives](#where-evidence-lives).
+**Runs:** the `evidence` job, on every scheduled run of
+`prism-load-nightly.yml` (the nightly, the Sunday weekly run and the Saturday
+soak). It is the only job in the workflow with `contents: write` (with
+`issues: write` and `actions: read`). A `run-load` PR and a dispatch get
+`evidence-preview` instead, with a read-only token. It applies the same rule
+to its own rows against the recorded trend and writes only to the job
+summary. Both jobs call `.github/actions/prism-load-evidence`, which the L3
+tag-push job will call too once #550's tag hook lands (after #608).
+
+**Trend rows.** Each preset job builds its row on every event with
+`scripts/prism_load_trend.py row` and uploads it as the artifact
+`prism-load-trend-<preset>` (7 days). Only `evidence` records rows. A row is
+one JSON object, schema `qbit.prism.load-trend-row.v1`:
+
+| Field | What |
+|---|---|
+| `kind` | `preset` (a preset run), `missing` (a planned preset whose job, at its latest attempt, left no row), `job` (a non-preset job's outcome: `bridging` as L2, `live-nightly` and `live-weekly` as L4, `stratum-fuzz` as `fuzz`, `shipped-images` as L6), or `promotion` (an asset promoted after its row was written) |
+| `run_id`, `run_attempt`, `run_url`, `event`, `ref`, `commit`, `recorded_at` | the run, the commit its job checked out, and when the row was built (UTC) |
+| `lane`, `preset`, `preset_sha256` | L2 for the nightly presets, `weekly` for the Saturday soak (#575, not L5); the preset file's hash, so a changed preset starts a new series |
+| `runner_class`, `host` | the runner label and `host.json`'s CPU, memory, kernel, filesystem, write cache and FUA |
+| `fsync` | `pg_test_fsync`'s fdatasync ops/s and µs/op, and its band |
+| `outcome` | the harness and gate exit codes, `pass`, `fail` or `no verdict`, and the build provenance |
+| `headline` | per phase: achieved rate, client ACK p50/p99 (ms, client clock), server ACK mean and bucketed p99 (ms, receipt to response write, including the share append), ORDER_LOCK max and mean waiters, peak frontend RSS (MiB), shortfall, refused valid shares, missing shares; per run: tip-to-last-notify p99 (ms) and durability findings |
+| `artifact`, `promotion`, `asset_url` | the run's artifact (name, ID, URL), and its release asset once promoted |
+
+A number the run did not measure is `null`, never 0. A row of another schema
+is skipped by every reader, not guessed at.
+
+**The branch.** `ci-evidence` is an orphan branch holding
+`trend/<lane>/YYYY-MM.jsonl` (the month of `recorded_at`) and a README. It is
+append-only: rows are added, never edited, and a push is never forced. The
+first write creates it. `scripts/prism_load_trend.py append` refuses any row
+whose event is not `schedule`, or a `push` of a `refs/tags/v*` tag. The
+action refuses to write from any other event too. Each attempt fetches the
+tip and skips rows already there. The identity is kind, run, attempt and
+preset; for a job row it is job, attempt, outcome and commit (each job exports the attempt it ran in). It then commits on top
+and pushes, and retries a rejected or unconfirmed push from a fresh fetch, up
+to 5 attempts in 300 s. So the nightly and the soak writing at once lose no
+row, and a re-run never duplicates one.
+
+**Promotion.** Bundles that must outlive the 90-day artifacts become release
+assets:
+
+- the Saturday soak's (`weekly`) bundle, and any L5 run's, always;
+- an L2 run's bundle when it is flagged, meaning the rule found a regressed
+  number or the gate failed;
+- a tag's full-suite bundles (L3), all of them, once the tag hook lands.
+
+Monthly bundles go to the rolling `ci-evidence/YYYY-MM` pre-release, which
+is created when missing and never marked latest. A tag's bundles go to that
+tag's release. An asset is the run's artifact, fetched by its exact ID and
+tarred as `<lane>-<preset>-run<id>-attempt<n>.tar.gz`, so `--clobber` only
+ever replaces the same bundle on a retry. The row records the asset URL read
+back from the release. A promotion that fails is recorded as `failed` in the
+row, and the job fails. A re-run that later promotes it adds a `promotion`
+row. To keep a run cited in an issue or a doc, a maintainer runs
+`scripts/prism_load_trend.py cite --artifact-id N --lane L2 --preset NAME
+--repository Qbit-Org/qbit-mining-bootstrap [--append]`.
+
+**The regression rule** (`scripts/prism_load_regress.py`) is **report-only**.
+Its thresholds live in `test/prism-load-regression.toml`, which is marked
+`provisional`.
+
+- **Series.** A series is one lane (L2 today), preset and preset sha256,
+  runner class and fsync band (`fast` under 1,000 µs/op, `medium` under
+  4,000, `slow` above). Only runs whose harness exited 0 count, each at its
+  latest attempt.
+- **Limit.** A number regresses when it is worse than the median of the last
+  14 such runs (at least 5) by more than
+  `max(k × spread, min_relative_change × |median|, min_absolute_change)`,
+  with `k = 3` and per-number floors.
+- **Spread.** The spread is #542's measured coefficient of variation over
+  every run (`all.cv` in `scripts/prism_load_probe.py variance`'s document,
+  schema `qbit.prism.runner-probe-variance.v1`). It is read from the group
+  for the run's own #542 fsync band, or else the class's all-band group, when
+  that document is checked in as `test/prism-load-variance.json`. Otherwise
+  it is the baseline's scaled MAD, which is provisional.
+- **Where #542 does not apply.** #542 measures the rate, the client ACK
+  p50/p99 and the tip-to-last-notify p99, so the server ACK, lock waiters
+  and RSS stay provisional. A variance document of another schema or version
+  is refused by name. When #542's VM-to-VM spread is over 2× its run-to-run
+  spread, the summary points at #511's same-VM A/B instead.
+- **Commit range.** A regressed number is reported with the range from the
+  last good run's commit to the first bad run's. Flagged runs stay out of
+  later baselines, so a lasting regression keeps its range. After 14 flagged
+  runs in a row, the new level is taken as accepted.
+- **Unknowns.** An unmeasured number, a run with no fsync cost, a short
+  series, a harness exit other than 0 and a planned preset with no row each
+  read **unknown** or **not evaluated**, with the reason, never as within.
+- **Where it reports.** The verdict goes to the job summary and the artifact
+  `prism-load-regression-verdict` (90 days). On a regression, `evidence`
+  opens or updates the one `prism-load-regression` issue. Its body is the
+  latest flagged run's table, with the commit range and both runs' numbers
+  side by side, and each flagged run adds a comment. It never pages and
+  never blocks a merge.
+
+**Proves:** every scheduled run since #551 has trend rows, and PR and
+dispatch runs record nothing. It also shows whether a number moved beyond
+the (provisional) noise allowance of its own series, and between which
+commits.
+
+**Does not prove:** a D1 verdict (decision 5), or a regression gate. The rule
+never fails a job. Its thresholds stay provisional until #542's measured
+document is checked in and `provisional` is set to false.
 
 ### Runner classes and noise floor (#541, #542)
 
@@ -304,11 +408,14 @@ defines each field.
 | `prism-load-bridging` | both runs' directories (`fake/`, `real/`) and `bridge-row.json` | 90 days | running |
 | `prism-live-nightly`, `prism-live-weekly`, `prism-stratum-fuzz`, `prism-shipped-images` | gate manifests and test logs; fuzz logs and crashing inputs; `l6-report.json` and the Compose logs | 30 days | running |
 | `prism-load-tested-commit` | the commit the last nightly carried to a verdict (the guard reads it) | 90 days | running |
-| `ci-evidence` branch | one JSON line per run, one file per lane per month | permanent | **not yet; owner #551** |
-| Release assets | bundles that must outlive 90 days: every full-suite job, flagged L2 runs, soaks, and any run cited in an issue or doc | permanent | **not yet; owner #551** (the bundle for a release candidate is #557) |
+| `prism-load-trend-<preset>` | the preset run's trend row (every event) | 7 days | running |
+| `prism-load-regression-verdict` | the regression rule's verdict JSON and summary | 90 days | running |
+| `ci-evidence` branch | `trend/<lane>/YYYY-MM.jsonl`: one JSON line per preset run, job outcome, missing preset or later promotion, from scheduled runs (and `v*` tag runs once L3's tag hook lands) | permanent | running (#551) |
+| Release assets | the rolling `ci-evidence/YYYY-MM` pre-release: soaks, flagged L2 runs and cited runs; a tag's release: its full-suite jobs | permanent | running for the nightly workflow (#551); the tag's release follows L3's tag hook, and the bundle for a release candidate is #557 |
 
 A run cited in [prism-throughput-measurements.md](prism-throughput-measurements.md)
-or in an issue should link its run and artifact until #551 can promote it.
+or in an issue can be promoted with `scripts/prism_load_trend.py cite`
+([above](#trend-regression-rule-and-evidence-promotion-551)); link the asset.
 
 ## Reproducing a run locally
 
