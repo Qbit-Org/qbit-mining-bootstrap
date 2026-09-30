@@ -78,8 +78,9 @@ name: PRISM load harness (nightly)
 #   - The guard job ends the nightly schedule early when 3.x.x's head is the
 #     commit the last scheduled nightly tested, and cancels the run so the
 #     skip shows as cancelled, never as passed. A nightly records the commit
-#     it tested in its `prism-load-tested-commit` artifact once every preset
-#     reached its gate, pass or fail. Neither weekly schedule (the Sunday
+#     it tested in its `prism-load-tested-commit` artifact once every preset,
+#     and both halves of the bridging job (#552), reached its gate, pass or
+#     fail. Neither weekly schedule (the Sunday
 #     live scenarios, the Saturday soak) nor a dispatch is ever skipped.
 #   - Each preset's artifact carries host.json (runner label, filesystem mount
 #     options, block device write cache and FUA) and is kept for 90 days
@@ -518,6 +519,29 @@ jobs:
           python3 scripts/prism_load_bridge.py --fake "${out}/fake" --real "${out}/real" \
             --order "${ORDER}" --out "${out}/bridge-row.json" --summary "${GITHUB_STEP_SUMMARY}" \
             --commit "${SHA}" --run-url "${RUN_URL}"
+      # As the matrix's presets do: the report job records a nightly's commit
+      # as tested only if this marker says both halves reached a verdict
+      # (gate exit 0 or 1), so a bridge that failed before that, or timed
+      # out, is retried the next night rather than skipped as unchanged.
+      - name: Mark the bridge as gated
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gated"
+          for side in fake real; do
+            code="$(cat "${RUNNER_TEMP}/prism-load-bridging/${side}/gate-exit-code" 2>/dev/null || true)"
+            [[ "${code}" == 0 || "${code}" == 1 ]] || exit 0
+          done
+          touch "${RUNNER_TEMP}/gated/bridging"
+      - name: Upload the gated marker
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-gated-bridging
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/gated
+          if-no-files-found: ignore
       - name: Upload both runs and the row
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -801,7 +825,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/gated" "${RUNNER_TEMP}/tested"
-          missing="$(jq -r '.include[].preset' <<<"${MATRIX}" | while read -r preset; do
+          # `bridging` is #552's job, which runs on every nightly.
+          missing="$( { jq -r '.include[].preset' <<<"${MATRIX}"; echo bridging; } | while read -r preset; do
             [[ -f "${RUNNER_TEMP}/gated/${preset}" ]] || echo "${preset}"
           done)"
           if [[ -n "${missing}" ]]; then

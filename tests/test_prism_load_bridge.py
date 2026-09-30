@@ -265,6 +265,13 @@ class Workflow(unittest.TestCase):
         # host.json records the label the job gives, so it must be this one.
         self.assertEqual(re.search(r"^          RUNNER_LABEL: (\S+)$", self.job, re.M).group(1), runner)
 
+    def test_a_bridge_that_reached_no_verdict_keeps_the_commit_untested(self) -> None:
+        self.assertIn("name: prism-load-gated-bridging", self.job)
+        self.assertIn('touch "${RUNNER_TEMP}/gated/bridging"', self.job)
+        report = re.search(r"^  report:\n(.*?)(?=^  [a-z-]+:\n)", self.text, re.S | re.M).group(1)
+        self.assertIn("echo bridging; } | while read -r preset", report)
+        self.assertIn("pattern: prism-load-gated-*", report)
+
     def test_a_failed_bridging_run_reaches_the_failure_report(self) -> None:
         needs = re.search(r"^  report:\n(?:.*\n)*?    needs: \[(.*)\]", self.text, re.M).group(1)
         self.assertIn("bridging", [name.strip() for name in needs.split(",")])
