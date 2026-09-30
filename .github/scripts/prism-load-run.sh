@@ -13,10 +13,17 @@
 # server binaries in PG_BIN_DIR (default /usr/lib/postgresql/16/bin).
 #
 # Writes into the output directory:
+#   host.json                the host fingerprint from scripts/prism_load_probe.py
+#                            host: the runner label (RUNNER_LABEL, when set),
+#                            CPU, memory, kernel, and the filesystem and block
+#                            device under the cluster (mount options, write
+#                            cache, FUA)
 #   pg_test_fsync.txt        the WAL volume's commit cost, on the filesystem
 #                            the harness builds its cluster on
 #   harness-exit-code        the harness's exit code
 #   gate.md                  the gate's verdict table
+#   gate-exit-code           the gate's exit code: 0 or 1 is a verdict, anything
+#                            else (2, a panic, a binary that would not start) is not
 #   everything the harness writes (load-harness-report.json, logs/, ...)
 #
 # Optional overrides of the preset's gates: PRISM_LOAD_MAX_SHORTFALL and
@@ -48,6 +55,12 @@ mkdir -p "${out}"
 # socket path over 107 bytes, so the directory is kept short.
 export TMPDIR="${PRISM_LOAD_TMPDIR:-${RUNNER_TEMP:-/tmp}/pload}"
 mkdir -p "${TMPDIR}"
+
+# #549: the fingerprint is evidence beside the result, so failing to take it
+# is noted in the file and does not stop the run.
+python3 "${root}/scripts/prism_load_probe.py" host --out "${out}/host.json" --dir "${TMPDIR}" \
+  ${RUNNER_LABEL:+--runner "${RUNNER_LABEL}"} \
+  || echo '{"error": "prism_load_probe.py host failed"}' > "${out}/host.json"
 
 {
   echo "# pg_test_fsync on the harness's cluster filesystem (${TMPDIR})"
@@ -81,10 +94,19 @@ set +e
 "${gate[@]}" > "${out}/gate.md"
 status=$?
 set -e
+echo "${status}" > "${out}/gate-exit-code"
 cat "${out}/gate.md"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
     cat "${out}/gate.md"
+    echo
+    echo "<details><summary>Host</summary>"
+    echo
+    echo '```json'
+    cat "${out}/host.json"
+    echo '```'
+    echo
+    echo "</details>"
     echo
     echo "<details><summary>pg_test_fsync</summary>"
     echo

@@ -850,6 +850,24 @@ cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
 .github/scripts/prism-load-run.sh mainnet-shape-130-addresses load-out
 ```
 
+Each preset's artifact also carries `host.json`
+(`scripts/prism_load_probe.py host`): the runner label, CPU, memory, kernel,
+and the filesystem and block device the cluster sits on (mount options,
+write cache, FUA). The artifacts are kept for 90 days (#549).
+
+A maintainer can run the nightly set against a PR by applying the `run-load`
+label: the workflow runs on `pull_request` (`labeled`, never
+`pull_request_target`) against the PR's merge result, in a concurrency group
+of its own so it never cancels a queued nightly. A later push needs the label
+applied again.
+
+The nightly schedule skips a night when `3.x.x`'s head is the commit the last
+scheduled nightly tested (recorded in its `prism-load-tested-commit`
+artifact once every preset reached its gate); the skipped run is cancelled so
+it never shows as a pass. The weekly schedule and dispatches always run. A
+failed scheduled run, nightly or weekly, opens the `prism-load-nightly-failure`
+issue, or comments on it while it is open.
+
 `.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
 schedule) measures the Blacksmith runner classes themselves before a lane
 depends on them. On each chosen class (8, 16 and 32 vCPU by default) it builds
