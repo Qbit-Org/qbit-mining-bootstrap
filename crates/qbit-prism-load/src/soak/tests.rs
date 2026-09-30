@@ -11,6 +11,7 @@ fn gates() -> Gates {
         rss_trend_window_minutes: 20.0,
         min_trend_windows: 3,
         rss_warmup_peak_multiple_max: Some(2.0),
+        rss_expected_failure: None,
         fd_slope_per_hour_max: 2.0,
         pool_connections_max: 20,
         pool_connections_drift_max: 2.0,
@@ -350,4 +351,95 @@ fn the_checked_in_testnet4_gates_parse_and_validate() {
         !gates.one_lifetime,
         "a deployment may be restarted by its operator"
     );
+    assert_eq!(gates.rss_expected_failure, None);
+}
+
+#[test]
+fn an_expected_resident_memory_failure_passes_until_it_looks_fixed() {
+    let mut known = gates();
+    known.rss_expected_failure = Some("#600".into());
+    // A leak fails the slope row alone; with the issue named it is reported,
+    // not gated, and every other gate still holds.
+    let checks = evaluate(&series(120, 64.0), &known);
+    assert!(failed(&checks).is_empty(), "{:?}", failed(&checks));
+    let expected: Vec<&Check> = checks
+        .iter()
+        .filter(|c| c.observed.starts_with("expected failure (#600): "))
+        .collect();
+    assert_eq!(expected.len(), 1, "{checks:?}");
+    assert!(expected[0].name.starts_with("resident memory slope"));
+    assert_eq!(expected[0].pass, None);
+    // The warm-up ratio row passes beside it, as fe-1's did in #600's run:
+    // the group has failed, so that is not "looks fixed".
+    assert!(checks
+        .iter()
+        .any(|c| c.name.starts_with("resident memory against") && c.pass == Some(true)));
+    // #600's shape: one frontend leaks, a second stays flat and passes both
+    // of its rows. The group has still failed as expected.
+    let mut samples = series(120, 64.0);
+    for sample in &mut samples {
+        let mut flat = sample.processes[0].clone();
+        flat.instance = "load-fe-1".into();
+        flat.pid = Some(43);
+        flat.rss_bytes = Some(200 << 20);
+        sample.processes.push(flat);
+        if let Some(clients) = sample.database.connections.as_mut() {
+            clients.insert("load-fe-1".into(), 10);
+        }
+    }
+    let checks = evaluate(&samples, &known);
+    assert!(failed(&checks).is_empty(), "{:?}", failed(&checks));
+    assert_eq!(
+        checks
+            .iter()
+            .filter(|c| c.name.starts_with("resident memory") && c.name.ends_with("load-fe-1"))
+            .filter(|c| c.pass == Some(true))
+            .count(),
+        2,
+        "{checks:?}"
+    );
+    // Flat memory: the issue looks fixed, and that fails the soak.
+    let failures = failed(&evaluate(&series(120, 0.0), &known));
+    assert_eq!(
+        failures,
+        vec!["resident memory expected failure, #600: #600 looks fixed: every resident-memory row passed"]
+    );
+    // Other gates stay hard: a descriptor leak still fails.
+    let mut samples = series(120, 64.0);
+    for (minute, sample) in samples.iter_mut().enumerate() {
+        sample.processes[0].open_fds = Some(300 + minute as u64);
+    }
+    let failures = failed(&evaluate(&samples, &known));
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].starts_with("open file descriptors slope"));
+}
+
+#[test]
+fn an_expected_resident_memory_failure_is_no_excuse_for_an_unknown_reading() {
+    let mut known = gates();
+    known.rss_expected_failure = Some("#600".into());
+    let mut samples = series(120, 0.0);
+    for sample in &mut samples {
+        sample.processes[0].rss_bytes = None;
+    }
+    let failures = failed(&evaluate(&samples, &known));
+    assert!(
+        failures
+            .iter()
+            .all(|line| line.starts_with("resident memory") && line.contains("unknown")),
+        "{failures:?}"
+    );
+    assert!(!failures.is_empty());
+    assert!(!failures.iter().any(|line| line.contains("looks fixed")));
+}
+
+#[test]
+fn rss_expected_failure_must_name_an_issue() {
+    let mut known = gates();
+    for bad in ["600", "#", "#60a", "see #600"] {
+        known.rss_expected_failure = Some(bad.into());
+        assert!(known.validate().is_err(), "{bad}");
+    }
+    known.rss_expected_failure = Some("#600".into());
+    known.validate().unwrap();
 }

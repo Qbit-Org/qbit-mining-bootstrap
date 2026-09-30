@@ -41,6 +41,7 @@ fn gates(min_rollovers: u64) -> soak::Gates {
         rss_trend_window_minutes: 20.0,
         min_trend_windows: 3,
         rss_warmup_peak_multiple_max: None,
+        rss_expected_failure: None,
         fd_slope_per_hour_max: 1e9,
         pool_connections_max: 1000,
         pool_connections_drift_max: 1000.0,

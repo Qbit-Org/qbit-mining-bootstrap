@@ -136,6 +136,13 @@ pub struct Gates {
     /// the warm-up, resident memory stays within this multiple of the
     /// warm-up's peak. `null` does not gate on it.
     pub rss_warmup_peak_multiple_max: Option<f64>,
+    /// The issue (`#<number>`) that explains a known resident-memory
+    /// failure, or `null`. While it is set, the resident-memory rows are an
+    /// expected failure: a measured one is reported, not gated, and a soak
+    /// in which every resident-memory row passes fails with "looks fixed",
+    /// so the key is removed and the gate is real again. Unknown readings
+    /// still fail. Every other gate is unaffected.
+    pub rss_expected_failure: Option<String>,
     /// Least-squares slope of open file descriptors after the warm-up, per
     /// process, per hour.
     pub fd_slope_per_hour_max: f64,
@@ -234,6 +241,14 @@ impl Gates {
             ensure!(
                 multiple.is_finite() && multiple >= 1.0,
                 "soak gate rss_warmup_peak_multiple_max must be at least 1"
+            );
+        }
+        if let Some(issue) = &self.rss_expected_failure {
+            ensure!(
+                issue
+                    .strip_prefix('#')
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+                "soak gate rss_expected_failure must name an issue as #<number>, or be null"
             );
         }
         Ok(())

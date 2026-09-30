@@ -291,9 +291,14 @@ pub fn evaluate(samples: &[Sample], gates: &Gates) -> Vec<Check> {
             "at least one".into(),
         ));
     }
+    let mut processes = Vec::new();
     for instance in &names {
-        checks.extend(process_checks(samples, instance, gates));
+        processes.extend(process_checks(samples, instance, gates));
     }
+    if let Some(issue) = &gates.rss_expected_failure {
+        expect_rss_failure(&mut processes, issue);
+    }
+    checks.extend(processes);
     checks.extend(connection_checks(samples, &after, gates));
     checks.push(peak_check(
         samples,
@@ -415,6 +420,40 @@ fn process_checks(samples: &[Sample], instance: &str, gates: &Gates) -> Vec<Chec
         gates,
     ));
     checks
+}
+
+/// A known resident-memory failure (see [`Gates::rss_expected_failure`]),
+/// over every process's rows at once: one frontend's warm-up ratio can pass
+/// while its slope, or another frontend's rows, fail. A measured failure is
+/// reported, not gated. When no row failed and none was unknown, the issue
+/// looks fixed, and that fails until the key is removed. An unknown row is
+/// left failing: it is no evidence either way.
+fn expect_rss_failure(checks: &mut Vec<Check>, issue: &str) {
+    let rss = |check: &Check| check.name.starts_with("resident memory ");
+    let unknown = |check: &Check| check.observed.starts_with("unknown");
+    let mut expected = 0usize;
+    let mut unread = false;
+    for check in checks.iter_mut().filter(|check| rss(check)) {
+        match check.pass {
+            Some(false) if unknown(check) => unread = true,
+            Some(false) => {
+                check.pass = None;
+                check.observed = format!("expected failure ({issue}): {}", check.observed);
+                expected += 1;
+            }
+            _ => {}
+        }
+    }
+    if expected == 0 && !unread {
+        checks.push(fail(
+            format!("resident memory expected failure, {issue}"),
+            format!("{issue} looks fixed: every resident-memory row passed"),
+            format!(
+                "a resident-memory row fails as {issue} describes; once it is \
+                 resolved, set rss_expected_failure to null"
+            ),
+        ));
+    }
 }
 
 /// Connections per client key: a server process's key is its instance name
