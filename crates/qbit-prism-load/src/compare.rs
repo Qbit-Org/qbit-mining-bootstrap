@@ -1628,10 +1628,14 @@ pub fn compare(
         }
     }
     // Every scheduled own block fires in `steady_state`, so the phases'
-    // total is the pinned `--scheduled-blocks` (in every harness since #271).
-    // Under the dense cadence the flag is instead the dense phase's landing
-    // budget: the report states it, and the phase lands one block on each
-    // slot the gap pattern places while the budget lasts.
+    // total is the pinned `--scheduled-blocks`, and each must have landed:
+    // the node accepted it (`node.submissions`, which only scheduled blocks
+    // reach), or the gated phase went without the payout-revision rebuild
+    // it carries (in every harness since #271). Under the dense cadence the
+    // flag is instead the dense phase's landing budget: the report states
+    // it, and the phase schedules one landing on each slot the gap pattern
+    // places while the budget lasts. How those landings fare is that side
+    // phase's measurement, after the gated phases, so it is not held here.
     if let Some(blocks) = pinned.get("--scheduled-blocks").and_then(Value::as_u64) {
         let gaps = args.cadence_gaps()?;
         let slots = planned
@@ -1647,7 +1651,12 @@ pub fn compare(
             let budget = report
                 .and_then(|r| r.pointer("/dense_cadence/landing_budget"))
                 .and_then(Value::as_u64);
-            let landed = scheduled.map_or("an unreported number of".into(), |n| n.to_string());
+            let accepted = report
+                .and_then(|r| r.pointer("/node/submissions"))
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter(|s| s["accepted"] == true).count() as u64);
+            let count =
+                |n: Option<u64>| n.map_or("an unreported number of".into(), |n| n.to_string());
             let why = match slots {
                 Some(_) if budget != Some(blocks) => Some(format!(
                     "ran a dense-cadence landing budget of {}, not the pinned \
@@ -1655,11 +1664,18 @@ pub fn compare(
                     budget.map_or("unreported".into(), |n| n.to_string())
                 )),
                 Some(slots) if scheduled != Some(expected) => Some(format!(
-                    "landed {landed} own blocks, not the {expected} that the pinned \
-                     `--scheduled-blocks` {blocks} buys of the gap pattern's {slots} slots"
+                    "scheduled {} dense-cadence landings, not the {expected} that the pinned \
+                     `--scheduled-blocks` {blocks} buys of the gap pattern's {slots} slots",
+                    count(scheduled)
                 )),
                 None if scheduled != Some(expected) => Some(format!(
-                    "scheduled {landed} own blocks, not the pinned `--scheduled-blocks` {blocks}"
+                    "scheduled {} own blocks, not the pinned `--scheduled-blocks` {blocks}",
+                    count(scheduled)
+                )),
+                None if blocks > 0 && accepted != Some(expected) => Some(format!(
+                    "landed {} of its {blocks} scheduled own blocks (`node.submissions` \
+                     accepted), not the pinned `--scheduled-blocks` {blocks}",
+                    count(accepted)
                 )),
                 _ => None,
             };
@@ -1668,6 +1684,29 @@ pub fn compare(
                 findings.push(format!(
                     "**the runs did not drive the pinned workload**: {} {why}",
                     run.run.id
+                ));
+                break;
+            }
+        }
+    }
+    // The mid-flight kill caught submits in flight: the harness waits for
+    // them before it kills, and reports 0 when none came, which the report
+    // itself says means the scenario did not exercise (every harness since
+    // #271).
+    if args.mid_flight_kill {
+        for run in runs.iter().filter(|r| r.excluded.is_none()) {
+            let outstanding = run
+                .report
+                .as_ref()
+                .and_then(|r| r.pointer("/mid_flight_kill/submits_outstanding_at_kill"))
+                .and_then(Value::as_u64);
+            if !outstanding.is_some_and(|n| n > 0) {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} killed its frontend with \
+                     {} submits outstanding, so the pinned `--mid-flight-kill` did not exercise",
+                    run.run.id,
+                    outstanding.map_or("an unreported number of".into(), |n| n.to_string())
                 ));
                 break;
             }

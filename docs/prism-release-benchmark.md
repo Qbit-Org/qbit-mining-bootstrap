@@ -138,9 +138,10 @@ the pinned value); a build that reads a pinned rate differently
 fails the comparison rather than passing on less load. The same holds for
 the rest of the planned workload, even when every run agrees: each phase's
 database delay and frontend restarts (the reconnect phase's drained restart
-with two or more frontends, the mid-flight kill's relaunch), the scheduled
-blocks (under the dense cadence, the pinned landing budget and the landings
-it buys), a connection for every pinned session, the completed reconnects,
+with two or more frontends, the mid-flight kill's relaunch, with submits in
+flight at the kill), the scheduled blocks, each accepted by the node (under
+the dense cadence, the pinned landing budget and the landings it schedules),
+a connection for every pinned session, the completed reconnects,
 the memory floor, and the samplers' pinned intervals on every launched
 frontend.
 

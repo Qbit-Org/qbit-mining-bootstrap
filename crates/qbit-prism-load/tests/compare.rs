@@ -650,14 +650,29 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
     assert!(result
         .markdown
         .contains("scheduled 0 own blocks, not the pinned `--scheduled-blocks` 2"));
-    let mut runs = loaded(&manifest, |_, _| met_steady());
-    for run in &mut runs {
-        run.report.as_mut().unwrap()["phases"][0]["scheduled_blocks"] = json!(2);
-    }
+    // Scheduled, each block must also have landed: the node accepted it.
+    let landed = |accepted: [bool; 2]| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            report["phases"][0]["scheduled_blocks"] = json!(2);
+            report["node"]["submissions"] = json!([
+                {"accepted": accepted[0], "rejection": null},
+                {"accepted": accepted[1], "rejection": "parent mismatch"},
+            ]);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = landed([true, true]);
+    assert!(result.passed, "{}", result.markdown);
+    let result = landed([true, false]);
+    assert!(!result.passed);
     assert!(
-        compare::compare(&manifest, &runs, &d1_budgets(), &pinned)
-            .unwrap()
-            .passed
+        result
+            .markdown
+            .contains("landed 1 of its 2 scheduled own blocks"),
+        "{}",
+        result.markdown
     );
 }
 
@@ -1027,7 +1042,7 @@ fn a_planned_restart_or_kill_is_held_to_the_preset_even_when_every_run_agrees() 
     // says the kill ran.
     let mut pinned = d1_args();
     pinned.insert("--mid-flight-kill".into(), json!(true));
-    let with_kill = |restarts: u64, ran: bool| {
+    let with_kill = |restarts: u64, ran: bool, outstanding: u64| {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
@@ -1035,17 +1050,28 @@ fn a_planned_restart_or_kill_is_held_to_the_preset_even_when_every_run_agrees() 
             kill["frontend_restarts"] = json!(restarts);
             report["phases"].as_array_mut().unwrap().push(kill);
             report["mid_flight_kill"]["ran"] = json!(ran);
+            report["mid_flight_kill"]["submits_outstanding_at_kill"] = json!(outstanding);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
-    let result = with_kill(1, true);
+    let result = with_kill(1, true, 7);
     assert!(result.passed, "{}", result.markdown);
-    let result = with_kill(0, true);
+    // A kill with nothing in flight did not exercise the scenario.
+    let result = with_kill(1, true, 0);
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("killed its frontend with 0 submits outstanding"),
+        "{}",
+        result.markdown
+    );
+    let result = with_kill(0, true, 7);
     assert!(!result.passed);
     assert!(result
         .markdown
         .contains("restarted a frontend 0 times in `mid_flight_kill`, not the planned 1"));
-    let result = with_kill(1, false);
+    let result = with_kill(1, false, 7);
     assert!(!result.passed);
     assert!(
         result.markdown.contains("`/mid_flight_kill/ran` false"),
@@ -1097,8 +1123,8 @@ fn the_dense_landing_budget_is_held_to_the_pinned_scheduled_blocks() {
     let result = dense(15, 15, 1);
     assert!(!result.passed);
     assert!(result.markdown.contains(
-        "landed 1 own blocks, not the 15 that the pinned `--scheduled-blocks` 15 buys of the \
-         gap pattern's 15 slots"
+        "scheduled 1 dense-cadence landings, not the 15 that the pinned `--scheduled-blocks` 15 \
+         buys of the gap pattern's 15 slots"
     ));
 }
 
