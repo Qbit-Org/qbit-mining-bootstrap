@@ -5,6 +5,7 @@
 # removed must be changed here too. See docs/prism-integration-test-gate.md.
 # A live_regtest or load_smoke test is an end-to-end scenario: name it in
 # test/e2e-scenarios.toml too (scripts/check_e2e_scenarios.py, #543).
+qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder
 qbit-prism-load::harness::a_managed_cluster_that_fails_to_start_reports_the_servers_own_reason
 qbit-prism-load::load_smoke::the_smoke_preset_serves_every_session_every_tip_and_reconciles
 qbit-prism-load::quorum_replication::an_any_1_quorum_standby_on_postgres_16_is_observed_as_sync_like_first_1

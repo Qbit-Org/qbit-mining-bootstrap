@@ -342,6 +342,20 @@ class CheckE2eScenarios(unittest.TestCase):
         self.fixture.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, COMPONENT])) + "\n")
         self.assertProblem("preset 'smoke' is unknown or runs in no lane")
 
+    def test_a_smoke_preset_also_runs_in_pr_through_the_faults_test(self) -> None:
+        # #554: `faults` runs its own smoke preset, and every test in that
+        # binary is an end-to-end scenario the manifest has to name.
+        faults = "qbit-prism-load::faults::drain_and_lock"
+        self.fixture.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, COMPONENT, faults])) + "\n")
+        self.replace(f'tests = ["{SMOKE}"]', f'tests = ["{faults}"]')
+        self.assertEqual(self.fixture.problems(), [])
+        added = "qbit-prism-load::faults::zz_unnamed"
+        self.fixture.write(
+            "test/prism-gated-tests.txt",
+            "\n".join(sorted([LIVE, COMPONENT, faults, added])) + "\n",
+        )
+        self.assertProblem(f"pr runs {added}, which no running scenario names")
+
 
 class CheckedInManifest(unittest.TestCase):
     # This is how the check runs in CI: the required python-tests shards run

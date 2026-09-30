@@ -12,8 +12,8 @@ evidence, and the evidence decides its lanes:
   `test/prism-nightly-gated-tests.txt` runs in `nightly`.
 - `presets`: load-harness presets in `crates/qbit-prism-load/presets`. A
   `nightly` preset runs in `nightly`, a `weekly` one (the long soak, #575)
-  in `weekly`, a `manual` one in `dispatch`, and the `smoke` preset in `pr`
-  through the gated `load_smoke` test.
+  in `weekly`, a `manual` one in `dispatch`, and a `smoke` preset in `pr`
+  through the gated `load_smoke` or `faults` test (`SMOKE_BINARIES`).
 - `unit_tests`: `<file>::<fn>` for an ungated `#[test]` or `#[tokio::test]`
   that is not `#[ignore]`d; `cargo test --workspace` runs it in `pr`.
 - `lane_checks`: names from `CHECKS` in `scripts/prism_shipped_image_lane.py`,
@@ -69,10 +69,14 @@ L6_DRIVER = Path("scripts/prism_shipped_image_lane.py")
 # Gated test binaries whose every test is an end-to-end scenario and so must
 # be named in the manifest. The rest of the gated list is component tests.
 SCENARIO_BINARIES = (
+    "qbit-prism-load::faults::",
     "qbit-prism-server::live_regtest::",
     "qbit-prism-load::load_smoke::",
 )
 PRESET_LANES = {"nightly": "nightly", "weekly": "weekly", "manual": "dispatch", "smoke": "pr"}
+# The gated test binaries that run the `smoke` presets in the PR shards:
+# `load_smoke` runs `pr-smoke`, and `faults` runs `faults-pr-smoke` (#554).
+SMOKE_BINARIES = ("qbit-prism-load::load_smoke::", "qbit-prism-load::faults::")
 # The lanes this check can enumerate, and the workflow text that has to be
 # present for each to run at all. A lane marked running that is not here needs
 # this check taught how to read it.
@@ -138,7 +142,7 @@ class Lanes:
         if preset is None:
             return set()
         lane = PRESET_LANES.get(preset.get("schedule"))
-        if lane == "pr" and not any(t.startswith("qbit-prism-load::load_smoke::") for t in self.pr):
+        if lane == "pr" and not any(t.startswith(SMOKE_BINARIES) for t in self.pr):
             return set()
         return {lane} if lane else set()
 

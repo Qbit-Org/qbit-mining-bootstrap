@@ -47,6 +47,7 @@ pub const NULL_MEANS_OFF: &[&str] = &[
     "--burst-seconds",
     "--burst-rate",
     "--recipients",
+    "--faults",
 ];
 
 /// When the nightly workflow runs a preset.

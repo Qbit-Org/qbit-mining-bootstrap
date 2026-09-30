@@ -191,6 +191,53 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         "completed".into(),
         failed.is_none() && aborted.is_none(),
     ));
+    // A run with a fault phase (#554) is held to each fault's criteria, one
+    // row per fault so the summary names the one that failed.
+    if let Some(faults) = report["faults"]["faults"].as_array() {
+        for fault in faults {
+            let failed: Vec<&str> = fault["checks"]
+                .as_array()
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .filter(|check| check["pass"] != true)
+                        .filter_map(|check| check["name"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            checks.push(Check::gate(
+                format!(
+                    "fault {}: {}",
+                    fault["ordinal"],
+                    fault["fault"].as_str().unwrap_or("unnamed")
+                ),
+                if failed.is_empty() {
+                    "every criterion met".into()
+                } else {
+                    format!("failed: {}", failed.join("; "))
+                },
+                "every criterion met".into(),
+                fault["pass"] == true,
+            ));
+        }
+        let read_tier = &report["faults"]["read_tier_over_the_phase"];
+        if !read_tier.is_null() || !report["faults"]["read_tier_error"].is_null() {
+            checks.push(Check::gate(
+                "read tier throughout the fault phase",
+                match report["faults"]["read_tier_error"].as_str() {
+                    Some(error) => format!("never started: {error}"),
+                    None => format!(
+                        "public API {} of {} answered 2xx, p99 {} ms",
+                        read_tier["public_api"]["answered_2xx"],
+                        read_tier["public_api"]["requests"],
+                        read_tier["public_api"]["latency_milliseconds"]["p99"]
+                    ),
+                },
+                "at least 99% 2xx, p99 at most 1000 ms, every /metrics within 1 s".into(),
+                read_tier["pass"] == true && report["faults"]["read_tier_error"].is_null(),
+            ));
+        }
+    }
     let findings = report["durability_findings"].as_array().map(Vec::len);
     checks.push(Check::gate(
         "acknowledged shares lost or unexplained (durability findings)",
