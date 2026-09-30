@@ -477,18 +477,28 @@ presets = [
 notes = "Run by hand only; L3 (#550) puts them on the version-bump and weekly triggers."
 
 # ---------------------------------------------------------------------------
-# #474's scenarios that have not landed. Its A item landed as #521 scenario 7
-# (#524); the 1,001-recipient case stays with #474.
+# #474's scenarios. Its A item's CTV case is #521 scenario 7 (#524), which
+# #474 A extends with the signed audit bundle and the owning wallets; A adds
+# direct settlement and the 1,001-recipient case. B and C have not landed.
 # ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "r474-a-direct-recipients-share-to-spend"
+title = "#474 A: weighted recipients through direct coinbase settlement (CTV off) to spent outputs"
+owner = "#474"
+lanes = ["pr"]
+criteria = "Six addresses from six wallets with unequal weights, carry below the floor and the pool fee's dust sweep: exact direct outputs, ledger accounts and signed audit bundle against an independent model; the owning wallets spend a payee output of every block."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::real_weighted_recipients_pay_exact_direct_outputs_without_ctv"]
 
 [[scenario]]
 id = "r474-a-1001-recipients"
 title = "#474 A: 1,001 payable recipients across the 1,000-recipient chunk boundary"
 owner = "#474"
-lanes = ["L4"]
-criteria = "Set by #474: seeded and submitted recipient counts reported separately; every recipient paid exactly across two chunks."
-runs = false
-reason = "Not built; #474 decides whether it is a per-PR test or a qualification command."
+lanes = ["nightly"]
+criteria = "Seeded (Ledger::append) and Stratum-submitted recipient counts reported separately; all 1,001 recipients paid exactly across two fanout chunks per the model and the signed audit bundle; the owning wallets spend an output of each chunk."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::recipient_boundary::nightly_1001_recipients_cross_the_fanout_chunk_boundary_to_spent_outputs"]
 
 [[scenario]]
 id = "r474-b-async-promotion-under-live-miners"
