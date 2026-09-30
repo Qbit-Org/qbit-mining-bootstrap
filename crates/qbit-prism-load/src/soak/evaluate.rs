@@ -427,10 +427,14 @@ fn process_checks(samples: &[Sample], instance: &str, gates: &Gates) -> Vec<Chec
 /// while its slope, or another frontend's rows, fail. A measured failure is
 /// reported, not gated. When no row failed and none was unknown, the issue
 /// looks fixed, and that fails until the key is removed. An unknown row is
-/// left failing: it is no evidence either way.
+/// left failing: it is no evidence either way. No row at all (no sample
+/// named a server process, which fails on its own) is no evidence either.
 fn expect_rss_failure(checks: &mut Vec<Check>, issue: &str) {
     let rss = |check: &Check| check.name.starts_with("resident memory ");
     let unknown = |check: &Check| check.observed.starts_with("unknown");
+    if !checks.iter().any(rss) {
+        return;
+    }
     let mut expected = 0usize;
     let mut unread = false;
     for check in checks.iter_mut().filter(|check| rss(check)) {

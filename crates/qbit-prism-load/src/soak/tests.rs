@@ -431,6 +431,22 @@ fn an_expected_resident_memory_failure_is_no_excuse_for_an_unknown_reading() {
     );
     assert!(!failures.is_empty());
     assert!(!failures.iter().any(|line| line.contains("looks fixed")));
+    // No sample names a server process: that fails on its own, and with no
+    // resident-memory row nothing looks fixed.
+    for sample in &mut samples {
+        sample.processes.clear();
+    }
+    let failures = failed(&evaluate(&samples, &known));
+    assert!(
+        failures
+            .iter()
+            .any(|line| line.starts_with("server processes")),
+        "{failures:?}"
+    );
+    assert!(
+        !failures.iter().any(|line| line.contains("looks fixed")),
+        "{failures:?}"
+    );
 }
 
 #[test]
