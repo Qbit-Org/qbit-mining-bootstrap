@@ -125,7 +125,7 @@ tests = ["qbit-prism-server::live_regtest::compact_runtime_tests::real_large_tem
 
 # ---------------------------------------------------------------------------
 # Functional entries from #487's catalogue, mapped to the tests that cover
-# them (#543). Only vardiff convergence had no test; #558 owns it.
+# them (#543). Only vardiff convergence had no test; #558 added it.
 # ---------------------------------------------------------------------------
 
 [[scenario]]
@@ -225,8 +225,9 @@ title = "Vardiff convergence per session over a real Stratum socket"
 owner = "#558"
 lanes = ["pr"]
 criteria = "Sessions starting well below and well above their target settle within a stated number of retargets into the target share-interval band and do not oscillate."
-runs = false
-reason = "The existing tests check single retarget steps, and the load harness sets a converged difficulty up front, so no test runs a session through its retargets to convergence."
+runs = true
+unit_tests = ["crates/qbit-prism-server/tests/vardiff_convergence.rs::sessions_below_and_above_their_target_settle_into_the_share_interval_band"]
+notes = "Two miners 16x below and 16x above their target over a real socket to the native listener, each settling within 6 retarget periods and 4 adjustments (2 expected) into 1.5x of the target share interval, every adjustment closer to the target and none reversing direction, and changing at most once more over the next 8 retarget periods. It takes 8 s of wall time and little CPU, so it runs per PR."
 
 # ---------------------------------------------------------------------------
 # #521's scenarios: #521 owns the fixtures and assertions; #487's L4 and L5
