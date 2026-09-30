@@ -1,0 +1,66 @@
+{
+  "schema": "qbit.prism.load-trend-row.v1",
+  "kind": "preset",
+  "recorded_at": "2026-09-13T02:40:00Z",
+  "repository": "Qbit-Org/qbit-mining-bootstrap",
+  "run_id": 1013,
+  "run_attempt": 1,
+  "run_url": "https://github.com/Qbit-Org/qbit-mining-bootstrap/actions/runs/1013",
+  "event": "schedule",
+  "ref": "3.x.x",
+  "commit": "03336910cebe160ef006593b9d30a729b5e3ab8f",
+  "lane": "L2",
+  "preset": "throughput-20k-window-1fe",
+  "preset_sha256": "b0dc655875203ad73922c5aaf15bd5cc4b49cd5ae86d1eb5362497dc783e8a3a",
+  "runner_class": "blacksmith-8vcpu-ubuntu-2404",
+  "fsync": {
+    "method": "fdatasync",
+    "ops_per_second": 2000.0,
+    "usecs_per_op": 500.0,
+    "band": "fast",
+    "band_edges_usecs": [
+      1000.0,
+      4000.0
+    ]
+  },
+  "host": null,
+  "outcome": {
+    "harness_exit_code": 0,
+    "gate_exit_code": 0,
+    "result": "pass",
+    "provenance": "pass"
+  },
+  "report": null,
+  "headline": {
+    "run": {
+      "tip_last_notify_p99_ms": null,
+      "tips_missing_a_session": null,
+      "durability_findings": 0
+    },
+    "phases": {
+      "steady_state": {
+        "in_artifact": true,
+        "completed": true,
+        "duration_seconds": 120.0,
+        "target_rate_shares_per_second": 500.0,
+        "achieved_rate_shares_per_second": 500.0,
+        "shortfall": 0,
+        "client_ack_p50_ms": 22.75,
+        "client_ack_p99_ms": 91.0,
+        "server_ack_mean_ms": 12.1,
+        "server_ack_p99_upper_ms": null,
+        "order_lock_max_waiters": 1,
+        "order_lock_mean_waiters": 0.1,
+        "peak_rss_mib": 180.0,
+        "rejected_valid_shares": 0,
+        "missing_shares": 0
+      }
+    }
+  },
+  "artifact": {
+    "name": "prism-load-throughput-20k-window-1fe",
+    "url": null
+  },
+  "promotion": null,
+  "asset_url": null
+}
