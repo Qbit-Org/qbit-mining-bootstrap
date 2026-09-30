@@ -767,6 +767,10 @@ keepalives plus its tips and own blocks.
 
 ## Presets and the nightly run
 
+[docs/prism-e2e-load-ci.md](../../docs/prism-e2e-load-ci.md) says what each CI
+lane that runs these presets proves and does not, and how to dispatch, read
+and reproduce a run.
+
 `crates/qbit-prism-load/presets/*.json` pins runs by name. A preset states
 every flag a result depends on, `null` only where omitting the flag is itself
 the choice (`--database-url`, the short and tips plans' `--burst-seconds` and
