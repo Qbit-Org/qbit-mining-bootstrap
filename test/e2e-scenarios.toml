@@ -54,9 +54,10 @@ runs = false
 owner = "#549"
 
 [lanes.L3]
-title = "Production-window matrix: full on the version bump, reduced weekly"
-runs = false
+title = "Production-window matrix: full on the version bump, reduced weekly (#550)"
+runs = true
 owner = "#550"
+workflow = ".github/workflows/prism-load-l3.yml"
 
 [lanes.L4]
 title = "Real-node scenarios under session load"
@@ -470,7 +471,7 @@ presets = [
   "throughput-500k-window-2fe-async",
   "throughput-500k-window-4fe-async",
 ]
-notes = "Run by hand only; L3 (#550) puts them on the version-bump and weekly triggers."
+notes = "Also in L3 (#550): l3-full runs every one of them, l3-reduced the 400k async ones (l3-production-window-matrix)."
 
 # ---------------------------------------------------------------------------
 # #474's scenarios that have not landed. Its A item landed as #521 scenario 7
@@ -574,12 +575,18 @@ reason = "The pair of presets exists (real-node-short-plan-pair, #547); running 
 
 [[scenario]]
 id = "l3-production-window-matrix"
-title = "#447's full production-window matrix on the version-bump PR and the tag"
+title = "#447's full production-window matrix on the version-bump PR and the tag, and its reduced weekly set"
 owner = "#550"
-lanes = ["L3"]
+lanes = ["dispatch", "L3"]
 criteria = "Every cell's gates; the correctness and regression rows count toward #291, the rates do not (decision 5)."
-runs = false
-reason = "The cells run only by hand (load-d1-473-cells); the triggers and collation are #550."
+runs = true
+suites = ["l3-full", "l3-reduced"]
+presets = [
+  "throughput-400k-window-2fe-async-3-blocks",
+  "dense-cadence-400k-window-1fe-async",
+  "dense-cadence-400k-window-2fe-async",
+]
+notes = "l3-full runs every #473 cell three times: the eight rate cells (load-d1-473-cells and the nightly 400k baseline), the found-block run and dense cadence at 1 and 2 frontends, listed here. The 20k dense attempt (exit 6) and #473's flush and build controls are not presets. The reduced weekly suite (l3-reduced) is 400k at 1, 2 and 4 frontends, async."
 
 [[scenario]]
 id = "session-points"
