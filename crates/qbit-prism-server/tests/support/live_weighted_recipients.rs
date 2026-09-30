@@ -51,15 +51,15 @@ async fn nightly_mainnet_floor_weighted_recipients_share_to_spend() -> Result<()
     weighted_case(&MAINNET_FLOOR).await
 }
 
-struct Scenario {
-    name: &'static str,
-    seed: u64,
-    payees: usize,
-    blocks: usize,
+pub(super) struct Scenario {
+    pub(super) name: &'static str,
+    pub(super) seed: u64,
+    pub(super) payees: usize,
+    pub(super) blocks: usize,
     /// Each whale's share of every round's work, in address order.
-    whales: &'static [f64],
+    pub(super) whales: &'static [f64],
     /// Addresses that submit one minimum-difficulty share in one round.
-    near_zero: usize,
+    pub(super) near_zero: usize,
 }
 
 const PER_PR: Scenario = Scenario {
@@ -109,8 +109,10 @@ const FANOUT_PREMIUM_BPS: u64 = 12_000;
 /// The fanout weight estimate: fixed bytes plus one P2MR output each.
 const FANOUT_FIXED_WEIGHT: u64 = 90;
 const FANOUT_OUTPUT_WEIGHT: u64 = 43;
+/// The server's default `PRISM_STRATUM_MAX_CONNECTIONS`.
+const DEFAULT_MAX_CONNECTIONS: usize = 384;
 
-async fn weighted_case(scenario: &Scenario) -> Result<()> {
+pub(super) async fn weighted_case(scenario: &Scenario) -> Result<()> {
     let Some(mut fixture) = Fixture::open_with_servers(true, false).await? else {
         return Ok(());
     };
@@ -162,7 +164,7 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
         "payee programs are not distinct"
     );
     let plan = Plan::new(scenario, network, coinbase)?;
-    start_servers(fixture, &pool).await?;
+    start_servers(fixture, &pool, plan.workers.len()).await?;
 
     let mut sessions = Vec::with_capacity(plan.workers.len());
     for worker in &plan.workers {
@@ -497,8 +499,8 @@ async fn identity_of(fixture: &Fixture, address: &str) -> Result<Identity> {
     })
 }
 
-async fn start_servers(fixture: &mut Fixture, pool: &Identity) -> Result<()> {
-    fixture.server_env = [
+async fn start_servers(fixture: &mut Fixture, pool: &Identity, workers: usize) -> Result<()> {
+    let mut env: Vec<(String, String)> = [
         // Fixed per-worker difficulty: each worker's password sets it.
         ("PRISM_STRATUM_VARDIFF", "0".to_owned()),
         ("PRISM_STRATUM_VARDIFF_MIN_DIFF", "1e-12".to_owned()),
@@ -518,6 +520,15 @@ async fn start_servers(fixture: &mut Fixture, pool: &Identity) -> Result<()> {
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value))
     .collect();
+    // #553's 2,000-wallet case has one session per worker, more than the
+    // server's default of 384 connections.
+    if workers > DEFAULT_MAX_CONNECTIONS {
+        env.push((
+            "PRISM_STRATUM_MAX_CONNECTIONS".to_owned(),
+            (workers + 64).to_string(),
+        ));
+    }
+    fixture.server_env = env;
     for index in 0..2 {
         let process = fixture.start_server(index)?;
         fixture.servers.push(process);

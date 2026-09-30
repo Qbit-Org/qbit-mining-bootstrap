@@ -240,6 +240,26 @@ fn solve(
     bail!("no {proof:?} solution in the nonce budget (share difficulty {difficulty})")
 }
 
+/// Solve `notify` for a share that misses its block target, without
+/// version rolling: the session load's proof (#553).
+pub(crate) fn solve_share(
+    notify: &Value,
+    extranonce1: &str,
+    extranonce2_size: usize,
+    difficulty: f64,
+    counter: u64,
+) -> Result<Solution> {
+    solve(
+        notify,
+        extranonce1,
+        extranonce2_size,
+        difficulty,
+        0,
+        counter,
+        Proof::Share,
+    )
+}
+
 /// A hex string of even length, of `length` digits when given.
 pub(crate) fn is_hex(value: &Value, length: Option<usize>) -> bool {
     value.as_str().is_some_and(|text| {

@@ -93,7 +93,7 @@ async fn node_killed_after_accepting_and_reindexed_lands_the_block_once() -> Res
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Fault {
+pub(super) enum Fault {
     /// `SIGSTOP`, later `SIGCONT`: the node keeps its sockets and state.
     Stop,
     /// `SIGKILL`, later a restart on the same data directory and RPC port.
@@ -101,7 +101,7 @@ enum Fault {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Hold {
+pub(super) enum Hold {
     /// Before the `submitblock` request is forwarded to the node.
     Request,
     /// After the node's reply to `submitblock` was read, before it is
@@ -120,15 +120,35 @@ async fn outage_case(fault: Fault, hold: Hold, reindex: bool) -> Result<()> {
     let Some(mut fixture) = Fixture::open_with_servers(false, false).await? else {
         return Ok(());
     };
+    let result = outage_case_on(&mut fixture, fault, hold, reindex, async |_| Ok(())).await;
+    let cleanup = fixture.cleanup().await;
+    result.and(cleanup)
+}
+
+/// One case on a fixture opened without servers, which the caller cleans
+/// up, then `after` while the servers still reach the node through the
+/// proxy: #553 runs the cases under session load.
+pub(super) async fn outage_case_on<F>(
+    fixture: &mut Fixture,
+    fault: Fault,
+    hold: Hold,
+    reindex: bool,
+    after: F,
+) -> Result<()>
+where
+    F: AsyncFnOnce(&mut Fixture) -> Result<()>,
+{
     let proxy = RpcProxy::start(fixture.rpc_port).await?;
-    let result = outage_steps(&mut fixture, &proxy, fault, hold, reindex).await;
+    let mut result = outage_steps(fixture, &proxy, fault, hold, reindex).await;
+    if result.is_ok() {
+        result = after(fixture).await;
+    }
     if result.is_err() {
         eprintln!("proxy saw submitblock for {:?}", proxy.submitted());
         eprintln!("{}", fixture.diagnostics());
     }
     proxy.stop();
-    let cleanup = fixture.cleanup().await;
-    result.and(cleanup)
+    result
 }
 
 async fn outage_steps(

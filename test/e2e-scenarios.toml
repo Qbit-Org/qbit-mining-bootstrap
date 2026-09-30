@@ -7,9 +7,11 @@
 #
 # - A scenario with `runs = true` cites its evidence, and the evidence decides
 #   its lanes: `tests` are gated test ids (test/prism-gated-tests.txt runs in
-#   `pr`, test/prism-nightly-gated-tests.txt in `nightly`), `presets` are
+#   `pr`, test/prism-nightly-gated-tests.txt in `nightly`,
+#   test/prism-weekly-gated-tests.txt in `weekly`), `presets` are
 #   crates/qbit-prism-load/presets (a nightly preset runs in `nightly`, a
-#   manual one in `dispatch`, `smoke` in `pr`), `unit_tests` are
+#   weekly one in `weekly`, a manual one in `dispatch`, `smoke` in `pr`),
+#   `unit_tests` are
 #   `<file>::<fn>` ungated tests that `cargo test --workspace` runs in `pr`,
 #   and `lane_checks` are the named checks of scripts/prism_shipped_image_lane.py,
 #   which run in `L6`.
@@ -17,8 +19,8 @@
 #   `owner` is the linked issue, and its `lanes` are the lanes it is planned
 #   for (#487's definition of done: nothing unexercised without both).
 # - Every live_regtest and load_smoke test in the PR gated list, every opt-in
-#   nightly test, every preset and every L6 check must be cited by a running
-#   scenario.
+#   nightly and weekly test, every preset and every L6 check must be cited by
+#   a running scenario.
 #
 # Scenarios whose fixtures belong to #521 or #474 are listed under those
 # issues; #487's lanes run them under load without redefining what they
@@ -27,7 +29,7 @@
 schema = "qbit.e2e-scenarios.v1"
 
 # ---------------------------------------------------------------------------
-# Lanes. `pr`, `nightly`, `dispatch` and L6 run today; L2 to L5 are #487's
+# Lanes. `pr`, `nightly`, `dispatch`, `weekly` and L6 run today; L2 to L5 are #487's
 # lanes that do not exist yet, each owned by the sub-issue that builds it.
 # ---------------------------------------------------------------------------
 
@@ -47,7 +49,7 @@ runs = true
 workflow = ".github/workflows/prism-load-nightly.yml"
 
 [lanes.weekly]
-title = "Weekly on 3.x.x: the long soak's weekly presets (#575 item 2)"
+title = "Weekly on 3.x.x: the long soak's weekly presets (#575 item 2) and the live-weekly job's opt-in live_regtest tests (#487 L4)"
 runs = true
 workflow = ".github/workflows/prism-load-nightly.yml"
 
@@ -518,45 +520,77 @@ id = "wallets-2000-cap"
 title = "2,000 wallets at the production window on #521 scenario 7's fixture"
 owner = "#553"
 lanes = ["L4"]
-criteria = "Every wallet is paid exactly and spends its output, at the real-node wallet cap (decision 7)."
+criteria = "#521 scenario 7's assertions unchanged at 2,000 payees (two fanout chunks per block): attribution, coinbase, CTV outputs and carry-forward balances match an independent PPLNS recomputation, and the fanouts reach the wallets and are spent (decision 7)."
 runs = false
-reason = "Needs the real-node harness mode (#547) and L4."
+reason = "Blocked by #604: the fixture opens about 1,500 worker sessions per frontend one at a time, and at its 1 s reanchor each first job queues behind every connected session's same-tip rebuild, so some worker never gets work. Scenario wallets-2000-cap-expected-failure runs the case weekly and fails once #604 is fixed."
+
+[[scenario]]
+id = "wallets-2000-cap-expected-failure"
+title = "#604's expected failure: #521 scenario 7 at 2,000 wallets"
+owner = "#604"
+lanes = ["weekly"]
+criteria = "Passes while #604 holds: the 2,000-wallet case (wallets-2000-cap) fails because a worker never received work. It fails on any other failure, and when scenario 7 passes, which is when wallets-2000-cap runs and this expectation goes."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_wallets_share_to_spend_starves_first_jobs_until_604_is_fixed"]
 
 [[scenario]]
 id = "chain-events-under-load"
 title = "#521 scenarios 1, 2, 4 and 5 at L4's session counts"
 owner = "#553"
-lanes = ["L4"]
-criteria = "#521's assertions for each scenario, held under session load."
-runs = false
-reason = "Needs the real-node harness mode (#547) and L4."
+lanes = ["nightly", "weekly"]
+criteria = "#521's assertions for each scenario, unchanged, under 2,000 share-only sessions at 100 shares/s; and the load's own: every acknowledged share durable and no refused share credited, no impossible refusal, and every session on a ready frontend given work on every tip that lasts 15 s within 15 s."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_every_session",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_lost_race_under_2000_sessions_orphans_once_and_serves_every_session",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_node_killed_after_accepting_under_2000_sessions_reconciles_the_lost_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_flat",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_killed_before_submitblock_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_restarted_into_warmup_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_after_accepting_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_before_submitblock_under_2000_sessions_lands_the_block_once",
+]
+notes = "The frontends run #575's share-only settings and the production 60 s payout reanchor (#598: at the live fixture's 1 s, 2,000 sessions on one frontend get no work; scenario one-frontend-fast-reanchor-expected-failure). Scenarios 1 and 2 and scenario 4's crash case run nightly; scenario 4's other four cases and scenario 5's 20-minute soak at 400 shares/s run weekly."
+
+[[scenario]]
+id = "one-frontend-fast-reanchor-expected-failure"
+title = "#598's expected failure: 2,000 sessions on one frontend at a 1 s reanchor"
+owner = "#598"
+lanes = ["weekly"]
+criteria = "Passes while #598 holds: of three external tips 20 s apart, at least one leaves sessions on the ready frontend without work past 15 s, while every acknowledged share stays durable and no refusal is impossible. It fails on any other load failure, and when every tip reaches every session in time, which is when the expectation goes."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_is_fixed"]
 
 [[scenario]]
 id = "external-tips-time-to-usable-work"
 title = "External tips at a realistic cadence; time to usable work per frontend (#481)"
 owner = "#553"
-lanes = ["L4"]
-criteria = "Time to usable work per frontend is measured and stated for each tip."
-runs = false
-reason = "Needs the real-node harness mode (#547) and L4."
+lanes = ["nightly", "weekly"]
+criteria = "External tips from a second node at qbit's 60 s target spacing (seeded exponential gaps) to 2,000 sessions on two frontends: every tip that lasts 15 s reaches every session on both frontends within 15 s, and #481's time to usable work (node stamp to first notify on that parent) is reported per frontend and per tip, replaced tips counted apart."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_external_tips_at_target_spacing_reach_every_session_on_both_frontends",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends",
+]
+notes = "5 minutes at 100 shares/s nightly; 45 minutes at 400 shares/s weekly."
 
 [[scenario]]
 id = "node-loses-peer"
 title = "The node loses its peer while miners are connected"
 owner = "#553"
-lanes = ["L4"]
-criteria = "Set by #553."
-runs = false
-reason = "Needs the real-node harness mode (#547) and L4."
+lanes = ["nightly"]
+criteria = "Regtest exempts the peer floor (readiness_rpc.rs pins both sides), so: with its only peer partitioned away, the pool mines on an isolated node, its own block there is deactivated when the node reorganizes onto the peer's longer chain and credited exactly once, with no payout divergence or duplicate header, and every one of 2,000 sessions gets work on the isolated block and on the healed chain within 15 s."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_block_and_recovers"]
 
 [[scenario]]
 id = "two-frontends-disagree-on-tip"
 title = "Two frontends on two nodes that briefly disagree about the tip"
 owner = "#553"
-lanes = ["L4"]
-criteria = "Set by #553."
-runs = false
-reason = "Needs the real-node harness mode (#547) and L4."
+lanes = ["nightly"]
+criteria = "Propagation lag and a partitioned split at equal work: the ledger takes one side's tip, the frontend on the other side reports itself unready and gives no work on its node's tip, no payout divergence or duplicate header follows, and after convergence every session on both frontends has work on the converged tip within 15 s."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_two_frontends_on_two_nodes_disagree_briefly_and_converge_under_2000_sessions"]
 
 [[scenario]]
 id = "l2-load-regression"
@@ -698,20 +732,23 @@ reason = "Needs S16's faults (#554); #521 scenario 5's 10-minute soak (r521-5-de
 id = "migration-lifecycle"
 title = "A seeded 2.x.x-schema database migrated, mined on, reconciled and rolled back"
 owner = "#545"
-lanes = ["L4"]
-criteria = "Set by #545; #291's rehearsal stays the authority on production-sized data."
-runs = false
-reason = "Not built; #545."
+lanes = ["weekly"]
+criteria = "Set by #545: the drained source's evidence and backup, an isolated restore reconciling exactly before any native acknowledgement, migrate and import-audits rehearsed then run for the cutover, both native servers landing their own blocks on the real node with the history untouched, and the post-ACK boundary of the migration guide's rollback section. #291's rehearsal stays the authority on production-sized data."
+runs = true
+tests = ["qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation"]
 
 [[scenario]]
 id = "cutover-rehearsal"
 title = "A mainnet-shaped 2.x.x ledger cut over as the migration guide runs it, measured"
 owner = "#575"
-lanes = ["pr"]
+lanes = ["pr", "weekly"]
 criteria = "Recovery evidence, every 2.x.x table's counts and sums, every address's balances (SQL and the running API) and the payout window are unchanged; a frontend on the result is ready, issues a first job and passes self-check; each step's wall time and longest lock are reported."
 runs = true
-tests = ["qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance"]
-notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant in test/prism-weekly-gated-tests.txt cuts over 1x at 1/32 of the rows (1/16 once #582 is fixed) on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+tests = [
+  "qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance",
+  "qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation",
+]
+notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/32 of the rows (1/16 once #582 is fixed) on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
 
 [[scenario]]
 id = "shipped-image-lane"

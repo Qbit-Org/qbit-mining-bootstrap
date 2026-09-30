@@ -23,6 +23,7 @@ LIVE = "qbit-prism-server::live_regtest::two_node_tests::lost_race"
 SMOKE = "qbit-prism-load::load_smoke::smoke_reconciles"
 COMPONENT = "qbit-prism-server::ledger_postgres::alpha"
 NIGHTLY = "qbit-prism-server::live_regtest::node_outage_tests::reindex"
+WEEKLY = "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_soak"
 UNIT = "crates/qbit-prism-server/tests/stratum_protocol.rs::oversized_frames_close"
 
 LANES = """
@@ -40,6 +41,11 @@ workflow = ".github/workflows/prism-load-nightly.yml"
 
 [lanes.dispatch]
 title = "Dispatch"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
+[lanes.weekly]
+title = "Weekly"
 runs = true
 workflow = ".github/workflows/prism-load-nightly.yml"
 
@@ -82,6 +88,15 @@ lanes = ["nightly"]
 criteria = "Lands once."
 runs = true
 tests = ["{NIGHTLY}"]
+
+[[scenario]]
+id = "soak-under-load"
+title = "Soak under load"
+owner = "#553"
+lanes = ["weekly"]
+criteria = "Lands every block."
+runs = true
+tests = ["{WEEKLY}"]
 
 [[scenario]]
 id = "d1"
@@ -142,6 +157,16 @@ fn helper_not_a_test() {}
 """
 
 
+WORKFLOW = (
+    'on:\n  schedule:\n    - cron: x\n    - cron: "43 3 * * 0"\n    - cron: "41 5 * * 6"\n'
+    "  pull_request:\n  workflow_dispatch:\n"
+    "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n"
+    "SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') }}\n"
+    "--expected test/prism-weekly-gated-tests.txt\n"
+    "scripts/prism_shipped_image_lane.py run\n"
+)
+
+
 class Fixture:
     """A throwaway repository root holding just what the check reads."""
 
@@ -149,6 +174,7 @@ class Fixture:
         self.root = root
         self.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, SMOKE, COMPONENT])) + "\n")
         self.write("test/prism-nightly-gated-tests.txt", f"# opt-in\n{NIGHTLY}\n")
+        self.write("test/prism-weekly-gated-tests.txt", f"# opt-in weekly\n{WEEKLY}\n")
         for name, schedule in (("d1-20k", "nightly"), ("d1-500k", "manual"), ("smoke", "smoke")):
             self.write(
                 f"crates/qbit-prism-load/presets/{name}.json",
@@ -161,10 +187,7 @@ class Fixture:
         )
         self.write(
             ".github/workflows/prism-load-nightly.yml",
-            'on:\n  schedule:\n    - cron: x\n    - cron: "43 3 * * 0"\n  pull_request:\n'
-            "  workflow_dispatch:\n"
-            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n"
-            "scripts/prism_shipped_image_lane.py run\n",
+            WORKFLOW,
         )
         self.write("scripts/prism_shipped_image_lane.py", 'CHECKS = ("found-block", "resume")\n')
         self.manifest = LANES + SCENARIOS
@@ -223,7 +246,7 @@ class CheckE2eScenarios(unittest.TestCase):
 
     def test_a_claim_no_lane_runs_fails(self) -> None:
         self.replace(f'tests = ["{LIVE}"]', 'tests = ["qbit-prism-server::live_regtest::gone"]')
-        self.assertProblem("is in neither")
+        self.assertProblem("is in none of")
         self.replace('presets = ["d1-20k"]', 'presets = ["no-such-preset"]')
         self.assertProblem("preset 'no-such-preset' is unknown or runs in no lane")
 
@@ -297,20 +320,33 @@ class CheckE2eScenarios(unittest.TestCase):
         )
         self.assertProblem("weekly runs preset soak, which no running scenario names")
         self.fixture.manifest += (
-            '\n[lanes.weekly]\ntitle = "Weekly soak"\nruns = true\n'
-            'workflow = ".github/workflows/prism-load-nightly.yml"\n'
             '\n[[scenario]]\nid = "soak"\ntitle = "Soak"\nowner = "#575"\nlanes = ["weekly"]\n'
             'criteria = "Its gates."\nruns = true\npresets = ["soak"]\n'
         )
-        self.assertProblem("lane weekly: .github/workflows/prism-load-nightly.yml no longer contains")
-        workflow = self.fixture.root / ".github/workflows/prism-load-nightly.yml"
-        workflow.write_text(
-            workflow.read_text(encoding="utf-8")
-            + "    - cron: \"41 5 * * 6\"\n"
-            + "SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') }}\n",
-            encoding="utf-8",
-        )
         self.assertEqual(self.fixture.problems(), [])
+        self.fixture.write(
+            ".github/workflows/prism-load-nightly.yml",
+            WORKFLOW.replace("github.event.schedule == '41 5 * * 6' && 'weekly'", ""),
+        )
+        self.assertProblem("lane weekly: .github/workflows/prism-load-nightly.yml no longer contains")
+
+    def test_a_weekly_test_runs_in_the_weekly_lane_and_each_needs_a_scenario(self) -> None:
+        added = "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_tips"
+        self.fixture.write(
+            "test/prism-weekly-gated-tests.txt", "\n".join(sorted([WEEKLY, added])) + "\n"
+        )
+        self.assertProblem(f"weekly runs {added}, which no running scenario names")
+        self.replace('lanes = ["weekly"]\ncriteria = "Lands', 'lanes = ["nightly"]\ncriteria = "Lands')
+        self.assertProblem("scenario soak-under-load claims lane 'nightly', but none of its evidence runs there")
+        self.assertProblem("scenario soak-under-load: its evidence runs in 'weekly'; add it to lanes")
+
+    def test_the_weekly_lane_needs_the_live_weekly_job_wired(self) -> None:
+        for needle in ('cron: "43 3 * * 0"', "--expected test/prism-weekly-gated-tests.txt"):
+            with self.subTest(needle=needle):
+                self.fixture.write(
+                    ".github/workflows/prism-load-nightly.yml", WORKFLOW.replace(needle, "")
+                )
+                self.assertProblem(f"lane weekly: .github/workflows/prism-load-nightly.yml no longer contains {needle!r}")
 
     def test_l6_checks_run_in_l6_and_each_needs_a_scenario(self) -> None:
         self.fixture.write("scripts/prism_shipped_image_lane.py", 'CHECKS = ("found-block", "resume", "new")\n')

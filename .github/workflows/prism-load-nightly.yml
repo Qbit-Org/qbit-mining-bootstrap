@@ -32,8 +32,9 @@ name: PRISM load harness (nightly)
 #
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
-# today #545's 2.x.x migration lifecycle and #575's measured cutover of a
-# mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
+# today #545's 2.x.x migration lifecycle, #575's measured cutover of a
+# mainnet-shaped 2.x.x ledger and #553's long set of chain events under
+# 2,000 sessions. The weekly schedule runs only that job (and L6); the
 # nightly jobs keep their own schedule.
 #
 # #575 item 2: the long soak has a third schedule, Saturday 05:41 UTC, whose
@@ -515,7 +516,11 @@ jobs:
   # PostgreSQL's client tools for the scenarios' pg_dump and psql. Today that
   # is #545's migration lifecycle: a scaled 2.x.x ledger through migrate,
   # import-audits, native mining on the real node, exact reconciliation and
-  # the isolated-restore rollback of docs/prism-rust-migration.md.
+  # the isolated-restore rollback of docs/prism-rust-migration.md. And #553's
+  # long set of chain events under 2,000 sessions: #521 scenario 4's other
+  # four cases, scenario 5's 20-minute soak, scenario 7 at 2,000 wallets
+  # (#604's expected failure), 45 minutes of external tips at 400 shares/s,
+  # and #598's expected failure.
   live-weekly:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
@@ -526,8 +531,10 @@ jobs:
     # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
     # of the rows on a 22-core host in release, and its row-proportional
     # phases put 1/16 near 20 minutes there, so the job builds in release and
-    # allows two hours.
-    timeout-minutes: 120
+    # allowed two hours; #553's long set adds about 85 minutes (45 of
+    # external tips, a 20-minute soak, the 2,000-wallet case and five shorter
+    # cases), so it allows three.
+    timeout-minutes: 180
     services:
       postgres:
         image: postgres:16
