@@ -982,6 +982,139 @@ fn predates(manifest: &Manifest, run: &LoadedRun, flag: &str) -> bool {
         .is_some_and(|b| b.dropped_legacy_flags.iter().any(|f| f == flag))
 }
 
+/// The flags that decide the generated population: a build whose harness
+/// predates any of them drew no population to compare.
+const POPULATION_FLAGS: &[&str] = &[
+    "--recipients",
+    "--recipient-weights",
+    "--session-hashrate-sigma",
+    "--session-difficulty",
+    "--seed",
+];
+
+/// How far a figure of the generated population may sit from this
+/// harness's, as a fraction of it: the same seed and spec draw the same
+/// sessions, so only float summation order could move one.
+pub const POPULATION_TOLERANCE: f64 = 1e-9;
+
+/// The generated population's figures a side report states, drawn by this
+/// harness's own generator from the preset (`Population::build`; none of
+/// these reads the payout address): each session's difficulty multiplier,
+/// hashrate and offer weight, as `population_report` summarizes them, and
+/// the mean offered multiplier. A build that echoes the pinned distribution
+/// but draws another shows it here.
+pub fn expected_population(pinned: &BTreeMap<String, Value>) -> Result<Vec<(&'static str, f64)>> {
+    let args = preset_args(pinned)?;
+    let population = crate::realism::Population::build(&args.population_spec()?, "")?;
+    let summary = |values: Vec<f64>| crate::measure::summarize(values, "ratio", "");
+    let multipliers = summary(
+        population
+            .sessions
+            .iter()
+            .map(|s| s.difficulty_multiplier)
+            .collect(),
+    );
+    let hashrates = summary(population.sessions.iter().map(|s| s.hashrate).collect());
+    let offers = summary(population.sessions.iter().map(|s| s.offer_weight).collect());
+    let mut expected = vec![(
+        "/population/mean_offered_difficulty_multiplier",
+        population.mean_offered_multiplier(),
+    )];
+    for (pointers, figures) in [
+        (
+            [
+                "/population/session_difficulty_multiplier/min",
+                "/population/session_difficulty_multiplier/max",
+                "/population/session_difficulty_multiplier/mean",
+            ],
+            multipliers,
+        ),
+        (
+            [
+                "/population/session_hashrate/min",
+                "/population/session_hashrate/max",
+                "/population/session_hashrate/mean",
+            ],
+            hashrates,
+        ),
+        (
+            [
+                "/population/offer_weight/min",
+                "/population/offer_weight/max",
+                "/population/offer_weight/mean",
+            ],
+            offers,
+        ),
+    ] {
+        for (pointer, value) in pointers
+            .into_iter()
+            .zip([figures.min, figures.max, figures.mean])
+        {
+            expected.push((pointer, value.context("a population has sessions")?));
+        }
+    }
+    Ok(expected)
+}
+
+/// How far a phase's reported offered-rate CV may sit from the one its
+/// seeded arrival clock mints, beyond [`ExpectedArrival::tolerance`]'s
+/// allowance for the tick: a smooth schedule where a bursty one was pinned
+/// sits a whole CV away.
+pub const ARRIVAL_CV_TOLERANCE: f64 = 0.05;
+
+/// A planned phase's offered-rate CV over 1 s and 60 s windows, `None`
+/// where fewer than two windows fit.
+pub struct ExpectedArrival {
+    pub phase: String,
+    pub rate: f64,
+    pub cv_1s: Option<f64>,
+    pub cv_60s: Option<f64>,
+}
+
+impl ExpectedArrival {
+    /// How far a reported CV over `window` seconds may sit from this one:
+    /// the scheduler counts tokens on a 1 ms tick, so a window's count can
+    /// gain or lose a token at either boundary, which at a low rate is a
+    /// visible share of it.
+    pub fn tolerance(&self, window: u64) -> f64 {
+        ARRIVAL_CV_TOLERANCE + 2.0 / (self.rate * window as f64).max(1.0)
+    }
+}
+
+/// Each planned phase's offered-rate CVs as the preset's seeded arrival
+/// clock mints offers (the harness's own `Arrival::clock` and
+/// `windowed_cv`): the tokens due by the end of each whole second, as the
+/// scheduler counts them.
+pub fn expected_arrival(pinned: &BTreeMap<String, Value>) -> Result<Vec<ExpectedArrival>> {
+    let args = preset_args(pinned)?;
+    let arrival = args.arrival()?;
+    crate::cli::phases(&args)?
+        .into_iter()
+        .map(|plan| {
+            let clock = arrival.clock(args.seed, &plan.name, plan.seconds);
+            let due = |second: u64| (clock.elapsed(second as f64) * plan.rate).floor() as u64;
+            let offers: Vec<u64> = (0..plan.seconds)
+                .map(|second| due(second + 1).saturating_sub(due(second)))
+                .collect();
+            Ok(ExpectedArrival {
+                phase: plan.name,
+                rate: plan.rate,
+                cv_1s: crate::realism::windowed_cv(&offers, 1),
+                cv_60s: crate::realism::windowed_cv(&offers, 60),
+            })
+        })
+        .collect()
+}
+
+/// The database path of a database URL: what follows the host, up to its
+/// query. A password is percent-encoded, so the first `/` after the scheme
+/// ends the authority, redacted or not.
+fn database_path(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let path = &rest[rest.find('/')?..];
+    path.split(['?', '#']).next()
+}
+
 /// Why a counted run's churn phase did not carry out the preset's plan, or
 /// `None` when every one did: every planned rental spawned and every one
 /// planned to leave in the phase departed (a departure is recorded at its
@@ -1541,6 +1674,116 @@ pub fn compare(
                 run.run.id
             ));
             break;
+        }
+    }
+    // The population the seed draws (`expected_population`).
+    let population = expected_population(pinned)?;
+    'population: for run in runs.iter().filter(|r| r.excluded.is_none()) {
+        if POPULATION_FLAGS
+            .iter()
+            .any(|flag| predates(manifest, run, flag))
+        {
+            continue;
+        }
+        for (pointer, expected) in &population {
+            let reported = run
+                .report
+                .as_ref()
+                .and_then(|r| r.pointer(pointer))
+                .and_then(Value::as_f64);
+            if !reported.is_some_and(|value| {
+                (value - expected).abs() <= expected.abs() * POPULATION_TOLERANCE + f64::EPSILON
+            }) {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} reports `{pointer}` {}, \
+                     not the {expected} the preset's population draws",
+                    run.run.id,
+                    reported.map_or("unreported".into(), |value| value.to_string())
+                ));
+                break 'population;
+            }
+        }
+    }
+    // Each planned phase offered on its seeded arrival clock
+    // (`expected_arrival`): `/arrival` alone only echoes the flag.
+    let arrival = expected_arrival(pinned)?;
+    'arrival: for run in runs.iter().filter(|r| r.excluded.is_none()) {
+        if predates(manifest, run, "--arrival") {
+            continue;
+        }
+        for planned in &arrival {
+            let name = &planned.phase;
+            let reported = run.phase(name).map(|phase| &phase["arrival"]);
+            for (window, expected, key) in [
+                (1, planned.cv_1s, "offered_per_second_cv_1s"),
+                (60, planned.cv_60s, "offered_per_second_cv_60s"),
+            ] {
+                let value = reported.and_then(|a| a[key].as_f64());
+                let close = match (value, expected) {
+                    (Some(value), Some(expected)) => {
+                        (value - expected).abs() <= planned.tolerance(window)
+                    }
+                    (None, None) => reported.is_some_and(|a| a[key].is_null()),
+                    _ => false,
+                };
+                if !close {
+                    passed = false;
+                    findings.push(format!(
+                        "**the runs did not drive the pinned workload**: {} offered `{name}` at \
+                         a {window} s rate CV of {}, not the {} its pinned `--arrival` clock mints",
+                        run.run.id,
+                        value.map_or("unreported".into(), |v| format!("{v:.3}")),
+                        expected.map_or("none".into(), |e| format!("{e:.3}"))
+                    ));
+                    break 'arrival;
+                }
+            }
+        }
+    }
+    // An external database is the one the preset names: the delay proxy
+    // fronted its `host:port` (as the harness's `run::host_port` derives
+    // it), and every frontend's URL names its database. `database.mode`
+    // alone only says a URL was given.
+    if let Some(url) = pinned.get("--database-url").and_then(Value::as_str) {
+        let upstream = crate::run::host_port(url)?;
+        let database = database_path(url);
+        for run in runs.iter().filter(|r| r.excluded.is_none()) {
+            let report = run.report.as_ref();
+            let reported = report
+                .and_then(|r| r.pointer("/database/delay_proxy/upstream"))
+                .and_then(Value::as_str);
+            let paths: Vec<Option<&str>> = report
+                .and_then(|r| r["frontend_environment"].as_array())
+                .into_iter()
+                .flatten()
+                .map(|f| {
+                    f["environment"]["PRISM_DATABASE_URL"]
+                        .as_str()
+                        .and_then(database_path)
+                })
+                .collect();
+            let why = if reported != Some(upstream.as_str()) {
+                Some(format!(
+                    "fronted the database at {}, not the pinned `--database-url`'s {upstream}",
+                    reported.unwrap_or("an unreported address")
+                ))
+            } else if paths.is_empty() || paths.iter().any(|path| *path != database) {
+                Some(format!(
+                    "launched a frontend on another database than the pinned `--database-url`'s {}",
+                    database.unwrap_or("default")
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} {why}",
+                    run.run.id
+                ));
+                break;
+            }
         }
     }
     // The seeded ledger is the preset's: `--window-shares` rows plus the

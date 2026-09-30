@@ -63,7 +63,8 @@ either build is short of its repeats.
 `--skip-build` reuses only builds the driver itself made: it records each
 build's commit and binary digests beside the binaries, and refuses a
 worktree whose binaries were built for another commit, copied in, or left
-by a build that failed.
+by a build that failed. `--resume` likewise refuses a build whose binaries are
+not the ones the recorded runs used.
 
 `python3 scripts/prism_load_ab.py --help` lists the
 settings.
@@ -141,9 +142,10 @@ limit, with every frontend launched
 with the pinned server settings (runtime workers, database connections,
 commit timeout, block poll, initial-job admission, pool fee), and with the arrival,
 population, template, pool-fee, churn and node settings the report states reading
-as this harness renders the preset's (a build whose harness predates one of
-those flags is exempt from it, since the legacy table already proved it ran
-the pinned value); a build that reads a pinned rate differently
+as this harness renders the preset's, with the population its seed draws
+and each phase's offers on its pinned arrival clock (a build whose harness
+predates one of those flags is exempt from it, since the legacy table
+already proved it ran the pinned value); a build that reads a pinned rate differently
 fails the comparison rather than passing on less load. The same holds for
 the rest of the planned workload, even when every run agrees: each phase's
 database delay, seen to be paid, and frontend restarts (the reconnect phase's drained restart
@@ -151,7 +153,8 @@ with two or more frontends, the mid-flight kill's relaunch, with submits in
 flight at the kill), the scheduled blocks, each accepted by the node (under
 the dense cadence, the pinned landing budget and the landings it schedules),
 the seeded ledger's rows (a retargeting node's older history included) and
-average share size, a connection for every pinned session, the completed reconnects,
+average share size, a connection for every pinned session, an external database's endpoint,
+the completed reconnects,
 the memory floor, and the samplers, each sampling at its pinned interval on
 every launched frontend.
 

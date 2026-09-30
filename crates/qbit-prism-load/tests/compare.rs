@@ -27,7 +27,22 @@ fn phase(name: &str, target: f64, achieved: f64, shortfall: u64, rejected: u64, 
         phase["database_delay_observed_select1_median_milliseconds"] =
             json!(2.0 * plan.database_delay_ms as f64 + 2.9);
     }
+    with_arrival(&mut phase, &d1_args());
     phase
+}
+
+/// The phase's offered-rate CVs as `pinned`'s arrival clock mints them.
+fn with_arrival(phase: &mut Value, pinned: &std::collections::BTreeMap<String, Value>) {
+    if let Some(planned) = compare::expected_arrival(pinned)
+        .unwrap()
+        .into_iter()
+        .find(|planned| phase["name"] == planned.phase.as_str())
+    {
+        phase["arrival"] = json!({
+            "offered_per_second_cv_1s": planned.cv_1s,
+            "offered_per_second_cv_60s": planned.cv_60s,
+        });
+    }
 }
 
 fn plain_phase(
@@ -72,9 +87,13 @@ fn plain_phase(
 
 fn report(commit: &str, steady: Value, burst: Value) -> Value {
     let mut report = bare_report(commit, steady, burst);
-    // The realism and churn settings as this harness reports the D1 preset.
+    // The realism and churn settings as this harness reports the D1 preset,
+    // and the population its seed draws.
     for setting in compare::expected_settings(&d1_args()).unwrap() {
         set_pointer(&mut report, setting.pointer, setting.value);
+    }
+    for (pointer, value) in compare::expected_population(&d1_args()).unwrap() {
+        set_pointer(&mut report, pointer, json!(value));
     }
     report
 }
@@ -688,6 +707,124 @@ fn a_seeded_ledger_short_of_its_rows_or_its_share_size_fails() {
     );
 }
 
+/// Runs of `pinned` whose reports carry its settings, the population its
+/// seed draws and the arrival its clock mints.
+fn realistic_runs(
+    manifest: &Manifest,
+    pinned: &std::collections::BTreeMap<String, Value>,
+) -> Vec<LoadedRun> {
+    let mut runs = loaded(manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let report = run.report.as_mut().unwrap();
+        for setting in compare::expected_settings(pinned).unwrap() {
+            set_pointer(report, setting.pointer, setting.value);
+        }
+        for (pointer, value) in compare::expected_population(pinned).unwrap() {
+            set_pointer(report, pointer, json!(value));
+        }
+        for phase in report["phases"].as_array_mut().unwrap() {
+            with_arrival(phase, pinned);
+        }
+    }
+    runs
+}
+
+/// The D1 preset with mainnet-shape's population and arrival.
+fn d1_mainnet_shape() -> std::collections::BTreeMap<String, Value> {
+    let mut pinned = d1_args();
+    for (flag, value) in [
+        ("--arrival", json!("bursty:cv1=0.6,cv60=0.9,max=8")),
+        ("--recipients", json!(130)),
+        ("--recipient-weights", json!("whale:0.6+zipf:1.1")),
+        ("--session-difficulty", json!("vardiff:1000")),
+        ("--session-hashrate-sigma", json!(1)),
+    ] {
+        pinned.insert(flag.into(), value);
+    }
+    pinned
+}
+
+#[test]
+fn a_population_or_an_arrival_other_than_the_seed_draws_fails() {
+    let manifest = manifest(288.0);
+    let pinned = d1_mainnet_shape();
+    let result = compare::compare(
+        &manifest,
+        &realistic_runs(&manifest, &pinned),
+        &d1_budgets(),
+        &pinned,
+    )
+    .unwrap();
+    assert!(result.passed, "{}", result.markdown);
+    // Every session at one difficulty, though the report echoes vardiff.
+    let mut runs = realistic_runs(&manifest, &pinned);
+    for pointer in [
+        "/population/session_difficulty_multiplier/max",
+        "/population/mean_offered_difficulty_multiplier",
+    ] {
+        set_pointer(runs[1].report.as_mut().unwrap(), pointer, json!(1.0));
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains("the preset's population draws"),
+        "{}",
+        result.markdown
+    );
+    // A smooth schedule, though the report echoes the bursty declaration.
+    let mut runs = realistic_runs(&manifest, &pinned);
+    set_pointer(
+        runs[1].report.as_mut().unwrap(),
+        "/phases/0/arrival/offered_per_second_cv_1s",
+        json!(0.001),
+    );
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("offered `steady_state` at a 1 s rate CV of 0.001"),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
+fn an_external_database_other_than_the_pinned_url_fails() {
+    let manifest = manifest(288.0);
+    let mut pinned = d1_args();
+    pinned.insert(
+        "--database-url".into(),
+        json!("postgresql://alex:hunter2@db.example:5433/qbit"),
+    );
+    let external = |upstream: &str, database: &str| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            report["database"]["mode"] = json!("external");
+            report["database"]["delay_proxy"] = json!({"upstream": upstream});
+            report["frontend_environment"][0]["environment"]["PRISM_DATABASE_URL"] =
+                json!(format!(
+                "postgresql://alex:<redacted>@127.0.0.1:41000/{database}?application_name=load-fe-0"
+            ));
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = external("db.example:5433", "qbit");
+    assert!(result.passed, "{}", result.markdown);
+    let result = external("other.example:5433", "qbit");
+    assert!(!result.passed);
+    assert!(result.markdown.contains(
+        "fronted the database at other.example:5433, not the pinned `--database-url`'s \
+         db.example:5433"
+    ));
+    let result = external("db.example:5433", "other");
+    assert!(!result.passed);
+    assert!(result.markdown.contains(
+        "launched a frontend on another database than the pinned `--database-url`'s /qbit"
+    ));
+}
+
 #[test]
 fn fewer_completed_reconnects_than_pinned_fails() {
     let manifest = manifest(288.0);
@@ -859,6 +996,7 @@ fn churn_runs(
         phase["duration_seconds"] = json!(churn_phase.seconds as f64);
         phase["in_artifact"] = json!(churn_phase.in_artifact);
         phase["database_delay_milliseconds_configured"] = json!(churn_phase.database_delay_ms);
+        with_arrival(&mut phase, pinned);
         report["phases"].as_array_mut().unwrap().push(phase);
         // Each planned storm, run over 600 connected sessions.
         let storms: Vec<Value> = plan["storms"]
@@ -1073,6 +1211,7 @@ fn planned_in(pinned: &std::collections::BTreeMap<String, Value>, name: &str) ->
     phase["database_delay_milliseconds_configured"] = json!(plan.database_delay_ms);
     phase["database_delay_observed_select1_median_milliseconds"] =
         json!(2.0 * plan.database_delay_ms as f64 + 2.9);
+    with_arrival(&mut phase, pinned);
     phase
 }
 

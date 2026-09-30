@@ -693,6 +693,26 @@ Compare file sync methods using two 8kB writes:
         self.assertNotIn("hunter2", log.getvalue())
         self.assertIn("postgresql://alex:<redacted>@db.example/qbit", manifest)
 
+    def test_a_resume_whose_rebuilt_binaries_differ_is_refused(self) -> None:
+        def build(label, ref, out, skip_build):
+            return {"label": label, "ref": ref, "commit": label[0] * 40, "worktree": f"builds/{label}",
+                    "sha256": {"qbit-prism-load": f"{label}-rebuilt", "qbit-prism-server": label}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            options = ab.parse_args(["--base", "a", "--candidate", "b", "--preset", "throughput-20k-window-1fe",
+                                     "--out", directory, "--resume"])
+            preset = {"name": "throughput-20k-window-1fe", "_path": "p.json", "_sha256": "ab", "args": {}}
+            previous = {"builds": [
+                {"label": label, "commit": label[0] * 40,
+                 "sha256": {"qbit-prism-load": label, "qbit-prism-server": label}}
+                for label in ab.LABELS
+            ], "runs": [], "pg_test_fsync": {}}
+            with mock.patch.object(ab, "prepare_build", build), \
+                    mock.patch.object(ab, "help_flags", lambda harness: frozenset()), \
+                    self.assertRaisesRegex(ab.DriverError, "not the ones its recorded runs used"):
+                ab.run_series(options, out, preset, {}, frozenset(), out / "manifest.json", previous)
+
     def test_a_named_preset_resolves_to_the_checked_in_file(self) -> None:
         self.assertEqual(ab.preset_path("throughput-20k-window-1fe"), ab.PRESETS / "throughput-20k-window-1fe.json")
         with contextlib.redirect_stderr(io.StringIO()) as warning:

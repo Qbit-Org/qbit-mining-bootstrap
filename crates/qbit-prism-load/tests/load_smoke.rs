@@ -120,6 +120,43 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             setting.value
         );
     }
+    // So must the population its seed draws, and each phase's offers the
+    // arrival clock it pins.
+    for (pointer, expected) in compare::expected_population(&loaded.args)? {
+        let reported = report
+            .pointer(pointer)
+            .and_then(|value| value.as_f64())
+            .context(pointer)?;
+        assert!(
+            (reported - expected).abs()
+                <= expected.abs() * compare::POPULATION_TOLERANCE + f64::EPSILON,
+            "{pointer}: reported {reported}, drawn {expected}"
+        );
+    }
+    for planned in compare::expected_arrival(&loaded.args)? {
+        let arrival = &report["phases"]
+            .as_array()
+            .context("phases")?
+            .iter()
+            .find(|phase| phase["name"] == planned.phase.as_str())
+            .with_context(|| format!("{} is not reported", planned.phase))?["arrival"];
+        for (window, expected, key) in [
+            (1, planned.cv_1s, "offered_per_second_cv_1s"),
+            (60, planned.cv_60s, "offered_per_second_cv_60s"),
+        ] {
+            match (arrival[key].as_f64(), expected) {
+                (Some(value), Some(expected)) => assert!(
+                    (value - expected).abs() <= planned.tolerance(window),
+                    "{} {key}: offered {value}, clock {expected}",
+                    planned.phase
+                ),
+                (None, None) => {}
+                (value, expected) => {
+                    panic!("{} {key}: {value:?} against {expected:?}", planned.phase)
+                }
+            }
+        }
+    }
     for (flag, pointer) in compare::PINNED_REPORT_FIELDS {
         let pinned = &loaded.args[*flag];
         let reported = report.pointer(pointer);

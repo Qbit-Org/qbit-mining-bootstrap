@@ -460,19 +460,21 @@ def prepare_build(label: str, ref: str, out: Path, skip_build: bool) -> dict[str
     for binary in BINARIES:
         if not (release / binary).is_file():
             raise DriverError(f"{release / binary} is missing")
+    built = build_record(commit, release)
     if skip_build:
         try:
             recorded = json.loads(record.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             recorded = None
-        if recorded != build_record(commit, release):
+        if recorded != built:
             raise DriverError(
                 f"--skip-build: {release} holds no build this driver made of {ref} ({commit[:8]}), "
                 "so its binaries cannot be attributed to that commit; run without --skip-build"
             )
     else:
-        write_json(record, build_record(commit, release))
-    return {"label": label, "ref": ref, "commit": commit, "worktree": str(tree.relative_to(out))}
+        write_json(record, built)
+    return {"label": label, "ref": ref, "commit": commit, "worktree": str(tree.relative_to(out)),
+            "sha256": built["sha256"]}
 
 
 # --- one run ----------------------------------------------------------------
@@ -904,6 +906,14 @@ def run_series(
         for old, new in zip(previous["builds"], builds):
             if old["commit"] != new["commit"]:
                 raise DriverError(f"{manifest_path}: the {old['label']} build was {old['commit']}, not {new['commit']}")
+            # The same commit can build other binaries (a toolchain, RUSTFLAGS
+            # or another build input changed), and runs of both would be
+            # pooled under one label.
+            if old.get("sha256") != new.get("sha256"):
+                raise DriverError(
+                    f"{manifest_path}: the {old['label']} build's binaries are not the ones its recorded "
+                    "runs used; start a new series"
+                )
 
     manifest = {
         "schema": MANIFEST_SCHEMA,
