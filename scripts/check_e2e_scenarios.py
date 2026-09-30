@@ -9,7 +9,9 @@ evidence, and the evidence decides its lanes:
 - `tests`: `<package>::<binary>::<test path>` ids of gated tests. An id in
   `test/prism-gated-tests.txt` runs in `pr` (the required
   `prism-native-postgres` shards prove it executed); one in
-  `test/prism-nightly-gated-tests.txt` runs in `nightly`.
+  `test/prism-nightly-gated-tests.txt` runs in `nightly`, and one in
+  `test/prism-weekly-gated-tests.txt` in `weekly` (the live-weekly job, #487
+  L4).
 - `presets`: load-harness presets in `crates/qbit-prism-load/presets`. A
   `nightly` preset runs in `nightly`, a `weekly` one (the long soak, #575)
   in `weekly`, a `manual` one in `dispatch`, and a `smoke` preset in `pr`
@@ -31,8 +33,8 @@ This check fails when:
   definition of done: nothing unexercised without a linked issue and a
   reason; the owner is the linked issue);
 - a lane runs a scenario the manifest does not name: a gated test in one of
-  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly test, a
-  preset, or an L6 check that no running scenario cites;
+  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly or weekly
+  test, a preset, or an L6 check that no running scenario cites;
 - a lane the manifest marks as running no longer has the workflow wiring
   that runs it.
 
@@ -64,6 +66,7 @@ DEFAULT_MANIFEST = ROOT / "test" / "e2e-scenarios.toml"
 SCHEMA = "qbit.e2e-scenarios.v1"
 PR_LIST = Path("test/prism-gated-tests.txt")
 NIGHTLY_LIST = Path("test/prism-nightly-gated-tests.txt")
+WEEKLY_LIST = Path("test/prism-weekly-gated-tests.txt")
 PRESETS = Path("crates/qbit-prism-load/presets")
 L6_DRIVER = Path("scripts/prism_shipped_image_lane.py")
 # Gated test binaries whose every test is an end-to-end scenario and so must
@@ -97,10 +100,16 @@ LANE_WIRING = {
         ".github/workflows/prism-load-nightly.yml",
         ("workflow_dispatch:", "scripts/prism_load_matrix.py"),
     ),
-    # The long soak's schedule (#575), whose plan selects the `weekly` presets.
+    # The long soak's schedule (#575), whose plan selects the `weekly` presets,
+    # and the live-weekly job's, which runs the weekly gated list (#487 L4).
     "weekly": (
         ".github/workflows/prism-load-nightly.yml",
-        ('cron: "41 5 * * 6"', "github.event.schedule == '41 5 * * 6' && 'weekly'"),
+        (
+            'cron: "41 5 * * 6"',
+            "github.event.schedule == '41 5 * * 6' && 'weekly'",
+            'cron: "43 3 * * 0"',
+            "--expected test/prism-weekly-gated-tests.txt",
+        ),
     ),
     "L6": (
         ".github/workflows/prism-load-nightly.yml",
@@ -126,6 +135,7 @@ class Lanes:
         self.root = root
         self.pr = read_expected(root / PR_LIST)
         self.nightly = read_expected(root / NIGHTLY_LIST)
+        self.weekly = read_expected(root / WEEKLY_LIST)
         self.presets = load_presets(root / PRESETS)
         self.l6_checks = read_lane_checks(root / L6_DRIVER)
 
@@ -135,6 +145,8 @@ class Lanes:
             lanes.add("pr")
         if test_id in self.nightly:
             lanes.add("nightly")
+        if test_id in self.weekly:
+            lanes.add("weekly")
         return lanes
 
     def preset_lanes(self, name: str) -> set[str]:
@@ -314,8 +326,8 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
             found = lanes_run.test_lanes(test_id)
             if not found:
                 problems.append(
-                    f"{where}: {test_id} is in neither {PR_LIST} nor {NIGHTLY_LIST}, "
-                    "so no lane runs it"
+                    f"{where}: {test_id} is in none of {PR_LIST}, {NIGHTLY_LIST} "
+                    f"or {WEEKLY_LIST}, so no lane runs it"
                 )
             derived |= found
         for preset in evidence["presets"]:
@@ -350,6 +362,9 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
     for test_id in lanes_run.nightly:
         if test_id not in cited["tests"]:
             problems.append(f"nightly runs {test_id}, which no running scenario names")
+    for test_id in lanes_run.weekly:
+        if test_id not in cited["tests"]:
+            problems.append(f"weekly runs {test_id}, which no running scenario names")
     for name in lanes_run.l6_checks:
         if name not in cited["lane_checks"]:
             problems.append(f"L6 runs check {name}, which no running scenario names")

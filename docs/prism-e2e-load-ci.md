@@ -19,7 +19,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
 | L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz` | `nightly`, `dispatch` | running; repeats, trend and regression rule not yet (#549, #551, #542) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
-| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | partly; under session load **not yet** (#553) |
+| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
 | L6 shipped images | `prism-load-nightly.yml`'s `shipped-images` job | `L6` | running |
 
@@ -86,7 +86,8 @@ parts:
 - `live-nightly`: the opt-in `#[ignore]` real-node variants listed in
   `test/prism-nightly-gated-tests.txt`. They are the qbitd `-reindex` crash,
   the 130-payee weighted recipients, the dense-cadence soak, a full PostgreSQL
-  disk, wall-clock jumps and the soak smoke. The job uses the same gate
+  disk, wall-clock jumps, the soak smoke and #553's short set of chain events
+  under 2,000 Stratum sessions (L4, below). The job uses the same gate
   manifest check to show each one ran.
 - `stratum-fuzz`: the cargo-fuzz Stratum targets for 20 minutes, gated on no
   crash ([prism-stratum-fuzzing.md](prism-stratum-fuzzing.md)).
@@ -176,15 +177,26 @@ count toward #291. Its rates are not D1 verdicts.
 - the nightly `live-nightly` variants above;
 - the Sunday 03:43 UTC `live-weekly` job, which runs
   `test/prism-weekly-gated-tests.txt` in release mode: #545's 2.x.x migration
-  lifecycle and #575's measured cutover of a mainnet-shaped 2.x.x ledger.
+  lifecycle, #575's measured cutover of a mainnet-shaped 2.x.x ledger and
+  #553's long set of chain events under 2,000 sessions.
+
+#553 runs #521's fixtures unchanged under a load of 2,000 share-only Stratum
+sessions (`tests/support/live_session_load.rs`), which adds its own checks:
+every acknowledged share durable, only refusals a correct miner can earn,
+and every session given work on each lasting tip within 15 s, with #481's
+time to usable work reported per frontend. Nightly, at 100 shares/s:
+scenarios 1 and 2, scenario 4's crash case, two frontends on two nodes that
+disagree about the tip, a node that loses its peer, 5 minutes of external
+tips, and #598's guard (2,000 sessions on one frontend at a 1 s reanchor, in
+debug). Weekly, at 400 shares/s: scenario 4's other four cases, scenario 5's
+20-minute soak and 45 minutes of external tips.
 
 **Proves:** each listed scenario's own assertions on a real regtest node and
 PostgreSQL 16, and that every listed id executed.
 
-**Does not prove:** anything under session load. **Not yet running; owner
-#553:** #521's scenarios 1, 2, 4 and 5 and the 2,000-wallet case at L4's
-session counts, plus the scenarios where the frontends disagree about the tip.
-Fault injection under load is #554.
+**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #604 in
+debug and #622 in release and runs only by hand until both are fixed. Fault
+injection under load is #554.
 
 ## L5: soak and chaos
 

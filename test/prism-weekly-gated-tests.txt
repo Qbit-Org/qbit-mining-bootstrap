@@ -4,5 +4,11 @@
 # qbit-prism-server::live_regtest ids: the job runs that one binary. Neither
 # the prism-native-postgres PR job nor live-nightly runs these; the job proves
 # each executed with scripts/check_gate_manifest.py (#487 L4).
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_flat
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_killed_before_submitblock_under_2000_sessions_lands_the_block_once
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_restarted_into_warmup_under_2000_sessions_lands_the_block_once
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_after_accepting_under_2000_sessions_lands_the_block_once
+qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_before_submitblock_under_2000_sessions_lands_the_block_once
 qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation
 qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation

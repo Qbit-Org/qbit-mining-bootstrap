@@ -75,6 +75,12 @@ mod clock_jump_tests;
 #[path = "support/live_transcript_replay.rs"]
 mod transcript_replay_tests;
 
+#[path = "support/live_session_load.rs"]
+mod session_load;
+
+#[path = "support/live_chain_events_load.rs"]
+mod chain_events_load_tests;
+
 /// The payout policy of the 0-bps fee every live server runs unless a case
 /// sets its own (#535). An in-process coordinator sharing a fixture's cluster
 /// must pin it, or its configuration fingerprint differs from the servers'.

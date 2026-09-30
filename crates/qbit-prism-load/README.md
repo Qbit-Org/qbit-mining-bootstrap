@@ -958,7 +958,10 @@ against a real qbitd and PostgreSQL 16, and proves each executed with
 `scripts/check_gate_manifest.py`, as the PR suite proves its own list.
 Once a week (Sunday) its `live-weekly` job does the same for the longer
 scenarios listed in `test/prism-weekly-gated-tests.txt`: #545's 2.x.x
-migration lifecycle today. Dispatch sets `weekly` to run them on demand.
+migration lifecycle, #575's measured cutover and #553's long set of chain
+events under 2,000 sessions today. Dispatch sets `weekly` to run them on
+demand. `scripts/check_e2e_scenarios.py` fails on an id in either list that
+no scenario names.
 
 The per-PR smoke run is the gated test `tests/load_smoke.rs`: the `pr-smoke`
 preset (a debug frontend, 100 sessions over 20 addresses under a 60% whale

@@ -71,20 +71,20 @@ async fn real_weighted_recipients_pay_exact_direct_outputs_without_ctv() -> Resu
     weighted_case(&DIRECT).await
 }
 
-struct Scenario {
-    name: &'static str,
-    seed: u64,
-    payees: usize,
-    blocks: usize,
+pub(super) struct Scenario {
+    pub(super) name: &'static str,
+    pub(super) seed: u64,
+    pub(super) payees: usize,
+    pub(super) blocks: usize,
     /// Each whale's share of every round's work, in address order.
-    whales: &'static [f64],
+    pub(super) whales: &'static [f64],
     /// Addresses that submit one minimum-difficulty share in one round.
-    near_zero: usize,
+    pub(super) near_zero: usize,
     /// CTV settlement; direct coinbase settlement when false.
-    ctv: bool,
+    pub(super) ctv: bool,
     /// Wallets the payee addresses are spread over, round robin. Each
     /// output is spent by the wallet that generated its address.
-    wallets: usize,
+    pub(super) wallets: usize,
 }
 
 const PER_PR: Scenario = Scenario {
@@ -149,8 +149,10 @@ const FANOUT_PREMIUM_BPS: u64 = 12_000;
 /// The fanout weight estimate: fixed bytes plus one P2MR output each.
 const FANOUT_FIXED_WEIGHT: u64 = 90;
 const FANOUT_OUTPUT_WEIGHT: u64 = 43;
+/// The server's default `PRISM_STRATUM_MAX_CONNECTIONS`.
+const DEFAULT_MAX_CONNECTIONS: usize = 384;
 
-async fn weighted_case(scenario: &Scenario) -> Result<()> {
+pub(super) async fn weighted_case(scenario: &Scenario) -> Result<()> {
     let Some(mut fixture) = Fixture::open_with_servers(scenario.ctv, false).await? else {
         return Ok(());
     };
@@ -187,14 +189,17 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
     };
     let payees = Payees::create(fixture, scenario.payees, scenario.wallets).await?;
     let plan = Plan::new(scenario, network, coinbase)?;
-    start_servers(fixture, &policy).await?;
+    start_servers_for(fixture, &policy, plan.workers.len()).await?;
     phases.lap("wallets and servers", &mut since);
 
     let mut sessions = Vec::with_capacity(plan.workers.len());
     for worker in &plan.workers {
         let username = format!("{}.{}", payees.ids[worker.payee].recipient, worker.name);
+        let opened = sessions.len();
         sessions.push(Some(
-            Session::open(fixture.stratum[worker.server], username, worker.difficulty).await?,
+            Session::open(fixture.stratum[worker.server], username, worker.difficulty)
+                .await
+                .with_context(|| format!("{opened} of {} sessions opened", plan.workers.len()))?,
         ));
     }
     let mut accepted: HashMap<String, usize> = HashMap::new();
@@ -662,6 +667,11 @@ struct Policy {
 }
 
 async fn start_servers(fixture: &mut Fixture, policy: &Policy) -> Result<()> {
+    start_servers_for(fixture, policy, 0).await
+}
+
+/// [`start_servers`] with room for `workers` sessions.
+async fn start_servers_for(fixture: &mut Fixture, policy: &Policy, workers: usize) -> Result<()> {
     let mut env = vec![
         // Fixed per-worker difficulty: each worker's password sets it.
         ("PRISM_STRATUM_VARDIFF", "0".to_owned()),
@@ -682,6 +692,11 @@ async fn start_servers(fixture: &mut Fixture, policy: &Policy) -> Result<()> {
                 MAX_DIRECT_OUTPUTS.to_string(),
             ),
         ]);
+    }
+    // #553's 2,000-wallet case has one session per worker, more than the
+    // server's default of 384 connections.
+    if workers > DEFAULT_MAX_CONNECTIONS {
+        env.push(("PRISM_STRATUM_MAX_CONNECTIONS", (workers + 64).to_string()));
     }
     fixture.server_env = env
         .into_iter()

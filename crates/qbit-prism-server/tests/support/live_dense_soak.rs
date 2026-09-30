@@ -38,7 +38,7 @@ const ORPHAN_BURIAL_BLOCKS: u64 = 7;
 /// Regtest's constant target.
 const REGTEST_BITS: &str = "207fffff";
 
-fn setting<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
+pub(super) fn setting<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -237,7 +237,7 @@ async fn metrics_body(fixture: &Fixture, index: usize) -> Result<String> {
         .await?)
 }
 
-async fn soak(fixture: &mut Fixture, seconds: u64, budget: f64) -> Result<()> {
+pub(super) async fn soak(fixture: &mut Fixture, seconds: u64, budget: f64) -> Result<()> {
     let start_height = fixture
         .rpc("getblockcount", json!([]))
         .await?
