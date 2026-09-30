@@ -324,7 +324,28 @@ def mib(kib: int | None) -> float | None:
     return None if kib is None else round(kib / 1024, 1)
 
 
+def process_state(pid: int | str) -> tuple[str, int] | None:
+    """(state, process group) from /proc/<pid>/stat, or None when it is gone."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    fields = text[text.rindex(")") + 2:].split()
+    return fields[0], int(fields[2])
+
+
 def group_alive(pgid: int) -> bool:
+    """Whether any process of the group is still running. A zombie is not:
+    an orphan whose PID 1 does not reap it promptly stays in the group
+    as a zombie, and a kill(0) probe would wait on it for the whole grace."""
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if entry.name.isdigit():
+                state = process_state(entry.name)
+                if state is not None and state[1] == pgid and state[0] not in ("Z", "X"):
+                    return True
+        return False
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -969,9 +990,16 @@ def size_evidence(runs: list[dict], planned: int, preset: dict | None,
     totals = [t for t in (finite(r.get("mem_total_mib")) for r in measured) if t is not None]
     peaks = [p for p in (finite(r.get("peak_used_mib")) for r in measured) if p is not None]
     headrooms = [h for h in (finite(r.get("headroom_mib")) for r in measured) if h is not None]
-    required = None
-    if totals:
-        required = round(max(headroom_fraction * min(totals), floor or 0), 1)
+    # Each run against its own VM's MemTotal: one class's VMs need not all
+    # report the same total, and the smallest must not set a lenient bar
+    # for the others.
+    required_by_run = [
+        (h, round(max(headroom_fraction * t, floor or 0), 1))
+        for h, t in ((finite(r.get("headroom_mib")), finite(r.get("mem_total_mib")))
+                     for r in measured)
+        if h is not None and t is not None
+    ]
+    required = max((need for _h, need in required_by_run), default=None)
     shortfalls: list[float | None] = []
     for run in measured:
         names = phases or list((run.get("phases") or {}))
@@ -981,14 +1009,15 @@ def size_evidence(runs: list[dict], planned: int, preset: dict | None,
     problems = []
     if any(v > 0 for v in known_shortfalls):
         problems.append(f"{sum(v > 0 for v in known_shortfalls)} run(s) with gated shortfall")
-    if required is not None and any(h < required for h in headrooms):
-        problems.append(f"{sum(h < required for h in headrooms)} run(s) under the headroom")
+    short = sum(h < need for h, need in required_by_run)
+    if short:
+        problems.append(f"{short} run(s) under the headroom")
     unknowns = []
     if len(measured) < planned:
         unknowns.append(f"{planned - len(measured)} of {planned} run(s) unknown")
     if len(known_shortfalls) < len(measured):
         unknowns.append(f"{len(measured) - len(known_shortfalls)} run(s) with no gated shortfall")
-    if len(headrooms) < len(measured) or required is None:
+    if len(required_by_run) < len(measured) or required is None:
         unknowns.append("memory headroom not measured on every run")
     if problems:
         fits, why = False, "; ".join(problems)
@@ -1005,6 +1034,8 @@ def size_evidence(runs: list[dict], planned: int, preset: dict | None,
         "peak_used_mib_max": max(peaks) if peaks else None,
         "mem_total_mib_min": min(totals) if totals else None,
         "headroom_mib_min": min(headrooms) if headrooms else None,
+        # The most any run needed: each run's is max(fraction x its own
+        # MemTotal, the preset's floor).
         "headroom_mib_required": required,
         "headroom_fraction": headroom_fraction,
         "preset_min_mem_available_mib": floor,

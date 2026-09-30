@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -383,8 +382,10 @@ class MeasureTimeout(unittest.TestCase):
             self.assertTrue(result["timed_out"])
             self.assertNotEqual(result["exit_code"], 0)
             grandchild = int(pid_file.read_text())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(grandchild, 0)
+            # Gone, or a zombie a slow PID 1 has not reaped yet: not running.
+            state = probe.process_state(grandchild)
+            self.assertTrue(state is None or state[0] in ("Z", "X"), state)
+            self.assertFalse(probe.group_alive(grandchild))
 
     def test_the_cli_exits_124_on_a_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,6 +630,14 @@ class Variance(unittest.TestCase):
             "size_evidence"]
         self.assertFalse(evidence["fits"])
         self.assertIn("under the headroom", evidence["why"])
+
+        # Each run against its own MemTotal: a 64 GiB VM with 10 GiB left
+        # fails even when a 32 GiB VM of the class needs only 8 GiB.
+        rows[1]["runs"][PRESET][0] = run(total=65536.0, peak=55536.0)
+        evidence = group(probe.variance(rows, self.expected(2), self.presets), 8, "all")[
+            "size_evidence"]
+        self.assertFalse(evidence["fits"])
+        self.assertEqual(evidence["headroom_mib_required"], 16384.0)
 
         # The preset's own memory floor (6 GiB) wins over a small fraction.
         evidence = group(probe.variance([probe_row(1, [run(peak=27000.0), run()])],
