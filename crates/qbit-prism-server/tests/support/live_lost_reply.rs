@@ -29,7 +29,7 @@
 //! it, so the survivor takes over through the production claim predicate.
 use super::fault_seams::{
     end_frontend_backends, expire_dead_lease, frontend_index, kill_frontend, start_frontend,
-    JournalGate, RpcReplyHold, StratumRelay,
+    HeldReply, JournalGate, RpcReplyHold, StratumRelay,
 };
 use super::share_client::{
     reason_id, start_share_only_servers, Answer, Proof, ShareClient, StratumSession, ANSWER,
@@ -426,27 +426,27 @@ async fn fanout_gate(fixture: &Fixture) -> Result<JournalGate> {
     .await
 }
 
-/// With a broadcaster's call held after the node accepted it: close `gate`,
-/// check the attempt is unjournaled, kill its owner and hand its lease to
-/// the survivor. Returns the owner's instance id and index.
+/// With a broadcaster's call held after the node accepted it, behind the
+/// closed `gate`: kill its owner, check the attempt stayed unjournaled, and
+/// hand its lease to the survivor. Returns the owner's instance id and index.
 async fn kill_fanout_owner(
     fixture: &mut Fixture,
-    mut gate: JournalGate,
+    gate: JournalGate,
     fanout: &str,
-    attempts_before: i64,
 ) -> Result<(String, usize)> {
-    gate.close(fixture).await?;
+    // The gate was closed before the call: the attempt cannot be journaled,
+    // so this is the row as the owner left it before sending.
     let (status, attempts, owner) = fanout_journal(fixture, fanout).await?;
     let owner = owner.context("the held fanout has no claim owner")?;
     ensure!(
-        status == "broadcastable" && attempts == attempts_before,
-        "the owner journaled its attempt before the gate closed: {status}, {attempts}"
+        !matches!(status.as_str(), "broadcast_submitted" | "confirmed"),
+        "the owner journaled its held send before the kill: {status}"
     );
     let owner_index = frontend_index(&owner)?;
     let terminated = kill_owner_behind_gate(fixture, gate, owner_index).await?;
     let journal = fanout_journal(fixture, fanout).await?;
     ensure!(
-        journal == ("broadcastable".into(), attempts_before, Some(owner.clone())),
+        journal == (status, attempts, Some(owner.clone())),
         "the killed owner journaled its attempt: {journal:?}"
     );
     expire_dead_lease(
@@ -462,6 +462,51 @@ async fn kill_fanout_owner(
         terminated.0, terminated.1
     );
     Ok((owner, owner_index))
+}
+
+/// Wait for the armed call's withheld reply while `gate` stays closed, so
+/// the owner can never journal the call first, however late this task runs.
+/// An attempt that ends without sending would wait on the gate and hold its
+/// claim: it is let through, and the gate closes again at once. Returns the
+/// held reply and how many such attempts passed.
+async fn held_behind_gate(
+    fixture: &Fixture,
+    gate: &mut JournalGate,
+    mut held: tokio::sync::oneshot::Receiver<HeldReply>,
+    call: &str,
+) -> Result<(HeldReply, usize)> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut passed = 0;
+    loop {
+        tokio::select! {
+            biased;
+            reply = &mut held => {
+                return Ok((reply.with_context(|| format!("the proxy dropped the held {call}"))?, passed));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "no {call} reached the proxy ({passed} unsent attempt(s) let through the gate)"
+        );
+        if !gate.waiting(fixture).await?.is_empty() {
+            // The proxy hands over the held reply before it withholds the
+            // node's answer, so an update that follows a send always finds
+            // the reply already here: take it instead of opening the gate.
+            // Only an attempt that never sent gets through.
+            match held.try_recv() {
+                Ok(reply) => return Ok((reply, passed)),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    bail!("the proxy dropped the held {call}")
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            // Closing again waits for the released update's transaction.
+            gate.open().await?;
+            gate.close(fixture).await?;
+            passed += 1;
+        }
+    }
 }
 
 async fn wait_fanout(fixture: &Fixture, fanout: &str, status: &str) -> Result<()> {
@@ -539,13 +584,14 @@ async fn lost_fanout_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resul
     start_frontends(fixture, proxy, None).await?;
     // Installed open once the servers made the schema; nothing is claimable
     // before the coinbase matures.
-    let gate = fanout_gate(fixture).await?;
+    let mut gate = fanout_gate(fixture).await?;
     let (fanout, raw, height) = mined_fanout(fixture).await?;
     ensure!(
         txid(&raw)? == fanout,
         "the manifest's bytes are not its txid"
     );
-    let (_, attempts_before, _) = fanout_journal(fixture, &fanout).await?;
+    // Closed before the coinbase matures: nothing is claimable until then.
+    gate.close(fixture).await?;
     let held = proxy.arm("sendrawtransaction");
     let tip = fixture
         .rpc("getblockcount", json!([]))
@@ -558,9 +604,7 @@ async fn lost_fanout_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resul
             json!([height + 1000 - tip, fixture.address]),
         )
         .await?;
-    let held = tokio::time::timeout(Duration::from_secs(60), held)
-        .await
-        .context("no sendrawtransaction reached the proxy")??;
+    let (held, passed) = held_behind_gate(fixture, &mut gate, held, "sendrawtransaction").await?;
     ensure!(
         held.params[0].as_str() == Some(raw.as_str()) && held.reply["result"] == json!(fanout),
         "the node did not accept the fanout's signed bytes: {}",
@@ -570,7 +614,7 @@ async fn lost_fanout_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resul
         in_mempool(fixture, &fanout).await?,
         "the accepted fanout is not in the mempool"
     );
-    let (owner, owner_index) = kill_fanout_owner(fixture, gate, &fanout, attempts_before).await?;
+    let (owner, owner_index) = kill_fanout_owner(fixture, gate, &fanout).await?;
     let _ = held.release.send(());
     // The survivor finds the fanout in the mempool and records it.
     wait_fanout(fixture, &fanout, "broadcast_submitted").await?;
@@ -597,7 +641,7 @@ async fn lost_fanout_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resul
     fixture.integrity().await?;
     let (_, attempts, _) = fanout_journal(fixture, &fanout).await?;
     eprintln!(
-        "lost sendrawtransaction reply: fanout {fanout} accepted by the node, owner {owner} killed before journaling; survivor recorded it from the mempool and it confirmed with its signed bytes; {} identical broadcast(s), {attempts} journaled attempt(s)",
+        "lost sendrawtransaction reply: fanout {fanout} accepted by the node, owner {owner} killed before journaling; survivor recorded it from the mempool and it confirmed with its signed bytes; {} identical broadcast(s), {attempts} journaled attempt(s), {passed} unsent attempt(s) let through the gate first",
         sends.len()
     );
     Ok(())
@@ -613,13 +657,12 @@ async fn lost_package_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resu
         .bind(&fanout)
         .fetch_one(&fixture.pool)
         .await?;
-        let (_, attempts_before, _) = fanout_journal(fixture, &fanout).await?;
-        let gate = fanout_gate(fixture).await?;
+        // Closed before any broadcaster runs.
+        let mut gate = fanout_gate(fixture).await?;
+        gate.close(fixture).await?;
         let held = proxy.arm("submitpackage");
         start_frontends(fixture, proxy, Some(100_000)).await?;
-        let held = tokio::time::timeout(Duration::from_secs(60), held)
-            .await
-            .context("no submitpackage reached the proxy")??;
+        let (held, passed) = held_behind_gate(fixture, &mut gate, held, "submitpackage").await?;
         let child_raw = held.params[0][1]
             .as_str()
             .context("package without a child")?
@@ -646,7 +689,7 @@ async fn lost_package_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resu
             "the durable package is not the one submitted: {package:?}"
         );
         let (funding_txid, funding_vout) = (package.1.clone(), package.2);
-        let (owner, owner_index) = kill_fanout_owner(fixture, gate, &fanout, attempts_before).await?;
+        let (owner, owner_index) = kill_fanout_owner(fixture, gate, &fanout).await?;
         let _ = held.release.send(());
         wait_fanout(fixture, &fanout, "broadcast_submitted").await?;
         // Unconfirmed: the funding stays reserved and locked, its cleanup
@@ -726,7 +769,7 @@ async fn lost_package_reply(fixture: &mut Fixture, proxy: &RpcReplyHold) -> Resu
         ensure!(retired == 0, "the takeover retired the signed package's funding");
         fixture.integrity().await?;
         eprintln!(
-            "lost submitpackage reply: package {fanout}+{child} accepted by the node, owner {owner} killed before journaling; survivor recorded it from the mempool, kept funding {funding_txid}:{funding_vout} reserved until the child confirmed, then released it; {} identical submission(s)",
+            "lost submitpackage reply: package {fanout}+{child} accepted by the node, owner {owner} killed before journaling; survivor recorded it from the mempool, kept funding {funding_txid}:{funding_vout} reserved until the child confirmed, then released it; {} identical submission(s), {passed} unsent attempt(s) let through the gate first",
             submits.len()
         );
         Ok::<_, anyhow::Error>(())

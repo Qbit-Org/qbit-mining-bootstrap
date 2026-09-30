@@ -254,6 +254,30 @@ impl JournalGate {
         Ok(())
     }
 
+    /// Open the gate, keeping its trigger: every waiting update proceeds.
+    pub(crate) async fn open(&mut self) -> Result<()> {
+        let (connection, _) = self.holder.take().context("the gate is open")?;
+        self.unlock(connection).await
+    }
+
+    /// Release the gate's lock on its holder. If the unlock fails, the
+    /// connection is closed rather than returned to the pool still holding
+    /// the session lock; closing it releases the lock.
+    async fn unlock(
+        &self,
+        mut connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    ) -> Result<()> {
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+            .bind(&self.key)
+            .execute(&mut *connection)
+            .await;
+        if unlocked.is_err() {
+            drop(connection.detach());
+        }
+        unlocked?;
+        Ok(())
+    }
+
     /// The backends whose update waits on the closed gate.
     pub(crate) async fn waiting(&self, fixture: &Fixture) -> Result<Vec<i32>> {
         let (_, pid) = self.holder.as_ref().context("the gate is open")?;
@@ -267,11 +291,8 @@ impl JournalGate {
 
     /// Open the gate and remove its trigger.
     pub(crate) async fn remove(mut self, fixture: &Fixture) -> Result<()> {
-        if let Some((mut connection, _)) = self.holder.take() {
-            sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
-                .bind(&self.key)
-                .execute(&mut *connection)
-                .await?;
+        if let Some((connection, _)) = self.holder.take() {
+            self.unlock(connection).await?;
         }
         sqlx::raw_sql(&format!(
             "DROP TRIGGER {name} ON {schema}.{table}; DROP FUNCTION {schema}.{name}();",
@@ -282,6 +303,17 @@ impl JournalGate {
         .execute(&fixture.pool)
         .await?;
         Ok(())
+    }
+}
+
+/// A gate dropped while closed (a failed case) closes its holder
+/// connection instead of returning it to the pool with the session lock
+/// held, which would hold every gated update, and the teardown, forever.
+impl Drop for JournalGate {
+    fn drop(&mut self) {
+        if let Some((connection, _)) = self.holder.take() {
+            drop(connection.detach());
+        }
     }
 }
 
