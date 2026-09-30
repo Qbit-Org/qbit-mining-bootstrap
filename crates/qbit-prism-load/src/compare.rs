@@ -2210,22 +2210,44 @@ pub fn compare(
     // The memory floor the preset pins stops a run below it, so a counted
     // run's lowest reading must be at or above it; an unread minimum cannot
     // show that (`phases[].min_mem_available_kib`, in every harness since #271).
+    // Nor can a floor check that could not read MemAvailable: a phase that
+    // counts one (`mem_available_unread_checks`, since #514) went unguarded
+    // for a while, whatever its other readings said. A harness older than
+    // #514 counts none, and is held to its readings alone.
     if let Some(floor_mib) = pinned
         .get("--min-mem-available-mib")
         .and_then(Value::as_u64)
     {
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
-            let lowest: Option<u64> = run
+            let phases = run
                 .report
                 .as_ref()
                 .and_then(|r| r["phases"].as_array())
-                .and_then(|phases| {
+                .cloned()
+                .unwrap_or_default();
+            let lowest: Option<u64> = (!phases.is_empty())
+                .then(|| {
                     phases
                         .iter()
                         .map(|p| p["min_mem_available_kib"].as_u64())
                         .collect::<Option<Vec<u64>>>()
                 })
+                .flatten()
                 .and_then(|lows| lows.into_iter().min());
+            let unread: u64 = phases
+                .iter()
+                .filter_map(|p| p["mem_available_unread_checks"].as_u64())
+                .sum();
+            if unread > 0 {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not hold the pinned memory floor**: {} could not read \
+                     MemAvailable at {unread} of its checks, so the pinned \
+                     `--min-mem-available-mib` {floor_mib} went unguarded",
+                    run.run.id
+                ));
+                break;
+            }
             if !lowest.is_some_and(|kib| kib >= floor_mib * 1024) {
                 passed = false;
                 findings.push(format!(

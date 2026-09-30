@@ -1023,6 +1023,30 @@ fn a_run_that_fell_under_the_pinned_memory_floor_fails() {
     assert!(result
         .markdown
         .contains("lowest MemAvailable of nothing it read"));
+    // A floor check that could not read MemAvailable, though every phase kept
+    // a reading above the floor.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    runs[1].report.as_mut().unwrap()["phases"][1]["mem_available_unread_checks"] = json!(3);
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("could not read MemAvailable at 3 of its checks"),
+        "{}",
+        result.markdown
+    );
+    // None counted is a floor held, and a harness older than the count is
+    // held to its readings alone.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        run.report.as_mut().unwrap()["phases"][0]["mem_available_unread_checks"] = json!(0);
+    }
+    assert!(
+        compare::compare(&manifest, &runs, &d1_budgets(), &d1_args())
+            .unwrap()
+            .passed
+    );
 }
 
 #[test]

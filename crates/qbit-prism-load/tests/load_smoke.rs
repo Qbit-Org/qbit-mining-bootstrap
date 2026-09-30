@@ -285,6 +285,12 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             plan.name
         );
         assert_eq!(
+            phase["mem_available_unread_checks"].as_u64(),
+            Some(0),
+            "{} missed MemAvailable readings",
+            plan.name
+        );
+        assert_eq!(
             phase["database_delay_milliseconds_configured"].as_u64(),
             Some(plan.database_delay_ms),
             "{}",
