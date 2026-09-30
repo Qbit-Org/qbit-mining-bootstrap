@@ -8,7 +8,7 @@
 //! never as a failure. An append carrying a found block follows the same
 //! deadline and grace but is never refused, so it runs on past an unknown
 //! answer. Block-only proofs wait for their candidate's disposition up to
-//! `block_only_ack_timeout`, which is `share_commit_timeout` itself (#574).
+//! `share_commit_timeout` itself (#574).
 //! A block-bearing submission still pending at its bound is answered
 //! `ledger-outcome-unknown` and counted in `block_proof_ack_capped_total`; the
 //! bound only ends the wait, never the probe, enqueue, append or landing.
@@ -696,7 +696,13 @@ impl Coordinator {
     }
 
     /// Credit a block-only proof once its candidate is confirmed on the active
-    /// chain, waiting at most `block_only_ack_timeout` from `start`.
+    /// chain, waiting at most `share_commit_timeout` from `start` (#574): a
+    /// captured proof's answer used to wait up to `max(share_commit_timeout,
+    /// 60 s)` for its own frontend's landing, and the miner's session can
+    /// submit nothing else meanwhile. At the bound the proof is answered
+    /// `ledger-outcome-unknown`, as any share still pending at its deadline
+    /// is; the block and any deferred share are still landed and credited
+    /// once, because only the wait ends there.
     async fn persist_block_only(
         &self,
         share: &AcceptedShare,
@@ -705,7 +711,7 @@ impl Coordinator {
         block_hash: &str,
         start: tokio::time::Instant,
     ) -> SaveOutcome {
-        let bound = start + self.config.block_only_ack_timeout;
+        let bound = start + self.config.share_commit_timeout;
         let candidate = match candidate.context("missing candidate") {
             Ok(candidate) => candidate,
             Err(error) => return SaveOutcome::Failed(error),
@@ -893,7 +899,7 @@ impl Coordinator {
             .record_block_ack_capped(BlockAckPath::BlockOnly);
         SaveOutcome::Unknown {
             phase,
-            detail: "the block candidate had no disposition by block_only_ack_timeout".into(),
+            detail: "the block candidate had no disposition by share_commit_timeout".into(),
         }
     }
 }

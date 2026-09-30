@@ -30,8 +30,8 @@
 //! # Acceptance is not the assertion
 //!
 //! The latency percentiles are. From #324 (`e13051cf`) on, a share-pass append
-//! carrying a found-block candidate has its own `block_only_ack_timeout`, so
-//! a slow solve no longer shows up as `ledger-confirmation-failed`; it shows
+//! carrying a found-block candidate is never refused at the share deadline,
+//! so a slow solve no longer shows up as `ledger-confirmation-failed`; it shows
 //! up as a late acknowledgement counted in
 //! `qbit_prism_late_confirmed_shares_total`, or at worst as
 //! `ledger-outcome-unknown`, and an "every share was accepted" check would
@@ -280,7 +280,6 @@ fn frontend_config(database_url: &str, node: &FakeNode, instance_id: &str) -> Re
         health_timeout: Duration::from_secs(3600),
         share_commit_timeout: SHARE_COMMIT_TIMEOUT,
         share_commit_grace: Duration::from_secs(5),
-        block_only_ack_timeout: Duration::from_secs(60),
         candidate_orphan_confirmations: 6,
         capture_overpay_ceiling_bps: 100,
         offer_standby: None,

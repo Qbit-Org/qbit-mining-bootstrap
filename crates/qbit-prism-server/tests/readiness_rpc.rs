@@ -409,7 +409,6 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         health_timeout: Duration::from_secs(15),
         share_commit_timeout: Duration::from_secs(15),
         share_commit_grace: Duration::from_secs(5),
-        block_only_ack_timeout: Duration::from_secs(60),
         candidate_orphan_confirmations: 6,
         capture_overpay_ceiling_bps: 100,
         offer_standby: None,
@@ -819,11 +818,12 @@ async fn another_frontend_payout_revision_captures_the_same_parent_block_but_fen
     };
     let fixture = FixtureDatabase::open(&raw, "prism_job_revision_").await?;
     let node = Node::open().await?;
-    // The node keeps every offer's outcome unknown, so bound the block-only
-    // acknowledgement instead of waiting the full default for a landing that
-    // cannot happen against this node.
+    // The node keeps every offer's outcome unknown, so shorten the share
+    // deadline, which bounds the block-only acknowledgement, instead of
+    // waiting the full default for a landing that cannot happen against this
+    // node.
     let mut first_config = coordinator_config(fixture.url.clone(), &node)?;
-    first_config.block_only_ack_timeout = Duration::from_secs(3);
+    first_config.share_commit_timeout = Duration::from_secs(3);
     let first = Coordinator::new(
         first_config,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
@@ -831,7 +831,7 @@ async fn another_frontend_payout_revision_captures_the_same_parent_block_but_fen
     .await?;
     let mut config = coordinator_config(fixture.url.clone(), &node)?;
     config.instance_id = "readiness-second".into();
-    config.block_only_ack_timeout = Duration::from_secs(3);
+    config.share_commit_timeout = Duration::from_secs(3);
     let second = Coordinator::new(
         config,
         std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),

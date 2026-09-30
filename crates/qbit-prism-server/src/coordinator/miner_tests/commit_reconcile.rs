@@ -255,16 +255,9 @@ async fn commit_reconcile_candidate_bearing_append_is_never_refused() {
         assert!(records[0].1.is_some(), "the found block was discarded");
     }
 
-    // Held before COMMIT past the share deadline: unknown there, not at the
-    // block-only bound, and the append runs on.
-    let fixture = fixture(
-        |config| {
-            config.share_commit_timeout = MS(200);
-            config.block_only_ack_timeout = MS(1000);
-        },
-        None,
-    )
-    .await;
+    // Held before COMMIT past the share deadline: unknown there, without the
+    // grace, and the append runs on.
+    let fixture = fixture(|config| config.share_commit_timeout = MS(200), None).await;
     let append = Arc::new(Gate::default());
     *fixture.store.append_gate.lock().unwrap() = Some(append.clone());
     let started = TokioInstant::now();
