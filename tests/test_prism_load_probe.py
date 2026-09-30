@@ -660,6 +660,17 @@ class Variance(unittest.TestCase):
         self.assertIsNone(rate["run_to_run"])
         self.assertEqual(everything["metrics"]["peak_used_mib"]["all"]["unknown"], 4)
 
+    def test_an_all_phase_preset_lists_the_phases_its_unknown_runs_reported(self) -> None:
+        # pr-smoke's gates name no phases, so every driven phase is gated.
+        self.assertIsNone(probe.gated_phases(self.presets["pr-smoke"]))
+        row = probe_row(1, [run(harness=6)])
+        row["runs"] = {"pr-smoke": row["runs"][PRESET]}
+        planned = probe.matrices("8", "sticky-disk", "0", "pr-smoke", "1", "1")
+        everything = group(probe.variance([row], planned, self.presets), 8, "all", "pr-smoke")
+        for phase in ("steady_state", "burst"):
+            metric = everything["metrics"][f"{phase}.shortfall"]
+            self.assertEqual((metric["all"]["n"], metric["all"]["unknown"]), (0, 1))
+
     def test_one_commit_one_row_per_job(self) -> None:
         with self.assertRaises(probe.ProbeError):
             probe.variance([probe_row(1, [run()]), probe_row(2, [run()], commit="other")])

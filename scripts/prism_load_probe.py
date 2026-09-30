@@ -1075,8 +1075,13 @@ def group_document(size: int, preset_name: str, band: str, jobs: list[dict],
         per_job.append([r for r in runs if r.get("unmeasured_reason") is None])
     measured = [r for jr in per_job for r in jr]
     # The headline metrics are always present, so a group whose every run is
-    # unknown still says n 0 and how many are unknown for each.
-    seeded = set(RUN_METRICS) | {f"{phase}.{name}" for phase in (gated_phases(preset) or [])
+    # unknown still says n 0 and how many are unknown for each. A preset
+    # whose gates name no phases gates every phase it drives: those are the
+    # phases any of the group's runs reported, measured or not (none, when
+    # no run got as far as a report).
+    phases = gated_phases(preset) or sorted(
+        {name for run in runs_all for name in (run.get("phases") or {})})
+    seeded = set(RUN_METRICS) | {f"{phase}.{name}" for phase in phases
                                  for name in PHASE_METRICS}
     names = sorted(seeded | {n for r in measured for n in run_metrics(r)})
     metrics = {}
