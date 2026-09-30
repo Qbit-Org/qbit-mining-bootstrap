@@ -1,5 +1,5 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
-use super::{Labels, LockKind, Outcome, RefreshAcquisition, RefreshTrigger};
+use super::{Labels, LockKind, OrderLockHolder, Outcome, RefreshAcquisition, RefreshTrigger};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -109,6 +109,9 @@ families! {
     NodeObservationAge: Gauge, "node_observation_age_seconds", "Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable.";
     RollupLag: Gauge, "hashrate_rollup_watermark_lag_seconds", "Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled.";
     WorkRefreshStalled: Gauge, "work_refresh_stalled_seconds", "Monotonic time since this frontend's last successful template refresh, which publishes or revalidates its work, or since start before the first; -1 before the coordinator publishes it.";
+    OrderLockHold: Histogram, "database_order_lock_hold_seconds", "ORDER_LOCK hold from the grant of the lock to the end of the transaction holding it, by holder, in seconds (#602).";
+    ShareAckLandingWindow: Histogram, "share_ack_landing_window_seconds", "The share_ack_seconds observations whose submission arrived within 30 seconds after a pool block acceptance this frontend observed, by outcome (#602); steady state is share_ack_seconds minus this family.";
+    SlowLandingWindows: Gauge, "share_ack_slow_landing_windows", "Consecutive most recent closed landing windows on this frontend whose share acknowledgement p99 exceeded the bound in seconds (#602); -1 before a landing window holding an acknowledgement has closed.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -121,12 +124,18 @@ const SHARE_ACK_BUCKETS: &[f64] = &[
 const REVISION_WORK_BUCKETS: &[f64] = &[
     0.25, 0.5, 1., 2.5, 5., 10., 30., 60., 120., 300., 307., 600.,
 ];
+// #602: an append holds ORDER_LOCK for milliseconds and #602's R2 budget for
+// every other holder is 250 ms, so the ladder starts at one millisecond.
+const ORDER_LOCK_HOLD_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10.,
+];
 // Fixed storage keeps event recording allocation-free. Guard every ladder so
 // future changes cannot silently truncate observation or rendering via zip.
 const _: () = {
     assert!(BUCKETS.len() <= BUCKET_COUNT);
     assert!(SHARE_ACK_BUCKETS.len() <= BUCKET_COUNT);
     assert!(REVISION_WORK_BUCKETS.len() <= BUCKET_COUNT);
+    assert!(ORDER_LOCK_HOLD_BUCKETS.len() <= BUCKET_COUNT);
 };
 
 impl Family {
@@ -135,7 +144,9 @@ impl Family {
             // Rows, not seconds: a native chunk is one claimed fanout. See
             // docs/prism-metrics-histogram-consumers.md before changing this.
             Self::CtvChunkRows => &[1.],
-            Self::ShareAck => SHARE_ACK_BUCKETS,
+            // The same ladder as ShareAck, so steady state is a subtraction.
+            Self::ShareAck | Self::ShareAckLandingWindow => SHARE_ACK_BUCKETS,
+            Self::OrderLockHold => ORDER_LOCK_HOLD_BUCKETS,
             Self::RevisionWork => REVISION_WORK_BUCKETS,
             _ => BUCKETS,
         }
@@ -232,6 +243,14 @@ impl Registry {
                             Sample::Pending,
                         );
                     }
+                }
+            }
+            Family::OrderLockHold => {
+                for holder in OrderLockHolder::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("holder", holder.as_str()))),
+                        Sample::Pending,
+                    );
                 }
             }
             Family::RefreshSeconds => {

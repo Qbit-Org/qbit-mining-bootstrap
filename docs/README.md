@@ -59,6 +59,9 @@ This is useful for reviewers and operators who need implementation detail:
   shared gate every environment-dependent Rust test goes through, its
   required-mode switch, the execution manifest CI proves against, and how to
   add a gated test.
+- [prism-e2e-load-ci.md](prism-e2e-load-ci.md): the end-to-end and load CI
+  lanes (#487 L0-L6): what each proves and does not, how to dispatch and read
+  a run, where its evidence lives and how to reproduce it locally.
 - [prism-stratum-fuzzing.md](prism-stratum-fuzzing.md): the Stratum
   cargo-fuzz targets, their invariants and nightly job, and the per-PR
   property tests for the line codec and target conversions (#575).

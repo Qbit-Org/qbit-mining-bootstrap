@@ -53,6 +53,11 @@ const SECONDS: &[&str] = &[
 const ACK_SECONDS: &[&str] = &[
     "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "15", "20", "30", "+Inf",
 ];
+/// #602: ORDER_LOCK holds start at one millisecond.
+const HOLD_SECONDS: &[&str] = &[
+    "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5",
+    "10", "+Inf",
+];
 
 impl Census {
     fn family(&mut self, name: &str, kind: &str, labels: &[String], buckets: &[&str]) {
@@ -237,6 +242,20 @@ pub fn expected(populated: bool) -> Census {
         &labels("result", "accepted,rejected"),
         ACK_SECONDS,
     );
+    // #602: the landing-window subset of the ACK family, on its ladder, and
+    // the per-bound count of consecutive slow landing windows.
+    result.family(
+        "share_ack_landing_window_seconds",
+        "histogram",
+        &labels("result", "accepted,rejected"),
+        ACK_SECONDS,
+    );
+    result.family(
+        "share_ack_slow_landing_windows",
+        "gauge",
+        &labels("p99_above_seconds", "2,10"),
+        &[],
+    );
     result.family(
         "database_pool_acquire_seconds",
         "histogram",
@@ -262,6 +281,16 @@ pub fn expected(populated: bool) -> Census {
         "histogram",
         if populated { &locks } else { &[] },
         SECONDS,
+    );
+    let holders = labels(
+        "holder",
+        "append,candidate_insert,first_confirmation,settlement,reconcile,orphan,prepared,cleanup,fatal_state,operator",
+    );
+    result.family(
+        "database_order_lock_hold_seconds",
+        "histogram",
+        if populated { &holders } else { &[] },
+        HOLD_SECONDS,
     );
     let refreshes: Vec<_> = [
         "initial", "tip", "revision", "balances", "reanchor", "shares", "template", "fee",

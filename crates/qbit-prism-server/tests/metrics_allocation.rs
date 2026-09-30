@@ -2,8 +2,8 @@
 //! rendering, and test/thread setup. Run with `cargo test --release --locked
 //! -p qbit-prism-server --test metrics_allocation` as well as the debug suite.
 use qbit_prism_server::metrics::{
-    AckResult, ConnectionRefusalReason, LockKind, Metrics, NodeObservation, Outcome, RejectReason,
-    StaleJobCause,
+    AckResult, ConnectionRefusalReason, LockKind, Metrics, NodeObservation, OrderLockHolder,
+    Outcome, RejectReason, StaleJobCause,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -75,6 +75,17 @@ fn observe_all(metrics: &Metrics, elapsed: Duration) {
     metrics.observe_first_offer(elapsed);
 }
 
+/// #602's hooks: the Stratum ACK path, which outside a landing window adds
+/// one atomic load to the ACK, and every ORDER_LOCK holder's hold.
+fn observe_602(metrics: &Metrics, elapsed: Duration) {
+    for result in AckResult::ALL {
+        metrics.observe_share_ack_received(*result, tokio::time::Instant::now());
+    }
+    for holder in OrderLockHolder::ALL {
+        metrics.observe_order_lock_hold(*holder, elapsed);
+    }
+}
+
 fn increment_all(metrics: &Metrics) {
     for reason in RejectReason::ALL {
         metrics.record_rejection(*reason);
@@ -114,6 +125,7 @@ fn every_closed_event_key_allocates_nothing_on_first_and_repeated_calls() {
         let count = allocations(|| {
             for _ in 0..iterations {
                 observe_all(black_box(&metrics), black_box(Duration::from_millis(125)));
+                observe_602(black_box(&metrics), black_box(Duration::from_millis(125)));
                 increment_all(black_box(&metrics));
             }
         });
@@ -165,13 +177,15 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
     }
     let body = metrics.render();
     let histogram_count = body.lines().filter(|line| line.contains("_count")).count();
-    // Eleven exercised event series plus two idle CTV and three idle landing
-    // histograms. Runtime suites own their observations.
-    assert_eq!(histogram_count, 16);
+    // Eleven exercised event series plus two idle CTV, three idle landing
+    // and two idle landing-window ACK histograms (#602). Runtime suites own
+    // their observations.
+    assert_eq!(histogram_count, 18);
     for line in body.lines().filter(|line| line.contains("_count")) {
         let (key, count) = line.rsplit_once(' ').unwrap();
         if key.starts_with("qbit_prism_ctv_fanout_broadcaster_")
             || key.starts_with("qbit_prism_accepted_block_to_revision_work_")
+            || key.starts_with("qbit_prism_share_ack_landing_window_seconds_")
         {
             assert_eq!(count, "0");
             assert_eq!(sample(&body, &key.replace("_count", "_sum")), 0.);

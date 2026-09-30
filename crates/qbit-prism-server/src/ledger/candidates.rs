@@ -572,7 +572,9 @@ impl Ledger {
     ) -> Result<bool> {
         let prepared = prepare_candidate_observed(candidate, proof_observed_at_ms).await?;
         let mut tx = self.begin().await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let _order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::CandidateInsert)
+            .await?;
         writable(&mut tx).await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",

@@ -76,6 +76,8 @@ const WALLET_CAP: Scenario = Scenario {
     blocks: 6,
     whales: &[],
     near_zero: 40,
+    ctv: true,
+    wallets: 8,
 };
 
 /// Open the fixture without servers, with the load's server settings.

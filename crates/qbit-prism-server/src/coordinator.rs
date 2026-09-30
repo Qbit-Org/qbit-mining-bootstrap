@@ -978,7 +978,8 @@ impl Coordinator {
         self.ready_tip(tip).await?;
         for (hash, height, confirmed) in &landing_targets {
             if *confirmed {
-                self.metrics.accepted_landed_block(hash, *height);
+                self.metrics
+                    .accepted_landed_block(hash, *height, *height == tip_height);
             } else {
                 self.metrics.accepted_block(hash, *height);
             }

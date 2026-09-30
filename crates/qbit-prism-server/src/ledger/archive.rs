@@ -834,6 +834,9 @@ fn check_sequence_passed(record: &PartitionRecord, next_share_seq: i64, what: &s
 /// rolled back; an append that starts afterwards draws a value at or above
 /// what the sequence reported, outside the partition. Only after this is a
 /// stream of the live rows complete.
+///
+/// Its wait is observed; there is no hold to observe (#602): the lock is
+/// released as the statement ends.
 async fn drain_appends(ledger: &Ledger, connection: &mut PgConnection) -> Result<()> {
     super::connect::lock(connection, super::ORDER_LOCK, ledger.metrics.as_deref())
         .await
@@ -1902,6 +1905,8 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
     drop(connection);
     let live_rows_compared = attachment.attached && attachment.relation_present;
     let mut tx = ledger.begin().await?;
+    // Taken inside the branch below, held through the commit at the end.
+    let mut _order = None;
     if live_rows_compared {
         // Fence the evidence checked above against archive rewrites. Lock
         // predecessor before successor, in the same order archive updates
@@ -1943,7 +1948,11 @@ pub async fn verify(ledger: &Ledger, partition_name: &str, root: &Path) -> Resul
         // must finish probing the still-attached legacy rows before detach
         // becomes eligible. Take the ordering lock only after the scan, and
         // keep it through commit so the next append sees the retained IDs.
-        ledger.lock(&mut tx, ORDER_LOCK).await?;
+        _order = Some(
+            ledger
+                .lock_order(&mut tx, crate::metrics::OrderLockHolder::Operator)
+                .await?,
+        );
     }
     let verified_at: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT archive_verified_at FROM qbit_prism_share_partitions WHERE partition_name=$1",
@@ -2374,6 +2383,8 @@ pub async fn restore(
         None => format!("share_seq < {upper}"),
     };
     let mut tx = ledger.begin().await?;
+    // Taken when attaching below, held through the transaction's commit.
+    let mut _order = None;
     sqlx::query(
         "SELECT set_config('statement_timeout','0',true),set_config('lock_timeout','0',true)",
     )
@@ -2457,7 +2468,11 @@ pub async fn restore(
         // unarchived legacy rejected rows have no global mapping. Drain and
         // fence appends through commit so none can race this check and the
         // attachment.
-        ledger.lock(&mut tx, ORDER_LOCK).await?;
+        _order = Some(
+            ledger
+                .lock_order(&mut tx, crate::metrics::OrderLockHolder::Operator)
+                .await?,
+        );
         let existing = sqlx::query("SELECT lower_seq,upper_seq,archive_manifest_sha256 FROM qbit_prism_share_partitions WHERE partition_name=$1 FOR UPDATE")
             .bind(&partition_name)
             .fetch_optional(&mut *tx)
