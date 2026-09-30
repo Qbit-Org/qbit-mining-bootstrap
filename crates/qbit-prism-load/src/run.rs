@@ -57,6 +57,10 @@ pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
 /// The artifact is withheld, because it would name a configuration the run
 /// did not measure.
 pub const EXIT_PREMISE_CONTRADICTED: i32 = 8;
+/// A fault the `faults` phase injected did not meet its pass criteria
+/// (#554), in a run that otherwise reconciled. The side report's `faults`
+/// block names the fault and the check.
+pub const EXIT_FAULT_CRITERIA: i32 = 9;
 
 /// The server's `share_commit_grace`: how long past the share-commit timeout
 /// it goes on waiting for a COMMIT reply before answering
@@ -1309,6 +1313,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     delay_proxy.set_delay_millis(0);
     check_delay_observed(args.slow_db_delay_ms, proxied_rtt_delayed)?;
 
+    // --- fault relay (#554) ----------------------------------------------
+    // Only a run with a fault phase puts the relay between its frontends and
+    // the node, one port per frontend; every other run's node path is the
+    // one it always had.
+    let fault_plan = args.fault_plan()?;
+    let fault_relay = match &fault_plan {
+        Some(_) => Some(Arc::new(
+            crate::fault::rpc_relay::RpcFaultRelay::open(&ctx.node_url, args.frontends).await?,
+        )),
+        None => None,
+    };
+
     // --- frontends --------------------------------------------------------
     // The listener limits come from the one derivation `validate` already
     // checked, so what the child reads is what was validated (EP-CONFIG).
@@ -1345,6 +1361,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 "PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS".into(),
                 soak.spec.partition_ensure_interval_seconds.to_string(),
             );
+        }
+        if let Some(relay) = &fault_relay {
+            environment.insert("QBIT_RPC_URL".into(), relay.url(index).to_owned());
         }
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
         // Frontend 1 first: concurrent first-boot migrations wait inside a
@@ -1592,6 +1611,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         )?),
         None => None,
     };
+    // The fault phase's driver and read-tier scraper, built when that phase
+    // starts so their clocks start with it (#554).
+    let mut fault_driver: Option<crate::fault::FaultDriver> = None;
+    let mut read_tier: Option<crate::fault::read_tier::ReadTier> = None;
+    let mut read_tier_error: Option<String> = None;
     let mut runs: Vec<PhaseRun> = Vec::new();
     let mut aborted: Option<String> = None;
     let mut external_tips: Vec<crate::node::TipChange> = Vec::new();
@@ -1693,6 +1717,63 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 )
             })
             .transpose()?;
+        if plan.kind == crate::fault::PHASE {
+            if let (Some(fault_plan), Some(relay)) = (&fault_plan, &fault_relay) {
+                if fault_plan.read_tier {
+                    // The public tier reads the standby when there is one,
+                    // as D3's separate public-read replica does.
+                    let (database, replica) = match (&ctx.managed_standby, ctx.declared_replication)
+                    {
+                        (Some(standby), Replication::Async) => (standby.clone(), true),
+                        _ => (ctx.direct_url.clone(), false),
+                    };
+                    // The node itself, not the fault relay: the public tier
+                    // is not a frontend, and a fault's arm is not its.
+                    let mut node_env: Vec<(String, String)> =
+                        ["QBIT_CHAIN", "QBIT_RPC_USER", "QBIT_RPC_PASSWORD"]
+                            .iter()
+                            .filter_map(|key| {
+                                frontends[0]
+                                    .environment
+                                    .get(*key)
+                                    .map(|value| ((*key).to_owned(), value.clone()))
+                            })
+                            .collect();
+                    node_env.push(("QBIT_RPC_URL".into(), ctx.node_url.clone()));
+                    match crate::fault::read_tier::ReadTier::start(
+                        &ctx.server_bin,
+                        &database,
+                        replica,
+                        node_env,
+                        &ctx.log_dir,
+                        frontends
+                            .iter()
+                            .map(|child| (child.spec.instance_id.clone(), child.metrics_url()))
+                            .collect(),
+                    )
+                    .await
+                    {
+                        Ok(tier) => read_tier = Some(tier),
+                        Err(error) => read_tier_error = Some(format!("{error:#}")),
+                    }
+                }
+                fault_driver = Some(crate::fault::FaultDriver::new(
+                    fault_plan.clone(),
+                    crate::fault::FaultTools {
+                        direct_url: ctx.direct_url.clone(),
+                        proxied_url: proxied_url.clone(),
+                        side: side.clone(),
+                        relay: relay.clone(),
+                        ready_limit: Duration::from_secs(args.work_timeout),
+                        drain_limit: settle_limit,
+                        slow_db_delay_ms: args.slow_db_delay_ms,
+                        lease_wait_seconds: fault_plan.lease_wait_seconds,
+                        storm_fraction: fault_plan.storm_fraction,
+                        seed: fault_plan.seed,
+                    },
+                ));
+            }
+        }
         let outcome = drive_phase_with_population(
             phase_args,
             plan,
@@ -1707,8 +1788,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &mut remaining_tips,
             &collected,
             &kill_fence,
+            if plan.kind == crate::fault::PHASE {
+                fault_driver.as_mut().map(|driver| (driver, &delay_proxy))
+            } else {
+                None
+            },
         )
         .await?;
+        if plan.kind == crate::fault::PHASE {
+            if let Some(tier) = read_tier.as_mut() {
+                tier.stop();
+            }
+        }
         // The phase's bounds are when it started and stopped scheduling; a
         // restart the phase's deadline cut across was completed inside
         // `drive_phase` after that, as boundary time.
@@ -2282,6 +2373,44 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     } = gaps;
     let node_submissions = ctx.node.submissions();
     let tip_changes = ctx.node.tip_changes();
+    // The fault phase's verdict (#554), from the same records the
+    // reconciliation read.
+    let faults_report = fault_driver.as_ref().map(|driver| {
+        let phase = runs.iter().find(|run| run.plan.kind == crate::fault::PHASE);
+        let samples = read_tier
+            .as_ref()
+            .map(crate::fault::read_tier::ReadTier::samples);
+        let instance_ids: Vec<String> = frontends
+            .iter()
+            .map(|child| child.spec.instance_id.clone())
+            .collect();
+        let empty = PerSecond::default();
+        let mut report = driver.evaluate(&crate::fault::EvalInputs {
+            submits: &collected.submits,
+            collected: &collected,
+            tip_changes: &tip_changes,
+            sessions: args.sessions,
+            per_second: phase.map_or(&empty, |phase| &phase.per_second),
+            phase_started: phase.map_or(driver.started, |phase| phase.started),
+            ack_p99_limit_ms: args.ack_p99_limit_ms,
+            read_tier: samples.as_deref(),
+            instance_ids: &instance_ids,
+        });
+        if let Some(tier) = &read_tier {
+            report["read_tier_process"] = json!({
+                "url": tier.url,
+                "reads": tier.reads,
+                "log": tier.log.display().to_string(),
+            });
+        }
+        if let Some(error) = &read_tier_error {
+            // Asked for and never started: the tier was not shown to stay
+            // up, which is a failure, not an absent measurement.
+            report["read_tier_error"] = json!(error);
+            report["passed"] = json!(false);
+        }
+        report
+    });
     // A real node's external tips are the ones its pool node saw, taken from
     // the watcher now that every mint has landed.
     if let Some(real) = ctx.node.qbitd() {
@@ -2545,6 +2674,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "validator": validator_block(&evidence, args, slowest_rate, &worst_p99, &unrecognised),
         "stale_outputs_removed": ctx.stale_outputs_removed,
     });
+    // The fault phase's block is added only to a run that had one, so every
+    // other report keeps exactly the keys it always had.
+    if let Some(report) = faults_report {
+        side_report["faults"] = report;
+    }
     // Real-node keys are added only to a real-node run's report, so a
     // fake-node report keeps exactly the keys it always had (#547).
     if let Some(real) = ctx.node.qbitd() {
@@ -2580,7 +2714,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     if let Some(line) = outcome.explanation(&report_path) {
         eprintln!("{line}");
     }
-    Ok(outcome.exit_code())
+    let mut code = outcome.exit_code();
+    let faults_failed = side_report
+        .get("faults")
+        .is_some_and(|faults| faults["passed"] != json!(true));
+    if code == EXIT_OK && faults_failed {
+        eprintln!(
+            "fault criteria not met; see faults in {}",
+            report_path.display()
+        );
+        code = EXIT_FAULT_CRITERIA;
+    }
+    Ok(code)
 }
 
 // --- phase driving -------------------------------------------------------
@@ -2736,6 +2881,7 @@ pub async fn drive_phase(
         remaining_tips,
         collected,
         kill_fence,
+        None,
     )
     .await
 }
@@ -2784,6 +2930,8 @@ pub async fn drive_phase_with_population(
     // `client::SessionShared`: a kill in this phase bumps it once, and the
     // bumped value is the census boundary.
     kill_fence: &Arc<AtomicU64>,
+    // The `faults` phase's driver and the delay proxy it may set (#554).
+    mut faults: Option<(&mut crate::fault::FaultDriver, &crate::proxy::DelayProxy)>,
 ) -> Result<PhaseOutcome> {
     let started = Instant::now();
     let duration = Duration::from_secs(plan.seconds);
@@ -3018,6 +3166,26 @@ pub async fn drive_phase_with_population(
                 }
             }
         }
+        if let Some((driver, proxy)) = faults.as_mut() {
+            let mut env = crate::fault::FaultEnv {
+                sessions,
+                frontends: &mut *frontends,
+                samplers,
+                collected,
+                kill_fence,
+                node: node_state,
+                delay_proxy: proxy,
+            };
+            if let Err(error) = driver.poll(&mut env) {
+                outcome.aborted = Some(format!("a fault could not be carried out: {error:#}"));
+                break;
+            }
+            // The phase is as long as its faults: it ends once the last one
+            // has recovered.
+            if driver.finished() {
+                break;
+            }
+        }
         if mem_check.elapsed() >= Duration::from_secs(1) {
             mem_check = Instant::now();
             let available = measure::mem_available_kib();
@@ -3039,7 +3207,14 @@ pub async fn drive_phase_with_population(
                     break;
                 }
             }
+            // A frontend a fault took down on purpose is not a crash.
+            let planned = faults
+                .as_ref()
+                .and_then(|(driver, _)| driver.planned_outage());
             for child in frontends.iter_mut() {
+                if planned == Some(child.spec.index) {
+                    continue;
+                }
                 if let Some(status) = child.exited() {
                     outcome.aborted = Some(format!(
                         "{} exited unexpectedly with {status}",
@@ -3108,6 +3283,24 @@ pub async fn drive_phase_with_population(
             }
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A fault still running when the phase ran out of time is stopped, and
+    // its row says so; every SIGKILL's census joins the phase's, so the
+    // reconciliation excuses those answers as the kill's own.
+    if let Some((driver, proxy)) = faults.as_mut() {
+        if !driver.finished() {
+            let mut env = crate::fault::FaultEnv {
+                sessions,
+                frontends: &mut *frontends,
+                samplers,
+                collected,
+                kill_fence,
+                node: node_state,
+                delay_proxy: proxy,
+            };
+            driver.abandon(&mut env);
+        }
+        outcome.indeterminate.extend(driver.kill_indeterminate());
     }
     Ok(outcome)
 }

@@ -54,6 +54,9 @@ pub enum MintPurpose {
     /// A real node's keepalive, so its template never ages past regtest's
     /// minimum-difficulty gap. The fake node never mints one.
     Keepalive,
+    /// A fault's tip (#554): the settlement-lock fault mints one while the
+    /// lock is held, so its jobs have to wait for the release.
+    Fault,
 }
 
 /// Something that can put an external tip on the frontends' node.

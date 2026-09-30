@@ -765,6 +765,44 @@ and a second pool node for two frontends on two nodes is a second relay and
 watcher. The epoch's headroom covers a two-hour soak (#556): about 60
 keepalives plus its tips and own blocks.
 
+## Faults under load (#554)
+
+`--faults <fault>[,<fault>...][;<key>=<value>...]` adds a `faults` side
+phase after every other phase, in which each named fault is injected while
+the sessions keep mining (`src/fault/`). Each fault gets a baseline window,
+its injection, its removal and a recovery window; the phase ends when the
+last fault has recovered. The faults:
+
+| Fault | What is done | Pass criteria (besides the run's own reconciliation) |
+|---|---|---|
+| `slow-database` | the delay proxy holds every chunk for `--slow-db-delay-ms` for `hold` s | the delay is seen on the frontends' URL; no frontend exits; full rate and normal ACK p99 in the second half of the recovery window |
+| `pool-exhaustion` | every free PostgreSQL slot is taken and the frontends' idle backends are terminated into the full server (managed cluster only) | PostgreSQL refused a connection (53300) and a frontend backend was terminated; recovery as above; pool-acquire outcomes recorded |
+| `settlement-lock` | an outside transaction holds `SETTLEMENT_LOCK`; a tip is minted halfway | no share waits on the holder; at least 90% of shares accepted until the stall reaches `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (the server then refuses what it cannot prove current, and the refusals are counted); no session has work on the tip before the release, every session within 10 s of it; ACK p50/p99/max over the hold recorded |
+| `frontend-sigkill` | a scheduled block's `submitblock` is forwarded and its reply withheld, then the offering frontend is SIGKILLed and relaunched (the mid-flight kill's census and re-offers) | the block reaches the node exactly once and lands without a second offer; the time to land is reported, not gated: it is the 120 s candidate lease, #529's option-A gap |
+| `sigterm-drain` | a scheduled block's `submitblock` is held 500 ms and the offering frontend gets SIGTERM as it arrives | the shutdown logs that it waits for the offer and no budget ALERT, exits 0 within 35 s, the block reaches the node once, and `accepted` is recorded before the exit (#578, #585) |
+| `rolling-restart` | each frontend in turn gets SIGTERM, its sessions move to the other, it is relaunched; then the sessions are rebalanced | every exit is 0 within 35 s; every moved session has work within 30 s |
+| `reconnect-storm` | `storm` of the sessions drop abruptly and return within 5 s | every stormed session has work within 10 s of its return |
+
+Throughout the phase (`read-tier=on`, the default) a separate `public-api`
+process on the standby (the primary without one) is polled at 5 requests a
+second and every frontend's `/metrics` every 5 s: at least 99% 2xx and a p99
+within 1 s for the public API, every live frontend's `/metrics` within 1 s.
+
+Keys: `order=listed|random`, `seed`, `count` (random draws), `baseline`,
+`hold`, `recovery`, `gap=<s>|<min>..<max>`, `read-tier=on|off`,
+`storm=<fraction>`, `lease-wait=<s>`. A random order is seeded and the drawn
+sequence is in the report, so #556's soak can fire one fault every few
+minutes and replay a failure. Only a run with a fault phase puts the fault
+relay (one port per frontend) between the frontends and the node.
+
+The verdict is the side report's `faults` block: one row per fault with its
+windows, the shares offered in each, its evidence and its checks. A fault
+that misses a criterion exits 9, and the gate shows one row per fault.
+`faults-pr-smoke` (per PR, `tests/faults.rs`: `sigterm-drain` and
+`settlement-lock` on the fake node) and `faults-short-real-node` (nightly,
+all seven on the real node with 500 sessions) are the checked-in plans;
+`test/e2e-scenarios.toml` names each fault with its criteria.
+
 ## Presets and the nightly run
 
 `crates/qbit-prism-load/presets/*.json` pins runs by name. A preset states
@@ -932,6 +970,7 @@ has the gates, the presets, the weekly job and the testnet4 procedure.
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus the 10 s drain margin, the `mid_flight_kill` phase's relaunched frontend exited or did not answer `/healthz` within `--work-timeout`, its session accounting or collector barriers did not finish within the share-commit timeout plus the 10 s drain margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, a delayed phase's round trip through the proxied URL did not pay the delay, or, under `--node qbitd`, a node exited or its tip watcher lost it (seen at the next phase boundary). No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 | 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops; or, under `--node qbitd`, the node's chain does not reconcile with what the harness recorded (see [Real-node mode](#real-node-mode-547)). The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
+| 9 | A fault the `--faults` phase injected missed one of its pass criteria, in a run that otherwise reconciled; the side report's `faults` block names the fault and the check (#554) |
 
 ## Outputs
 
@@ -1568,7 +1607,8 @@ skip without them: the quorum-standby detection in `tests/quorum_replication.rs`
 in `tests/harness.rs` a cluster that fails to start, whose error has to
 carry PostgreSQL's own reason, the per-PR smoke run in
 `tests/load_smoke.rs`, and, also needing `QBITD_BIN`, the per-PR real-node
-smoke run in `tests/real_node.rs`. `tests/real_node.rs` also holds
+smoke run in `tests/real_node.rs`, and the per-PR fault smoke run in
+`tests/faults.rs`. `tests/real_node.rs` also holds
 `fake_node_mode_is_unchanged`, which needs nothing: the fake node's answers to
 a fixed request corpus and a pr-smoke frontend's environment, against goldens
 taken on the commit before real-node mode existed (`tests/golden/`); the
