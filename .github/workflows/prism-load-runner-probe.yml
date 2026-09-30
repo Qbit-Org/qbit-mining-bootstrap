@@ -29,6 +29,81 @@ name: PRISM load harness runner probe
 #
 # The rates here are for this probe only: CI numbers are not compared with
 # another host class's (lesson 1) and are not D1 verdicts (lesson 2).
+#
+# #542 (S2 of #487): the same commit, repeated, to measure the harness's
+# noise per runner class. `repeats` runs that many separate probe jobs per
+# class and cache backend (the VM-to-VM spread: every job is a fresh VM),
+# `in_job_repeats` runs each preset that many times inside one job (the
+# run-to-run spread on one VM), and `presets` picks any checked-in fake-node
+# presets. The plan job refuses an unknown class, cache backend or preset, a
+# real-node preset (the probe builds no qbitd), a repeat count out of range,
+# more than 64 probe jobs, and a job that would need more than 360 minutes,
+# before any probe runner starts, and writes the dispatch's spend ceiling to
+# its summary. Each run ends at its preset's `timeout_minutes`, its process
+# group and PostgreSQL clusters killed, and the job's timeout is setup,
+# build and reports plus every run's timeout, so the rows are uploaded even
+# after a hung run. The collate job also writes `variance.json`
+# (`scripts/prism_load_probe.py variance`, schema
+# qbit.prism.runner-probe-variance.v1): per class, preset and fsync-cost
+# band, the median, MAD and CV of each headline metric over every run, over
+# the per-VM medians and within each VM, with n and the unknown count (a
+# failed, timed-out or missing run is unknown, never a zero), and each
+# class's runner-size evidence. #551's regression rule reads it.
+#
+# Run plan for #542 (none of it has been dispatched; each dispatch is
+# user-approved Blacksmith spend). GitHub dispatches only the default
+# branch's copy of this file, so it must be mirrored to `main` first. The
+# concurrency group keeps one run going and one pending, and a newer
+# dispatch replaces a pending one, so send each only once the previous one
+# has started. Pin every phase to one commit (<sha>, a 3.x.x commit). Costs
+# are at $0.004 per 2 vCPU minute (list price, before free minutes): the
+# ceiling is every job at its timeout; the estimate uses #541/L2's measured
+# 8-13 min per 20k run and #473's ~20 min per 400k cell.
+#
+#   A. Noise floor at 20k, 10 VMs x 2 runs per class (30 jobs, 60 runs):
+#        gh workflow run prism-load-runner-probe.yml -R Qbit-Org/qbit-mining-bootstrap \
+#          -f ref=<sha> -f classes=8,16,32 -f target_cache=sticky-disk -f fsync_vms=0 \
+#          -f presets=throughput-20k-window-1fe -f repeats=10 -f in_job_repeats=2
+#      Ceiling 60,225 2 vCPU min (~$241); estimate 35-50 min a job, ~$39-56.
+#   B. Post-#273 memory footprint on 32 vCPU, 3 VMs:
+#        ... -f classes=32 -f repeats=3 -f in_job_repeats=1 -f fsync_vms=0 \
+#          -f presets=throughput-400k-window-1fe-async,throughput-400k-window-2fe-async,throughput-400k-window-4fe-async
+#      Ceiling 13,225 (~$53); estimate ~75 min a job, ~$14.
+#   B2. #555's 5,000- and 10,000-session points on 32 vCPU, once #555 checks
+#      their presets in (named by #555, not here): as B with
+#      -f presets=<#555's 5,000-session preset>,<#555's 10,000-session preset>.
+#      At 60-minute preset timeouts: ceiling ~$41, estimate ~$12.
+#   C. The P5 step down: B's and B2's presets on 16 vCPU (-f classes=16),
+#      only for those whose 32 vCPU peak would leave the 16 vCPU class its
+#      headroom. Ceiling ~$47, estimate ~$13.
+#   D. L2's other nightly presets on 8 vCPU, 3 VMs, in two dispatches (one
+#      job's runs must fit 360 minutes):
+#        -f classes=8 -f repeats=3 -f presets=throughput-400k-window-1fe-async,tip-delivery-2000-miners-400k-2fe-retarget,mainnet-shape-650-addresses
+#        -f classes=8 -f repeats=3 -f presets=mainnet-shape-130-addresses,rental-churn-bursts-and-storms,throughput-20k-window-1fe-500-addresses,short-plan-fake-node
+#      Ceiling ~$15 each, estimate ~$2-3 each.
+#   Total: ceiling ~$410, estimate ~$80-100.
+#
+# Per-lane pick: download each phase's prism-probe-table artifact and read
+# variance.json. A lane's class is the smallest on which every preset the
+# lane runs has `size_evidence.fits == true`: every planned run measured
+# (harness exit 0, provenance passed, no timeout), zero shortfall in each
+# phase the preset gates on every run (the generator offered the full rate),
+# and at least max(25 % of MemTotal, the preset's --min-mem-available-mib)
+# left at peak on every run. `null` (a run unknown) is not a pass: rerun
+# that class first.
+#   L2: A and D, on 8 then 16 vCPU.
+#   L3 reduced: B, B2 and C (400k at 1/2/4 frontends, the session points).
+#   L3 full: stays on 32 vCPU unless 400k at 4 frontends fits 16 vCPU in C;
+#     only then are its 200k and 500k presets probed on 16 vCPU the same way.
+#   L4, L5, L6: the probe runs no real node or Compose stack, so the same
+#     rule is applied to those lanes' own first runs (host.json and peak
+#     memory; shortfall where the harness drives the load; memory alone for
+#     L6), from #487's table class downwards.
+# Run-to-run against VM-to-VM CV then gives #551 its rule's shape: where
+# the VM CV is well above the run CV, the same-VM A/B (#511); otherwise the
+# trailing same-class median per fsync band. Each lane's measured cost is
+# its jobs' billed minutes (gh run view <id> --json jobs) times the class's
+# multiplier, replacing #487's timeout ceilings.
 
 on:
   workflow_dispatch:
@@ -62,6 +137,23 @@ on:
           duration (0 to skip; 1500 tests a 24 h soak).
         required: true
         default: "0"
+      presets:
+        description: >-
+          Checked-in fake-node presets each probe job runs, comma separated.
+        required: true
+        default: short-plan-20k-window-1fe,throughput-20k-window-1fe
+      repeats:
+        description: >-
+          Separate probe jobs (VMs) per class and cache backend, 1 to 20
+          (#542: VM-to-VM spread).
+        required: true
+        default: "1"
+      in_job_repeats:
+        description: >-
+          Runs of each preset inside one probe job, 1 to 5 (#542: run-to-run
+          spread on one VM).
+        required: true
+        default: "1"
 
 permissions:
   contents: read
@@ -74,10 +166,15 @@ jobs:
   plan:
     name: Plan the probe matrix
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
     outputs:
       probe: ${{ steps.plan.outputs.probe }}
       fsync: ${{ steps.plan.outputs.fsync }}
       fsync_enabled: ${{ steps.plan.outputs.fsync_enabled }}
+      presets: ${{ steps.plan.outputs.presets }}
+      in_job_repeats: ${{ steps.plan.outputs.in_job_repeats }}
+      runs_minutes: ${{ steps.plan.outputs.runs_minutes }}
+      job_minutes: ${{ steps.plan.outputs.job_minutes }}
       duration_minutes: ${{ steps.duration.outputs.minutes }}
       sha: ${{ steps.pin.outputs.sha }}
     steps:
@@ -90,16 +187,23 @@ jobs:
         # Every later job checks out this commit, so a push to the ref while
         # runners are queued cannot make classes measure different code.
         run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
-      - name: Select runner classes and target caches
+      - name: Select runner classes, target caches, presets and repeats
         id: plan
+        # Every input is checked here, against the presets of the commit the
+        # probe jobs will build, before a probe runner is asked for.
         env:
           CLASSES: ${{ inputs.classes }}
           TARGET_CACHE: ${{ inputs.target_cache }}
           FSYNC_VMS: ${{ inputs.fsync_vms }}
+          PRESETS: ${{ inputs.presets }}
+          REPEATS: ${{ inputs.repeats }}
+          IN_JOB_REPEATS: ${{ inputs.in_job_repeats }}
         run: |
           set -euo pipefail
           python3 scripts/prism_load_probe.py matrix \
             --classes "${CLASSES}" --target-cache "${TARGET_CACHE}" --fsync-vms "${FSYNC_VMS}" \
+            --presets "${PRESETS}" --repeats "${REPEATS}" --in-job-repeats "${IN_JOB_REPEATS}" \
+            --summary "${GITHUB_STEP_SUMMARY}" \
             | tee -a "${GITHUB_OUTPUT}"
       - name: Check the duration probe's length
         id: duration
@@ -123,10 +227,12 @@ jobs:
           printf 'minutes=%d\n' "${minutes}" >> "${GITHUB_OUTPUT}"
 
   probe:
-    name: ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}
+    name: ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}, repeat ${{ matrix.repeat }}
     needs: plan
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    # Setup, the build, every run at its preset's timeout and the reports
+    # (the plan's sum, at most 360).
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_minutes) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.probe) }}
@@ -166,7 +272,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}-${{ matrix.repeat }}
           restore-keys: ${{ steps.key.outputs.prefix }}
       - name: Mount the target directory's sticky disk
         if: ${{ matrix.target_cache == 'sticky-disk' }}
@@ -188,7 +294,7 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/pload"
           python3 scripts/prism_load_probe.py host --out "${PROBE}/host.json" --dir "${RUNNER_TEMP}/pload"
           {
-            echo "### ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}"
+            echo "### ${{ matrix.class }} vCPU, ${{ matrix.target_cache }}, repeat ${{ matrix.repeat }}"
             echo
             echo '```'
             git rev-parse HEAD
@@ -197,6 +303,7 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
       - name: Build the server, the harness and the gate in release mode
+        timeout-minutes: 60
         run: |
           python3 scripts/prism_load_probe.py measure --out "${PROBE}/build.json" -- \
             cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
@@ -210,7 +317,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}-${{ matrix.repeat }}
       - name: Time the Actions cache save
         if: ${{ matrix.target_cache == 'actions-cache' }}
         run: |
@@ -218,53 +325,83 @@ jobs:
             'BEGIN { printf "%.1f\n", now - then }' > "${PROBE}/save-seconds"
       # The sticky disk is committed in the action's post step, after every
       # step here, so its save time is in that step's log, not in the row.
-      - name: Run short-plan-20k-window-1fe
-        timeout-minutes: 60
+      - name: Run each preset
+        # One step for every preset and in-job repeat. Each run ends at its
+        # preset's timeout_minutes (the plan's runs_minutes is their sum plus
+        # slack), so a hung run cannot take the job's row with it.
+        timeout-minutes: ${{ fromJSON(needs.plan.outputs.runs_minutes) }}
         env:
           TARGET_DIR: ${{ env.CARGO_TARGET_DIR }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+          PRESETS: ${{ needs.plan.outputs.presets }}
+          IN_JOB_REPEATS: ${{ needs.plan.outputs.in_job_repeats }}
         run: |
           set -uo pipefail
-          out="${PROBE}/short-plan-20k-window-1fe"
-          python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" -- \
-            bash .github/scripts/prism-load-run.sh short-plan-20k-window-1fe "${out}" || true
-      - name: Run throughput-20k-window-1fe
-        if: ${{ !cancelled() }}
-        timeout-minutes: 60
-        env:
-          TARGET_DIR: ${{ env.CARGO_TARGET_DIR }}
-        run: |
-          set -uo pipefail
-          out="${PROBE}/throughput-20k-window-1fe"
-          python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" -- \
-            bash .github/scripts/prism-load-run.sh throughput-20k-window-1fe "${out}" || true
+          pload="${RUNNER_TEMP}/pload"
+          IFS=, read -ra presets <<< "${PRESETS}"
+          for preset in "${presets[@]}"; do
+            minutes="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["timeout_minutes"])' \
+              "crates/qbit-prism-load/presets/${preset}.json")"
+            for ((i = 1; i <= IN_JOB_REPEATS; i++)); do
+              out="${PROBE}/${preset}/${i}"
+              echo "::group::${preset}, run ${i} of ${IN_JOB_REPEATS} (timeout ${minutes} min)"
+              python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" \
+                --timeout-seconds "$((minutes * 60))" -- \
+                bash .github/scripts/prism-load-run.sh "${preset}" "${out}"
+              status=$?
+              echo "::endgroup::"
+              if (( status == 124 )); then
+                # measure ended the run's process group; pg_ctl starts each
+                # postmaster in a session of its own, so end those by their
+                # data directory, and drop the clusters, before the next run.
+                echo "::warning::${preset} run ${i} timed out after ${minutes} min"
+                pkill -KILL -f -- "${pload}/" || true
+                sleep 2
+                find "${pload}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+              fi
+            done
+          done
       - name: Write the class's row
         if: ${{ !cancelled() }}
         env:
           SIZE: ${{ matrix.class }}
           RUNNER_LABEL: ${{ matrix.runner }}
           TARGET_CACHE: ${{ matrix.target_cache }}
-          CACHE_ROW: ${{ matrix.class }}-${{ matrix.target_cache }}
+          REPEAT: ${{ matrix.repeat }}
+          CACHE_ROW: ${{ matrix.class }}-${{ matrix.target_cache }}-${{ matrix.repeat }}
+          PRESETS: ${{ needs.plan.outputs.presets }}
+          IN_JOB_REPEATS: ${{ needs.plan.outputs.in_job_repeats }}
         run: |
           set -euo pipefail
           read_or_empty() { cat "$1" 2>/dev/null || true; }
           before="$(read_or_empty "${PROBE}/target-bytes-before")"
           restored="$(read_or_empty "${PROBE}/target-restored")"
+          # Every planned run, whether or not it ran: one that did not is
+          # unknown in the row, not left out.
+          runs=()
+          IFS=, read -ra presets <<< "${PRESETS}"
+          for preset in "${presets[@]}"; do
+            for ((i = 1; i <= IN_JOB_REPEATS; i++)); do
+              runs+=(--run "${preset}=${PROBE}/${preset}/${i}")
+            done
+          done
           mkdir -p "${PROBE}/row"
           python3 scripts/prism_load_probe.py row --out "${PROBE}/row/${CACHE_ROW}.json" \
             --class "${SIZE}" --runner "${RUNNER_LABEL}" --target-cache "${TARGET_CACHE}" \
+            --repeat "${REPEAT}" --commit "$(git rev-parse HEAD)" \
             --target-restored "${restored}" \
             --target-bytes-before "${before}" \
             --target-bytes-after "$(read_or_empty "${PROBE}/target-bytes-after")" \
             --restore-seconds "$(read_or_empty "${PROBE}/restore-seconds")" \
             --save-seconds "$(read_or_empty "${PROBE}/save-seconds")" \
             --build "${PROBE}/build.json" --host "${PROBE}/host.json" \
-            --run "short-plan-20k-window-1fe=${PROBE}/short-plan-20k-window-1fe" --run "throughput-20k-window-1fe=${PROBE}/throughput-20k-window-1fe"
+            "${runs[@]}"
           python3 scripts/prism_load_probe.py table "${PROBE}/row" >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the class's row
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: prism-probe-row-${{ matrix.class }}-${{ matrix.target_cache }}
+          name: prism-probe-row-${{ matrix.class }}-${{ matrix.target_cache }}-${{ matrix.repeat }}
           overwrite: true
           retention-days: 90
           path: ${{ env.PROBE }}/row
@@ -273,7 +410,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: prism-probe-${{ matrix.class }}-${{ matrix.target_cache }}
+          name: prism-probe-${{ matrix.class }}-${{ matrix.target_cache }}-${{ matrix.repeat }}
           overwrite: true
           retention-days: 90
           path: |
@@ -282,22 +419,13 @@ jobs:
           if-no-files-found: error
       - name: Fail on the build's or a gate's exit code
         # #487 lesson 5: the exit code is the verdict, after the reports are
-        # uploaded either way.
+        # uploaded either way. A planned run that wrote no measurement fails.
+        env:
+          PRESETS: ${{ needs.plan.outputs.presets }}
+          IN_JOB_REPEATS: ${{ needs.plan.outputs.in_job_repeats }}
         run: |
-          set -euo pipefail
-          python3 - "${PROBE}" <<'EOF'
-          import json, sys
-          from pathlib import Path
-          probe = Path(sys.argv[1])
-          failed = []
-          for name in ("build", "short-plan-20k-window-1fe/probe-measure", "throughput-20k-window-1fe/probe-measure"):
-              path = probe / f"{name}.json"
-              code = json.loads(path.read_text())["exit_code"] if path.exists() else None
-              if code != 0:
-                  failed.append(f"{name}: exit {code}")
-          if failed:
-              sys.exit("; ".join(failed))
-          EOF
+          python3 scripts/prism_load_probe.py verdict --probe "${PROBE}" \
+            --presets "${PRESETS}" --in-job-repeats "${IN_JOB_REPEATS}"
 
   fsync-spread:
     name: pg_test_fsync, ${{ matrix.class }} vCPU, VM ${{ matrix.vm }}
@@ -371,6 +499,7 @@ jobs:
     needs: [plan, probe, fsync-spread]
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
@@ -390,16 +519,29 @@ jobs:
           PROBE_MATRIX: ${{ needs.plan.outputs.probe }}
           FSYNC_MATRIX: ${{ needs.plan.outputs.fsync }}
           FSYNC_ENABLED: ${{ needs.plan.outputs.fsync_enabled }}
+          PRESETS: ${{ needs.plan.outputs.presets }}
+          IN_JOB_REPEATS: ${{ needs.plan.outputs.in_job_repeats }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/rows"
-          # What the plan asked for, so a job that wrote no row is counted.
-          python3 -c 'import json, os; print(json.dumps({"probe": json.loads(os.environ["PROBE_MATRIX"]), "fsync": json.loads(os.environ["FSYNC_MATRIX"]), "fsync_enabled": os.environ["FSYNC_ENABLED"] == "true"}))' \
+          # What the plan asked for, so a job or a run that wrote no row is
+          # counted as unknown.
+          python3 -c 'import json, os; print(json.dumps({"probe": json.loads(os.environ["PROBE_MATRIX"]), "fsync": json.loads(os.environ["FSYNC_MATRIX"]), "fsync_enabled": os.environ["FSYNC_ENABLED"] == "true", "presets": os.environ["PRESETS"], "in_job_repeats": int(os.environ["IN_JOB_REPEATS"])}))' \
             > "${RUNNER_TEMP}/expected.json"
           python3 scripts/prism_load_probe.py table "${RUNNER_TEMP}/rows" --expected "${RUNNER_TEMP}/expected.json" \
             | tee "${RUNNER_TEMP}/rows/table.md" \
             >> "${GITHUB_STEP_SUMMARY}"
+      - name: Write the variance document
+        # #542's per-class, per-preset, per-fsync-band spread, for #551.
+        run: |
+          set -euo pipefail
+          python3 scripts/prism_load_probe.py variance "${RUNNER_TEMP}/rows" \
+            --expected "${RUNNER_TEMP}/expected.json" --out "${RUNNER_TEMP}/rows/variance.json" \
+            --markdown >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the table and the rows
+        # The rows are the evidence even when the table or the variance
+        # step failed on them.
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: prism-probe-table
