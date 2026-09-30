@@ -1,0 +1,237 @@
+name: Record PRISM load evidence
+description: >-
+  #551 (S6 of #487): read the ci-evidence trend, apply the report-only
+  regression rule to this run's trend rows, and, when `write` is true,
+  promote the selected bundles to a release, append the rows to ci-evidence
+  and open or update the one regression tracking issue. With `write` false
+  (pull requests and dispatches) it only reads and reports: nothing is
+  recorded, promoted or filed. Expects this repository checked out at the
+  workspace root (the scripts and the regression config are read from it)
+  and the rows as scripts/prism_load_trend.py `row` wrote them, one *.json
+  per preset run. A writing job needs `contents: write` (rows, releases),
+  `issues: write` and `actions: read` (to download the bundles it promotes);
+  it must be a scheduled run or a `v*` tag push, and the first step refuses
+  anything else, as `append` refuses any push row whose `ref` is not
+  refs/tags/v*. For #550's tag job: rows built with `--lane L3 --ref
+  "$GITHUB_REF"`, `rows-dir` holding them,
+  `promote: all`, `release: <the tag>` (the release must already exist),
+  and `regression-config: ''` unless L3 joins the rule's lanes.
+
+inputs:
+  rows-dir:
+    description: Directory of this run's trend rows (*.json).
+    required: true
+  write:
+    description: >-
+      `true` to promote, append and file the issue; only on a schedule or a
+      `v*` tag push.
+    required: false
+    default: "false"
+  promote:
+    description: >-
+      Which rows' bundles to promote: `policy` (L3, L5 and the weekly soak always, L2 when
+      flagged), `all`, `flagged` or `none`.
+    required: false
+    default: policy
+  release:
+    description: >-
+      `monthly` for the rolling ci-evidence/YYYY-MM pre-release (created when
+      missing), or an existing release's tag (the full suite's).
+    required: false
+    default: monthly
+  regression-config:
+    description: The rule's thresholds; empty skips the rule.
+    required: false
+    default: test/prism-load-regression.toml
+  variance:
+    description: >-
+      #542's variance document (scripts/prism_load_probe.py variance --out).
+      Empty uses test/prism-load-variance.json when it is checked in, and the
+      provisional spread otherwise.
+    required: false
+    default: ""
+  issue-label:
+    description: The label of the one regression tracking issue.
+    required: false
+    default: prism-load-regression
+  artifact-name:
+    description: Name of the artifact the verdict is uploaded as.
+    required: false
+    default: prism-load-regression-verdict
+  github-token:
+    description: The job's token.
+    required: true
+
+outputs:
+  regressions:
+    description: Numbers the rule flagged; `unknown` when it could not run, empty when skipped.
+    value: ${{ steps.regress.outputs.regressions }}
+
+runs:
+  using: composite
+  steps:
+    - name: Refuse a write from an event that may not write
+      if: ${{ inputs.write == 'true' }}
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+      run: |
+        set -euo pipefail
+        if [[ "${EVENT}" == schedule || ( "${EVENT}" == push && "${REF}" == refs/tags/v* ) ]]; then
+          exit 0
+        fi
+        echo "::error::${EVENT} on ${REF} may not write evidence; pull request and dispatch runs produce artifacts only (#551)"
+        exit 1
+
+    - name: Read the trend from ci-evidence
+      id: history
+      shell: bash
+      run: |
+        set -uo pipefail
+        dir="${RUNNER_TEMP}/prism-load-history"
+        rm -rf "${dir}"
+        if python3 scripts/prism_load_trend.py fetch --out "${dir}"; then
+          printf 'ok=true\ndir=%s\n' "${dir}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "::warning::could not read ci-evidence; the regression rule has no history this run"
+          printf 'ok=false\n' >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Apply the regression rule (report-only)
+      id: regress
+      if: ${{ inputs.regression-config != '' }}
+      shell: bash
+      env:
+        ROWS: ${{ inputs.rows-dir }}
+        CONFIG: ${{ inputs.regression-config }}
+        VARIANCE: ${{ inputs.variance }}
+        HISTORY_OK: ${{ steps.history.outputs.ok }}
+        HISTORY: ${{ steps.history.outputs.dir }}
+      run: |
+        set -uo pipefail
+        verdict="${RUNNER_TEMP}/prism-load-verdict"
+        mkdir -p "${verdict}"
+        if [[ "${HISTORY_OK}" != true ]]; then
+          # Unknown, not "nothing regressed" (EP-OBSERVABILITY).
+          printf 'regressions=unknown\n' >> "${GITHUB_OUTPUT}"
+          printf '### Load regression rule (#551)\n\nNo verdict: ci-evidence could not be read.\n' >> "${GITHUB_STEP_SUMMARY}"
+          exit 0
+        fi
+        args=(--history "${HISTORY}" --rows "${ROWS}" --config "${CONFIG}"
+          --json "${verdict}/verdict.json" --markdown "${verdict}/verdict.md"
+          --github-output "${GITHUB_OUTPUT}"
+          --repository "${GITHUB_REPOSITORY}" --server-url "${GITHUB_SERVER_URL}")
+        if [[ -z "${VARIANCE}" && -f test/prism-load-variance.json ]]; then
+          VARIANCE=test/prism-load-variance.json
+        fi
+        if [[ -n "${VARIANCE}" ]]; then
+          args+=(--variance "${VARIANCE}")
+        fi
+        if python3 scripts/prism_load_regress.py "${args[@]}" > /dev/null; then
+          cat "${verdict}/verdict.md" >> "${GITHUB_STEP_SUMMARY}"
+          printf 'verdict=%s\n' "${verdict}/verdict.json" >> "${GITHUB_OUTPUT}"
+        else
+          printf 'regressions=unknown\n' >> "${GITHUB_OUTPUT}"
+          printf '### Load regression rule (#551)\n\nNo verdict: the rule could not read its inputs (see the log).\n' >> "${GITHUB_STEP_SUMMARY}"
+        fi
+
+    - name: Upload the verdict
+      if: ${{ steps.regress.outputs.verdict != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        overwrite: true
+        retention-days: 90
+        path: ${{ runner.temp }}/prism-load-verdict
+        if-no-files-found: error
+
+    - name: Promote the selected bundles
+      id: promote
+      if: ${{ inputs.write == 'true' && inputs.promote != 'none' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ROWS: ${{ inputs.rows-dir }}
+        SELECT: ${{ inputs.promote }}
+        RELEASE: ${{ inputs.release }}
+        VERDICT: ${{ steps.regress.outputs.verdict }}
+      run: |
+        set -uo pipefail
+        args=(--rows "${ROWS}" --select "${SELECT}" --release "${RELEASE}" --repository "${GITHUB_REPOSITORY}")
+        if [[ -n "${VERDICT}" ]]; then
+          args+=(--verdict "${VERDICT}")
+        fi
+        # A failed promotion is written into its row as failed and the rows
+        # are still recorded; the last step fails the job.
+        if python3 scripts/prism_load_trend.py promote "${args[@]}"; then
+          printf 'ok=true\n' >> "${GITHUB_OUTPUT}"
+        else
+          printf 'ok=false\n' >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Append the rows to ci-evidence
+      id: append
+      if: ${{ inputs.write == 'true' }}
+      shell: bash
+      env:
+        ROWS: ${{ inputs.rows-dir }}
+      run: |
+        set -uo pipefail
+        if python3 scripts/prism_load_trend.py append --rows "${ROWS}"; then
+          printf 'ok=true\n' >> "${GITHUB_OUTPUT}"
+        else
+          printf 'ok=false\n' >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Open or update the regression tracking issue
+      if: >-
+        ${{ inputs.write == 'true' && steps.regress.outputs.regressions != ''
+        && steps.regress.outputs.regressions != '0' && steps.regress.outputs.regressions != 'unknown' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        LABEL: ${{ inputs.issue-label }}
+        COUNT: ${{ steps.regress.outputs.regressions }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        repo="${GITHUB_REPOSITORY}"
+        gh label create "${LABEL}" --repo "${repo}" --color D93F0B \
+          --description "The load regression rule flagged a number (#551); report-only" 2>/dev/null || true
+        # An issue body holds 65,536 characters.
+        body="$(head -c 60000 "${RUNNER_TEMP}/prism-load-verdict/verdict.md")
+
+        Kept by the prism-load-evidence action (#551) from ${RUN_URL}. Report-only: it does not page and does not block a merge. The body always shows the latest flagged run; each flagged run also comments. Close it once the cause is fixed or the change is accepted."
+        issue="$(gh issue list --repo "${repo}" --label "${LABEL}" --state open --limit 1 --json number --jq '.[0].number // empty')"
+        if [[ -n "${issue}" ]]; then
+          gh issue edit "${issue}" --repo "${repo}" --body "${body}"
+          gh issue comment "${issue}" --repo "${repo}" \
+            --body "${RUN_URL} flagged ${COUNT} number(s); the body now shows that run."
+        else
+          gh issue create --repo "${repo}" --label "${LABEL}" \
+            --title "PRISM load: the regression rule flagged a number (report-only)" --body "${body}"
+        fi
+
+    - name: Fail if evidence was not recorded
+      if: ${{ always() }}
+      shell: bash
+      env:
+        WRITE: ${{ inputs.write }}
+        HISTORY: ${{ steps.history.outputs.ok }}
+        REGRESSIONS: ${{ steps.regress.outputs.regressions }}
+        PROMOTED: ${{ steps.promote.outputs.ok }}
+        APPENDED: ${{ steps.append.outputs.ok }}
+      run: |
+        set -euo pipefail
+        failed=()
+        [[ "${HISTORY}" == false ]] && failed+=("reading ci-evidence")
+        [[ "${REGRESSIONS}" == unknown ]] && failed+=("the regression rule")
+        [[ "${PROMOTED}" == false ]] && failed+=("a promotion (see the rows' promotion field)")
+        if [[ "${WRITE}" == true && "${APPENDED}" != true ]]; then
+          failed+=("appending the rows to ci-evidence")
+        fi
+        if (( ${#failed[@]} )); then
+          printf '::error::not done: %s\n' "${failed[@]}"
+          exit 1
+        fi

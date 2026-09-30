@@ -369,6 +369,14 @@ pub struct Args {
     #[arg(long, default_value_t = 5.0)]
     pub storm_reconnect_seconds: f64,
 
+    /// Inject faults under load in a `faults` side phase after every other
+    /// phase (#554): `<fault>[,<fault>...][;<key>=<value>...]`, e.g.
+    /// `sigterm-drain,settlement-lock;hold=10;recovery=8`. Omitted, the run
+    /// has no fault phase and its frontends talk to the node directly. See
+    /// `fault/plan.rs` for the faults and keys.
+    #[arg(long)]
+    pub faults: Option<String>,
+
     /// A checked-in preset (`crates/qbit-prism-load/presets/*.json`) whose
     /// flags are added to the command line; any flag it sets cannot be given
     /// again. The side report records its name and SHA-256.
@@ -387,7 +395,24 @@ impl Args {
         Plan::parse(&self.plan)
     }
 
+    /// The `--faults` plan, parsed; `None` when the run injects none.
+    pub fn fault_plan(&self) -> Result<Option<crate::fault::plan::FaultPlan>> {
+        self.faults
+            .as_deref()
+            .map(crate::fault::plan::FaultPlan::parse)
+            .transpose()
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if let Some(plan) = self.fault_plan()? {
+            plan.check_against(self.frontends, self.database_url.is_none())?;
+            // A soak's phases come from its looped presets, never this
+            // flag's, so its fault verdict would silently be missing.
+            ensure!(
+                self.plan()? != Plan::Soak,
+                "--faults does not run under --plan soak yet (#556)"
+            );
+        }
         ensure!(
             matches!(self.frontends, 1 | 2 | 4),
             "--frontends must be 1, 2 or 4"
@@ -940,10 +965,9 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         });
     }
     if plan == Plan::Tips {
-        plans.extend(churn_phase(
-            args,
-            args.steady_state_rate.unwrap_or(args.rate),
-        ));
+        let rate = args.steady_state_rate.unwrap_or(args.rate);
+        plans.extend(churn_phase(args, rate));
+        plans.extend(faults_phase(args, rate)?);
         return Ok(plans);
     }
     plans.push(PhasePlan {
@@ -1033,6 +1057,10 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             restart_frontend: false,
         });
     }
+    // Last of all, as documented: a fault the phase's bound cut short can
+    // leave a frontend down, and no phase may follow that would read the
+    // planned outage as a crash or aim its own kill at that frontend.
+    plans.extend(faults_phase(args, steady_rate)?);
     Ok(plans)
 }
 
@@ -1051,4 +1079,22 @@ fn churn_phase(args: &Args, steady_rate: f64) -> Option<PhasePlan> {
         dense_cadence: false,
         restart_frontend: false,
     })
+}
+
+/// The `faults` side phase, when `--faults` asks for one (#554): no proxy
+/// delay of its own, outside the artifact. Its length is the plan's upper
+/// bound; the phase ends as soon as the last fault has recovered.
+fn faults_phase(args: &Args, steady_rate: f64) -> Result<Option<PhasePlan>> {
+    Ok(args.fault_plan()?.map(|plan| PhasePlan {
+        name: crate::fault::PHASE.into(),
+        kind: crate::fault::PHASE.into(),
+        seconds: plan.phase_seconds_bound(args.frontends),
+        rate: steady_rate,
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+        restart_frontend: false,
+    }))
 }

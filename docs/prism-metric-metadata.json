@@ -23,7 +23,7 @@
       "labels": {
         "path": "BlockAckPath"
       },
-      "status": "Counted once per block-bearing submission answered before its outcome was known (#574). `block_only`: a captured (#478) or below-target block proof whose deferred share waits for its own frontend's landing, or for its duplicate probe and candidate enqueue, past `block_only_ack_timeout`, which is `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` itself (15 s by default; it was at least 60 s before #574). `share`: a share-pass append carrying a found block that had not committed by the share deadline, or by its grace when COMMIT was already in flight, the same bounds as a plain share; it is never refused, so it runs on. Either is answered `ledger-outcome-unknown` (Stratum error 20, \"share outcome is not yet known\"), the same reply as any share still pending at its deadline, so it also counts in `qbit_prism_rejections_total{reason_id=\"ledger-outcome-unknown\"}` and feeds PrismShareAppendFailures; the WARN log names the block hash, share id, phase and elapsed_ms. Only the wait ends at the bound: the probe, enqueue, append and landing run on, so the block is still offered and landed and its share is credited once when that commits. Process-local; both series start at zero. No firing rule of its own."
+      "status": "Counted once per block-bearing submission answered before its outcome was known (#574). `block_only`: a captured (#478) or below-target block proof whose deferred share waits for its own frontend's landing, or for its duplicate probe and candidate enqueue, past `share_commit_timeout` itself (`PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, 15 s by default; it was at least 60 s before #574). `share`: a share-pass append carrying a found block that had not committed by the share deadline, or by its grace when COMMIT was already in flight, the same bounds as a plain share; it is never refused, so it runs on. Either is answered `ledger-outcome-unknown` (Stratum error 20, \"share outcome is not yet known\"), the same reply as any share still pending at its deadline, so it also counts in `qbit_prism_rejections_total{reason_id=\"ledger-outcome-unknown\"}` and feeds PrismShareAppendFailures; the WARN log names the block hash, share id, phase and elapsed_ms. Only the wait ends at the bound: the probe, enqueue, append and landing run on, so the block is still offered and landed and its share is credited once when that commits. Process-local; both series start at zero. No firing rule of its own."
     },
     "block_offer_standby_wait_total": {
       "labels": {
@@ -65,6 +65,18 @@
         "result": "AckResult"
       },
       "status": "Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines."
+    },
+    "share_ack_landing_window_seconds": {
+      "labels": {
+        "result": "AckResult"
+      },
+      "status": "Each observation is also in `share_ack_seconds`, on the same ladder: steady state is `share_ack_seconds` minus this family, bucket by bucket. A landing window opens when this frontend first observes a pool block's acceptance, its own `submitblock` acceptance, or a peer frontend's block on the active chain, first seen either before it is confirmed or already confirmed at the tip (a buried block first seen confirmed, as after a restart, opens none; a restart whose tip is a pool block opens one), and admits every submission that arrives within 30 seconds of it; an acceptance while a window admits extends it. A submission in flight at the acceptance is in the window. Both series start at zero. Fed by PrismLandingAckP99Slow and PrismLandingAckP99High through `share_ack_slow_landing_windows`."
+    },
+    "share_ack_slow_landing_windows": {
+      "labels": {
+        "p99_above_seconds": "LandingAckBound"
+      },
+      "status": "A landing window (see `share_ack_landing_window_seconds`) is judged 30 seconds after it stops admitting submissions, so late acknowledgements can complete, or at the next acceptance if that comes first. Its nearest-rank p99 is over a bound exactly when more than one percent of its acknowledgements took longer than the bound, which the process counts exactly rather than reading from buckets. A window with no acknowledgement has no verdict and leaves the count unchanged; a window at or under the bound resets it to zero. -1 until the first verdict since process start. Per frontend: each frontend judges the landings it observed. PrismLandingAckP99Slow tickets at three for the 2-second bound, PrismLandingAckP99High warns at one for the 10-second bound."
     },
     "rejections_total": {
       "replaces": [
@@ -181,6 +193,12 @@
         "result": "Outcome"
       },
       "status": "Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`."
+    },
+    "database_order_lock_hold_seconds": {
+      "labels": {
+        "holder": "OrderLockHolder"
+      },
+      "status": "Measured by the coordinator's ledger from the instant `pg_advisory_xact_lock` returned for `ORDER_LOCK` to the instant the holding transaction's COMMIT or ROLLBACK returned (#602); a transaction abandoned by an error ends its hold as it unwinds, a moment before its queued ROLLBACK releases the lock. `append` is the share append, which every miner's acknowledgement waits behind; `first_confirmation` is the offering frontend's settlement that confirmed its block for the first time and `settlement` every other one, including an abandon; `reconcile` is the reorg reconciler, which runs on every template build and can also confirm a block; `first_confirmation` and `settlement` are per attempt, so a settlement that rolls back and is retried records twice; `prepared` is the refresh's window snapshot that prepared work is built from; `candidate_insert` a block-only candidate's insert; `cleanup` blob garbage collection; `fatal_state` fatal-state recovery; `operator` the policy and signing transitions and archive verify and restore, when run with a registry. The schema cutover's hold and archive's statement-scoped append drain are not observed. #602's R2 budget is 250 ms for every holder but `append`. Own ladder from 1 ms to 10 s. Series appear on their first observation. No firing rule of its own."
     },
     "collector_available": {
       "labels": {

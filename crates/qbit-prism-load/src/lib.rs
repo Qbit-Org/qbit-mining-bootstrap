@@ -22,6 +22,7 @@ pub mod client;
 pub mod cluster;
 pub mod compare;
 pub mod digest;
+pub mod fault;
 pub mod frontend;
 pub mod gate;
 pub mod kill;

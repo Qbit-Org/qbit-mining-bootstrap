@@ -46,17 +46,14 @@ pub struct Config {
     pub runtime_workers: usize,
     pub snapshot_interval: Duration,
     pub health_timeout: Duration,
+    /// `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`: a share's acknowledgement
+    /// deadline, and also the bound a block-only proof (a captured, deferred
+    /// or below-target block) waits for its enqueue and landing (#574).
     pub share_commit_timeout: Duration,
     /// How long a share whose COMMIT was already in flight at
     /// `share_commit_timeout` may still be confirmed. Not an environment
     /// variable.
     pub share_commit_grace: Duration,
-    /// The acknowledgement bound for a block-only proof (a captured, deferred
-    /// or below-target block) waiting for its enqueue and landing. Measured
-    /// from the same instant as `share_commit_timeout`; see
-    /// [`block_only_ack_timeout`]. A share-pass append carrying a block uses
-    /// the share deadline and grace instead. Not an environment variable.
-    pub block_only_ack_timeout: Duration,
     /// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (#415): how many confirmations
     /// a DIFFERENT block active at an offered candidate's height needs, on
     /// one coherent tip observation, before the post-offer settlement marks
@@ -230,17 +227,6 @@ fn alias(primary: &str, legacy: &str, default: u64) -> Result<u64> {
         positive(legacy, default)
     }
 }
-/// The acknowledgement bound for a block-only proof (#574): the share commit
-/// deadline itself. A captured proof's answer used to wait up to
-/// `max(share_commit_timeout, 60 s)` for its own frontend's landing, and the
-/// miner's session can submit nothing else meanwhile. At the bound the proof
-/// is answered `ledger-outcome-unknown`, as any share still pending at its
-/// deadline is; the block and any deferred share are still landed and credited
-/// once, because only the wait ends there.
-pub fn block_only_ack_timeout(share_commit_timeout: Duration) -> Duration {
-    share_commit_timeout
-}
-
 pub(crate) fn seconds(name: &str, default: f64) -> Result<Duration> {
     let n = number(name, default)?;
     ensure!(
@@ -576,13 +562,12 @@ impl Config {
         )
         .context("invalid PRISM_VERSION_ROLLING_MASK")?;
         let share_commit_timeout = seconds("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", 15.0)?;
-        // Neither bound below is an environment variable.
+        // The grace is not an environment variable.
         let share_commit_grace = Duration::from_secs(5);
         ensure!(
             share_commit_grace > Duration::ZERO,
             "share commit grace must be positive"
         );
-        let block_only_ack_timeout = block_only_ack_timeout(share_commit_timeout);
         let candidate_orphan_confirmations =
             bounded_usize("PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS", 6, 1, 1000)? as u64;
         let capture_overpay_ceiling_bps =
@@ -616,7 +601,6 @@ impl Config {
             health_timeout: seconds("PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS", 15.0)?,
             share_commit_timeout,
             share_commit_grace,
-            block_only_ack_timeout,
             candidate_orphan_confirmations,
             capture_overpay_ceiling_bps,
             offer_standby,
@@ -748,7 +732,6 @@ mod tests {
             health_timeout: Duration::from_secs(15),
             share_commit_timeout: Duration::from_secs(15),
             share_commit_grace: Duration::from_secs(5),
-            block_only_ack_timeout: Duration::from_secs(60),
             candidate_orphan_confirmations: 6,
             capture_overpay_ceiling_bps: 100,
             offer_standby: None,

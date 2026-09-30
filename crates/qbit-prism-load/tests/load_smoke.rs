@@ -33,15 +33,43 @@ fn profile_dir() -> Result<PathBuf> {
 }
 
 /// Build the debug server beside this test binary and return its path.
+///
+/// The nested build has to see what the build of this test binary saw, or
+/// each invalidates the other's dependencies and every run pays a ~20 s
+/// rebuild: `qbit-prism-load` is selected beside the server so Cargo
+/// resolves the shared dependencies' features the same way, and the
+/// variables `cargo test` sets for this process but not for its own build
+/// (`CARGO_PKG_NAME`, `CARGO_MANIFEST_DIR` and the rest) are removed,
+/// because `ring`'s build script tracks them. The server's library is then
+/// already built and only its binary links.
 fn build_server() -> Result<PathBuf> {
     let profile = profile_dir()?;
     let target = profile
         .parent()
         .context("profile directory has no parent")?;
-    let status = std::process::Command::new(env!("CARGO"))
+    let mut command = std::process::Command::new(env!("CARGO"));
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().into_owned();
+        if [
+            "CARGO_PKG_",
+            "CARGO_MANIFEST_",
+            "CARGO_CRATE_",
+            "CARGO_BIN_",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        {
+            command.env_remove(name);
+        }
+    }
+    let status = command
         .args([
             "build",
             "--locked",
+            "-p",
+            "qbit-prism-load",
             "-p",
             "qbit-prism-server",
             "--bin",

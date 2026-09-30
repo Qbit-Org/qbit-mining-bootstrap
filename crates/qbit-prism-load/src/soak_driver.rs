@@ -133,6 +133,10 @@ pub fn plan(run_args: &Args, preset: &crate::preset::Preset) -> Result<SoakPlan>
             "{name} kills a frontend (--mid-flight-kill), which would end the soak's one \
              server lifetime"
         );
+        ensure!(
+            args.faults.is_none(),
+            "{name} injects faults (--faults), which a soak cycle does not drive yet (#556)"
+        );
         // The frontends are launched once, with listener limits sized from
         // the soak preset's own flags; a looped workload that could connect
         // more sessions at once than those limits admit is refused here

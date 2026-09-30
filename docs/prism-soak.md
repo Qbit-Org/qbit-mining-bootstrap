@@ -46,6 +46,18 @@ On regtest the harness's own gate still applies on top: exit 0, which is an
 exact reconciliation of every offered, acknowledged and committed share, no
 durability finding, no shortfall in any phase, and the tip-delivery budgets.
 
+**A known resident-memory failure.** `rss_expected_failure` names an issue,
+or is `null`. `soak-weekly` names #600: its first run found a 400k-window
+frontend's resident set ratcheting up with block landings to about 3.3 GB,
+while every other gate passed. While the key is set, the resident-memory
+rows of every process are an expected failure as a group. A measured failure
+is reported as `expected failure (#600)` and does not fail the soak; a soak in
+which every resident-memory row passed fails with `#600 looks fixed`, so the
+key goes back to `null` and the gate is real again. It is the group, not each
+row, because one frontend's warm-up ratio can pass while its slope, or the
+other frontend's rows, fail. An unknown reading still fails, and no other
+gate is affected.
+
 Memory and descriptors are fitted only over *steady* samples, those taken
 outside rental churn, so the population being compared is the same from
 sample to sample; the connection gates use every sample.

@@ -506,6 +506,10 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
             metrics.observe_advisory_lock(*lock, *outcome, Duration::from_millis(25));
         }
     }
+    // #602: every ORDER_LOCK holder observed once.
+    for holder in crate::metrics::OrderLockHolder::ALL {
+        metrics.observe_order_lock_hold(*holder, Duration::from_millis(5));
+    }
     // The refresh families are the other owner-dependent series: every closed
     // pair observed once, so the populated census covers them too.
     for outcome in WindowAcquisition::ALL {

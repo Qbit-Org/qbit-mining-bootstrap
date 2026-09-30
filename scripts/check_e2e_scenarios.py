@@ -9,27 +9,32 @@ evidence, and the evidence decides its lanes:
 - `tests`: `<package>::<binary>::<test path>` ids of gated tests. An id in
   `test/prism-gated-tests.txt` runs in `pr` (the required
   `prism-native-postgres` shards prove it executed); one in
-  `test/prism-nightly-gated-tests.txt` runs in `nightly`.
+  `test/prism-nightly-gated-tests.txt` runs in `nightly`, and one in
+  `test/prism-weekly-gated-tests.txt` in `weekly` (the live-weekly job, #487
+  L4).
 - `presets`: load-harness presets in `crates/qbit-prism-load/presets`. A
   `nightly` preset runs in `nightly`, a `weekly` one (the long soak, #575)
-  in `weekly`, a `manual` one in `dispatch`, and the `smoke` preset in `pr`
-  through the gated `load_smoke` test.
+  in `weekly`, a `manual` one in `dispatch`, and a `smoke` preset in `pr`
+  through the gated `load_smoke` or `faults` test (`SMOKE_BINARIES`).
 - `unit_tests`: `<file>::<fn>` for an ungated `#[test]` or `#[tokio::test]`
   that is not `#[ignore]`d; `cargo test --workspace` runs it in `pr`.
+- `lane_checks`: names from `CHECKS` in `scripts/prism_shipped_image_lane.py`,
+  the checks lane L6 (#544) holds the shipped images to; they run in `L6`.
 
 This check fails when:
 
 - the manifest is malformed: an unknown key, a missing or empty field, a
   duplicate id, an owner that is not `#<issue>`, or an undefined lane;
 - a running scenario cites evidence no lane runs (an id in no gated list, an
-  unknown preset, a missing or ignored test), or declares lanes other than
+  unknown preset, a missing or ignored test, an L6 check the lane does not
+  define), or declares lanes other than
   the ones its evidence runs in;
 - an unexercised scenario cites evidence, or lacks a reason (#487's
   definition of done: nothing unexercised without a linked issue and a
   reason; the owner is the linked issue);
 - a lane runs a scenario the manifest does not name: a gated test in one of
-  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly test, or
-  a preset that no running scenario cites;
+  the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly or weekly
+  test, a preset, or an L6 check that no running scenario cites;
 - a lane the manifest marks as running no longer has the workflow wiring
   that runs it.
 
@@ -42,6 +47,7 @@ Usage: python3 scripts/check_e2e_scenarios.py [--manifest test/e2e-scenarios.tom
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
 from pathlib import Path
 import re
@@ -60,14 +66,20 @@ DEFAULT_MANIFEST = ROOT / "test" / "e2e-scenarios.toml"
 SCHEMA = "qbit.e2e-scenarios.v1"
 PR_LIST = Path("test/prism-gated-tests.txt")
 NIGHTLY_LIST = Path("test/prism-nightly-gated-tests.txt")
+WEEKLY_LIST = Path("test/prism-weekly-gated-tests.txt")
 PRESETS = Path("crates/qbit-prism-load/presets")
+L6_DRIVER = Path("scripts/prism_shipped_image_lane.py")
 # Gated test binaries whose every test is an end-to-end scenario and so must
 # be named in the manifest. The rest of the gated list is component tests.
 SCENARIO_BINARIES = (
+    "qbit-prism-load::faults::",
     "qbit-prism-server::live_regtest::",
     "qbit-prism-load::load_smoke::",
 )
 PRESET_LANES = {"nightly": "nightly", "weekly": "weekly", "manual": "dispatch", "smoke": "pr"}
+# The gated test binaries that run the `smoke` presets in the PR shards:
+# `load_smoke` runs `pr-smoke`, and `faults` runs `faults-pr-smoke` (#554).
+SMOKE_BINARIES = ("qbit-prism-load::load_smoke::", "qbit-prism-load::faults::")
 # The lanes this check can enumerate, and the workflow text that has to be
 # present for each to run at all. A lane marked running that is not here needs
 # this check taught how to read it.
@@ -88,18 +100,28 @@ LANE_WIRING = {
         ".github/workflows/prism-load-nightly.yml",
         ("workflow_dispatch:", "scripts/prism_load_matrix.py"),
     ),
-    # The long soak's schedule (#575), whose plan selects the `weekly` presets.
+    # The long soak's schedule (#575), whose plan selects the `weekly` presets,
+    # and the live-weekly job's, which runs the weekly gated list (#487 L4).
     "weekly": (
         ".github/workflows/prism-load-nightly.yml",
-        ('cron: "41 5 * * 6"', "github.event.schedule == '41 5 * * 6' && 'weekly'"),
+        (
+            'cron: "41 5 * * 6"',
+            "github.event.schedule == '41 5 * * 6' && 'weekly'",
+            'cron: "43 3 * * 0"',
+            "--expected test/prism-weekly-gated-tests.txt",
+        ),
+    ),
+    "L6": (
+        ".github/workflows/prism-load-nightly.yml",
+        ('cron: "43 3 * * 0"', "pull_request:", f"{L6_DRIVER} run"),
     ),
 }
 LANE_KEYS = {"title", "runs", "owner", "workflow"}
 SCENARIO_KEYS = {
     "id", "title", "owner", "lanes", "criteria", "runs", "reason",
-    "tests", "presets", "unit_tests", "notes",
+    "tests", "presets", "unit_tests", "lane_checks", "notes",
 }
-EVIDENCE_KEYS = ("tests", "presets", "unit_tests")
+EVIDENCE_KEYS = ("tests", "presets", "unit_tests", "lane_checks")
 ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 ISSUE = re.compile(r"^#[1-9][0-9]*$")
 UNIT_TEST = re.compile(r"^(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*)$")
@@ -113,7 +135,9 @@ class Lanes:
         self.root = root
         self.pr = read_expected(root / PR_LIST)
         self.nightly = read_expected(root / NIGHTLY_LIST)
+        self.weekly = read_expected(root / WEEKLY_LIST)
         self.presets = load_presets(root / PRESETS)
+        self.l6_checks = read_lane_checks(root / L6_DRIVER)
 
     def test_lanes(self, test_id: str) -> set[str]:
         lanes = set()
@@ -121,6 +145,8 @@ class Lanes:
             lanes.add("pr")
         if test_id in self.nightly:
             lanes.add("nightly")
+        if test_id in self.weekly:
+            lanes.add("weekly")
         return lanes
 
     def preset_lanes(self, name: str) -> set[str]:
@@ -128,7 +154,7 @@ class Lanes:
         if preset is None:
             return set()
         lane = PRESET_LANES.get(preset.get("schedule"))
-        if lane == "pr" and not any(t.startswith("qbit-prism-load::load_smoke::") for t in self.pr):
+        if lane == "pr" and not any(t.startswith(SMOKE_BINARIES) for t in self.pr):
             return set()
         return {lane} if lane else set()
 
@@ -158,6 +184,21 @@ class Lanes:
             if any(TEST_ATTRIBUTE.match(a) for a in attributes):
                 return None
         return f"{reference} is not a #[test] or #[tokio::test]"
+
+
+def read_lane_checks(path: Path) -> tuple[str, ...]:
+    """The driver's `CHECKS` tuple, read without importing the driver."""
+    if not path.is_file():
+        return ()
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "CHECKS" for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            if not (isinstance(value, tuple) and all(text(item) for item in value)):
+                raise ValueError(f"{path}: CHECKS must be a tuple of names")
+            return value
+    raise ValueError(f"{path} defines no CHECKS")
 
 
 def text(value: object) -> bool:
@@ -278,15 +319,15 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
         if "reason" in scenario:
             problems.append(f"{where} runs; reason is only for an unexercised scenario")
         if not any(evidence.values()):
-            problems.append(f"{where} runs but cites no tests, presets or unit_tests")
+            problems.append(f"{where} runs but cites no tests, presets, unit_tests or lane_checks")
             continue
         derived: set[str] = set()
         for test_id in evidence["tests"]:
             found = lanes_run.test_lanes(test_id)
             if not found:
                 problems.append(
-                    f"{where}: {test_id} is in neither {PR_LIST} nor {NIGHTLY_LIST}, "
-                    "so no lane runs it"
+                    f"{where}: {test_id} is in none of {PR_LIST}, {NIGHTLY_LIST} "
+                    f"or {WEEKLY_LIST}, so no lane runs it"
                 )
             derived |= found
         for preset in evidence["presets"]:
@@ -300,6 +341,11 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
                 problems.append(f"{where}: {problem}")
             else:
                 derived.add("pr")
+        for name in evidence["lane_checks"]:
+            if name in lanes_run.l6_checks:
+                derived.add("L6")
+            else:
+                problems.append(f"{where}: {L6_DRIVER} defines no check {name!r}, so L6 does not run it")
         for key in EVIDENCE_KEYS:
             cited[key] |= set(evidence[key])
         for lane in sorted(set(declared) - derived):
@@ -316,6 +362,12 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
     for test_id in lanes_run.nightly:
         if test_id not in cited["tests"]:
             problems.append(f"nightly runs {test_id}, which no running scenario names")
+    for test_id in lanes_run.weekly:
+        if test_id not in cited["tests"]:
+            problems.append(f"weekly runs {test_id}, which no running scenario names")
+    for name in lanes_run.l6_checks:
+        if name not in cited["lane_checks"]:
+            problems.append(f"L6 runs check {name}, which no running scenario names")
     for name, preset in sorted(lanes_run.presets.items()):
         lane = PRESET_LANES.get(preset.get("schedule"))
         if lane and name not in cited["presets"]:

@@ -2805,7 +2805,9 @@ pub(super) async fn migrate_schema(
     let mut online = Vec::new();
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
-        // schema repair and cutover atomic with their accounting.
+        // schema repair and cutover atomic with their accounting. Its hold
+        // is not in the #602 hold histogram: the caller owns and commits
+        // this transaction, once, at schema initialization.
         lock(tx, SETTLEMENT_LOCK, metrics).await?;
         lock(tx, ORDER_LOCK, metrics).await?;
         let lease_exists: bool =

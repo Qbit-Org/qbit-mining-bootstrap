@@ -22,15 +22,15 @@ const NOTIFY_BOUND: Duration = Duration::from_secs(15);
 const ORPHAN_CONFIRMATIONS: u64 = 6;
 
 /// The second regtest node.
-struct PeerNode {
+pub(super) struct PeerNode {
     process: Process,
-    rpc_port: u16,
+    pub(super) rpc_port: u16,
     p2p_port: u16,
     client: reqwest::Client,
 }
 
 impl PeerNode {
-    async fn start(fixture: &Fixture) -> Result<Self> {
+    pub(super) async fn start(fixture: &Fixture) -> Result<Self> {
         let directory = fixture.directory.path().join("node-b");
         std::fs::create_dir_all(&directory)?;
         let rpc_port = fixture.ports.reserve()?;
@@ -68,7 +68,7 @@ impl PeerNode {
         }
     }
 
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+    pub(super) async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         let payload: Value = self
             .client
             .post(format!("http://127.0.0.1:{}/", self.rpc_port))
@@ -86,11 +86,11 @@ impl PeerNode {
         Ok(payload["result"].clone())
     }
 
-    async fn best(&self) -> Result<String> {
+    pub(super) async fn best(&self) -> Result<String> {
         best_of(self.rpc("getbestblockhash", json!([])).await?)
     }
 
-    async fn mine(&self, blocks: u64, address: &str) -> Result<Vec<String>> {
+    pub(super) async fn mine(&self, blocks: u64, address: &str) -> Result<Vec<String>> {
         mined(
             self.rpc("generatetoaddress", json!([blocks, address]))
                 .await?,
@@ -98,7 +98,7 @@ impl PeerNode {
     }
 
     /// Connect A to B and wait until both hold the same active tip.
-    async fn heal(&self, fixture: &Fixture) -> Result<String> {
+    pub(super) async fn heal(&self, fixture: &Fixture) -> Result<String> {
         self.rpc("setnetworkactive", json!([true])).await?;
         let address = format!("127.0.0.1:{}", self.p2p_port);
         until("node A connected to node B", 30, || async {
@@ -119,7 +119,7 @@ impl PeerNode {
         node_a_best(fixture).await
     }
 
-    async fn partition(&self, fixture: &Fixture) -> Result<()> {
+    pub(super) async fn partition(&self, fixture: &Fixture) -> Result<()> {
         self.rpc("setnetworkactive", json!([false])).await?;
         until("nodes A and B partitioned", 30, || async {
             Ok(fixture.rpc("getconnectioncount", json!([])).await? == 0
@@ -166,11 +166,11 @@ async fn new_address(fixture: &Fixture) -> Result<String> {
         .to_owned())
 }
 
-async fn node_a_best(fixture: &Fixture) -> Result<String> {
+pub(super) async fn node_a_best(fixture: &Fixture) -> Result<String> {
     best_of(fixture.rpc("getbestblockhash", json!([])).await?)
 }
 
-async fn node_a_mine(fixture: &Fixture, blocks: u64) -> Result<Vec<String>> {
+pub(super) async fn node_a_mine(fixture: &Fixture, blocks: u64) -> Result<Vec<String>> {
     mined(
         fixture
             .rpc("generatetoaddress", json!([blocks, fixture.address]))
@@ -179,11 +179,17 @@ async fn node_a_mine(fixture: &Fixture, blocks: u64) -> Result<Vec<String>> {
 }
 
 /// Start frontend `index` against the node whose RPC listens on `rpc_port`.
-fn start_frontend(fixture: &Fixture, index: usize, rpc_port: u16) -> Result<Process> {
+pub(super) fn start_frontend(fixture: &Fixture, index: usize, rpc_port: u16) -> Result<Process> {
     fixture.start_server_with(index, None, &[("QBIT_RPC_PORT", rpc_port.to_string())])
 }
 
-async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
+/// A check [`server_ready`] also waits on once the server is ready: #553
+/// installs one while a session load runs, so a scenario's next step comes
+/// under the whole load. `None` otherwise; live cases run one at a time.
+pub(super) type ReadyGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+pub(super) static READY_GATE: std::sync::Mutex<Option<ReadyGate>> = std::sync::Mutex::new(None);
+
+pub(super) async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
     until(
         &format!("PRISM readiness of server {index}"),
         60,
@@ -197,7 +203,15 @@ async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
                 .is_success())
         },
     )
-    .await
+    .await?;
+    let gate = READY_GATE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ready gate poisoned"))?
+        .clone();
+    match gate {
+        Some(gate) => until("the ready gate", 120, || async { Ok(gate()) }).await,
+        None => Ok(()),
+    }
 }
 
 /// Wait until `client` holds work on `parent`, and require that it arrived
@@ -220,7 +234,7 @@ async fn delivered(client: &mut HighdiffClient, parent: &str, changed: Instant) 
 /// One own block: a block-only proof by worker `username` on frontend
 /// `index`'s work for `parent`, acknowledged only once the block is durably
 /// credited on the active chain.
-async fn own_block(
+pub(super) async fn own_block(
     fixture: &Fixture,
     index: usize,
     username: &str,
@@ -241,7 +255,7 @@ async fn own_block(
     Ok(hash)
 }
 
-async fn chain_state(fixture: &Fixture, hash: &str) -> Result<Option<String>> {
+pub(super) async fn chain_state(fixture: &Fixture, hash: &str) -> Result<Option<String>> {
     Ok(
         sqlx::query_scalar("SELECT chain_state FROM qbit_pool_blocks WHERE block_hash=$1")
             .bind(hash)
@@ -260,7 +274,7 @@ async fn chain_states_are(fixture: &Fixture, hashes: &[&str], state: &str) -> Re
 }
 
 /// Accepted ledger rows for the share a block-only proof of `hash` defers.
-async fn credits(fixture: &Fixture, username: &str, hash: &str) -> Result<i64> {
+pub(super) async fn credits(fixture: &Fixture, username: &str, hash: &str) -> Result<i64> {
     Ok(
         sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_id=$1")
             .bind(format!("{username}:{hash}"))
@@ -269,13 +283,16 @@ async fn credits(fixture: &Fixture, username: &str, hash: &str) -> Result<i64> {
     )
 }
 
-async fn assert_no_duplicate_headers(fixture: &Fixture) -> Result<()> {
-    let accepted: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted")
-        .fetch_one(&fixture.pool)
-        .await?;
-    let unique: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
-        .fetch_one(&fixture.pool)
-        .await?;
+pub(super) async fn assert_no_duplicate_headers(fixture: &Fixture) -> Result<()> {
+    // One statement, so one snapshot: under session load (#553) shares land
+    // between two separate counts. An append writes both rows in one
+    // transaction.
+    let (accepted, unique): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM qbit_share_ledger WHERE accepted),\
+                (SELECT count(*) FROM qbit_prism_share_hashes)",
+    )
+    .fetch_one(&fixture.pool)
+    .await?;
     ensure!(
         accepted == unique,
         "{accepted} accepted rows for {unique} headers: a header was credited twice"
@@ -512,7 +529,7 @@ fn rand_key() -> u32 {
 /// waits for its orphan proof, settle `orphaned` exactly at the default
 /// confirmation depth, never stall job delivery, and be credited once when
 /// a reorg back activates it.
-async fn lost_race(fixture: &mut Fixture, peer: &PeerNode) -> Result<()> {
+pub(super) async fn lost_race(fixture: &mut Fixture, peer: &PeerNode) -> Result<()> {
     let base = peer.heal(fixture).await?;
     fixture.servers.push(fixture.start_server(0)?);
     server_ready(fixture, 0).await?;
@@ -727,7 +744,7 @@ async fn real_own_block_loses_same_height_race_is_orphaned_and_credited_once_on_
 /// divergence, integrity stays clean, and the
 /// reactivated blocks' CTV fanouts recover from `reorged` and confirm at
 /// maturity while branch B's are never broadcast.
-async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result<()> {
+pub(super) async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result<()> {
     // Two payout identities, so each own block splits its reward and the
     // miners' balances depend on which branch is active.
     let main = format!("{}.highdiff", fixture.address);
@@ -907,7 +924,11 @@ async fn real_deep_reorg_with_own_blocks_on_both_branches_keeps_credit_balances_
 
 /// Report both nodes on failure, stop node B, then clean the fixture up,
 /// which releases the serial guard only after every process is stopped.
-async fn finish(fixture: Fixture, peer: Result<PeerNode>, result: Result<()>) -> Result<()> {
+pub(super) async fn finish(
+    fixture: Fixture,
+    peer: Result<PeerNode>,
+    result: Result<()>,
+) -> Result<()> {
     if result.is_err() {
         eprintln!("{}", fixture.diagnostics());
         if let Ok(peer) = &peer {

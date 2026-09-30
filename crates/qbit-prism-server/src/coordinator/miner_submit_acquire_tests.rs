@@ -77,7 +77,7 @@ where
     let mut pools = Vec::new();
     let result = AssertUnwindSafe(async {
         let mut fixture =
-            Fixture::build(WAIT, |config| config.block_only_ack_timeout = WAIT, None).await;
+            Fixture::build(WAIT, |config| config.share_commit_timeout = WAIT, None).await;
         let metrics = fixture.coordinator.metrics.clone();
         let mut ledger = Ledger::connect_with_metrics(
             &database.url,

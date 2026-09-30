@@ -59,7 +59,12 @@ impl Ledger {
             deadline,
         };
         self.lock(tx.statement().await?, SETTLEMENT_LOCK).await?;
-        self.lock(tx.statement().await?, ORDER_LOCK).await?;
+        let _order = self
+            .lock_order(
+                tx.statement().await?,
+                crate::metrics::OrderLockHolder::Cleanup,
+            )
+            .await?;
         // A separate statement AFTER acquiring this fence gets a fresh snapshot
         // of any repair that committed while we waited. Blob row locks alone
         // cannot protect an absent prepared reference or refresh a DELETE's

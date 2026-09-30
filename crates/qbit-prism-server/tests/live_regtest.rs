@@ -75,6 +75,12 @@ mod clock_jump_tests;
 #[path = "support/live_transcript_replay.rs"]
 mod transcript_replay_tests;
 
+#[path = "support/live_session_load.rs"]
+mod session_load;
+
+#[path = "support/live_chain_events_load.rs"]
+mod chain_events_load_tests;
+
 /// The payout policy of the 0-bps fee every live server runs unless a case
 /// sets its own (#535). An in-process coordinator sharing a fixture's cluster
 /// must pin it, or its configuration fingerprint differs from the servers'.
@@ -1397,8 +1403,8 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         // Every regtest share is also a block. A proof on work whose payout
         // revision a landing superseded is captured (#478): its share is
         // credited by this server's own landing of that block, and its answer
-        // waits for that credit up to block_only_ack_timeout, which #574 cut
-        // from 60 s to share_commit_timeout (15 s here). Under load a landing
+        // waits for that credit up to share_commit_timeout (15 s here), which
+        // #574 cut from a 60 s floor. Under load a landing
         // takes seconds, so three credited shares can outlast a fixed 20 s
         // (#562). This counts credits, which still follow the landing rather
         // than the answer, so each keeps the 60 s allowance, here and after

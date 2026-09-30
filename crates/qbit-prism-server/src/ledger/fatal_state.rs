@@ -70,7 +70,9 @@ impl Ledger {
     async fn clear_fatal_state_in(&self, config: &Config, reason: &str) -> Result<Value> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let _order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::FatalState)
+            .await?;
         // Block heartbeat updates AND new registrations, not just existing
         // rows. A concurrent startup cannot pass an instance scan unseen.
         sqlx::query(

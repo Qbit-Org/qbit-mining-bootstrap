@@ -39,6 +39,7 @@
     "--database-url": null,
     "--db-max-connections": 16,
     "--external-tips": 3,
+    "--faults": null,
     "--forecast-peak-shares-per-second": 2000,
     "--frontends": 2,
     "--lock-sample-interval-ms": 10,

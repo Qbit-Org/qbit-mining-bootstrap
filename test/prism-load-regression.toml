@@ -1,0 +1,113 @@
+# The load lanes' regression rule (#551, S6 of #487), read by
+# scripts/prism_load_regress.py.
+#
+# A run's headline number regresses when it is worse than the trailing median
+# of the same series by more than the allowed change:
+#
+#   allowed = max(k * spread, min_relative_change * |median|, min_absolute_change)
+#
+# where a series is one lane, preset (and the preset file's sha256, so a
+# changed preset starts a new baseline), runner class and fsync band, and only
+# runs whose harness exited 0 count toward it. `spread` is #542's measured
+# spread for the runner class, preset and number (the coefficient of variation
+# over every run, `all.cv`, times the median) when #542's variance document is
+# given (scripts/prism_load_probe.py `variance --out`, checked in as
+# test/prism-load-variance.json, which the evidence action passes when it
+# exists), and otherwise the baseline's own scaled median absolute deviation
+# (1.4826 * MAD), which is provisional. #542 measures the rate, the client ACK
+# p50/p99 and the tip-to-last-notify p99; the other numbers stay provisional.
+#
+# PROVISIONAL: no measured variance document is checked in yet, so `k`,
+# `window`, `min_baseline`, the per-metric floors and the fsync band edges
+# below are placeholders chosen to be quiet, not calibrated. Set
+# `provisional = false` once they are; a verdict still says provisional while
+# any number it compared used the provisional spread. The rule is
+# report-only either way: it opens or updates one tracking issue and never
+# fails a job or blocks a merge (#487's "Results, evidence and regression
+# detection"). When #542 finds VM-to-VM spread much larger than run-to-run
+# spread on one VM (`ab_ratio` below), the summary says so: the path is then
+# #511's interleaved A/B driver on one VM, not a wider threshold.
+
+schema = "qbit.prism.load-regression-config.v1"
+provisional = true
+
+[rule]
+# Lanes the rule reads. The weekly soak (#575) has its own bounds, still being
+# calibrated (#575), and L3's rows are compared by #557's bundle, not here.
+lanes = ["L2"]
+# Trailing runs of the same series the median is taken over (#487: "the
+# trailing 14-run median"). Flagged runs are left out of it; a streak of
+# this many flagged runs is taken as the accepted new level.
+window = 14
+# Fewer runs than this in the series gives no verdict ("unknown"), not a pass.
+min_baseline = 5
+# Multiples of the spread a run may be worse by.
+k = 3.0
+# The ratio of VM-to-VM to run-to-run spread above which the summary points at
+# #511's same-VM A/B instead. Read only from a variance file.
+ab_ratio = 2.0
+
+[fsync_bands]
+# pg_test_fsync's fdatasync cost for one 8 kB write, in microseconds per
+# operation, on the filesystem under the harness's cluster. A run is compared
+# only with runs in its own band; one whose cost was not measured is in no
+# band and gets no verdict. `edges_usecs` are the upper bounds of every band
+# but the last.
+edges_usecs = [1000.0, 4000.0]
+names = ["fast", "medium", "slow"]
+
+# The headline numbers the rule compares. `scope = "phase"` compares each of
+# the run's artifact phases on its own; `worse` says which direction is a
+# regression. Units are in the key.
+
+[[metric]]
+key = "achieved_rate_shares_per_second"
+scope = "phase"
+worse = "lower"
+min_relative_change = 0.05
+min_absolute_change = 1.0
+
+[[metric]]
+key = "client_ack_p50_ms"
+scope = "phase"
+worse = "higher"
+min_relative_change = 0.25
+min_absolute_change = 2.0
+
+[[metric]]
+key = "client_ack_p99_ms"
+scope = "phase"
+worse = "higher"
+min_relative_change = 0.25
+min_absolute_change = 5.0
+
+# Server-side, from qbit_prism_share_ack_seconds{result="accepted"}: complete
+# submit frame receipt to completed response write, which includes the share
+# append.
+[[metric]]
+key = "server_ack_mean_ms"
+scope = "phase"
+worse = "higher"
+min_relative_change = 0.25
+min_absolute_change = 1.0
+
+[[metric]]
+key = "order_lock_mean_waiters"
+scope = "phase"
+worse = "higher"
+min_relative_change = 0.5
+min_absolute_change = 0.5
+
+[[metric]]
+key = "peak_rss_mib"
+scope = "phase"
+worse = "higher"
+min_relative_change = 0.15
+min_absolute_change = 32.0
+
+[[metric]]
+key = "tip_last_notify_p99_ms"
+scope = "run"
+worse = "higher"
+min_relative_change = 0.25
+min_absolute_change = 50.0

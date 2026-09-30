@@ -6,7 +6,7 @@
 //! cancelled; an outcome still unknown at the acknowledgement deadline is
 //! answered `ledger-outcome-unknown`, never `ledger-confirmation-failed`. A
 //! block-only proof's acknowledgement follows its candidate's disposition up
-//! to `block_only_ack_timeout`. Faults come from a deferred constraint trigger
+//! to `share_commit_timeout`. Faults come from a deferred constraint trigger
 //! that runs at COMMIT, the literal `ORDER_LOCK` key, a table lock and
 //! `pg_terminate_backend`.
 
@@ -812,14 +812,13 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn commit_reconcile_block_only_confirmed_after_the_share_deadline_is_accepted() -> Result<()>
-{
+async fn commit_reconcile_block_only_confirmed_before_its_bound_is_accepted() -> Result<()> {
     let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
     let fixture = Fixture::open(&raw, |config| {
-        config.block_only_ack_timeout = Duration::from_secs(10)
+        config.share_commit_timeout = Duration::from_secs(10)
     })
     .await?;
     let outcome = async {
@@ -834,7 +833,7 @@ async fn commit_reconcile_block_only_confirmed_after_the_share_deadline_is_accep
         tokio::time::sleep_until(started + Duration::from_millis(1500)).await;
         ensure!(
             !submitted.is_finished(),
-            "a block-only proof was answered at the share deadline"
+            "a block-only proof was answered before its candidate's disposition"
         );
         fixture.drive_candidate().await?;
         let answer = answer(submitted).await?;
@@ -846,10 +845,6 @@ async fn commit_reconcile_block_only_confirmed_after_the_share_deadline_is_accep
         ensure!(
             fixture.rows(&share_id).await? == 1,
             "expected one credit row"
-        );
-        ensure!(
-            fixture.late_confirmed() == 0,
-            "block-only counted a late confirmation"
         );
         Ok::<_, anyhow::Error>(())
     }
@@ -864,7 +859,7 @@ async fn commit_reconcile_block_only_still_pending_at_its_bound_is_unknown() -> 
     };
     let _serial = TEST_LOCK.lock().await;
     let fixture = Fixture::open(&raw, |config| {
-        config.block_only_ack_timeout = Duration::from_millis(1500)
+        config.share_commit_timeout = Duration::from_millis(1500)
     })
     .await?;
     let outcome = async {
@@ -906,7 +901,7 @@ async fn commit_reconcile_block_only_enqueue_behind_the_order_lock_is_not_cut_of
     };
     let _serial = TEST_LOCK.lock().await;
     let fixture = Fixture::open(&raw, |config| {
-        config.block_only_ack_timeout = Duration::from_secs(10)
+        config.share_commit_timeout = Duration::from_secs(10)
     })
     .await?;
     let outcome = async {
@@ -916,11 +911,11 @@ async fn commit_reconcile_block_only_enqueue_behind_the_order_lock_is_not_cut_of
         let started = TokioInstant::now();
         let (submitted, _log) = fixture.submit(proof);
         wait_until_blocked(&fixture, holder_pid).await?;
-        // Past the share deadline, inside the 5 s lock_timeout.
+        // Held behind the lock inside the 5 s lock_timeout and the bound.
         tokio::time::sleep_until(started + Duration::from_millis(1500)).await;
         ensure!(
             !submitted.is_finished(),
-            "a block-only enqueue was cut off at the share deadline"
+            "a block-only proof was answered while its enqueue waited behind ORDER_LOCK"
         );
         sqlx::query(&format!("SELECT pg_advisory_unlock({ORDER_LOCK_KEY})"))
             .execute(&mut *holder)
@@ -955,7 +950,7 @@ async fn commit_reconcile_block_only_poll_errors_are_retried_then_unknown() -> R
     };
     let _serial = TEST_LOCK.lock().await;
     let fixture = Fixture::open(&raw, |config| {
-        config.block_only_ack_timeout = Duration::from_secs(8)
+        config.share_commit_timeout = Duration::from_secs(8)
     })
     .await?;
     let outcome = async {
@@ -1012,7 +1007,7 @@ async fn commit_reconcile_block_only_enqueue_past_the_bound_is_unknown() -> Resu
     };
     let _serial = TEST_LOCK.lock().await;
     let fixture = Fixture::open(&raw, |config| {
-        config.block_only_ack_timeout = Duration::from_millis(1500)
+        config.share_commit_timeout = Duration::from_millis(1500)
     })
     .await?;
     let outcome = async {

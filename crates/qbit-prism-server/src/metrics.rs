@@ -3,6 +3,7 @@ pub mod collectors;
 mod events;
 mod labels;
 mod landing;
+mod landing_acks;
 mod registry;
 pub mod runtime;
 mod snapshots;
@@ -70,6 +71,8 @@ pub struct Metrics {
     node: Mutex<NodeState>,
     /// When this frontend's hashrate rollup last left no unfolded share.
     rollup_caught_up: Mutex<Option<Instant>>,
+    /// Share acknowledgements around pool block landings (#602).
+    landing_acks: landing_acks::LandingAcks,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -134,6 +137,20 @@ impl Metrics {
         for value in AckResult::ALL {
             registry.register(Family::ShareAck, label("result", value.as_str()), 0.);
         }
+        for value in AckResult::ALL {
+            registry.register(
+                Family::ShareAckLandingWindow,
+                label("result", value.as_str()),
+                0.,
+            );
+        }
+        for bound in LandingAckBound::ALL {
+            registry.register(
+                Family::SlowLandingWindows,
+                label("p99_above_seconds", bound.as_str()),
+                -1.,
+            );
+        }
         for value in RevisionWorkResult::ALL {
             registry.register(Family::RevisionWork, label("result", value.as_str()), 0.);
         }
@@ -188,6 +205,7 @@ impl Metrics {
         for family in [
             Family::FirstOffer,
             Family::LockWait,
+            Family::OrderLockHold,
             Family::RefreshSeconds,
             Family::RollupLag,
         ] {
@@ -218,6 +236,7 @@ impl Metrics {
             landing: Mutex::new(landing::Landing::default()),
             node: Mutex::new(NodeState::default()),
             rollup_caught_up: Mutex::new(None),
+            landing_acks: landing_acks::LandingAcks::default(),
         }
     }
     pub fn runtime(&self) -> Arc<runtime::RuntimeMonitor> {
@@ -289,6 +308,14 @@ impl Metrics {
             Labels::Empty,
             caught_up.map_or(-1., |at| at.elapsed().as_secs_f64()),
         );
+        let streaks = self.landing_acks.streaks(tokio::time::Instant::now());
+        for (index, bound) in LandingAckBound::ALL.iter().enumerate() {
+            registry.set(
+                Family::SlowLandingWindows,
+                label("p99_above_seconds", bound.as_str()),
+                streaks.map_or(-1., |streaks| f64::from(streaks[index])),
+            );
+        }
         registry
     }
 }

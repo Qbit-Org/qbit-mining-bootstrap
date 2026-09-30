@@ -68,7 +68,9 @@ impl Ledger {
 
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let _order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::Operator)
+            .await?;
         // Exclude registrations and heartbeats racing the instance scan: a
         // frontend starting now writes its row only after this commits, and
         // its configure then waits on the cluster row below.

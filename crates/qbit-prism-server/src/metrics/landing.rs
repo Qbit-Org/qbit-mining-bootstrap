@@ -242,19 +242,31 @@ impl Metrics {
         event(&mut landing, &mut registry)
     }
 
-    /// See [`Observation::Active`].
+    /// See [`Observation::Active`]. Also opens a share acknowledgement
+    /// landing window (#602).
     pub(crate) fn accepted_block(&self, hash: &str, height: u64) {
         self.accept_block(hash, height, Observation::Active);
+        self.landing_acks.opened(Instant::now(), hash);
     }
 
-    /// See [`Observation::Unlanded`] (#493).
+    /// See [`Observation::Unlanded`] (#493). Also opens a share
+    /// acknowledgement landing window (#602).
     pub(crate) fn accepted_unlanded_block(&self, hash: &str, height: u64) {
         self.accept_block(hash, height, Observation::Unlanded);
+        self.landing_acks.opened(Instant::now(), hash);
     }
 
-    /// See [`Observation::Confirmed`].
-    pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64) {
+    /// See [`Observation::Confirmed`]. `at_tip` is whether the block is the
+    /// chain's tip in the observation. Only then does it open a landing
+    /// window (#602): a peer frontend's block that settled before this
+    /// frontend's reconciler first saw it is still landing now, while the
+    /// buried blocks a restart first sees landed long ago. A restart whose
+    /// tip is a pool block opens one window.
+    pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64, at_tip: bool) {
         self.accept_block(hash, height, Observation::Confirmed);
+        if at_tip {
+            self.landing_acks.opened(Instant::now(), hash);
+        }
     }
 
     /// A committed proven orphan has no delivery target. Close its wait without
