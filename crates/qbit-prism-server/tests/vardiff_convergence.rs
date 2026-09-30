@@ -20,7 +20,8 @@
 //!   target interval. The listener sends nothing for an evaluation that
 //!   leaves the difficulty alone, so the period bound is on elapsed time;
 //! - every adjustment, before and after settling, moves toward the target:
-//!   the difficulty never reverses direction;
+//!   the difficulty never reverses direction, and never ends farther from
+//!   the target (as a ratio) than it started;
 //! - it stays settled for at least `SETTLED_RETARGET_PERIODS` retarget
 //!   periods, with at most one further adjustment.
 //!
@@ -402,6 +403,22 @@ fn reversal(difficulties: &[(f64, f64)]) -> Option<usize> {
     None
 }
 
+/// The index of the first adjustment that leaves the difficulty farther
+/// from `target`, as a ratio either way, than it was, or None when every
+/// adjustment brings it closer. This holds after settling too, even inside
+/// the band: vardiff only moves by 25% or more (its tolerance), and a window
+/// cut short by the listener's timer misjudges this client's paced rate by at
+/// most one share in six, which the EWMA shrinks further. So a move of that
+/// size away from the target is a wrong estimate, not noise; and if the
+/// client stalled, `verdict` says so.
+fn away_from_target(difficulties: &[(f64, f64)], target: f64) -> Option<usize> {
+    let error = |difficulty: f64| (difficulty / target).ln().abs();
+    difficulties
+        .windows(2)
+        .position(|pair| error(pair[1].1) > error(pair[0].1))
+        .map(|index| index + 1)
+}
+
 /// The index of the first difficulty from which every later one is within
 /// `BAND` of `target`, or None when the session never settled.
 fn settled_from(difficulties: &[(f64, f64)], target: f64) -> Option<usize> {
@@ -474,6 +491,11 @@ fn convergence_failures(trace: &Trace, target: f64) -> (Vec<String>, Option<f64>
     if let Some(index) = reversal(&trace.difficulties) {
         failures.push(format!(
             "adjustment {index} reversed the direction of the ones before it"
+        ));
+    }
+    if let Some(index) = away_from_target(&trace.difficulties, target) {
+        failures.push(format!(
+            "adjustment {index} left the difficulty farther from its target"
         ));
     }
     let Some(settled) = settled_from(&trace.difficulties, target) else {
@@ -724,4 +746,24 @@ fn settling_without_shares_to_show_it_held_is_a_failure() {
         .iter()
         .any(|failure| failure.starts_with("only 2 shares after settling")));
     assert!(convergence_failures(&trace(60), 1.0).0.is_empty());
+}
+
+#[test]
+fn an_adjustment_that_overshoots_farther_from_the_target_is_found() {
+    assert_eq!(
+        away_from_target(&[(0.0, 0.0625), (1.0, 0.25), (2.0, 0.99)], 1.0),
+        None
+    );
+    assert_eq!(
+        away_from_target(&[(0.0, 16.0), (1.0, 4.0), (2.0, 1.0)], 1.0),
+        None
+    );
+    // Same direction all the way, but past the target and away from it.
+    assert_eq!(
+        away_from_target(&[(0.0, 0.0625), (1.0, 1.0), (2.0, 1.4)], 1.0),
+        Some(2)
+    );
+    assert_eq!(reversal(&[(0.0, 0.0625), (1.0, 1.0), (2.0, 1.4)]), None);
+    // Crossing the target to a closer point is still closer.
+    assert_eq!(away_from_target(&[(0.0, 1.3), (1.0, 0.9)], 1.0), None);
 }
