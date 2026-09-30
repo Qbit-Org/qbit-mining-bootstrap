@@ -1397,8 +1397,8 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         // Every regtest share is also a block. A proof on work whose payout
         // revision a landing superseded is captured (#478): its share is
         // credited by this server's own landing of that block, and its answer
-        // waits for that credit up to block_only_ack_timeout, which #574 cut
-        // from 60 s to share_commit_timeout (15 s here). Under load a landing
+        // waits for that credit up to share_commit_timeout (15 s here), which
+        // #574 cut from a 60 s floor. Under load a landing
         // takes seconds, so three credited shares can outlast a fixed 20 s
         // (#562). This counts credits, which still follow the landing rather
         // than the answer, so each keeps the 60 s allowance, here and after

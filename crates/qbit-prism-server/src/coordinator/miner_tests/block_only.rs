@@ -125,7 +125,16 @@ async fn block_only_work_earns_no_share_credit_at_the_current_revision() {
 /// fixture's ledger is offline, so that path fails before any write.)
 #[tokio::test]
 async fn block_only_work_block_never_takes_the_credited_share_path() {
-    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    // The block-only proof's duplicate probe fails on this fixture's offline
+    // ledger at the pool's 30 s acquire timeout. The share deadline, which
+    // bounds a block-only proof (#580), has to outlast it for that failure,
+    // not the bound, to be the answer.
+    let fixture = Fixture::build(
+        Duration::from_secs(10),
+        |config| config.share_commit_timeout = Duration::from_secs(60),
+        None,
+    )
+    .await;
     fixture.observe(1, true).await;
     let credit = fixture.job(1, 0, "original.worker");
     let retired = block_only(credit.clone());

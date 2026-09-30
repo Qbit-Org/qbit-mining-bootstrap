@@ -153,9 +153,6 @@ pub(super) fn test_config(
         health_timeout: Duration::from_secs(60),
         share_commit_timeout,
         share_commit_grace: Duration::from_secs(5),
-        // Block-only acknowledgements keep the bound these harnesses were
-        // written against.
-        block_only_ack_timeout: share_commit_timeout,
         candidate_orphan_confirmations: 6,
         capture_overpay_ceiling_bps: 100,
         offer_standby: None,
