@@ -86,6 +86,7 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     let (expanded, loaded) = preset::expand_command_line(std::mem::take(&mut argv))?;
     let loaded = loaded.context("the pr-smoke preset")?;
     let args = Args::try_parse_from(expanded)?;
+    let (seed_rows, seed_bytes) = (args.seed_share_count(), args.seed_share_bytes as f64);
     let exit = run::execute_with_preset(args, Some(loaded.clone())).await?;
     let ran = started.elapsed() - built;
 
@@ -322,6 +323,18 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             loaded.args["--pool-fee-bps"].to_string().as_str()
         );
     }
+    // The seeded ledger holds the preset's rows, retarget history included,
+    // padded to the pinned share size.
+    let seed = &report["window"]["seed"];
+    assert_eq!(seed["rows"].as_u64(), Some(seed_rows), "{seed}");
+    let average = seed["serialized_bytes"]
+        .as_f64()
+        .context("serialized bytes")?
+        / seed_rows as f64;
+    assert!(
+        (average - seed_bytes).abs() <= seed_bytes * compare::SEED_SHARE_BYTES_TOLERANCE,
+        "{seed}"
+    );
     // Every pinned session connected at least once.
     assert!(
         report["client"]["connects"].as_u64()

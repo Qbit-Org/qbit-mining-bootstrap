@@ -133,7 +133,7 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
             "requested_window_shares": 20000,
             "computed_window_shares": 20000,
             "ledger_window_shares_at_start": 20000,
-            "seed": {"target_share_bytes": 581},
+            "seed": {"rows": 20000, "serialized_bytes": 11_674_595, "target_share_bytes": 581},
         },
         "time_to_usable_work": {"tips": [
             {"all_sessions_milliseconds": 600.0},
@@ -649,6 +649,43 @@ fn a_delayed_phase_whose_delay_was_not_seen_to_be_paid_fails() {
         assert!(!result.passed);
         assert!(result.markdown.contains(why), "{}", result.markdown);
     }
+}
+
+#[test]
+fn a_seeded_ledger_short_of_its_rows_or_its_share_size_fails() {
+    let manifest = manifest(288.0);
+    let seeded = |pinned: &std::collections::BTreeMap<String, Value>, rows: u64, bytes: u64| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let seed = &mut run.report.as_mut().unwrap()["window"]["seed"];
+            seed["rows"] = json!(rows);
+            seed["serialized_bytes"] = json!(bytes);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), pinned).unwrap()
+    };
+    // 583.7 bytes a share, as a real 20k seed at 581 reads.
+    assert!(seeded(&d1_args(), 20_000, 11_674_595).passed);
+    let result = seeded(&d1_args(), 20_000, 20_000 * 300);
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "seeded shares of 300 bytes on average, not the pinned `--seed-share-bytes` 581"
+        ),
+        "{}",
+        result.markdown
+    );
+    // A retargeting node needs a tenth more of older history.
+    let mut retarget = d1_args();
+    retarget.insert("--retarget-bits".into(), json!(true));
+    let result = seeded(&retarget, 20_000, 11_674_595);
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("seeded 20000 ledger rows, not the 22000 the pinned `--window-shares`"),
+        "{}",
+        result.markdown
+    );
 }
 
 #[test]

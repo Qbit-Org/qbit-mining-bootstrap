@@ -656,6 +656,12 @@ pub const PINNED_REPORT_FIELDS: &[(&str, &str)] = &[
     ),
 ];
 
+/// How far a counted run's seeded shares may sit, on average, from the
+/// pinned `--seed-share-bytes`, as a fraction of it: the seed plan pads its
+/// first share to the target exactly, and later shares' ids run a few digits
+/// longer, while a plan that stopped padding would sit far below it.
+pub const SEED_SHARE_BYTES_TOLERANCE: f64 = 0.05;
+
 /// Measured facts of the workload every counted run of both builds must
 /// report alike, where the preset fixes them only through the harness: the
 /// payout window's length as the database held it at the start (in every
@@ -1524,6 +1530,46 @@ pub fn compare(
                 "launched {} frontends, not the pinned `--frontends` {}",
                 launched.map_or("an unreported number of".into(), |n| n.to_string()),
                 frontends.unwrap_or_default()
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            passed = false;
+            findings.push(format!(
+                "**the runs did not drive the pinned workload**: {} {why}",
+                run.run.id
+            ));
+            break;
+        }
+    }
+    // The seeded ledger is the preset's: `--window-shares` rows plus the
+    // tenth more of older history a retargeting node needs, as this
+    // harness's `Args::seed_share_count` derives them, each padded to the
+    // pinned `--seed-share-bytes` on average (`window.seed`, in every harness
+    // since #271). `window.seed.target_share_bytes` alone only echoes the
+    // flag.
+    let seed_rows = args.seed_share_count();
+    let seed_bytes = args.seed_share_bytes as f64;
+    for run in runs.iter().filter(|r| r.excluded.is_none()) {
+        let seed = run.report.as_ref().and_then(|r| r.pointer("/window/seed"));
+        let rows = seed.and_then(|s| s["rows"].as_u64());
+        let average = seed
+            .and_then(|s| s["serialized_bytes"].as_f64())
+            .map(|bytes| bytes / seed_rows as f64);
+        let why = if rows != Some(seed_rows) {
+            Some(format!(
+                "seeded {} ledger rows, not the {seed_rows} the pinned `--window-shares` and \
+                 `--retarget-bits` call for",
+                rows.map_or("an unreported number of".into(), |n| n.to_string())
+            ))
+        } else if !average
+            .is_some_and(|a| (a - seed_bytes).abs() <= seed_bytes * SEED_SHARE_BYTES_TOLERANCE)
+        {
+            Some(format!(
+                "seeded shares of {} bytes on average, not the pinned `--seed-share-bytes` {}",
+                average.map_or("an unreported number of".into(), |a| number(a, None)),
+                number(seed_bytes, None)
             ))
         } else {
             None

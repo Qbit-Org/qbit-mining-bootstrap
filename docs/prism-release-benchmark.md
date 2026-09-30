@@ -150,7 +150,8 @@ database delay, seen to be paid, and frontend restarts (the reconnect phase's dr
 with two or more frontends, the mid-flight kill's relaunch, with submits in
 flight at the kill), the scheduled blocks, each accepted by the node (under
 the dense cadence, the pinned landing budget and the landings it schedules),
-a connection for every pinned session, the completed reconnects,
+the seeded ledger's rows (a retargeting node's older history included) and
+average share size, a connection for every pinned session, the completed reconnects,
 the memory floor, and the samplers, each sampling at its pinned interval on
 every launched frontend.
 
