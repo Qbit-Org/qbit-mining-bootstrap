@@ -86,9 +86,9 @@ name: PRISM load harness runner probe
 # Per-lane pick: download each phase's prism-probe-table artifact and read
 # variance.json. A lane's class is the smallest on which every preset the
 # lane runs has `size_evidence.fits == true`: every planned run measured
-# (harness exit 0, provenance passed, no timeout), zero shortfall in each
+# (harness exit 0, provenance passed, a gate verdict, no timeout), zero shortfall in each
 # phase the preset gates on every run (the generator offered the full rate),
-# and at least max(25 % of MemTotal, the preset's --min-mem-available-mib)
+# and at least max(25 % of its own MemTotal, the preset's --min-mem-available-mib)
 # left at peak on every run. `null` (a run unknown) is not a pass: rerun
 # that class first.
 #   L2: A and D, on 8 then 16 vCPU.

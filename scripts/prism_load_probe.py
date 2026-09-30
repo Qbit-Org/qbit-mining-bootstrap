@@ -582,8 +582,8 @@ def latency_ms(summary, key: str) -> float | None:
 
 def unmeasured_reason(result: dict) -> str | None:
     """Why a run's numbers are not a sample, or None when they are. Only a
-    harness exit 0 with a report and every provenance check passed is a
-    measurement; a gate that failed on it (exit 1) still measured it, and
+    harness exit 0 with a report, every provenance check passed and a gate
+    verdict is a measurement; a gate that failed on it (exit 1) still measured it, and
     its shortfall is exactly what the runner-size pick reads."""
     if result.get("timed_out"):
         return "timed out"
@@ -594,6 +594,11 @@ def unmeasured_reason(result: dict) -> str | None:
         return f"harness exit {code}"
     if result.get("provenance") != "pass":
         return f"provenance {result.get('provenance')}"
+    # prism-load-run.sh's status is the gate's: 0 or 1 is a verdict, anything
+    # else (2, a panic, a gate that would not start) is not.
+    gate = result.get("gate_exit_code")
+    if gate not in (0, 1) or isinstance(gate, bool):
+        return f"gate exit {gate}"
     return None
 
 
@@ -1069,11 +1074,15 @@ def group_document(size: int, preset_name: str, band: str, jobs: list[dict],
         runs_all += runs
         per_job.append([r for r in runs if r.get("unmeasured_reason") is None])
     measured = [r for jr in per_job for r in jr]
-    names = sorted({n for r in measured for n in run_metrics(r)})
+    # The headline metrics are always present, so a group whose every run is
+    # unknown still says n 0 and how many are unknown for each.
+    seeded = set(RUN_METRICS) | {f"{phase}.{name}" for phase in (gated_phases(preset) or [])
+                                 for name in PHASE_METRICS}
+    names = sorted(seeded | {n for r in measured for n in run_metrics(r)})
     metrics = {}
     for name in names:
-        values = [v for v in (run_metrics(r)[name] for r in measured) if v is not None]
-        job_values = [[v for v in (run_metrics(r)[name] for r in jr) if v is not None]
+        values = [v for v in (run_metrics(r).get(name) for r in measured) if v is not None]
+        job_values = [[v for v in (run_metrics(r).get(name) for r in jr) if v is not None]
                       for jr in per_job]
         medians = [statistics.median(vs) for vs in job_values if vs]
         within = [stats(vs) for vs in job_values if len(vs) >= 2]

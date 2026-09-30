@@ -462,7 +462,8 @@ class RowsV2(unittest.TestCase):
         self.assertIsNone(burst["achieved_rate_shares_per_second"])
 
     def test_what_makes_a_run_a_measurement(self) -> None:
-        base = {"harness_exit_code": 0, "provenance": "pass", "timed_out": False}
+        base = {"harness_exit_code": 0, "provenance": "pass", "timed_out": False,
+                "gate_exit_code": 0}
         self.assertIsNone(probe.unmeasured_reason(base))
         # A failed gate still measured the run.
         self.assertIsNone(probe.unmeasured_reason(dict(base, gate_exit_code=1)))
@@ -473,6 +474,10 @@ class RowsV2(unittest.TestCase):
                          "harness exit 3")
         self.assertTrue(probe.unmeasured_reason(dict(base, provenance="fail: dirty tree"))
                         .startswith("provenance"))
+        # Only a gate verdict (0 or 1) makes the run a sample.
+        for gate in (2, 101, None, -15):
+            self.assertEqual(probe.unmeasured_reason(dict(base, gate_exit_code=gate)),
+                             f"gate exit {gate}")
 
     def test_v1_rows_are_read_and_unknown_schemas_refused(self) -> None:
         v1 = {"schema": probe.ROW_SCHEMA_V1, "kind": "probe", "class": 8, "runner": "r",
@@ -645,6 +650,15 @@ class Variance(unittest.TestCase):
                          8, "all")["size_evidence"]
         self.assertEqual(evidence["headroom_mib_required"], 6144.0)
         self.assertFalse(evidence["fits"])
+
+    def test_a_group_with_every_run_unknown_still_lists_its_metrics(self) -> None:
+        rows = [probe_row(1, [run(harness=6), run(harness=6)])]
+        everything = group(probe.variance(rows, self.expected(2), self.presets), 8, "all")
+        rate = everything["metrics"]["steady_state.achieved_rate_shares_per_second"]
+        self.assertEqual((rate["all"]["n"], rate["all"]["unknown"]), (0, 4))
+        self.assertEqual((rate["vm_to_vm"]["n"], rate["vm_to_vm"]["unknown"]), (0, 2))
+        self.assertIsNone(rate["run_to_run"])
+        self.assertEqual(everything["metrics"]["peak_used_mib"]["all"]["unknown"], 4)
 
     def test_one_commit_one_row_per_job(self) -> None:
         with self.assertRaises(probe.ProbeError):
