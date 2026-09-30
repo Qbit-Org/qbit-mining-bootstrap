@@ -152,17 +152,20 @@ class Reconciliation(unittest.TestCase):
     def test_every_acknowledged_share_in_the_ledger_reconciles(self) -> None:
         self.assertEqual(lane.reconcile_client("c", self.tally(10, 9, 1), 9), [])
 
-    def test_unanswered_submissions_may_have_committed(self) -> None:
-        self.assertEqual(lane.reconcile_client("c", self.tally(12, 9, 1), 11), [])
+    def test_an_unanswered_submission_leaves_the_count_unprovable(self) -> None:
+        # One acknowledged share lost and one unanswered share committed
+        # would leave rows == acknowledged; counts cannot tell, so it fails.
+        problems = lane.reconcile_client("c", self.tally(12, 9, 1), 9)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("2 submissions were unanswered", problems[0])
 
     def test_a_missing_acknowledged_share_fails(self) -> None:
         problems = lane.reconcile_client("c", self.tally(10, 9, 1), 8)
         self.assertEqual(problems, ["c: 9 shares acknowledged but only 8 in the ledger"])
 
-    def test_rows_beyond_every_submission_fail(self) -> None:
+    def test_rows_beyond_the_acknowledged_shares_fail(self) -> None:
         problems = lane.reconcile_client("c", self.tally(10, 9, 1), 10)
-        self.assertEqual(len(problems), 1)
-        self.assertIn("exceed 9 acknowledged plus 0 unanswered", problems[0])
+        self.assertEqual(problems, ["c: 10 ledger rows but only 9 shares acknowledged"])
 
     def test_no_accepted_share_fails(self) -> None:
         self.assertIn("c: no share was accepted", lane.reconcile_client("c", self.tally(0, 0), 0))

@@ -718,7 +718,7 @@ id = "shipped-image-lane"
 title = "The Compose prism profile with the HA overlay under modest real-miner load"
 owner = "#544"
 lanes = ["L6"]
-criteria = "Built by `docker compose build`, the stack runs both overlay frontends ready with distinct IDs that each one's self-check observes; cpuminer-opt on one frontend and qbit-prism-miner on the other each solve a block the node keeps, whose audit bundle both frontends serve identically and which verifies against the node's coinbase and the ledger key; every acknowledged share is in the ledger once and no more than was submitted; the public API lists the verified blocks; and #281 criterion 1 holds on the images."
+criteria = "Built by `docker compose build`, the stack runs both overlay frontends ready with distinct IDs that each one's self-check observes; cpuminer-opt on one frontend and qbit-prism-miner on the other each solve a block the node keeps, whose audit bundle both frontends serve identically and which verifies against the node's coinbase and the ledger key; each client's ledger rows equal the shares it saw acknowledged, with every submission answered; the public API lists the verified blocks; and #281 criterion 1 holds on the images."
 runs = true
 lane_checks = [
   "ha-frontends-ready",

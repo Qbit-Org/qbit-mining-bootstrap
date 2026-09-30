@@ -21,10 +21,11 @@ test/e2e-scenarios.toml cites as the lane's evidence:
   bundle, served identically by both frontends, verifies with
   `qbit-prism-audit-verify` against the node's coinbase and the lane's
   ledger writer key.
-- `ledger-reconciles`: every share a client saw acknowledged is in the
-  ledger (and nothing beyond its unanswered submissions), each credited
-  header is credited once, both frontends wrote shares, and both frontends'
-  `/audit/latest` report the ledger's accepted-share count.
+- `ledger-reconciles`: each client's ledger rows equal the shares it saw
+  acknowledged, with none of its submissions left unanswered (see
+  `reconcile_client`), each credited header is credited once, both frontends
+  wrote shares, and both frontends' `/audit/latest` report the ledger's
+  accepted-share count.
 - `public-api-lists-found-blocks`: the public API, reading the replica,
   lists every verified block.
 
@@ -298,20 +299,30 @@ def parse_prism_miner(output: str) -> ClientTally:
 def reconcile_client(name: str, tally: ClientTally, ledger_rows: int) -> list[str]:
     """Why a client's acknowledged shares and the ledger disagree; empty when they agree.
 
-    Every acknowledged share must be in the ledger. The ledger may also hold
-    shares the client submitted but stopped before hearing about, and no more.
+    Neither shipped client logs a share's identity, so this compares counts,
+    which is exact only when every submission was answered: each ledger row
+    is a submission, an answered one is acknowledged or refused, and a
+    refused share has no accepted row, so rows == acknowledged means every
+    acknowledged share is there. With a submission left unanswered, a lost
+    acknowledged share and a committed unanswered one would cancel out, so
+    that is a failure too, not a pass on bounds. (The load harness, L2,
+    reconciles share identities.)
     """
     problems = []
     if tally.accepted == 0:
         problems.append(f"{name}: no share was accepted")
+    if tally.unanswered:
+        problems.append(
+            f"{name}: {tally.unanswered} submissions were unanswered when it stopped, so counts cannot "
+            "prove every acknowledged share is in the ledger"
+        )
     if ledger_rows < tally.accepted:
         problems.append(
             f"{name}: {tally.accepted} shares acknowledged but only {ledger_rows} in the ledger"
         )
-    if ledger_rows > tally.accepted + tally.unanswered:
+    if ledger_rows > tally.accepted:
         problems.append(
-            f"{name}: {ledger_rows} ledger rows exceed {tally.accepted} acknowledged plus "
-            f"{tally.unanswered} unanswered submissions"
+            f"{name}: {ledger_rows} ledger rows but only {tally.accepted} shares acknowledged"
         )
     return problems
 
