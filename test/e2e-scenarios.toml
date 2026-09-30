@@ -529,7 +529,7 @@ id = "chain-events-under-load"
 title = "#521 scenarios 1, 2, 4 and 5 at L4's session counts"
 owner = "#553"
 lanes = ["nightly", "weekly"]
-criteria = "#521's assertions for each scenario, unchanged, under 2,000 share-only sessions at 100 shares/s; and the load's own: every acknowledged share durable and no refused share credited, no impossible refusal, and every session on a ready frontend given work on every tip that lasts 15 s within 15 s."
+criteria = "#521's assertions for each scenario, unchanged, under 2,000 share-only sessions at 100 shares/s; and the load's own: every acknowledged share durable and no refused share credited (ledger-outcome-unknown counts as unanswered), every refusal one a correct miner can earn (an allow-list), and every session on a ready frontend given work on every tip that lasts 15 s within 15 s."
 runs = true
 tests = [
   "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_every_session",
@@ -548,7 +548,7 @@ id = "one-frontend-fast-reanchor"
 title = "#598's guard: 2,000 sessions on one frontend at a 1 s reanchor"
 owner = "#598"
 lanes = ["nightly"]
-criteria = "Each of three external tips 20 s apart reaches every one of 2,000 sessions on the one frontend within 15 s at the live fixture's 1 s reanchor and 5 shares/s, with the load's own checks. Before #598's fix almost no session got work on the 2nd and 3rd tips. Debug only: in release the fan-out outruns the reanchor even without the fix."
+criteria = "With at least 99% of 2,000 sessions on the one frontend holding work, each of three external tips 20 s apart reaches every session holding work within 15 s at the live fixture's 1 s reanchor and 5 shares/s, with the load's own checks. Before #598's fix almost no session got work on the 2nd and 3rd tips. Debug only: in release the fan-out outruns the reanchor even without the fix."
 runs = true
 tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_every_tip"]
 

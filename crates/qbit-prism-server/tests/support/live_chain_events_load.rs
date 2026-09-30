@@ -178,11 +178,12 @@ fn tip_delivery<'a>(report: &'a Value, frontend: usize, tip: &str) -> Result<&'a
         .with_context(|| format!("no delivery of {tip} on frontend {frontend}: {report}"))
 }
 
-/// Every frontend in `frontends` had at least one tip held to the bound.
+/// Every frontend in `frontends` had at least one tip held to the bound:
+/// gated, and lasting the bound, so no session could count as replaced.
 fn held_to_the_bound(report: &Value, frontends: &[usize]) -> Result<()> {
     for frontend in frontends {
         ensure!(
-            report["time_to_usable_work"][frontend]["gated_tips"].as_u64() >= Some(1),
+            report["time_to_usable_work"][frontend]["held_tips"].as_u64() >= Some(1),
             "the load's check held no tip of frontend {frontend} to the bound: {report}"
         );
     }
@@ -420,7 +421,9 @@ async fn weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_f
         );
         let report = under_load(fixture, plan, async |fixture, load| {
             load.until_connected(0.99, 120).await?;
-            soak(fixture, seconds, budget).await
+            soak(fixture, seconds, budget).await?;
+            // The soak's own blocks come seconds apart, under the bound.
+            closing_tip(fixture).await
         })
         .await?;
         held_to_the_bound(&report, &[0, 1])
@@ -528,7 +531,7 @@ async fn nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_ever
         })
         .await?;
         ensure!(
-            report["time_to_usable_work"][0]["gated_tips"].as_u64() >= Some(3),
+            report["time_to_usable_work"][0]["held_tips"].as_u64() >= Some(3),
             "the load's check held too few of the three tips to the bound: {report}"
         );
         Ok(())
@@ -681,8 +684,8 @@ async fn nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_bl
                 report["time_to_usable_work"][frontend]["gated_tips"].as_u64() >= Some(2),
                 "the load's check held too few of frontend {frontend}'s tips to the bound: {report}"
             );
-            // The isolated block is the case: it is held to the bound on
-            // every session, whatever the load's check gated.
+            // The isolated block is the case: beyond the count above, it
+            // must be gated and reach every eligible session in the bound.
             let delivery = tip_delivery(&report, frontend, &isolated)?;
             ensure!(
                 delivery["gated"] == true

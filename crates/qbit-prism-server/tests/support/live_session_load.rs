@@ -94,8 +94,10 @@ const EXPECTED_REASONS: [&str; 6] = [
 /// A refusal whose COMMIT outcome the server does not know: the share may
 /// still land, so it counts as unanswered (#324).
 const OUTCOME_UNKNOWN: &str = "ledger-outcome-unknown";
-/// Refusals without a `reason_id` that a correct load can earn, by message.
-const EXPECTED_UNTYPED: [&str; 2] = ["too many connections", "too many unknown job submissions"];
+/// Refusals without a `reason_id` that a correct load can earn, by code
+/// and exact message: the unknown-job budget, as
+/// `qbit_prism_load::classify::is_unknown_job_budget` matches it.
+const EXPECTED_UNTYPED: [&str; 1] = ["20 too many unknown job submissions"];
 const UNTYPED: &str = "(no reason_id)";
 
 /// The payout-artifact reanchor a load run's frontends use: the server's,
@@ -192,8 +194,8 @@ struct Connection {
     /// Subscribed, authorized and holding work.
     ready_at: Instant,
     closed_at: Option<Instant>,
-    /// Every parent the connection was given work on, when it first was;
-    /// consecutive notifies on one parent are one entry.
+    /// Every notify's parent, in arrival order: a republication on one
+    /// parent is an entry of its own.
     parents: Vec<(Instant, String)>,
 }
 
@@ -307,17 +309,21 @@ impl SessionLoad {
     /// that outlives this borrow.
     pub(super) fn holding(&self, fraction: f64) -> Arc<dyn Fn() -> bool + Send + Sync> {
         let shared = self.shared.clone();
-        let wanted = (shared.plan.sessions as f64 * fraction).ceil() as usize;
+        let wanted = self.wanted(fraction);
         Arc::new(move || shared.connected.load(Ordering::SeqCst) >= wanted)
+    }
+
+    fn wanted(&self, fraction: f64) -> usize {
+        (self.shared.plan.sessions as f64 * fraction).ceil() as usize
     }
 
     /// Wait until at least `fraction` of the sessions hold work.
     pub(super) async fn until_connected(&self, fraction: f64, seconds: u64) -> Result<()> {
-        let wanted = (self.shared.plan.sessions as f64 * fraction).ceil() as usize;
+        let holding = self.holding(fraction);
         until(
-            &format!("{wanted} load sessions holding work"),
+            &format!("{} load sessions holding work", self.wanted(fraction)),
             seconds,
-            || async { Ok(self.connected() >= wanted) },
+            || async { Ok(holding()) },
         )
         .await
         .with_context(|| format!("{} of them hold work", self.connected()))
@@ -851,6 +857,15 @@ impl Delivery {
             .flatten()
     }
 
+    /// Gated and lasting the bound: a tip that every session had to get in
+    /// time, where a shorter one can only count sessions as replaced.
+    fn held(&self) -> bool {
+        self.gated
+            && self
+                .lifetime
+                .is_none_or(|lifetime| lifetime >= DELIVERY_BOUND.as_secs_f64())
+    }
+
     fn json(&self) -> Value {
         json!({
             "frontend": self.frontend,
@@ -877,6 +892,35 @@ fn round(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
 
+/// When `connection` got work on `stamp`'s tip, which the node took after
+/// its previous tip at `previous`. Ahead of the stamp only while the
+/// connection still held that work at the stamp: of its last run of
+/// notifies on the tip before the stamp, the first after `previous` (the
+/// frontend saw the tip before the watcher). A notify on the tip that one
+/// on another parent followed was for an earlier time this block was the
+/// tip, or a republication before the frontend saw the next one. Otherwise
+/// the first notify on the tip after the stamp.
+fn served_at(
+    connection: &Connection,
+    stamp: &TipStamp,
+    previous: Option<Instant>,
+) -> Option<Instant> {
+    let before = connection.parents.partition_point(|(at, _)| *at < stamp.at);
+    let held = connection.parents[..before]
+        .iter()
+        .rev()
+        .take_while(|(_, parent)| parent == &stamp.hash)
+        .map(|(at, _)| *at)
+        .filter(|at| previous.is_none_or(|previous| *at > previous))
+        .last();
+    held.or_else(|| {
+        connection.parents[before..]
+            .iter()
+            .find(|(_, parent)| parent == &stamp.hash)
+            .map(|(at, _)| *at)
+    })
+}
+
 /// How the load's submissions ended and what the ledger holds.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct ShareCounts {
@@ -892,10 +936,8 @@ pub(super) struct ShareCounts {
 /// allow-list, so an impossible refusal and one this check does not know
 /// both fail.
 fn expected_refusal(reason: &str) -> bool {
-    if let Some(message) = reason.strip_prefix(UNTYPED) {
-        return EXPECTED_UNTYPED
-            .iter()
-            .any(|expected| message.contains(expected));
+    if let Some(refusal) = reason.strip_prefix(UNTYPED) {
+        return EXPECTED_UNTYPED.contains(&refusal.trim_start());
     }
     EXPECTED_REASONS.contains(&reason)
 }
@@ -933,7 +975,11 @@ fn reconcile(submits: &[&SubmitRecord], durable: &HashSet<String>) -> Result<Sha
             Answer::Rejected(response) => {
                 let reason = match record.answer.reason_id() {
                     Some(reason) => reason.to_owned(),
-                    None => format!("{UNTYPED} {}", response["error"][1].as_str().unwrap_or("")),
+                    None => format!(
+                        "{UNTYPED} {} {}",
+                        response["error"][0],
+                        response["error"][1].as_str().unwrap_or("")
+                    ),
                 };
                 *counts.rejected.entry(reason.clone()).or_default() += 1;
                 ensure!(
@@ -1054,15 +1100,9 @@ impl LoadRecord {
                         continue;
                     }
                     delivery.eligible += 1;
-                    // Work on this parent given after the node's previous tip:
-                    // an earlier notify on the same parent was for an earlier
-                    // time this block was the tip.
-                    let served = connection.parents.iter().find(|(at, parent)| {
-                        parent == &stamp.hash && previous.is_none_or(|previous| *at > previous)
-                    });
-                    match served {
-                        Some((at, _)) if next.is_none_or(|next| *at <= next) => {
-                            if *at < stamp.at {
+                    match served_at(connection, stamp, previous) {
+                        Some(at) if next.is_none_or(|next| at <= next) => {
+                            if at < stamp.at {
                                 delivery.ahead_of_stamp += 1;
                             }
                             let seconds = at.saturating_duration_since(stamp.at).as_secs_f64();
@@ -1201,6 +1241,7 @@ impl LoadRecord {
                 "healthz_timeouts": self.health_stats[frontend].1,
                 "tips": own.len(),
                 "gated_tips": own.iter().filter(|delivery| delivery.gated).count(),
+                "held_tips": own.iter().filter(|delivery| delivery.held()).count(),
                 "session_deliveries": all.len(),
                 "p50_s": pick(0.5),
                 "p99_s": pick(0.99),
@@ -1427,6 +1468,40 @@ mod tests {
     }
 
     #[test]
+    fn work_the_session_moved_off_before_a_reorg_back_does_not_serve_it() {
+        let start = Instant::now();
+        // A republication on "x" after "y"'s stamp, then "y" itself: when
+        // the node returns to "x" the session holds work on "y", so the
+        // stale notify is not work on the returned tip. The second session
+        // still holds that republished work, which counts ahead of the stamp.
+        let record = record(
+            start,
+            vec![
+                connection(start, 0, &[(1.0, "x"), (20.1, "x"), (20.5, "y")]),
+                connection(start, 0, &[(1.0, "x"), (20.1, "x")]),
+            ],
+            &[(0, "x", 0.0), (0, "y", 20.0), (0, "x", 30.0)],
+        );
+        let deliveries = record.deliveries();
+        let back = deliveries
+            .iter()
+            .rfind(|delivery| delivery.hash == "x")
+            .expect("the reorg back's delivery");
+        assert_eq!(
+            (back.eligible, back.served, back.ahead_of_stamp, back.late),
+            (2, 1, 1, 1),
+            "{back:?}"
+        );
+        assert!(back.held());
+        // "y" lasted 10 s, under the bound: gated, but not held.
+        let y = deliveries
+            .iter()
+            .find(|delivery| delivery.hash == "y")
+            .expect("y's delivery");
+        assert!(y.gated && !y.held(), "{y:?}");
+    }
+
+    #[test]
     fn a_frontend_still_unready_when_the_bound_expires_is_not_gated() {
         let start = Instant::now();
         let mut record = record(
@@ -1541,9 +1616,20 @@ mod tests {
             assert!(!expected_refusal(reason), "{reason}");
         }
         assert!(expected_refusal(&format!(
-            "{UNTYPED} too many connections for username"
+            "{UNTYPED} 20 too many unknown job submissions"
         )));
-        assert!(!expected_refusal(&format!("{UNTYPED} ")));
+        // Only the unknown-job budget, at its code and exact message.
+        for untyped in [
+            "21 too many unknown job submissions",
+            "20 too many unknown job submissions, and more",
+            "20 too many connections for username",
+            "",
+        ] {
+            assert!(
+                !expected_refusal(&format!("{UNTYPED} {untyped}")),
+                "{untyped}"
+            );
+        }
     }
 
     #[test]
