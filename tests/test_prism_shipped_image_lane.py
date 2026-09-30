@@ -89,6 +89,22 @@ class Solving(unittest.TestCase):
         })
 
 
+class Refusals(unittest.TestCase):
+    def test_the_reason_id_names_a_refusal(self) -> None:
+        # As the lane's first run recorded them from the shipped images.
+        stale = {"id": 3, "result": None, "error": [21, "stale job", {"reason_id": "unknown-job"}]}
+        duplicate = {"id": 4, "result": None, "error": [22, "duplicate share", {"reason_id": "duplicate-share"}]}
+        self.assertEqual(lane.refusal_reason(stale), "unknown-job")
+        self.assertEqual(lane.refusal_reason(duplicate), "duplicate-share")
+
+    def test_an_accepted_or_silent_answer_is_not_a_refusal(self) -> None:
+        self.assertIsNone(lane.refusal_reason({"id": 3, "result": True, "error": None}))
+        self.assertIsNone(lane.refusal_reason({"id": 3, "result": None, "error": None}))
+
+    def test_a_reason_without_details_falls_back_to_the_message(self) -> None:
+        self.assertEqual(lane.refusal_reason({"result": False, "error": [23, "low difficulty"]}), "low difficulty")
+
+
 class ClientOutput(unittest.TestCase):
     def test_cpuminer_totals_come_from_its_last_result_line(self) -> None:
         output = "\n".join([

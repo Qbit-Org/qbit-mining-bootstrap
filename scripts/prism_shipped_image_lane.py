@@ -358,6 +358,18 @@ def solve_share(job: dict, extranonce1: bytes, extranonce2_size: int, difficulty
     raise LaneFailure("no nonce meets the share target")
 
 
+def refusal_reason(answer: dict) -> str | None:
+    """The server's reason for refusing a submit, or None if it did not refuse."""
+    error = answer.get("error")
+    if answer.get("result") is True or not error:
+        return None
+    if isinstance(error, list) and len(error) > 2 and isinstance(error[2], dict):
+        return error[2].get("reason_id") or str(error[1])
+    if isinstance(error, list) and len(error) > 1:
+        return str(error[1])
+    return str(error)
+
+
 def notify_job(message: dict) -> dict:
     params = message["params"]
     keys = ("job_id", "prevhash", "coinb1", "coinb2", "branch", "version", "nbits", "ntime", "clean")
@@ -613,14 +625,17 @@ class Lane:
         submit = [username, job["job_id"], extranonce2, job["ntime"], nonce]
         clients = []
         try:
-            resumed = Stratum(STRATUM_PORTS[1])
-            clients.append(resumed)
-            resumed.login(username)
-            answers["resumed_on_frontend_2"] = resumed.request("mining.submit", submit)
+            # The other worker goes first, while the proof is still unspent:
+            # after the legitimate submit a refusal could be a mere duplicate
+            # and would not show that another worker cannot resume the job.
             stranger = Stratum(STRATUM_PORTS[1])
             clients.append(stranger)
             stranger.login(thief)
             answers["other_worker_on_frontend_2"] = stranger.request("mining.submit", [thief, *submit[1:]])
+            resumed = Stratum(STRATUM_PORTS[1])
+            clients.append(resumed)
+            resumed.login(username)
+            answers["resumed_on_frontend_2"] = resumed.request("mining.submit", submit)
             answers["replay_on_frontend_2"] = resumed.request("mining.submit", submit)
             back = Stratum(STRATUM_PORTS[0])
             clients.append(back)
@@ -637,6 +652,9 @@ class Lane:
         for name in ("other_worker_on_frontend_2", "replay_on_frontend_2", "replay_on_frontend_1"):
             if answers[name].get("result") is True:
                 problems.append(f"{name} was accepted: {answers[name]}")
+        if refusal_reason(answers["other_worker_on_frontend_2"]) in (None, "duplicate-share"):
+            problems.append("the other worker's submission was not refused as someone else's work: "
+                            f"{answers['other_worker_on_frontend_2']}")
         self.report["resume_answers"] = answers
         self.report["resume_job"] = job["job_id"]
         # The ledger half (one credited row, none for the other worker) is
