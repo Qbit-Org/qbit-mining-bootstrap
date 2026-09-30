@@ -91,6 +91,7 @@ impl Metrics {
             Family::Connections,
             Family::Authorized,
             Family::Builds,
+            Family::RebuildWaiters,
             Family::Covered,
             Family::Missing,
             Family::Accepted,

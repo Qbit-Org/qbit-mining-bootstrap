@@ -19,7 +19,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
 | L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz`, `evidence` | `nightly`, `dispatch` | running; trend rows and a report-only regression rule with provisional thresholds (#551); repeats not yet (#549) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
-| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
+| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#621, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
 | L6 shipped images | `prism-load-nightly.yml`'s `shipped-images` job | `L6` | running |
 
@@ -298,7 +298,7 @@ debug). Weekly, at 400 shares/s: scenario 4's other four cases, scenario 5's
 **Proves:** each listed scenario's own assertions on a real regtest node and
 PostgreSQL 16, and that every listed id executed.
 
-**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #604 in
+**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #621 in
 debug and #622 in release and runs only by hand until both are fixed. Fault
 injection under load is #554.
 

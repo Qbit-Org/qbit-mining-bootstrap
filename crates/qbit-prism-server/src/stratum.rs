@@ -96,6 +96,13 @@ pub trait MiningBackend: Send + Sync + 'static {
     fn observed_tip_hint(&self) -> impl Future<Output = Option<RetentionTip>> + Send {
         async { None }
     }
+    /// The published work's parent and payout revision, an admission hint
+    /// only (#604): a session whose newest job matches it holds current work
+    /// and rebuilds through the rebuild lane. `None` when unknown, which
+    /// counts any issued job as current.
+    fn published_work_hint(&self) -> impl Future<Output = Option<(String, i64)>> + Send {
+        async { None }
+    }
     fn health_ready(&self) -> impl Future<Output = bool> + Send {
         async { true }
     }
@@ -182,6 +189,14 @@ pub struct StratumConfig {
     pub write_timeout_seconds: f64,
     pub connection_limit: ConnectionLimit,
     pub initial_job_limit: Arc<Semaphore>,
+    /// The rebuild lane (#604): a session that already holds current work
+    /// (its newest job, for its current worker, is on the published parent
+    /// and payout revision) takes one of these before `initial_job_limit`
+    /// and keeps it through persistence, so rebuilds hold at most a quarter of the
+    /// initial-job permits (one, below four) and a first job never queues
+    /// behind a whole fan-out. Sized from
+    /// `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` by [`rebuild_lane_permits`].
+    pub rebuild_job_limit: Arc<Semaphore>,
     pub max_connections_per_username: usize,
     pub username_connections: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
     pub max_connections_per_ip: usize,
@@ -215,6 +230,7 @@ impl Default for StratumConfig {
             write_timeout_seconds: 20.0,
             connection_limit: ConnectionLimit::new(384),
             initial_job_limit: Arc::new(Semaphore::new(128)),
+            rebuild_job_limit: Arc::new(Semaphore::new(rebuild_lane_permits(128))),
             max_connections_per_username: 0,
             username_connections: Arc::new(Mutex::new(HashMap::new())),
             max_connections_per_ip: 0,
@@ -226,6 +242,18 @@ impl Default for StratumConfig {
             stats: Arc::new(StratumStats::default()),
         }
     }
+}
+
+/// Rebuild-lane permits for `initial` initial-job permits: a quarter, at
+/// least one (#604). At the default 128 that is 32, enough to keep the build
+/// workers and the database pool busy with rebuilds while at least 96
+/// initial-job permits stay free for sessions with no work yet. A first job
+/// waits for about this many rebuilds, so a larger lane is slower for it.
+/// The lane also bounds how many rebuilds share one issued-job batch
+/// transaction, so while commits are slow, rebuilds complete at about the
+/// lane per commit.
+pub fn rebuild_lane_permits(initial: usize) -> usize {
+    (initial / 4).max(1)
 }
 
 /// The global Stratum admission ceiling, kept with the capacity it was created
@@ -299,6 +327,7 @@ pub struct StratumStats {
     connections: AtomicUsize,
     authorized: AtomicUsize,
     pending_builds: AtomicUsize,
+    rebuild_lane_waiters: AtomicUsize,
     job_delivery_successes: AtomicU64,
     job_delivery_failures: AtomicU64,
     accepted_submissions: AtomicU64,
@@ -314,6 +343,7 @@ pub struct StratumStatsSnapshot {
     pub connections: usize,
     pub authorized: usize,
     pub pending_builds: usize,
+    pub rebuild_lane_waiters: usize,
     pub job_delivery_successes: u64,
     pub job_delivery_failures: u64,
     pub accepted_submissions: u64,
@@ -347,6 +377,7 @@ impl StratumStats {
             connections: self.connections.load(Ordering::Relaxed),
             authorized,
             pending_builds: self.pending_builds.load(Ordering::Relaxed),
+            rebuild_lane_waiters: self.rebuild_lane_waiters.load(Ordering::Relaxed),
             job_delivery_successes: self.job_delivery_successes.load(Ordering::Relaxed),
             job_delivery_failures: self.job_delivery_failures.load(Ordering::Relaxed),
             accepted_submissions: self.accepted_submissions.load(Ordering::Relaxed),
@@ -475,6 +506,21 @@ impl Drop for DeliveryObservation {
     }
 }
 
+/// Counts one rebuild waiting for the rebuild lane (#604) until it holds a
+/// permit, times out or its session goes away.
+struct RebuildLaneWait(Arc<StratumStats>);
+impl RebuildLaneWait {
+    fn new(stats: Arc<StratumStats>) -> Self {
+        stats.rebuild_lane_waiters.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+impl Drop for RebuildLaneWait {
+    fn drop(&mut self) {
+        self.0.rebuild_lane_waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl StratumConfig {
     pub fn from_env() -> Result<Self> {
         fn value<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
@@ -583,6 +629,7 @@ impl StratumConfig {
             "Stratum pending initial job limit must be positive and no greater than connection limit");
         config.connection_limit = ConnectionLimit::new(connections);
         config.initial_job_limit = Arc::new(Semaphore::new(initial));
+        config.rebuild_job_limit = Arc::new(Semaphore::new(rebuild_lane_permits(initial)));
         config.max_connections_per_username =
             value("PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME", 0usize)?;
         config.max_connections_per_ip = value("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", 0usize)?;
@@ -1044,7 +1091,41 @@ async fn deliver_job<B: MiningBackend>(
     };
     let worker = &worker;
     let mut observation = DeliveryObservation::new(config.stats.clone());
+    // #604: a session that holds current work (its newest job, for this
+    // worker, is on the published parent and payout revision) can keep
+    // mining meanwhile, so its rebuild (a same-tip republication, a
+    // retarget) queues in the rebuild lane first and holds that permit
+    // through persistence. Rebuilds of current work therefore occupy at most
+    // the lane's permits anywhere between admission and a durable job, and a
+    // session without current work (a first job, a new worker, a tip change
+    // or a payout revision landing) waits for those, not for every session's
+    // rebuild. It takes only the shared initial-job admission, as before.
+    let holds_current_work = match session.jobs.back() {
+        Some(prior) if prior.worker.username == worker.username => backend
+            .published_work_hint()
+            .await
+            .is_none_or(|(parent, revision)| {
+                prior.job.wire.previousblockhash == parent
+                    && prior.job.wire.payout_revision == revision
+            }),
+        _ => false,
+    };
     let build = async {
+        let lane = if holds_current_work {
+            Some(match config.rebuild_job_limit.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _waiting = RebuildLaneWait::new(config.stats.clone());
+                    config
+                        .rebuild_job_limit
+                        .acquire()
+                        .await
+                        .map_err(|_| StratumError::internal("pool is shutting down"))?
+                }
+            })
+        } else {
+            None
+        };
         let _admission = config
             .initial_job_limit
             .acquire()
@@ -1058,15 +1139,16 @@ async fn deliver_job<B: MiningBackend>(
                 config.minimum_difficulty,
             )
             .await
+            .map(|job| (job, lane))
     };
     let revision_build = metrics.revision_work_build();
-    let mut job = match timeout(
+    let (mut job, lane) = match timeout(
         Duration::from_secs_f64(config.initial_job_timeout_seconds),
         build,
     )
     .await
     {
-        Ok(Ok(job)) => job,
+        Ok(Ok(built)) => built,
         Ok(Err(error)) => {
             session.retry_job = true;
             return Err(error.into());
@@ -1106,6 +1188,8 @@ async fn deliver_job<B: MiningBackend>(
             return Err(StratumError::backend("job persistence timed out").into());
         }
     }
+    // The job is durable; a slow miner's socket must not hold the lane.
+    drop(lane);
     if session.miner_version_mask.is_some() && mask != session.advertised_version_mask {
         write_json(
             writer,

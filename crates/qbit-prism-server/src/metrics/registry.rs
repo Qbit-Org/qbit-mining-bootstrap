@@ -49,6 +49,7 @@ families! {
     Connections: Gauge, "connections", "Current local Stratum connections.";
     Authorized: Gauge, "authorized_clients", "Current local authorized Stratum connections.";
     Builds: Gauge, "pending_job_builds", "Current local pending job deliveries.";
+    RebuildWaiters: Gauge, "stratum_rebuild_lane_waiters", "Local job rebuilds waiting for a rebuild-lane permit; sessions that already hold work queue here, first jobs never do.";
     Covered: Gauge, "authorized_with_current_work", "Authorized connections holding the current semantic work generation.";
     Missing: Gauge, "authorized_missing_current_work", "Authorized connections missing the current semantic work generation.";
     Accepted: Counter, "accepted_shares_total", "Shares accepted by this instance since process start.";

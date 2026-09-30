@@ -2752,6 +2752,11 @@ impl MiningBackend for Coordinator {
     async fn observed_tip_hint(&self) -> Option<crate::stratum::RetentionTip> {
         self.observed_tip.read().await.retention_hint()
     }
+    async fn published_work_hint(&self) -> Option<(String, i64)> {
+        let prepared = self.prepared.read().await.clone()?;
+        let parent = prepared.template["previousblockhash"].as_str()?.to_owned();
+        Some((parent, prepared.snapshot.payout_revision))
+    }
     type Context = JobContext;
 
     async fn health_ready(&self) -> bool {
@@ -3277,6 +3282,9 @@ mod clocked_revision_tests;
 
 #[cfg(test)]
 mod d2_bootstrap_tests;
+
+#[cfg(test)]
+mod first_job_lane_tests;
 
 #[cfg(test)]
 mod d2_test_support;
