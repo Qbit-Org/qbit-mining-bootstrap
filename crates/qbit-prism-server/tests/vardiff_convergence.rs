@@ -316,6 +316,43 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
     trace
 }
 
+/// The pace the client kept at each difficulty it was sent: for each span
+/// from one advertised difficulty to the next (or the end of the run), the
+/// shares it sent there against the whole intervals the span holds at its
+/// hashrate. The schedule restarts at each new difficulty, so a client that
+/// kept its pace sent exactly that many, give or take the one in flight.
+/// Returns `(seconds at the span's start, sent, expected)` per span.
+fn pace_by_difficulty(trace: &Trace, hashrate: f64) -> Vec<(f64, usize, usize)> {
+    trace
+        .difficulties
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, difficulty))| {
+            let end = trace
+                .difficulties
+                .get(index + 1)
+                .map_or(trace.ran_seconds, |(at, _)| *at);
+            let sent = trace
+                .shares
+                .iter()
+                .filter(|share| {
+                    share.difficulty == difficulty && share.sent >= start && share.sent < end
+                })
+                .count();
+            // The epsilon keeps a whole number of intervals whole in floating point.
+            let expected = ((end - start) / (difficulty / hashrate) + 1e-9).floor() as usize;
+            (start, sent, expected)
+        })
+        .collect()
+}
+
+/// Whether a span's shares fell short of its pace: up to a fifth of the
+/// expected shares may be missing, and never fewer than one (the share in
+/// flight at the span's end).
+fn short_of_pace(sent: usize, expected: usize) -> bool {
+    sent + (expected / 5).max(1) < expected
+}
+
 /// The index of the first adjustment that moves away from where the first
 /// one went (a reversal), or None when every adjustment keeps its direction.
 fn reversal(difficulties: &[(f64, f64)]) -> Option<usize> {
@@ -349,11 +386,14 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
         trace.refusals
     );
     // The premise: the listener measured a client that kept its pace. It is
-    // judged on the shares at the final difficulty, as actually sent: a
-    // sustained shortfall in their rate fails here, as the host's fault and
-    // not vardiff's. Shares sent over half an interval late (bunched by a
-    // busy host) are only counted: convergence despite them is still
-    // convergence, and every failure below names them.
+    // judged at every difficulty the session was sent, as the shares were
+    // actually sent: a span in which the client fell short of its hashrate
+    // (a stalled host) fails here, as the host's fault and not vardiff's,
+    // before its effect on the trajectory can be read as a vardiff finding.
+    // The final difficulty's mean interval is checked too. Shares sent over
+    // half an interval late (bunched by a busy host) are only counted:
+    // convergence despite them is still convergence, and every failure below
+    // names them.
     let (final_at, final_difficulty) = *trace.difficulties.last().unwrap();
     let expected = final_difficulty / hashrate;
     let paced: Vec<&Share> = trace
@@ -385,6 +425,18 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
     assert!(
         (0.8..=1.25).contains(&(measured / expected)),
         "{context}: premise failed, the client did not keep its pace (host overloaded?)"
+    );
+    let spans = pace_by_difficulty(trace, hashrate);
+    let short: Vec<String> = spans
+        .iter()
+        .filter(|(_, sent, expected)| short_of_pace(*sent, *expected))
+        .map(|(at, sent, expected)| format!("from {at:.2}s: {sent} of {expected}"))
+        .collect();
+    assert!(
+        short.is_empty(),
+        "{context}: premise failed, the client sent too few shares at some difficulty \
+         ({short:?}): a stalled host, or the listener acknowledging slowly, since the client \
+         sends a share only once the last is answered"
     );
     let start = trace.difficulties[0].1 / target;
     assert!(
@@ -418,8 +470,13 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
         changes <= 1,
         "{context}: changed {changes} times after settling"
     );
+    let spans: Vec<String> = spans
+        .iter()
+        .map(|(at, sent, expected)| format!("{at:.2}s:{sent}/{expected}"))
+        .collect();
     eprintln!(
-        "{context}; settled after {settled} adjustments in {:.1} retarget periods",
+        "{context}; shares sent / expected per difficulty {spans:?}; settled after {settled} \
+         adjustments in {:.1} retarget periods",
         settled_at / RETARGET_SECONDS
     );
 }
@@ -490,4 +547,41 @@ fn a_reversal_is_any_adjustment_against_the_first_ones_direction() {
         Some(3)
     );
     assert_eq!(reversal(&[(0.0, 0.0625), (1.0, 1.2), (2.0, 0.9)]), Some(2));
+}
+
+#[test]
+fn a_span_short_of_its_pace_is_found_even_when_it_expects_two_shares() {
+    let share = |sent: f64, difficulty: f64| Share {
+        due: sent,
+        sent,
+        difficulty,
+    };
+    // Hashrate 1: a difficulty-0.4 span of 0.8 s expects 2 shares.
+    let trace = |shares| Trace {
+        difficulties: vec![(0.0, 1.6), (1.0, 0.4), (1.8, 0.1)],
+        shares,
+        ran_seconds: 2.8,
+        ..Default::default()
+    };
+    let paced = trace(
+        (0..10)
+            .map(|i| share(1.8 + 0.1 * f64::from(i), 0.1))
+            .collect(),
+    );
+    assert_eq!(pace_by_difficulty(&paced, 1.0)[1], (1.0, 0, 2));
+    let full = trace(
+        [share(1.4, 0.4), share(1.79, 0.4)]
+            .into_iter()
+            .chain((1..10).map(|i| share(1.8 + 0.1 * f64::from(i), 0.1)))
+            .collect(),
+    );
+    assert_eq!(pace_by_difficulty(&full, 1.0)[1], (1.0, 2, 2));
+    assert_eq!(pace_by_difficulty(&full, 1.0)[2], (1.8, 9, 10));
+    assert!(short_of_pace(0, 2), "a stalled two-share window is found");
+    assert!(!short_of_pace(1, 2) && !short_of_pace(0, 0) && !short_of_pace(9, 10));
+    assert!(
+        !short_of_pace(77, 80),
+        "the worst span seen under load passes"
+    );
+    assert!(short_of_pace(63, 80));
 }
