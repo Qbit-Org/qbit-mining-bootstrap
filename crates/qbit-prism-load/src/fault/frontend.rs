@@ -30,6 +30,10 @@ pub const OFFER_WAIT: Duration = Duration::from_secs(30);
 /// `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 s), so the call is answered
 /// rather than timed out into an unknown outcome.
 pub const OFFER_DELAY: Duration = Duration::from_millis(500);
+/// The server's default `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS`: a frontend
+/// still alive this long after it sent a `submitblock` has recorded the call
+/// as an unknown outcome, so a kill after it no longer loses the answer.
+pub const SUBMIT_RPC_TIMEOUT: Duration = Duration::from_secs(1);
 /// The server joins its tasks for 30 s after a shutdown signal; this adds
 /// the time to reap.
 pub const EXIT_LIMIT: Duration = Duration::from_secs(40);
@@ -659,12 +663,19 @@ impl FrontendSigkill {
                         .unwrap_or_else(|| env.frontends.len().saturating_sub(1).min(1));
                     self.killed_index = Some(index);
                     self.kill_started_at = Some(Instant::now());
-                    self.stage = KillStage::Killing(Box::new(KillDriver::start(
-                        index,
-                        tools.ready_limit,
-                        tools.drain_limit,
-                        env.kill_fence.clone(),
-                    )));
+                    // At once, not after the mid-flight kill's wait for
+                    // outstanding shares: the frontend has to die inside its
+                    // own submitblock deadline, or it records the call as an
+                    // unknown outcome and the answer is not what is lost.
+                    self.stage = KillStage::Killing(Box::new(
+                        KillDriver::start(
+                            index,
+                            tools.ready_limit,
+                            tools.drain_limit,
+                            env.kill_fence.clone(),
+                        )
+                        .without_work_wait(),
+                    ));
                     continue;
                 }
                 KillStage::Killing(driver) => {

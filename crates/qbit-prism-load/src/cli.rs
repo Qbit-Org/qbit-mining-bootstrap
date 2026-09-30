@@ -406,6 +406,12 @@ impl Args {
     pub fn validate(&self) -> Result<()> {
         if let Some(plan) = self.fault_plan()? {
             plan.check_against(self.frontends, self.database_url.is_none())?;
+            // A soak's phases come from its looped presets, never this
+            // flag's, so its fault verdict would silently be missing.
+            ensure!(
+                self.plan()? != Plan::Soak,
+                "--faults does not run under --plan soak yet (#556)"
+            );
         }
         ensure!(
             matches!(self.frontends, 1 | 2 | 4),
@@ -1017,7 +1023,6 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         });
     }
     plans.extend(churn_phase(args, steady_rate));
-    plans.extend(faults_phase(args, steady_rate)?);
     if args.mid_flight_kill {
         plans.push(PhasePlan {
             name: "mid_flight_kill".into(),
@@ -1037,6 +1042,10 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             restart_frontend: false,
         });
     }
+    // Last of all, as documented: a fault the phase's bound cut short can
+    // leave a frontend down, and no phase may follow that would read the
+    // planned outage as a crash or aim its own kill at that frontend.
+    plans.extend(faults_phase(args, steady_rate)?);
     Ok(plans)
 }
 
@@ -1064,7 +1073,7 @@ fn faults_phase(args: &Args, steady_rate: f64) -> Result<Option<PhasePlan>> {
     Ok(args.fault_plan()?.map(|plan| PhasePlan {
         name: crate::fault::PHASE.into(),
         kind: crate::fault::PHASE.into(),
-        seconds: plan.phase_seconds_bound(),
+        seconds: plan.phase_seconds_bound(args.frontends),
         rate: steady_rate,
         in_artifact: false,
         reconnects: false,

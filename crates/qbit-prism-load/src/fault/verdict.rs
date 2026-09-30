@@ -2,6 +2,7 @@
 //! offered in them, its evidence and its checks, computed after the run from
 //! the same records the reconciliation reads.
 
+use super::frontend::SUBMIT_RPC_TIMEOUT;
 use super::*;
 
 /// One pass line of a fault.
@@ -24,13 +25,21 @@ fn check(name: &str, pass: bool, detail: impl Into<String>) -> Check {
 pub struct EvalInputs<'a> {
     pub submits: &'a [SubmitRecord],
     pub collected: &'a Collected,
-    pub tip_changes: &'a [TipChange],
+    /// The share ids PostgreSQL holds, for a kill's census.
+    pub committed: &'a std::collections::BTreeSet<String>,
+    /// A real node's `MintPurpose::Fault` tips as its pool node saw them,
+    /// in the order asked; empty on the fake node, whose mint is known at
+    /// once.
+    pub fault_mints: &'a [TipChange],
     pub sessions: usize,
     /// The phase's offers per second, and its first second.
     pub per_second: &'a crate::run::PerSecond,
     pub phase_started: Instant,
     pub ack_p99_limit_ms: f64,
     pub read_tier: Option<&'a [read_tier::ReadSample]>,
+    /// The public process reads the standby, which the exhaustion of the
+    /// primary's slots does not touch.
+    pub read_tier_on_replica: bool,
     pub instance_ids: &'a [String],
 }
 
@@ -153,9 +162,10 @@ impl FaultDriver {
                         ));
                     }
                 }
-                Action::PoolExhaustion { .. } => {
-                    // A full server denies the public reader's pool too: its
-                    // answers then are not the read tier's independence.
+                Action::PoolExhaustion { .. } if !inputs.read_tier_on_replica => {
+                    // A full primary denies a public reader on it too: its
+                    // answers then are not the read tier's independence. One
+                    // on the standby is held to them throughout.
                     if let (Some(from), Some(to)) = (run.inject_start, run.removed_at) {
                         public_exclusions.push((from, to + Duration::from_secs(5)));
                     }
@@ -307,15 +317,18 @@ impl FaultDriver {
                 let before_tip = window_shares(inputs, injected, minted.unwrap_or(removed));
                 // Shares take ORDER_LOCK, never SETTLEMENT_LOCK, so none may
                 // wait on the holder: every answer in the hold, accepted or
-                // refused, comes back as fast as the run's ACK limit.
-                let answers = answer_latency(inputs, injected, minted.unwrap_or(removed));
+                // refused, comes back as fast as the run's ACK limit. The
+                // whole hold, not only up to the mint: a refresh of the
+                // minted tip that held ORDER_LOCK while it queued for the
+                // holder would stall the shares only after it.
+                let answers = answer_latency(inputs, injected, removed);
                 checks.push(check(
                     "no share waited on the lock holder",
                     answers
                         .p99
                         .is_some_and(|p99| p99 <= inputs.ack_p99_limit_ms),
                     format!(
-                        "answer p99 {:?} ms, max {:?} ms over {} answers before the tip, against \
+                        "answer p99 {:?} ms, max {:?} ms over {} answers in the hold, against \
                          --ack-p99-limit-ms {}",
                         answers.p99, answers.max, answers.samples, inputs.ack_p99_limit_ms
                     ),
@@ -342,19 +355,25 @@ impl FaultDriver {
                     ),
                 ));
                 // The tip minted halfway through the hold: a fake node's
-                // mint is known at once; a real node's is the first tip
-                // change after the request.
+                // mint is known at once; a real node's is the first of the
+                // fault's own mints the pool node saw after the request, never
+                // just the next tip change, which a keepalive or a found
+                // block can be.
                 let tip = tip.clone().or_else(|| {
                     minted.and_then(|minted| {
                         inputs
-                            .tip_changes
+                            .fault_mints
                             .iter()
                             .find(|change| change.monotonic >= minted)
                             .cloned()
                     })
                 });
+                // A tip that reached the pool node only after the release
+                // was never gated by the lock: no session could have had
+                // work on it during the hold, so a zero would pass vacuously.
+                let arrived_in_hold = tip.as_ref().is_some_and(|tip| tip.monotonic < removed);
                 let (served_during_hold, all_served_after_release) = match &tip {
-                    Some(tip) => {
+                    Some(tip) if arrived_in_hold => {
                         let mut first: BTreeMap<usize, Instant> = BTreeMap::new();
                         for sighting in &inputs.collected.tips {
                             if sighting.tip == tip.hash && sighting.session < inputs.sessions {
@@ -371,18 +390,22 @@ impl FaultDriver {
                             .map(|last| last.saturating_duration_since(removed).as_secs_f64());
                         (Some(during), all)
                     }
-                    None => (None, None),
+                    _ => (None, None),
                 };
                 checks.push(check(
                     "the tip's jobs waited for the release",
                     served_during_hold == Some(0),
-                    match served_during_hold {
-                        Some(count) => format!(
+                    match (served_during_hold, &tip) {
+                        (Some(count), _) => format!(
                             "{count} sessions got work on the tip minted during the hold before \
                              the lock was released"
                         ),
-                        None => "no tip was minted during the hold, so the lock's effect on job \
-                                 issuance was not observed"
+                        (None, Some(_)) => "the tip minted during the hold reached the pool node \
+                                            only after the release, so the lock's effect on job \
+                                            issuance was not observed"
+                            .into(),
+                        (None, None) => "no tip was minted during the hold, so the lock's effect \
+                                         on job issuance was not observed"
                             .into(),
                     },
                 ));
@@ -613,13 +636,33 @@ impl FaultDriver {
                 evidence = rolling.evidence(origin);
             }
             Action::FrontendSigkill(kill) => {
+                // Held: killed inside its own submitblock deadline, so the
+                // answer really died with it rather than timing out first.
+                let kill_after_send = kill
+                    .seen
+                    .as_ref()
+                    .zip(kill.kill_started_at)
+                    .map(|(seen, killed)| killed.saturating_duration_since(seen.at));
+                // Accepted, not merely answered: a rejection or an RPC error
+                // is an answer too.
+                let accepted = kill.seen.as_ref().is_some_and(|seen| {
+                    self.tools.relay.submits().iter().any(|submit| {
+                        submit.block_hash == seen.block_hash && submit.node_accepted()
+                    })
+                });
                 checks.push(check(
                     "the killed frontend held a found block the node had accepted",
-                    kill.seen.is_some() && kill.node_answered_at.is_some(),
+                    kill.node_answered_at.is_some()
+                        && accepted
+                        && kill_after_send.is_some_and(|after| after < SUBMIT_RPC_TIMEOUT),
                     format!(
-                        "offer seen: {}; node answered before the kill: {}",
+                        "offer seen: {}; node answered before the kill: {}; accepted: {accepted}; \
+                         killed {:?} ms after the call, against the frontend's {} ms submitblock \
+                         deadline",
                         kill.seen.is_some(),
-                        kill.node_answered_at.is_some()
+                        kill.node_answered_at.is_some(),
+                        kill_after_send.map(|after| after.as_millis()),
+                        SUBMIT_RPC_TIMEOUT.as_millis()
                     ),
                 ));
                 let sent = kill.seen.as_ref().map(|seen| {
@@ -649,6 +692,14 @@ impl FaultDriver {
                     },
                 ));
                 evidence = kill.evidence(origin, self.tools.lease_wait_seconds);
+                // The kill's census, as the mid-flight kill reports its own:
+                // each re-offer's answer against PostgreSQL, possible losses
+                // named (reported, not gated, by the same rule).
+                evidence["census"] = crate::run::mid_flight_census(
+                    &kill.indeterminate,
+                    inputs.submits,
+                    inputs.committed,
+                );
             }
             Action::ReconnectStorm(storm) => {
                 let departed = storm.departed_at.unwrap_or(inject_start);

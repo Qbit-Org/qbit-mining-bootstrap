@@ -60,6 +60,8 @@ pub struct RelaySubmit {
     pub forwarded_at: Option<Instant>,
     /// The node's JSON-RPC `result`, verbatim, once it answered.
     pub result: Option<Value>,
+    /// The node's JSON-RPC `error`, when it was not null.
+    pub rpc_error: Option<Value>,
     pub error: Option<String>,
     /// The arm this call met, if any.
     pub armed: Option<&'static str>,
@@ -71,7 +73,9 @@ struct Armed {
 }
 
 struct Shared {
-    upstream: String,
+    /// The node URL's scheme, credentials and authority, without its path:
+    /// a call keeps the path it arrived on, which is already the node's.
+    upstream_origin: String,
     client: reqwest::Client,
     arms: Vec<Mutex<Option<Armed>>>,
     submits: Mutex<Vec<RelaySubmit>>,
@@ -104,7 +108,7 @@ impl RpcFaultRelay {
             .context("building the fault relay's HTTP client")?;
         let (closed, _) = tokio::sync::watch::channel(false);
         let shared = Arc::new(Shared {
-            upstream: upstream.to_owned(),
+            upstream_origin: origin_of(upstream)?,
             client,
             arms: (0..frontends).map(|_| Mutex::new(None)).collect(),
             submits: Mutex::new(Vec::new()),
@@ -180,6 +184,24 @@ fn rebase_url(upstream: &str, authority: &str) -> Result<String> {
     Ok(format!("{scheme}://{credentials}{authority}{path}"))
 }
 
+/// `upstream` without its path: scheme, credentials and authority.
+fn origin_of(upstream: &str) -> Result<String> {
+    let (scheme, rest) = upstream
+        .split_once("://")
+        .with_context(|| format!("node URL {upstream:?} has no scheme"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    Ok(format!("{scheme}://{authority}"))
+}
+
+impl RelaySubmit {
+    /// The node answered and accepted the block: `submitblock`'s `result` is
+    /// null on acceptance and a reason string otherwise, and an RPC error
+    /// also carries a null `result`.
+    pub fn node_accepted(&self) -> bool {
+        self.result.as_ref().is_some_and(Value::is_null) && self.rpc_error.is_none()
+    }
+}
+
 /// The display hash of a serialized block: the double SHA-256 of its
 /// 80-byte header, byte-reversed as the node prints it.
 pub fn block_hash_of(block_hex: &str) -> Option<String> {
@@ -231,6 +253,7 @@ async fn carry(
             at,
             forwarded_at: None,
             result: None,
+            rpc_error: None,
             error: None,
             armed: armed.as_ref().map(|armed| match armed.arm {
                 Arm::DelayForward(_) => "delay-forward",
@@ -258,8 +281,11 @@ async fn carry(
             }
         }
     }
-    let mut target = shared.upstream.trim_end_matches('/').to_owned();
-    target.push_str(uri.path());
+    let target = format!(
+        "{}{}",
+        shared.upstream_origin,
+        uri.path_and_query().map_or("/", |path| path.as_str())
+    );
     let mut forward = shared.client.post(&target).body(body.clone());
     for (name, value) in &headers {
         if name != axum::http::header::HOST && name != axum::http::header::CONTENT_LENGTH {
@@ -297,7 +323,12 @@ async fn carry(
     };
     if let Some(record) = record_index {
         let parsed: Option<Value> = serde_json::from_slice(&reply).ok();
-        shared.submits.lock().expect("relay submits lock")[record].result = Some(
+        let mut submits = shared.submits.lock().expect("relay submits lock");
+        submits[record].rpc_error = parsed
+            .as_ref()
+            .map(|value| value["error"].clone())
+            .filter(|error| !error.is_null());
+        submits[record].result = Some(
             parsed
                 .map(|value| value["result"].clone())
                 .unwrap_or_else(|| json!({"unparseable": String::from_utf8_lossy(&reply)})),
@@ -342,6 +373,31 @@ mod tests {
             "http://127.0.0.1:9/"
         );
         assert!(rebase_url("node:1", "127.0.0.1:9").is_err());
+        // A call arrives on the node's own path, so it is forwarded to the
+        // node's origin, never to the full node URL with the path again.
+        assert_eq!(
+            origin_of("http://user:pw@node:1/wallet/x").unwrap(),
+            "http://user:pw@node:1"
+        );
+        assert_eq!(origin_of("http://node:1").unwrap(), "http://node:1");
+    }
+
+    #[test]
+    fn only_a_null_result_without_an_error_is_an_accepted_block() {
+        let submit = |result: Option<Value>, rpc_error: Option<Value>| RelaySubmit {
+            frontend: 0,
+            block_hash: "00".into(),
+            at: Instant::now(),
+            forwarded_at: Some(Instant::now()),
+            result,
+            rpc_error,
+            error: None,
+            armed: None,
+        };
+        assert!(submit(Some(Value::Null), None).node_accepted());
+        assert!(!submit(None, None).node_accepted(), "no answer yet");
+        assert!(!submit(Some(json!("duplicate")), None).node_accepted());
+        assert!(!submit(Some(Value::Null), Some(json!({"code": -1}))).node_accepted());
     }
 
     #[test]

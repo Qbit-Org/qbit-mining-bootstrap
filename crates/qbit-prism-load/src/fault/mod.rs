@@ -118,7 +118,9 @@ impl<T: Send + 'static> Spawned<T> {
             if !task.is_finished() {
                 return None;
             }
-            if let Some(Ok(value)) = finished(self.task.take().expect("checked above")) {
+            let result = finished(self.task.as_mut().expect("checked above"))?;
+            self.task = None;
+            if let Ok(value) = result {
                 self.value = Some(value);
             }
         }
@@ -126,12 +128,13 @@ impl<T: Send + 'static> Spawned<T> {
     }
 }
 
-/// The result of a task that `is_finished` already said is ready.
-pub(crate) fn finished<T>(task: JoinHandle<T>) -> Option<Result<T, tokio::task::JoinError>> {
+/// The result of a task that `is_finished` already said is ready. Polled in
+/// place: a `Pending` (the runtime's task budget) leaves the handle to be
+/// polled again, rather than dropping it and the result with it.
+pub(crate) fn finished<T>(task: &mut JoinHandle<T>) -> Option<Result<T, tokio::task::JoinError>> {
     use std::task::{Context, Poll};
     let mut context = Context::from_waker(std::task::Waker::noop());
-    let mut task = std::pin::pin!(task);
-    match task.as_mut().poll(&mut context) {
+    match std::pin::Pin::new(task).poll(&mut context) {
         Poll::Ready(result) => Some(result),
         Poll::Pending => None,
     }
@@ -196,6 +199,18 @@ enum Action {
 }
 
 impl Action {
+    /// Stop a fault's own scrapers once its recovery window has closed, so
+    /// they do not go on loading every frontend's `/metrics` through the
+    /// faults that follow.
+    fn stop_sampling(&mut self) {
+        if let Self::SettlementLock {
+            stall: Some(stall), ..
+        } = self
+        {
+            stall.stop();
+        }
+    }
+
     fn new(kind: FaultKind, tools: &FaultTools) -> Self {
         match kind {
             FaultKind::SlowDatabase => Self::SlowDatabase {
@@ -393,7 +408,8 @@ impl FaultDriver {
                         return Ok(());
                     }
                     run.recovery_end = Some(Instant::now());
-                    let (run, _) = self.current.take().expect("in progress");
+                    let (mut run, _) = self.current.take().expect("in progress");
+                    run.action.stop_sampling();
                     self.runs.push(run);
                     return Ok(());
                 }
@@ -415,6 +431,7 @@ impl FaultDriver {
                 } => exhauster.stop(),
                 _ => {}
             }
+            run.action.stop_sampling();
             self.tools.relay.disarm_all();
             run.problems
                 .push("the phase ended before this fault finished its recovery window".into());
@@ -778,6 +795,11 @@ impl StallSampler {
 
     fn samples(&self) -> Vec<(String, Instant, Option<f64>)> {
         self.samples.lock().expect("stall samples lock").clone()
+    }
+
+    /// Stop scraping; the samples taken so far are kept for the verdict.
+    fn stop(&self) {
+        self.task.abort();
     }
 }
 

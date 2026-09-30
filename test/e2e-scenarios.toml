@@ -637,7 +637,7 @@ id = "fault-settlement-lock-holder"
 title = "A long SETTLEMENT_LOCK holder while the sessions keep mining, with a tip minted during the hold"
 owner = "#554"
 lanes = ["nightly", "pr"]
-criteria = "No share waits on the holder (answer p99 within --ack-p99-limit-ms); shares on retained work are accepted (at least 90%) until the refresh has been stalled for PRISM_SUBMIT_TIP_MAX_AGE_SECONDS, after which the server's refusals are counted; no session gets work on the new tip before the release, and every session has it within 10 s of the release. The share-ACK p50, p99 and max over the hold are recorded."
+criteria = "No share waits on the holder (answer p99 over the whole hold within --ack-p99-limit-ms); shares on retained work are accepted (at least 90%) until the refresh has been stalled for PRISM_SUBMIT_TIP_MAX_AGE_SECONDS, after which the server's refusals are counted; no session gets work on the new tip before the release, and every session has it within 10 s of the release. The share-ACK p50, p99 and max over the hold are recorded."
 runs = true
 tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
 presets = ["faults-pr-smoke", "faults-short-real-node"]
@@ -665,7 +665,7 @@ id = "fault-frontend-sigkill-holding-a-block"
 title = "SIGKILL of the frontend holding a found block the node has accepted, before its answer is recorded"
 owner = "#554"
 lanes = ["nightly"]
-criteria = "The killed frontend's in-flight shares are censused and re-offered and credited once; the block reached the node exactly once and lands without a second offer. The time until it lands is reported, not gated: the dead holder's claim waits for the 120 s candidate lease, which is #529's option-A gap that #585 left open."
+criteria = "The node accepted the block and the frontend is killed inside its 1 s submitblock deadline; its in-flight shares are censused and re-offered and credited once; the block reached the node exactly once and lands without a second offer. The time until it lands is reported, not gated: the dead holder's claim waits for the 120 s candidate lease, which is #529's option-A gap that #585 left open."
 runs = true
 presets = ["faults-short-real-node"]
 
@@ -693,7 +693,7 @@ id = "read-tier-independence"
 title = "The public API and every /metrics scraped at a realistic rate throughout the faults"
 owner = "#554"
 lanes = ["nightly"]
-criteria = "A separate public-api process on the standby, polled at 5 requests a second, answers at least 99% 2xx with p99 at most 1 s over each fault and the whole phase (excluding only a PostgreSQL at max_connections, which denies its pool too); every live frontend's /metrics answers within 1 s (#189's class, #469)."
+criteria = "A separate public-api process on the standby, polled at 5 requests a second, answers at least 99% 2xx with p99 at most 1 s over each fault and the whole phase (excluding a PostgreSQL at max_connections only when the public API reads the primary, whose slots that takes); every live frontend's /metrics answers within 1 s (#189's class, #469)."
 runs = true
 presets = ["faults-short-real-node"]
 

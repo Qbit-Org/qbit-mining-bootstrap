@@ -125,6 +125,16 @@ impl KillDriver {
         }
     }
 
+    /// Kill at the next poll, whether or not the target holds work: for a
+    /// kill whose point is something other than outstanding shares, which
+    /// must not wait for them (#554's `frontend-sigkill`).
+    pub fn without_work_wait(mut self) -> Self {
+        if let Stage::WaitingForWork { deadline } = &mut self.stage {
+            *deadline = Instant::now();
+        }
+        self
+    }
+
     pub fn index(&self) -> usize {
         self.index
     }

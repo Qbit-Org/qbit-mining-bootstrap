@@ -300,7 +300,7 @@ impl FaultPlan {
     /// wait for a SIGKILL. The phase ends as soon as the last fault's
     /// recovery window closes; this bound only stops a fault that never
     /// finishes from running forever.
-    pub fn phase_seconds_bound(&self) -> u64 {
+    pub fn phase_seconds_bound(&self, frontends: usize) -> u64 {
         self.schedule()
             .iter()
             .map(|scheduled| {
@@ -312,7 +312,8 @@ impl FaultPlan {
                     seconds += ACTION_ALLOWANCE_SECONDS;
                 }
                 if scheduled.kind == FaultKind::RollingRestart {
-                    seconds += ACTION_ALLOWANCE_SECONDS;
+                    // One drain and relaunch per frontend, each its own turn.
+                    seconds += ACTION_ALLOWANCE_SECONDS * (frontends as u64).saturating_sub(1);
                 }
                 if scheduled.kind == FaultKind::FrontendSigkill {
                     seconds += self.lease_wait_seconds;
@@ -424,6 +425,16 @@ mod tests {
         assert!(rolling.check_against(2, true).is_ok());
         let exhaustion = FaultPlan::parse("pool-exhaustion").unwrap();
         assert!(exhaustion.check_against(2, false).is_err());
+        use clap::Parser;
+        let soak = crate::cli::Args::parse_from([
+            "qbit-prism-load",
+            "--plan",
+            "soak",
+            "--faults",
+            "sigterm-drain",
+        ]);
+        let error = format!("{:#}", soak.validate().unwrap_err());
+        assert!(error.contains("--plan soak"), "{error}");
     }
 
     #[test]
@@ -432,8 +443,38 @@ mod tests {
             FaultPlan::parse("frontend-sigkill;baseline=5;hold=10;recovery=20;lease-wait=150")
                 .unwrap();
         assert_eq!(
-            plan.phase_seconds_bound(),
+            plan.phase_seconds_bound(2),
             5 + 10 + 20 + ACTION_ALLOWANCE_SECONDS + 150 + 30
         );
+        let rolling = FaultPlan::parse("rolling-restart;baseline=5;hold=10;recovery=20").unwrap();
+        assert_eq!(
+            rolling.phase_seconds_bound(4),
+            5 + 10 + 20 + 4 * ACTION_ALLOWANCE_SECONDS + 30
+        );
+    }
+
+    #[test]
+    fn the_faults_phase_runs_after_every_other_phase() {
+        use clap::Parser;
+        let side_phases = ["--churn-seconds", "30", "--frontends", "2"];
+        for extra in [&["--mid-flight-kill"][..], &["--plan", "tips"][..]] {
+            let args = crate::cli::Args::parse_from(
+                ["qbit-prism-load", "--faults", "sigterm-drain"]
+                    .iter()
+                    .chain(&side_phases)
+                    .chain(extra),
+            );
+            args.validate().unwrap();
+            let names: Vec<String> = crate::cli::phases(&args)
+                .unwrap()
+                .into_iter()
+                .map(|phase| phase.name)
+                .collect();
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some(crate::fault::PHASE),
+                "{names:?}"
+            );
+        }
     }
 }

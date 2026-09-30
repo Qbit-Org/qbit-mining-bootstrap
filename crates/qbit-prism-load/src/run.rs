@@ -1703,20 +1703,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         shared_session
             .record_notifies
             .store(plan.dense_cadence, std::sync::atomic::Ordering::Relaxed);
-        let started = Instant::now();
-        let started_wall = chrono::Utc::now();
-        let mut churn_driver = (plan.kind == crate::churn::PHASE)
-            .then(|| {
-                churn_driver(
-                    phase_args,
-                    &ctx,
-                    &solution,
-                    &frontends,
-                    &shared_session,
-                    quiesce_limit,
-                )
-            })
-            .transpose()?;
+        // The fault phase's read tier starts before the phase's clock does:
+        // its start-up is awaited, and the verdict reads the per-second
+        // buckets from the phase's recorded start (#554).
         if plan.kind == crate::fault::PHASE {
             if let (Some(fault_plan), Some(relay)) = (&fault_plan, &fault_relay) {
                 if fault_plan.read_tier {
@@ -1774,6 +1763,20 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 ));
             }
         }
+        let started = Instant::now();
+        let started_wall = chrono::Utc::now();
+        let mut churn_driver = (plan.kind == crate::churn::PHASE)
+            .then(|| {
+                churn_driver(
+                    phase_args,
+                    &ctx,
+                    &solution,
+                    &frontends,
+                    &shared_session,
+                    quiesce_limit,
+                )
+            })
+            .transpose()?;
         let outcome = drive_phase_with_population(
             phase_args,
             plan,
@@ -2375,6 +2378,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let tip_changes = ctx.node.tip_changes();
     // The fault phase's verdict (#554), from the same records the
     // reconciliation read.
+    let fault_mints = ctx
+        .node
+        .qbitd()
+        .map(|real| real.observed_mints(crate::node::MintPurpose::Fault))
+        .unwrap_or_default();
     let faults_report = fault_driver.as_ref().map(|driver| {
         let phase = runs.iter().find(|run| run.plan.kind == crate::fault::PHASE);
         let samples = read_tier
@@ -2388,12 +2396,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         let mut report = driver.evaluate(&crate::fault::EvalInputs {
             submits: &collected.submits,
             collected: &collected,
-            tip_changes: &tip_changes,
+            committed: &committed,
+            fault_mints: &fault_mints,
             sessions: args.sessions,
             per_second: phase.map_or(&empty, |phase| &phase.per_second),
             phase_started: phase.map_or(driver.started, |phase| phase.started),
             ack_p99_limit_ms: args.ack_p99_limit_ms,
             read_tier: samples.as_deref(),
+            read_tier_on_replica: read_tier
+                .as_ref()
+                .is_some_and(|tier| tier.reads == "replica"),
             instance_ids: &instance_ids,
         });
         if let Some(tier) = &read_tier {

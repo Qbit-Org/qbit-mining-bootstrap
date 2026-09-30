@@ -63,8 +63,11 @@ impl LockHolder {
             // A dropped sender releases too: the lock never outlives the
             // driver that asked for it.
             let _ = release_rx.await;
-            sqlx::query("ROLLBACK").execute(&mut connection).await?;
+            // Stamped as the ROLLBACK is sent: until then the lock is
+            // certainly held, so work on the tip before this is a violation
+            // and none after it can be one.
             let released = Instant::now();
+            sqlx::query("ROLLBACK").execute(&mut connection).await?;
             let _ = connection.close().await;
             Ok(released)
         });
@@ -96,7 +99,11 @@ impl LockHolder {
             }
         }
         if self.acquired.is_none() {
-            self.poll_released()?;
+            // The sender drops as the task returns, a moment before the task
+            // reads as finished: wait for that, so its error is the reason.
+            if self.poll_released()?.is_none() {
+                return Ok(None);
+            }
             anyhow::bail!(
                 "the lock holder ended before it took the lock: {}",
                 self.error.as_deref().unwrap_or("no reason given")
@@ -123,8 +130,11 @@ impl LockHolder {
         if !task.is_finished() {
             return Ok(None);
         }
-        let task = self.task.take().expect("checked above");
-        match super::finished(task) {
+        let result = super::finished(self.task.as_mut().expect("checked above"));
+        if result.is_some() {
+            self.task = None;
+        }
+        match result {
             Some(Ok(Ok(at))) => {
                 self.released_at = Some(at);
                 Ok(Some(at))
@@ -315,7 +325,7 @@ impl Exhauster {
         if !task.is_finished() {
             return None;
         }
-        let outcome = match super::finished(self.task.take().expect("checked above")) {
+        let outcome = match super::finished(self.task.as_mut().expect("checked above")) {
             Some(Ok(outcome)) => outcome,
             Some(Err(error)) => Exhaustion {
                 error: Some(format!("exhaustion task: {error}")),
@@ -323,6 +333,7 @@ impl Exhauster {
             },
             None => return None,
         };
+        self.task = None;
         self.outcome = Some(outcome.clone());
         Some(outcome)
     }
