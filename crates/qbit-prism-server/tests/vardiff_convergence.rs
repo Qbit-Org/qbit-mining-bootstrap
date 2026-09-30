@@ -12,12 +12,17 @@
 //! bring each session to `hashrate * target_seconds`, the difficulty at
 //! which it submits one share per `target_seconds`.
 //!
-//! What each session is held to, from the difficulties the listener sent it:
-//! - it settles within `MAX_RETARGETS_TO_SETTLE` retargets: from then on
-//!   every difficulty keeps the share interval inside `BAND` of the target
-//!   interval;
+//! What each session is held to, from the difficulties the listener sent it
+//! and when:
+//! - it settles within `MAX_RETARGET_PERIODS_TO_SETTLE` retarget periods of
+//!   its first job, and within `MAX_ADJUSTMENTS_TO_SETTLE` adjustments: from
+//!   then on every difficulty keeps the share interval inside `BAND` of the
+//!   target interval. The listener sends nothing for an evaluation that
+//!   leaves the difficulty alone, so the period bound is on elapsed time;
+//! - every adjustment, before and after settling, moves toward the target:
+//!   the difficulty never reverses direction;
 //! - it stays settled for at least `SETTLED_RETARGET_PERIODS` retarget
-//!   periods, with at most one further change (so none reversing another).
+//!   periods, with at most one further adjustment.
 //!
 //! The listener's clock is the real one (vardiff reads `std::time::Instant`),
 //! so the premise that the client kept its pace is checked, and reported as
@@ -54,9 +59,17 @@ const START_DIFFICULTY: f64 = 1.6e-8;
 const START_ERROR: f64 = 16.0;
 /// Settled: the share interval is within this factor of TARGET_SECONDS.
 const BAND: f64 = 1.5;
-/// A 16x error takes two retargets at vardiff's 4x step limit; two more
+/// A 16x error takes two adjustments at vardiff's 4x step limit; two more
 /// allow for a window cut short by the listener's once-a-second timer.
-const MAX_RETARGETS_TO_SETTLE: usize = 4;
+const MAX_ADJUSTMENTS_TO_SETTLE: usize = 4;
+/// Vardiff evaluates a session on each accepted share and on the listener's
+/// once-a-second timer, at least RETARGET_SECONDS apart. The fast session
+/// settles after two share-driven periods (1.0 s). The slow one sends no
+/// share before the listener's first timer tick past RETARGET_SECONDS (0.5
+/// to 1.5 s in, about 1.0 s in practice: an idle step down), then needs one
+/// more window of two shares (0.8 s): about 3.6 periods, 4.6 at worst. Six
+/// periods (3.0 s) cover the worst case.
+const MAX_RETARGET_PERIODS_TO_SETTLE: f64 = 6.0;
 /// How long a session must then be seen staying settled.
 const SETTLED_RETARGET_PERIODS: f64 = 8.0;
 const RUN: Duration = Duration::from_secs(8);
@@ -303,6 +316,19 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
     trace
 }
 
+/// The index of the first adjustment that moves away from where the first
+/// one went (a reversal), or None when every adjustment keeps its direction.
+fn reversal(difficulties: &[(f64, f64)]) -> Option<usize> {
+    let mut direction = None;
+    for (index, pair) in difficulties.windows(2).enumerate() {
+        let up = pair[1].1 > pair[0].1;
+        if *direction.get_or_insert(up) != up {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
 /// The index of the first difficulty from which every later one is within
 /// `BAND` of `target`, or None when the session never settled.
 fn settled_from(difficulties: &[(f64, f64)], target: f64) -> Option<usize> {
@@ -365,13 +391,22 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
         (start - START_ERROR).abs() < 1e-9 || (start - 1.0 / START_ERROR).abs() < 1e-9,
         "{context}: the session did not start {START_ERROR}x from its target"
     );
+    if let Some(index) = reversal(&trace.difficulties) {
+        panic!("{context}: adjustment {index} reversed the direction of the ones before it");
+    }
     let settled = settled_from(&trace.difficulties, target)
         .unwrap_or_else(|| panic!("{context}: never settled within {BAND}x of its target"));
     assert!(
-        settled <= MAX_RETARGETS_TO_SETTLE,
-        "{context}: took {settled} retargets to settle, more than {MAX_RETARGETS_TO_SETTLE}"
+        settled <= MAX_ADJUSTMENTS_TO_SETTLE,
+        "{context}: took {settled} adjustments to settle, more than {MAX_ADJUSTMENTS_TO_SETTLE}"
     );
     let settled_at = trace.difficulties[settled].0;
+    assert!(
+        settled_at <= MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS,
+        "{context}: settled at {settled_at:.2}s, later than {MAX_RETARGET_PERIODS_TO_SETTLE} \
+         retarget periods ({:.2}s)",
+        MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS
+    );
     let held = trace.ran_seconds - settled_at;
     assert!(
         held >= SETTLED_RETARGET_PERIODS * RETARGET_SECONDS,
@@ -383,7 +418,10 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
         changes <= 1,
         "{context}: changed {changes} times after settling"
     );
-    eprintln!("{context}; settled after {settled} retargets");
+    eprintln!(
+        "{context}; settled after {settled} adjustments in {:.1} retarget periods",
+        settled_at / RETARGET_SECONDS
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -439,4 +477,17 @@ fn settling_is_the_first_difficulty_after_the_last_one_outside_the_band() {
         settled_from(&[(0.0, 16.0), (1.0, 1.0), (2.0, 0.5), (3.0, 0.9)], target),
         Some(3)
     );
+}
+
+#[test]
+fn a_reversal_is_any_adjustment_against_the_first_ones_direction() {
+    assert_eq!(reversal(&[(0.0, 16.0), (1.0, 4.0), (2.0, 1.0)]), None);
+    assert_eq!(reversal(&[(0.0, 0.0625), (1.0, 0.25), (2.0, 0.99)]), None);
+    assert_eq!(reversal(&[(0.0, 16.0)]), None);
+    // Settled at 1x, then back up to 1.4x: inside the band, but a reversal.
+    assert_eq!(
+        reversal(&[(0.0, 16.0), (1.0, 4.0), (2.0, 1.0), (3.0, 1.4)]),
+        Some(3)
+    );
+    assert_eq!(reversal(&[(0.0, 0.0625), (1.0, 1.2), (2.0, 0.9)]), Some(2));
 }
