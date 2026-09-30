@@ -519,15 +519,11 @@ impl<'a> WaitGuard<'a> {
 
     /// Record the completed wait and disarm. Taking the handle out first makes
     /// the disarm unconditional, so `Drop` cannot record a second observation.
-    /// Returns the instant the wait ended, which starts a hold's clock
-    /// without a second clock read.
-    fn complete(mut self, result: Outcome) -> std::time::Instant {
-        let ended = std::time::Instant::now();
-        let elapsed = ended.saturating_duration_since(self.started);
+    fn complete(mut self, result: Outcome) {
+        let elapsed = self.started.elapsed();
         if let Some(metrics) = self.metrics.take() {
             metrics.observe_advisory_lock(self.kind, result, elapsed);
         }
-        ended
     }
 }
 
@@ -544,7 +540,8 @@ impl Drop for WaitGuard<'_> {
 /// the guard is dropped, which each holder does once its transaction has
 /// committed or rolled back. A transaction abandoned by an error drops the
 /// guard as it unwinds, a moment before its queued `ROLLBACK` releases the
-/// lock. Holds on an unattached ledger read no clock and record nothing.
+/// lock. Holds on an unattached ledger read no clock and record nothing; an
+/// attached one reads the clock once more, after the grant.
 pub(super) struct OrderHold<'a> {
     started: Option<(&'a Metrics, std::time::Instant)>,
     holder: OrderLockHolder,
@@ -573,9 +570,9 @@ pub(super) async fn lock_order<'a>(
     metrics: Option<&'a Metrics>,
     holder: OrderLockHolder,
 ) -> Result<OrderHold<'a>, sqlx::Error> {
-    let granted = lock_with_scope(connection, ORDER_LOCK, metrics, false).await?;
+    lock(connection, ORDER_LOCK, metrics).await?;
     Ok(OrderHold {
-        started: metrics.zip(granted),
+        started: metrics.map(|metrics| (metrics, std::time::Instant::now())),
         holder,
     })
 }
@@ -603,9 +600,7 @@ pub(super) async fn lock(
     key: i64,
     metrics: Option<&Metrics>,
 ) -> Result<(), sqlx::Error> {
-    lock_with_scope(connection, key, metrics, false)
-        .await
-        .map(|_| ())
+    lock_with_scope(connection, key, metrics, false).await
 }
 
 pub(super) async fn session_lock(
@@ -613,18 +608,15 @@ pub(super) async fn session_lock(
     key: i64,
     metrics: Option<&Metrics>,
 ) -> Result<(), sqlx::Error> {
-    lock_with_scope(connection, key, metrics, true)
-        .await
-        .map(|_| ())
+    lock_with_scope(connection, key, metrics, true).await
 }
 
-/// Returns the instant the lock was granted when the wait was timed.
 async fn lock_with_scope(
     connection: &mut PgConnection,
     key: i64,
     metrics: Option<&Metrics>,
     session: bool,
-) -> Result<Option<std::time::Instant>, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     // Time the advisory lock statement and nothing else: the clock starts
     // immediately before the wait begins.
     let guard = match (metrics, lock_kind(key)) {
@@ -653,15 +645,15 @@ async fn lock_with_scope(
             .await
             .map(|_| ())
     };
-    let granted = guard.map(|guard| {
+    if let Some(guard) = guard {
         guard.complete(if acquired.is_ok() {
             Outcome::Success
         } else {
             Outcome::Failure
-        })
-    });
+        });
+    }
     acquired?;
-    Ok(granted)
+    Ok(())
 }
 
 /// Begin a ledger transaction, timing the pool acquisition.

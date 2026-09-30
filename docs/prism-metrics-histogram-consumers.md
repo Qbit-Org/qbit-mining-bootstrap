@@ -100,10 +100,11 @@ publishes how many consecutive windows exceeded it.
 `qbit_prism_database_order_lock_hold_seconds{holder}` has its own ladder:
 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10
 seconds, then `+Inf`. An append holds `ORDER_LOCK` for milliseconds, and #602's
-budget for every other holder is 250 ms (`le="0.25"`). A holder that appears
-once per landing (`first_confirmation`, `reconcile`, `orphan`) has one
-observation per block: read `_sum` increases per landing rather than a
-quantile. A hold runs from the grant of the lock to the end of its transaction,
+budget for every other holder is 250 ms (`le="0.25"`). `first_confirmation` and
+`orphan` appear about once per block (a settlement attempt that rolls back and
+is retried records a second hold), so read their `_sum` increases per landing
+rather than a quantile. `reconcile` runs on every template build as well as at
+landings, so its landing holds are mixed with routine ones. A hold runs from the grant of the lock to the end of its transaction,
 so it includes the transaction's own statements and its COMMIT round trip;
 the wait for the lock is `qbit_prism_database_advisory_lock_wait_seconds`.
 

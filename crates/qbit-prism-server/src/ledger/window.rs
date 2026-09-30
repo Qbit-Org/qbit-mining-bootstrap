@@ -691,7 +691,8 @@ impl Ledger {
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
         let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
-        // Dropped on every path out, after the COMMIT or ROLLBACK below.
+        // Dropped on every path out: after the COMMIT or the gate's ROLLBACK
+        // below, or, on an error, just before the queued ROLLBACK runs.
         let _order = self
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Append)
             .await?;

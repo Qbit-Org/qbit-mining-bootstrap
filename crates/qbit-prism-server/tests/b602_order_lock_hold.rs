@@ -73,7 +73,7 @@ async fn settlement_is_held(f: &Fixture) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let sleeping: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep'")
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event='PgSleep' AND query LIKE 'UPDATE qbit_pool_blocks%'")
                 .fetch_one(f.pool())
                 .await?;
         if sleeping > 0 {
@@ -261,7 +261,8 @@ async fn acknowledgements_after_an_acceptance_are_read_in_the_landing_window() -
             f.node.accept_blocks();
             let claim = queue_block(&f.a).await?;
             f.a.process_candidate(&claim).await?;
-            f.a.refresh_once().await?;
+            // No refresh first: its reconciler would open the window too,
+            // and this checks the offer's own acceptance does.
             acknowledge_one(&f.a, "b602-landing-a.rig").await?;
             ensure!(acks(&f.a.metrics, ACK) == 2.);
             ensure!(
@@ -384,8 +385,24 @@ fn every_order_lock_acquisition_records_its_hold() -> Result<()> {
             let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
             let lines: Vec<&str> = source.lines().collect();
             for (index, line) in lines.iter().enumerate() {
-                if line.contains("ORDER_LOCK") && line.contains("lock(") {
+                // `connect.rs` is the helper itself.
+                if relative != "connect.rs" && line.contains("ORDER_LOCK") && line.contains("lock(")
+                {
                     plain.push(format!("{relative}:{}", index + 1));
+                }
+                // An explicit end of a hold comes right after its COMMIT.
+                if line.trim() == "drop(order);" {
+                    let previous = lines[..index]
+                        .iter()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                        .copied()
+                        .unwrap_or_default();
+                    ensure!(
+                        previous.contains(".commit()"),
+                        "{relative}:{}: an ORDER_LOCK hold must end right after its transaction's COMMIT",
+                        index + 1
+                    );
                 }
                 if line.contains(".lock_order(") || line.contains("lock_order(tx") {
                     labelled += 1;

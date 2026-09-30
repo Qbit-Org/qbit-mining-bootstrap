@@ -23,8 +23,16 @@
 //! many consecutive most recent windows exceeded it. An acceptance while a
 //! window still admits arrivals extends that window rather than opening a
 //! second one, so two landings seconds apart are one window and one verdict.
+//! A later acceptance opens a new window and leaves the previous one settling:
+//! its late acknowledgements still count toward its own verdict.
 //! A window no submission arrived in has no verdict and leaves the streaks
 //! as they were: a quiet landing proves nothing either way.
+//!
+//! A block height opens at most one window, whichever observation of it
+//! comes first, so the reconciler seeing a block this frontend offered does
+//! not open a second one. This state is independent of the revision-work
+//! tracker in `landing.rs`: that tracker's capacity limits never stop a
+//! window from opening.
 use super::LandingAckBound;
 use std::{
     sync::{
@@ -64,6 +72,12 @@ pub(super) struct LandingAcks {
 #[derive(Default)]
 struct Windows {
     open: Option<Window>,
+    /// The previous window, no longer admitting but still settling when a
+    /// later acceptance opened `open`: its late acknowledgements still count
+    /// toward its own verdict.
+    settling: Option<Window>,
+    /// The highest block height that opened a window.
+    highest: Option<u64>,
     /// Per bound, in [`LandingAckBound::ALL`] order; `None` before a verdict.
     streaks: Option<[u32; 2]>,
 }
@@ -93,15 +107,25 @@ impl LandingAcks {
             .max(1)
     }
 
-    /// A pool block acceptance observed at `now` opens a window, or extends
-    /// the one still admitting arrivals.
-    pub(super) fn opened(&self, now: Instant) {
+    /// The first observation of a pool block's acceptance at `height`, at
+    /// `now`, opens a window, or extends the one still admitting arrivals. A
+    /// height at or below one that already opened a window opens nothing.
+    pub(super) fn opened(&self, now: Instant, height: u64) {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        if windows.highest.is_some_and(|highest| height <= highest) {
+            return;
+        }
+        windows.highest = Some(height);
         let until = now + WINDOW;
         match windows.open.as_mut() {
             Some(window) if now < window.admits_until => window.admits_until = until,
             _ => {
-                windows.close();
+                // At most one window settles at a time: the older one takes
+                // its verdict now, so verdicts stay in acceptance order.
+                if let Some(settling) = windows.settling.take() {
+                    windows.judge(settling);
+                }
+                windows.settling = windows.open.take();
                 windows.open = Some(Window {
                     admits_until: until,
                     acks: 0,
@@ -122,12 +146,15 @@ impl LandingAcks {
         until != 0 && self.offset(received_at) < until
     }
 
-    /// Count one admitted acknowledgement toward its window's verdict.
+    /// Count one admitted acknowledgement toward its window's verdict: the
+    /// settling window's when it admitted the arrival, else the open one's.
     pub(super) fn record(&self, received_at: Instant, elapsed: Duration) {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(window) = windows
-            .open
+        let Windows { open, settling, .. } = &mut *windows;
+        if let Some(window) = settling
             .as_mut()
+            .filter(|window| received_at < window.admits_until)
+            .or(open.as_mut())
             .filter(|window| received_at < window.admits_until)
         {
             window.acks += 1;
@@ -138,26 +165,29 @@ impl LandingAcks {
     }
 
     /// Per bound, the consecutive most recent windows whose p99 exceeded it,
-    /// or `None` before the first verdict. A window whose settle time has
-    /// passed by `now` gets its verdict first.
+    /// or `None` before the first verdict. Windows whose settle time has
+    /// passed by `now` get their verdicts first, oldest first.
     pub(super) fn streaks(&self, now: Instant) -> Option<[u32; 2]> {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        if windows
-            .open
-            .as_ref()
-            .is_some_and(|window| now >= window.admits_until + SETTLE)
-        {
-            windows.close();
+        let settled = |window: &Option<Window>| {
+            window
+                .as_ref()
+                .is_some_and(|window| now >= window.admits_until + SETTLE)
+        };
+        if settled(&windows.settling) {
+            let window = windows.settling.take().expect("checked above");
+            windows.judge(window);
+        }
+        if windows.settling.is_none() && settled(&windows.open) {
+            let window = windows.open.take().expect("checked above");
+            windows.judge(window);
         }
         windows.streaks
     }
 }
 
 impl Windows {
-    fn close(&mut self) {
-        let Some(window) = self.open.take() else {
-            return;
-        };
+    fn judge(&mut self, window: Window) {
         if window.acks == 0 {
             return;
         }
@@ -194,7 +224,7 @@ mod tests {
         assert_eq!(state.streaks(Instant::now()), None);
         let before = Instant::now();
         tokio::time::advance(MS).await;
-        state.opened(Instant::now());
+        state.opened(Instant::now(), 1);
         // In flight at the acceptance: admitted.
         assert!(state.admits(before));
         tokio::time::advance(WINDOW - MS).await;
@@ -206,7 +236,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_verdict_is_the_nearest_rank_p99_and_waits_for_settle() {
         let state = LandingAcks::default();
-        state.opened(Instant::now());
+        state.opened(Instant::now(), 10);
         let arrived = Instant::now();
         // 100 acknowledgements, one over 2 s: p99 is the 99th, under 2 s.
         acks(&state, arrived, &[MS; 99]);
@@ -217,7 +247,7 @@ mod tests {
         assert_eq!(state.streaks(Instant::now()), Some([0, 0]));
 
         // 100 more, two over 2 s and one over 10 s: p99 over 2 s, not 10 s.
-        state.opened(Instant::now());
+        state.opened(Instant::now(), 11);
         let arrived = Instant::now();
         acks(&state, arrived, &[MS; 97]);
         acks(
@@ -233,8 +263,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn streaks_count_consecutive_slow_windows_and_quiet_windows_are_skipped() {
         let state = LandingAcks::default();
-        let window = |slow: Option<Duration>| {
-            state.opened(Instant::now());
+        let mut height = 100;
+        let mut window = |slow: Option<Duration>| {
+            height += 1;
+            state.opened(Instant::now(), height);
             if let Some(elapsed) = slow {
                 acks(&state, Instant::now(), &[elapsed]);
             }
@@ -258,12 +290,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_acceptance_inside_a_window_extends_it_and_a_later_one_closes_it() {
+    async fn an_acceptance_inside_a_window_extends_it_and_a_later_one_lets_it_settle() {
         let state = LandingAcks::default();
-        state.opened(Instant::now());
-        acks(&state, Instant::now(), &[Duration::from_secs(3)]);
+        let start = Instant::now();
+        state.opened(start, 13);
+        acks(&state, start, &[Duration::from_secs(3)]);
         tokio::time::advance(Duration::from_secs(20)).await;
-        state.opened(Instant::now());
+        state.opened(Instant::now(), 14);
         tokio::time::advance(Duration::from_secs(25)).await;
         // 45 s after the first acceptance, 25 s after the second: admitted.
         acks(&state, Instant::now(), &[MS]);
@@ -272,10 +305,38 @@ mod tests {
             None,
             "one window, still open"
         );
-        // Past the extended window's admissions but before its settle, a new
-        // acceptance takes the verdict now: one of two over 2 s.
+        // Past the extended window's admissions, before its settle: a new
+        // acceptance opens another window and leaves this one settling.
         tokio::time::advance(Duration::from_secs(10)).await;
-        state.opened(Instant::now());
+        state.opened(Instant::now(), 15);
+        assert_eq!(
+            state.streaks(Instant::now()),
+            None,
+            "the first window still settles"
+        );
+        // A submission in flight since 49 s, answered 8 s late, counts
+        // toward the first window's verdict, not the second's.
+        state.record(start + Duration::from_secs(49), Duration::from_secs(8));
+        tokio::time::advance(Duration::from_secs(25)).await;
         assert_eq!(state.streaks(Instant::now()), Some([1, 0]));
+        // The second window saw no acknowledgement: no verdict of its own.
+        tokio::time::advance(WINDOW + SETTLE).await;
+        assert_eq!(state.streaks(Instant::now()), Some([1, 0]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_height_opens_one_window_whichever_observation_comes_first() {
+        let state = LandingAcks::default();
+        state.opened(Instant::now(), 20);
+        tokio::time::advance(WINDOW - MS).await;
+        // The reconciler's later observation of the same block, or of an
+        // older one, neither extends nor reopens the window.
+        state.opened(Instant::now(), 20);
+        state.opened(Instant::now(), 19);
+        tokio::time::advance(MS).await;
+        assert!(!state.admits(Instant::now()));
+        // The next height does.
+        state.opened(Instant::now(), 21);
+        assert!(state.admits(Instant::now()));
     }
 }
