@@ -1156,6 +1156,8 @@ struct LedgerShare {
     order_key: String,
     program: String,
     weight: u128,
+    /// The height of the tip the share's job was built on.
+    template_height: i64,
     issued_ms: i64,
     accepted_ms: i64,
     writer: String,
@@ -1164,7 +1166,7 @@ struct LedgerShare {
 
 async fn ledger_shares(fixture: &Fixture) -> Result<Vec<LedgerShare>> {
     let rows = sqlx::query(
-        "SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,share_difficulty::text AS weight,
+        "SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,share_difficulty::text AS weight,template_height,
                 round(extract(epoch FROM job_issued_at)*1000)::bigint AS issued_ms,round(extract(epoch FROM accepted_at)*1000)::bigint AS accepted_ms,
                 writer_id,credit_policy
          FROM qbit_share_ledger WHERE accepted ORDER BY share_seq",
@@ -1180,6 +1182,7 @@ async fn ledger_shares(fixture: &Fixture) -> Result<Vec<LedgerShare>> {
                 order_key: row.try_get("payout_order_key")?,
                 program: row.try_get("program")?,
                 weight: row.try_get::<String, _>("weight")?.parse()?,
+                template_height: row.try_get("template_height")?,
                 issued_ms: row.try_get("issued_ms")?,
                 accepted_ms: row.try_get("accepted_ms")?,
                 writer: row.try_get("writer_id")?,

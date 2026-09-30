@@ -62,9 +62,13 @@ async fn run(fixture: &mut Fixture) -> Result<()> {
         .rpc("getblocktemplate", json!([{"rules": ["segwit"]}]))
         .await?;
     let network = block_weight(template["bits"].as_str().context("template bits missing")?)?;
-    let height = template["height"]
+    // A share records the height of the tip its job was built on, the
+    // template's parent, as the production submit path does.
+    let parent_height = template["height"]
         .as_u64()
-        .context("template height missing")?;
+        .context("template height missing")?
+        .checked_sub(1)
+        .context("template at height zero")?;
     let ntime = u32::try_from(template["curtime"].as_u64().context("curtime missing")?)?;
     let policy = Policy {
         ctv: true,
@@ -96,7 +100,16 @@ async fn run(fixture: &mut Fixture) -> Result<()> {
     // Seeded work, through the production append, before the servers start
     // and load the window.
     let seeding = Instant::now();
-    let seeded = seed(fixture, &payees.ids, &units, unit, network, height, ntime).await?;
+    let seeded = seed(
+        fixture,
+        &payees.ids,
+        &units,
+        unit,
+        network,
+        parent_height,
+        ntime,
+    )
+    .await?;
     let seeding = seeding.elapsed();
 
     start_servers(fixture, &policy).await?;
@@ -147,7 +160,14 @@ async fn run(fixture: &mut Fixture) -> Result<()> {
     }];
 
     let shares = ledger_shares(fixture).await?;
-    let sources = check_sources(&shares, &seeded, &submitted, &payees.ids, unit)?;
+    let sources = check_sources(
+        &shares,
+        &seeded,
+        &submitted,
+        &payees.ids,
+        unit,
+        parent_height,
+    )?;
     let verifying = Instant::now();
     let verified =
         verify_payouts(fixture, &ramp_address, &found, &shares, &policy, &payees).await?;
@@ -229,7 +249,7 @@ async fn seed(
     units: &[u64],
     unit: u128,
     network: u128,
-    height: u64,
+    parent_height: u64,
     ntime: u32,
 ) -> Result<HashMap<String, (usize, u128)>> {
     let ledger =
@@ -258,7 +278,7 @@ async fn seed(
                 p2mr_program_hex: identity.program.clone(),
                 share_difficulty: weight,
                 network_difficulty: network,
-                template_height: height,
+                template_height: parent_height,
                 job_id: SEED_WRITER.into(),
                 job_issued_at_ms: issued + offset,
                 accepted_at_ms: issued + offset + 1,
@@ -286,13 +306,16 @@ struct Sources {
 
 /// The ledger holds exactly the seeded shares, under the seed writer, and
 /// the shares the servers acknowledged, under the server each session used,
-/// each credited to its payee at the unit or seeded weight.
+/// each credited to its payee at the unit or seeded weight, and every one
+/// built on the same tip, `parent_height`: the seeded shares record the
+/// height the servers record for the submitted ones.
 fn check_sources(
     shares: &[LedgerShare],
     seeded: &HashMap<String, (usize, u128)>,
     submitted: &HashMap<String, usize>,
     payees: &[Identity],
     unit: u128,
+    parent_height: u64,
 ) -> Result<Sources> {
     ensure!(
         shares.len() == seeded.len() + submitted.len(),
@@ -328,6 +351,12 @@ fn check_sources(
             share.weight,
             share.writer,
             identity.recipient
+        );
+        ensure!(
+            u64::try_from(share.template_height).ok() == Some(parent_height),
+            "share {} records template height {}, the found block's parent is {parent_height}",
+            share.share_id,
+            share.template_height
         );
     }
     let seeded_recipients = from_seed.len();
