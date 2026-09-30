@@ -911,11 +911,11 @@ async fn commit_reconcile_block_only_enqueue_behind_the_order_lock_is_not_cut_of
         let started = TokioInstant::now();
         let (submitted, _log) = fixture.submit(proof);
         wait_until_blocked(&fixture, holder_pid).await?;
-        // Past the share deadline, inside the 5 s lock_timeout.
+        // Held behind the lock inside the 5 s lock_timeout and the bound.
         tokio::time::sleep_until(started + Duration::from_millis(1500)).await;
         ensure!(
             !submitted.is_finished(),
-            "a block-only enqueue was cut off at the share deadline"
+            "a block-only proof was answered while its enqueue waited behind ORDER_LOCK"
         );
         sqlx::query(&format!("SELECT pg_advisory_unlock({ORDER_LOCK_KEY})"))
             .execute(&mut *holder)
