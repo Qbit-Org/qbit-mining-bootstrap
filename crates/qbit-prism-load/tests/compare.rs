@@ -871,34 +871,48 @@ fn an_external_database_other_than_the_pinned_url_fails() {
     let mut pinned = d1_args();
     pinned.insert(
         "--database-url".into(),
-        json!("postgresql://alex:hunter2@db.example:5433/qbit"),
+        json!("postgresql://alex:hunter2@db.example:5433/qbit?sslmode=require"),
     );
-    let external = |upstream: &str, database: &str| {
+    let external = |upstream: &str, launched: &str| {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
             report["database"]["mode"] = json!("external");
             report["database"]["delay_proxy"] = json!({"upstream": upstream});
             report["frontend_environment"][0]["environment"]["PRISM_DATABASE_URL"] =
-                json!(format!(
-                "postgresql://alex:<redacted>@127.0.0.1:41000/{database}?application_name=load-fe-0"
-            ));
+                json!(launched);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
-    let result = external("db.example:5433", "qbit");
+    // As the harness launches it: pointed at the proxy, named for the
+    // frontend, redacted in the report.
+    let proxied = "postgresql://alex:<redacted>@127.0.0.1:41000/qbit?sslmode=require&\
+                   application_name=load-fe-0";
+    let result = external("db.example:5433", proxied);
     assert!(result.passed, "{}", result.markdown);
-    let result = external("other.example:5433", "qbit");
+    let result = external("other.example:5433", proxied);
     assert!(!result.passed);
     assert!(result.markdown.contains(
         "fronted the database at other.example:5433, not the pinned `--database-url`'s \
          db.example:5433"
     ));
-    let result = external("db.example:5433", "other");
-    assert!(!result.passed);
-    assert!(result.markdown.contains(
-        "launched a frontend on another database than the pinned `--database-url`'s /qbit"
-    ));
+    // Another database, role or option, though the endpoint is the pinned one.
+    for launched in [
+        "postgresql://alex:<redacted>@127.0.0.1:41000/other?sslmode=require&application_name=load-fe-0",
+        "postgresql://root:<redacted>@127.0.0.1:41000/qbit?sslmode=require&application_name=load-fe-0",
+        "postgresql://alex:<redacted>@127.0.0.1:41000/qbit?sslmode=disable&application_name=load-fe-0",
+    ] {
+        let result = external("db.example:5433", launched);
+        assert!(!result.passed, "{launched}");
+        assert!(
+            result
+                .markdown
+                .contains("not the pinned `--database-url` (endpoint aside)"),
+            "{launched}: {}",
+            result.markdown
+        );
+        assert!(!result.markdown.contains("hunter2"));
+    }
 }
 
 #[test]

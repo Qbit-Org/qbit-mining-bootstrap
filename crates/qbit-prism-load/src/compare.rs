@@ -1135,15 +1135,6 @@ pub fn expected_arrival(pinned: &BTreeMap<String, Value>) -> Result<Vec<Expected
         .collect()
 }
 
-/// The database path of a database URL: what follows the host, up to its
-/// query. A password is percent-encoded, so the first `/` after the scheme
-/// ends the authority, redacted or not.
-fn database_path(url: &str) -> Option<&str> {
-    let rest = url.split_once("://")?.1;
-    let path = &rest[rest.find('/')?..];
-    path.split(['?', '#']).next()
-}
-
 /// Why a counted run's churn phase did not carry out the preset's plan, or
 /// `None` when every one did: every planned rental spawned and every one
 /// planned to leave in the phase departed (a departure is recorded at its
@@ -1894,38 +1885,50 @@ pub fn compare(
     }
     // An external database is the one the preset names: the delay proxy
     // fronted its `host:port` (as the harness's `run::host_port` derives
-    // it), and every frontend's URL names its database. `database.mode`
-    // alone only says a URL was given.
+    // it), and every frontend was given the URL itself, user, database and
+    // options included, pointed at the proxy and named for the frontend, as
+    // the harness builds it (`run::rewrite_host`, then
+    // `run::with_application_name`) and the report redacts it. Only the
+    // endpoint, the proxy's own, is left out of the comparison.
+    // `database.mode` alone only says a URL was given.
     if let Some(url) = pinned.get("--database-url").and_then(Value::as_str) {
         let upstream = crate::run::host_port(url)?;
-        let database = database_path(url);
+        let options = |url: &str| crate::run::rewrite_host(url, "endpoint").ok();
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
             let report = run.report.as_ref();
             let reported = report
                 .and_then(|r| r.pointer("/database/delay_proxy/upstream"))
                 .and_then(Value::as_str);
-            let paths: Vec<Option<&str>> = report
+            let frontends = report
                 .and_then(|r| r["frontend_environment"].as_array())
-                .into_iter()
-                .flatten()
-                .map(|f| {
-                    f["environment"]["PRISM_DATABASE_URL"]
-                        .as_str()
-                        .and_then(database_path)
-                })
-                .collect();
+                .cloned()
+                .unwrap_or_default();
+            let other = frontends.iter().find_map(|frontend| {
+                let launched = frontend["environment"]["PRISM_DATABASE_URL"]
+                    .as_str()
+                    .and_then(options);
+                let expected = frontend["instance_id"].as_str().and_then(|name| {
+                    options(&crate::frontend::redact_url_secrets(
+                        &crate::run::with_application_name(url, name),
+                    ))
+                });
+                (launched.is_none() || launched != expected)
+                    .then(|| launched.unwrap_or_else(|| "no URL".into()))
+            });
             let why = if reported != Some(upstream.as_str()) {
                 Some(format!(
                     "fronted the database at {}, not the pinned `--database-url`'s {upstream}",
                     reported.unwrap_or("an unreported address")
                 ))
-            } else if paths.is_empty() || paths.iter().any(|path| *path != database) {
-                Some(format!(
-                    "launched a frontend on another database than the pinned `--database-url`'s {}",
-                    database.unwrap_or("default")
-                ))
+            } else if frontends.is_empty() {
+                Some("reports no frontend's database URL".to_owned())
             } else {
-                None
+                other.map(|launched| {
+                    format!(
+                        "launched a frontend on {launched}, not the pinned `--database-url` \
+                         (endpoint aside)"
+                    )
+                })
             };
             if let Some(why) = why {
                 passed = false;
