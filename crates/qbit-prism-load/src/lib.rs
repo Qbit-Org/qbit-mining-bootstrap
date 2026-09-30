@@ -20,6 +20,7 @@ pub mod classify;
 pub mod cli;
 pub mod client;
 pub mod cluster;
+pub mod compare;
 pub mod digest;
 pub mod frontend;
 pub mod gate;

@@ -18,7 +18,7 @@
 
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use qbit_prism_load::{cli::Args, gate, preset, run};
+use qbit_prism_load::{cli::Args, compare, gate, preset, run};
 use qbit_prism_test_gate as test_gate;
 use std::path::PathBuf;
 
@@ -106,6 +106,144 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         key_sets, golden,
         "the fake-node side report's keys moved from what origin/3.x.x wrote"
     );
+
+    // The A/B comparator (#511) holds every run to what the preset pins, as
+    // a side report states it; a real report must read exactly so, or every
+    // comparison would fail on a rendering difference.
+    for setting in compare::expected_settings(&loaded.args)? {
+        let reported = report.pointer(setting.pointer);
+        assert!(
+            reported.is_some_and(|value| compare::same_json(value, &setting.value)),
+            "{}: reported {reported:?}, expected {}",
+            setting.pointer,
+            setting.value
+        );
+    }
+    for (flag, pointer) in compare::PINNED_REPORT_FIELDS {
+        let pinned = &loaded.args[*flag];
+        let reported = report.pointer(pointer);
+        assert!(
+            reported.is_some_and(|value| compare::same_json(value, pinned)),
+            "{pointer}: reported {reported:?}, pinned {flag} {pinned}"
+        );
+    }
+    let reported: Vec<&str> = report["phases"]
+        .as_array()
+        .context("phases")?
+        .iter()
+        .filter_map(|phase| phase["name"].as_str())
+        .collect();
+    for plan in compare::expected_phases(&loaded.args)? {
+        let phase = report["phases"]
+            .as_array()
+            .context("phases")?
+            .iter()
+            .find(|phase| phase["name"] == plan.name.as_str())
+            .with_context(|| format!("{} is not in {reported:?}", plan.name))?;
+        assert_eq!(
+            phase["target_rate_shares_per_second"].as_f64(),
+            Some(plan.rate),
+            "{}",
+            plan.name
+        );
+        let duration = phase["duration_seconds"].as_f64().context("duration")?;
+        let seconds = plan.seconds as f64;
+        assert!(
+            (duration - seconds).abs() <= seconds * compare::DURATION_TOLERANCE,
+            "{} ran {duration} s against a planned {seconds} s",
+            plan.name
+        );
+        assert_eq!(
+            phase["in_artifact"].as_bool(),
+            Some(plan.in_artifact),
+            "{}",
+            plan.name
+        );
+        // The comparator holds the lowest reading to the preset's memory
+        // floor, and treats an unread one as a failure.
+        assert!(
+            phase["min_mem_available_kib"].as_u64().is_some(),
+            "{} read no MemAvailable",
+            plan.name
+        );
+        assert_eq!(
+            phase["database_delay_milliseconds_configured"].as_u64(),
+            Some(plan.database_delay_ms),
+            "{}",
+            plan.name
+        );
+    }
+    // The churn plan the comparator expects is the one the run carried out.
+    let churn = &report["churn"];
+    assert_eq!(
+        churn["realised"]["rentals_spawned"], churn["plan"]["rental_sessions"],
+        "{churn}"
+    );
+    assert_eq!(
+        churn["realised"]["storms"].as_array().map(Vec::len),
+        churn["plan"]["storms"].as_array().map(Vec::len),
+        "{churn}"
+    );
+    assert_eq!(
+        churn["realised"]["rentals_departed"], churn["plan"]["rentals_departing_in_phase"],
+        "{churn}"
+    );
+    let dropped: u64 = churn["realised"]["storms"]
+        .as_array()
+        .context("storms")?
+        .iter()
+        .filter_map(|s| s["dropped"].as_u64())
+        .sum();
+    let departed = churn["realised"]["rentals_departed"]
+        .as_u64()
+        .context("departed")?;
+    let reconnected = churn["realised"]["reconnects_completed"]
+        .as_u64()
+        .context("reconnects")?;
+    assert!(reconnected + departed >= dropped, "{churn}");
+    assert_eq!(
+        report["database"]["replication"]["agreed_with_declared"], true,
+        "the replication premise"
+    );
+    assert_eq!(report["database"]["mode"], "managed");
+    for storm in churn["realised"]["storms"].as_array().context("storms")? {
+        let connected = storm["connected"].as_f64().context("connected")?;
+        let fraction = storm["fraction"].as_f64().context("fraction")?;
+        assert_eq!(
+            storm["dropped"].as_f64(),
+            Some((fraction * connected).round().min(connected)),
+            "{storm}"
+        );
+        assert!(storm["dropped"].as_u64() > Some(0), "{storm}");
+    }
+    assert_eq!(
+        churn["tip_delivery"]["tips"].as_array().map(Vec::len),
+        churn["plan"]["tips_at_seconds"].as_array().map(Vec::len),
+        "{churn}"
+    );
+    for (flag, pointer) in compare::PINNED_REPORT_COUNTS {
+        let pinned = loaded.args[*flag].as_u64().context("a pinned count")?;
+        let listed = report
+            .pointer(pointer)
+            .and_then(|v| v.as_array())
+            .map(Vec::len);
+        assert_eq!(listed, Some(pinned as usize), "{pointer} for {flag}");
+    }
+    for frontend in report["frontend_environment"]
+        .as_array()
+        .context("frontend environment")?
+    {
+        for (flag, key) in compare::PINNED_FRONTEND_ENV {
+            let pinned = loaded.args[*flag]
+                .as_f64()
+                .context("numeric server setting")?;
+            let launched: f64 = frontend["environment"][key]
+                .as_str()
+                .context("launched setting")?
+                .parse()?;
+            assert_eq!(launched, pinned, "{key} for {flag}");
+        }
+    }
 
     // The run is the preset's, and the skew it asked for is the skew it drove.
     assert_eq!(report["preset"]["name"], "pr-smoke");

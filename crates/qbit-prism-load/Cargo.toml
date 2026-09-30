@@ -23,6 +23,10 @@ path = "src/gate_main.rs"
 name = "qbit-prism-soak-report"
 path = "src/soak_report_main.rs"
 
+[[bin]]
+name = "qbit-prism-load-compare"
+path = "src/compare_main.rs"
+
 [dependencies]
 qbit-prism = { path = "../qbit-prism" }
 qbit-prism-server = { path = "../qbit-prism-server" }
