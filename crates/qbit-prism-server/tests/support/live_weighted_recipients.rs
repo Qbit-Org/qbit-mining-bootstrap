@@ -169,8 +169,11 @@ async fn run(fixture: &mut Fixture, scenario: &Scenario) -> Result<()> {
     let mut sessions = Vec::with_capacity(plan.workers.len());
     for worker in &plan.workers {
         let username = format!("{}.{}", payees[worker.payee].recipient, worker.name);
+        let opened = sessions.len();
         sessions.push(Some(
-            Session::open(fixture.stratum[worker.server], username, worker.difficulty).await?,
+            Session::open(fixture.stratum[worker.server], username, worker.difficulty)
+                .await
+                .with_context(|| format!("{opened} of {} sessions opened", plan.workers.len()))?,
         ));
     }
     let mut accepted: HashMap<String, usize> = HashMap::new();

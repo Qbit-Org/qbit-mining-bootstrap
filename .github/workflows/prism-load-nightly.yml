@@ -419,8 +419,10 @@ jobs:
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
   # That is #523's qbitd -reindex crash variant, #524's 130-payee
-  # weighted-recipients variant, scenario 5's dense-cadence soak, and #575's
-  # PostgreSQL disk-exhaustion and wall-clock-jump variants.
+  # weighted-recipients variant, scenario 5's dense-cadence soak, #575's
+  # PostgreSQL disk-exhaustion and wall-clock-jump variants and soak smoke,
+  # and #553's short set of chain events under 2,000 sessions, #598's guard
+  # included (about 13 minutes on a 22-core host in debug).
   live-nightly:
     name: Live regtest nightly variants
     needs: guard
@@ -518,9 +520,8 @@ jobs:
   # import-audits, native mining on the real node, exact reconciliation and
   # the isolated-restore rollback of docs/prism-rust-migration.md. And #553's
   # long set of chain events under 2,000 sessions: #521 scenario 4's other
-  # four cases, scenario 5's 20-minute soak, scenario 7 at 2,000 wallets
-  # (#604's expected failure), 45 minutes of external tips at 400 shares/s,
-  # and #598's expected failure.
+  # four cases, scenario 5's 20-minute soak and 45 minutes of external tips
+  # at 400 shares/s.
   live-weekly:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
@@ -531,9 +532,9 @@ jobs:
     # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
     # of the rows on a 22-core host in release, and its row-proportional
     # phases put 1/16 near 20 minutes there, so the job builds in release and
-    # allowed two hours; #553's long set adds about 85 minutes (45 of
-    # external tips, a 20-minute soak, the 2,000-wallet case and five shorter
-    # cases), so it allows three.
+    # allowed two hours; #553's long set adds about 75 minutes (45 of
+    # external tips, a 20-minute soak and four shorter cases, measured in
+    # debug), so it allows three.
     timeout-minutes: 180
     services:
       postgres:

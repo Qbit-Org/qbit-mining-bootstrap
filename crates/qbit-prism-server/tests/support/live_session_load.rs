@@ -7,8 +7,8 @@
 //! misses its job's block target, so the load never finds a block and never
 //! changes which own blocks a scenario has. The servers run with
 //! [`load_server_env`]: #575's share-only settings, which make such a share
-//! possible on regtest, room for every session, and the production reanchor
-//! (#598). A load share
+//! possible on regtest, room for every session, and the production reanchor.
+//! A load share
 //! weighs about 2^-32 of a difficulty-1 share, so the payout window and every
 //! scenario's economics are unchanged. What the load does exercise is the
 //! share append under `ORDER_LOCK`, the database pool, and the notify fan-out
@@ -31,6 +31,7 @@
 //! It reports #481's time to usable work per frontend and per tip: from the
 //! node's stamp to each session's first notify on that parent. A tip replaced
 //! before a session was served is counted as replaced, never as zero.
+use super::dense_soak_tests::setting;
 use super::share_client::{solve_share, Answer, SHARE_ONLY_SETTINGS};
 use super::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -77,14 +78,30 @@ const HANDSHAKE_BOUND: Duration = Duration::from_secs(35);
 const DRAIN_BOUND: Duration = Duration::from_secs(30);
 
 /// Refusals a session that submits only valid, distinct shares on work it
-/// was given can never earn.
-const IMPOSSIBLE_REASONS: [&str; 3] = ["duplicate-share", "low-difficulty", "malformed-submit"];
+/// was given can earn: a race with the tip or the payout revision, a job
+/// the session no longer holds, or a backend refusal
+/// (`qbit_prism_load::classify`'s expected and backend classes). Any other,
+/// such as `duplicate-share`, `low-difficulty`, `unauthorized-worker` or an
+/// `invalid-*`, fails the load, as does one nobody classified yet.
+const EXPECTED_REASONS: [&str; 6] = [
+    "stale-job",
+    "unknown-job",
+    "pool-closed",
+    "backend-rpc-unavailable",
+    "ledger-confirmation-failed",
+    "internal-error",
+];
+/// A refusal whose COMMIT outcome the server does not know: the share may
+/// still land, so it counts as unanswered (#324).
+const OUTCOME_UNKNOWN: &str = "ledger-outcome-unknown";
+/// Refusals without a `reason_id` that a correct load can earn, by message.
+const EXPECTED_UNTYPED: [&str; 2] = ["too many connections", "too many unknown job submissions"];
+const UNTYPED: &str = "(no reason_id)";
 
 /// The payout-artifact reanchor a load run's frontends use: the server's,
 /// the harness's and Compose's default, where the live fixture's is 1 s.
-/// Under a 1 s reanchor, 2,000 sessions on one frontend get no work on a new
-/// tip at all: each job build is superseded by the next publication before
-/// it completes (#598).
+/// Before #598's fix, 2,000 sessions on one frontend at 1 s got no work on a
+/// new tip; one nightly case keeps the fixture's 1 s as #598's guard.
 const REANCHOR_SECONDS: u64 = 60;
 
 /// The frontend settings a load run needs: #575's share-only settings, a
@@ -284,6 +301,14 @@ impl SessionLoad {
     /// Sessions holding work right now.
     pub(super) fn connected(&self) -> usize {
         self.shared.connected.load(Ordering::SeqCst)
+    }
+
+    /// Whether at least `fraction` of the sessions hold work, as a check
+    /// that outlives this borrow.
+    pub(super) fn holding(&self, fraction: f64) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = self.shared.clone();
+        let wanted = (shared.plan.sessions as f64 * fraction).ceil() as usize;
+        Arc::new(move || shared.connected.load(Ordering::SeqCst) >= wanted)
     }
 
     /// Wait until at least `fraction` of the sessions hold work.
@@ -573,8 +598,15 @@ async fn run_session(
         interval,
     );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Spread the first connections, so the frontends' initial-job admission
-    // (128 pending by default) is not the thing measured.
+    // Spread the first connections from the first ready frontend, so the
+    // frontends' initial-job admission (128 pending by default) is not the
+    // thing measured: a case may start its servers after the load.
+    while shared.pick(home).is_none() {
+        tokio::select! {
+            _ = stop.changed() => return log,
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
     let spread = Duration::from_millis(u64::try_from(index).unwrap_or(0) * 5 % 10_000);
     tokio::select! {
         _ = stop.changed() => return log,
@@ -721,10 +753,11 @@ fn receive(live: &mut Live, line: &str, log: &mut SessionLog) -> Result<()> {
     match message["method"].as_str() {
         Some("mining.notify") => {
             let parent = notify_parent(&message).context("notify parent malformed")?;
+            // Every notify, not only a changed parent: after a tip the
+            // session never got, work on a parent it held before (a reorg
+            // back) is new work for that tip.
             let connection = log.connections.last_mut().context("no connection")?;
-            if connection.parents.last().map(|(_, known)| known) != Some(&parent) {
-                connection.parents.push((Instant::now(), parent));
-            }
+            connection.parents.push((Instant::now(), parent));
             live.notify = message;
         }
         Some("mining.set_difficulty") => {
@@ -855,6 +888,18 @@ pub(super) struct ShareCounts {
     pub unknown_durable: usize,
 }
 
+/// Whether a correct load can earn a refusal counted under `reason`: an
+/// allow-list, so an impossible refusal and one this check does not know
+/// both fail.
+fn expected_refusal(reason: &str) -> bool {
+    if let Some(message) = reason.strip_prefix(UNTYPED) {
+        return EXPECTED_UNTYPED
+            .iter()
+            .any(|expected| message.contains(expected));
+    }
+    EXPECTED_REASONS.contains(&reason)
+}
+
 /// Hold `submits` to the durable ledger rows `durable`: every accepted
 /// share is durable, no refused share is, and a durable share was accepted
 /// or has an unknown answer.
@@ -881,9 +926,16 @@ fn reconcile(submits: &[&SubmitRecord], durable: &HashSet<String>) -> Result<Sha
                     record.share_id
                 );
             }
-            Answer::Rejected(_) => {
-                let reason = record.answer.reason_id().unwrap_or("(no reason_id)");
-                *counts.rejected.entry(reason.to_owned()).or_default() += 1;
+            Answer::Rejected(_) if record.answer.reason_id() == Some(OUTCOME_UNKNOWN) => {
+                counts.unknown += 1;
+                counts.unknown_durable += usize::from(durable.contains(&record.share_id));
+            }
+            Answer::Rejected(response) => {
+                let reason = match record.answer.reason_id() {
+                    Some(reason) => reason.to_owned(),
+                    None => format!("{UNTYPED} {}", response["error"][1].as_str().unwrap_or("")),
+                };
+                *counts.rejected.entry(reason.clone()).or_default() += 1;
                 ensure!(
                     !durable.contains(&record.share_id),
                     "refused share {} ({reason}) is in the ledger",
@@ -1070,19 +1122,16 @@ impl LoadRecord {
     fn verdict(&self, durable: &HashSet<String>) -> Result<()> {
         let submits = self.submits();
         let counts = reconcile(&submits, durable)?;
-        let impossible: Vec<String> = IMPOSSIBLE_REASONS
+        let unexpected: Vec<String> = counts
+            .rejected
             .iter()
-            .filter_map(|reason| {
-                counts
-                    .rejected
-                    .get(*reason)
-                    .map(|count| format!("{count} {reason}"))
-            })
+            .filter(|(reason, _)| !expected_refusal(reason))
+            .map(|(reason, count)| format!("{count} {reason}"))
             .collect();
         ensure!(
-            impossible.is_empty(),
-            "the load earned refusals a correct miner never earns: {}",
-            impossible.join(", ")
+            unexpected.is_empty(),
+            "the load earned refusals a correct miner never earns, or unrecognised ones: {}",
+            unexpected.join(", ")
         );
         ensure!(
             counts.accepted > 0,
@@ -1213,21 +1262,8 @@ impl LoadRecord {
 /// The scenario-level load settings: `PRISM_L4_SESSIONS` and
 /// `PRISM_L4_SHARE_RATE`, or each case's defaults.
 pub(super) fn load_settings(sessions: usize, rate: f64) -> Result<(usize, f64)> {
-    fn read<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
-    where
-        T::Err: std::fmt::Display,
-    {
-        match std::env::var(name) {
-            Ok(value) => value
-                .trim()
-                .parse()
-                .map_err(|error| anyhow::anyhow!("{name}={value:?}: {error}")),
-            Err(std::env::VarError::NotPresent) => Ok(default),
-            Err(error) => bail!("{name}: {error}"),
-        }
-    }
-    let sessions: usize = read("PRISM_L4_SESSIONS", sessions)?;
-    let rate: f64 = read("PRISM_L4_SHARE_RATE", rate)?;
+    let sessions: usize = setting("PRISM_L4_SESSIONS", sessions)?;
+    let rate: f64 = setting("PRISM_L4_SHARE_RATE", rate)?;
     ensure!(
         sessions > 0 && rate.is_finite() && rate > 0.0,
         "PRISM_L4_SESSIONS and PRISM_L4_SHARE_RATE must be positive"
@@ -1363,6 +1399,34 @@ mod tests {
     }
 
     #[test]
+    fn work_on_a_parent_held_before_serves_its_tip_again_after_a_reorg_back() {
+        let start = Instant::now();
+        // `receive` records every notify, so the second notify on "a" after
+        // the missed tip "b" is there to find.
+        let record = record(
+            start,
+            vec![connection(
+                start,
+                0,
+                &[(1.0, "g"), (10.5, "a"), (20.6, "a")],
+            )],
+            &[
+                (0, "g", 0.0),
+                (0, "a", 10.0),
+                (0, "b", 20.0),
+                (0, "a", 20.1),
+            ],
+        );
+        let deliveries = record.deliveries();
+        let back = deliveries
+            .iter()
+            .rfind(|delivery| delivery.hash == "a")
+            .expect("the reorg back's delivery");
+        assert_eq!((back.served, back.late), (1, 0), "{back:?}");
+        assert!((back.seconds[0] - 0.5).abs() < 1e-6, "{back:?}");
+    }
+
+    #[test]
     fn a_frontend_still_unready_when_the_bound_expires_is_not_gated() {
         let start = Instant::now();
         let mut record = record(
@@ -1450,6 +1514,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("s9 was never submitted"));
+
+        // An unknown COMMIT outcome may land: it counts as unanswered.
+        let unknown = Answer::Rejected(json!({"id":4,"result":null,
+            "error":[20,"ledger outcome unknown",{"reason_id":"ledger-outcome-unknown"}]}));
+        let submits = [submit("s5", unknown)];
+        let records: Vec<&SubmitRecord> = submits.iter().collect();
+        let counts = reconcile(&records, &durable(&["s5"])).expect("an unknown outcome may land");
+        assert_eq!((counts.unknown, counts.unknown_durable), (1, 1));
+        assert!(counts.rejected.is_empty());
+    }
+
+    #[test]
+    fn only_refusals_a_correct_miner_can_earn_are_expected() {
+        for reason in ["stale-job", "unknown-job", "backend-rpc-unavailable"] {
+            assert!(expected_refusal(reason), "{reason}");
+        }
+        for reason in [
+            "duplicate-share",
+            "low-difficulty",
+            "unauthorized-worker",
+            "invalid-extranonce",
+            "invalid-ntime-or-nonce",
+            "something-new",
+        ] {
+            assert!(!expected_refusal(reason), "{reason}");
+        }
+        assert!(expected_refusal(&format!(
+            "{UNTYPED} too many connections for username"
+        )));
+        assert!(!expected_refusal(&format!("{UNTYPED} ")));
     }
 
     #[test]

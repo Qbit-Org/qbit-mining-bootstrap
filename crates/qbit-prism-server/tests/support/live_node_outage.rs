@@ -120,26 +120,37 @@ async fn outage_case(fault: Fault, hold: Hold, reindex: bool) -> Result<()> {
     let Some(mut fixture) = Fixture::open_with_servers(false, false).await? else {
         return Ok(());
     };
-    let result = outage_case_on(&mut fixture, fault, hold, reindex, async |_| Ok(())).await;
+    let result = outage_case_on(
+        &mut fixture,
+        fault,
+        hold,
+        reindex,
+        async |_| Ok(()),
+        async |_| Ok(()),
+    )
+    .await;
     let cleanup = fixture.cleanup().await;
     result.and(cleanup)
 }
 
 /// One case on a fixture opened without servers, which the caller cleans
-/// up, then `after` while the servers still reach the node through the
-/// proxy: #553 runs the cases under session load.
-pub(super) async fn outage_case_on<F>(
+/// up: `ready` once both servers report healthy, before the first block,
+/// and `after` while the servers still reach the node through the proxy.
+/// #553 runs the cases under session load.
+pub(super) async fn outage_case_on<R, F>(
     fixture: &mut Fixture,
     fault: Fault,
     hold: Hold,
     reindex: bool,
+    ready: R,
     after: F,
 ) -> Result<()>
 where
+    R: AsyncFnOnce(&mut Fixture) -> Result<()>,
     F: AsyncFnOnce(&mut Fixture) -> Result<()>,
 {
     let proxy = RpcProxy::start(fixture.rpc_port).await?;
-    let mut result = outage_steps(fixture, &proxy, fault, hold, reindex).await;
+    let mut result = outage_steps(fixture, &proxy, fault, hold, reindex, ready).await;
     if result.is_ok() {
         result = after(fixture).await;
     }
@@ -151,13 +162,17 @@ where
     result
 }
 
-async fn outage_steps(
+async fn outage_steps<R>(
     fixture: &mut Fixture,
     proxy: &RpcProxy,
     fault: Fault,
     hold: Hold,
     reindex: bool,
-) -> Result<()> {
+    ready: R,
+) -> Result<()>
+where
+    R: AsyncFnOnce(&mut Fixture) -> Result<()>,
+{
     // The servers are the only clients that go through the proxy; the test's
     // own calls go to the node directly.
     let node_port = fixture.rpc_port;
@@ -170,6 +185,7 @@ async fn outage_steps(
     fixture.rpc_port = node_port;
     started?;
     wait_health(fixture, true, 30).await?;
+    ready(fixture).await?;
 
     // A block before the fault: the proxy is transparent.
     let genesis = fixture.rpc("getbestblockhash", json!([])).await?;

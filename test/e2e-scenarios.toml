@@ -522,16 +522,7 @@ owner = "#553"
 lanes = ["L4"]
 criteria = "#521 scenario 7's assertions unchanged at 2,000 payees (two fanout chunks per block): attribution, coinbase, CTV outputs and carry-forward balances match an independent PPLNS recomputation, and the fanouts reach the wallets and are spent (decision 7)."
 runs = false
-reason = "Blocked by #604: the fixture opens about 1,500 worker sessions per frontend one at a time, and at its 1 s reanchor each first job queues behind every connected session's same-tip rebuild, so some worker never gets work. Scenario wallets-2000-cap-expected-failure runs the case weekly and fails once #604 is fixed."
-
-[[scenario]]
-id = "wallets-2000-cap-expected-failure"
-title = "#604's expected failure: #521 scenario 7 at 2,000 wallets"
-owner = "#604"
-lanes = ["weekly"]
-criteria = "Passes while #604 holds: the 2,000-wallet case (wallets-2000-cap) fails because a worker never received work. It fails on any other failure, and when scenario 7 passes, which is when wallets-2000-cap runs and this expectation goes."
-runs = true
-tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_wallets_share_to_spend_starves_first_jobs_until_604_is_fixed"]
+reason = "Blocked by #604 and #622. In debug the fixture opens about 1,500 worker sessions per frontend one at a time, and at its 1 s reanchor each first job queues behind every connected session's same-tip rebuild, so some worker never gets work (#604). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_starves_first_jobs_until_604_is_fixed reproduces #604 by hand."
 
 [[scenario]]
 id = "chain-events-under-load"
@@ -550,16 +541,16 @@ tests = [
   "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_after_accepting_under_2000_sessions_lands_the_block_once",
   "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_before_submitblock_under_2000_sessions_lands_the_block_once",
 ]
-notes = "The frontends run #575's share-only settings and the production 60 s payout reanchor (#598: at the live fixture's 1 s, 2,000 sessions on one frontend get no work; scenario one-frontend-fast-reanchor-expected-failure). Scenarios 1 and 2 and scenario 4's crash case run nightly; scenario 4's other four cases and scenario 5's 20-minute soak at 400 shares/s run weekly."
+notes = "The frontends run #575's share-only settings and the production 60 s payout reanchor (scenario one-frontend-fast-reanchor runs the fixture's 1 s as #598's guard). Scenarios 1 and 2 and scenario 4's crash case run nightly; scenario 4's other four cases and scenario 5's 20-minute soak at 400 shares/s run weekly."
 
 [[scenario]]
-id = "one-frontend-fast-reanchor-expected-failure"
-title = "#598's expected failure: 2,000 sessions on one frontend at a 1 s reanchor"
+id = "one-frontend-fast-reanchor"
+title = "#598's guard: 2,000 sessions on one frontend at a 1 s reanchor"
 owner = "#598"
-lanes = ["weekly"]
-criteria = "Passes while #598 holds: of three external tips 20 s apart, at least one leaves sessions on the ready frontend without work past 15 s, while every acknowledged share stays durable and no refusal is impossible. It fails on any other load failure, and when every tip reaches every session in time, which is when the expectation goes."
+lanes = ["nightly"]
+criteria = "Each of three external tips 20 s apart reaches every one of 2,000 sessions on the one frontend within 15 s at the live fixture's 1 s reanchor and 5 shares/s, with the load's own checks. Before #598's fix almost no session got work on the 2nd and 3rd tips. Debug only: in release the fan-out outruns the reanchor even without the fix."
 runs = true
-tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_is_fixed"]
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_every_tip"]
 
 [[scenario]]
 id = "external-tips-time-to-usable-work"

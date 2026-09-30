@@ -183,6 +183,12 @@ pub(super) fn start_frontend(fixture: &Fixture, index: usize, rpc_port: u16) -> 
     fixture.start_server_with(index, None, &[("QBIT_RPC_PORT", rpc_port.to_string())])
 }
 
+/// A check [`server_ready`] also waits on once the server is ready: #553
+/// installs one while a session load runs, so a scenario's next step comes
+/// under the whole load. `None` otherwise; live cases run one at a time.
+pub(super) type ReadyGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+pub(super) static READY_GATE: std::sync::Mutex<Option<ReadyGate>> = std::sync::Mutex::new(None);
+
 pub(super) async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
     until(
         &format!("PRISM readiness of server {index}"),
@@ -197,7 +203,15 @@ pub(super) async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> 
                 .is_success())
         },
     )
-    .await
+    .await?;
+    let gate = READY_GATE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ready gate poisoned"))?
+        .clone();
+    match gate {
+        Some(gate) => until("the ready gate", 120, || async { Ok(gate()) }).await,
+        None => Ok(()),
+    }
 }
 
 /// Wait until `client` holds work on `parent`, and require that it arrived

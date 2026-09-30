@@ -7,6 +7,7 @@
 # executed with scripts/check_gate_manifest.py (#521).
 # Each id is also named in test/e2e-scenarios.toml (#543).
 qbit-prism-load::soak_smoke::the_soak_smoke_preset_rolls_over_archives_and_holds_its_gates
+qbit-prism-server::live_regtest::chain_events_load_tests::nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_every_tip
 qbit-prism-server::live_regtest::chain_events_load_tests::nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_every_session
 qbit-prism-server::live_regtest::chain_events_load_tests::nightly_external_tips_at_target_spacing_reach_every_session_on_both_frontends
 qbit-prism-server::live_regtest::chain_events_load_tests::nightly_lost_race_under_2000_sessions_orphans_once_and_serves_every_session

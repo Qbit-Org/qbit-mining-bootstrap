@@ -4,8 +4,6 @@
 # qbit-prism-server::live_regtest ids: the job runs that one binary. Neither
 # the prism-native-postgres PR job nor live-nightly runs these; the job proves
 # each executed with scripts/check_gate_manifest.py (#487 L4).
-qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_is_fixed
-qbit-prism-server::live_regtest::chain_events_load_tests::weekly_2000_wallets_share_to_spend_starves_first_jobs_until_604_is_fixed
 qbit-prism-server::live_regtest::chain_events_load_tests::weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_flat
 qbit-prism-server::live_regtest::chain_events_load_tests::weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends
 qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_killed_before_submitblock_under_2000_sessions_lands_the_block_once

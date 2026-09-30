@@ -7,9 +7,9 @@
 //! shares can miss the regtest block target. The load adds its own checks
 //! (see `live_session_load.rs`) and reports #481's time to usable work per
 //! frontend. Scenarios 1, 2 and 4 run at 2,000 sessions, D1's session count,
-//! as does scenario 5's soak; scenario 7 runs at the real-node wallet cap of
-//! 2,000 payees (#487 decision 7), whose workers are its load, and waits on
-//! #604.
+//! as does scenario 5's soak; scenario 7 at the real-node wallet cap of
+//! 2,000 payees (#487 decision 7), whose workers are its load, waits on #604
+//! and #622 and runs in no lane yet.
 //!
 //! #553 adds three scenarios, with the pass criteria set here:
 //! - two frontends on two nodes that briefly disagree about the tip;
@@ -20,11 +20,11 @@
 //!
 //! None of these runs per PR. The nightly set (test/prism-nightly-gated-tests.txt)
 //! is scenarios 1 and 2, the crash case of scenario 4, and the three new
-//! scenarios with 5 minutes of external tips, all at 100 shares/s. The weekly
-//! set (test/prism-weekly-gated-tests.txt) is the other scenario-4 cases, the
-//! soak and 45 minutes of external tips at 400 shares/s, mainnet-floor's
-//! peak, and two expected failures: 2,000 sessions on one frontend at the
-//! fixture's 1 s reanchor, on #598, and the 2,000-wallet case, on #604.
+//! scenarios with 5 minutes of external tips, all at 100 shares/s, and #598's
+//! guard, 2,000 sessions on one frontend at the fixture's 1 s reanchor. The
+//! weekly set (test/prism-weekly-gated-tests.txt) is the other scenario-4
+//! cases, the soak and 45 minutes of external tips at 400 shares/s,
+//! mainnet-floor's peak.
 //!
 //! For a local run, `PRISM_L4_SESSIONS` and `PRISM_L4_SHARE_RATE` override a
 //! case's load, `PRISM_L4_REANCHOR_SECONDS` the frontends' reanchor, and
@@ -37,7 +37,7 @@ use super::session_load::{
 };
 use super::two_node_tests::{
     assert_no_duplicate_headers, chain_state, credits, deep_reorg, finish, lost_race, node_a_best,
-    node_a_mine, own_block, server_ready, start_frontend, PeerNode,
+    node_a_mine, own_block, server_ready, start_frontend, PeerNode, READY_GATE,
 };
 use super::weighted_recipients_tests::{weighted_case, Scenario};
 use super::*;
@@ -50,6 +50,10 @@ const NIGHTLY_RATE: f64 = 100.0;
 /// The weekly set's: mainnet-floor's peak (#521's shapes; mainnet's worst
 /// five-minute rate was 394 shares/s).
 const WEEKLY_RATE: f64 = 400.0;
+/// The #598 guard's offered rate, #598's reproducer. Before the fix, at 5
+/// shares/s the 2nd and 3rd tips reached almost no session in every debug
+/// run; at 100 some runs left only ten sessions without work, and one none.
+const STARVATION_RATE: f64 = 5.0;
 /// qbit's target spacing.
 const TARGET_SPACING_SECONDS: f64 = 60.0;
 /// How long a frontend may take to report itself ready again after a
@@ -130,6 +134,28 @@ async fn load_address(fixture: &Fixture) -> Result<String> {
         .to_owned())
 }
 
+/// While alive, #521's `server_ready` waits after each server turns ready
+/// until 99% of the load's sessions hold work: scenarios 1 and 2 start their
+/// own servers, and their first events follow within seconds.
+struct ReadyGateGuard;
+
+impl ReadyGateGuard {
+    fn install(load: &SessionLoad) -> Result<Self> {
+        *READY_GATE
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ready gate poisoned"))? = Some(load.holding(0.99));
+        Ok(Self)
+    }
+}
+
+impl Drop for ReadyGateGuard {
+    fn drop(&mut self) {
+        if let Ok(mut gate) = READY_GATE.lock() {
+            *gate = None;
+        }
+    }
+}
+
 /// After a #521 scenario, one more tip on the fixture's node and the
 /// delivery bound, so the load's check holds every frontend still running to
 /// at least one tip: a scenario often ends seconds after its last one.
@@ -140,6 +166,16 @@ async fn closing_tip(fixture: &Fixture) -> Result<()> {
         .await?;
     tokio::time::sleep(DELIVERY_BOUND + Duration::from_secs(1)).await;
     Ok(())
+}
+
+/// The load report's delivery of `tip` on `frontend`.
+fn tip_delivery<'a>(report: &'a Value, frontend: usize, tip: &str) -> Result<&'a Value> {
+    report["tips"]
+        .as_array()
+        .context("no tips in the report")?
+        .iter()
+        .find(|delivery| delivery["frontend"] == frontend && delivery["tip"] == tip)
+        .with_context(|| format!("no delivery of {tip} on frontend {frontend}: {report}"))
 }
 
 /// Every frontend in `frontends` had at least one tip held to the bound.
@@ -219,7 +255,8 @@ async fn nightly_lost_race_under_2000_sessions_orphans_once_and_serves_every_ses
             [Some(0), Some(0)],
         )
         .await?;
-        let report = under_load(fixture, plan, async |fixture, _| {
+        let report = under_load(fixture, plan, async |fixture, load| {
+            let _gate = ReadyGateGuard::install(load)?;
             lost_race(fixture, peer).await?;
             closing_tip(fixture).await
         })
@@ -245,7 +282,8 @@ async fn nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_
             [Some(0), Some(1)],
         )
         .await?;
-        let report = under_load(fixture, plan, async |fixture, _| {
+        let report = under_load(fixture, plan, async |fixture, load| {
+            let _gate = ReadyGateGuard::install(load)?;
             deep_reorg(fixture, peer).await?;
             closing_tip(fixture).await
         })
@@ -262,10 +300,16 @@ async fn outage_under_load(name: &str, fault: Fault, hold: Hold, rate: f64) -> R
     one_node_case(false, sessions, async |fixture| {
         let plan =
             LoadPlan::on_fixture(fixture, name, sessions, rate, load_address(fixture).await?);
-        let report = under_load(fixture, plan, async |fixture, _| {
-            outage_case_on(fixture, fault, hold, false, async |fixture| {
-                closing_tip(fixture).await
-            })
+        let report = under_load(fixture, plan, async |fixture, load| {
+            outage_case_on(
+                fixture,
+                fault,
+                hold,
+                false,
+                // The case starts the servers; the fault waits for the load.
+                async |_| load.until_connected(0.99, 120).await,
+                async |fixture| closing_tip(fixture).await,
+            )
             .await
         })
         .await?;
@@ -350,7 +394,15 @@ async fn weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_f
 {
     let (sessions, rate) = load_settings(SESSIONS, WEEKLY_RATE)?;
     let seconds: u64 = setting("PRISM_DENSE_SOAK_SECONDS", 1_200)?;
+    ensure!(
+        seconds >= 60,
+        "PRISM_DENSE_SOAK_SECONDS must be at least 60, not {seconds}"
+    );
     let budget: f64 = setting("PRISM_DENSE_SOAK_REBUILD_P99_SECONDS", 5.0)?;
+    ensure!(
+        budget.is_finite() && budget > 0.0,
+        "PRISM_DENSE_SOAK_REBUILD_P99_SECONDS must be finite and positive"
+    );
     one_node_case(false, sessions, async |fixture| {
         for index in 0..2 {
             let process = fixture.start_server(index)?;
@@ -366,14 +418,29 @@ async fn weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_f
             rate,
             load_address(fixture).await?,
         );
-        under_load(fixture, plan, async |fixture, load| {
+        let report = under_load(fixture, plan, async |fixture, load| {
             load.until_connected(0.99, 120).await?;
             soak(fixture, seconds, budget).await
         })
-        .await
-        .map(drop)
+        .await?;
+        held_to_the_bound(&report, &[0, 1])
     })
     .await
+}
+
+/// #604's queueing grows with the sessions already open, so a first job
+/// missing this early is some other failure (a wedged server, a difficulty
+/// regression), not #604.
+const WALLET_CAP_OPENED_FIRST: usize = 100;
+
+/// The `<n> of <m> sessions opened` count in the wallet case's error.
+fn sessions_opened(error: &str) -> Option<usize> {
+    let (before, _) = error.split_once(" sessions opened")?;
+    let words: Vec<&str> = before.split_whitespace().rev().take(3).collect();
+    match words[..] {
+        [_, "of", opened] => opened.parse().ok(),
+        _ => None,
+    }
 }
 
 /// #521 scenario 7 at the real-node wallet cap (#487 decision 7), expected
@@ -389,15 +456,24 @@ async fn weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_f
 /// scenario's own degeneracy check fails there. The case passes while the
 /// first-job starvation holds; once #604 is fixed it runs the scenario
 /// unchanged and says so, and then the expectation goes.
+///
+/// In no lane: that holds in debug, but in release (the weekly job's build)
+/// every session opens and a later round's new tip reaches some worker
+/// late, with `tip polling stale` deferrals (#622). Run it by hand until
+/// both are fixed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "#553 L4 weekly: #521 scenario 7 at 2,000 wallets, #604's expected failure"]
-async fn weekly_2000_wallets_share_to_spend_starves_first_jobs_until_604_is_fixed() -> Result<()> {
+#[ignore = "#553 L4, by hand: #521 scenario 7 at 2,000 wallets, #604's expected failure (#622 in release)"]
+async fn wallets_2000_share_to_spend_starves_first_jobs_until_604_is_fixed() -> Result<()> {
     gate::required_inputs(
         gate::site!(),
         &[gate::Input::QbitdBin, gate::Input::DatabaseUrl],
     )?;
     match weighted_case(&WALLET_CAP).await {
-        Err(error) if format!("{error:#}").contains("never received work") => {
+        Err(error)
+            if format!("{error:#}").contains("never received work")
+                && sessions_opened(&format!("{error:#}"))
+                    .is_some_and(|opened| opened >= WALLET_CAP_OPENED_FIRST) =>
+        {
             eprintln!("#604 reproduced at 2,000 wallets: {error:#}");
             Ok(())
         }
@@ -405,26 +481,24 @@ async fn weekly_2000_wallets_share_to_spend_starves_first_jobs_until_604_is_fixe
             Err(error.context("the 2,000-wallet case failed for a reason other than #604"))
         }
         Ok(()) => bail!(
-            "#604 looks fixed: #521 scenario 7 passed at 2,000 wallets; drop this expectation and \
-             keep the case as an ordinary weekly one"
+            "#604 looks fixed: #521 scenario 7 passed at 2,000 wallets; drop this expectation and, \
+             once #622 is fixed too, list the case weekly"
         ),
     }
 }
 
-/// #598, expected to fail until it is fixed, as the migration lifecycle
-/// holds #582. 2,000 sessions on one frontend at the live fixture's 1 s
-/// reanchor: each session's job build is superseded by the next publication
-/// before it completes, so a new tip reaches no session. The case passes
-/// while that stays true: a tip that lasts past the delivery bound on a
-/// ready frontend leaves sessions without work, and the load's other checks
-/// (every acknowledged share durable, no impossible refusal) still hold.
-/// Once #598 is fixed it fails; then drop the expectation and keep it as an
-/// ordinary weekly case.
+/// #598's regression guard: 2,000 sessions on one frontend at the live
+/// fixture's 1 s reanchor. Before #598's fix each session's job build was
+/// superseded by the next publication before it completed, so a new tip
+/// reached almost no session; now every one of three external tips, 20 s
+/// apart, must reach every session within the delivery bound, with the
+/// load's other checks. Nightly, in debug: in release the fan-out outruns
+/// the reanchor and even the unfixed server passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "#553 L4 weekly: #598's expected failure, 2,000 sessions on one frontend at a 1 s reanchor"]
-async fn weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_is_fixed(
-) -> Result<()> {
-    let (sessions, rate) = load_settings(SESSIONS, NIGHTLY_RATE)?;
+#[ignore = "#553 L4 nightly: #598's guard, 2,000 sessions on one frontend at a 1 s reanchor"]
+async fn nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_every_tip() -> Result<()>
+{
+    let (sessions, rate) = load_settings(SESSIONS, STARVATION_RATE)?;
     two_node_case(false, sessions, async |fixture, peer| {
         fixture
             .server_env
@@ -435,7 +509,7 @@ async fn weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_
         let mut plan = two_node_plan(
             fixture,
             peer,
-            "598-one-frontend-1s-reanchor",
+            "one-frontend-1s-reanchor",
             sessions,
             rate,
             [None, None],
@@ -444,54 +518,20 @@ async fn weekly_2000_sessions_on_one_frontend_at_a_1s_reanchor_starve_until_598_
         plan.stratum.truncate(1);
         plan.api.truncate(1);
         plan.node_of = vec![Some(0)];
-        let load = SessionLoad::start(plan)?;
-        let driven = async {
-            // #598 starves some first jobs too; the tips below are the case.
-            load.until_connected(0.9, 120).await?;
+        let report = under_load(fixture, plan, async |fixture, load| {
+            load.until_connected(0.99, 120).await?;
             for _ in 0..3 {
                 external_tip(fixture, peer).await?;
                 tokio::time::sleep(DELIVERY_BOUND + Duration::from_secs(5)).await;
             }
-            anyhow::Ok(())
-        }
-        .await;
-        let record = load.stop().await;
-        driven?;
-        let starved: Vec<String> = record
-            .deliveries()
-            .iter()
-            .filter(|delivery| delivery.gated && delivery.late > 0)
-            .map(|delivery| format!("{} of {} sessions", delivery.late, delivery.eligible))
-            .collect();
-        let checked = record.check(fixture).await;
+            Ok(())
+        })
+        .await?;
         ensure!(
-            !starved.is_empty(),
-            "#598 looks fixed: every tip reached every session within {DELIVERY_BOUND:?} at a 1 s \
-             reanchor; drop this expectation and keep the case as an ordinary weekly one \
-             ({checked:?})"
+            report["time_to_usable_work"][0]["gated_tips"].as_u64() >= Some(3),
+            "the load's check held too few of the three tips to the bound: {report}"
         );
-        // The load's check runs its share reconciliation and refusal checks
-        // first, so failing on either of #598's two symptoms means those
-        // held: tips that reached no session in time, or sessions whose
-        // first job never came.
-        match checked {
-            Err(error)
-                if [
-                    "new-tip work did not reach every session",
-                    "never held work",
-                ]
-                .iter()
-                .any(|symptom| format!("{error:#}").contains(symptom)) =>
-            {
-                eprintln!(
-                    "#598 reproduced: tips left {} without work",
-                    starved.join(", ")
-                );
-                Ok(())
-            }
-            Err(error) => Err(error.context("#598's starvation came with another load failure")),
-            Ok(_) => bail!("the load's check passed although {starved:?} were starved"),
-        }
+        Ok(())
     })
     .await
 }
@@ -586,6 +626,7 @@ async fn nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_bl
         let plan =
             two_node_plan(fixture, peer, "node-loses-peer", sessions, rate, [Some(0), Some(0)])
                 .await?;
+        let mut isolated_tip: Option<String> = None;
         let report = under_load(fixture, plan, async |fixture, load| {
             load.until_connected(0.99, 120).await?;
             let stale = external_tip(fixture, peer).await?;
@@ -599,6 +640,7 @@ async fn nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_bl
                 node_a_best(fixture).await? == isolated,
                 "the isolated own block is not node A's tip"
             );
+            isolated_tip = Some(isolated.clone());
             tokio::time::sleep(HOLD).await;
             let ready_while_isolated = [
                 health(fixture, 0).await?.0,
@@ -633,10 +675,24 @@ async fn nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_bl
             Ok(())
         })
         .await?;
+        let isolated = isolated_tip.context("the isolated block was not recorded")?;
         for frontend in 0..2 {
             ensure!(
                 report["time_to_usable_work"][frontend]["gated_tips"].as_u64() >= Some(2),
                 "the load's check held too few of frontend {frontend}'s tips to the bound: {report}"
+            );
+            // The isolated block is the case: it is held to the bound on
+            // every session, whatever the load's check gated.
+            let delivery = tip_delivery(&report, frontend, &isolated)?;
+            ensure!(
+                delivery["gated"] == true
+                    && delivery["eligible"].as_u64() > Some(0)
+                    && delivery["served"] == delivery["eligible"]
+                    && delivery["all_sessions_s"]
+                        .as_f64()
+                        .is_some_and(|seconds| seconds <= DELIVERY_BOUND.as_secs_f64()),
+                "frontend {frontend} did not give every session work on the isolated block within \
+                 {DELIVERY_BOUND:?}: {delivery}"
             );
         }
         Ok(())
@@ -743,12 +799,7 @@ async fn nightly_two_frontends_on_two_nodes_disagree_briefly_and_converge_under_
         })
         .await?;
         let (refused, loser, winner) = split.context("the split was not recorded")?;
-        let tips = report["tips"].as_array().context("no tips in the report")?;
-        let delivery = |frontend: usize, tip: &str| {
-            tips.iter()
-                .find(|delivery| delivery["frontend"] == frontend && delivery["tip"] == tip)
-                .with_context(|| format!("no delivery of {tip} on frontend {frontend}: {report}"))
-        };
+        let delivery = |frontend: usize, tip: &str| tip_delivery(&report, frontend, tip);
         let refused = delivery(loser, &refused)?;
         ensure!(
             refused["served"] == 0 && refused["eligible"].as_u64() > Some(0),
@@ -797,7 +848,7 @@ async fn external_tips(name: &str, seconds: u64, rate: f64) -> Result<()> {
         }
         let plan = two_node_plan(fixture, peer, name, sessions, rate, [Some(0), Some(0)]).await?;
         let mut minted = 0usize;
-        under_load(fixture, plan, async |fixture, load| {
+        let report = under_load(fixture, plan, async |fixture, load| {
             load.until_connected(0.99, 120).await?;
             let mut rng = StdRng::seed_from_u64(0x0553_0060);
             let started = Instant::now();
@@ -822,7 +873,7 @@ async fn external_tips(name: &str, seconds: u64, rate: f64) -> Result<()> {
         .await?;
         ensure!(minted > 0, "no external tip in {seconds} s");
         eprintln!("{name}: {minted} external tips in {seconds} s");
-        Ok(())
+        held_to_the_bound(&report, &[0, 1])
     })
     .await
 }
@@ -839,4 +890,18 @@ async fn nightly_external_tips_at_target_spacing_reach_every_session_on_both_fro
 async fn weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends() -> Result<()>
 {
     external_tips("external-tips-45m", 2_700, WEEKLY_RATE).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wallet_case_error_names_how_many_sessions_opened() {
+        let error = "wallet-cap-2000: 1234 of 3000 sessions opened: a.w0 never received work at \
+                     difficulty 0.1: deadline has elapsed";
+        assert_eq!(sessions_opened(error), Some(1234));
+        assert_eq!(sessions_opened("a.w0 never received work"), None);
+        assert_eq!(sessions_opened("0 of 3000 sessions opened: x"), Some(0));
+    }
 }
