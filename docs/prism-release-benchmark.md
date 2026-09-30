@@ -181,6 +181,28 @@ agree. When the base meets it and the candidate does not, the comparison
 calls it a **regression**. The medians' differences are printed under each
 phase.
 
+## One build across a suite (L3, #550)
+
+`qbit-prism-load-compare --collate <plan.json> --runs-dir <dir> --presets-dir
+crates/qbit-prism-load/presets --verdict-out verdict.json` renders one build's
+run of a preset suite (`presets/suites.toml`) instead of two builds' runs of
+one preset. `.github/workflows/prism-load-l3.yml` calls it after the
+production-window matrix. It uses the same row as the A/B table, so a cell
+reads the same in both: #473's rule over the repeats in the medians, "n/a"
+for a figure a report does not carry, and every run held to its preset's
+gates. Each row leads with the preset's sessions, window, frontends,
+replication and plan, as #473's tables do. A preset with no D1 verdict table
+(the capacity-envelope points and the mainnet shapes) is measured in the same
+columns but gets no D1 verdict.
+
+A run counts only when its artifact is present, its report names the plan's
+commit, it ran the checked-in preset byte for byte (SHA-256) and it was built
+from a clean tree. Exit 0 when every planned run reached its gate and passed
+it, 1 when not, 2 when the inputs cannot be read. The collation does not
+compare against a base. The A/B series on the reference host stays the
+release's regression check, and L3 is the production-window evidence beside
+it, on the CI runner class.
+
 ## Reference host
 
 Rates depend heavily on what a durable commit costs. The share append

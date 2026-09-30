@@ -915,6 +915,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `tip-delivery-2000-miners-400k-2fe-retarget-500-addresses` | manual | 8 vCPU | the same with 500 Zipf(1.1) addresses |
 | `throughput-400k-window-1fe-async` | nightly | 8 vCPU | PR #473's production-window D1 baseline cell, exactly as it ran it on `a1937054` (admission `sessions_per_frontend + 16`, from before #497) |
 | `throughput-400k-window-{2,4}fe-async`, `throughput-400k-window-2fe-sync`, `throughput-200k-window-1fe-async`, `throughput-500k-window-{1,2,4}fe-async` | manual | 16 vCPU | #473's other cells, likewise |
+| `throughput-400k-window-2fe-async-3-blocks`, `dense-cadence-400k-window-{1,2}fe-async` | manual | 16 vCPU | #473's found-block run (`--scheduled-blocks 3`) and its dense-cadence runs (`--cadence dense --scheduled-blocks 15`) at 400k, likewise (#550). The 20k dense attempt, which exited 6, is not a preset |
 | `mainnet-shape-130-addresses` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
 | `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
 | `mainnet-shape-2600-addresses` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
@@ -985,6 +986,43 @@ it never shows as a pass. Both weekly schedules (Sunday's live scenarios,
 Saturday's soak) and dispatches always run. A failed scheduled run, nightly,
 weekly or the soak, opens the `prism-load-nightly-failure` issue, or comments
 on it while it is open.
+
+### The production-window matrix, L3 (#550)
+
+`presets/suites.toml` names preset suites apart from each preset's own
+`schedule`, so a preset can run nightly and in a suite. A suite lists its
+presets, how many times each runs (`repeats`, one job each) and, optionally,
+one `runner` for all of them; `scripts/prism_load_matrix.py suite:<name>`
+plans it, and `scripts/check_e2e_scenarios.py` holds the scenario manifest to
+it.
+
+| Suite | Presets | Repeats | Runner |
+|---|---|---|---|
+| `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, the 3-block run, dense cadence at fe1 and fe2, 500k fe1/2/4 | 3 | 32 vCPU |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async | 1 | 32 vCPU |
+
+The runner is the 32 vCPU class until #542 picks one per lane.
+`.github/workflows/prism-load-l3.yml` runs `l3-full` on a pull request into
+`3.x.x` or `main` that changes `VERSION` (from this repository), when a
+maintainer applies the `release-candidate` label, on a `v*` tag and on
+dispatch (`suite`, `ref`), and `l3-reduced` weekly on `3.x.x`. It follows the
+nightly's pattern (one pinned commit, one release build, one job per preset
+repeat through `prism-load-run.sh`, gated by its preset), then collates every
+run with `qbit-prism-load-compare --collate` into #473's document tables: per
+D1 phase a row per preset with its sessions, window, frontends, replication
+and plan, and #511's cells. A planned run whose job left no artifact, or
+whose report names another commit or another preset file, is listed and
+fails the suite; it is never dropped. The collate job writes a verdict,
+`complete` when every run reached its gate and `passed` when every one passed
+it, as the artifact `prism-l3-verdict-<tree>`.
+
+A tag promotes instead of rerunning when the newest finished pull request
+run of `l3-full` from this repository recorded a complete verdict for the
+tagged commit's tree (`git rev-parse HEAD^{tree}`): the tag run carries that
+run's tables and verdict, linked to it, and fails if it failed. Anything
+else, including a failed lookup, reruns the suite. Dispatch with
+`tag_dry_run` does the same on `ref` without a tag. The workflow is never a
+required check.
 
 `.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
 schedule) measures the Blacksmith runner classes themselves before a lane
