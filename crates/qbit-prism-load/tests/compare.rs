@@ -794,6 +794,29 @@ fn a_population_or_an_arrival_other_than_the_seed_draws_fails() {
         "{}",
         result.markdown
     );
+    // Every seeded share on one recipient, though the sessions still fan out.
+    let mut runs = realistic_runs(&manifest, &pinned);
+    for (pointer, value) in [
+        (
+            "/population/window_shares_per_recipient_concentration/nonzero",
+            json!(1),
+        ),
+        (
+            "/population/window_shares_per_recipient_concentration/top1_share",
+            json!(1.0),
+        ),
+    ] {
+        set_pointer(runs[1].report.as_mut().unwrap(), pointer, value);
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("/population/window_shares_per_recipient_concentration/nonzero"),
+        "{}",
+        result.markdown
+    );
     // A smooth schedule, though the report echoes the bursty declaration.
     let mut runs = realistic_runs(&manifest, &pinned);
     set_pointer(

@@ -1004,9 +1004,10 @@ pub const POPULATION_TOLERANCE: f64 = 1e-9;
 /// The generated population's figures a side report states, drawn by this
 /// harness's own generator from the preset (`Population::build`; none of
 /// these reads the payout address): each session's difficulty multiplier,
-/// hashrate and offer weight, as `population_report` summarizes them, and
-/// the mean offered multiplier. A build that echoes the pinned distribution
-/// but draws another shows it here.
+/// hashrate and offer weight, as `population_report` summarizes them, the
+/// mean offered multiplier, and the sessions' and seeded window's fan-out
+/// over the recipients. A build that echoes the pinned distribution but
+/// draws another shows it here.
 pub fn expected_population(pinned: &BTreeMap<String, Value>) -> Result<Vec<(&'static str, f64)>> {
     let args = preset_args(pinned)?;
     let population = crate::realism::Population::build(&args.population_spec()?, "")?;
@@ -1055,6 +1056,62 @@ pub fn expected_population(pinned: &BTreeMap<String, Value>) -> Result<Vec<(&'st
             .zip([figures.min, figures.max, figures.mean])
         {
             expected.push((pointer, value.context("a population has sessions")?));
+        }
+    }
+    // How the sessions and the seeded window's shares fan out over the
+    // recipients, as `population_report` concentrates them: the sessions
+    // by recipient, and the window as `window_assignments` draws it for
+    // the preset's seeded rows (none for a single-address population).
+    let recipients = population.addresses.len();
+    let mut sessions = vec![0f64; recipients];
+    for session in &population.sessions {
+        sessions[session.recipient] += 1.0;
+    }
+    let window = population
+        .window_assignments(args.seed_share_count())
+        .map(|assignments| {
+            let mut counts = vec![0f64; recipients];
+            for recipient in assignments {
+                counts[recipient as usize] += 1.0;
+            }
+            counts
+        });
+    for (pointers, counts) in [
+        (
+            [
+                "/population/sessions_per_recipient_concentration/count",
+                "/population/sessions_per_recipient_concentration/nonzero",
+                "/population/sessions_per_recipient_concentration/total",
+                "/population/sessions_per_recipient_concentration/top1_share",
+                "/population/sessions_per_recipient_concentration/top10_share",
+                "/population/sessions_per_recipient_concentration/gini",
+            ],
+            Some(sessions),
+        ),
+        (
+            [
+                "/population/window_shares_per_recipient_concentration/count",
+                "/population/window_shares_per_recipient_concentration/nonzero",
+                "/population/window_shares_per_recipient_concentration/total",
+                "/population/window_shares_per_recipient_concentration/top1_share",
+                "/population/window_shares_per_recipient_concentration/top10_share",
+                "/population/window_shares_per_recipient_concentration/gini",
+            ],
+            window,
+        ),
+    ] {
+        let Some(counts) = counts else {
+            continue;
+        };
+        let figures = crate::realism::concentration(&counts);
+        for pointer in pointers {
+            let key = pointer.rsplit('/').next().expect("a pointer has a key");
+            expected.push((
+                pointer,
+                figures[key]
+                    .as_f64()
+                    .with_context(|| format!("the drawn population has no {key}"))?,
+            ));
         }
     }
     Ok(expected)
