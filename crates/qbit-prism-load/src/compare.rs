@@ -545,11 +545,13 @@ pub const DURATION_TOLERANCE: f64 = 0.05;
 /// left the phase out while another ran it, reported no target rate or no
 /// length, a second distinct target, or lengths spread past
 /// [`DURATION_TOLERANCE`] each fail. A phase reported only for information
-/// still has to be the same workload on both sides.
+/// still has to be the same workload on both sides. `frontends` is the
+/// pinned count, which decides the planned restarts.
 fn phase_workload(
     runs: &[LoadedRun],
     phase: &str,
     expected: Option<&crate::cli::PhasePlan>,
+    frontends: usize,
 ) -> Option<String> {
     let planned = expected.is_some();
     let counted: Vec<&LoadedRun> = runs.iter().filter(|r| r.excluded.is_none()).collect();
@@ -572,7 +574,7 @@ fn phase_workload(
             ));
         };
         if let Some(expected) = expected {
-            if let Some(why) = off_plan(id, value, expected) {
+            if let Some(why) = off_plan(id, value, expected, frontends) {
                 return Some(format!(
                     "**the runs did not drive the pinned workload**: {why}"
                 ));
@@ -768,9 +770,15 @@ pub fn expected_phases(pinned: &BTreeMap<String, Value>) -> Result<Vec<crate::cl
 
 /// Why a counted run's report of `phase` does not match the preset's plan
 /// for it, or `None` when it does: the target rate and whether the phase is
-/// in the artifact exactly, the configured database delay exactly, and the
-/// length within [`DURATION_TOLERANCE`] of the planned seconds.
-fn off_plan(id: &str, reported: &Value, plan: &crate::cli::PhasePlan) -> Option<String> {
+/// in the artifact exactly, the configured database delay and the frontend
+/// restarts exactly (with `frontends` running), and the length within
+/// [`DURATION_TOLERANCE`] of the planned seconds.
+fn off_plan(
+    id: &str,
+    reported: &Value,
+    plan: &crate::cli::PhasePlan,
+    frontends: usize,
+) -> Option<String> {
     let name = &plan.name;
     let Some(target) = reported["target_rate_shares_per_second"].as_f64() else {
         return Some(format!("{id} reports no target rate for `{name}`"));
@@ -805,6 +813,16 @@ fn off_plan(id: &str, reported: &Value, plan: &crate::cli::PhasePlan) -> Option<
             "{id} ran `{name}` with a {} ms database delay, not the planned {} ms",
             delay.map_or("unreported".into(), |d| d.to_string()),
             plan.database_delay_ms
+        ));
+    }
+    // A run that skipped the drained restart or the mid-flight kill ran an
+    // easier phase, whatever the other runs did.
+    let restarts = reported["frontend_restarts"].as_u64();
+    let planned = plan.frontend_restarts(frontends);
+    if restarts != Some(planned) {
+        return Some(format!(
+            "{id} restarted a frontend {} times in `{name}`, not the planned {planned}",
+            restarts.map_or("an unreported number of".into(), |n| n.to_string())
         ));
     }
     None
@@ -868,6 +886,11 @@ pub fn expected_settings(pinned: &BTreeMap<String, Value>) -> Result<Vec<Expecte
             "--pool-fee-bps",
             "/topology/pool_fee_bps",
             serde_json::json!(args.pool_fee_bps),
+        ),
+        one(
+            "--mid-flight-kill",
+            "/mid_flight_kill/ran",
+            Value::Bool(args.mid_flight_kill),
         ),
     ];
     expected.push(if args.cadence()?.is_dense() {
@@ -1044,7 +1067,17 @@ fn churn_unrealised(
 /// JSON equality with numbers compared as numbers, at any depth.
 pub fn same_json(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(_), Value::Number(_)) => a.as_f64() == b.as_f64(),
+        // Integers exactly (a seed above 2^53 has neighbours an f64 cannot
+        // tell apart); a mixed or fractional pair as numbers (0 == 0.0).
+        (Value::Number(x), Value::Number(y)) => {
+            if let (Some(p), Some(q)) = (x.as_u64(), y.as_u64()) {
+                p == q
+            } else if let (Some(p), Some(q)) = (x.as_i64(), y.as_i64()) {
+                p == q
+            } else {
+                x.as_f64() == y.as_f64()
+            }
+        }
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_json(a, b))
         }
@@ -1111,13 +1144,18 @@ fn frontend_env_mismatch(
     pinned: Option<&Value>,
 ) -> Option<String> {
     let pinned = pinned.filter(|v| !v.is_null())?;
-    let wanted = pinned.as_f64().map_or_else(
-        || pinned.as_str().unwrap_or_default().to_owned(),
-        |n| n.to_string(),
-    );
-    let same = |value: &str| match (value.parse::<f64>(), wanted.parse::<f64>()) {
+    // The number as JSON wrote it: through an f64 an integer above 2^53
+    // would already be its neighbour.
+    let wanted = match pinned {
+        Value::Number(n) => n.to_string(),
+        other => other.as_str().unwrap_or_default().to_owned(),
+    };
+    let same = |value: &str| match (value.parse::<i128>(), wanted.parse::<i128>()) {
         (Ok(a), Ok(b)) => a == b,
-        _ => value == wanted,
+        _ => match (value.parse::<f64>(), wanted.parse::<f64>()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => value == wanted,
+        },
     };
     for run in runs.iter().filter(|r| r.excluded.is_none()) {
         let frontends = run
@@ -1162,10 +1200,6 @@ fn pinned_mismatch(
     pointer: &str,
     pinned: Option<&Value>,
 ) -> Option<String> {
-    let same = |a: &Value, b: &Value| match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    };
     let mut expected: Option<Value> = pinned.filter(|v| !v.is_null()).cloned();
     for run in runs.iter().filter(|r| r.excluded.is_none()) {
         let reported = run.report.as_ref().and_then(|r| r.pointer(pointer));
@@ -1176,7 +1210,7 @@ fn pinned_mismatch(
             ));
         };
         match &expected {
-            Some(value) if !same(value, reported) => {
+            Some(value) if !same_json(value, reported) => {
                 return Some(format!(
                     "**the runs did not drive the pinned workload**: {} ran `{flag}` {reported}, \
                      not {value}",
@@ -1331,7 +1365,8 @@ pub fn compare(
                 .to_owned(),
         );
     }
-    let planned = expected_phases(pinned)?;
+    let args = preset_args(pinned)?;
+    let planned = crate::cli::phases(&args)?;
     let mut all_phases: Vec<String> = planned.iter().map(|plan| plan.name.clone()).collect();
     for run in runs.iter().filter(|r| r.excluded.is_none()) {
         let names = run.report.as_ref().and_then(|r| r["phases"].as_array());
@@ -1347,7 +1382,7 @@ pub fn compare(
     }
     for phase in &all_phases {
         let plan = planned.iter().find(|plan| &plan.name == phase);
-        if let Some(why) = phase_workload(runs, phase, plan) {
+        if let Some(why) = phase_workload(runs, phase, plan, args.frontends) {
             passed = false;
             findings.push(format!("`{phase}`: {why}"));
         }
@@ -1404,6 +1439,68 @@ pub fn compare(
             break;
         }
     }
+    // The samplers ran at the pinned intervals: the ORDER-lock sampler's
+    // and every frontend's process sampler, in every phase that reports
+    // them and at least in `steady_state` (every harness since #271 reports
+    // both in every phase).
+    let lock_ms = pinned
+        .get("--lock-sample-interval-ms")
+        .and_then(Value::as_f64);
+    let process_ms = pinned
+        .get("--process-sample-interval-ms")
+        .and_then(Value::as_f64);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    'runs: for run in runs.iter().filter(|r| r.excluded.is_none()) {
+        let phases = run
+            .report
+            .as_ref()
+            .and_then(|r| r["phases"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        for phase in &phases {
+            let name = phase["name"].as_str().unwrap_or("?");
+            let lock = phase["order_lock"]["sample_interval_milliseconds"].as_f64();
+            let processes = phase["processes"]
+                .as_array()
+                .filter(|list| !list.is_empty());
+            let lock_off = match (lock, lock_ms) {
+                (Some(reported), Some(pinned)) if !close(reported, pinned) => {
+                    Some((reported, pinned))
+                }
+                _ => None,
+            };
+            let process_off = process_ms.filter(|&pinned| {
+                processes.into_iter().flatten().any(|process| {
+                    !process["sample_interval_seconds"]
+                        .as_f64()
+                        .is_some_and(|seconds| close(seconds * 1000.0, pinned))
+                })
+            });
+            let why = if name == "steady_state" && (lock.is_none() || processes.is_none()) {
+                Some(format!("reports no sampler intervals for `{name}`"))
+            } else if let Some((reported, pinned)) = lock_off {
+                Some(format!(
+                    "sampled the ORDER lock every {reported} ms in `{name}`, not the pinned \
+                     `--lock-sample-interval-ms` {pinned}"
+                ))
+            } else {
+                process_off.map(|pinned| {
+                    format!(
+                        "sampled its frontends at another interval than the pinned \
+                         `--process-sample-interval-ms` {pinned} in `{name}`"
+                    )
+                })
+            };
+            if let Some(why) = why {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} {why}",
+                    run.run.id
+                ));
+                break 'runs;
+            }
+        }
+    }
     // The degraded-database phase's delay is the pinned one.
     if let Some(pinned_delay) = pinned.get("--slow-db-delay-ms").and_then(Value::as_f64) {
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
@@ -1424,27 +1521,47 @@ pub fn compare(
             }
         }
     }
-    // Every scheduled own block fires in `steady_state` unless the dense
-    // cadence spends them as a landing budget, so outside it the phases'
+    // Every scheduled own block fires in `steady_state`, so the phases'
     // total is the pinned `--scheduled-blocks` (in every harness since #271).
-    let dense = pinned.get("--cadence").and_then(Value::as_str) == Some("dense");
-    if let (false, Some(blocks)) = (
-        dense,
-        pinned.get("--scheduled-blocks").and_then(Value::as_u64),
-    ) {
+    // Under the dense cadence the flag is instead the dense phase's landing
+    // budget: the report states it, and the phase lands one block on each
+    // slot the gap pattern places while the budget lasts.
+    if let Some(blocks) = pinned.get("--scheduled-blocks").and_then(Value::as_u64) {
+        let gaps = args.cadence_gaps()?;
+        let slots = planned
+            .iter()
+            .find(|plan| plan.dense_cadence)
+            .map(|plan| crate::cadence::landing_offsets(&gaps, plan.seconds as f64).len() as u64);
+        let expected = slots.map_or(blocks, |slots| blocks.min(slots));
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
-            let scheduled: Option<u64> = run
-                .report
-                .as_ref()
+            let report = run.report.as_ref();
+            let scheduled: Option<u64> = report
                 .and_then(|r| r["phases"].as_array())
                 .and_then(|phases| phases.iter().map(|p| p["scheduled_blocks"].as_u64()).sum());
-            if scheduled != Some(blocks) {
+            let budget = report
+                .and_then(|r| r.pointer("/dense_cadence/landing_budget"))
+                .and_then(Value::as_u64);
+            let landed = scheduled.map_or("an unreported number of".into(), |n| n.to_string());
+            let why = match slots {
+                Some(_) if budget != Some(blocks) => Some(format!(
+                    "ran a dense-cadence landing budget of {}, not the pinned \
+                     `--scheduled-blocks` {blocks}",
+                    budget.map_or("unreported".into(), |n| n.to_string())
+                )),
+                Some(slots) if scheduled != Some(expected) => Some(format!(
+                    "landed {landed} own blocks, not the {expected} that the pinned \
+                     `--scheduled-blocks` {blocks} buys of the gap pattern's {slots} slots"
+                )),
+                None if scheduled != Some(expected) => Some(format!(
+                    "scheduled {landed} own blocks, not the pinned `--scheduled-blocks` {blocks}"
+                )),
+                _ => None,
+            };
+            if let Some(why) = why {
                 passed = false;
                 findings.push(format!(
-                    "**the runs did not drive the pinned workload**: {} scheduled {} own blocks, \
-                     not the pinned `--scheduled-blocks` {blocks}",
-                    run.run.id,
-                    scheduled.map_or("an unreported number of".into(), |n| n.to_string())
+                    "**the runs did not drive the pinned workload**: {} {why}",
+                    run.run.id
                 ));
                 break;
             }

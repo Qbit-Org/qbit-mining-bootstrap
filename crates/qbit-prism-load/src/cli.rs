@@ -883,6 +883,21 @@ pub struct PhasePlan {
     pub restart_frontend: bool,
 }
 
+impl PhasePlan {
+    /// Whether the phase drains and restarts a frontend with `frontends`
+    /// running: one frontend alone cannot be restarted under load.
+    pub fn restarts_a_frontend(&self, frontends: usize) -> bool {
+        self.reconnects && self.restart_frontend && frontends >= 2
+    }
+
+    /// The frontend restarts the phase drives, as its report's
+    /// `frontend_restarts` counts them: the drained restart, and the
+    /// mid-flight kill's relaunch.
+    pub fn frontend_restarts(&self, frontends: usize) -> u64 {
+        u64::from(self.restarts_a_frontend(frontends)) + u64::from(self.mid_flight_kill)
+    }
+}
+
 pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
     let plan = args.plan()?;
     let (steady_seconds, steady_rate, burst, reconnect_seconds, slow_seconds) = match plan {

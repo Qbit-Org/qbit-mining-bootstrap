@@ -159,6 +159,29 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             "{}",
             plan.name
         );
+        // The comparator holds the samplers to the pinned intervals.
+        let lock_ms = loaded.args["--lock-sample-interval-ms"]
+            .as_f64()
+            .context("lock interval")?;
+        let process_ms = loaded.args["--process-sample-interval-ms"]
+            .as_f64()
+            .context("process interval")?;
+        assert_eq!(
+            phase["order_lock"]["sample_interval_milliseconds"].as_f64(),
+            Some(lock_ms),
+            "{}",
+            plan.name
+        );
+        for process in phase["processes"].as_array().context("processes")? {
+            let seconds = process["sample_interval_seconds"]
+                .as_f64()
+                .context("interval")?;
+            assert!(
+                (seconds * 1000.0 - process_ms).abs() < 1e-6,
+                "{}",
+                plan.name
+            );
+        }
         // The comparator holds the lowest reading to the preset's memory
         // floor, and treats an unread one as a failure.
         assert!(
@@ -169,6 +192,15 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         assert_eq!(
             phase["database_delay_milliseconds_configured"].as_u64(),
             Some(plan.database_delay_ms),
+            "{}",
+            plan.name
+        );
+        let frontends = loaded.args["--frontends"]
+            .as_u64()
+            .context("pinned frontends")?;
+        assert_eq!(
+            phase["frontend_restarts"].as_u64(),
+            Some(plan.frontend_restarts(frontends as usize)),
             "{}",
             plan.name
         );

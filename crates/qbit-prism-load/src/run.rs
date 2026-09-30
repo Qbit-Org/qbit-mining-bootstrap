@@ -2822,7 +2822,8 @@ pub async fn drive_phase_with_population(
     } else {
         None
     };
-    let restart_at = (plan.reconnects && plan.restart_frontend && args.frontends >= 2)
+    let restart_at = plan
+        .restarts_a_frontend(args.frontends)
         .then(|| duration.as_secs_f64() / 3.0);
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;

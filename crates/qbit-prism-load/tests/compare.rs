@@ -45,7 +45,8 @@ fn plain_phase(
         "shortfall": shortfall,
         "rejected_valid_shares": rejected,
         "client_ack_latency": {"p50": 2.5, "p99": p99},
-        "order_lock": {"max_waiters": 15, "mean_waiters": 13.4},
+        "order_lock": {"max_waiters": 15, "mean_waiters": 13.4, "sample_interval_milliseconds": 10.0},
+        "processes": [{"sample_interval_seconds": 1.0}],
         "reconciliation": {"missing": 0, "unexpected": 0},
         "min_mem_available_kib": 30_000 * 1024,
         "in_artifact": true,
@@ -858,6 +859,229 @@ fn another_database_or_fewer_launched_frontends_than_pinned_fails() {
             result.markdown
         );
     }
+}
+
+#[test]
+fn samplers_at_another_interval_than_pinned_fail() {
+    let manifest = manifest(288.0);
+    for (pointer, value, why) in [
+        (
+            "/phases/0/order_lock/sample_interval_milliseconds",
+            json!(100.0),
+            "sampled the ORDER lock every 100 ms",
+        ),
+        (
+            "/phases/0/processes/0/sample_interval_seconds",
+            json!(5.0),
+            "`--process-sample-interval-ms` 1000",
+        ),
+        (
+            "/phases/0/processes",
+            Value::Null,
+            "reports no sampler intervals",
+        ),
+        (
+            "/phases/0/processes",
+            json!([]),
+            "reports no sampler intervals",
+        ),
+        // Outside `steady_state` too, wherever a phase reports them.
+        (
+            "/phases/1/order_lock/sample_interval_milliseconds",
+            json!(20.0),
+            "every 20 ms in `burst`",
+        ),
+    ] {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        set_pointer(runs[1].report.as_mut().unwrap(), pointer, value);
+        let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+        assert!(!result.passed, "{pointer}");
+        assert!(
+            result.markdown.contains(why),
+            "{pointer}: {}",
+            result.markdown
+        );
+    }
+    // Each pinned interval is held on its own.
+    let mut pinned = d1_args();
+    pinned.remove("--lock-sample-interval-ms");
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    set_pointer(
+        runs[1].report.as_mut().unwrap(),
+        "/phases/0/processes/0/sample_interval_seconds",
+        json!(5.0),
+    );
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(result
+        .markdown
+        .contains("`--process-sample-interval-ms` 1000"));
+}
+
+/// A met phase as `pinned` plans it.
+fn planned_in(pinned: &std::collections::BTreeMap<String, Value>, name: &str) -> Value {
+    let plan = compare::expected_phases(pinned)
+        .unwrap()
+        .into_iter()
+        .find(|plan| plan.name == name)
+        .unwrap();
+    let mut phase = plain_phase(name, plan.rate, plan.rate - 0.003, 0, 0, 30.0);
+    phase["duration_seconds"] = json!(plan.seconds as f64 + 0.004);
+    phase["in_artifact"] = json!(plan.in_artifact);
+    phase["database_delay_milliseconds_configured"] = json!(plan.database_delay_ms);
+    phase
+}
+
+#[test]
+fn a_planned_restart_or_kill_is_held_to_the_preset_even_when_every_run_agrees() {
+    let manifest = manifest(288.0);
+    // With two frontends the reconnect phase drains and restarts one.
+    let mut pinned = d1_args();
+    pinned.insert("--frontends".into(), json!(2));
+    let two_frontends = |restarts: u64| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            report["topology"]["frontends"] = json!(2);
+            let frontend = report["frontend_environment"][0].clone();
+            report["frontend_environment"] = json!([frontend.clone(), frontend]);
+            report["phases"][3]["frontend_restarts"] = json!(restarts);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = two_frontends(1);
+    assert!(result.passed, "{}", result.markdown);
+    let result = two_frontends(0);
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("restarted a frontend 0 times in `reconnect`, not the planned 1"),
+        "{}",
+        result.markdown
+    );
+    // One frontend alone is never restarted.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        run.report.as_mut().unwrap()["phases"][3]["frontend_restarts"] = json!(1);
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(result
+        .markdown
+        .contains("restarted a frontend 1 times in `reconnect`, not the planned 0"));
+    // The mid-flight kill's relaunch is its phase's restart, and the report
+    // says the kill ran.
+    let mut pinned = d1_args();
+    pinned.insert("--mid-flight-kill".into(), json!(true));
+    let with_kill = |restarts: u64, ran: bool| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            let mut kill = planned_in(&pinned, "mid_flight_kill");
+            kill["frontend_restarts"] = json!(restarts);
+            report["phases"].as_array_mut().unwrap().push(kill);
+            report["mid_flight_kill"]["ran"] = json!(ran);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = with_kill(1, true);
+    assert!(result.passed, "{}", result.markdown);
+    let result = with_kill(0, true);
+    assert!(!result.passed);
+    assert!(result
+        .markdown
+        .contains("restarted a frontend 0 times in `mid_flight_kill`, not the planned 1"));
+    let result = with_kill(1, false);
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains("`/mid_flight_kill/ran` false"),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
+fn the_dense_landing_budget_is_held_to_the_pinned_scheduled_blocks() {
+    let manifest = manifest(288.0);
+    let mut pinned = d1_args();
+    pinned.insert("--cadence".into(), json!("dense"));
+    let slots = qbit_prism_load::cadence::landing_offsets(&[9.0, 19.0, 9.0, 18.0, 20.0], 240.0)
+        .len() as u64;
+    assert_eq!(slots, 15, "the D1 preset's gaps in its 240 s phase");
+    let dense = |pinned_blocks: u64, budget: u64, landed: u64| {
+        let mut pinned = pinned.clone();
+        pinned.insert("--scheduled-blocks".into(), json!(pinned_blocks));
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            let report = run.report.as_mut().unwrap();
+            let mut phase = planned_in(&pinned, "dense_cadence");
+            phase["scheduled_blocks"] = json!(landed);
+            report["phases"].as_array_mut().unwrap().push(phase);
+            report["dense_cadence"] = json!({
+                "ran": true,
+                "gap_pattern_seconds": [9.0, 19.0, 9.0, 18.0, 20.0],
+                "landing_budget": budget,
+            });
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    // The budget buys one landing a slot while it lasts.
+    for (blocks, landed) in [(12, 12), (15, 15), (20, 15)] {
+        let result = dense(blocks, blocks, landed);
+        assert!(result.passed, "{blocks}: {}", result.markdown);
+    }
+    // Every run reading a pinned 15 as 1 agrees with itself and still fails.
+    let result = dense(15, 1, 1);
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "ran a dense-cadence landing budget of 1, not the pinned `--scheduled-blocks` 15"
+        ),
+        "{}",
+        result.markdown
+    );
+    let result = dense(15, 15, 1);
+    assert!(!result.passed);
+    assert!(result.markdown.contains(
+        "landed 1 own blocks, not the 15 that the pinned `--scheduled-blocks` 15 buys of the \
+         gap pattern's 15 slots"
+    ));
+}
+
+#[test]
+fn integers_beyond_an_f64_compare_exactly() {
+    assert!(!compare::same_json(
+        &json!(9_007_199_254_740_992_u64),
+        &json!(9_007_199_254_740_993_u64)
+    ));
+    assert!(compare::same_json(&json!(0), &json!(0.0)));
+    assert!(compare::same_json(&json!(2016), &json!(2016)));
+    assert!(compare::same_json(&json!(-3), &json!(-3.0)));
+    assert!(!compare::same_json(&json!(u64::MAX), &json!(-1)));
+    assert!(!compare::same_json(&json!(1), &json!(1.5)));
+    // So a seed above 2^53 and its neighbour are different populations.
+    let manifest = manifest(288.0);
+    let mut pinned = d1_args();
+    pinned.insert("--seed".into(), json!(9_007_199_254_740_992_u64));
+    let with_seed = |seed: u64| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            set_pointer(
+                run.report.as_mut().unwrap(),
+                "/population/seed",
+                json!(seed),
+            );
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
+    };
+    let result = with_seed(9_007_199_254_740_992);
+    assert!(result.passed, "{}", result.markdown);
+    let result = with_seed(9_007_199_254_740_993);
+    assert!(!result.passed);
+    assert!(result
+        .markdown
+        .contains("`/population/seed` 9007199254740993"));
 }
 
 #[test]

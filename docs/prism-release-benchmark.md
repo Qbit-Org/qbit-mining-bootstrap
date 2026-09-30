@@ -135,7 +135,13 @@ population, template, pool-fee, churn and node settings the report states readin
 as this harness renders the preset's (a build whose harness predates one of
 those flags is exempt from it, since the legacy table already proved it ran
 the pinned value); a build that reads a pinned rate differently
-fails the comparison rather than passing on less load.
+fails the comparison rather than passing on less load. The same holds for
+the rest of the planned workload, even when every run agrees: each phase's
+database delay and frontend restarts (the reconnect phase's drained restart
+with two or more frontends, the mid-flight kill's relaunch), the scheduled
+blocks (under the dense cadence, the pinned landing budget and the landings
+it buys), the completed reconnects, the memory floor and the samplers'
+pinned intervals.
 
 **The verdict is PASS** when the candidate meets the rule in every gated
 phase, every candidate run passes the preset's gates, and the targets
