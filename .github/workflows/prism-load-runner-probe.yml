@@ -272,7 +272,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}-${{ matrix.repeat }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
           restore-keys: ${{ steps.key.outputs.prefix }}
       - name: Mount the target directory's sticky disk
         if: ${{ matrix.target_cache == 'sticky-disk' }}
@@ -309,17 +309,20 @@ jobs:
             cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
       - name: Measure the target directory after the build
         run: du -sb "${CARGO_TARGET_DIR}" | cut -f1 > "${PROBE}/target-bytes-after"
+      # Only repeat 1 saves: every repeat saving its own multi-GB entry would
+      # evict other workflows' caches. The other repeats restore the last
+      # saved build and record no save time.
       - name: Start timing the Actions cache save
-        if: ${{ matrix.target_cache == 'actions-cache' }}
+        if: ${{ matrix.target_cache == 'actions-cache' && matrix.repeat == 1 }}
         run: date +%s.%N > "${PROBE}/save-started"
       - name: Save the target directory to the Actions cache
-        if: ${{ matrix.target_cache == 'actions-cache' }}
+        if: ${{ matrix.target_cache == 'actions-cache' && matrix.repeat == 1 }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}-${{ matrix.repeat }}
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
       - name: Time the Actions cache save
-        if: ${{ matrix.target_cache == 'actions-cache' }}
+        if: ${{ matrix.target_cache == 'actions-cache' && matrix.repeat == 1 }}
         run: |
           awk -v now="$(date +%s.%N)" -v then="$(cat "${PROBE}/save-started")" \
             'BEGIN { printf "%.1f\n", now - then }' > "${PROBE}/save-seconds"
@@ -345,10 +348,12 @@ jobs:
             for ((i = 1; i <= IN_JOB_REPEATS; i++)); do
               out="${PROBE}/${preset}/${i}"
               echo "::group::${preset}, run ${i} of ${IN_JOB_REPEATS} (timeout ${minutes} min)"
+              # The step's shell is bash -e: a failed gate or a timeout must
+              # not end the loop, so the status is caught, not raised.
+              status=0
               python3 scripts/prism_load_probe.py measure --out "${out}/probe-measure.json" \
                 --timeout-seconds "$((minutes * 60))" -- \
-                bash .github/scripts/prism-load-run.sh "${preset}" "${out}"
-              status=$?
+                bash .github/scripts/prism-load-run.sh "${preset}" "${out}" || status=$?
               echo "::endgroup::"
               if (( status == 124 )); then
                 # measure ended the run's process group; pg_ctl starts each

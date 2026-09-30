@@ -685,7 +685,10 @@ def upgrade_row(row: dict, path: Path) -> dict:
         if row.get("kind") == "probe":
             row["repeat"] = 1
             row["commit"] = None
-            row["runs"] = {name: [run] for name, run in (row.get("runs") or {}).items()}
+            # v1 runs carry no memory total, so their headroom stays unknown,
+            # and whether each is a sample is decided here as for v2 runs.
+            row["runs"] = {name: [dict(run, unmeasured_reason=unmeasured_reason(run))]
+                           for name, run in (row.get("runs") or {}).items()}
         return row
     raise ProbeError(f"{path}: row schema {schema!r} is not {ROW_SCHEMA} or {ROW_SCHEMA_V1}")
 
@@ -771,9 +774,12 @@ def table(rows: list[dict], expected: dict | None = None) -> str:
     for row in probes:
         for runs in (row.get("runs") or {}).values():
             iterations = max(iterations, len(runs))
-    names = expected_presets(expected) if expected else list(PRESETS)
+    # Without the plan, the presets the rows ran (a job's own summary has
+    # only its row), not the defaults, which a dispatch may not have asked for.
+    names = expected_presets(expected) if expected else []
     for row in probes:
         names += [n for n in (row.get("runs") or {}) if n not in names]
+    names = names or list(PRESETS)
     columns = [(name, i) for name in names for i in range(iterations)]
 
     def heading(name: str, i: int) -> str:

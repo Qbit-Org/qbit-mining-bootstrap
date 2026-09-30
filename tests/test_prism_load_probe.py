@@ -249,8 +249,9 @@ class Table(unittest.TestCase):
             text = probe.table(probe.load_rows(rows))
         self.assertIn("### 8 vCPU · sticky-disk · repeat 1 (cold target)", text)
         self.assertIn("2,034 ops/s", text)
-        self.assertIn("| Measure | short-plan-20k-window-1fe | throughput-20k-window-1fe |", text)
-        self.assertIn("not run", text)
+        # Without the plan, the columns are the presets the rows ran.
+        self.assertIn("| Measure | short-plan-20k-window-1fe |\n", text)
+        self.assertNotIn("throughput-20k-window-1fe", text)
         self.assertIn("steady_state 2", text)
         self.assertIn("over 2 VMs, max/min 2.00", text)
 
@@ -275,6 +276,13 @@ class Table(unittest.TestCase):
             self.assertIn(f"### {size} vCPU · sticky-disk · repeat 1: no row", text)
         self.assertIn("| 8 vCPU | 1,000–2,000 over 2 VMs, max/min 2.00; 1 of 3 VMs unknown", text)
         self.assertIn("| 16 vCPU | unknown; 3 of 3 VMs unknown", text)
+        # With the plan, a planned run a row lacks is shown as not run.
+        row = probe_row(1, [run()])
+        row["class"] = 8
+        planned = probe.matrices("8", "sticky-disk", "0", f"{PRESET},short-plan-20k-window-1fe")
+        text = probe.table([row], planned)
+        self.assertIn(f"| Measure | {PRESET} | short-plan-20k-window-1fe |", text)
+        self.assertIn("| not run |", text)
         # With no fsync jobs planned, none is expected.
         self.assertNotIn("fdatasync across VMs", probe.table([], probe.matrices("8", "both", "0")))
 
@@ -474,7 +482,9 @@ class RowsV2(unittest.TestCase):
             self.assertEqual(row["schema"], probe.ROW_SCHEMA)
             self.assertEqual(row["repeat"], 1)
             self.assertIsNone(row["commit"])
-            self.assertEqual(row["runs"]["throughput-20k-window-1fe"], [{"x": 1}])
+            # A v1 run with no harness exit code is unknown, not a sample.
+            self.assertEqual(row["runs"]["throughput-20k-window-1fe"],
+                             [{"x": 1, "unmeasured_reason": "no harness exit code"}])
             Path(tmp, "v9.json").write_text(json.dumps(
                 dict(v1, schema="qbit.prism.runner-probe-row.v9")))
             with self.assertRaises(probe.ProbeError):
