@@ -1476,8 +1476,9 @@ pub fn compare(
     }
     // The database the run used: managed unless the preset names one, with
     // the observed replication agreeing with the declared one at entry and
-    // after the load, and one launched frontend per pinned frontend (every
-    // harness since #271 reports these).
+    // after the load, each observation reported (the premise's `agreed`
+    // skips one that was never made), and one launched frontend per pinned
+    // frontend (every harness since #271 reports these).
     let mode = if pinned.get("--database-url").is_some_and(|v| !v.is_null()) {
         "external"
     } else {
@@ -1492,6 +1493,12 @@ pub fn compare(
         let agreed = report
             .and_then(|r| r.pointer("/database/replication/agreed_with_declared"))
             .and_then(Value::as_bool);
+        let replication = |key: &str| {
+            report
+                .and_then(|r| r.pointer("/database/replication"))
+                .and_then(|block| block[key].as_str())
+        };
+        let declared = replication("declared");
         let launched = report
             .and_then(|r| r["frontend_environment"].as_array())
             .map(|f| f.len() as u64);
@@ -1502,6 +1509,16 @@ pub fn compare(
             ))
         } else if agreed != Some(true) {
             Some("does not report its observed replication agreeing with the declared one".into())
+        } else if declared.is_none()
+            || replication("observed") != declared
+            || replication("observed_after_load") != declared
+        {
+            Some(format!(
+                "observed replication {} at entry and {} after the load, not the declared {}",
+                replication("observed").unwrap_or("unreported"),
+                replication("observed_after_load").unwrap_or("unreported"),
+                declared.unwrap_or("unreported")
+            ))
         } else if frontends.is_some() && launched != frontends {
             Some(format!(
                 "launched {} frontends, not the pinned `--frontends` {}",

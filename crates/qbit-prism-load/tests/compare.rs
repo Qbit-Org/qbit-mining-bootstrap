@@ -140,7 +140,12 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
             {"all_sessions_milliseconds": 700.0},
             {"all_sessions_milliseconds": 800.0},
         ]},
-        "database": {"mode": "managed", "replication": {"declared": "async", "agreed_with_declared": true}},
+        "database": {"mode": "managed", "replication": {
+            "declared": "async",
+            "observed": "async",
+            "observed_after_load": "async",
+            "agreed_with_declared": true,
+        }},
         "rejections": {"no_response_by_phase": {}, "by_phase_reason_and_message": []},
         // The D1 plan's other phases, after the two the tests vary.
         "phases": [steady, burst, planned("warm_up"), planned("reconnect"), planned("slow_database")],
@@ -904,6 +909,18 @@ fn another_database_or_fewer_launched_frontends_than_pinned_fails() {
             "/database/replication/agreed_with_declared",
             json!(false),
             "observed replication agreeing",
+        ),
+        // `agreed` alone skips an observation that was never made.
+        (
+            "/database/replication/observed_after_load",
+            Value::Null,
+            "observed replication async at entry and unreported after the load, not the \
+             declared async",
+        ),
+        (
+            "/database/replication/observed",
+            json!("none"),
+            "observed replication none at entry",
         ),
         ("/frontend_environment", json!([]), "launched 0 frontends"),
     ] {

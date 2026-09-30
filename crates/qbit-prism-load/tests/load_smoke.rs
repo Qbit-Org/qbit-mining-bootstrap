@@ -273,6 +273,10 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         report["database"]["replication"]["agreed_with_declared"], true,
         "the replication premise"
     );
+    let replication = &report["database"]["replication"];
+    for observed in ["observed", "observed_after_load"] {
+        assert_eq!(replication[observed], replication["declared"], "{observed}");
+    }
     assert_eq!(report["database"]["mode"], "managed");
     for storm in churn["realised"]["storms"].as_array().context("storms")? {
         let connected = storm["connected"].as_f64().context("connected")?;

@@ -133,7 +133,8 @@ any tip-delivery or churn budget the preset sets. Both builds must report the
 same target rate and, within 5%, the same phase length in every phase, and
 every counted run must report every phase any run reported and the
 preset's pinned frontends, sessions, submits in flight per session, plan,
-window size, replication and ACK p99 limit, with every frontend launched
+window size, replication (observed at entry and after the load) and ACK p99
+limit, with every frontend launched
 with the pinned server settings (runtime workers, database connections,
 commit timeout, block poll, initial-job admission, pool fee), and with the arrival,
 population, template, pool-fee, churn and node settings the report states reading
