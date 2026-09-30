@@ -244,17 +244,20 @@ impl Metrics {
 
     /// See [`Observation::Active`].
     pub(crate) fn accepted_block(&self, hash: &str, height: u64) {
-        self.accept_block(hash, height, Observation::Active);
+        self.accept_block(hash, height, Observation::Active, false);
     }
 
     /// See [`Observation::Unlanded`] (#493).
     pub(crate) fn accepted_unlanded_block(&self, hash: &str, height: u64) {
-        self.accept_block(hash, height, Observation::Unlanded);
+        self.accept_block(hash, height, Observation::Unlanded, false);
     }
 
-    /// See [`Observation::Confirmed`].
-    pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64) {
-        self.accept_block(hash, height, Observation::Confirmed);
+    /// See [`Observation::Confirmed`]. `at_tip` is whether the block is the
+    /// chain's tip in the observation: a peer frontend's block that settled
+    /// before this frontend's reconciler first saw it still opens a landing
+    /// window then (#602).
+    pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64, at_tip: bool) {
+        self.accept_block(hash, height, Observation::Confirmed, at_tip);
     }
 
     /// A committed proven orphan has no delivery target. Close its wait without
@@ -308,12 +311,12 @@ impl Metrics {
         }
     }
 
-    fn accept_block(&self, hash: &str, height: u64, observation: Observation) {
-        self.landing_event(|state, _| {
+    fn accept_block(&self, hash: &str, height: u64, observation: Observation, at_tip: bool) {
+        let opened = self.landing_event(|state, _| {
             let mut identity = [0; 32];
             if hex::decode_to_slice(hash, &mut identity).is_err() {
                 state.saturated = true;
-                return;
+                return false;
             }
             if let Some(block) = state.blocks.get_mut(&identity) {
                 // An active-chain observation lands an earlier accepted offer
@@ -322,14 +325,14 @@ impl Metrics {
                 if observation != Observation::Unlanded && !block.closed {
                     block.unlanded = false;
                 }
-                return;
+                return false;
             }
             if state.saturated || height <= state.retired_height {
-                return;
+                return false;
             }
             if state.blocks.len() == LIMIT {
                 state.saturated = true;
-                return;
+                return false;
             }
             state.blocks.insert(
                 identity,
@@ -348,7 +351,17 @@ impl Metrics {
             );
             state.pending_count += 1;
             state.acceptance_epoch = state.acceptance_epoch.saturating_add(1);
+            observation != Observation::Confirmed || at_tip
         });
+        // #602: the first observation of a block's acceptance opens a share
+        // acknowledgement landing window. A block first seen already
+        // confirmed opens one only at the tip: a peer's block that settled
+        // before this frontend's reconciler saw it is still landing now,
+        // while the buried blocks a restart first sees landed long ago. A
+        // restart whose tip is a pool block opens one window.
+        if opened {
+            self.landing_acks.opened(Instant::now());
+        }
     }
 
     /// The caller proved this committed revision includes the block. A later

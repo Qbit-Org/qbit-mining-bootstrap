@@ -22,8 +22,7 @@ impl<'a> ShareObservation<'a> {
     }
     pub(super) fn acknowledged(&self, result: AckResult) {
         if let Some(received_at) = self.received_at {
-            self.metrics
-                .observe_share_ack(result, received_at.elapsed());
+            self.metrics.observe_share_ack_received(result, received_at);
         }
     }
 }

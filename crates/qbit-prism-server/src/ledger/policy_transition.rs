@@ -29,7 +29,9 @@ impl Ledger {
 
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let _order = self
+            .lock_order(&mut tx, crate::metrics::OrderLockHolder::Operator)
+            .await?;
         // Also exclude registrations and heartbeats racing the stopped scan.
         sqlx::query(
             "LOCK TABLE qbit_prism_instances, qbit_ledger_writer_lease IN SHARE ROW EXCLUSIVE MODE",

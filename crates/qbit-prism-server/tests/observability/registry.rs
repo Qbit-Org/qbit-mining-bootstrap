@@ -259,6 +259,9 @@ async fn ack_deadline_buckets_resolve_both_edges_without_changing_other_histogra
     for line in body.lines().filter(|line| {
         (line.contains("_count{") || line.starts_with("qbit_prism_block_submit_seconds_count "))
             && !line.starts_with("qbit_prism_accepted_block_to_revision_work_seconds_")
+            // #602: observed only inside a landing window; its ladder is the
+            // ACK family's, pinned by the contract census.
+            && !line.starts_with("qbit_prism_share_ack_landing_window_seconds_")
     }) {
         let (key, _) = line.rsplit_once(' ').unwrap();
         let (prefix, labels) = key.split_once("_count").unwrap();

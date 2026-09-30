@@ -130,6 +130,23 @@ labels!(StandbyWaitOutcome {
 // share-pass append that carries the block, or a block-only, deferred or
 // captured proof's wait for its enqueue and landing.
 labels!(BlockAckPath { Share => "share", BlockOnly => "block_only" });
+// #602: the transaction that held ORDER_LOCK, one value per kind of holder:
+// the share append, a block-only candidate insert, the offering frontend's
+// settlement (first_confirmation when that transaction confirmed the block
+// for the first time, settlement otherwise, including an abandon), the reorg
+// reconciler, the orphan disposition, the refresh's window snapshot that
+// prepared work is built from, blob cleanup, fatal-state recovery, and the
+// operator commands (policy and signing transitions, archive verify and
+// restore). The schema cutover's hold is not observed.
+labels!(OrderLockHolder {
+    Append => "append", CandidateInsert => "candidate_insert",
+    FirstConfirmation => "first_confirmation", Settlement => "settlement",
+    Reconcile => "reconcile", Orphan => "orphan", Prepared => "prepared",
+    Cleanup => "cleanup", FatalState => "fatal_state", Operator => "operator"
+});
+// #602: the share acknowledgement p99 bound, in seconds, a landing window is
+// judged against: 2 s tickets after three windows in a row, 10 s warns.
+labels!(LandingAckBound { Ticket => "2", Warning => "10" });
 
 impl RejectReason {
     /// Metrics normalization must not alter the existing protocol response.

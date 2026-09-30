@@ -67,6 +67,25 @@ impl Metrics {
             elapsed,
         );
     }
+    /// [`Self::observe_share_ack`] for a submission whose complete frame
+    /// arrived at `received_at`, which also records it in the landing-window
+    /// family when it arrived within one (#602). Outside a window that costs
+    /// one atomic load; the clock is read once, for the elapsed time.
+    pub fn observe_share_ack_received(&self, result: AckResult, received_at: tokio::time::Instant) {
+        let elapsed = received_at.elapsed();
+        let landing = self.landing_acks.admits(received_at);
+        {
+            let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let labels = Labels::One(("result", result.as_str()));
+            registry.observe(Family::ShareAck, labels.clone(), elapsed.as_secs_f64());
+            if landing {
+                registry.observe(Family::ShareAckLandingWindow, labels, elapsed.as_secs_f64());
+            }
+        }
+        if landing {
+            self.landing_acks.record(received_at, elapsed);
+        }
+    }
     /// Record stale-grace credit only after durable acceptance.
     pub fn record_grace_credit(&self) {
         self.inner
@@ -288,6 +307,14 @@ impl Metrics {
         self.observe(
             Family::LockWait,
             Labels::Two(("lock", lock.as_str()), ("result", result.as_str())),
+            elapsed,
+        );
+    }
+    /// One ORDER_LOCK hold, from the grant to the end of its transaction.
+    pub fn observe_order_lock_hold(&self, holder: OrderLockHolder, elapsed: Duration) {
+        self.observe(
+            Family::OrderLockHold,
+            Labels::One(("holder", holder.as_str())),
             elapsed,
         );
     }

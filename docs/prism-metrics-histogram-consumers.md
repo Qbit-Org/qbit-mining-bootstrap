@@ -11,8 +11,10 @@ share acknowledgement or database operation duration.
 
 The default finite bucket upper bounds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
 2.5, 5, 10, and 30 seconds, followed by `+Inf`. Only
-`qbit_prism_share_ack_seconds` adds 15 and 20 seconds, and only the chunk-row
-histogram replaces the ladder. Buckets are cumulative and include
+`qbit_prism_share_ack_seconds` and its landing-window subset add 15 and 20
+seconds, and only the chunk-row histogram and the `ORDER_LOCK` hold histogram
+(see [Landing-window ACKs and ORDER_LOCK holds](#landing-window-acks-and-order_lock-holds-602))
+replace the ladder. Buckets are cumulative and include
 their upper bound: an observation of exactly 5 seconds increments `le="5"` and
 every larger bucket; an observation greater than 5 and at most 10 seconds first
 appears in `le="10"`. An ACK of exactly 15 seconds first appears in `le="15"`,
@@ -72,6 +74,38 @@ continue to use the default ladder. The rendered event fixture pins all existing
 samples plus the five additive series; HTTP inventory tests retain all 46
 coordinator and 14 public families. See the [native inventory](prism-native-metrics.md)
 for reason-label compatibility.
+
+## Landing-window ACKs and ORDER_LOCK holds (#602)
+
+`qbit_prism_share_ack_landing_window_seconds{result}` holds the
+`qbit_prism_share_ack_seconds` observations whose submission arrived within 30
+seconds after a pool block acceptance the frontend observed; each is recorded
+in both families, on the same ladder. Steady state is therefore the difference,
+bucket by bucket and with matching labels and rate windows:
+
+```promql
+sum by (le) (rate(qbit_prism_share_ack_seconds_bucket[1h]))
+-
+sum by (le) (rate(qbit_prism_share_ack_landing_window_seconds_bucket[1h]))
+```
+
+A landing window holds a few hundred to a few thousand acknowledgements and
+landings are hours apart, so a five-minute `histogram_quantile` over the
+landing family is mostly empty. Judge landings with
+`qbit_prism_share_ack_slow_landing_windows{p99_above_seconds}` instead: the
+process counts, per window, how many acknowledgements exceeded 2 and 10
+seconds, which gives the nearest-rank p99 against each bound exactly, and
+publishes how many consecutive windows exceeded it.
+
+`qbit_prism_database_order_lock_hold_seconds{holder}` has its own ladder:
+0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10
+seconds, then `+Inf`. An append holds `ORDER_LOCK` for milliseconds, and #602's
+budget for every other holder is 250 ms (`le="0.25"`). A holder that appears
+once per landing (`first_confirmation`, `reconcile`, `orphan`) has one
+observation per block: read `_sum` increases per landing rather than a
+quantile. A hold runs from the grant of the lock to the end of its transaction,
+so it includes the transaction's own statements and its COMMIT round trip;
+the wait for the lock is `qbit_prism_database_advisory_lock_wait_seconds`.
 
 ## Reading the CTV chunk-row histogram
 

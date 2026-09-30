@@ -1,6 +1,7 @@
 use super::audit::{persist_audit_snapshot, verify_durable_range, AuditSnapshotWrite};
 use super::candidates::{header_bits_hex, CandidateState, ClaimParts, ORPHANED_STATE};
 use super::*;
+use crate::metrics::OrderLockHolder;
 use qbit_prism::{verify_audit_parts, AuditVerificationReport};
 use std::sync::Arc;
 
@@ -290,7 +291,9 @@ impl Ledger {
     ) -> Result<(bool, i64)> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let mut order = self
+            .lock_order(&mut tx, OrderLockHolder::Settlement)
+            .await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_revision).await?;
         let state = require_claim(&mut tx, claim).await?;
@@ -306,6 +309,9 @@ impl Ledger {
             .fetch_optional(&mut *tx)
             .await?
             .unwrap_or(false);
+            if first_confirmation {
+                order.relabel(OrderLockHolder::FirstConfirmation);
+            }
             // #478: the debt this block's rows create is realized here, when
             // they start to count; record it against the balances they meet.
             // Nothing is read for a block whose rows already count.
@@ -364,6 +370,7 @@ impl Ledger {
             .filter(|_| submitted)
             .map(|metrics| metrics.revision_work_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
+        drop(order);
         if let Some(landing) = landing {
             landing.committed(first_confirmation, committed_revision);
         }
@@ -416,7 +423,7 @@ impl Ledger {
         );
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let order = self.lock_order(&mut tx, OrderLockHolder::Orphan).await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_revision).await?;
         let state = require_claim(&mut tx, claim).await?;
@@ -458,6 +465,7 @@ impl Ledger {
             .as_ref()
             .map(|metrics| metrics.revision_work_orphan_settlement(&claim.candidate.block_hash));
         tx.commit().await?;
+        drop(order);
         if let Some(orphan) = orphan {
             orphan.committed();
         }
@@ -503,7 +511,7 @@ impl Ledger {
     ) -> Result<u64> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        self.lock(&mut tx, ORDER_LOCK).await?;
+        let order = self.lock_order(&mut tx, OrderLockHolder::Reconcile).await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_revision).await?;
         let (fatal, effects) = self
@@ -524,6 +532,7 @@ impl Ledger {
                 .collect()
         });
         tx.commit().await?;
+        drop(order);
         self.record_debt_metrics(effects.divergences.iter(), effects.debt);
         for (hash, observation) in landing {
             let first = effects.first_confirmations.contains(hash);
