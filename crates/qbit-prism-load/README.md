@@ -906,6 +906,20 @@ gates, every session served on every tip within 5 s. It builds the debug
 server itself and adds about a minute and a half to its CI shard (22 s to
 build the server beside the test's own build, 71 s to run).
 
+### A/B release comparison (#511)
+
+`scripts/prism_load_ab.py --base <ref> --candidate <ref> --preset <name> --out <dir>`
+runs one preset as interleaved repeats of two builds on one host. Each build
+is compiled in its own worktree and run with its own harness and server. The
+driver holds a benchmark lock, gates each run on the load average, samples
+the host and records `pg_test_fsync`. It then prints
+`qbit-prism-load-compare`'s table, one row per build and D1 phase, held to
+#473's rule over every repeat. A build whose harness predates a flag the
+preset pins runs without that flag only when `legacy-flags.json` shows it ran
+that value anyway; otherwise the pair is refused before anything runs. The
+release preset pair, the reference host and its flush cost are in
+[`docs/prism-release-benchmark.md`](../../docs/prism-release-benchmark.md).
+
 ## Long soak (#575)
 
 `--plan soak` runs a soak preset: one server lifetime, looping the workloads
@@ -1561,6 +1575,10 @@ flags' parsing and refusals, the default population's byte-for-byte legacy
 shape, the generated skew, windows and bursts, every checked-in preset's
 completeness and validity, #473's cells and rule, and the gate and its
 #473-format table.
+`tests/compare.rs` covers the A/B summarizer: the D1 rule over repeats, runs
+kept out of the medians, a report of another build refused, unreported figures
+failing, and the flush-class line. `tests/legacy_flags.rs` holds
+`legacy-flags.json` to the harness's own defaults.
 
 The gated tests start the managed cluster against real PostgreSQL 16 server
 binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
