@@ -236,6 +236,10 @@ class Triggers(unittest.TestCase):
         self.assertIn("python3 scripts/prism_shipped_image_lane.py changed", workflow)
         self.assertIn("needs.changes.outputs.images == 'true'", workflow)
         self.assertIn("github.base_ref == '3.x.x'", workflow)
+        # A change list at the API's cap may be truncated, so it runs the lane.
+        self.assertIn("cap=300", workflow)
+        self.assertIn("cap=3000", workflow)
+        self.assertIn("(( count >= cap ))", workflow)
         # The load nightly's guard must not start the preset matrix on a push.
         self.assertIn("github.event_name != 'push'", workflow)
 

@@ -755,15 +755,29 @@ jobs:
         run: |
           set -euo pipefail
           files="${RUNNER_TEMP}/changed-files"
+          # The APIs list at most 3,000 files for a PR and 300 for a
+          # comparison. A list at its cap may omit a watched path, so it runs
+          # the lane, as does a new branch with nothing to compare.
           if [[ -n "${PR}" ]]; then
-            gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .filename, (.previous_filename // empty)' > "${files}"
+            cap=3000
+            gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .filename' > "${files}.names"
+            gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .previous_filename // empty' > "${files}.renames"
           elif [[ "${BEFORE}" =~ ^0+$ ]]; then
-            # A new branch has no base to compare; run.
-            printf '%s\n' Dockerfile > "${files}"
+            cap=0
+            : > "${files}.names"
+            : > "${files}.renames"
           else
-            gh api "repos/${REPO}/compare/${BEFORE}...${AFTER}" --jq '.files[] | .filename, (.previous_filename // empty)' > "${files}"
+            cap=300
+            gh api "repos/${REPO}/compare/${BEFORE}...${AFTER}" --jq '.files[] | .filename' > "${files}.names"
+            gh api "repos/${REPO}/compare/${BEFORE}...${AFTER}" --jq '.files[] | .previous_filename // empty' > "${files}.renames"
           fi
-          images="$(python3 scripts/prism_shipped_image_lane.py changed < "${files}")"
+          count="$(wc -l < "${files}.names")"
+          if (( count >= cap )); then
+            images=true
+            echo "The change list has ${count} files (cap ${cap}); running L6 in case it is truncated."
+          else
+            images="$(cat "${files}.names" "${files}.renames" | python3 scripts/prism_shipped_image_lane.py changed)"
+          fi
           echo "L6 runs: ${images}"
           printf 'images=%s\n' "${images}" >> "${GITHUB_OUTPUT}"
 
