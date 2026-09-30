@@ -127,6 +127,33 @@ class Suites(unittest.TestCase):
             self.assertIn(f"throughput-400k-window-{fe}fe-async", names)
         self.assertEqual({entry["repeat"] for entry in entries}, {1})
 
+    def test_the_reduced_l3_carries_555s_session_points_and_the_mainnet_shapes(self) -> None:
+        names = [e["preset"] for e in matrix.select(self.presets, "suite:l3-reduced", suites=self.suites)]
+        for name in (
+            "mainnet-shape-130-addresses",
+            "mainnet-shape-650-addresses",
+            "mainnet-shape-2600-addresses",
+            "rental-churn-bursts-and-storms",
+        ):
+            self.assertIn(name, names)
+        base = self.presets["throughput-400k-window-2fe-async"]
+        for sessions in (5000, 10000):
+            name = f"session-point-{sessions}-sessions-400k-2fe-async"
+            self.assertIn(name, names)
+            point = self.presets[name]
+            # The 2,000-session cell's workload but for the session count and
+            # its admission, sessions per frontend + 16.
+            differs = {flag for flag, value in point["args"].items() if base["args"][flag] != value}
+            self.assertEqual(differs, {"--sessions", "--stratum-max-pending-initial-jobs"}, name)
+            self.assertEqual(point["args"]["--sessions"], sessions)
+            self.assertEqual(point["args"]["--stratum-max-pending-initial-jobs"], sessions // 2 + 16)
+            self.assertEqual(point["args"]["--steady-state-rate"], 500)
+            # The D1 plan's burst is the 2,000/s-for-60-s burst variant.
+            self.assertEqual(point["args"]["--plan"], "d1")
+            self.assertEqual((point["args"]["--burst-rate"], point["args"]["--burst-seconds"]), (2000, 60))
+            # A capacity-envelope point, not a D1 verdict.
+            self.assertFalse(point["gates"]["d1_verdict_table"], name)
+
     def test_a_suite_preset_can_keep_its_own_schedule(self) -> None:
         # throughput-400k-window-1fe-async is nightly and in both L3 suites.
         self.assertEqual(self.presets["throughput-400k-window-1fe-async"]["schedule"], "nightly")

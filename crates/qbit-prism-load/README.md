@@ -801,6 +801,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `tip-delivery-2000-miners-400k-2fe-retarget-500-addresses` | manual | 8 vCPU | the same with 500 Zipf(1.1) addresses |
 | `throughput-400k-window-1fe-async` | nightly | 8 vCPU | PR #473's production-window D1 baseline cell, exactly as it ran it on `a1937054` (admission `sessions_per_frontend + 16`, from before #497) |
 | `throughput-400k-window-{2,4}fe-async`, `throughput-400k-window-2fe-sync`, `throughput-200k-window-1fe-async`, `throughput-500k-window-{1,2,4}fe-async` | manual | 16 vCPU | #473's other cells, likewise |
+| `session-point-{5000,10000}-sessions-400k-2fe-async` | manual | 32 vCPU | #555's capacity-envelope session points: `throughput-400k-window-2fe-async` at 5,000 and 10,000 sessions (admission sessions per frontend + 16). The 10,000 point's D1-plan burst (2,000 shares/s for 60 s) is #555's burst variant; the 5,000 point's is reported beside it; gated on reconciliation and on `steady_state` placing every offer, with no D1 verdict (decision 5) |
 | `throughput-400k-window-2fe-async-3-blocks`, `dense-cadence-400k-window-{1,2}fe-async` | manual | 16 vCPU | #473's found-block run (`--scheduled-blocks 3`) and its dense-cadence runs (`--cadence dense --scheduled-blocks 15`) at 400k, likewise (#550). The 20k dense attempt, which exited 6, is not a preset |
 | `mainnet-shape-130-addresses` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
 | `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
@@ -885,7 +886,7 @@ it.
 | Suite | Presets | Repeats | Runner |
 |---|---|---|---|
 | `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, the 3-block run, dense cadence at fe1 and fe2, 500k fe1/2/4 | 3 | 32 vCPU |
-| `l3-reduced` | 400k at 1, 2 and 4 frontends, async | 1 | 32 vCPU |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; the 5,000 and 10,000 session points (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521) | 1 | 32 vCPU |
 
 The runner is the 32 vCPU class until #542 picks one per lane.
 `.github/workflows/prism-load-l3.yml` runs `l3-full` on a pull request into
@@ -909,6 +910,27 @@ run's tables and verdict, linked to it, and fails if it failed. Anything
 else, including a failed lookup, reruns the suite. Dispatch with
 `tag_dry_run` does the same on `ref` without a tag. The workflow is never a
 required check.
+
+The session points and the mainnet shapes in `l3-reduced` are
+capacity-envelope evidence beyond D1 (#555 decisions 7 and 11), never D1
+verdicts (decision 5): their rows carry no D1 verdict, and only their own
+gates hold them. #555's 10,000-recipient point (ten fanout chunks per block,
+under the 20/80 stress shape, with seeded and submitted recipient counts
+reported apart) waits on CTV fanout settlement in the harness (#548). Its
+50,000-recipient follow-up runs only on this trigger, written down before
+the 10,000 point has run:
+
+> The 10,000-recipient point costs more than 25% more **per recipient** than
+> the same preset at 1,000 recipients (one fanout chunk), run on the same
+> runner class the same week, in either
+> - **window rebuild**: the tip-to-last-notify p99 over its tips
+>   (`time_to_usable_work.tips[].all_sessions_milliseconds`), or
+> - **payout revision**: from an own-block landing until every session holds
+>   work for the new payout revision, the median over landings.
+
+A fixed cost only lowers the per-recipient figure at the larger size, so a
+linear cost never fires the trigger. It is evaluated once #548 lands and both
+presets run weekly.
 
 `.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
 schedule) measures the Blacksmith runner classes themselves before a lane
