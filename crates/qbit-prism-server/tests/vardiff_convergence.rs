@@ -25,8 +25,11 @@
 //!   periods, with at most one further adjustment.
 //!
 //! The listener's clock is the real one (vardiff reads `std::time::Instant`),
-//! so the premise that the client kept its pace is checked, and reported as
-//! such, instead of being assumed. The fake backend is a pared-down copy of
+//! so the premise that the client kept its pace is checked instead of
+//! assumed. A session that converged passes either way. One that did not
+//! is reported as a vardiff finding only if the premise held, and
+//! otherwise as the premise failing (see `verdict`), so a stalled host is
+//! not read as a vardiff regression. The fake backend is a pared-down copy of
 //! `tests/stratum_protocol.rs`'s: no persistence, no resume, one tip.
 
 use qbit_pool_builder::{build_manifest, CoinbaseBuildRequest, WeightedEntitlement};
@@ -70,6 +73,10 @@ const MAX_ADJUSTMENTS_TO_SETTLE: usize = 4;
 /// more window of two shares (0.8 s): about 3.6 periods, 4.6 at worst. Six
 /// periods (3.0 s) cover the worst case.
 const MAX_RETARGET_PERIODS_TO_SETTLE: f64 = 6.0;
+/// A share waiting longer than this past its due time means the client
+/// stalled, half a retarget period. It only decides how a failure is
+/// reported (see `verdict`), never whether a converged session passes.
+const STALL_SECONDS: f64 = 0.25;
 /// How long a session must then be seen staying settled.
 const SETTLED_RETARGET_PERIODS: f64 = 8.0;
 const RUN: Duration = Duration::from_secs(8);
@@ -178,6 +185,9 @@ struct Share {
 struct Trace {
     difficulties: Vec<(f64, f64)>,
     shares: Vec<Share>,
+    /// Shares still unsent when a new difficulty replaced them: seconds when
+    /// it arrived, and how long past due the share was by then.
+    overdue_at_change: Vec<(f64, f64)>,
     refusals: Vec<Value>,
     ran_seconds: f64,
 }
@@ -269,9 +279,11 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
     let (mut last_due, mut outstanding, mut id, mut nonce) = (started, None, 10u64, 0u32);
     loop {
         let interval = Duration::from_secs_f64(difficulty / hashrate);
-        let mut due = last_due + interval;
+        let scheduled = last_due + interval;
+        let mut due = scheduled;
         // A client that fell more than a share behind (a stalled host)
-        // resumes its pace instead of submitting the backlog in a burst.
+        // resumes its pace instead of submitting the backlog in a burst. The
+        // share keeps its scheduled time, so the stall is still measured.
         if Instant::now().saturating_duration_since(due) > interval {
             due = Instant::now();
         }
@@ -286,6 +298,12 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
                         let sent = announced.expect("a job before any difficulty");
                         if sent != difficulty {
                             let now = Instant::now();
+                            if outstanding.is_none() && now > scheduled {
+                                trace.overdue_at_change.push((
+                                    seconds(now),
+                                    now.duration_since(scheduled).as_secs_f64(),
+                                ));
+                            }
                             trace.difficulties.push((seconds(now), sent));
                             last_due = now;
                         }
@@ -305,7 +323,7 @@ async fn mine(address: std::net::SocketAddr, username: &str, hashrate: f64) -> T
                 submit["id"] = json!(id);
                 submit["params"][0] = json!(username);
                 send(submit).await;
-                trace.shares.push(Share { due: seconds(due), sent: seconds(Instant::now()), difficulty });
+                trace.shares.push(Share { due: seconds(scheduled), sent: seconds(Instant::now()), difficulty });
                 outstanding = Some(id);
                 id += 1;
                 last_due = due;
@@ -346,6 +364,21 @@ fn pace_by_difficulty(trace: &Trace, hashrate: f64) -> Vec<(f64, usize, usize)> 
         .collect()
 }
 
+/// The longest any share waited past its due time, sent or not: a share
+/// sent late, or one still unsent when a new difficulty replaced it, as
+/// `(seconds when it was sent or replaced, seconds past due)`.
+fn worst_stall(trace: &Trace) -> (f64, f64) {
+    trace
+        .shares
+        .iter()
+        .map(|share| (share.sent, share.sent - share.due))
+        .chain(trace.overdue_at_change.iter().copied())
+        .fold(
+            (0.0, 0.0),
+            |worst, next| if next.1 > worst.1 { next } else { worst },
+        )
+}
+
 /// Whether a span's shares fell short of its pace: up to a fifth of the
 /// expected shares may be missing, and never fewer than one (the share in
 /// flight at the span's end).
@@ -378,6 +411,131 @@ fn settled_from(difficulties: &[(f64, f64)], target: f64) -> Option<usize> {
     }
 }
 
+/// Why the client may not have kept its pace, so that the listener measured
+/// something other than the hashrate the test states; empty when it kept
+/// it. Judged at every difficulty the session was sent, as the shares were
+/// actually sent: a share that waited more than STALL_SECONDS past due
+/// (sent late, or still unsent when a new difficulty replaced it), a span
+/// short of its shares, or a final mean interval off the hashrate's. The
+/// client sends a share only once the last is answered, so a listener that
+/// acknowledges slowly shows up here as well as a stalled host.
+fn premise_problems(trace: &Trace, hashrate: f64) -> Vec<String> {
+    let mut problems = Vec::new();
+    let (at, past_due) = worst_stall(trace);
+    if past_due > STALL_SECONDS {
+        problems.push(format!(
+            "a share was {past_due:.3}s past due at {at:.2}s, a stall over {STALL_SECONDS}s"
+        ));
+    }
+    let short: Vec<String> = pace_by_difficulty(trace, hashrate)
+        .iter()
+        .filter(|(_, sent, expected)| short_of_pace(*sent, *expected))
+        .map(|(at, sent, expected)| format!("from {at:.2}s: {sent} of {expected}"))
+        .collect();
+    if !short.is_empty() {
+        problems.push(format!("too few shares at some difficulty {short:?}"));
+    }
+    let (final_at, final_difficulty) = *trace.difficulties.last().unwrap();
+    let expected = final_difficulty / hashrate;
+    let paced: Vec<f64> = trace
+        .shares
+        .iter()
+        .filter(|share| share.difficulty == final_difficulty && share.sent >= final_at)
+        .map(|share| share.sent)
+        .collect();
+    if paced.len() < 10 {
+        problems.push(format!(
+            "only {} shares at the final difficulty",
+            paced.len()
+        ));
+    } else {
+        let measured = (paced.last().unwrap() - paced[0]) / (paced.len() - 1) as f64;
+        if !(0.8..=1.25).contains(&(measured / expected)) {
+            problems.push(format!(
+                "a {measured:.3}s mean interval at the final difficulty against the \
+                 {expected:.3}s the hashrate implies"
+            ));
+        }
+    }
+    problems
+}
+
+/// Every way the session failed to converge as stated; empty when it did.
+/// The second value is when it settled, if it did.
+fn convergence_failures(trace: &Trace, target: f64) -> (Vec<String>, Option<f64>) {
+    let mut failures = Vec::new();
+    let start = trace.difficulties[0].1 / target;
+    if (start - START_ERROR).abs() >= 1e-9 && (start - 1.0 / START_ERROR).abs() >= 1e-9 {
+        failures.push(format!("it did not start {START_ERROR}x from its target"));
+    }
+    if let Some(index) = reversal(&trace.difficulties) {
+        failures.push(format!(
+            "adjustment {index} reversed the direction of the ones before it"
+        ));
+    }
+    let Some(settled) = settled_from(&trace.difficulties, target) else {
+        failures.push(format!("it never settled within {BAND}x of its target"));
+        return (failures, None);
+    };
+    if settled > MAX_ADJUSTMENTS_TO_SETTLE {
+        failures.push(format!(
+            "it took {settled} adjustments to settle, more than {MAX_ADJUSTMENTS_TO_SETTLE}"
+        ));
+    }
+    let settled_at = trace.difficulties[settled].0;
+    if settled_at > MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS {
+        failures.push(format!(
+            "it settled at {settled_at:.2}s, later than {MAX_RETARGET_PERIODS_TO_SETTLE} \
+             retarget periods ({:.2}s)",
+            MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS
+        ));
+    }
+    let held = trace.ran_seconds - settled_at;
+    if held < SETTLED_RETARGET_PERIODS * RETARGET_SECONDS {
+        failures.push(format!(
+            "it settled at {settled_at:.2}s, leaving {held:.2}s, less than \
+             {SETTLED_RETARGET_PERIODS} retarget periods to show it stays settled"
+        ));
+    }
+    let changes = trace.difficulties.len() - 1 - settled;
+    if changes > 1 {
+        failures.push(format!("it changed {changes} times after settling"));
+    }
+    // Staying settled is shown by shares the listener saw after settling:
+    // at least half those the hold implies at the band's longest interval.
+    let shown = trace
+        .shares
+        .iter()
+        .filter(|share| share.sent >= settled_at)
+        .count();
+    let needed = (held / (BAND * TARGET_SECONDS) / 2.0).floor() as usize;
+    if shown < needed {
+        failures.push(format!(
+            "only {shown} shares after settling, fewer than the {needed} needed to show it \
+             stays settled over {held:.2}s"
+        ));
+    }
+    (failures, Some(settled_at))
+}
+
+/// The verdict. A session that converged passes, whatever its client's
+/// pace: convergence despite a noisy client is still convergence. One that
+/// did not is a vardiff finding only if the client kept its pace; otherwise
+/// the failure names the broken premise first, so a stalled host is not
+/// read as a vardiff regression.
+fn verdict(premise: &[String], failures: &[String]) -> Result<(), String> {
+    match (failures.is_empty(), premise.is_empty()) {
+        (true, _) => Ok(()),
+        (false, true) => Err(format!("vardiff did not converge: {}", failures.join("; "))),
+        (false, false) => Err(format!(
+            "premise failed, the client did not keep its pace ({}), so these are not \
+             vardiff findings: {}",
+            premise.join("; "),
+            failures.join("; ")
+        )),
+    }
+}
+
 fn check(name: &str, trace: &Trace, hashrate: f64) {
     let target = hashrate * TARGET_SECONDS;
     assert!(
@@ -385,99 +543,28 @@ fn check(name: &str, trace: &Trace, hashrate: f64) {
         "{name}: refused shares {:?}",
         trace.refusals
     );
-    // The premise: the listener measured a client that kept its pace. It is
-    // judged at every difficulty the session was sent, as the shares were
-    // actually sent: a span in which the client fell short of its hashrate
-    // (a stalled host) fails here, as the host's fault and not vardiff's,
-    // before its effect on the trajectory can be read as a vardiff finding.
-    // The final difficulty's mean interval is checked too. Shares sent over
-    // half an interval late (bunched by a busy host) are only counted:
-    // convergence despite them is still convergence, and every failure below
-    // names them.
-    let (final_at, final_difficulty) = *trace.difficulties.last().unwrap();
-    let expected = final_difficulty / hashrate;
-    let paced: Vec<&Share> = trace
-        .shares
-        .iter()
-        .filter(|share| share.difficulty == final_difficulty && share.sent >= final_at)
-        .collect();
     let steps: Vec<String> = trace
         .difficulties
         .iter()
         .map(|(at, d)| format!("{at:.2}s:{:.3}x", d / target))
         .collect();
-    assert!(
-        paced.len() >= 10,
-        "{name}: only {} shares at the final difficulty; difficulty / target over time {steps:?}",
-        paced.len()
-    );
-    let measured = (paced.last().unwrap().sent - paced[0].sent) / (paced.len() - 1) as f64;
-    let late = paced
-        .iter()
-        .filter(|share| share.sent - share.due > expected / 2.0)
-        .count();
-    let context = format!(
-        "{name}: difficulty / target over time {steps:?}; the client sent every {measured:.3}s \
-         against the {expected:.3}s its hashrate implies, {late} of {} shares over half an \
-         interval late",
-        paced.len()
-    );
-    assert!(
-        (0.8..=1.25).contains(&(measured / expected)),
-        "{context}: premise failed, the client did not keep its pace (host overloaded?)"
-    );
-    let spans = pace_by_difficulty(trace, hashrate);
-    let short: Vec<String> = spans
-        .iter()
-        .filter(|(_, sent, expected)| short_of_pace(*sent, *expected))
-        .map(|(at, sent, expected)| format!("from {at:.2}s: {sent} of {expected}"))
-        .collect();
-    assert!(
-        short.is_empty(),
-        "{context}: premise failed, the client sent too few shares at some difficulty \
-         ({short:?}): a stalled host, or the listener acknowledging slowly, since the client \
-         sends a share only once the last is answered"
-    );
-    let start = trace.difficulties[0].1 / target;
-    assert!(
-        (start - START_ERROR).abs() < 1e-9 || (start - 1.0 / START_ERROR).abs() < 1e-9,
-        "{context}: the session did not start {START_ERROR}x from its target"
-    );
-    if let Some(index) = reversal(&trace.difficulties) {
-        panic!("{context}: adjustment {index} reversed the direction of the ones before it");
-    }
-    let settled = settled_from(&trace.difficulties, target)
-        .unwrap_or_else(|| panic!("{context}: never settled within {BAND}x of its target"));
-    assert!(
-        settled <= MAX_ADJUSTMENTS_TO_SETTLE,
-        "{context}: took {settled} adjustments to settle, more than {MAX_ADJUSTMENTS_TO_SETTLE}"
-    );
-    let settled_at = trace.difficulties[settled].0;
-    assert!(
-        settled_at <= MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS,
-        "{context}: settled at {settled_at:.2}s, later than {MAX_RETARGET_PERIODS_TO_SETTLE} \
-         retarget periods ({:.2}s)",
-        MAX_RETARGET_PERIODS_TO_SETTLE * RETARGET_SECONDS
-    );
-    let held = trace.ran_seconds - settled_at;
-    assert!(
-        held >= SETTLED_RETARGET_PERIODS * RETARGET_SECONDS,
-        "{context}: settled at {settled_at:.2}s, leaving {held:.2}s, less than \
-         {SETTLED_RETARGET_PERIODS} retarget periods to show it stays settled"
-    );
-    let changes = trace.difficulties.len() - 1 - settled;
-    assert!(
-        changes <= 1,
-        "{context}: changed {changes} times after settling"
-    );
-    let spans: Vec<String> = spans
+    let spans: Vec<String> = pace_by_difficulty(trace, hashrate)
         .iter()
         .map(|(at, sent, expected)| format!("{at:.2}s:{sent}/{expected}"))
         .collect();
+    let (past_due_at, past_due) = worst_stall(trace);
+    let context = format!(
+        "{name}: difficulty / target over time {steps:?}; shares sent / expected per difficulty \
+         {spans:?}; longest past due {past_due:.3}s at {past_due_at:.2}s"
+    );
+    let premise = premise_problems(trace, hashrate);
+    let (failures, settled_at) = convergence_failures(trace, target);
+    if let Err(reason) = verdict(&premise, &failures) {
+        panic!("{context}: {reason}");
+    }
     eprintln!(
-        "{context}; shares sent / expected per difficulty {spans:?}; settled after {settled} \
-         adjustments in {:.1} retarget periods",
-        settled_at / RETARGET_SECONDS
+        "{context}; settled in {:.1} retarget periods; client pace problems: {premise:?}",
+        settled_at.unwrap_or(f64::NAN) / RETARGET_SECONDS
     );
 }
 
@@ -584,4 +671,54 @@ fn a_span_short_of_its_pace_is_found_even_when_it_expects_two_shares() {
         "the worst span seen under load passes"
     );
     assert!(short_of_pace(63, 80));
+}
+
+#[test]
+fn a_failure_with_a_broken_premise_is_not_reported_as_a_vardiff_finding() {
+    let failures = vec!["it settled at 3.40s".to_string()];
+    let stalled = vec!["a share was 0.600s past due at 2.20s".to_string()];
+    assert_eq!(
+        verdict(&stalled, &[]),
+        Ok(()),
+        "convergence despite a stall passes"
+    );
+    assert!(verdict(&[], &failures)
+        .unwrap_err()
+        .starts_with("vardiff did not converge"));
+    assert!(verdict(&stalled, &failures)
+        .unwrap_err()
+        .starts_with("premise failed"));
+    // Codex's case on #609: a one-share span missed by a 2.2 s stall.
+    let trace = Trace {
+        difficulties: vec![(0.0, 1.6), (2.2, 0.4)],
+        shares: vec![],
+        overdue_at_change: vec![(2.2, 0.6)],
+        ran_seconds: 2.2,
+        ..Default::default()
+    };
+    assert!(premise_problems(&trace, 1.0)
+        .iter()
+        .any(|problem| problem.starts_with("a share was 0.600s past due at 2.20s")));
+}
+
+#[test]
+fn settling_without_shares_to_show_it_held_is_a_failure() {
+    let trace = |shares: usize| Trace {
+        difficulties: vec![(0.0, 16.0), (0.5, 4.0), (1.0, 1.0)],
+        shares: (0..shares)
+            .map(|i| Share {
+                due: 1.1 + 0.1 * i as f64,
+                sent: 1.1 + 0.1 * i as f64,
+                difficulty: 1.0,
+            })
+            .collect(),
+        ran_seconds: 8.0,
+        ..Default::default()
+    };
+    // Target 1 at TARGET_SECONDS: 7 s held needs 7 / 0.15 / 2 = 23 shares.
+    let (failures, _) = convergence_failures(&trace(2), 1.0);
+    assert!(failures
+        .iter()
+        .any(|failure| failure.starts_with("only 2 shares after settling")));
+    assert!(convergence_failures(&trace(60), 1.0).0.is_empty());
 }
