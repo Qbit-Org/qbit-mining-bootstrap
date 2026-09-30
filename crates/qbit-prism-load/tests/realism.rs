@@ -497,6 +497,9 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
         "throughput-500k-window-1fe-async",
         "throughput-500k-window-2fe-async",
         "throughput-500k-window-4fe-async",
+        "throughput-400k-window-2fe-async-3-blocks",
+        "dense-cadence-400k-window-1fe-async",
+        "dense-cadence-400k-window-2fe-async",
     ] {
         assert!(
             names.contains(&required),
