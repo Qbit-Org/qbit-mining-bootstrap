@@ -64,24 +64,24 @@ name: PRISM load harness runner probe
 #        gh workflow run prism-load-runner-probe.yml -R Qbit-Org/qbit-mining-bootstrap \
 #          -f ref=<sha> -f classes=8,16,32 -f target_cache=sticky-disk -f fsync_vms=0 \
 #          -f presets=throughput-20k-window-1fe -f repeats=10 -f in_job_repeats=2
-#      Ceiling 60,225 2 vCPU min (~$241); estimate 35-50 min a job, ~$39-56.
+#      Ceiling 60,785 2 vCPU min (~$243); estimate 35-50 min a job, ~$39-56.
 #   B. Post-#273 memory footprint on 32 vCPU, 3 VMs:
 #        ... -f classes=32 -f repeats=3 -f in_job_repeats=1 -f fsync_vms=0 \
 #          -f presets=throughput-400k-window-1fe-async,throughput-400k-window-2fe-async,throughput-400k-window-4fe-async
-#      Ceiling 13,225 (~$53); estimate ~75 min a job, ~$14.
+#      Ceiling 13,369 (~$53); estimate ~75 min a job, ~$14.
 #   B2. #555's 5,000- and 10,000-session points on 32 vCPU, once #555 checks
 #      their presets in (named by #555, not here): as B with
 #      -f presets=<#555's 5,000-session preset>,<#555's 10,000-session preset>.
-#      At 60-minute preset timeouts: ceiling ~$41, estimate ~$12.
+#      At 60-minute preset timeouts: ceiling ~$42, estimate ~$12.
 #   C. The P5 step down: B's and B2's presets on 16 vCPU (-f classes=16),
 #      only for those whose 32 vCPU peak would leave the 16 vCPU class its
-#      headroom. Ceiling ~$47, estimate ~$13.
+#      headroom. Ceiling ~$48, estimate ~$13.
 #   D. L2's other nightly presets on 8 vCPU, 3 VMs, in two dispatches (one
 #      job's runs must fit 360 minutes):
 #        -f classes=8 -f repeats=3 -f presets=throughput-400k-window-1fe-async,tip-delivery-2000-miners-400k-2fe-retarget,mainnet-shape-650-addresses
 #        -f classes=8 -f repeats=3 -f presets=mainnet-shape-130-addresses,rental-churn-bursts-and-storms,throughput-20k-window-1fe-500-addresses,short-plan-fake-node
 #      Ceiling ~$15 each, estimate ~$2-3 each.
-#   Total: ceiling ~$410, estimate ~$80-100.
+#   Total: ceiling ~$415, estimate ~$80-100.
 #
 # Per-lane pick: download each phase's prism-probe-table artifact and read
 # variance.json. A lane's class is the smallest on which every preset the

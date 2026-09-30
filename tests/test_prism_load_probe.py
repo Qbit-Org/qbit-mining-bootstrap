@@ -302,8 +302,10 @@ class RepeatPlan(unittest.TestCase):
         self.assertEqual({e["repeat"] for e in plan["probe"]["include"]}, set(range(1, 11)))
         self.assertEqual(plan["presets"], "throughput-20k-window-1fe")
         self.assertEqual(plan["in_job_repeats"], 2)
-        # Two 60-minute runs plus slack, inside setup, build and reports.
-        self.assertEqual(plan["runs_minutes"], 2 * 60 + probe.RUN_STEP_SLACK_MINUTES)
+        # Two 60-minute runs plus slack and each run's cleanup, inside setup,
+        # build and reports.
+        self.assertEqual(plan["runs_minutes"], 2 * 60 + probe.RUN_STEP_SLACK_MINUTES
+                         + 2 * probe.CLEANUP_MINUTES_PER_RUN)
         self.assertEqual(plan["job_minutes"], probe.SETUP_MINUTES + probe.BUILD_MINUTES
                          + plan["runs_minutes"] + probe.REPORT_MINUTES)
         ceiling = plan["ceiling"]
@@ -363,7 +365,7 @@ class RepeatPlan(unittest.TestCase):
             keys = set(outputs)
             # The workflow splits the preset list on commas, so it is bare text.
             self.assertEqual(outputs["presets"], ",".join(probe.PRESETS))
-            self.assertEqual(json.loads(outputs["job_minutes"]), 200)
+            self.assertEqual(json.loads(outputs["job_minutes"]), 202)
             self.assertEqual(json.loads(outputs["probe"])["include"][2]["repeat"], 3)
             self.assertEqual(keys, {"probe", "fsync", "fsync_enabled", "presets",
                                     "in_job_repeats", "runs_minutes", "job_minutes", "ceiling"})

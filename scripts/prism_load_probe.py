@@ -91,9 +91,13 @@ PRESETS = ("short-plan-20k-window-1fe", "throughput-20k-window-1fe")
 SETUP_MINUTES = 15
 BUILD_MINUTES = 60
 REPORT_MINUTES = 15
-# Slack between the runs' summed timeouts and the run step's own timeout,
-# for the cleanup after a run that timed out.
+# Slack between the runs' summed timeouts and the run step's own timeout: a
+# fixed allowance, plus one minute per run for the cleanup after a run that
+# timed out (end_group's 30 s SIGTERM grace and 5 s SIGKILL wait, the
+# postmaster kill and the cluster removal), so every run can time out and
+# the last one still writes its measurement.
 RUN_STEP_SLACK_MINUTES = 5
+CLEANUP_MINUTES_PER_RUN = 1
 # The longest probe job the plan accepts. GitHub's hosted-runner limit is
 # 360 minutes; Blacksmith's is what #541's duration job measures, so the
 # probe stays inside the lower one until that is known.
@@ -224,7 +228,9 @@ def matrices(
     known, aliases = load_presets(presets_dir)
     names = parse_presets(presets, known, aliases)
     run_minutes = {name: preset_minutes(known[name]) for name in names}
-    runs_minutes = sum(run_minutes.values()) * iterations + RUN_STEP_SLACK_MINUTES
+    runs = len(names) * iterations
+    runs_minutes = (sum(run_minutes.values()) * iterations + RUN_STEP_SLACK_MINUTES
+                    + CLEANUP_MINUTES_PER_RUN * runs)
     job_minutes = SETUP_MINUTES + BUILD_MINUTES + runs_minutes + REPORT_MINUTES
     if job_minutes > MAX_JOB_MINUTES:
         overhead = job_minutes - sum(run_minutes.values()) * iterations
