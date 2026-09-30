@@ -28,7 +28,9 @@ name: PRISM load harness (nightly)
 # The bridging pair (short-plan-real-node and short-plan-fake-node, #547,
 # #552) runs the same short plan on a managed regtest qbitd and on the fake
 # node, on the same runner class, so their difference is what the real node
-# costs.
+# costs. The matrix runs each half on its own VM; the `bridging` job (#552)
+# also runs both on one VM and writes the difference as a row, so the cost is
+# not blurred by the spread between two VMs.
 #
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
@@ -154,6 +156,14 @@ on:
         description: >-
           Also run L6, the shipped images under the Compose prism profile
           with the HA overlay (#544; the weekly schedule always does).
+        type: boolean
+        required: false
+        default: false
+      bridging:
+        description: >-
+          Also run the bridging lane, the short plan on the fake and the real
+          node on one runner (#552; the nightly schedule and the run-load
+          label always do).
         type: boolean
         required: false
         default: false
@@ -413,6 +423,124 @@ jobs:
           path: ${{ runner.temp }}/prism-load-out
           if-no-files-found: error
 
+  # #552 (S12 of #487): the bridging lane. The same short plan on the fake
+  # node and on the real node, one after the other on one runner, so the
+  # difference is what the real node costs and not the spread between two
+  # VMs. It runs in addition to the matrix's short-plan-fake-node and
+  # short-plan-real-node jobs, which gate each half on its own runner. The
+  # order alternates with the run number, so whatever going first or second
+  # costs (a cold page cache, say) does not always land on one side; the row
+  # records it. scripts/prism_load_bridge.py writes the row and the summary
+  # table: the real node's cost on this runner, not a D1 verdict (#487
+  # decisions 1 and 5), with anything a side could not measure left unknown.
+  # Both halves always run and the row is always written; the job then fails
+  # if either half failed its gate.
+  bridging:
+    name: Bridging (short plan, fake and real node on one runner)
+    needs: [guard, plan, build]
+    if: >-
+      ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *'
+      || github.event_name == 'pull_request' || inputs.bridging) }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Each half runs under its preset's timeout_minutes (30), so this is
+    # both of them plus the setup, the row and the upload.
+    timeout-minutes: 75
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Download the binaries built once
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-load-binaries
+          path: ${{ runner.temp }}
+      - name: Unpack the binaries into target/release
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar"
+          touch target/release/qbit-prism-server target/release/qbit-prism-load \
+            target/release/qbit-prism-load-gate
+      - name: Run both halves on this runner
+        id: sides
+        env:
+          PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS: ${{ inputs.tip_last_notify_p99_budget_ms }}
+          PRISM_LOAD_MAX_SHORTFALL: ${{ inputs.max_shortfall }}
+          RUNNER_LABEL: blacksmith-8vcpu-ubuntu-2404
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          declare -A preset=([fake]=short-plan-fake-node [real]=short-plan-real-node)
+          if (( RUN_NUMBER % 2 )); then order=(real fake); else order=(fake real); fi
+          printf 'order=%s,%s\n' "${order[@]}" >> "${GITHUB_OUTPUT}"
+          for side in "${order[@]}"; do
+            {
+              echo "### ${preset[${side}]} on ${RUNNER_LABEL} (bridging, ${side} side)"
+              echo
+              echo "Commit \`$(git rev-parse HEAD)\`; order ${order[*]}."
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+            # Each half gets its preset's own timeout_minutes (the matrix
+            # enforces it as the job's), so a hung half cannot use up the
+            # job's and leave the other half and the row unrun. timeout
+            # signals the half's whole process group. A failing or timed-out
+            # half is its gate's verdict (or its missing gate-exit-code),
+            # read in the last step; the other half still runs.
+            minutes="$(jq -er .timeout_minutes "crates/qbit-prism-load/presets/${preset[${side}]}.json")"
+            timeout --kill-after=60 "${minutes}m" \
+              bash .github/scripts/prism-load-run.sh "${preset[${side}]}" \
+              "${RUNNER_TEMP}/prism-load-bridging/${side}" || true
+          done
+      - name: Write the comparison row
+        if: ${{ !cancelled() && steps.sides.outputs.order != '' }}
+        env:
+          ORDER: ${{ steps.sides.outputs.order }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prism-load-bridging"
+          python3 scripts/prism_load_bridge.py --fake "${out}/fake" --real "${out}/real" \
+            --order "${ORDER}" --out "${out}/bridge-row.json" --summary "${GITHUB_STEP_SUMMARY}" \
+            --commit "${SHA}" --run-url "${RUN_URL}"
+      - name: Upload both runs and the row
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-bridging
+          overwrite: true
+          # #487 decision 3: the load evidence is kept 90 days.
+          retention-days: 90
+          path: ${{ runner.temp }}/prism-load-bridging
+          if-no-files-found: error
+      - name: Fail if either half failed its gate
+        run: |
+          set -euo pipefail
+          failed=0
+          for side in fake real; do
+            code="$(cat "${RUNNER_TEMP}/prism-load-bridging/${side}/gate-exit-code" 2>/dev/null || echo missing)"
+            if [[ "${code}" != 0 ]]; then
+              echo "the ${side} half's gate exit code is ${code}; see its gate.md in the summary" >&2
+              failed=1
+            fi
+          done
+          exit "${failed}"
+
   # The opt-in #[ignore] live_regtest variants (#521): each id in
   # test/prism-nightly-gated-tests.txt, run explicitly with --ignored --exact
   # in required integration mode against a real qbitd and PostgreSQL 16, and
@@ -645,7 +773,7 @@ jobs:
   # (a skipped night) does neither. The soak never records a tested commit.
   report:
     name: Record the tested commit and report a failure
-    needs: [guard, plan, build, run, live-nightly, live-weekly, stratum-fuzz, shipped-images]
+    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
