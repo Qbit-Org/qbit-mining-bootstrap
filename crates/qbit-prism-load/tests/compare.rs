@@ -24,6 +24,8 @@ fn phase(name: &str, target: f64, achieved: f64, shortfall: u64, rejected: u64, 
         phase["duration_seconds"] = json!(plan.seconds as f64 + 0.004);
         phase["in_artifact"] = json!(plan.in_artifact);
         phase["database_delay_milliseconds_configured"] = json!(plan.database_delay_ms);
+        phase["database_delay_observed_select1_median_milliseconds"] =
+            json!(2.0 * plan.database_delay_ms as f64 + 2.9);
     }
     phase
 }
@@ -45,8 +47,20 @@ fn plain_phase(
         "shortfall": shortfall,
         "rejected_valid_shares": rejected,
         "client_ack_latency": {"p50": 2.5, "p99": p99},
-        "order_lock": {"max_waiters": 15, "mean_waiters": 13.4, "sample_interval_milliseconds": 10.0},
-        "processes": [{"instance_id": "load-fe-0", "sample_interval_seconds": 1.0}],
+        "order_lock": {
+            "max_waiters": 15,
+            "mean_waiters": 13.4,
+            "sample_interval_milliseconds": 10.0,
+            "samples": 5000,
+            "unavailable_reason": null,
+        },
+        "processes": [{
+            "instance_id": "load-fe-0",
+            "sample_interval_seconds": 1.0,
+            "samples": 60,
+            "unavailable_reason": null,
+        }],
+        "database_delay_observed_select1_median_milliseconds": 0.2,
         "reconciliation": {"missing": 0, "unexpected": 0},
         "min_mem_available_kib": 30_000 * 1024,
         "in_artifact": true,
@@ -607,6 +621,32 @@ fn a_build_skipping_a_phases_blocks_or_database_delay_fails() {
 }
 
 #[test]
+fn a_delayed_phase_whose_delay_was_not_seen_to_be_paid_fails() {
+    let manifest = manifest(288.0);
+    // `slow_database` is the fifth phase the fixture reports.
+    for (observed, why) in [
+        (
+            json!(5.0),
+            "ran `slow_database` without paying its delay: a round trip through the proxied \
+             database URL took 5.000 ms",
+        ),
+        (
+            Value::Null,
+            "reports no observed database delay for `slow_database`",
+        ),
+    ] {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in &mut runs {
+            run.report.as_mut().unwrap()["phases"][4]
+                ["database_delay_observed_select1_median_milliseconds"] = observed.clone();
+        }
+        let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+        assert!(!result.passed);
+        assert!(result.markdown.contains(why), "{}", result.markdown);
+    }
+}
+
+#[test]
 fn fewer_completed_reconnects_than_pinned_fails() {
     let manifest = manifest(288.0);
     let with_reconnects = |completed: u64| {
@@ -914,6 +954,17 @@ fn samplers_at_another_interval_than_pinned_fail() {
             json!({"max_waiters": 15, "mean_waiters": 13.4}),
             "reports no sampler intervals for `burst`",
         ),
+        // Each sampler sampled, and says of no reason it could not.
+        (
+            "/phases/0/order_lock/samples",
+            json!(0),
+            "reports a sampler that took no samples in `steady_state`",
+        ),
+        (
+            "/phases/1/processes/0/unavailable_reason",
+            json!("no samples fell inside the window"),
+            "reports a sampler that took no samples in `burst`",
+        ),
         // Every launched frontend is sampled, and only those.
         (
             "/phases/0/processes/0/instance_id",
@@ -923,8 +974,8 @@ fn samplers_at_another_interval_than_pinned_fail() {
         (
             "/phases/2/processes",
             json!([
-                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0},
-                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0},
+                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0, "samples": 60},
+                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0, "samples": 60},
             ]),
             "sampled load-fe-0, load-fe-0 in `warm_up`",
         ),
@@ -966,6 +1017,8 @@ fn planned_in(pinned: &std::collections::BTreeMap<String, Value>, name: &str) ->
     phase["duration_seconds"] = json!(plan.seconds as f64 + 0.004);
     phase["in_artifact"] = json!(plan.in_artifact);
     phase["database_delay_milliseconds_configured"] = json!(plan.database_delay_ms);
+    phase["database_delay_observed_select1_median_milliseconds"] =
+        json!(2.0 * plan.database_delay_ms as f64 + 2.9);
     phase
 }
 

@@ -599,6 +599,46 @@ Compare file sync methods using two 8kB writes:
                 ab.main(["--base", "a", "--candidate", "b", "--preset", "throughput-20k-window-1fe",
                          "--out", directory, "--pg-bin-dir", directory])
 
+    def test_a_skipped_build_reuses_only_binaries_the_driver_built_for_that_commit(self) -> None:
+        commits = {"now": "a" * 40}
+
+        def git(*args: str, cwd: Path = ab.ROOT) -> str:
+            return commits["now"] if args[0] == "rev-parse" else ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            release = out / "builds" / "base" / "target" / "release"
+            release.mkdir(parents=True)
+            for binary in ab.BINARIES:
+                (release / binary).write_bytes(b"left here by " + binary.encode())
+            built = subprocess.CompletedProcess([], 0)
+            with mock.patch.object(ab, "git", git), \
+                    mock.patch.object(ab.subprocess, "run", return_value=built) as cargo, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                # Binaries the driver did not build are not reused.
+                with self.assertRaisesRegex(ab.DriverError, "holds no build this driver made"):
+                    ab.prepare_build("base", "v1", out, skip_build=True)
+                cargo.assert_not_called()
+                # The driver's own build records them, and then they are.
+                ab.prepare_build("base", "v1", out, skip_build=False)
+                self.assertEqual(cargo.call_count, 1)
+                ab.prepare_build("base", "v1", out, skip_build=True)
+                self.assertEqual(cargo.call_count, 1)
+                # A binary replaced since, or a worktree moved to another
+                # commit, is not.
+                (release / "qbit-prism-load").write_bytes(b"copied in")
+                with self.assertRaisesRegex(ab.DriverError, "holds no build this driver made"):
+                    ab.prepare_build("base", "v1", out, skip_build=True)
+                ab.prepare_build("base", "v1", out, skip_build=False)
+                commits["now"] = "b" * 40
+                with self.assertRaisesRegex(ab.DriverError, "holds no build this driver made"):
+                    ab.prepare_build("base", "v2", out, skip_build=True)
+                # A failed build leaves no record to reuse.
+                cargo.return_value = subprocess.CompletedProcess([], 101)
+                with self.assertRaisesRegex(ab.DriverError, "failed with exit 101"):
+                    ab.prepare_build("base", "v2", out, skip_build=False)
+                self.assertFalse((release / ab.BUILD_RECORD).exists())
+
     def test_a_named_preset_resolves_to_the_checked_in_file(self) -> None:
         self.assertEqual(ab.preset_path("throughput-20k-window-1fe"), ab.PRESETS / "throughput-20k-window-1fe.json")
         with contextlib.redirect_stderr(io.StringIO()) as warning:

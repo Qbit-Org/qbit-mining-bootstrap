@@ -770,9 +770,9 @@ pub fn expected_phases(pinned: &BTreeMap<String, Value>) -> Result<Vec<crate::cl
 
 /// Why a counted run's report of `phase` does not match the preset's plan
 /// for it, or `None` when it does: the target rate and whether the phase is
-/// in the artifact exactly, the configured database delay and the frontend
-/// restarts exactly (with `frontends` running), and the length within
-/// [`DURATION_TOLERANCE`] of the planned seconds.
+/// in the artifact exactly, the configured database delay (seen to be paid)
+/// and the frontend restarts exactly (with `frontends` running), and the
+/// length within [`DURATION_TOLERANCE`] of the planned seconds.
 fn off_plan(
     id: &str,
     reported: &Value,
@@ -814,6 +814,28 @@ fn off_plan(
             delay.map_or("unreported".into(), |d| d.to_string()),
             plan.database_delay_ms
         ));
+    }
+    // A delayed phase's delay was seen to be paid before the phase, as the
+    // harness itself requires (`run::check_delay_observed`, in every harness
+    // since #271): a report that only states the configured delay proves
+    // nothing about the database the phase ran against.
+    if plan.database_delay_ms > 0 {
+        let observed = reported["database_delay_observed_select1_median_milliseconds"].as_f64();
+        match observed
+            .map(|median| crate::run::check_delay_observed(plan.database_delay_ms, median))
+        {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                return Some(format!(
+                    "{id} ran `{name}` without paying its delay: {error:#}"
+                ))
+            }
+            None => {
+                return Some(format!(
+                    "{id} reports no observed database delay for `{name}`"
+                ))
+            }
+        }
     }
     // A run that skipped the drained restart or the mid-flight kill ran an
     // easier phase, whatever the other runs did.
@@ -1524,7 +1546,9 @@ pub fn compare(
     // The samplers ran at the pinned intervals, on every frontend: each
     // phase reports the ORDER-lock sampler's interval and one process record
     // per launched frontend (`frontend_environment`), each at the pinned
-    // interval (every harness since #271 reports both in every phase).
+    // interval and each having sampled, with no reason it could not (every
+    // harness since #271 reports all of it in every phase). A sampler that
+    // stopped would spare the run its queries and publish no evidence.
     let lock_ms = pinned
         .get("--lock-sample-interval-ms")
         .and_then(Value::as_f64);
@@ -1576,8 +1600,16 @@ pub fn compare(
                 })
             });
             let sampled = processes.map(|list| instance_ids(list));
+            let idle = |summary: &Value| {
+                summary["samples"].as_u64().is_none_or(|n| n == 0)
+                    || !summary["unavailable_reason"].is_null()
+            };
             let why = if lock.is_none() || sampled.is_none() {
                 Some(format!("reports no sampler intervals for `{name}`"))
+            } else if idle(&phase["order_lock"]) || processes.into_iter().flatten().any(idle) {
+                Some(format!(
+                    "reports a sampler that took no samples in `{name}`, or says why it could not"
+                ))
             } else if sampled.as_ref() != Some(&launched) {
                 Some(format!(
                     "sampled {} in `{name}`, not its launched frontends {}",

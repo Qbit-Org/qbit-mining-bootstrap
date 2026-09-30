@@ -57,6 +57,11 @@ setting unchanged except `--resume`, `--skip-build`, `--dry-run` and
 stopped before the driver exits, on Ctrl-C, SIGTERM or SIGHUP alike. The summarizer refuses a series in which
 either build is short of its repeats.
 
+`--skip-build` reuses only builds the driver itself made: it records each
+build's commit and binary digests beside the binaries, and refuses a
+worktree whose binaries were built for another commit, copied in, or left
+by a build that failed.
+
 `python3 scripts/prism_load_ab.py --help` lists the
 settings.
 
@@ -137,13 +142,13 @@ those flags is exempt from it, since the legacy table already proved it ran
 the pinned value); a build that reads a pinned rate differently
 fails the comparison rather than passing on less load. The same holds for
 the rest of the planned workload, even when every run agrees: each phase's
-database delay and frontend restarts (the reconnect phase's drained restart
+database delay, seen to be paid, and frontend restarts (the reconnect phase's drained restart
 with two or more frontends, the mid-flight kill's relaunch, with submits in
 flight at the kill), the scheduled blocks, each accepted by the node (under
 the dense cadence, the pinned landing budget and the landings it schedules),
 a connection for every pinned session, the completed reconnects,
-the memory floor, and the samplers' pinned intervals on every launched
-frontend.
+the memory floor, and the samplers, each sampling at its pinned interval on
+every launched frontend.
 
 **The verdict is PASS** when the candidate meets the rule in every gated
 phase, every candidate run passes the preset's gates, and the targets

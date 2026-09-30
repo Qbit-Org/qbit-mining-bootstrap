@@ -374,6 +374,27 @@ def git(*args: str, cwd: Path = ROOT) -> str:
     return result.stdout.strip()
 
 
+# The binaries a build provides, and the record of a build this driver made:
+# the commit it built and each binary's digest. `--skip-build` reuses a
+# worktree's binaries only under that record. The harness takes its revision
+# from the checkout it runs in and proves the server binary's provenance from
+# Cargo's dep-info, but not its own, so a harness binary left from another
+# commit, or copied in, would have its measurements attributed to this one.
+BINARIES = ("qbit-prism-load", "qbit-prism-server")
+BUILD_RECORD = ".prism-ab-build.json"
+
+
+def build_record(commit: str, release: Path) -> dict[str, Any]:
+    digests = {}
+    for binary in BINARIES:
+        digest = hashlib.sha256()
+        with (release / binary).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        digests[binary] = digest.hexdigest()
+    return {"commit": commit, "sha256": digests}
+
+
 def prepare_build(label: str, ref: str, out: Path, skip_build: bool) -> dict[str, Any]:
     commit = git("rev-parse", "--verify", f"{ref}^{{commit}}")
     tree = out / "builds" / label
@@ -386,7 +407,11 @@ def prepare_build(label: str, ref: str, out: Path, skip_build: bool) -> dict[str
         git("worktree", "add", "--detach", str(tree), commit)
     if git("status", "--porcelain", cwd=tree):
         raise DriverError(f"{tree} has local changes; the harness would refuse its dirty tree")
+    release = tree / "target" / "release"
+    record = release / BUILD_RECORD
     if not skip_build:
+        # A build that fails or is interrupted leaves no record behind it.
+        record.unlink(missing_ok=True)
         env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
         print(f"building {label} ({ref}, {commit[:8]}) in {tree}", file=sys.stderr, flush=True)
         result = subprocess.run(
@@ -397,10 +422,21 @@ def prepare_build(label: str, ref: str, out: Path, skip_build: bool) -> dict[str
         )
         if result.returncode != 0:
             raise DriverError(f"building {label} ({ref}) failed with exit {result.returncode}")
-    release = tree / "target" / "release"
-    for binary in ("qbit-prism-load", "qbit-prism-server"):
+    for binary in BINARIES:
         if not (release / binary).is_file():
             raise DriverError(f"{release / binary} is missing")
+    if skip_build:
+        try:
+            recorded = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = None
+        if recorded != build_record(commit, release):
+            raise DriverError(
+                f"--skip-build: {release} holds no build this driver made of {ref} ({commit[:8]}), "
+                "so its binaries cannot be attributed to that commit; run without --skip-build"
+            )
+    else:
+        write_json(record, build_record(commit, release))
     return {"label": label, "ref": ref, "commit": commit, "worktree": str(tree.relative_to(out))}
 
 
@@ -653,7 +689,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="the harness's TMPDIR, where it builds its clusters; kept short for the socket path")
     parser.add_argument("--compare-bin", type=Path, help="a built qbit-prism-load-compare (default: build this checkout's)")
     parser.add_argument("--resume", action="store_true", help="keep the runs an interrupted series already recorded")
-    parser.add_argument("--skip-build", action="store_true", help="use the worktrees' existing release builds")
+    parser.add_argument("--skip-build", action="store_true",
+                        help="reuse the release builds this driver made in the worktrees, as it recorded them")
     parser.add_argument("--dry-run", action="store_true", help="build and resolve both command lines, run nothing")
     return parser.parse_args(argv)
 

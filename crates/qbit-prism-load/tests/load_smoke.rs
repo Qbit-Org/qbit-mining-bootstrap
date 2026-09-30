@@ -204,6 +204,20 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             "{}",
             plan.name
         );
+        // ... each having sampled, with no reason it could not.
+        let summaries = std::iter::once(&phase["order_lock"])
+            .chain(phase["processes"].as_array().context("processes")?);
+        for summary in summaries {
+            assert!(summary["samples"].as_u64() > Some(0), "{}", plan.name);
+            assert!(summary["unavailable_reason"].is_null(), "{}", plan.name);
+        }
+        // A delayed phase's delay was seen to be paid.
+        if plan.database_delay_ms > 0 {
+            let observed = phase["database_delay_observed_select1_median_milliseconds"]
+                .as_f64()
+                .context("observed delay")?;
+            run::check_delay_observed(plan.database_delay_ms, observed)?;
+        }
         // The comparator holds the lowest reading to the preset's memory
         // floor, and treats an unread one as a failure.
         assert!(
