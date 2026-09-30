@@ -192,7 +192,7 @@ target/release/qbit-prism-load-gate --report out/soak-leak/load-harness-report.j
 
 ## The weekly CI job
 
-`prism-load-nightly.yml` has a second schedule, Saturday 05:41 UTC, that
+`prism-load-nightly.yml` has a third schedule, Saturday 05:41 UTC, that
 selects `weekly` (`scripts/prism_load_matrix.py weekly`), which is
 `soak-weekly`. It reuses the workflow's release build, runs the preset with
 `prism-load-run.sh` on an 8 vCPU runner and uploads the run directory. The
@@ -200,6 +200,14 @@ preset's timeout is 355 min, under the 6 h job limit. The soak has its own
 concurrency group, so it never holds the nightly queue, and the live regtest
 variants do not run on its schedule. Dispatch it by hand with
 `preset: soak-weekly`.
+
+The nightly's skip-unchanged guard (#549) does not apply to the soak: it runs
+every Saturday whether or not `3.x.x` moved. A soak measures drift over one
+server lifetime and its bounds are still being calibrated, so another lifetime
+on the same commit is a second sample, not a repeat; and the commit the guard
+compares with is the one the nightly presets tested, not the soak. A failed
+soak opens or comments on the `prism-load-nightly-failure` issue like any
+scheduled run.
 
 **Cost.** About 5 h 40 min of one 8 vCPU runner a week plus the shared
 release build, roughly 350 runner-minutes, about $5.60 a week at $0.016 per

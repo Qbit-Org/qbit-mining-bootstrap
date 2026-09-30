@@ -27,7 +27,7 @@ Usage:
   prism_load_probe.py measure --out build.json -- cargo build ...
   prism_load_probe.py row --out row.json --class 8 ... --run short-plan-20k-window-1fe=DIR ...
   prism_load_probe.py fsync-row --out row.json --class 8 --vm 1 --fsync FILE
-  prism_load_probe.py host --out host.json --dir "$RUNNER_TEMP/pload"
+  prism_load_probe.py host --out host.json --dir "$RUNNER_TEMP/pload" [--runner LABEL]
   prism_load_probe.py table DIR
 """
 
@@ -588,6 +588,8 @@ def main(argv: list[str] | None = None) -> int:
     h = sub.add_parser("host")
     h.add_argument("--out", type=Path, required=True)
     h.add_argument("--dir", type=Path, required=True)
+    h.add_argument("--runner", default=None,
+                   help="the runner label the job asked for, recorded as runner_label")
 
     t = sub.add_parser("table")
     t.add_argument("directory", type=Path)
@@ -611,7 +613,10 @@ def main(argv: list[str] | None = None) -> int:
             return result["exit_code"] if result["exit_code"] >= 0 else 128 - result["exit_code"]
         if args.action == "host":
             args.out.parent.mkdir(parents=True, exist_ok=True)
-            args.out.write_text(json.dumps(host_facts(args.dir), indent=2) + "\n", encoding="utf-8")
+            facts = host_facts(args.dir)
+            if args.runner:
+                facts = {"runner_label": args.runner, **facts}
+            args.out.write_text(json.dumps(facts, indent=2) + "\n", encoding="utf-8")
             return 0
         if args.action in ("row", "fsync-row"):
             row = build_row(args) if args.action == "row" else build_fsync_row(args)

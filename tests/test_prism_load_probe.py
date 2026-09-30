@@ -136,6 +136,24 @@ def report(**overrides) -> dict:
     return document
 
 
+class Host(unittest.TestCase):
+    def test_the_runner_label_leads_the_fingerprint_when_given(self) -> None:
+        # #549: each nightly preset's artifact names the runner it asked for
+        # beside the disk facts.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "host.json"
+            self.assertEqual(probe.main(["host", "--out", str(out), "--dir", tmp,
+                                         "--runner", "blacksmith-8vcpu-ubuntu-2404"]), 0)
+            facts = json.loads(out.read_text())
+            self.assertEqual(next(iter(facts)), "runner_label")
+            self.assertEqual(facts["runner_label"], "blacksmith-8vcpu-ubuntu-2404")
+            self.assertIn("block_device", facts)
+            self.assertIn("options", facts["filesystem"])
+
+            self.assertEqual(probe.main(["host", "--out", str(out), "--dir", tmp]), 0)
+            self.assertNotIn("runner_label", json.loads(out.read_text()))
+
+
 class Rows(unittest.TestCase):
     def test_provenance_names_each_bypassed_check(self) -> None:
         self.assertEqual(probe.provenance(report()), "pass")
