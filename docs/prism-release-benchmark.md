@@ -143,7 +143,8 @@ with the pinned server settings (runtime workers, database connections,
 commit timeout, block poll, initial-job admission, pool fee), and with the arrival,
 population, template, pool-fee, churn and node settings the report states reading
 as this harness renders the preset's, with the population its seed draws
-and each phase's offers on its pinned arrival clock (a build whose harness
+and each phase's offers on its pinned arrival clock, second by second and
+placed as the population asks (a build whose harness
 predates one of those flags is exempt from it, since the legacy table
 already proved it ran the pinned value); a build that reads a pinned rate differently
 fails the comparison rather than passing on less load. The same holds for

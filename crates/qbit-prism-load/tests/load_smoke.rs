@@ -156,6 +156,27 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
                 }
             }
         }
+        let trace = arrival["offered_per_second"]
+            .as_array()
+            .context("offered_per_second")?
+            .iter()
+            .map(|count| count.as_u64().context("a count"))
+            .collect::<Result<Vec<u64>>>()?;
+        assert_eq!(
+            planned.trace_departure(&trace),
+            None,
+            "{} ran off its clock: {trace:?} against {:?}",
+            planned.phase,
+            planned.offers
+        );
+        assert_eq!(
+            arrival["offer_placement"]
+                .as_str()
+                .map(|placement| placement.starts_with("weighted")),
+            Some(planned.weighted),
+            "{}",
+            planned.phase
+        );
     }
     for (flag, pointer) in compare::PINNED_REPORT_FIELDS {
         let pinned = &loaded.args[*flag];

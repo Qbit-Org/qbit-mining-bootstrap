@@ -39,6 +39,12 @@ fn with_arrival(phase: &mut Value, pinned: &std::collections::BTreeMap<String, V
         .find(|planned| phase["name"] == planned.phase.as_str())
     {
         phase["arrival"] = json!({
+            "offer_placement": if planned.weighted {
+                "weighted by session share rate"
+            } else {
+                "round-robin"
+            },
+            "offered_per_second": planned.offers,
             "offered_per_second_cv_1s": planned.cv_1s,
             "offered_per_second_cv_60s": planned.cv_60s,
         });
@@ -787,6 +793,76 @@ fn a_population_or_an_arrival_other_than_the_seed_draws_fails() {
         "{}",
         result.markdown
     );
+    // The same seconds in another order: every sum and CV holds, the trace
+    // does not.
+    let mut runs = realistic_runs(&manifest, &pinned);
+    let trace = &mut runs[1].report.as_mut().unwrap()["phases"][0]["arrival"]["offered_per_second"];
+    let mut seconds: Vec<u64> = trace
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_u64().unwrap())
+        .collect();
+    seconds[..60].reverse();
+    *trace = json!(seconds);
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("offered `steady_state` off its pinned `--arrival` clock by second"),
+        "{}",
+        result.markdown
+    );
+    // Round-robin placement under a population whose sessions offer at
+    // different rates.
+    let mut runs = realistic_runs(&manifest, &pinned);
+    set_pointer(
+        runs[1].report.as_mut().unwrap(),
+        "/phases/0/arrival/offer_placement",
+        json!("round-robin"),
+    );
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "placed `steady_state`'s offers round-robin, though the population's sessions offer \
+             at different rates"
+        ),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
+fn a_trace_is_never_ahead_of_its_clock_and_lags_it_by_at_most_a_stall() {
+    let planned = compare::ExpectedArrival {
+        phase: "steady_state".into(),
+        rate: 50.0,
+        offers: vec![50; 60],
+        cv_1s: Some(0.0),
+        cv_60s: None,
+        weighted: false,
+    };
+    // A real 50/s trace: the token due at 1.000 s is minted in second 1.
+    let mut real = vec![50u64; 60];
+    real[0] = 49;
+    real[59] = 50;
+    assert_eq!(planned.trace_departure(&real), None);
+    // A late tick that had not yet minted half a second's offers.
+    let mut stalled = vec![50u64; 60];
+    stalled[10] = 26;
+    stalled[11] = 74;
+    assert_eq!(planned.trace_departure(&stalled), None);
+    // Ahead of the clock, or behind it by more than a stall.
+    let mut ahead = vec![50u64; 60];
+    ahead[10] = 52;
+    ahead[11] = 48;
+    assert_eq!(planned.trace_departure(&ahead), Some(10));
+    let mut behind = vec![50u64; 60];
+    behind[10] = 20;
+    behind[11] = 80;
+    assert_eq!(planned.trace_departure(&behind), Some(10));
 }
 
 #[test]

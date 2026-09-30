@@ -1062,13 +1062,17 @@ pub fn expected_population(pinned: &BTreeMap<String, Value>) -> Result<Vec<(&'st
 /// sits a whole CV away.
 pub const ARRIVAL_CV_TOLERANCE: f64 = 0.05;
 
-/// A planned phase's offered-rate CV over 1 s and 60 s windows, `None`
-/// where fewer than two windows fit.
+/// A planned phase's offers as its seeded arrival clock mints them: the
+/// count due in each whole second, their CV over 1 s and 60 s windows
+/// (`None` where fewer than two windows fit), and whether the scheduler
+/// places them by the sessions' share rates.
 pub struct ExpectedArrival {
     pub phase: String,
     pub rate: f64,
+    pub offers: Vec<u64>,
     pub cv_1s: Option<f64>,
     pub cv_60s: Option<f64>,
+    pub weighted: bool,
 }
 
 impl ExpectedArrival {
@@ -1079,15 +1083,38 @@ impl ExpectedArrival {
     pub fn tolerance(&self, window: u64) -> f64 {
         ARRIVAL_CV_TOLERANCE + 2.0 / (self.rate * window as f64).max(1.0)
     }
+
+    /// The first second at whose end a reported per-second trace has left
+    /// the clock's, or `None`. The scheduler mints every token due by its
+    /// tick and counts it in the second it mints it, so the offers counted
+    /// by the end of a second are never more than the clock had due by
+    /// then; they fall short only by what a late tick had not yet minted,
+    /// allowed here up to half that second's offers (a stall of half a
+    /// second). A trace reordered within a window sums the same and has the
+    /// same CVs, but runs ahead of the clock or lags it by a burst.
+    pub fn trace_departure(&self, reported: &[u64]) -> Option<usize> {
+        let seconds = self.offers.len().max(reported.len());
+        let (mut due, mut offered) = (0u64, 0u64);
+        (0..seconds).find(|&second| {
+            let expected = self.offers.get(second).copied().unwrap_or(0);
+            due += expected;
+            offered += reported.get(second).copied().unwrap_or(0);
+            offered > due + 1 || offered + 2 + expected / 2 < due
+        })
+    }
 }
 
-/// Each planned phase's offered-rate CVs as the preset's seeded arrival
-/// clock mints offers (the harness's own `Arrival::clock` and
-/// `windowed_cv`): the tokens due by the end of each whole second, as the
-/// scheduler counts them.
+/// Each planned phase's offers as the preset's seeded arrival clock mints
+/// them (the harness's own `Arrival::clock` and `windowed_cv`): the tokens
+/// due by the end of each whole second, as the scheduler counts them, and
+/// their placement.
 pub fn expected_arrival(pinned: &BTreeMap<String, Value>) -> Result<Vec<ExpectedArrival>> {
     let args = preset_args(pinned)?;
     let arrival = args.arrival()?;
+    // The scheduler weights placement when the drawn sessions offer at
+    // different rates (`OfferPicker::new`), in every phase of a run.
+    let weighted =
+        !crate::realism::Population::build(&args.population_spec()?, "")?.uniform_offers();
     crate::cli::phases(&args)?
         .into_iter()
         .map(|plan| {
@@ -1101,6 +1128,8 @@ pub fn expected_arrival(pinned: &BTreeMap<String, Value>) -> Result<Vec<Expected
                 rate: plan.rate,
                 cv_1s: crate::realism::windowed_cv(&offers, 1),
                 cv_60s: crate::realism::windowed_cv(&offers, 60),
+                offers,
+                weighted,
             })
         })
         .collect()
@@ -1705,16 +1734,52 @@ pub fn compare(
             }
         }
     }
-    // Each planned phase offered on its seeded arrival clock
-    // (`expected_arrival`): `/arrival` alone only echoes the flag.
+    // Each planned phase offered on its seeded arrival clock, second by
+    // second, placed as its population asks (`expected_arrival`): `/arrival`
+    // alone only echoes the flag.
     let arrival = expected_arrival(pinned)?;
     'arrival: for run in runs.iter().filter(|r| r.excluded.is_none()) {
-        if predates(manifest, run, "--arrival") {
+        if predates(manifest, run, "--arrival")
+            || POPULATION_FLAGS
+                .iter()
+                .any(|flag| predates(manifest, run, flag))
+        {
             continue;
         }
         for planned in &arrival {
             let name = &planned.phase;
             let reported = run.phase(name).map(|phase| &phase["arrival"]);
+            let trace: Option<Vec<u64>> = reported
+                .and_then(|a| a["offered_per_second"].as_array())
+                .and_then(|trace| trace.iter().map(Value::as_u64).collect());
+            let placement = reported.and_then(|a| a["offer_placement"].as_str());
+            let why = match (trace, placement) {
+                (None, _) => Some(format!("reports no offered-per-second trace for `{name}`")),
+                (_, None) => Some(format!("reports no offer placement for `{name}`")),
+                (Some(trace), Some(placement)) => match planned.trace_departure(&trace) {
+                    Some(second) => Some(format!(
+                        "offered `{name}` off its pinned `--arrival` clock by second {second}"
+                    )),
+                    None if placement.starts_with("weighted") != planned.weighted => Some(format!(
+                        "placed `{name}`'s offers {placement}, though the population's \
+                             sessions offer {}",
+                        if planned.weighted {
+                            "at different rates"
+                        } else {
+                            "at one rate"
+                        }
+                    )),
+                    None => None,
+                },
+            };
+            if let Some(why) = why {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} {why}",
+                    run.run.id
+                ));
+                break 'arrival;
+            }
             for (window, expected, key) in [
                 (1, planned.cv_1s, "offered_per_second_cv_1s"),
                 (60, planned.cv_60s, "offered_per_second_cv_60s"),
