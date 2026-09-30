@@ -639,6 +639,60 @@ Compare file sync methods using two 8kB writes:
                     ab.prepare_build("base", "v2", out, skip_build=False)
                 self.assertFalse((release / ab.BUILD_RECORD).exists())
 
+    def test_url_secrets_are_redacted_as_the_harness_redacts_them(self) -> None:
+        password = "hunter2-Sup3r_Secret"
+        # The cases of the harness's own redaction tests (tests/harness.rs).
+        for url, expected in [
+            (f"postgresql://alex:{password}@db.example:5432/qbit?sslmode=disable&application_name=load-fe-0",
+             "postgresql://alex:<redacted>@db.example:5432/qbit?sslmode=disable&application_name=load-fe-0"),
+            (f"https://svc:{password}@api.example/v1#frag", "https://svc:<redacted>@api.example/v1#frag"),
+            (f"postgresql://db.example/qbit?password={password}&sslmode=require",
+             "postgresql://db.example/qbit?password=<redacted>&sslmode=require"),
+            (f"postgresql://db.example/qbit?pass%77ord={password}&sslmode=require",
+             "postgresql://db.example/qbit?pass%77ord=<redacted>&sslmode=require"),
+            (f"postgresql://db.example/qbit?%70%61%73%73%77%6F%72%64={password}",
+             "postgresql://db.example/qbit?%70%61%73%73%77%6F%72%64=<redacted>"),
+            (f"postgresql://alex:{password}@db.example/qbit?PASS%57ORD={password}#f",
+             "postgresql://alex:<redacted>@db.example/qbit?PASS%57ORD=<redacted>#f"),
+        ]:
+            self.assertEqual(ab.redact_url_secrets(url), expected)
+        for untouched in ["postgresql://u@127.0.0.1:5432/postgres", "info", "0.0000000122070312",
+                          "postgresql://h/d?pass+word=x&pass%zzword=y", "--database-url"]:
+            self.assertEqual(ab.redact_url_secrets(untouched), untouched)
+
+    def test_a_database_url_password_reaches_the_harness_but_not_the_manifest_or_the_log(self) -> None:
+        url = "postgresql://alex:hunter2@db.example/qbit"
+        launched: list[list[str]] = []
+
+        def build(label, ref, out, skip_build):
+            return {"label": label, "ref": ref, "commit": label[0] * 40, "worktree": f"builds/{label}"}
+
+        def run(run_id, command, *rest):
+            launched.append(command)
+            return {"exit_code": 0, "ceiling_hit": False, "load_max": 0.1, "mem_available_min_mib": 1}
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            options = ab.parse_args(["--base", "a", "--candidate", "b", "--preset", "throughput-20k-window-1fe",
+                                     "--out", directory, "--repeats", "1", "--cooldown-seconds", "0"])
+            preset = {"name": "throughput-20k-window-1fe", "_path": "p.json", "_sha256": "ab",
+                      "args": {"--database-url": url}}
+            comparison = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with mock.patch.object(ab, "prepare_build", build), \
+                    mock.patch.object(ab, "help_flags", lambda harness: frozenset(["--database-url"])), \
+                    mock.patch.object(ab, "record_fsync", lambda *args: {"fdatasync_usecs_per_op": 288.0}), \
+                    mock.patch.object(ab, "wait_for_quiet", lambda *args: 0.1), \
+                    mock.patch.object(ab, "execute_run", run), \
+                    mock.patch.object(ab.subprocess, "run", return_value=comparison), \
+                    contextlib.redirect_stderr(io.StringIO()) as log:
+                ab.run_series(options, out, preset, {}, frozenset(), out / "manifest.json", None)
+            manifest = (out / "manifest.json").read_text()
+        self.assertEqual(len(launched), 2)
+        self.assertTrue(all(url in command for command in launched))
+        self.assertNotIn("hunter2", manifest)
+        self.assertNotIn("hunter2", log.getvalue())
+        self.assertIn("postgresql://alex:<redacted>@db.example/qbit", manifest)
+
     def test_a_named_preset_resolves_to_the_checked_in_file(self) -> None:
         self.assertEqual(ab.preset_path("throughput-20k-window-1fe"), ab.PRESETS / "throughput-20k-window-1fe.json")
         with contextlib.redirect_stderr(io.StringIO()) as warning:

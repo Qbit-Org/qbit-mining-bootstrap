@@ -41,14 +41,17 @@ The driver, `scripts/prism_load_ab.py`:
    hour and exits 3; it never runs on a loaded host.
 6. **Samples the host.** During each run it records the load average and
    `MemAvailable` every 10 s. It also snapshots the process table at the
-   start and end of each run.
+   start and end of each run, by command name only, since another process's
+   command line may carry a secret.
 7. **Enforces a ceiling.** A run still going after 2,400 s is killed.
 8. **Summarizes.** It calls `qbit-prism-load-compare` and writes the result
    to `<out>/comparison.md`. The exit status is the comparison's: 0 pass,
    1 fail, 2 bad inputs.
 
 `--dry-run` builds both refs, prints each build's resolved command line and
-runs nothing. It takes the lock too, since its builds load the host.
+runs nothing. It takes the lock too, since its builds load the host. Printed
+and in `manifest.json`, a command line's URLs carry no password: an external
+`--database-url`'s is redacted as the harness redacts it.
 
 `--resume` continues an interrupted series from `<out>/manifest.json`. It
 must run on the same host (hostname, vCPUs, memory and kernel) with every

@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from typing import Any, Callable, Iterator
 
 from prism_load_matrix import load_aliases
@@ -395,6 +396,40 @@ def build_record(commit: str, release: Path) -> dict[str, Any]:
     return {"commit": commit, "sha256": digests}
 
 
+REDACTED = "<redacted>"
+
+
+def redact_url_secrets(value: str) -> str:
+    """As the harness's `frontend::redact_url_secrets`: a URL keeps its user,
+    host and path but loses its password and the value of any query
+    parameter whose percent-decoded name is `password`; anything else is
+    returned as it is. The manifest and the log carry resolved command
+    lines, and a preset may pin an external `--database-url` with
+    credentials."""
+    scheme, separator, rest = value.partition("://")
+    if not separator:
+        return value
+    ends = [index for index in (rest.find(mark) for mark in "/?#") if index >= 0]
+    authority, tail = rest[:min(ends, default=len(rest))], rest[min(ends, default=len(rest)):]
+    userinfo, at, host = authority.rpartition("@")
+    if at:
+        user, colon, _ = userinfo.partition(":")
+        authority = f"{user}:{REDACTED}@{host}" if colon else f"{userinfo}@{host}"
+    path, question, query = tail.partition("?")
+    if question:
+        query, hash_mark, fragment = query.partition("#")
+        pairs = []
+        for pair in query.split("&"):
+            name, equals, _ = pair.partition("=")
+            # Decoded as SQLx reads a key (`+` a space, a malformed escape
+            # kept), compared ASCII case-insensitively.
+            decoded = urllib.parse.unquote_plus(name)
+            secret = equals and decoded.isascii() and decoded.lower() == "password"
+            pairs.append(f"{name}={REDACTED}" if secret else pair)
+        tail = f"{path}?{'&'.join(pairs)}" + (f"#{fragment}" if hash_mark else "")
+    return f"{scheme}://{authority}{tail}"
+
+
 def prepare_build(label: str, ref: str, out: Path, skip_build: bool) -> dict[str, Any]:
     commit = git("rev-parse", "--verify", f"{ref}^{{commit}}")
     tree = out / "builds" / label
@@ -450,8 +485,11 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def process_snapshot(path: Path) -> None:
+    # The command name, never the command line: on a shared host another
+    # process's arguments may carry a token or a password, and this file is
+    # attached with the series.
     result = subprocess.run(
-        ["ps", "-eo", "pid,ppid,pcpu,rss,etime,args", "--sort=-pcpu"],
+        ["ps", "-eo", "pid,ppid,pcpu,rss,etime,comm", "--sort=-pcpu"],
         capture_output=True,
         text=True,
         check=False,
@@ -851,12 +889,16 @@ def run_series(
     previous: dict[str, Any] | None,
 ) -> int:
     builds = []
+    # The command lines as they run; only redacted copies are printed or
+    # written to the manifest.
+    commands: dict[str, list[str]] = {}
     for label, ref in zip(LABELS, (options.base, options.candidate)):
         build = prepare_build(label, ref, out, options.skip_build)
         harness = out / build["worktree"] / "target" / "release" / "qbit-prism-load"
-        build["argv"], build["dropped_legacy_flags"] = resolve_argv(
+        commands[label], build["dropped_legacy_flags"] = resolve_argv(
             preset["args"], help_flags(harness), legacy, operational, label
         )
+        build["argv"] = [redact_url_secrets(word) for word in commands[label]]
         builds.append(build)
     if previous:
         for old, new in zip(previous["builds"], builds):
@@ -900,7 +942,7 @@ def run_series(
         release = out / build["worktree"] / "target" / "release"
         command = [
             str(release / "qbit-prism-load"),
-            *build["argv"],
+            *commands[label],
             "--server-bin", str(release / "qbit-prism-server"),
             "--pg-bin-dir", str(options.pg_bin_dir),
             "--out", str(run_dir),
