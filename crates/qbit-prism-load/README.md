@@ -812,7 +812,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `short-plan-20k-window-1fe` | manual | 8 vCPU | the short plan over `throughput-20k-window-1fe`'s fixture (2,000 sessions, one frontend, async standby, 20k window) at 50 shares/s with no burst; with `throughput-20k-window-1fe`, what the runner probe below runs on each class |
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 | `real-node-smoke` | every PR | 2 vCPU | the per-PR real-node smoke run: [Real-node mode](#real-node-mode-547) |
-| `short-plan-real-node`, `short-plan-fake-node` | nightly | 8 vCPU | the bridging pair (#552): the same short plan on the real and the fake node, differing only in `--node` |
+| `short-plan-real-node`, `short-plan-fake-node` | nightly | 8 vCPU | the bridging pair (#552): the same short plan on the real and the fake node, differing only in `--node`. Beside their own matrix jobs, the nightly's `bridging` job runs both on one runner and reports real minus fake (`scripts/prism_load_bridge.py`; [the lanes doc](../../docs/prism-e2e-load-ci.md#bridging-lane-552)) |
 | `soak-weekly` | weekly | 8 vCPU | the 5.5 h long soak; see [Long soak](#long-soak-575) |
 | `soak-short` | manual | 8 vCPU | a 19 min soak of the same cluster without block landings; the run the leak mutant must fail |
 | `soak-smoke` | manual | 2 vCPU | the soak smoke, run nightly by the opt-in gated test `tests/soak_smoke.rs` |

@@ -581,10 +581,11 @@ reason = "The nightly runs throughput-20k-window-1fe once and gates it alone; re
 id = "bridging-fake-and-real-node"
 title = "The same short plan against the fake and the real node on one runner"
 owner = "#552"
-lanes = ["L2"]
-criteria = "The cost a real node adds is reported as a number."
-runs = false
-reason = "The pair of presets exists (real-node-short-plan-pair, #547); running it nightly on one runner and reporting the difference is #552."
+lanes = ["nightly"]
+criteria = "Each run writes a comparison row stating the real node's cost as real minus fake (ACK latency, time to usable work, peak RSS; submitblock latency, which only the real node has, stays unknown on the fake side). It is not a D1 verdict."
+runs = true
+presets = ["short-plan-fake-node", "short-plan-real-node"]
+notes = "prism-load-nightly.yml's bridging job runs both presets on one runner, alternating the order, and scripts/prism_load_bridge.py writes the row; tests/test_prism_load_bridge.py holds that job's wiring. The matrix still runs each half on its own runner (real-node-short-plan-pair)."
 
 [[scenario]]
 id = "l3-production-window-matrix"

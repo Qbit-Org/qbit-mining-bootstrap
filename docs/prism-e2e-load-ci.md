@@ -17,7 +17,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 |---|---|---|---|
 | L0 existing CI | `ci.yml`, every PR and every push to `main`, `1.x.x`, `2.x.x`, `3.x.x` | `pr` | running, required |
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
-| L2 nightly load | `prism-load-nightly.yml`: `run`, `live-nightly`, `stratum-fuzz` | `nightly`, `dispatch` | running; repeats, trend and regression rule not yet (#549, #551, #542) |
+| L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz` | `nightly`, `dispatch` | running; repeats, trend and regression rule not yet (#549, #551, #542) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
 | L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | partly; under session load **not yet** (#553) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
@@ -81,6 +81,8 @@ parts:
   fixture with and without 500 addresses, #473's 400k one-frontend cell,
   #275's tip delivery, the `mainnet-shape-130/650-addresses` shapes, rental
   churn, and the bridging pair `short-plan-{fake,real}-node`.
+- `bridging`: the bridging pair again, both on one runner, with the
+  real-minus-fake row ([below](#bridging-lane-552)).
 - `live-nightly`: the opt-in `#[ignore]` real-node variants listed in
   `test/prism-nightly-gated-tests.txt`. They are the qbitd `-reindex` crash,
   the 130-payee weighted recipients, the dense-cadence soak, a full PostgreSQL
@@ -108,10 +110,36 @@ of this is on one named runner class, on one commit.
 
 ### Bridging lane (#552)
 
-**Not yet running; owner #552.** The two halves of the pair run as separate
-matrix jobs on separate VMs, so their difference includes the VM-to-VM
-spread. #552 runs both halves on one runner and reports what the real node
-adds.
+**Runs:** the `bridging` job, on the nightly schedule, on the `run-load`
+label, and on dispatch with `bridging: true`. It runs `short-plan-fake-node`
+and `short-plan-real-node` one after the other on one 8 vCPU runner, through
+`prism-load-run.sh`. The order alternates with the run number, and the row
+records it. The two presets differ only in `--node`: `--plan short`, 2
+frontends, 100 sessions, a 20k window at 50 shares/s and 3 external tips.
+The matrix still runs each half on its own VM as well.
+`scripts/prism_load_bridge.py` then writes `bridge-row.json` (schema
+`qbit.prism.load-bridge.v1`) and a table in the job summary. Each row is real
+minus fake:
+
+- `client_ack_latency` p50 and p99, per phase;
+- time to usable work: the slowest session's time on each external tip, p50
+  and max over the tips;
+- peak RSS (`VmHWM`) of each frontend and of the frontends summed;
+- the pool node's `submitblock` and `getblocktemplate` latency through the
+  harness's relay, and the pool qbitd's peak RSS. These exist only on the
+  real node. The fake side and the difference read `unknown`, never 0.
+
+A figure either side could not measure is `unknown`, and a footnote gives the
+reason. If either side failed its harness or its gate, the row is marked
+**Not trusted** and says why, and the job fails once the row and the artifact
+`prism-load-bridging` are written.
+
+**Proves:** what the real node costs on this runner class, at this commit,
+for this plan, without the VM-to-VM spread that separate jobs include.
+
+**Does not prove:** a D1 verdict or a D1 rate (#487 decisions 1 and 5).
+The plan runs at 50 shares/s. Each run is one sample, so a single night's
+difference carries the run-to-run noise, which #542 measures.
 
 ### Trend, regression rule and evidence promotion (#551)
 
@@ -209,7 +237,7 @@ The inputs are:
 - `ref`;
 - `tip_last_notify_p99_budget_ms` and `max_shortfall`: empty keeps each
   preset's own budget;
-- `live`, `weekly`, `fuzz` and `images`: add those jobs.
+- `live`, `weekly`, `fuzz`, `images` and `bridging`: add those jobs.
 
 A one-off configuration is a checked-in preset on a branch, dispatched with
 that branch as `ref`. The harness refuses a flag the preset pins if it is given
@@ -261,6 +289,7 @@ defines each field.
 | Where | What | Kept | Status |
 |---|---|---|---|
 | Actions artifact `prism-load-<preset>` | the run directory: `load-harness-report.json`, `gate.md`, both exit codes, `host.json`, `pg_test_fsync.txt`, `logs/`, and the soak's samples and report for a soak | 90 days | running |
+| `prism-load-bridging` | both runs' directories (`fake/`, `real/`) and `bridge-row.json` | 90 days | running |
 | `prism-live-nightly`, `prism-live-weekly`, `prism-stratum-fuzz`, `prism-shipped-images` | gate manifests and test logs; fuzz logs and crashing inputs; `l6-report.json` and the Compose logs | 30 days | running |
 | `prism-load-tested-commit` | the commit the last nightly carried to a verdict (the guard reads it) | 90 days | running |
 | `ci-evidence` branch | one JSON line per run, one file per lane per month | permanent | **not yet; owner #551** |
