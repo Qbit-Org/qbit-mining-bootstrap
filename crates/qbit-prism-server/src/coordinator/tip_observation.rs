@@ -48,9 +48,61 @@ pub struct IssuanceAuthority {
     lease: Option<Arc<PublishedLease>>,
     deadline: Option<AbsoluteDeadline>,
     expires_at_ms: Option<i64>,
+    /// Set only for freshly built work (#598).
+    same_tip: Option<Arc<SameTipIssue>>,
+}
+
+/// Fresh work may outlive a later publication on the same published tip
+/// (a reanchor, new shares, a template change) when that publication kept
+/// the work's parent, payout revision, prior balances and fee (#598): the
+/// class of work sessions already hold live from the earlier publication.
+/// The revision is still re-proved against the database at every step and
+/// inside the save transaction; a tip change, including A -> B -> A, still
+/// revokes it, and replacement leases keep the exact publication.
+struct SameTipIssue {
+    tip: (String, u64),
+    fee: Option<FanoutFeeRatePolicy>,
+}
+
+impl SameTipIssue {
+    fn holds(&self, identity: &PreparedIdentity, view: &AuthorityView<'_>) -> bool {
+        view.tip.issuance_tip().as_ref() == Some(&self.tip)
+            && view.prepared.as_deref().is_some_and(|current| {
+                identity.parent.as_deref() == current.template["previousblockhash"].as_str()
+                    && identity.revision == current.snapshot.payout_revision
+                    && identity.window.prior_balances_digest == current.window.prior_balances_digest
+                    && current.fee == self.fee
+            })
+    }
 }
 
 impl IssuanceAuthority {
+    /// Unproved admission for freshly built work, taken from the view
+    /// `prepared` was read with; the caller drops the view and revalidates
+    /// before using it. It is revoked like any other, except by a later
+    /// publication that kept the same published tip, parent, payout
+    /// revision, prior balances and fee: a build such a publication
+    /// overtakes is still delivered, and the session's next pass brings it
+    /// up to date (#598).
+    pub(super) fn fresh(prepared: &Prepared, view: &AuthorityView<'_>) -> Result<Self> {
+        let tip = view
+            .tip
+            .issuance_tip()
+            .context("no published tip for fresh work")?;
+        Ok(Self {
+            identity: Arc::new(PreparedIdentity::of(prepared)),
+            readiness_epoch: view.readiness.generation,
+            published_tip: view.tip.publication_stamp(),
+            lease: None,
+            deadline: None,
+            expires_at_ms: None,
+            same_tip: Some(Arc::new(SameTipIssue {
+                tip,
+                fee: prepared.fee,
+            })),
+        })
+    }
+
     pub(super) fn absolute_expiry(&self) -> Option<i64> {
         self.expires_at_ms
     }
@@ -229,6 +281,8 @@ pub struct TipState {
     // Observation ordering changes on every poll; this generation changes
     // only when a prepared publication is installed or replaced.
     publication_generation: u64,
+    // Changes only when a publication changes the published tip hash.
+    tip_generation: u64,
 }
 
 impl TipState {
@@ -236,6 +290,14 @@ impl TipState {
         self.published
             .as_ref()
             .map(|tip| (tip.hash.clone(), self.publication_generation))
+    }
+
+    /// The published tip, stamped so that a return to an earlier tip
+    /// (A -> B -> A) differs; same-tip republications keep it (#598).
+    pub(super) fn issuance_tip(&self) -> Option<(String, u64)> {
+        self.published
+            .as_ref()
+            .map(|tip| (tip.hash.clone(), self.tip_generation))
     }
 
     /// Freeze the selected lease interval before waiting on its economic
@@ -356,8 +418,16 @@ impl TipState {
             .publication_generation
             .checked_add(1)
             .context("prepared publication generation exhausted")?;
+        let tip_generation = if self.published.as_ref().is_some_and(|tip| tip.hash == hash) {
+            self.tip_generation
+        } else {
+            self.tip_generation
+                .checked_add(1)
+                .context("published tip generation exhausted")?
+        };
         self.update_published_tip(hash)?;
         self.publication_generation = generation;
+        self.tip_generation = tip_generation;
         Ok(())
     }
 
@@ -474,6 +544,7 @@ impl Coordinator {
             lease: None,
             deadline: None,
             expires_at_ms,
+            same_tip: None,
         };
         Ok(self
             .revalidate_issuance_authority(&mut proof, expires_at_ms)
@@ -503,7 +574,12 @@ impl Coordinator {
             view.readiness.generation == proof.readiness_epoch,
             "node readiness changed during work admission"
         );
-        if view.tip.publication_stamp() != proof.published_tip {
+        if view.tip.publication_stamp() != proof.published_tip
+            && !proof
+                .same_tip
+                .as_ref()
+                .is_some_and(|issue| issue.holds(&proof.identity, &view))
+        {
             return Ok(None);
         }
         if let Some(lease) = &proof.lease {

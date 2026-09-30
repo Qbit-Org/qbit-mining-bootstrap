@@ -565,6 +565,9 @@ qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::clock_and_block_only_duplicate_checkouts_are_lazy_and_cancel_once
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::clock_sql_wait_error_and_cancel_keep_the_successful_checkout
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::coordinator_reads_without_metrics_keep_results_and_emit_nothing
+qbit-prism-server::qbit_prism_server::coordinator::same_tip_republish_tests::a_build_overtaken_by_a_revision_or_fee_change_is_discarded
+qbit-prism-server::qbit_prism_server::coordinator::same_tip_republish_tests::a_build_overtaken_by_a_same_tip_republication_is_delivered_as_its_publication
+qbit-prism-server::qbit_prism_server::coordinator::same_tip_republish_tests::a_build_overtaken_by_a_tip_change_is_discarded
 qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_held_and_renewed_lease_before_any_call_is_not_offer_evidence
 qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_known_call_keeps_its_call_evidence_through_orphan_terminalization
 qbit-prism-server::qbit_prism_server::coordinator::storm_evidence_tests::a_pre_offer_retry_records_no_call_and_leaves_the_row_pending
