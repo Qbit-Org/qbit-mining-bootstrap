@@ -246,14 +246,14 @@ impl Metrics {
     /// landing window (#602).
     pub(crate) fn accepted_block(&self, hash: &str, height: u64) {
         self.accept_block(hash, height, Observation::Active);
-        self.landing_acks.opened(Instant::now(), height);
+        self.landing_acks.opened(Instant::now(), hash);
     }
 
     /// See [`Observation::Unlanded`] (#493). Also opens a share
     /// acknowledgement landing window (#602).
     pub(crate) fn accepted_unlanded_block(&self, hash: &str, height: u64) {
         self.accept_block(hash, height, Observation::Unlanded);
-        self.landing_acks.opened(Instant::now(), height);
+        self.landing_acks.opened(Instant::now(), hash);
     }
 
     /// See [`Observation::Confirmed`]. `at_tip` is whether the block is the
@@ -265,7 +265,7 @@ impl Metrics {
     pub(crate) fn accepted_landed_block(&self, hash: &str, height: u64, at_tip: bool) {
         self.accept_block(hash, height, Observation::Confirmed);
         if at_tip {
-            self.landing_acks.opened(Instant::now(), height);
+            self.landing_acks.opened(Instant::now(), hash);
         }
     }
 

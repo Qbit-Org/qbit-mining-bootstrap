@@ -28,9 +28,10 @@
 //! A window no submission arrived in has no verdict and leaves the streaks
 //! as they were: a quiet landing proves nothing either way.
 //!
-//! A block height opens at most one window, whichever observation of it
-//! comes first, so the reconciler seeing a block this frontend offered does
-//! not open a second one. This state is independent of the revision-work
+//! A block opens at most one window, whichever observation of it comes
+//! first, so the reconciler seeing a block this frontend offered does not
+//! open a second one. Blocks are told apart by hash, not height: a reorg's
+//! replacement pool block at the same or a lower height is a new settlement. This state is independent of the revision-work
 //! tracker in `landing.rs`: that tracker's capacity limits never stop a
 //! window from opening.
 use super::LandingAckBound;
@@ -42,6 +43,10 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
+
+/// Blocks remembered as having opened a window: far more than can land
+/// within any observation's reach of each other.
+const REMEMBERED: usize = 64;
 
 /// How long after an acceptance a submission's arrival still counts.
 pub(super) const WINDOW: Duration = Duration::from_secs(30);
@@ -76,8 +81,9 @@ struct Windows {
     /// later acceptance opened `open`: its late acknowledgements still count
     /// toward its own verdict.
     settling: Option<Window>,
-    /// The highest block height that opened a window.
-    highest: Option<u64>,
+    /// The most recent blocks that opened a window, oldest first, at most
+    /// [`REMEMBERED`].
+    opened_by: std::collections::VecDeque<String>,
     /// Per bound, in [`LandingAckBound::ALL`] order; `None` before a verdict.
     streaks: Option<[u32; 2]>,
 }
@@ -107,15 +113,19 @@ impl LandingAcks {
             .max(1)
     }
 
-    /// The first observation of a pool block's acceptance at `height`, at
-    /// `now`, opens a window, or extends the one still admitting arrivals. A
-    /// height at or below one that already opened a window opens nothing.
-    pub(super) fn opened(&self, now: Instant, height: u64) {
+    /// The first observation of pool block `hash`'s acceptance, at `now`,
+    /// opens a window, or extends the one still admitting arrivals. A block
+    /// that already opened one opens nothing.
+    pub(super) fn opened(&self, now: Instant, hash: &str) {
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        if windows.highest.is_some_and(|highest| height <= highest) {
+        let hash = hash.to_ascii_lowercase();
+        if windows.opened_by.contains(&hash) {
             return;
         }
-        windows.highest = Some(height);
+        if windows.opened_by.len() == REMEMBERED {
+            windows.opened_by.pop_front();
+        }
+        windows.opened_by.push_back(hash);
         let until = now + WINDOW;
         match windows.open.as_mut() {
             Some(window) if now < window.admits_until => window.admits_until = until,
@@ -224,7 +234,7 @@ mod tests {
         assert_eq!(state.streaks(Instant::now()), None);
         let before = Instant::now();
         tokio::time::advance(MS).await;
-        state.opened(Instant::now(), 1);
+        state.opened(Instant::now(), "01");
         // In flight at the acceptance: admitted.
         assert!(state.admits(before));
         tokio::time::advance(WINDOW - MS).await;
@@ -236,7 +246,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_verdict_is_the_nearest_rank_p99_and_waits_for_settle() {
         let state = LandingAcks::default();
-        state.opened(Instant::now(), 10);
+        state.opened(Instant::now(), "0a");
         let arrived = Instant::now();
         // 100 acknowledgements, one over 2 s: p99 is the 99th, under 2 s.
         acks(&state, arrived, &[MS; 99]);
@@ -247,7 +257,7 @@ mod tests {
         assert_eq!(state.streaks(Instant::now()), Some([0, 0]));
 
         // 100 more, two over 2 s and one over 10 s: p99 over 2 s, not 10 s.
-        state.opened(Instant::now(), 11);
+        state.opened(Instant::now(), "0b");
         let arrived = Instant::now();
         acks(&state, arrived, &[MS; 97]);
         acks(
@@ -266,7 +276,7 @@ mod tests {
         let mut height = 100;
         let mut window = |slow: Option<Duration>| {
             height += 1;
-            state.opened(Instant::now(), height);
+            state.opened(Instant::now(), &format!("{height:x}"));
             if let Some(elapsed) = slow {
                 acks(&state, Instant::now(), &[elapsed]);
             }
@@ -293,10 +303,10 @@ mod tests {
     async fn an_acceptance_inside_a_window_extends_it_and_a_later_one_lets_it_settle() {
         let state = LandingAcks::default();
         let start = Instant::now();
-        state.opened(start, 13);
+        state.opened(start, "0d");
         acks(&state, start, &[Duration::from_secs(3)]);
         tokio::time::advance(Duration::from_secs(20)).await;
-        state.opened(Instant::now(), 14);
+        state.opened(Instant::now(), "0e");
         tokio::time::advance(Duration::from_secs(25)).await;
         // 45 s after the first acceptance, 25 s after the second: admitted.
         acks(&state, Instant::now(), &[MS]);
@@ -308,7 +318,7 @@ mod tests {
         // Past the extended window's admissions, before its settle: a new
         // acceptance opens another window and leaves this one settling.
         tokio::time::advance(Duration::from_secs(10)).await;
-        state.opened(Instant::now(), 15);
+        state.opened(Instant::now(), "0f");
         assert_eq!(
             state.streaks(Instant::now()),
             None,
@@ -325,18 +335,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_height_opens_one_window_whichever_observation_comes_first() {
+    async fn a_block_opens_one_window_whichever_observation_comes_first() {
         let state = LandingAcks::default();
-        state.opened(Instant::now(), 20);
+        state.opened(Instant::now(), "aa");
         tokio::time::advance(WINDOW - MS).await;
-        // The reconciler's later observation of the same block, or of an
-        // older one, neither extends nor reopens the window.
-        state.opened(Instant::now(), 20);
-        state.opened(Instant::now(), 19);
+        // The reconciler's later observation of the same block, in either
+        // case, neither extends nor reopens the window.
+        state.opened(Instant::now(), "AA");
         tokio::time::advance(MS).await;
         assert!(!state.admits(Instant::now()));
-        // The next height does.
-        state.opened(Instant::now(), 21);
+        // Another block does, even at the same or a lower height, as a
+        // reorg's replacement would.
+        state.opened(Instant::now(), "bb");
         assert!(state.admits(Instant::now()));
+    }
+
+    /// Through the acceptance hooks: a reorg's replacement pool blocks at the
+    /// same height and at a lower one each open a window, while the same
+    /// block seen again, as its own offer and then by the reconciler at the
+    /// tip, opens one.
+    #[tokio::test(start_paused = true)]
+    async fn reorg_replacements_open_their_own_windows_and_a_block_opens_one() {
+        let metrics = crate::metrics::Metrics::default();
+        let open = |metrics: &crate::metrics::Metrics| metrics.landing_acks.admits(Instant::now());
+        let (a, b, c) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        metrics.accepted_unlanded_block(&a, 10);
+        assert!(open(&metrics));
+        tokio::time::advance(WINDOW).await;
+        metrics.accepted_landed_block(&a, 10, true);
+        assert!(!open(&metrics), "the same block opened a second window");
+        metrics.accepted_block(&b, 10);
+        assert!(
+            open(&metrics),
+            "a replacement at the same height opened none"
+        );
+        tokio::time::advance(WINDOW).await;
+        metrics.accepted_block(&c, 9);
+        assert!(
+            open(&metrics),
+            "a replacement at a lower height opened none"
+        );
     }
 }
