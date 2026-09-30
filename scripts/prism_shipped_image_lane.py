@@ -42,7 +42,8 @@ path the lane watches (WATCHED_PATHS), `false` otherwise; the workflow's
 writes DIR/lane.env: fresh signing seeds for this run, the ledger writer key
 derived from them, the public Stratum URL the public API requires, and the
 frontends' instance IDs. Nothing else overrides the checked-in lab defaults
-in config/upstream.env.example and .env.example. Requires Docker Compose
+in the upstream pins (config/upstream.env, as the Makefile and
+prepare-qbit-source.sh read it) and .env.example. Requires Docker Compose
 2.24.4 or newer, openssl and a free host port set 3340-3344 and 18452.
 """
 
@@ -90,6 +91,7 @@ WATCHED_PATHS = (
     "*/Dockerfile",
     "compose*.yaml",
     ".env.example",
+    "config/upstream.env",
     "config/upstream.env.example",
     "config/qbit/*",
     "config/prism-postgres/*",
@@ -103,7 +105,13 @@ WATCHED_PATHS = (
 )
 
 COMPOSE_FILES = ("compose.yaml", "compose.prism-ha.yaml")
-ENV_FILES = ("config/upstream.env.example", ".env.example")
+# The upstream pins as the Makefile and scripts/prepare-qbit-source.sh pick
+# them: config/upstream.env, or its example when a checkout has none. The
+# images must build from the same pins as the qbit source they stage.
+UPSTREAM_ENV_FILE = (
+    "config/upstream.env" if (ROOT / "config/upstream.env").is_file() else "config/upstream.env.example"
+)
+ENV_FILES = (UPSTREAM_ENV_FILE, ".env.example")
 INSTANCE_IDS = ("l6-frontend-1", "l6-frontend-2")
 # compose.prism-ha.yaml's default host ports.
 STRATUM_PORTS = (3340, 3343)

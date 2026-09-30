@@ -828,7 +828,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: generated/qbit-git-cache
-          key: prism-shipped-images-qbit-src-v1-${{ hashFiles('config/upstream.env.example') }}
+          key: prism-shipped-images-qbit-src-v1-${{ hashFiles('config/upstream.env', 'config/upstream.env.example') }}
       - name: Stage the qbit source and write the lane's env file
         run: python3 scripts/prism_shipped_image_lane.py prepare --work "${L6_WORK}"
       - name: Build the images with Compose

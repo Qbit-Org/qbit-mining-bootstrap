@@ -159,8 +159,15 @@ class Wiring(unittest.TestCase):
         files = [command[i + 1] for i, arg in enumerate(command) if arg == "-f"]
         self.assertEqual(files, ["compose.yaml", "compose.prism-ha.yaml"])
         env_files = [command[i + 1] for i, arg in enumerate(command) if arg == "--env-file"]
-        self.assertEqual(env_files, ["config/upstream.env.example", ".env.example", "/w/lane.env"])
+        self.assertEqual(env_files, [lane.UPSTREAM_ENV_FILE, ".env.example", "/w/lane.env"])
         self.assertEqual(command[-4:], ["--profile", "prism", "up", "-d"])
+
+    def test_the_upstream_pins_are_the_ones_prepare_qbit_source_reads(self) -> None:
+        # prepare-qbit-source.sh and the Makefile prefer config/upstream.env.
+        self.assertTrue((ROOT / "config/upstream.env").is_file())
+        self.assertEqual(lane.UPSTREAM_ENV_FILE, "config/upstream.env")
+        prepare = (ROOT / "scripts/prepare-qbit-source.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ -f "${ROOT_DIR}/config/upstream.env" ]]; then', prepare)
 
     def test_every_compose_file_and_env_file_exists(self) -> None:
         for name in (*lane.COMPOSE_FILES, *lane.ENV_FILES):
@@ -210,7 +217,8 @@ class Triggers(unittest.TestCase):
                      "compose.yaml", "compose.prism-ha.yaml", ".env.example",
                      "config/prism-postgres/replica-entrypoint.sh", "docker/qbit/qbit-entrypoint.sh",
                      "lab/real-miner/real_miner.py", "docker/real-miner/cpuminer-regtest.patch",
-                     "scripts/prism_shipped_image_lane.py", ".github/workflows/prism-load-nightly.yml"):
+                     "scripts/prism_shipped_image_lane.py", ".github/workflows/prism-load-nightly.yml",
+                     "config/upstream.env", "config/upstream.env.example"):
             with self.subTest(path=path):
                 self.assertTrue(lane.watched([path]))
 
