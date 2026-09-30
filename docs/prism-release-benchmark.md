@@ -130,7 +130,7 @@ every counted run must report every phase any run reported and the
 preset's pinned frontends, sessions, submits in flight per session, plan,
 window size, replication and ACK p99 limit, with every frontend launched
 with the pinned server settings (runtime workers, database connections,
-commit timeout, block poll, initial-job admission), and with the arrival,
+commit timeout, block poll, initial-job admission, pool fee), and with the arrival,
 population, template, pool-fee, churn and node settings the report states reading
 as this harness renders the preset's (a build whose harness predates one of
 those flags is exempt from it, since the legacy table already proved it ran
@@ -140,8 +140,9 @@ the rest of the planned workload, even when every run agrees: each phase's
 database delay and frontend restarts (the reconnect phase's drained restart
 with two or more frontends, the mid-flight kill's relaunch), the scheduled
 blocks (under the dense cadence, the pinned landing budget and the landings
-it buys), the completed reconnects, the memory floor, and the samplers'
-pinned intervals on every launched frontend.
+it buys), a connection for every pinned session, the completed reconnects,
+the memory floor, and the samplers' pinned intervals on every launched
+frontend.
 
 **The verdict is PASS** when the candidate meets the rule in every gated
 phase, every candidate run passes the preset's gates, and the targets

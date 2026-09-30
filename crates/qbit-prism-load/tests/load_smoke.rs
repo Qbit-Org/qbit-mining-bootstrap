@@ -297,7 +297,24 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
                 .parse()?;
             assert_eq!(launched, pinned, "{key} for {flag}");
         }
+        // The pool fee every frontend ran is the pinned one.
+        assert_eq!(frontend["environment"]["PRISM_POOL_FEE_ENABLED"], "1");
+        assert_eq!(
+            frontend["environment"]["PRISM_POOL_FEE_BPS"],
+            loaded.args["--pool-fee-bps"].to_string().as_str()
+        );
     }
+    // Every pinned session connected at least once.
+    assert!(
+        report["client"]["connects"].as_u64()
+            >= Some(
+                loaded.args["--sessions"]
+                    .as_u64()
+                    .context("pinned sessions")?
+            ),
+        "{}",
+        report["client"]
+    );
 
     // The run is the preset's, and the skew it asked for is the skew it drove.
     assert_eq!(report["preset"]["name"], "pr-smoke");

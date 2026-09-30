@@ -943,6 +943,17 @@ pub fn expected_settings(pinned: &BTreeMap<String, Value>) -> Result<Vec<Expecte
     Ok(expected)
 }
 
+/// Whether `run`'s build ran without `flag`: its harness predates the flag,
+/// and the driver left it off only because `legacy-flags.json` showed the
+/// build ran the pinned value anyway.
+fn predates(manifest: &Manifest, run: &LoadedRun, flag: &str) -> bool {
+    manifest
+        .builds
+        .iter()
+        .find(|b| b.label == run.run.build)
+        .is_some_and(|b| b.dropped_legacy_flags.iter().any(|f| f == flag))
+}
+
 /// Why a counted run's churn phase did not carry out the preset's plan, or
 /// `None` when every one did: every planned rental spawned and every one
 /// planned to leave in the phase departed (a departure is recorded at its
@@ -961,16 +972,7 @@ fn churn_unrealised(
     }
     let plan = spec.plan();
     for run in runs.iter().filter(|r| r.excluded.is_none()) {
-        let predates = manifest
-            .builds
-            .iter()
-            .find(|b| b.label == run.run.build)
-            .is_some_and(|b| {
-                b.dropped_legacy_flags
-                    .iter()
-                    .any(|f| f == "--churn-seconds")
-            });
-        if predates {
+        if predates(manifest, run, "--churn-seconds") {
             continue;
         }
         let churn = run.report.as_ref().map(|r| &r["churn"]);
@@ -1102,17 +1104,11 @@ fn setting_mismatches(
     let mut found = Vec::new();
     for setting in expected {
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
-            let dropped = manifest
-                .builds
+            if setting
+                .flags
                 .iter()
-                .find(|b| b.label == run.run.build)
-                .is_some_and(|b| {
-                    setting
-                        .flags
-                        .iter()
-                        .any(|flag| b.dropped_legacy_flags.iter().any(|d| d == flag))
-                });
-            if dropped {
+                .any(|flag| predates(manifest, run, flag))
+            {
                 continue;
             }
             let reported = run.report.as_ref().and_then(|r| r.pointer(setting.pointer));
@@ -1185,6 +1181,67 @@ fn frontend_env_mismatch(
                         run.run.id
                     ))
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Why some frontend of a counted run did not run the pinned pool fee, or
+/// `None` when every one did (#535): `topology.pool_fee_bps` only echoes the
+/// flag, while each frontend's environment is the fee the server applied,
+/// read as the server reads it (`PRISM_POOL_FEE_ENABLED` a boolean, off when
+/// unset; `PRISM_POOL_FEE_BPS` 0 when unset). A build whose harness predates the
+/// flag ran fee-off, which `legacy-flags.json` accepts for a pinned 0.
+fn pool_fee_mismatch(
+    manifest: &Manifest,
+    runs: &[LoadedRun],
+    pinned: Option<&Value>,
+) -> Option<String> {
+    let bps = pinned.and_then(Value::as_u64)?;
+    for run in runs.iter().filter(|r| r.excluded.is_none()) {
+        if predates(manifest, run, "--pool-fee-bps") {
+            continue;
+        }
+        let frontends = run
+            .report
+            .as_ref()
+            .and_then(|r| r["frontend_environment"].as_array())
+            .filter(|f| !f.is_empty());
+        let Some(frontends) = frontends else {
+            return Some(format!(
+                "{} reports no frontend environment, so its `--pool-fee-bps` cannot be checked",
+                run.run.id
+            ));
+        };
+        for frontend in frontends {
+            // A blank value is unset, as the server's `config::optional` reads it.
+            let value = |key: &str| {
+                frontend["environment"][key]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+            };
+            let enabled = value("PRISM_POOL_FEE_ENABLED").is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+            let applied = match value("PRISM_POOL_FEE_BPS") {
+                None => Some(0),
+                Some(value) => value.parse::<u16>().ok(),
+            };
+            if !enabled || applied.map(u64::from) != Some(bps) {
+                return Some(format!(
+                    "**the runs did not drive the pinned workload**: {} launched a frontend \
+                     with the pool fee {}, not the pinned `--pool-fee-bps` {bps}",
+                    run.run.id,
+                    match (enabled, applied) {
+                        (false, _) => "off".to_owned(),
+                        (true, Some(applied)) => format!("at {applied} bps"),
+                        (true, None) => "at an unreadable rate".to_owned(),
+                    }
+                ));
             }
         }
     }
@@ -1439,6 +1496,29 @@ pub fn compare(
             break;
         }
     }
+    // Every pinned session connected: the harness starts no phase until each
+    // of `--sessions` holds work, and `client.connects` counts each of those
+    // connections, which reconnects and rentals only add to (every harness
+    // since #271). `topology.sessions` alone only echoes the flag.
+    if let Some(sessions) = pinned.get("--sessions").and_then(Value::as_u64) {
+        for run in runs.iter().filter(|r| r.excluded.is_none()) {
+            let connects = run
+                .report
+                .as_ref()
+                .and_then(|r| r.pointer("/client/connects"))
+                .and_then(Value::as_u64);
+            if !connects.is_some_and(|n| n >= sessions) {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} made {} connections, \
+                     fewer than the pinned `--sessions` {sessions}",
+                    run.run.id,
+                    connects.map_or("an unreported number of".into(), |n| n.to_string())
+                ));
+                break;
+            }
+        }
+    }
     // The samplers ran at the pinned intervals, on every frontend: each
     // phase reports the ORDER-lock sampler's interval and one process record
     // per launched frontend (`frontend_environment`), each at the pinned
@@ -1663,12 +1743,7 @@ pub fn compare(
     if let Some(mode) = pinned.get("--node").and_then(Value::as_str) {
         let real = mode == "qbitd";
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
-            let predates = manifest
-                .builds
-                .iter()
-                .find(|b| b.label == run.run.build)
-                .is_some_and(|b| b.dropped_legacy_flags.iter().any(|f| f == "--node"));
-            if predates {
+            if predates(manifest, run, "--node") {
                 continue;
             }
             let node = run.report.as_ref().and_then(|r| r.get("node"));
@@ -1708,6 +1783,10 @@ pub fn compare(
             passed = false;
             findings.push(why);
         }
+    }
+    if let Some(why) = pool_fee_mismatch(manifest, runs, pinned.get("--pool-fee-bps")) {
+        passed = false;
+        findings.push(why);
     }
     let (gate_table, gates_ok) = preset_gate_rows([base, candidate], runs, budgets);
     out.push_str(&gate_table);

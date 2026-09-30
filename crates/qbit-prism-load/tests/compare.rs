@@ -111,7 +111,10 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
             "PRISM_BLOCKPOLL_SECONDS": "2",
             "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "2016",
+            "PRISM_POOL_FEE_ENABLED": "1",
+            "PRISM_POOL_FEE_BPS": "0",
         }}],
+        "client": {"connects": 2012},
         "window": {
             "requested_window_shares": 20000,
             "computed_window_shares": 20000,
@@ -1097,6 +1100,75 @@ fn the_dense_landing_budget_is_held_to_the_pinned_scheduled_blocks() {
         "landed 1 own blocks, not the 15 that the pinned `--scheduled-blocks` 15 buys of the \
          gap pattern's 15 slots"
     ));
+}
+
+#[test]
+fn fewer_connections_than_pinned_sessions_or_another_pool_fee_fails() {
+    let manifest = manifest(288.0);
+    // Every pinned session connects before the first phase, so a run with
+    // fewer connections than sessions did not drive them all.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    runs[1].report.as_mut().unwrap()["client"]["connects"] = json!(1012);
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("made 1012 connections, fewer than the pinned `--sessions` 2000"),
+        "{}",
+        result.markdown
+    );
+    // The pool fee each frontend ran, as the server reads its environment.
+    for (key, value, why) in [
+        (
+            "PRISM_POOL_FEE_ENABLED",
+            json!("0"),
+            "with the pool fee off",
+        ),
+        (
+            "PRISM_POOL_FEE_BPS",
+            json!("25"),
+            "with the pool fee at 25 bps",
+        ),
+        ("PRISM_POOL_FEE_BPS", json!("-1"), "at an unreadable rate"),
+    ] {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        runs[1].report.as_mut().unwrap()["frontend_environment"][0]["environment"][key] = value;
+        let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+        assert!(!result.passed, "{key}");
+        assert!(
+            result
+                .markdown
+                .contains(&format!("{why}, not the pinned `--pool-fee-bps` 0")),
+            "{key}: {}",
+            result.markdown
+        );
+    }
+    // `true` enables it as `1` does, and an unset rate is 0.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let environment =
+            &mut run.report.as_mut().unwrap()["frontend_environment"][0]["environment"];
+        environment["PRISM_POOL_FEE_ENABLED"] = json!("true");
+        environment
+            .as_object_mut()
+            .unwrap()
+            .remove("PRISM_POOL_FEE_BPS");
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(result.passed, "{}", result.markdown);
+    // A build whose harness predates the flag ran fee-off and is exempt.
+    let mut manifest = manifest;
+    manifest.builds[0]
+        .dropped_legacy_flags
+        .push("--pool-fee-bps".into());
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in runs.iter_mut().filter(|r| r.run.build == "base") {
+        run.report.as_mut().unwrap()["frontend_environment"][0]["environment"]
+            ["PRISM_POOL_FEE_ENABLED"] = json!("0");
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(result.passed, "{}", result.markdown);
 }
 
 #[test]
