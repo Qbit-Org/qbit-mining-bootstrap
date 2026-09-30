@@ -40,6 +40,9 @@ FLAGS_5D0042F6 = frozenset(
     --work-timeout --help --version""".split()
 )
 
+# 5d0042f6's history has none of the commits that introduced a legacy flag.
+OLDER = lambda introduced: False  # noqa: E731
+
 # #479 STEP 1's argument list: #271's 20k list, unchanged.
 ARGS_479 = (
     "--frontends 1 --sessions 2000 --window-shares 20000 --replication async --plan d1 "
@@ -95,7 +98,7 @@ class Resolution(unittest.TestCase):
 
     def test_d1_20k_runs_on_5d0042f6_with_479s_argument_list(self) -> None:
         preset = self.preset("throughput-20k-window-1fe")
-        words, dropped = ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base")
+        words, dropped = ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base", OLDER)
         resolved = pairs(words)
         expected = pairs(ARGS_479)
         for flag, value in expected.items():
@@ -107,7 +110,7 @@ class Resolution(unittest.TestCase):
 
     def test_a_current_build_runs_every_pinned_flag_and_leaves_nothing_off(self) -> None:
         preset = self.preset("throughput-20k-window-1fe")
-        words, dropped = ab.resolve_argv(preset["args"], self.current_flags(preset), self.legacy, self.operational, "candidate")
+        words, dropped = ab.resolve_argv(preset["args"], self.current_flags(preset), self.legacy, self.operational, "candidate", OLDER)
         self.assertEqual(dropped, [])
         self.assertIn("--stratum-max-pending-initial-jobs", words)
         self.assertEqual(words[words.index("--stratum-max-pending-initial-jobs") + 1], "2016")
@@ -117,7 +120,7 @@ class Resolution(unittest.TestCase):
     def test_a_workload_an_old_build_cannot_run_is_refused_with_every_reason(self) -> None:
         preset = self.preset("tip-delivery-2000-miners-400k-2fe-retarget")
         with self.assertRaises(ab.DriverError) as caught:
-            ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base")
+            ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base", OLDER)
         message = str(caught.exception)
         self.assertIn("--retarget-bits", message)
         self.assertIn("--background-shares-per-second", message)
@@ -128,13 +131,13 @@ class Resolution(unittest.TestCase):
         preset = self.preset("throughput-20k-window-1fe")
         flags = self.current_flags(preset) - {"--plan"}
         with self.assertRaisesRegex(ab.DriverError, "no --plan and legacy-flags.json has no rule"):
-            ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "base")
+            ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "base", OLDER)
 
     def test_a_newer_harness_flag_the_preset_does_not_pin_is_refused(self) -> None:
         preset = self.preset("throughput-20k-window-1fe")
         flags = self.current_flags(preset) | {"--some-new-knob"}
         with self.assertRaisesRegex(ab.DriverError, "result flag --some-new-knob"):
-            ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "candidate")
+            ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "candidate", OLDER)
 
     def test_inert_flags_are_dropped_only_while_their_phase_is_off(self) -> None:
         rule = self.legacy["--churn-rate"]
@@ -164,7 +167,7 @@ class Resolution(unittest.TestCase):
                 continue
             with self.subTest(preset=path.stem):
                 preset = ab.load_preset(path)
-                ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base")
+                ab.resolve_argv(preset["args"], FLAGS_5D0042F6, self.legacy, self.operational, "base", OLDER)
 
     def test_help_flags_are_the_option_lines_never_a_flag_a_description_mentions(self) -> None:
         text = """Options:
@@ -177,10 +180,22 @@ class Resolution(unittest.TestCase):
 """
         self.assertEqual(ab.parse_help_flags(text), {"--pg-bin-dir", "--mid-flight-kill", "--help", "--version"})
 
+    def test_a_harness_that_lost_a_legacy_flag_is_refused_not_treated_as_older(self) -> None:
+        preset = ab.load_preset(ab.preset_path("throughput-20k-window-1fe"))
+        flags = self.current_flags(preset) - {"--seed"}
+        seed = self.legacy["--seed"]["introduced"]
+        with self.assertRaisesRegex(ab.DriverError, "the flag was removed"):
+            ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "candidate",
+                            lambda introduced: introduced == seed)
+        # A build older than the flag runs without it, as the rule says.
+        _, dropped = ab.resolve_argv(preset["args"], flags, self.legacy, self.operational, "base", OLDER)
+        self.assertEqual(dropped, ["--seed"])
+
     def test_the_legacy_table_is_well_formed(self) -> None:
         for flag, rule in self.legacy.items():
             self.assertTrue(flag.startswith("--"))
             self.assertTrue(rule.get("why"), flag)
+            self.assertRegex(rule["introduced"], r"^[0-9a-f]{40}$", flag)
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / "legacy.json"
             broken.write_text(json.dumps({"schema": ab.LEGACY_SCHEMA, "flags": {"--x": {"equals": 1, "formula": "y"}}}))

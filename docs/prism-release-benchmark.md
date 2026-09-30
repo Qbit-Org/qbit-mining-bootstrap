@@ -83,6 +83,10 @@ from 2,016 to 128). Both refusals below happen before anything runs:
   that build ran that value anyway. For this flag the old value was
   `ceil(sessions / frontends) + 16`, at least 128, so `throughput-20k-window-1fe`'s 2,016
   qualifies. Any other value refuses the pair.
+- **A build's harness lost a flag the preset pins.** The table records the
+  commit that introduced each flag (`introduced`). A build whose history
+  has that commit but whose harness lacks the flag removed it, and the pair
+  is refused: the legacy rule speaks only for builds older than the flag.
 
 `tests/legacy_flags.rs` holds the table to the harness's own defaults.
 `tests/test_prism_load_ab.py` checks that every D1 preset resolves against

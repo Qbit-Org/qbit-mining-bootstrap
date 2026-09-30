@@ -139,7 +139,19 @@ def load_legacy(path: Path = LEGACY_FLAGS) -> dict[str, dict[str, Any]]:
             raise DriverError(f"{path}: {flag} needs exactly one rule, has {kinds}")
         if "formula" in rule and rule["formula"] not in FORMULAS:
             raise DriverError(f"{path}: {flag}: unknown formula {rule['formula']!r}")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(rule.get("introduced", ""))):
+            raise DriverError(f"{path}: {flag} needs the full commit that introduced it, as introduced")
     return flags
+
+
+def descends_from(commit: str, ancestor: str) -> bool:
+    """Whether `commit` has `ancestor` in its history; a history that cannot
+    be read (a shallow clone, an unknown commit) is refused, not guessed."""
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", ancestor, commit],
+                            cwd=ROOT, capture_output=True, text=True, check=False)
+    if result.returncode not in (0, 1):
+        raise DriverError(f"cannot tell whether {commit[:8]} descends from {ancestor[:8]}: {result.stderr.strip()}")
+    return result.returncode == 0
 
 
 def same(a: Any, b: Any) -> bool:
@@ -195,8 +207,12 @@ def resolve_argv(
     legacy: dict[str, dict[str, Any]],
     operational: frozenset[str],
     label: str,
+    contains: Callable[[str], bool],
 ) -> tuple[list[str], list[str]]:
-    """The preset's command line for one build, and the flags it left off."""
+    """The preset's command line for one build, and the flags it left off.
+    `contains` says whether the build's history has a commit: a build
+    lacking a flag it descends from the introduction of lost the flag, and
+    a legacy rule speaks only for builds that never had it."""
     words: list[str] = []
     dropped: list[str] = []
     problems: list[str] = []
@@ -209,6 +225,12 @@ def resolve_argv(
         if rule is None:
             problems.append(
                 f"its harness has no {flag} and legacy-flags.json has no rule for what it ran instead"
+            )
+            continue
+        if contains(rule["introduced"]):
+            problems.append(
+                f"its harness has no {flag}, though its history has {rule['introduced'][:8]}, which "
+                "introduced it: the flag was removed, and a legacy rule speaks only for older builds"
             )
             continue
         holds, needs = legacy_holds(flag, rule, args)
@@ -898,7 +920,8 @@ def run_series(
         build = prepare_build(label, ref, out, options.skip_build)
         harness = out / build["worktree"] / "target" / "release" / "qbit-prism-load"
         commands[label], build["dropped_legacy_flags"] = resolve_argv(
-            preset["args"], help_flags(harness), legacy, operational, label
+            preset["args"], help_flags(harness), legacy, operational, label,
+            lambda introduced, commit=build["commit"]: descends_from(commit, introduced),
         )
         build["argv"] = [redact_url_secrets(word) for word in commands[label]]
         builds.append(build)

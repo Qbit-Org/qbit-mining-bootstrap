@@ -1,97 +1,120 @@
 {
   "schema": "qbit.prism.load-legacy-flags.v1",
-  "description": "Result flags added to qbit-prism-load after the oldest build the A/B driver (scripts/prism_load_ab.py) compares, #271's base 5d0042f6. A build whose harness lacks one of these flags ran the workload its rule describes; the driver leaves the flag off that build's command line only when the preset's value satisfies the rule, and refuses the pair otherwise, so an older build never runs a different workload under the preset's name. A flag an older harness lacks with no rule here is refused too. tests/legacy_flags.rs holds every `equals` to the current harness's default.",
+  "description": "Result flags added to qbit-prism-load after the oldest build the A/B driver (scripts/prism_load_ab.py) compares, #271's base 5d0042f6. A build whose harness lacks one of these flags ran the workload its rule describes; the driver leaves the flag off that build's command line only when the preset's value satisfies the rule, and refuses the pair otherwise, so an older build never runs a different workload under the preset's name. A flag an older harness lacks with no rule here is refused too. tests/legacy_flags.rs holds every `equals` to the current harness's default. `introduced` is the commit that added the flag: a build descending from it lacks the flag only because its harness lost it, and is refused rather than treated as older.",
   "flags": {
     "--arrival": {
       "equals": "smooth",
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before #521's realism options every phase offered its rate smoothly."
     },
     "--background-shares-per-second": {
       "equals_flag": "--steady-state-rate",
+      "introduced": "03f634772303077add54efdd64000ddc66c6e23c",
       "why": "Before the flag, warm-up offered the steady-state rate."
     },
     "--churn-seconds": {
       "equals": 0,
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Before #521's churn phase no run had one."
     },
     "--churn-rate": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--churn-tips": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--rental-bursts": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--rental-burst-window-seconds": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--rental-burst-interval-seconds": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--rental-lifetime": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--rental-hashrate": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--reconnect-storms": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--storm-interval-seconds": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--storm-reconnect-seconds": {
       "inert_when": {"--churn-seconds": 0},
+      "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
     "--node": {
       "equals": "fake",
+      "introduced": "a3f1b1ce7fc37b13270ad479633d2f3fd2e487b5",
       "why": "Before #547 every run drove the in-harness fake node."
     },
     "--pool-fee-bps": {
       "equals": 0,
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag every run had the pool fee off; since #535 a 0-bps fee is enabled but pays nothing and adds no output until dust must be swept, where a fee-off run would have stalled, so fee-off runs reproduce at 0."
     },
     "--recipients": {
       "equals": null,
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag every live session used one payout address."
     },
     "--recipient-weights": {
       "inert_when": {"--recipients": null},
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Read only with --recipients."
     },
     "--retarget-bits": {
       "equals": false,
+      "introduced": "03f634772303077add54efdd64000ddc66c6e23c",
       "why": "Before the flag every tip served the same template bits."
     },
     "--seed": {
       "equals": 1,
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Seeds only the realism draws, which older builds did not make; the default keeps the checked-in presets' populations."
     },
     "--session-difficulty": {
       "equals": "fixed",
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag every session had the same share difficulty."
     },
     "--session-hashrate-sigma": {
       "equals": 0,
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag every session had the same hashrate."
     },
     "--stratum-max-pending-initial-jobs": {
       "formula": "sessions-per-frontend-plus-16-min-128",
+      "introduced": "a42f519bb30d9a349da7c310d6cb9701e918b98c",
       "why": "Before the flag the harness launched every frontend with PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS = ceil(sessions / frontends) + 16, at least 128 (docs/prism-throughput-measurements.md, Host)."
     },
     "--template-bits": {
       "equals": "1e7fffff",
+      "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag the fake node served these bits."
     }
   }
