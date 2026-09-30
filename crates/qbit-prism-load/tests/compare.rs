@@ -946,26 +946,47 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
         .markdown
         .contains("scheduled 0 own blocks, not the pinned `--scheduled-blocks` 2"));
     // Scheduled, each block must also have landed: the node accepted it.
-    let landed = |accepted: [bool; 2]| {
+    // `steady_state` runs 300 s from 12:00:00, so its two blocks are sent at
+    // 100 s and 200 s.
+    let at = |seconds: f64| {
+        (chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z").unwrap()
+            + chrono::Duration::milliseconds((seconds * 1000.0) as i64))
+        .to_rfc3339()
+    };
+    let landed = |accepted: [bool; 2], seconds: [f64; 2]| {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
-            report["phases"][0]["scheduled_blocks"] = json!(2);
+            let steady = &mut report["phases"][0];
+            steady["scheduled_blocks"] = json!(2);
+            steady["started_at"] = json!(at(0.0));
+            steady["ended_at"] = json!(at(300.004));
             report["node"]["submissions"] = json!([
-                {"accepted": accepted[0], "rejection": null},
-                {"accepted": accepted[1], "rejection": "parent mismatch"},
+                {"accepted": accepted[0], "rejection": null, "received_at": at(seconds[0])},
+                {"accepted": accepted[1], "rejection": "parent mismatch", "received_at": at(seconds[1])},
             ]);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
-    let result = landed([true, true]);
+    let result = landed([true, true], [103.3, 200.1]);
     assert!(result.passed, "{}", result.markdown);
-    let result = landed([true, false]);
+    let result = landed([true, false], [103.3, 200.1]);
     assert!(!result.passed);
     assert!(
         result
             .markdown
             .contains("landed 1 of its 2 scheduled own blocks"),
+        "{}",
+        result.markdown
+    );
+    // Both landed, but deferred to the phase's last seconds.
+    let result = landed([true, true], [298.0, 299.0]);
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "landed own block 0 at 298.0 s into `steady_state`, not between its 100.0 s slot and \
+             200.0 s"
+        ),
         "{}",
         result.markdown
     );
@@ -1174,6 +1195,11 @@ fn another_database_or_fewer_launched_frontends_than_pinned_fails() {
             "observed replication none at entry",
         ),
         ("/frontend_environment", json!([]), "launched 0 frontends"),
+        (
+            "/frontend_environment/0/instance_id",
+            json!("load-fe-7"),
+            "launched the frontends load-fe-7, not the harness's load-fe-0",
+        ),
     ] {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         set_pointer(runs[1].report.as_mut().unwrap(), pointer, value);
@@ -1319,6 +1345,31 @@ fn a_planned_restart_or_kill_is_held_to_the_preset_even_when_every_run_agrees() 
     };
     let result = two_frontends(1);
     assert!(result.passed, "{}", result.markdown);
+    // One frontend reported twice is not two.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let report = run.report.as_mut().unwrap();
+        report["topology"]["frontends"] = json!(2);
+        let first = report["frontend_environment"][0].clone();
+        report["frontend_environment"]
+            .as_array_mut()
+            .unwrap()
+            .push(first);
+        for phase in report["phases"].as_array_mut().unwrap() {
+            let sampler = phase["processes"][0].clone();
+            phase["processes"].as_array_mut().unwrap().push(sampler);
+        }
+        report["phases"][3]["frontend_restarts"] = json!(1);
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "launched the frontends load-fe-0, load-fe-0, not the harness's load-fe-0, load-fe-1"
+        ),
+        "{}",
+        result.markdown
+    );
     // One frontend's sampler left out fails, though the other ran.
     let mut runs = loaded(&manifest, |_, _| met_steady());
     for run in &mut runs {

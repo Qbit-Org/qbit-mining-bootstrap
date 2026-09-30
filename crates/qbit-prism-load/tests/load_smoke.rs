@@ -393,6 +393,21 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         (average - seed_bytes).abs() <= seed_bytes * compare::SEED_SHARE_BYTES_TOLERANCE,
         "{seed}"
     );
+    // Each launched frontend under the name the harness gives it, once.
+    let mut names: Vec<&str> = report["frontend_environment"]
+        .as_array()
+        .context("frontend environment")?
+        .iter()
+        .filter_map(|frontend| frontend["instance_id"].as_str())
+        .collect();
+    names.sort_unstable();
+    let frontends = loaded.args["--frontends"].as_u64().context("frontends")? as usize;
+    assert_eq!(
+        names,
+        (0..frontends)
+            .map(run::frontend_instance_id)
+            .collect::<Vec<_>>()
+    );
     // Every pinned session connected at least once.
     assert!(
         report["client"]["connects"].as_u64()

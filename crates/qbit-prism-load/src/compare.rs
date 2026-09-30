@@ -1321,6 +1321,74 @@ fn setting_mismatches(
     found
 }
 
+/// Why a counted run's accepted own blocks did not land when the harness
+/// sends them, or `None` when they did: the phase that holds them sends the
+/// `i`-th at its `run::scheduled_block_offsets` slot, so it lands at or after
+/// that slot (a block search takes a moment) and before the next one, or
+/// the phase's end for the last. A block deferred to the end of the phase,
+/// or into another, spares the phase the rebuild it was scheduled to cause.
+fn block_landings_off(
+    run: &LoadedRun,
+    planned: &[crate::cli::PhasePlan],
+    args: &crate::cli::Args,
+    blocks: u64,
+) -> Result<Option<String>> {
+    let Some(plan) = planned
+        .iter()
+        .map(|plan| crate::run::holds_scheduled_blocks(args, plan).map(|holds| (plan, holds)))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .find_map(|(plan, holds)| holds.then_some(plan))
+    else {
+        return Ok(None);
+    };
+    let at = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    };
+    let phase = run.phase(&plan.name);
+    let (Some(started), Some(ended)) = (
+        phase.and_then(|p| at(&p["started_at"])),
+        phase.and_then(|p| at(&p["ended_at"])),
+    ) else {
+        return Ok(Some(format!(
+            "reports no start or end for `{}`, so its own blocks' landings cannot be placed",
+            plan.name
+        )));
+    };
+    let seconds = |when: chrono::DateTime<chrono::FixedOffset>| {
+        (when - started).num_microseconds().unwrap_or(i64::MAX) as f64 / 1e6
+    };
+    let mut landed: Vec<Option<f64>> = run
+        .report
+        .as_ref()
+        .and_then(|r| r.pointer("/node/submissions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s["accepted"] == true)
+        .map(|s| at(&s["received_at"]).map(seconds))
+        .collect();
+    landed.sort_by(|a, b| a.unwrap_or(f64::NAN).total_cmp(&b.unwrap_or(f64::NAN)));
+    let slots = crate::run::scheduled_block_offsets(plan.seconds as f64, blocks as usize);
+    let end = seconds(ended);
+    for (index, (landing, slot)) in landed.iter().zip(&slots).enumerate() {
+        let next = slots.get(index + 1).copied().unwrap_or(end);
+        // Wall clocks read to the microsecond; a landing a hair before its
+        // slot is the same instant.
+        if !landing.is_some_and(|t| t >= slot - 0.05 && t < next + 0.05) {
+            return Ok(Some(format!(
+                "landed own block {index} {} into `{}`, not between its {slot:.1} s slot and \
+                 {next:.1} s",
+                landing.map_or("at an unreported time".into(), |t| format!("at {t:.1} s")),
+                plan.name
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Why some frontend of a counted run was not launched with `flag`'s pinned
 /// value as `key`, or `None` when every one was.
 fn frontend_env_mismatch(
@@ -1670,6 +1738,18 @@ pub fn compare(
         let launched = report
             .and_then(|r| r["frontend_environment"].as_array())
             .map(|f| f.len() as u64);
+        // Each frontend by the name the harness gives it, once.
+        let mut names: Vec<&str> = report
+            .and_then(|r| r["frontend_environment"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|f| f["instance_id"].as_str().unwrap_or("?"))
+            .collect();
+        names.sort_unstable();
+        let mut expected_names: Vec<String> = (0..args.frontends)
+            .map(crate::run::frontend_instance_id)
+            .collect();
+        expected_names.sort_unstable();
         let why = if reported_mode != Some(mode) {
             Some(format!(
                 "ran against a {} database, not the {mode} one the preset asks for",
@@ -1692,6 +1772,12 @@ pub fn compare(
                 "launched {} frontends, not the pinned `--frontends` {}",
                 launched.map_or("an unreported number of".into(), |n| n.to_string()),
                 frontends.unwrap_or_default()
+            ))
+        } else if names != expected_names {
+            Some(format!(
+                "launched the frontends {}, not the harness's {}",
+                names.join(", "),
+                expected_names.join(", ")
             ))
         } else {
             None
@@ -2075,6 +2161,9 @@ pub fn compare(
                     "scheduled {} own blocks, not the pinned `--scheduled-blocks` {blocks}",
                     count(scheduled)
                 )),
+                None if blocks > 0 && accepted == Some(expected) => {
+                    block_landings_off(run, &planned, &args, blocks)?
+                }
                 None if blocks > 0 && accepted != Some(expected) => Some(format!(
                     "landed {} of its {blocks} scheduled own blocks (`node.submissions` \
                      accepted), not the pinned `--scheduled-blocks` {blocks}",

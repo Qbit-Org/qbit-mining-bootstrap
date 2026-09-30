@@ -151,9 +151,11 @@ fails the comparison rather than passing on less load. The same holds for
 the rest of the planned workload, even when every run agrees: each phase's
 database delay, seen to be paid, and frontend restarts (the reconnect phase's drained restart
 with two or more frontends, the mid-flight kill's relaunch, with submits in
-flight at the kill), the scheduled blocks, each accepted by the node (under
+flight at the kill), the scheduled blocks, each accepted by the node between
+its slot and the next (under
 the dense cadence, the pinned landing budget and the landings it schedules),
-the seeded ledger's rows (a retargeting node's older history included) and
+each launched frontend by the harness's name for it, the seeded ledger's rows
+(a retargeting node's older history included) and
 average share size, a connection for every pinned session, an external database's endpoint,
 the completed reconnects,
 the memory floor, and the samplers, each sampling at its pinned interval on
