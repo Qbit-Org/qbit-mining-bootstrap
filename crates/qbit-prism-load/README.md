@@ -891,6 +891,23 @@ a 2 vCPU runner for a given time to find the maximum job duration. A collate
 job writes the per-class table (`scripts/prism_load_probe.py table`) to its
 summary and to the `prism-probe-table` artifact.
 
+For #542 the same workflow repeats one commit to measure the harness's noise:
+`presets` picks any checked-in fake-node presets, `repeats` runs that many
+separate probe jobs per class (the VM-to-VM spread) and `in_job_repeats` runs
+each preset that many times in one job (the run-to-run spread). The plan job
+refuses an unknown class or preset, a real-node preset, an out-of-range count
+or a job over 360 minutes before any probe runner starts, and writes the
+dispatch's spend ceiling to its summary; each run ends at its preset's
+`timeout_minutes`. The collate job adds `variance.json`
+(`scripts/prism_load_probe.py variance`, schema
+`qbit.prism.runner-probe-variance.v1`) to the artifact: per class, preset and
+fsync-cost band, the median, MAD and CV of each headline metric over every
+run, over the per-VM medians and within each VM, with n and the unknown count
+(a failed, timed-out or missing run is unknown, never zero), and whether the
+class holds each preset (every run measured, zero gated shortfall, at least a
+quarter of MemTotal and the preset's memory floor left at peak). The run plan
+and the per-lane pick rule are in the workflow's header comment.
+
 The same workflow's `live-nightly` job runs the opt-in `#[ignore]`
 `live_regtest` variants listed in `test/prism-nightly-gated-tests.txt`
 (#523's qbitd `-reindex` crash variant, #524's 130-payee weighted
