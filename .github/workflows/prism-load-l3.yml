@@ -3,7 +3,8 @@ name: PRISM load harness (L3 production-window matrix)
 # #550 (S5 of #487): #447's production-window matrix (L3) in CI. The full
 # suite, `l3-full` in crates/qbit-prism-load/presets/suites.toml, is every
 # cell #473 ran by hand, three repeats each; the reduced suite, `l3-reduced`,
-# is 400k at 1, 2 and 4 frontends, async, once each. Each preset pins every
+# is 400k at 1, 2 and 4 frontends, async, #555's capacity-envelope session
+# points (5,000 and 10,000 sessions) and #521's mainnet shapes, once each. Each preset pins every
 # flag its result depends on, so the suite file and the presets are the whole
 # configuration.
 #
@@ -42,7 +43,8 @@ name: PRISM load harness (L3 production-window matrix)
 # class per lane. At most eight preset jobs run at once. Cost, at about
 # $0.064 per 32 vCPU minute and about 20 minutes a job: the full suite is 33
 # jobs, about 660 runner-minutes or $42 a release candidate; the reduced
-# suite 3 jobs, about 60 minutes or $4 a week.
+# suite 9 jobs (#555 added the session points and the mainnet shapes), about
+# 200 runner-minutes or $13 a week.
 #
 # This workflow is never a required check. A per-PR, per-label group lets a
 # new push cancel the older push's run without touching a labelled run, and an
