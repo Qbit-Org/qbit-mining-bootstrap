@@ -140,8 +140,8 @@ the rest of the planned workload, even when every run agrees: each phase's
 database delay and frontend restarts (the reconnect phase's drained restart
 with two or more frontends, the mid-flight kill's relaunch), the scheduled
 blocks (under the dense cadence, the pinned landing budget and the landings
-it buys), the completed reconnects, the memory floor and the samplers'
-pinned intervals.
+it buys), the completed reconnects, the memory floor, and the samplers'
+pinned intervals on every launched frontend.
 
 **The verdict is PASS** when the candidate meets the rule in every gated
 phase, every candidate run passes the preset's gates, and the targets

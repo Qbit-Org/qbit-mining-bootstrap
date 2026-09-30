@@ -46,7 +46,7 @@ fn plain_phase(
         "rejected_valid_shares": rejected,
         "client_ack_latency": {"p50": 2.5, "p99": p99},
         "order_lock": {"max_waiters": 15, "mean_waiters": 13.4, "sample_interval_milliseconds": 10.0},
-        "processes": [{"sample_interval_seconds": 1.0}],
+        "processes": [{"instance_id": "load-fe-0", "sample_interval_seconds": 1.0}],
         "reconciliation": {"missing": 0, "unexpected": 0},
         "min_mem_available_kib": 30_000 * 1024,
         "in_artifact": true,
@@ -105,7 +105,7 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
         "versions": {"coordinator_revision": commit},
         "validator": {"ack_p99_limit_used_milliseconds": 1000.0, "forecast_used": 2000.0},
         "topology": {"frontends": 1, "sessions": 2000, "max_outstanding_per_session": 1, "plan": "d1"},
-        "frontend_environment": [{"environment": {
+        "frontend_environment": [{"instance_id": "load-fe-0", "environment": {
             "PRISM_RUNTIME_WORKERS": "2",
             "PRISM_DATABASE_MAX_CONNECTIONS": "16",
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS": "15",
@@ -885,11 +885,30 @@ fn samplers_at_another_interval_than_pinned_fail() {
             json!([]),
             "reports no sampler intervals",
         ),
-        // Outside `steady_state` too, wherever a phase reports them.
+        // Outside `steady_state` too: every phase reports them.
         (
             "/phases/1/order_lock/sample_interval_milliseconds",
             json!(20.0),
             "every 20 ms in `burst`",
+        ),
+        (
+            "/phases/1/order_lock",
+            json!({"max_waiters": 15, "mean_waiters": 13.4}),
+            "reports no sampler intervals for `burst`",
+        ),
+        // Every launched frontend is sampled, and only those.
+        (
+            "/phases/0/processes/0/instance_id",
+            json!("load-fe-9"),
+            "sampled load-fe-9 in `steady_state`, not its launched frontends load-fe-0",
+        ),
+        (
+            "/phases/2/processes",
+            json!([
+                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0},
+                {"instance_id": "load-fe-0", "sample_interval_seconds": 1.0},
+            ]),
+            "sampled load-fe-0, load-fe-0 in `warm_up`",
         ),
     ] {
         let mut runs = loaded(&manifest, |_, _| met_steady());
@@ -943,14 +962,45 @@ fn a_planned_restart_or_kill_is_held_to_the_preset_even_when_every_run_agrees() 
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
             report["topology"]["frontends"] = json!(2);
-            let frontend = report["frontend_environment"][0].clone();
-            report["frontend_environment"] = json!([frontend.clone(), frontend]);
+            let mut second = report["frontend_environment"][0].clone();
+            second["instance_id"] = json!("load-fe-1");
+            report["frontend_environment"]
+                .as_array_mut()
+                .unwrap()
+                .push(second);
+            for phase in report["phases"].as_array_mut().unwrap() {
+                let mut sampler = phase["processes"][0].clone();
+                sampler["instance_id"] = json!("load-fe-1");
+                phase["processes"].as_array_mut().unwrap().push(sampler);
+            }
             report["phases"][3]["frontend_restarts"] = json!(restarts);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
     let result = two_frontends(1);
     assert!(result.passed, "{}", result.markdown);
+    // One frontend's sampler left out fails, though the other ran.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let report = run.report.as_mut().unwrap();
+        report["topology"]["frontends"] = json!(2);
+        let mut second = report["frontend_environment"][0].clone();
+        second["instance_id"] = json!("load-fe-1");
+        report["frontend_environment"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        report["phases"][3]["frontend_restarts"] = json!(1);
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "sampled load-fe-0 in `steady_state`, not its launched frontends load-fe-0, load-fe-1"
+        ),
+        "{}",
+        result.markdown
+    );
     let result = two_frontends(0);
     assert!(!result.passed);
     assert!(

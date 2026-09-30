@@ -1439,10 +1439,10 @@ pub fn compare(
             break;
         }
     }
-    // The samplers ran at the pinned intervals: the ORDER-lock sampler's
-    // and every frontend's process sampler, in every phase that reports
-    // them and at least in `steady_state` (every harness since #271 reports
-    // both in every phase).
+    // The samplers ran at the pinned intervals, on every frontend: each
+    // phase reports the ORDER-lock sampler's interval and one process record
+    // per launched frontend (`frontend_environment`), each at the pinned
+    // interval (every harness since #271 reports both in every phase).
     let lock_ms = pinned
         .get("--lock-sample-interval-ms")
         .and_then(Value::as_f64);
@@ -1450,10 +1450,27 @@ pub fn compare(
         .get("--process-sample-interval-ms")
         .and_then(Value::as_f64);
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let instance_ids = |list: &[Value]| -> Vec<String> {
+        let mut ids: Vec<String> = list
+            .iter()
+            .map(|entry| entry["instance_id"].as_str().unwrap_or("?").to_owned())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let named = |ids: &[String]| {
+        if ids.is_empty() {
+            "none".to_owned()
+        } else {
+            ids.join(", ")
+        }
+    };
     'runs: for run in runs.iter().filter(|r| r.excluded.is_none()) {
-        let phases = run
-            .report
-            .as_ref()
+        let report = run.report.as_ref();
+        let launched = report
+            .and_then(|r| r["frontend_environment"].as_array())
+            .map_or_else(Vec::new, |list| instance_ids(list));
+        let phases = report
             .and_then(|r| r["phases"].as_array())
             .cloned()
             .unwrap_or_default();
@@ -1476,8 +1493,15 @@ pub fn compare(
                         .is_some_and(|seconds| close(seconds * 1000.0, pinned))
                 })
             });
-            let why = if name == "steady_state" && (lock.is_none() || processes.is_none()) {
+            let sampled = processes.map(|list| instance_ids(list));
+            let why = if lock.is_none() || sampled.is_none() {
                 Some(format!("reports no sampler intervals for `{name}`"))
+            } else if sampled.as_ref() != Some(&launched) {
+                Some(format!(
+                    "sampled {} in `{name}`, not its launched frontends {}",
+                    named(sampled.as_deref().unwrap_or_default()),
+                    named(&launched)
+                ))
             } else if let Some((reported, pinned)) = lock_off {
                 Some(format!(
                     "sampled the ORDER lock every {reported} ms in `{name}`, not the pinned \

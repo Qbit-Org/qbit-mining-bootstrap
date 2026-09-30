@@ -182,6 +182,28 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
                 plan.name
             );
         }
+        // ... on every launched frontend, one record each.
+        let ids = |list: &serde_json::Value| -> Result<Vec<String>> {
+            let mut ids = list
+                .as_array()
+                .context("a list")?
+                .iter()
+                .map(|entry| {
+                    entry["instance_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("instance_id")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ids.sort_unstable();
+            Ok(ids)
+        };
+        assert_eq!(
+            ids(&phase["processes"])?,
+            ids(&report["frontend_environment"])?,
+            "{}",
+            plan.name
+        );
         // The comparator holds the lowest reading to the preset's memory
         // floor, and treats an unread one as a failure.
         assert!(
