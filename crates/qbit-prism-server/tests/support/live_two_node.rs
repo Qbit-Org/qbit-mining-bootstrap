@@ -201,8 +201,9 @@ pub(super) struct LoadShares {
 pub(super) static LOAD_SHARES: std::sync::Mutex<Option<LoadShares>> = std::sync::Mutex::new(None);
 
 /// Pause a running load's share offers, until every offered share has its
-/// answer, or resume them. Nothing without a load.
-async fn pause_load_shares(paused: bool) -> Result<()> {
+/// answer and the share ledger has stopped growing, or resume them. Nothing
+/// without a load.
+async fn pause_load_shares(fixture: &Fixture, paused: bool) -> Result<()> {
     let shares = LOAD_SHARES
         .lock()
         .map_err(|_| anyhow::anyhow!("load shares poisoned"))?
@@ -211,13 +212,34 @@ async fn pause_load_shares(paused: bool) -> Result<()> {
         return Ok(());
     };
     (shares.pause)(paused);
-    if paused {
-        until("the load's offered shares answered", 60, || async {
-            Ok((shares.answered)())
-        })
-        .await?;
+    if !paused {
+        return Ok(());
     }
-    Ok(())
+    // A stuck share is cleared on the session's first tick past its answer
+    // bound, so allow the bound twice: ticks up to the bound apart.
+    let bound = 2 * super::share_client::ANSWER.as_secs();
+    until("the load's offered shares answered", bound, || async {
+        Ok((shares.answered)())
+    })
+    .await?;
+    // A share whose answer was lost, or `ledger-outcome-unknown`, may still
+    // commit: wait until the ledger holds still for two seconds.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = None;
+    loop {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger")
+            .fetch_one(&fixture.pool)
+            .await?;
+        if last == Some(rows) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the share ledger kept growing after the load's shares paused"
+        );
+        last = Some(rows);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 pub(super) async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
@@ -790,7 +812,7 @@ pub(super) async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result
     // block (credited at the network difficulty), so ~15 of them fill the
     // window: each own block would pay at most one earlier own share, by
     // timing, and branch B could pay both miners what branch A did.
-    pause_load_shares(true).await?;
+    pause_load_shares(fixture, true).await?;
     // Shared own blocks before the partition seed the payout window, so
     // every later own block pays both miners through a CTV fanout.
     let mut seeds = Vec::new();
@@ -839,7 +861,7 @@ pub(super) async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result
         "branch B's own blocks left the balances at branch A's, {balances_a:?}; the comparison below would prove nothing"
     );
     // Every own block is paid as found; the reorg runs under the whole load.
-    pause_load_shares(false).await?;
+    pause_load_shares(fixture, false).await?;
     // Branch B: 3 + 2 own + 4 = 9 blocks past the fork, so B1 has
     // ORPHAN_CONFIRMATIONS confirmations; branch A grows to 10 unobserved.
     peer.mine(4, &fixture.address).await?;

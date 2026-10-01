@@ -362,8 +362,10 @@ impl SessionLoad {
     }
 
     /// Whether no session waits for a share's answer, as a check that
-    /// outlives this borrow: after a pause, every share it offered has its
-    /// answer, or has run out its answer bound.
+    /// outlives this borrow: after a pause, every share offered before it has
+    /// its answer, has run out its answer bound ([`ANSWER_BOUND`]), or lost
+    /// its connection. A share answered `ledger-outcome-unknown` or lost may
+    /// still commit, so a caller that needs the ledger still waits for it.
     pub(super) fn answered(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
         let shared = self.shared.clone();
         Arc::new(move || shared.unanswered.load(Ordering::SeqCst) == 0)
@@ -714,7 +716,10 @@ async fn run_session(
             }
             continue;
         };
-        let waiting = current.outstanding.is_some();
+        // Whether `unanswered` counts this session: while it waits for an
+        // answer, and from before it checks the pause to the end of a submit,
+        // so a pause never misses a share already on its way.
+        let mut counted = current.outstanding.is_some();
         let wait = if stopping.is_some() {
             DRAIN_BOUND
         } else {
@@ -739,6 +744,10 @@ async fn run_session(
                         current.outstanding = None;
                     }
                 }
+                if current.outstanding.is_none() && !counted {
+                    shared.unanswered.fetch_add(1, Ordering::SeqCst);
+                    counted = true;
+                }
                 if current.outstanding.is_none() && !shared.paused.load(Ordering::SeqCst) {
                     submit(current, &username, &mut log)
                         .await
@@ -757,7 +766,7 @@ async fn run_session(
             close(&shared, &mut live, &mut log, &why);
         }
         match (
-            waiting,
+            counted,
             live.as_ref().is_some_and(|live| live.outstanding.is_some()),
         ) {
             (false, true) => {
