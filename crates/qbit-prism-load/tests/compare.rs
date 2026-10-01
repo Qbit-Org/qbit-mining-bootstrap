@@ -943,6 +943,13 @@ fn an_external_database_other_than_the_pinned_url_fails() {
                    application_name=load-fe-0";
     let result = external("db.example:5433", proxied);
     assert!(result.passed, "{}", result.markdown);
+    // This host's flush cost says nothing about the database host's.
+    assert!(
+        result.markdown.contains("Flush class: not applicable"),
+        "{}",
+        result.markdown
+    );
+    assert!(!result.markdown.contains("the reference flush class"));
     let result = external("other.example:5433", proxied);
     assert!(!result.passed);
     assert!(result.markdown.contains(

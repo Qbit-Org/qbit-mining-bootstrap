@@ -203,7 +203,9 @@ The 288 µs is compiled into the summarizer (`REFERENCE_FDATASYNC_USECS` in
 `crates/qbit-prism-load/src/compare.rs`). Every comparison says whether both
 of its `pg_test_fsync` readings fall within 2× of it. A reading outside that
 band is printed in bold, and that series' rates are not comparable with the
-reference's. #479 did not record the VM's hostname; every series records its
+reference's. A preset with an external `--database-url` commits on the
+database host's storage, which this probe does not measure, so its series is
+placed in no flush class. #479 did not record the VM's hostname; every series records its
 own in `manifest.json` (`host.hostname`).
 
 A replacement reference host needs three things:

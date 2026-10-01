@@ -440,7 +440,11 @@ fn host_line(manifest: &Manifest) -> String {
     )
 }
 
-fn flush_lines(manifest: &Manifest) -> String {
+/// The host's `pg_test_fsync` readings and its flush class. `external` is a
+/// preset that pins `--database-url`: its durable commits land on the
+/// database host's storage, which a probe of this host's disk does not
+/// measure, so no flush class applies.
+fn flush_lines(manifest: &Manifest, external: bool) -> String {
     let mut out = String::new();
     let mut costs = Vec::new();
     for when in ["before", "after"] {
@@ -452,7 +456,12 @@ fn flush_lines(manifest: &Manifest) -> String {
         ));
     }
     let reference = REFERENCE_FDATASYNC_USECS;
-    let class = if costs.len() < 2 {
+    let class = if external {
+        "not applicable: the preset's external database commits on its own host's storage, \
+         which this host's `pg_test_fsync` does not measure, so the series cannot be placed \
+         against the reference host"
+            .to_owned()
+    } else if costs.len() < 2 {
         "a flush reading is missing, so this host cannot be placed against the reference \
          host"
             .to_owned()
@@ -1653,7 +1662,10 @@ pub fn compare(
     out.push_str(&format!(
         "- Host: {}\n{}- Preset SHA-256: `{}`\n",
         host_line(manifest),
-        flush_lines(manifest),
+        flush_lines(
+            manifest,
+            pinned.get("--database-url").is_some_and(|v| !v.is_null())
+        ),
         manifest.preset.sha256
     ));
     for b in [base, candidate] {
