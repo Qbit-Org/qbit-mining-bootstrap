@@ -118,6 +118,7 @@ pub fn expected(populated: bool) -> Census {
         "revision_work_build_timeouts_total",
         "divergent_landings_total",
         "divergent_landing_overpay_sats_total",
+        "landing_malloc_trim_released_bytes_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -153,6 +154,7 @@ pub fn expected(populated: bool) -> Census {
         "node_initial_block_download",
         "node_observation_age_seconds",
         "work_refresh_stalled_seconds",
+        "landing_malloc_trim_resident_bytes",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -272,6 +274,12 @@ pub fn expected(populated: bool) -> Census {
     // until their owner actually records an event.
     result.family(
         "block_submit_seconds",
+        "histogram",
+        if populated { &unlabelled } else { &[] },
+        SECONDS,
+    );
+    result.family(
+        "landing_malloc_trim_seconds",
         "histogram",
         if populated { &unlabelled } else { &[] },
         SECONDS,

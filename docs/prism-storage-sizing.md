@@ -201,6 +201,71 @@ body is freed, so the slot count no longer bounds the number of live
 counted-share bodies exactly: expect one extra body per slot, transiently, on
 top of the bound the slot gives.
 
+### Landing memory per frontend
+
+Landing a block rebuilds its payout window and audit on the frontend that
+lands it. At a 400,000-share window the live heap goes from about 260 MiB to a
+1.6 GiB peak and back within the landing (#600). glibc keeps what the landing
+frees in the arenas of the threads that did the work and does not return it,
+so without a trim the landing frontend's resident set climbs with each of its
+landings to a plateau of 3.2–3.3 GB after four to six of them, with a
+high-water mark of 3.9 GB, while its live heap stays at about 250 MiB. A
+frontend that has not landed a block stays at 0.6–0.7 GB.
+
+Since #600 the frontend that landed calls `malloc_trim(0)` once the landing's
+transaction has ended and its rebuilt window is released. The trim runs on
+the blocking thread that released the window, never on a runtime worker and
+never under a lock or a database transaction, and returns every free page in
+every arena to the kernel. It locks each glibc arena in turn while it does,
+so a thread that allocates from that arena meanwhile, a runtime worker
+included, waits for it: `qbit_prism_landing_malloc_trim_seconds` bounds that
+pause. It is on by default;
+`PRISM_LANDING_MALLOC_TRIM_ENABLED=0` turns it off. glibc builds only (the
+image and release binaries); elsewhere it does nothing.
+`qbit_prism_landing_malloc_trim_seconds`,
+`qbit_prism_landing_malloc_trim_released_bytes_total` and
+`qbit_prism_landing_malloc_trim_resident_bytes` (the resident set right after
+the latest trim, the frontend's floor) report each trim.
+
+Measured with the same binary, trim off and on, two 30-minute runs of each
+over the weekly soak's 400k-window two-frontend shape (six blocks per run,
+pinned to four cores). The floor is the lowest resident set in each
+10-minute cycle; landings are the blocks that frontend rebuilt and landed,
+its trims with the trim on and its post-landing work deliveries, which can
+miss one, with it off (#600):
+
+| trim | frontend | landings | cycle floors (MiB) | peak (MiB) |
+| --- | --- | ---: | --- | ---: |
+| off | fe-1 | 4 | 420, 2,110, 2,540 | 3,166 |
+| off | fe-1 | 5 | 419, 1,374, 2,026 | 2,635 |
+| off | fe-0 | 1 | 354, 634, 1,349 | 1,436 |
+| off | fe-0 | 0 | 356, 614, 632 | 709 |
+| on | fe-0 | 6 | 426, 579, 593 | 1,367 |
+| on | fe-0 | 3 | 412, 538, 551 | 745 |
+| on | fe-1 | 3 | 387, 605, 685 | 1,642 |
+| on | fe-1 | 0 | 447, 651, 674 | 766 |
+
+Each trim took 62–100 ms and returned about 1 GB, leaving the frontend at
+about 400 MiB. With the trim on, the landing frontend's accepted block
+reached miners as post-landing work in 5.4–6.2 s, against 5.2–8.4 s with it
+off, and its block offers took 31–105 ms against 27–99 ms. Share
+acknowledgements slower than 50 ms or 250 ms were no more frequent within
+6 s of a trim than elsewhere in the run.
+
+Set the per-frontend memory limit from the peak, not the floor, and leave
+headroom for a larger landing:
+
+| 400k window, per frontend | memory limit | RSS warning |
+| --- | ---: | ---: |
+| trim on (default) | 3 GiB | 2.5 GiB |
+| trim off | 5 GiB | 4 GiB |
+
+Scale both roughly linearly with the window: at 200k the floor without a trim
+plateaued at 1.0–1.06 GB. Two frontends on one host need twice the limit plus
+PostgreSQL. `PrismResidentMemoryHigh` fires at 4 GiB, the trim-off warning:
+with a 3 GiB limit, lower it to 2.5 GiB or the frontend is killed before it
+fires.
+
 ## Estimate from measured ingest
 
 Estimate share growth from accepted share rate, not miner hashrate alone:

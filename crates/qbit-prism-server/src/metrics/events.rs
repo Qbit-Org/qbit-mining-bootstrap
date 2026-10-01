@@ -327,6 +327,24 @@ impl Metrics {
             elapsed,
         );
     }
+    /// Exactly once per post-landing `malloc_trim` (#600): its duration, the
+    /// resident bytes it returned, and the resident set it left.
+    pub fn observe_landing_trim(&self, trim: &crate::memory::Trim) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.observe(
+            Family::LandingTrimSeconds,
+            Labels::Empty,
+            trim.elapsed.as_secs_f64(),
+        );
+        if let Some(released) = trim.released() {
+            registry.add(Family::LandingTrimReleased, Labels::Empty, released as f64);
+        }
+        registry.set(
+            Family::LandingTrimResident,
+            Labels::Empty,
+            trim.resident_after.map_or(-1., |bytes| bytes as f64),
+        );
+    }
     fn observe(&self, family: Family, labels: Labels, elapsed: Duration) {
         self.inner
             .lock()

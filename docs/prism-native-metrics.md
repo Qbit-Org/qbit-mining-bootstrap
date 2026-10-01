@@ -86,6 +86,9 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
 | `qbit_prism_job_delivery_failures_total` | counter | none | run | Failed local job deliveries. | none |
 | `qbit_prism_job_delivery_successes_total` | counter | none | run | Successful local job deliveries. | none |
+| `qbit_prism_landing_malloc_trim_released_bytes_total` | counter | none | run | Resident bytes this frontend's post-landing malloc_trim calls returned to the kernel (#600): the process resident set just before each trim minus just after it, never negative; allocation on other threads during a trim can hide part of its release. | none |
+| `qbit_prism_landing_malloc_trim_resident_bytes` | gauge | none | run | Process resident bytes right after this frontend's latest post-landing trim, its resident floor after the landing, or -1 before the first trim or when procfs could not be read. | none |
+| `qbit_prism_landing_malloc_trim_seconds` | histogram | none | run | Duration of each malloc_trim(0) this frontend ran after a block landing released its rebuilt window (#600), in seconds; glibc builds only, none while PRISM_LANDING_MALLOC_TRIM_ENABLED=0. | none |
 | `qbit_prism_late_confirmed_shares_total` | counter | none | run | Shares accepted after the share commit deadline once their in-flight ledger commit was confirmed. | none |
 | `qbit_prism_low_difficulty_shares_total` | counter | none | run | Low difficulty share rejections. | `qbit_prism_low_difficulty_shares_total` |
 | `qbit_prism_metrics_snapshot_age_seconds` | gauge | none | run | Monotonic age of the metrics snapshot, or -1 before the first publication. | `qbit_prism_metrics_snapshot_age_seconds` |
