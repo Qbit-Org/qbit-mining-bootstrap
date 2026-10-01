@@ -189,6 +189,37 @@ pub(super) fn start_frontend(fixture: &Fixture, index: usize, rpc_port: u16) -> 
 pub(super) type ReadyGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 pub(super) static READY_GATE: std::sync::Mutex<Option<ReadyGate>> = std::sync::Mutex::new(None);
 
+/// A session load's share offers, which #553 installs while a load runs and
+/// [`deep_reorg`] pauses around its own blocks. `None` otherwise.
+#[derive(Clone)]
+pub(super) struct LoadShares {
+    /// Pause (`true`) or resume (`false`) the load's share offers.
+    pub pause: std::sync::Arc<dyn Fn(bool) + Send + Sync>,
+    /// Whether no load share waits for its answer.
+    pub answered: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+pub(super) static LOAD_SHARES: std::sync::Mutex<Option<LoadShares>> = std::sync::Mutex::new(None);
+
+/// Pause a running load's share offers, until every offered share has its
+/// answer, or resume them. Nothing without a load.
+async fn pause_load_shares(paused: bool) -> Result<()> {
+    let shares = LOAD_SHARES
+        .lock()
+        .map_err(|_| anyhow::anyhow!("load shares poisoned"))?
+        .clone();
+    let Some(shares) = shares else {
+        return Ok(());
+    };
+    (shares.pause)(paused);
+    if paused {
+        until("the load's offered shares answered", 60, || async {
+            Ok((shares.answered)())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn server_ready(fixture: &Fixture, index: usize) -> Result<()> {
     until(
         &format!("PRISM readiness of server {index}"),
@@ -754,6 +785,12 @@ pub(super) async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result
     let mut tip = peer.heal(fixture).await?;
     fixture.servers.push(fixture.start_server(0)?);
     server_ready(fixture, 0).await?;
+    // Under a session load (#553), its shares stop until branch B's own
+    // blocks are paid. On regtest a load share weighs about half an own
+    // block (credited at the network difficulty), so ~15 of them fill the
+    // window: each own block would pay at most one earlier own share, by
+    // timing, and branch B could pay both miners what branch A did.
+    pause_load_shares(true).await?;
     // Shared own blocks before the partition seed the payout window, so
     // every later own block pays both miners through a CTV fanout.
     let mut seeds = Vec::new();
@@ -799,8 +836,10 @@ pub(super) async fn deep_reorg(fixture: &mut Fixture, peer: &PeerNode) -> Result
     let balances_b = balances(fixture, &miners).await?;
     ensure!(
         balances_b != balances_a,
-        "branch B's own blocks left the balances at branch A's; the comparison below would prove nothing"
+        "branch B's own blocks left the balances at branch A's, {balances_a:?}; the comparison below would prove nothing"
     );
+    // Every own block is paid as found; the reorg runs under the whole load.
+    pause_load_shares(false).await?;
     // Branch B: 3 + 2 own + 4 = 9 blocks past the fork, so B1 has
     // ORPHAN_CONFIRMATIONS confirmations; branch A grows to 10 unobserved.
     peer.mine(4, &fixture.address).await?;
