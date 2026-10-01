@@ -39,45 +39,7 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
     let result=async {
         for server in &mut fixture.servers {server.stop();}
         let ledger=Ledger::connect(&fixture.database_url,"crashed-broadcaster".into(),4,false).await?;
-        let template=fixture.rpc("getblocktemplate",json!([{"rules":["segwit"]}])).await?;
-        let height=template["height"].as_u64().context("template height missing")?;
-        let ntime=template["curtime"].as_u64().context("template time missing")?;
-        let target=codec::target_from_compact(codec::parse_u32_hex(template["bits"].as_str().context("template bits missing")?)?)?;
-        let network=codec::scaled_target_difficulty(&target)?;
-        let validation=fixture.rpc("validateaddress",json!([fixture.address])).await?;
-        let script=validation["scriptPubKey"].as_str().context("payout script missing")?;
-        ledger.append(AcceptedShare {
-            share_seq:0,share_id:format!("cpfp:{}","12".repeat(32)),miner_id:fixture.address.clone(),order_key:fixture.address.clone(),
-            p2mr_program_hex:script[4..].into(),share_difficulty:network,network_difficulty:network,template_height:height.checked_sub(1).context("template parent height missing")?,
-            job_id:"legacy-cpfp".into(),job_issued_at_ms:1,accepted_at_ms:0,ntime:ntime.try_into()?,credit_policy:None,
-        },None).await?;
-        let snapshot=ledger.snapshot(network).await?;
-        let manifest_key=ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
-        let ledger_key=ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;
-        let bundle=qbit_prism::build_audit_bundle_with_ctv_settlement_options(
-            snapshot.shares.clone(),FoundBlock {block_height:height,coinbase_value_sats:template["coinbasevalue"].as_u64().context("subsidy missing")?,network_difficulty:network,anchor_job_issued_at_ms:snapshot.anchor_ms},
-            snapshot.prior_balances.clone(),PayoutPolicy::day_one_default(),u64::MAX,SettlementModeConfig::default(),None,
-            Some("00".repeat(12)),codec::witness_merkle_leaves_hex(&codec::transactions_from_template(&template)?),&manifest_key,&ledger_key,
-        )?;
-        let fanout=bundle.ctv_fanout_manifest_set.as_ref().context("missing zero-fee fanout")?.manifests.first().context("missing fanout chunk")?;
-        ensure!(fanout.precommitment.fanout_fee_sats==0 && fanout.precommitment.anchor_vout.is_some(),"fixture did not build a legacy anchored zero-fee fanout");
-        let fanout_txid=fanout.fanout_txid.clone();
-        let job=codec::Job::from_manifest("legacy-cpfp".into(),&template,&bundle.signed_coinbase_manifest.manifest,"00000000",8,1e-9,0.0,true)?;
-        let mut solved=None;
-        for nonce in 0u32..10_000 {
-            let submission=job.assemble_submission(&"00".repeat(8),&format!("{ntime:08x}"),&format!("{nonce:08x}"),None,0)?;
-            if submission.block_pass {solved=Some(submission);break;}
-        }
-        let solved=solved.context("regtest proof search exhausted")?;
-        let block_hash=solved.block_hash_hex.clone();
-        let block_bytes=hex::decode(&solved.block_hex)?;
-        ledger.enqueue_candidate(Candidate {block_hash:block_hash.clone(),block_sha256:Candidate::block_digest_hex(&block_bytes),job_id:"legacy-cpfp".into(),payout_revision:snapshot.payout_revision,window:WindowRef::from_snapshot(&snapshot)?,bootstrap_share:None,found_block:bundle.found_block.clone(),payout_policy:PayoutPolicy::day_one_default(),ctv:Some(CandidateCtv {direct_floor_sats:u64::MAX,settlement_config:SettlementModeConfig::default(),fanout_fee_policy:None}),audit_builder_version:qbit_prism::AUDIT_BUILDER_VERSION,signer_keys:SignerKeys::of(&manifest_key,&ledger_key),leased:false,coinbase_suffix_hex:"00".repeat(12),deferred_share:None,block_bytes,as_issued_balances:Vec::new()}).await?;
-        let candidate=ledger.claim_candidate(60).await?.context("candidate claim missing")?.with_bundle(bundle);
-        ledger.land_candidate(&candidate,&ledger_key.public_key_hex()).await?;
-        ensure!(fixture.rpc("submitblock",json!([solved.block_hex])).await?.is_null(),"legacy CTV coinbase rejected");
-        ledger.finish_candidate_at_revision(&candidate,true,None,snapshot.payout_revision).await?;
-        fixture.rpc("generatetoaddress",json!([1000,fixture.address])).await?;
-        ledger.reconcile_blocks_at_revision(&[BlockObservation {block_hash,active:true}],height+1000,ledger.payout_revision().await?).await?;
+        let (fanout_txid,height)=land_legacy_zero_fee_fanout(&fixture,&ledger).await?;
         let abandoned=ledger.claim_fanout(60).await?.context("mature fanout claim missing")?;
         let unspent=fixture.rpc("listunspent",json!([1,9_999_999,[],true])).await?;
         let funding=unspent.as_array().context("wallet UTXO list missing")?.iter().find(|row|row["spendable"]==true).context("mature sponsorship funding missing")?;
@@ -198,6 +160,175 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
     }
     let cleanup = fixture.cleanup().await;
     result.and(cleanup)
+}
+
+/// Land a block whose only payout is a legacy anchored zero-fee CTV fanout,
+/// built in process by `ledger` with the servers stopped, and mine it to
+/// maturity. Returns the fanout txid and the block height. Shared with the
+/// #474 lost `submitpackage` reply case.
+pub(crate) async fn land_legacy_zero_fee_fanout(
+    fixture: &Fixture,
+    ledger: &Ledger,
+) -> Result<(String, u64)> {
+    let template = fixture
+        .rpc("getblocktemplate", json!([{"rules":["segwit"]}]))
+        .await?;
+    let height = template["height"]
+        .as_u64()
+        .context("template height missing")?;
+    let ntime = template["curtime"]
+        .as_u64()
+        .context("template time missing")?;
+    let target = codec::target_from_compact(codec::parse_u32_hex(
+        template["bits"].as_str().context("template bits missing")?,
+    )?)?;
+    let network = codec::scaled_target_difficulty(&target)?;
+    let validation = fixture
+        .rpc("validateaddress", json!([fixture.address]))
+        .await?;
+    let script = validation["scriptPubKey"]
+        .as_str()
+        .context("payout script missing")?;
+    ledger
+        .append(
+            AcceptedShare {
+                share_seq: 0,
+                share_id: format!("cpfp:{}", "12".repeat(32)),
+                miner_id: fixture.address.clone(),
+                order_key: fixture.address.clone(),
+                p2mr_program_hex: script[4..].into(),
+                share_difficulty: network,
+                network_difficulty: network,
+                template_height: height
+                    .checked_sub(1)
+                    .context("template parent height missing")?,
+                job_id: "legacy-cpfp".into(),
+                job_issued_at_ms: 1,
+                accepted_at_ms: 0,
+                ntime: ntime.try_into()?,
+                credit_policy: None,
+            },
+            None,
+        )
+        .await?;
+    let snapshot = ledger.snapshot(network).await?;
+    let manifest_key = ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
+    let ledger_key = ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;
+    let bundle = qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+        snapshot.shares.clone(),
+        FoundBlock {
+            block_height: height,
+            coinbase_value_sats: template["coinbasevalue"]
+                .as_u64()
+                .context("subsidy missing")?,
+            network_difficulty: network,
+            anchor_job_issued_at_ms: snapshot.anchor_ms,
+        },
+        snapshot.prior_balances.clone(),
+        PayoutPolicy::day_one_default(),
+        u64::MAX,
+        SettlementModeConfig::default(),
+        None,
+        Some("00".repeat(12)),
+        codec::witness_merkle_leaves_hex(&codec::transactions_from_template(&template)?),
+        &manifest_key,
+        &ledger_key,
+    )?;
+    let fanout = bundle
+        .ctv_fanout_manifest_set
+        .as_ref()
+        .context("missing zero-fee fanout")?
+        .manifests
+        .first()
+        .context("missing fanout chunk")?;
+    ensure!(
+        fanout.precommitment.fanout_fee_sats == 0 && fanout.precommitment.anchor_vout.is_some(),
+        "fixture did not build a legacy anchored zero-fee fanout"
+    );
+    let fanout_txid = fanout.fanout_txid.clone();
+    let job = codec::Job::from_manifest(
+        "legacy-cpfp".into(),
+        &template,
+        &bundle.signed_coinbase_manifest.manifest,
+        "00000000",
+        8,
+        1e-9,
+        0.0,
+        true,
+    )?;
+    let mut solved = None;
+    for nonce in 0u32..10_000 {
+        let submission = job.assemble_submission(
+            &"00".repeat(8),
+            &format!("{ntime:08x}"),
+            &format!("{nonce:08x}"),
+            None,
+            0,
+        )?;
+        if submission.block_pass {
+            solved = Some(submission);
+            break;
+        }
+    }
+    let solved = solved.context("regtest proof search exhausted")?;
+    let block_hash = solved.block_hash_hex.clone();
+    let block_bytes = hex::decode(&solved.block_hex)?;
+    ledger
+        .enqueue_candidate(Candidate {
+            block_hash: block_hash.clone(),
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
+            job_id: "legacy-cpfp".into(),
+            payout_revision: snapshot.payout_revision,
+            window: WindowRef::from_snapshot(&snapshot)?,
+            bootstrap_share: None,
+            found_block: bundle.found_block.clone(),
+            payout_policy: PayoutPolicy::day_one_default(),
+            ctv: Some(CandidateCtv {
+                direct_floor_sats: u64::MAX,
+                settlement_config: SettlementModeConfig::default(),
+                fanout_fee_policy: None,
+            }),
+            audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+            signer_keys: SignerKeys::of(&manifest_key, &ledger_key),
+            leased: false,
+            coinbase_suffix_hex: "00".repeat(12),
+            deferred_share: None,
+            block_bytes,
+            as_issued_balances: Vec::new(),
+        })
+        .await?;
+    let candidate = ledger
+        .claim_candidate(60)
+        .await?
+        .context("candidate claim missing")?
+        .with_bundle(bundle);
+    ledger
+        .land_candidate(&candidate, &ledger_key.public_key_hex())
+        .await?;
+    ensure!(
+        fixture
+            .rpc("submitblock", json!([solved.block_hex]))
+            .await?
+            .is_null(),
+        "legacy CTV coinbase rejected"
+    );
+    ledger
+        .finish_candidate_at_revision(&candidate, true, None, snapshot.payout_revision)
+        .await?;
+    fixture
+        .rpc("generatetoaddress", json!([1000, fixture.address]))
+        .await?;
+    ledger
+        .reconcile_blocks_at_revision(
+            &[BlockObservation {
+                block_hash,
+                active: true,
+            }],
+            height + 1000,
+            ledger.payout_revision().await?,
+        )
+        .await?;
+    Ok((fanout_txid, height))
 }
 
 async fn spend_reserved_funding(fixture: &Fixture, outpoint: &Value, amount: u64) -> Result<()> {
