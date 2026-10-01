@@ -128,9 +128,12 @@ count verified in a green run.
 
 The job has four shards, each with its own PostgreSQL service and qbitd.
 [scripts/run_rust_test_shard.py](../scripts/run_rust_test_shard.py) discovers
-all workspace targets from Cargo metadata, sorts by package, kind, and name,
-and assigns them round-robin. Each test binary stays intact, preserving its
-fixtures and process-wide locks. New workspace targets join automatically.
+all workspace targets from Cargo metadata and assigns them longest first,
+each to the shard with the least estimated time so far. The estimates are
+measured durations for the few heavy targets and 20 seconds for the rest; each
+shard's job summary lists its per-command durations for the next re-measure.
+Each test binary stays intact, preserving its fixtures and process-wide locks.
+New workspace targets join automatically.
 The three explicit `--ignored` targets run only on the shards owning them.
 Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
 

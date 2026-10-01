@@ -344,7 +344,10 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
-    timeout-minutes: 30
+    # Interim for #647: shards ran 25-35 min on slow runners against a 30 min
+    # cap. scripts/run_rust_test_shard.py now balances them to about 17 min of
+    # tests each; lower this again once the job summaries confirm that.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
