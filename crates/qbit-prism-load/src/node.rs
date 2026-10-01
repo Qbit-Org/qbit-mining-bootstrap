@@ -400,9 +400,12 @@ impl NodeState {
                 self.wait_for_new_block(params[0].as_u64().unwrap_or(5_000))
                     .await
             }
-            // CTV is off for every load run, so these are never consulted; they
-            // are served anyway so an accidental enable does not look like a
-            // node outage.
+            // A `--ctv-settlement` frontend (#548) reads the relay floor from
+            // `getmempoolinfo` for every fanout fee policy it builds, and its
+            // explicit market rate (`frontend::apply_ctv_settlement`) is held
+            // to it: 0.00001 per kvB is 1,000 bits per 1,000 weight, the rate
+            // it pins. `estimatesmartfee` is read only by a frontend without
+            // an explicit rate, which the harness never launches.
             "estimatesmartfee" => json!({"feerate": "0.00001"}),
             "getmempoolinfo" => json!({"minrelaytxfee": "0.00001", "mempoolminfee": "0.00001"}),
             _ => {

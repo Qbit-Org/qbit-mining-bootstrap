@@ -36,6 +36,7 @@ pub mod realism;
 pub mod report;
 pub mod restart;
 pub mod run;
+pub mod settlement;
 pub mod soak;
 pub mod soak_driver;
 pub mod window;

@@ -154,6 +154,7 @@ fn fake_frontend_environment() -> Result<Value> {
         &spec,
         args.pool_fee_bps,
         &frontend::pool_fee_address("pload10123abcd"),
+        args.ctv_settlement,
         args.node_mode()?,
     );
     Ok(serde_json::to_value(environment)?)

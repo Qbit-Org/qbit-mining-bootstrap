@@ -56,6 +56,10 @@ runners have 2 vCPU and the builds are debug.
   with 100 sessions over 20 addresses, 3 tips and 30 s of churn.
 - `qbit-prism-load::real_node` runs `real-node-smoke` against a ramped real
   regtest node.
+- `qbit-prism-load::ctv_settlement` runs the harness with `--ctv-settlement`
+  (#548): 400 addresses overflow the direct-output cap, so the landed block
+  pays 12 directly and the rest through one CTV fanout chunk, counted in the
+  side report's `settlement` block.
 - `live_regtest::weighted_recipients_tests::real_weighted_recipients_pay_exact_pplns_outputs_through_fanout_spend`
   is #524's wallets, mined through to spent outputs.
 

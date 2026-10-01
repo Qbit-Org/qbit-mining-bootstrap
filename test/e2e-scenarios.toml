@@ -309,6 +309,20 @@ tests = ["qbit-prism-load::load_smoke::the_smoke_preset_serves_every_session_eve
 presets = ["pr-smoke"]
 
 [[scenario]]
+id = "r548-ctv-fanout-settlement-under-load"
+title = "#548: CTV fanout settlement in the load harness (#487 S9)"
+owner = "#548"
+lanes = ["pr"]
+criteria = "With --ctv-settlement, a fake-node run whose 400 payable recipients overflow the direct-output cap lands its block with 12 direct recipients and the rest in one fanout chunk, reconciles exactly, and its side report's settlement block counts the direct, fanout and carried recipients from the server's landing rows."
+runs = true
+tests = ["qbit-prism-load::ctv_settlement::a_ctv_run_pays_the_direct_overflow_through_fanout_and_counts_the_split"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/harness.rs::ctv_settlement_sets_mainnets_ctv_keys_and_leaves_the_broadcaster_off",
+  "crates/qbit-prism-load/tests/harness.rs::the_settlement_block_keeps_unmeasured_apart_from_zero",
+]
+notes = "The economic assertions on spent fanout outputs stay with r521-7 on the real node; this adds the settlement path under load only."
+
+[[scenario]]
 id = "r521-7-weighted-recipients-share-to-spend"
 title = "#521 scenario 7: weighted multi-address shares to spent outputs (#487 L1's wallet half)"
 owner = "#521"

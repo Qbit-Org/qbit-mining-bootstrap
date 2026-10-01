@@ -14,7 +14,7 @@ use qbit_prism_load::{
     frontend::{self, FrontendSpec, SharedEnvironment},
     measure,
     node::{self, NodeState},
-    profile, proxy, run, window,
+    profile, proxy, run, settlement, window,
 };
 use qbit_prism_server::{
     capacity::{validate_capacity_evidence, CONFIGURATION_KEYS, REQUIRED_PHASES, SUBJECT_KEYS},
@@ -10637,4 +10637,257 @@ fn a_failover_excuses_only_the_losses_its_verdict_proves() {
     );
     assert_eq!(excused.findings[0]["sample"], json!(["lost"]));
     assert!(excused.unknown_outcome_commits.is_empty());
+}
+
+// --- CTV settlement (#548) -------------------------------------------------
+
+/// The environment the first frontend of a fake-node run launches with, for
+/// `extra` added to a bare command line.
+fn launched_environment(extra: &[&str]) -> Result<BTreeMap<String, String>> {
+    use clap::Parser;
+    use qbit_prism_load::cli::Args;
+    let args =
+        Args::try_parse_from(std::iter::once("qbit-prism-load").chain(extra.iter().copied()))?;
+    let spec = FrontendSpec {
+        index: 0,
+        instance_id: "load-fe-0".into(),
+        stratum_port: 3340,
+        audit_port: 3341,
+        database_url: "postgresql://u@127.0.0.1:5432/postgres".into(),
+    };
+    let shared = run::shared_environment(
+        &args,
+        "http://127.0.0.1:1/".into(),
+        "secret".into(),
+        "0.0000000122070312".into(),
+    );
+    Ok(run::launch_environment(
+        &shared,
+        &spec,
+        args.pool_fee_bps,
+        &frontend::pool_fee_address("pload1run"),
+        args.ctv_settlement,
+        args.node_mode()?,
+    ))
+}
+
+/// `--ctv-settlement` sets exactly the CTV keys mainnet's configuration
+/// sets, to mainnet's values, through the one composition the run launches
+/// with; the broadcaster stays off; and without the flag the environment is
+/// unchanged (EP-CONFIG). Each key is one `config.rs` reads.
+#[test]
+fn ctv_settlement_sets_mainnets_ctv_keys_and_leaves_the_broadcaster_off() -> Result<()> {
+    let off = launched_environment(&[])?;
+    let on = launched_environment(&["--ctv-settlement"])?;
+    assert_eq!(off["PRISM_CTV_SETTLEMENT_ENABLED"], "0");
+    assert!(!off.contains_key("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"));
+    assert!(!off.contains_key("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"));
+    let changed: BTreeMap<&String, &String> = on
+        .iter()
+        .filter(|(key, value)| off.get(*key) != Some(*value))
+        .collect();
+    let mainnet = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mainnet-compose.env"
+    ))?;
+    let mainnet: BTreeMap<&str, &str> = mainnet
+        .lines()
+        .filter(|line| line.starts_with("PRISM_CTV_"))
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let expected = [
+        "PRISM_CTV_SETTLEMENT_ENABLED",
+        "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+        "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS",
+    ];
+    assert_eq!(
+        changed.keys().map(|key| key.as_str()).collect::<Vec<_>>(),
+        {
+            let mut keys = expected.to_vec();
+            keys.sort_unstable();
+            keys
+        },
+        "the flag changes the CTV keys and nothing else"
+    );
+    let config = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../qbit-prism-server/src/config.rs"
+    ))?;
+    for key in expected {
+        assert_eq!(
+            on[key], mainnet[key],
+            "{key} is the value mainnet-compose.env pins"
+        );
+        assert!(
+            config.contains(&format!("\"{key}\"")),
+            "{key} is read by the server's config.rs"
+        );
+    }
+    assert_eq!(on["PRISM_CTV_BROADCASTER_ENABLED"], "0");
+    assert_eq!(mainnet["PRISM_CTV_BROADCASTER_ENABLED"], "1");
+    // A real node's chain key and the pool fee compose with it as before.
+    let real = launched_environment(&["--ctv-settlement", "--node", "qbitd"])?;
+    assert_eq!(real["QBIT_CHAIN"], "regtest");
+    assert_eq!(real["PRISM_CTV_SETTLEMENT_ENABLED"], "1");
+    assert_eq!(real["PRISM_POOL_FEE_ENABLED"], "1");
+    Ok(())
+}
+
+/// The fake node's relay floor is the rate a CTV frontend pins, so the
+/// server's floor check (`validated_ctv_fee_policy`) admits it.
+#[tokio::test]
+async fn the_fake_nodes_relay_floor_admits_the_pinned_ctv_fee_rate() {
+    let state = NodeState::new(window::TEMPLATE_BITS, "pload1");
+    let answer = state
+        .handle(&json!({"id": 1, "method": "getmempoolinfo", "params": []}))
+        .await;
+    for name in ["minrelaytxfee", "mempoolminfee"] {
+        let coins: f64 = answer["result"][name]
+            .as_str()
+            .expect("a decimal string")
+            .parse()
+            .expect("a decimal");
+        let bits = (coins * 1e8).round() as u64;
+        assert!(
+            bits <= frontend::CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT,
+            "{name}: floor {bits} above the pinned rate"
+        );
+    }
+}
+
+fn landed(
+    hash: &str,
+    direct: u64,
+    fanout: u64,
+    carried: u64,
+    chunks: u64,
+) -> settlement::BlockSettlement {
+    settlement::BlockSettlement {
+        block_hash: hash.into(),
+        block_height: 101,
+        chain_state: "confirmed".into(),
+        settlement_mode: if chunks == 0 {
+            "direct_coinbase".into()
+        } else {
+            "hybrid_coinbase_ctv_fanout".into()
+        },
+        direct_recipients: direct,
+        fanout_recipients: fanout,
+        carried_recipients: carried,
+        fanout_chunks: chunks,
+        fanout_outputs: fanout,
+        unreadable_chunks: 0,
+    }
+}
+
+/// A landed block with no fanout measured 0 fanout recipients; a run with no
+/// landed block measured nothing, and says so rather than reporting 0; an
+/// accepted block with no landing is listed, not counted; a failed read
+/// leaves every count null (EP-OBSERVABILITY).
+#[test]
+fn the_settlement_block_keeps_unmeasured_apart_from_zero() {
+    let hashes = vec!["aa".to_owned(), "bb".to_owned()];
+
+    let direct_only = settlement::report(false, &hashes[..1], Ok(vec![landed("aa", 12, 0, 3, 0)]));
+    assert_eq!(direct_only["ctv_settlement"], false);
+    assert_eq!(direct_only["measured_blocks"], 1);
+    assert_eq!(direct_only["totals"]["fanout_recipients"], 0);
+    assert_eq!(direct_only["totals"]["direct_recipients"], 12);
+    assert_eq!(direct_only["totals"]["carried_recipients"], 3);
+    assert_eq!(direct_only["totals_unavailable_reason"], Value::Null);
+    assert_eq!(
+        direct_only["blocks"][0]["settlement_mode"],
+        "direct_coinbase"
+    );
+
+    let fanned = settlement::report(
+        true,
+        &hashes,
+        Ok(vec![
+            landed("aa", 12, 288, 0, 1),
+            landed("bb", 11, 1_989, 7, 2),
+        ]),
+    );
+    assert_eq!(fanned["totals"]["fanout_recipients"], 2_277);
+    assert_eq!(fanned["totals"]["direct_recipients"], 23);
+    assert_eq!(fanned["totals"]["carried_recipients"], 7);
+    assert_eq!(fanned["totals"]["fanout_chunks"], 3);
+    assert_eq!(fanned["totals"]["blocks_with_fanout"], 2);
+    assert_eq!(
+        fanned["totals"]["blocks_by_chain_state"],
+        json!({"confirmed": 2})
+    );
+    assert_eq!(fanned["unmeasured_blocks"], json!([]));
+
+    let partly = settlement::report(true, &hashes, Ok(vec![landed("bb", 12, 0, 0, 0)]));
+    assert_eq!(partly["accepted_blocks"], 2);
+    assert_eq!(partly["measured_blocks"], 1);
+    assert_eq!(partly["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert_eq!(partly["totals"]["covers"], "measured_blocks only");
+
+    // A landed block whose chain later reorged it still settled: it is
+    // counted, and the totals say in which state.
+    let mut reorged = landed("bb", 12, 88, 0, 1);
+    reorged.chain_state = "reorged".into();
+    let mixed = settlement::report(
+        true,
+        &hashes,
+        Ok(vec![landed("aa", 12, 288, 0, 1), reorged]),
+    );
+    assert_eq!(mixed["totals"]["fanout_recipients"], 376);
+    assert_eq!(
+        mixed["totals"]["blocks_by_chain_state"],
+        json!({"confirmed": 1, "reorged": 1})
+    );
+
+    // One unreadable chunk beside a readable one still makes the block
+    // unmeasured: its chunk's recipients would count as direct.
+    let mut half = landed("aa", 112, 100, 0, 2);
+    half.unreadable_chunks = 1;
+    let half = settlement::report(true, &hashes[..1], Ok(vec![half]));
+    assert_eq!(half["measured_blocks"], 0, "{half}");
+    assert_eq!(half["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert!(half["unmeasured_blocks"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.starts_with("1 of its 2 fanout chunk(s)")));
+
+    let mut unreadable = landed("aa", 12, 0, 0, 1);
+    unreadable.fanout_outputs = 0;
+    unreadable.unreadable_chunks = 1;
+    let unreadable = settlement::report(true, &hashes[..1], Ok(vec![unreadable]));
+    assert_eq!(unreadable["measured_blocks"], 0);
+    assert_eq!(unreadable["totals"], Value::Null);
+    assert_eq!(unreadable["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert!(unreadable["unmeasured_blocks"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("list no output")));
+
+    let none = settlement::report(true, &[], Ok(Vec::new()));
+    assert_eq!(none["totals"], Value::Null);
+    assert!(none["totals_unavailable_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("no block")));
+
+    let unlanded = settlement::report(false, &hashes[..1], Ok(Vec::new()));
+    assert_eq!(unlanded["totals"], Value::Null);
+    assert_eq!(unlanded["unmeasured_blocks"][0]["block_hash"], "aa");
+
+    let failed = settlement::report(
+        true,
+        &hashes,
+        Err(anyhow::anyhow!(
+            "connect postgresql://u:hunter2@127.0.0.1/db refused"
+        )),
+    );
+    for key in ["measured_blocks", "unmeasured_blocks", "totals", "blocks"] {
+        assert_eq!(failed[key], Value::Null, "{key}");
+    }
+    let reason = failed["totals_unavailable_reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("settlement read failed"), "{reason}");
+    assert!(
+        !reason.contains("hunter2"),
+        "the error is redacted: {reason}"
+    );
 }
