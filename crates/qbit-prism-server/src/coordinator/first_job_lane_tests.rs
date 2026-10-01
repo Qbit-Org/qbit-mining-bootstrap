@@ -316,6 +316,15 @@ async fn a_first_job_is_not_queued_behind_a_rebuild_storm() -> Result<()> {
                 .with_context(|| format!("new session {index} never received work"))??;
             overtaken.push((delivered.load(Ordering::Relaxed) - before, waited.elapsed()));
         }
+        // The first jobs can finish before a slow runner's storm has made a
+        // full pass; keep it going until it has, so the check below proves
+        // the storm was rebuilding every session, not how fast the host is.
+        let _ = tokio::time::timeout(Duration::from_secs(60), async {
+            while delivered.load(Ordering::Relaxed) - started < STORM_SESSIONS as u64 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
         drop(signal);
         let storm_deliveries = delivered.load(Ordering::Relaxed) - started;
         while let Some(reader) = readers.try_join_next() {
