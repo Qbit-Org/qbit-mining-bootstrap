@@ -109,6 +109,7 @@ pub fn expected(populated: bool) -> Census {
         "blocks_total",
         "job_delivery_successes_total",
         "job_delivery_failures_total",
+        "job_delivery_cancellations_total",
         "stale_shares_total",
         "duplicate_shares_total",
         "low_difficulty_shares_total",

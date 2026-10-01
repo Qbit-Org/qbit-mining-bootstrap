@@ -101,6 +101,10 @@ impl Metrics {
                 Family::DeliveryFailed,
                 snapshot.job_delivery_failures as f64,
             ),
+            (
+                Family::DeliveryCancelled,
+                snapshot.job_delivery_cancellations as f64,
+            ),
             (Family::Coverage, coverage),
         ] {
             registry.set(family, vec![], value);

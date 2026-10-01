@@ -339,6 +339,7 @@ pub struct StratumStats {
     rebuild_lane_waiters: AtomicUsize,
     job_delivery_successes: AtomicU64,
     job_delivery_failures: AtomicU64,
+    job_delivery_cancellations: AtomicU64,
     accepted_submissions: AtomicU64,
     rejected_submissions: AtomicU64,
     delivered_generations: Mutex<HashMap<u64, usize>>,
@@ -355,6 +356,7 @@ pub struct StratumStatsSnapshot {
     pub rebuild_lane_waiters: usize,
     pub job_delivery_successes: u64,
     pub job_delivery_failures: u64,
+    pub job_delivery_cancellations: u64,
     pub accepted_submissions: u64,
     pub rejected_submissions: u64,
     pub current_generation: u64,
@@ -389,6 +391,7 @@ impl StratumStats {
             rebuild_lane_waiters: self.rebuild_lane_waiters.load(Ordering::Relaxed),
             job_delivery_successes: self.job_delivery_successes.load(Ordering::Relaxed),
             job_delivery_failures: self.job_delivery_failures.load(Ordering::Relaxed),
+            job_delivery_cancellations: self.job_delivery_cancellations.load(Ordering::Relaxed),
             accepted_submissions: self.accepted_submissions.load(Ordering::Relaxed),
             rejected_submissions: self.rejected_submissions.load(Ordering::Relaxed),
             current_generation,
@@ -487,31 +490,45 @@ impl Drop for SessionObservation {
     }
 }
 
+/// How a job delivery ended, counted once when its observation drops.
+#[derive(Clone, Copy)]
+enum DeliveryOutcome {
+    Success,
+    Failure,
+    /// Abandoned unannounced because its session ended (#621).
+    Cancelled,
+}
+
 struct DeliveryObservation {
     stats: Arc<StratumStats>,
-    success: bool,
+    outcome: DeliveryOutcome,
 }
 impl DeliveryObservation {
     fn new(stats: Arc<StratumStats>) -> Self {
         stats.pending_builds.fetch_add(1, Ordering::Relaxed);
+        // Until it settles, a delivery that drops was abandoned by its
+        // session (#621): a miner that leaves, or a shutdown, is not a
+        // failed delivery.
         Self {
             stats,
-            success: false,
+            outcome: DeliveryOutcome::Cancelled,
         }
+    }
+    /// Settle as failed, handing back the error that failed it.
+    fn failed(mut self, error: StratumError) -> StratumError {
+        self.outcome = DeliveryOutcome::Failure;
+        error
     }
 }
 impl Drop for DeliveryObservation {
     fn drop(&mut self) {
         self.stats.pending_builds.fetch_sub(1, Ordering::Relaxed);
-        if self.success {
-            self.stats
-                .job_delivery_successes
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats
-                .job_delivery_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let counter = match self.outcome {
+            DeliveryOutcome::Success => &self.stats.job_delivery_successes,
+            DeliveryOutcome::Failure => &self.stats.job_delivery_failures,
+            DeliveryOutcome::Cancelled => &self.stats.job_delivery_cancellations,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1155,12 +1172,15 @@ struct PreparedJob<C> {
 }
 
 /// Requests a session answers while its job delivery is in flight (#621):
-/// none of them changes what that job is built from or how it is announced.
-/// A submit's own retarget waits for the delivery (`Session::retarget`).
-/// Every other request (subscribe, authorize, configure, suggest_difficulty,
-/// or a method this server does not know) waits for the delivery, and the
-/// session reads nothing after it until it is handled, so responses keep
-/// request order and those requests see the session exactly as before #621.
+/// `mining.submit` and `mining.get_health`, neither of which changes what
+/// that job is built from or how it is announced. A submit's own retarget
+/// waits for the delivery (`Session::retarget`). Every other object frame
+/// (`mining.subscribe`, `mining.authorize`, `mining.configure`,
+/// `mining.suggest_difficulty`, `mining.extranonce.subscribe`, any other
+/// method, or a method that is missing or not a string) waits for the
+/// delivery, and the session reads nothing after it until it is handled, so
+/// responses keep request order and those requests see the session exactly
+/// as before #621. A frame that is not a JSON object is answered at once.
 fn answered_during_delivery(request: &Value) -> bool {
     matches!(
         request.get("method").and_then(Value::as_str),
@@ -1261,10 +1281,11 @@ async fn prepare_job<B: MiningBackend>(
     )
     .await
     {
-        Ok(built) => built?,
+        Ok(Ok(built)) => built,
+        Ok(Err(error)) => return Err(observation.failed(error)),
         Err(_) => {
             revision_build.deadline_hit();
-            return Err(StratumError::backend("initial job delivery timed out"));
+            return Err(observation.failed(StratumError::backend("initial job delivery timed out")));
         }
     };
     let mask = miner_version_mask.map_or(0, |miner| {
@@ -1281,8 +1302,11 @@ async fn prepare_job<B: MiningBackend>(
     )
     .await
     {
-        Ok(persisted) => persisted?,
-        Err(_) => return Err(StratumError::backend("job persistence timed out")),
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(observation.failed(error)),
+        Err(_) => {
+            return Err(observation.failed(StratumError::backend("job persistence timed out")))
+        }
     }
     // The job is durable. Neither a slow miner's socket nor a submit the
     // session answers before announcing it (#621) may hold the lane.
@@ -1335,6 +1359,9 @@ async fn announce_job<B: MiningBackend>(
         mask,
         mut observation,
     } = prepared;
+    // A failed write from here ends the session and counts as a failed
+    // delivery, as it did before #621.
+    observation.outcome = DeliveryOutcome::Failure;
     let worker = &worker;
     // Against the work the miner holds now: a submit answered while this job
     // was built may have resumed or pruned some (#621).
@@ -1400,7 +1427,7 @@ async fn announce_job<B: MiningBackend>(
     });
     // `retry_job` was consumed when this delivery started: a publication or
     // retarget seen since asks for the next one.
-    observation.success = true;
+    observation.outcome = DeliveryOutcome::Success;
     if let Some((difficulty, evidence, downward_only)) = hint {
         remember_difficulty(
             backend,
@@ -1966,7 +1993,7 @@ pub async fn serve_connection<B: MiningBackend>(
                     Ok(value) if value.is_object() && !delivery.is_terminated() && !answered_during_delivery(&value) => held = Some((value, received_at)),
                     Ok(value) if value.is_object() => alongside(request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics), delivery.as_mut(), &mut finished).await?,
                     _ => {
-                        write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?;
+                        alongside(write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config), delivery.as_mut(), &mut finished).await?;
                         session.charge(crate::metrics::ConnectionRefusalReason::MalformedFrameBudget,&metrics);
                     }
                 }

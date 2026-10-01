@@ -99,6 +99,7 @@ impl Metrics {
             Family::Blocks,
             Family::Delivered,
             Family::DeliveryFailed,
+            Family::DeliveryCancelled,
             Family::Stale,
             Family::Duplicate,
             Family::LowDifficulty,

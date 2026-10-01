@@ -976,6 +976,217 @@ async fn a_rebuild_keeps_moving_while_a_submit_is_handled() {
     task.await.unwrap();
 }
 
+/// A writer whose writes wait, once armed, until the test releases them, or
+/// fail, once broken.
+#[derive(Default)]
+struct WriteHold {
+    armed: AtomicBool,
+    broken: AtomicBool,
+    held: tokio::sync::Notify,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+impl WriteHold {
+    fn release(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+struct HeldWriter<W> {
+    inner: W,
+    hold: Arc<WriteHold>,
+}
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HeldWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.hold.broken.load(Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        if this.hold.armed.load(Ordering::SeqCst) {
+            if this
+                .hold
+                .waker
+                .lock()
+                .unwrap()
+                .replace(cx.waker().clone())
+                .is_none()
+            {
+                this.hold.held.notify_one();
+            }
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+async fn next_frame(lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>) -> Value {
+    let line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+type DuplexLines = tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+
+/// One session served over an in-memory pipe whose server-side writes the
+/// test can hold or break, logged in as `username` with its first job read.
+async fn held_writer_session(
+    config: StratumConfig,
+    username: &str,
+) -> (
+    Arc<Backend>,
+    watch::Sender<u64>,
+    watch::Sender<bool>,
+    Arc<WriteHold>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    DuplexLines,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let backend = Arc::new(Backend::default());
+    let (refresh, refresh_rx) = watch::channel(0);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server);
+    let hold = Arc::new(WriteHold::default());
+    let task = tokio::spawn(serve_connection(
+        server_reader,
+        HeldWriter {
+            inner: server_writer,
+            hold: hold.clone(),
+        },
+        backend.clone(),
+        config,
+        refresh_rx,
+        shutdown_rx,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_reader).lines();
+    for request in [
+        json!({"id":1,"method":"mining.subscribe","params":[]}),
+        json!({"id":2,"method":"mining.authorize","params":[username,"x"]}),
+    ] {
+        client_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    while next_frame(&mut lines).await["method"] != "mining.notify" {}
+    (backend, refresh, shutdown, hold, client_writer, lines, task)
+}
+
+// #621: a peer that stops reading cannot stall the session's rebuild through
+// the answer to an invalid frame: the delivery keeps moving while that write
+// is held, as it does for every other answer.
+#[tokio::test]
+async fn a_rebuild_keeps_moving_while_an_invalid_frame_answer_is_held() {
+    let config = StratumConfig::default();
+    let (backend, refresh, shutdown, hold, mut client_writer, mut lines, task) =
+        held_writer_session(config, "miner.held-write").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer.write_all(b"not json\n").await.unwrap();
+    hold.held.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind a held write");
+    hold.release();
+    let answer = next_frame(&mut lines).await;
+    assert_eq!(
+        answer["error"][2]["reason_id"], "malformed-submit",
+        "{answer}"
+    );
+    assert_eq!(
+        next_frame(&mut lines).await["method"],
+        "mining.set_difficulty"
+    );
+    assert_eq!(next_frame(&mut lines).await["method"], "mining.notify");
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+// #621: a delivery its session abandons (the miner left, or the listener shut
+// down) is neither a success nor a failure: it is counted as a cancellation,
+// so the failure counter keeps meaning a build, persistence or write failed.
+#[tokio::test]
+async fn a_delivery_abandoned_by_its_session_is_a_cancellation_not_a_failure() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let (address, backend, refresh, shutdown, task) = start(config).await;
+    for (generation, username) in [(1, "miner.leaves"), (2, "miner.stays")] {
+        let mut client = Client::connect(address).await;
+        client.login(username).await;
+        let gate = Arc::new(observability::Gate::default());
+        *backend.build_gate.lock().unwrap() = Some(gate.clone());
+        refresh.send(generation).unwrap();
+        gate.entered.notified().await;
+        if generation == 1 {
+            drop(client);
+            wait_for_connections(&stats, 0).await;
+        } else {
+            shutdown.send(true).unwrap();
+        }
+    }
+    task.await.unwrap();
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_failures, 0);
+    assert_eq!(snapshot.job_delivery_successes, 2, "the two first jobs");
+    assert_eq!(snapshot.job_delivery_cancellations, 2);
+    assert_eq!(snapshot.pending_builds, 0);
+}
+
+// The boundary of the test above: a delivery whose announcement write fails
+// still counts as a failed delivery, as it did before #621.
+#[tokio::test]
+async fn a_failed_announcement_write_is_still_a_failed_delivery() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let (backend, refresh, _shutdown, hold, _client_writer, _lines, task) =
+        held_writer_session(config, "miner.broken-pipe").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    hold.broken.store(true, Ordering::SeqCst);
+    build.release.notify_one();
+    assert!(
+        task.await.unwrap().is_err(),
+        "the write failure ends the session"
+    );
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_successes, 1, "the first job");
+    assert_eq!(snapshot.job_delivery_failures, 1);
+    assert_eq!(snapshot.job_delivery_cancellations, 0);
+    assert_eq!(snapshot.pending_builds, 0);
+}
+
 // #621: a publication the session sees while its rebuild is held is not lost
 // when that older delivery finishes: the session delivers again after it.
 #[tokio::test]
