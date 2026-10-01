@@ -595,7 +595,8 @@ impl Ledger {
 
     /// Insert a prepared candidate inside the caller's `ORDER_LOCK`
     /// transaction. In order: the writer fence, the as-issued balance
-    /// snapshot, the window prefix probe, then the insert of the prepared
+    /// snapshot, the window holding probe (which refuses a window this
+    /// primary does not hold, #619), then the insert of the prepared
     /// bytes. Nothing here serializes, sorts, digests or encodes anything of
     /// the candidate.
     pub(super) async fn persist_prepared_candidate(
@@ -649,18 +650,64 @@ impl Ledger {
             .await?;
         }
         if let Some(range) = candidate.window.shares {
-            let first = i64::try_from(range.first_share_seq)?;
-            // Retention removes only a prefix, so the first row's presence
-            // means the whole range is present and the committed row then
-            // holds the retention floor. Shares cannot be written back, so a
-            // failed probe is not repaired: the block must still reach the
-            // node, and the claim then meets `Incomplete`, which #268 recovers.
-            if !probe_share_rows(tx, first, first).await? {
-                tracing::error!(
-                    block = %candidate.block_hash,
-                    first_share_seq = first,
-                    "ALERT: the candidate's window prefix row is missing; enqueueing anyway so the block reaches the node, its claim will fail to rebuild"
-                );
+            // Revalidate, on the primary that would hold the candidate and in
+            // the transaction that writes it, that this primary holds the
+            // window the coinbase pays (#619). After an asynchronous promotion
+            // the window's end can be lost, its numbers reissued to other
+            // shares, while every other check of the work still passes. Such
+            // a block could never land here: it is refused before any offer,
+            // and the share it carries is rolled back with it.
+            #[cfg(test)]
+            if faults::take(&candidate.block_hash, |fault| {
+                *fault == Fault::WindowProbeIoError
+            })
+            .is_some()
+            {
+                return Err(WindowError::Database(sqlx::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected window holding probe failure",
+                )))
+                .into());
+            }
+            match super::window::probe_window_holding(tx, &candidate.window).await? {
+                WindowHolding::Held => {}
+                WindowHolding::NotHeld => {
+                    let refused = WindowNotHeld {
+                        block_hash: candidate.block_hash.clone(),
+                        first_share_seq: range.first_share_seq,
+                        last_share_seq: range.last_share_seq,
+                        anchor_ms: candidate.window.anchor_ms,
+                    };
+                    tracing::warn!(
+                        block = %candidate.block_hash,
+                        first_share_seq = range.first_share_seq,
+                        last_share_seq = range.last_share_seq,
+                        anchor_ms = candidate.window.anchor_ms,
+                        "block refused stale-job before its offer: this primary does not hold the window its coinbase pays, which a promotion lost or reissued (#619); not enqueued, not offered, its share not credited"
+                    );
+                    // Counted here, at the one decision, so a refusal that
+                    // finishes after the miner's acknowledgement deadline
+                    // (answered `ledger-outcome-unknown`) is still counted,
+                    // and none is counted twice.
+                    if let Some(metrics) = self.metrics.as_deref() {
+                        metrics.record_stale_job_rejection(
+                            crate::metrics::StaleJobCause::WindowNotHeld,
+                        );
+                    }
+                    return Err(refused.into());
+                }
+                // Retention removes only a prefix, and the last row is the
+                // window's own, so this is retention. Shares cannot be written
+                // back, so it is not repaired: the block must still reach the
+                // node, and the claim then meets `Incomplete`, which #268
+                // recovers.
+                WindowHolding::PrefixPruned => {
+                    tracing::error!(
+                        block = %candidate.block_hash,
+                        first_share_seq = range.first_share_seq,
+                        "ALERT: the candidate's window prefix row is missing; enqueueing anyway so the block reaches the node, its claim will fail to rebuild"
+                    );
+                }
             }
         }
         let (first, last, count, snapshot) = match candidate.window.shares {
@@ -2089,7 +2136,7 @@ async fn park_candidate(
 /// that tests claiming other rows in the same binary never meet them. Each
 /// injected fault fires once.
 #[cfg(test)]
-pub(super) mod faults {
+pub(crate) mod faults {
     use anyhow::Result;
     use sqlx::PgPool;
     use std::sync::Mutex;
@@ -2109,6 +2156,9 @@ pub(super) mod faults {
         FailBeforeParkCommit,
         /// The parking commit succeeds but its reply is reported lost.
         LoseParkCommitReply,
+        /// The enqueue's window holding probe (#619) fails with an I/O
+        /// error, as a connection lost mid-statement does.
+        WindowProbeIoError,
     }
 
     static FAULTS: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());

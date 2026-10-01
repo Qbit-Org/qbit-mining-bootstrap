@@ -52,7 +52,7 @@ impl Coordinator {
                 None,
             )
             .await?
-            .context("payout snapshot stale")?
+            .map_err(|refusal| anyhow::anyhow!(refusal.context()))?
         };
         let expires_at_ms = authority
             .absolute_expiry()
@@ -171,7 +171,7 @@ impl Coordinator {
         let revision = self
             .revalidate_issuance_authority(&mut issued.authority, None)
             .await?
-            .context("payout snapshot stale")?;
+            .with_context(|| issued.authority.refusal_context())?;
         // No later database clock read or repair retry renews this deadline.
         ensure!(issued.deadline.live(), "issued job deadline elapsed");
         Ok(revision)

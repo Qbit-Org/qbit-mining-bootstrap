@@ -541,6 +541,23 @@ tests = [
 ]
 notes = "A proxy withholds qbitd's reply to submitblock, sendrawtransaction or submitpackage after the node accepted it; the owning frontend is killed before it journals the outcome and the survivor reconciles. The miner case withholds a durably credited share's acknowledgement and closes the connection; the retry is a duplicate on both frontends."
 
+[[scenario]]
+id = "r619-gap-work-after-async-promotion"
+title = "#619: work prepared in the replication gap is not payout authority after an async promotion"
+owner = "#619"
+lanes = ["pr"]
+criteria = "After a D3 promotion that lost the gap and reissued its share_seq values, a block on a held gap job is refused stale-job before its enqueue (window_not_held, share not credited), a new session is not issued the gap work and the refresh rebuilds under writer_timeline; a fenced switchover with full replay and a job persisted before the cut keep their authority and land."
+runs = true
+tests = [
+  "qbit-prism-server::b619_gap_work_after_promotion::a_block_on_a_job_issued_in_the_gap_is_refused_stale_job_before_its_offer",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_candidate_accepted_before_the_promotion_cannot_be_published_after_it",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_fenced_switchover_with_full_replay_keeps_pre_switch_work_and_lands_its_block",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_job_persisted_before_the_cut_is_resumed_after_an_async_promotion_and_lands",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_refusal_that_finishes_after_the_acknowledgement_deadline_is_still_counted_once",
+  "qbit-prism-server::b619_gap_work_after_promotion::work_prepared_in_the_gap_is_not_issued_to_a_new_session_after_an_async_promotion",
+]
+notes = "Disposable PostgreSQL 16 primary and async standby, one native frontend and the fake node, no qbitd. See docs/prism-async-promotion-gap-blocks.md."
+
 # ---------------------------------------------------------------------------
 # #487's catalogue entries that no lane runs yet, under the sub-issue that
 # builds each.

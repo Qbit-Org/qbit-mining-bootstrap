@@ -823,11 +823,12 @@ async fn window_read_failures_retry_with_an_alert_and_never_abandon() -> Result<
             .window
             .shares
             .context("the fixture window has a range")?;
+        // A count the held range does not match. A range this database does
+        // not hold at all is refused at the enqueue instead (#619).
+        ensure!(range.share_count > 1, "the fixture window is too small");
         let mut incomplete = fixture.found(0)?;
         incomplete.candidate.window.shares = Some(ShareRange {
-            first_share_seq: 5_000_000,
-            last_share_seq: 5_000_002,
-            share_count: 3,
+            share_count: range.share_count - 1,
             ..range
         });
         let mut digest = fixture.found(10_000)?;
@@ -877,6 +878,43 @@ async fn window_read_failures_retry_with_an_alert_and_never_abandon() -> Result<
             .fetch_one(&fixture.coordinator.ledger.pool)
             .await?;
         ensure!(blocks == 0, "a failed rebuild landed");
+
+        // A window held at its enqueue whose last row is another share by
+        // its landing, as after an asynchronous promotion reissued the
+        // number (#619). Share rows are immutable, so the fixture rewrites
+        // the row with triggers off. The reason names lost history, never
+        // pruning or corruption. Last: every case above shares this window.
+        let found = fixture.found(40_000)?;
+        let claim = fixture.enqueue_and_claim(&found).await?;
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DISABLE TRIGGER qbit_prism_immutable_share_history; \
+             UPDATE qbit_share_ledger SET accepted_at=to_timestamp({}::double precision/1000) WHERE share_seq={}; \
+             ALTER TABLE qbit_share_ledger ENABLE TRIGGER qbit_prism_immutable_share_history",
+            found.candidate.window.anchor_ms + 1,
+            range.last_share_seq
+        ))
+        .execute(&fixture.coordinator.ledger.pool)
+        .await?;
+        tokio::time::timeout(Duration::from_secs(10), fixture.process(&claim)).await???;
+        assert_reconciled(
+            &fixture,
+            &found.candidate.block_hash,
+            "window not held by this primary",
+        )
+        .await?;
+        let reason: String = sqlx::query_scalar(
+            "SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        )
+        .bind(&found.candidate.block_hash)
+        .fetch_one(&fixture.coordinator.ledger.pool)
+        .await?;
+        ensure!(
+            reason.contains("#619")
+                && !reason.contains("rows pruned or missing")
+                && !reason.contains("corruption or"),
+            "{reason}"
+        );
+        ensure!(!fixture.landed(&found.candidate.block_hash).await?);
         Ok::<_, anyhow::Error>(())
     }
     .await;

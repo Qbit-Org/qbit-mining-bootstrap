@@ -27,6 +27,8 @@ pub use audit::{
     decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReader,
 };
 mod candidates;
+#[cfg(test)]
+pub(crate) use candidates::faults as candidate_faults;
 use candidates::prepare_candidate_observed;
 pub use candidates::{
     adoption_evidence, authenticate_landed_audit, build_claim_parts,
@@ -72,14 +74,14 @@ pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
 pub use window::CommitGateClosed;
 pub use window::{
-    probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
-    ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot, Window, WindowError,
-    WindowRef,
+    probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,
+    BalanceSource, ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot,
+    Window, WindowError, WindowHolding, WindowNotHeld, WindowRef, WriterTimeline,
 };
 use window::{read_prior_balances, share_from_row};
 pub(crate) use window::{
     AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
-    RetainedShares, SnapshotCapture,
+    RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
 };
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;

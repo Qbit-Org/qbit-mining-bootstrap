@@ -276,6 +276,9 @@ async fn reconstruct(
                 metadata.original_expires_at_ms,
                 Instant::now(),
                 None,
+                // Stored, not re-read on a known timeline: its window is
+                // proven again wherever it is used (#619).
+                None,
             )?;
             drop(body);
             drop(snapshot);

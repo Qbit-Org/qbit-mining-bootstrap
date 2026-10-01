@@ -3,10 +3,12 @@
 use super::*;
 use crate::metrics::{Metrics, StaleJobCause};
 
-/// `[resume_expired, fee_floor, parent_grace, payout_revision]`.
+/// `[resume_expired, fee_floor, parent_grace, payout_revision]`; the fifth
+/// cause, `window_not_held` (#619), is decided at the enqueue and is pinned
+/// to zero here, so every caller still compares the four submit-time causes.
 pub(crate) fn stale_causes(metrics: &Metrics) -> [f64; 4] {
     let body = metrics.render();
-    StaleJobCause::ALL
+    let counts = StaleJobCause::ALL
         .iter()
         .map(|cause| {
             let key = format!(
@@ -21,9 +23,10 @@ pub(crate) fn stale_causes(metrics: &Metrics) -> [f64; 4] {
             assert_eq!(values.len(), 1, "expected one sample: {key}");
             values[0]
         })
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap()
+        .collect::<Vec<_>>();
+    let (submit, enqueue) = counts.split_at(4);
+    assert_eq!(enqueue, [0.0], "a window_not_held refusal was counted");
+    submit.try_into().unwrap()
 }
 
 /// The complete existing wire response, not only its reason.
