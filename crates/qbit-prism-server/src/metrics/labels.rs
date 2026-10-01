@@ -117,6 +117,13 @@ labels!(StaleJobCause {
     ParentGrace => "parent_grace", PayoutRevision => "payout_revision",
     WindowNotHeld => "window_not_held"
 });
+// #622: the first check that refused a job preparation. Tip authority's own
+// refusals come first, so a stale poll masks retired work behind it.
+labels!(JobDeferral {
+    TipPollingStale => "tip_polling_stale", TipPollingUnavailable => "tip_polling_unavailable",
+    NewTipPending => "new_tip_pending", WorkRetired => "work_retired",
+    FeeFloor => "fee_floor", Other => "other"
+});
 // #478: what the offer did with a pending block on the current tip whose
 // payout revision was superseded.
 labels!(CaptureDecision {

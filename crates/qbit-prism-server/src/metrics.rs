@@ -123,6 +123,7 @@ impl Metrics {
             Family::CoverageGap,
             Family::Coverage,
             Family::WorkRefreshStalled,
+            Family::TipPollAge,
             Family::Candidates,
             Family::CandidateAge,
             Family::CandidateUnacknowledgedAge,
@@ -187,6 +188,13 @@ impl Metrics {
             registry.register(
                 Family::OfferStandbyWaits,
                 label("outcome", outcome.as_str()),
+                0.,
+            );
+        }
+        for reason in JobDeferral::ALL {
+            registry.register(
+                Family::JobPreparationDeferrals,
+                label("reason", reason.as_str()),
                 0.,
             );
         }

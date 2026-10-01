@@ -96,7 +96,7 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` | 10 | Published-tip freshness budget in seconds; zero forces a live tip RPC per share and disables the replacement-build lease |
 | `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` | 120 | Published-work credit extension from the first detected departure, without renewal on failed refreshes; positive in production; does not control native process exit |
 | `QBIT_EXPECTED_GENESIS_HASH` | absent | Required 64-hex mainnet genesis pin; optional pins on other chains are also checked |
-| `PRISM_BLOCKWAIT_ENABLED` | true | Additional node tip-change wakeup |
+| `PRISM_BLOCKWAIT_ENABLED` | true | Additional node tip-change wakeup; it also polls the node for readiness while a rebuild holds the refresh loop (#622), so turning it off leaves readiness to age with the refresh as before |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | 15 | Maximum healthy tip-poll age |
 | `PRISM_CTV_SPEND_SCAN_BLOCKS` | 32 | Maximum historical blocks per no-txindex CTV scan pass |
 | `PRISM_STRATUM_PORT` | 3340 | Primary Stratum listener |

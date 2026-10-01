@@ -569,7 +569,13 @@ needed for these probes:
 `ready` is an instantaneous ability to provide current work: prepared work must
 match the observed node tip and database payout revision, the tip poll must be
 younger than `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` (default 15), and an enabled
-CTV policy must satisfy the current fee floor. The server can also clear readiness
+CTV policy must satisfy the current fee floor. The tip poll is the last refresh
+that published or revalidated work, or the last refresh-grade node poll that found
+the published tip with its template still within `PRISM_TEMPLATE_MAX_AGE_SECONDS`
+and, under CTV settlement, a relay floor read no older than the poll that the
+published fee still meets (#622), so a slow rebuild on a responsive node does not
+clear readiness;
+`qbit_prism_tip_poll_age_seconds` exports its age. The server can also clear readiness
 for stalled job delivery. A new tip **or payout-revision change** invalidates
 prepared work until rebuilding and publishing its replacement; this normal
 transition clears readiness even when the process and TCP listener are alive.

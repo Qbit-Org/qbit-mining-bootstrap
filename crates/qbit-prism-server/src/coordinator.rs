@@ -362,11 +362,59 @@ fn describe_offer(outcome: OfferOutcome, reply: Option<&str>) -> String {
     }
 }
 
+/// The longest interval the block wait waits for a new block, and so the
+/// longest between its readiness polls (#622); a shorter health timeout
+/// shortens it ([`Coordinator::unchanged_tip_poll_interval`]).
+const UNCHANGED_TIP_POLL: Duration = Duration::from_secs(5);
+/// The shortest such interval: `waitfornewblock` takes whole milliseconds and
+/// reads 0 as no timeout at all.
+const UNCHANGED_TIP_POLL_FLOOR: Duration = Duration::from_millis(1);
+
+/// A refresh-grade node poll: the readiness epoch read before it, the tip
+/// sequence it reserved, the tip it found and when it was sent (#622).
+struct TipPoll {
+    epoch: u64,
+    sequence: u64,
+    hash: String,
+    requested: Instant,
+}
+
 #[derive(Default)]
 struct ReadinessState {
     last_poll: Option<Instant>,
     generation: u64,
     ctv_fee_floor: Option<u64>,
+    /// When the read that produced `ctv_fee_floor` was sent. A poll renews
+    /// readiness under CTV settlement only with a floor read no older than
+    /// the poll, so fresh readiness keeps implying a fresh floor (#622).
+    ctv_fee_floor_read: Option<Instant>,
+    /// Whether a node poll may renew `last_poll` (#622). A refresh whose
+    /// chain observation and reconciliation agree sets it, as does every
+    /// refresh that renews readiness; one whose chain observation finds the
+    /// cluster on a heavier chain clears it, because this node's tip, even
+    /// when it is still the published one, is then no longer current.
+    poll_renews: bool,
+}
+
+impl ReadinessState {
+    /// Revoke readiness: admission and submissions in flight fence on the
+    /// changed generation, and only a refresh restores it.
+    fn revoke(&mut self) {
+        self.last_poll = None;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("readiness generation exhausted");
+    }
+
+    /// Record a relay floor read sent at `requested`, unless a read sent
+    /// later is already recorded: a slow read cannot roll the floor back.
+    fn record_fee_floor(&mut self, floor: u64, requested: Instant) {
+        if self.ctv_fee_floor_read.is_none_or(|read| read <= requested) {
+            self.ctv_fee_floor = Some(floor);
+            self.ctv_fee_floor_read = Some(requested);
+        }
+    }
 }
 
 struct ChainCache {
@@ -642,6 +690,8 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
+    /// When the `getmempoolinfo` that produced `floor` was sent (#622).
+    floor_requested: Instant,
 }
 
 pub(crate) async fn validated_ctv_fee_policy(
@@ -656,6 +706,20 @@ pub(crate) async fn validated_ctv_fee_policy(
         let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
         FanoutFeeRatePolicy::new(bits, premium_bps)
     };
+    let (required_rate, floor_requested) = relay_fee_floor(rpc).await?;
+    validate_fee_floor(policy, required_rate)?;
+    Ok(ValidatedFeePolicy {
+        policy,
+        floor: required_rate,
+        floor_requested,
+    })
+}
+
+/// The connected node's relay fee floor, in bits per 1,000 weight: the higher
+/// of `minrelaytxfee` and `mempoolminfee`, with when its request was sent, so
+/// reads order by the observation itself (#622).
+async fn relay_fee_floor(rpc: &Rpc) -> Result<(u64, Instant)> {
+    let requested = Instant::now();
     let mempool = rpc.call("getmempoolinfo", json!([])).await?;
     ensure!(mempool.is_object(), "getmempoolinfo returned non-object");
     let mut required_rate = None;
@@ -667,11 +731,7 @@ pub(crate) async fn validated_ctv_fee_policy(
         }
     }
     let required_rate = required_rate.context("getmempoolinfo did not report a relay fee floor")?;
-    validate_fee_floor(policy, required_rate)?;
-    Ok(ValidatedFeePolicy {
-        policy,
-        floor: required_rate,
-    })
+    Ok((required_rate, requested))
 }
 
 fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result<()> {
@@ -860,7 +920,7 @@ impl Coordinator {
         if !self.config.ctv_enabled {
             return Ok(None);
         }
-        match validated_ctv_fee_policy(
+        let validated = match validated_ctv_fee_policy(
             &self.rpc,
             self.config.ctv_fee,
             self.config.ctv_fee_premium_bps,
@@ -870,9 +930,19 @@ impl Coordinator {
             Ok(validated) => {
                 // Admission uses the latest observed floor even while a new
                 // bundle is being built. Replaced jobs retain their own fee.
-                self.readiness.write().await.ctv_fee_floor = Some(validated.floor);
-                Ok(Some(validated.policy))
+                // A block-wait floor read sent after this one may already be
+                // recorded (#622): the policy must meet the floor that is
+                // kept, not only the one this read returned.
+                let mut readiness = self.readiness.write().await;
+                readiness.record_fee_floor(validated.floor, validated.floor_requested);
+                let floor = readiness.ctv_fee_floor.unwrap_or(validated.floor);
+                drop(readiness);
+                validate_fee_floor(validated.policy, floor).map(|()| validated.policy)
             }
+            Err(error) => Err(error),
+        };
+        match validated {
+            Ok(policy) => Ok(Some(policy)),
             Err(error) => {
                 self.invalidate_readiness().await;
                 Err(error)
@@ -898,7 +968,31 @@ impl Coordinator {
     }
 
     async fn observe_chain_info(&self, from_refresh: bool) -> Result<Value> {
+        // Read before the node call, so a revocation while it is in flight
+        // wins. Renewal is opportunistic: never wait for readiness here, and
+        // skip it when a writer holds it; the next poll renews.
+        let epoch = from_refresh
+            .then(|| self.readiness.try_read().ok().map(|state| state.generation))
+            .flatten();
+        let (info, poll) = self.poll_chain_info(from_refresh, epoch).await?;
+        if let Some(poll) = poll {
+            self.renew_readiness_from_poll(&poll).await;
+        }
+        Ok(info)
+    }
+
+    /// [`Self::observe_chain_info`] without its readiness renewal, for a
+    /// refresh, which renews from its own poll only once its chain
+    /// observation agreed and it read the relay floor. `epoch` is the
+    /// readiness generation read before this call, if any; without one the
+    /// poll cannot renew.
+    async fn poll_chain_info(
+        &self,
+        from_refresh: bool,
+        epoch: Option<u64>,
+    ) -> Result<(Value, Option<TipPoll>)> {
         let sequence = self.observed_tip.write().await.reserve();
+        let requested = Instant::now();
         let result = crate::readiness::chain_info_with_metrics(
             &self.rpc,
             &self.config.chain,
@@ -918,7 +1012,13 @@ impl Coordinator {
                     .write()
                     .await
                     .observe(&hash, sequence, from_refresh);
-                Ok(info)
+                let poll = epoch.map(|epoch| TipPoll {
+                    epoch,
+                    sequence,
+                    hash,
+                    requested,
+                });
+                Ok((info, poll))
             }
             Err(error) => {
                 // An observed unsafe node state closes admission immediately;
@@ -929,13 +1029,103 @@ impl Coordinator {
         }
     }
 
+    /// A poll outside a refresh (the block wait's) carries no relay floor.
+    /// Under CTV settlement it re-reads the floor before renewing; a failed
+    /// read leaves readiness to age, without revoking it, as a refresh's
+    /// failed fee read would. Only a poll that found the published tip pays
+    /// for the read.
+    async fn renew_readiness_from_poll(&self, poll: &TipPoll) {
+        if self.config.ctv_enabled
+            && self
+                .observed_tip
+                .read()
+                .await
+                .polled_published(&poll.hash, poll.sequence)
+        {
+            match relay_fee_floor(&self.rpc).await {
+                Ok((floor, requested)) => {
+                    let prepared = self.prepared.read().await;
+                    let mut readiness = self.readiness.write().await;
+                    readiness.record_fee_floor(floor, requested);
+                    // A kept floor above the published fee retires that work,
+                    // as a refresh's fee read would: revoke readiness, so a
+                    // job or share admitted against the old floor fences on
+                    // the changed generation instead of completing.
+                    if prepared
+                        .as_deref()
+                        .and_then(|work| work.fee)
+                        .zip(readiness.ctv_fee_floor)
+                        .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_err())
+                    {
+                        readiness.revoke();
+                        return;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "relay floor unavailable; readiness not renewed");
+                    return;
+                }
+            }
+        }
+        self.renew_readiness(poll).await;
+    }
+
+    /// A refresh-grade poll that found the published tip proves what readiness
+    /// stands for, the node's tip within the health timeout, whether or not
+    /// the rebuild that follows it finishes in time (#622). It only renews:
+    /// revoked readiness waits for a refresh that revalidates everything, as
+    /// before. It also never renews across a revocation that raced the poll,
+    /// once a newer observation found another tip, for work on another
+    /// parent, for a template the reuse path would refuse as too old, after
+    /// a refresh found the cluster on a heavier chain, or, under CTV
+    /// settlement, without a relay floor read no older than the poll that
+    /// the work's fee still meets, so work that cannot be rebuilt in time
+    /// still ages out of admission and health. The stamp is when the poll
+    /// was sent, the earliest instant its answer describes.
+    async fn renew_readiness(&self, poll: &TipPoll) {
+        // Most polls that cannot renew fail here, without touching readiness.
+        if !self
+            .observed_tip
+            .read()
+            .await
+            .polled_published(&poll.hash, poll.sequence)
+        {
+            return;
+        }
+        let prepared = self.prepared.read().await;
+        let mut readiness = self.readiness.write().await;
+        let tip = self.observed_tip.read().await;
+        let floor_current = !self.config.ctv_enabled
+            || readiness
+                .ctv_fee_floor_read
+                .is_some_and(|read| read >= poll.requested);
+        let current = prepared.as_deref().is_some_and(|work| {
+            work.template["previousblockhash"].as_str() == Some(poll.hash.as_str())
+                && crate::readiness::validate_template_age(
+                    &work.template,
+                    self.config.template_max_age,
+                )
+                .is_ok()
+                && (!self.config.ctv_enabled
+                    || work
+                        .fee
+                        .zip(readiness.ctv_fee_floor)
+                        .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
+        });
+        if readiness.generation == poll.epoch
+            && readiness.poll_renews
+            && floor_current
+            && current
+            && tip.polled_published(&poll.hash, poll.sequence)
+        {
+            if let Some(last_poll) = readiness.last_poll.as_mut() {
+                *last_poll = (*last_poll).max(poll.requested);
+            }
+        }
+    }
+
     async fn invalidate_readiness(&self) {
-        let mut state = self.readiness.write().await;
-        state.last_poll = None;
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("readiness generation exhausted");
+        self.readiness.write().await.revoke();
     }
 
     async fn ensure_template_fresh(&self, template: &Value) -> Result<()> {
@@ -1061,6 +1251,13 @@ impl Coordinator {
         result
     }
 
+    /// Age of the readiness proof admission reads (#622): the last refresh,
+    /// or refresh-grade poll on the published tip, that renewed it; `None`
+    /// while readiness is revoked or before it is first established.
+    pub async fn tip_poll_age(&self) -> Option<Duration> {
+        self.readiness.read().await.last_poll.map(|at| at.elapsed())
+    }
+
     /// Time since the last successful refresh, or since start before one.
     pub fn work_refresh_age(&self) -> Duration {
         self.refreshed_at
@@ -1090,7 +1287,10 @@ impl Coordinator {
         // Capture before node I/O, so a delayed equal-work observation cannot
         // overwrite a replacement accepted while its proof was in flight.
         let chain_observation = self.work_ledger.chain_observation_state().await?;
-        let info = self.observe_chain_info(true).await?;
+        // The refresh's own readiness epoch, read before any of its node I/O.
+        let (info, tip_poll) = self
+            .poll_chain_info(true, Some(readiness_generation))
+            .await?;
         let chainwork = info["chainwork"]
             .as_str()
             .context("node chainwork missing")?;
@@ -1126,7 +1326,7 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = observation
+        let observed_revision = match observation
             .observe(
                 &*self.work_ledger,
                 parent,
@@ -1134,9 +1334,25 @@ impl Coordinator {
                 chainwork,
                 &chain_observation,
             )
-            .await?;
+            .await
+        {
+            Err(error) if error.is::<crate::ledger::ChainObservationBehind>() => {
+                self.readiness.write().await.poll_renews = false;
+                return Err(error);
+            }
+            observed => observed?,
+        };
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
+        // The chain observation agreed: re-arm poll renewal, and without CTV
+        // settlement renew from this refresh's poll now (#622); nothing read
+        // after this point backs readiness.
+        self.readiness.write().await.poll_renews = true;
+        if !self.config.ctv_enabled {
+            if let Some(poll) = &tip_poll {
+                self.renew_readiness(poll).await;
+            }
+        }
         // The landing metric's "revision observed" instant stays here, where
         // the ledger probe used to feed it: the chain-observation write
         // returned the current revision. A bump after this point is recorded
@@ -1178,6 +1394,13 @@ impl Coordinator {
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
+        // #622: under CTV settlement this refresh's poll renews readiness only
+        // now, after its chain observation agreed and it read the relay floor.
+        if self.config.ctv_enabled {
+            if let Some(poll) = &tip_poll {
+                self.renew_readiness(poll).await;
+            }
+        }
         let current_prepared = self.prepared.read().await;
         // Whether the cached window, as held at entry, is still inside the
         // reanchor interval: an input of the trigger label below, read here
@@ -1246,6 +1469,7 @@ impl Coordinator {
                     .await
                     .refresh_publication(parent)?;
                 readiness.last_poll = Some(Instant::now());
+                readiness.poll_renews = true;
                 return Ok(());
             }
         }
@@ -1566,6 +1790,8 @@ impl Coordinator {
     }
 
     pub async fn blockwait_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        let mut unchanged_polled = None::<Instant>;
+        let wait = self.unchanged_tip_poll_interval();
         loop {
             if *shutdown.borrow() {
                 break;
@@ -1573,7 +1799,7 @@ impl Coordinator {
             let notification = tokio::select! {
                 biased;
                 _=shutdown.changed()=>break,
-                result=self.rpc.call_timeout("waitfornewblock",json!([5000]),Some(Duration::from_secs(7)))=>result,
+                result=self.rpc.call_timeout("waitfornewblock",json!([wait.as_millis() as u64]),Some(wait+Duration::from_secs(2)))=>result,
             };
             // A notification is a wake hint, not a sequenced chain proof. Even
             // errors wake normal polling; an unavailable long-poll method must
@@ -1588,6 +1814,13 @@ impl Coordinator {
                     // Reserve order when this fresh request starts, after the
                     // wait completes. A later poll can still supersede it.
                     // No refresh lock: a pending build must not delay fencing.
+                    self.observe_chain_info(true).await?;
+                } else if self.unchanged_tip_poll_due(unchanged_polled).await {
+                    // #622: a rebuild holding the refresh loop must not age
+                    // readiness while the node answers. Only once readiness
+                    // is that old, and at most once per interval, so an idle
+                    // or healthy frontend adds no call.
+                    unchanged_polled = Some(Instant::now());
                     self.observe_chain_info(true).await?;
                 }
                 Ok::<_, anyhow::Error>(())
@@ -1606,6 +1839,37 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// How old readiness must be before an unchanged block notification
+    /// polls the node for it, the least time between two such polls, and how
+    /// long the block wait waits for a new block, so it returns at least this
+    /// often while the tip is idle (#622): a third of the health timeout, at
+    /// most [`UNCHANGED_TIP_POLL`] (5 s at the default 15 s timeout), so the
+    /// poll always lands before readiness expires; a short timeout polls
+    /// often, as configured. Only below 3 ms, where no node call can answer
+    /// in time anyway, does [`UNCHANGED_TIP_POLL_FLOOR`] decide. A frontend
+    /// adds at most one readiness check per interval, and none while its
+    /// refreshes keep readiness younger: `getblockchaininfo`, `getnetworkinfo`
+    /// on a public chain (the peer floor is part of readiness), and
+    /// `getmempoolinfo` under CTV settlement (the relay floor is too).
+    fn unchanged_tip_poll_interval(&self) -> Duration {
+        (self.config.health_timeout / 3).clamp(UNCHANGED_TIP_POLL_FLOOR, UNCHANGED_TIP_POLL)
+    }
+
+    /// Whether an unchanged block notification should poll the node for
+    /// readiness: it is live but at least one interval old, and this loop has
+    /// not polled for it within that interval. Revoked readiness is never
+    /// polled for; only a refresh restores it.
+    async fn unchanged_tip_poll_due(&self, polled: Option<Instant>) -> bool {
+        let interval = self.unchanged_tip_poll_interval();
+        polled.is_none_or(|at| at.elapsed() >= interval)
+            && self
+                .readiness
+                .read()
+                .await
+                .last_poll
+                .is_some_and(|at| at.elapsed() >= interval)
     }
 
     /// One coherent read-only observation of a candidate's block against the
@@ -2824,6 +3088,41 @@ impl Coordinator {
     }
 }
 
+/// Job preparation found the authority its work was read with retired: a
+/// payout revision or balance change, a tip its parent lost, a lease or
+/// publication the work no longer matches, or a window this primary does not
+/// hold (#619). It reads as the refusal's own context, as the log always has.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct WorkRetired(&'static str);
+
+/// The job's CTV fee is below the live relay floor, or the floor is unknown.
+/// Displays as the refusal it carries, so the deferral's log line is unchanged.
+#[derive(Debug)]
+struct JobFeeRefused(anyhow::Error);
+
+impl std::fmt::Display for JobFeeRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for JobFeeRefused {}
+
+/// The first check that refused a job preparation (#622), for its counter.
+fn job_deferral(error: &anyhow::Error) -> crate::metrics::JobDeferral {
+    use crate::metrics::JobDeferral;
+    use tip_observation::TipRefusal;
+    match error.downcast_ref::<TipRefusal>() {
+        Some(TipRefusal::PollingStale) => JobDeferral::TipPollingStale,
+        Some(TipRefusal::PollingUnavailable) => JobDeferral::TipPollingUnavailable,
+        Some(TipRefusal::NewTipPending) => JobDeferral::NewTipPending,
+        None if error.is::<WorkRetired>() => JobDeferral::WorkRetired,
+        None if error.is::<JobFeeRefused>() => JobDeferral::FeeFloor,
+        None => JobDeferral::Other,
+    }
+}
+
 fn header_parent(block: &[u8]) -> Result<String> {
     let bytes = block.get(4..36).context("truncated block header")?;
     Ok(hex::encode(bytes.iter().rev().copied().collect::<Vec<_>>()))
@@ -3003,8 +3302,10 @@ impl MiningBackend for Coordinator {
             drop(initial);
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .with_context(|| issuance_authority.refusal_context())?;
-            self.ensure_job_fee_current(prepared.fee).await?;
+                .ok_or_else(|| WorkRetired(issuance_authority.refusal_context()))?;
+            self.ensure_job_fee_current(prepared.fee)
+                .await
+                .map_err(JobFeeRefused)?;
             let (base, bundle, bootstrap_share) = self
                 .materialize_wire(
                     prepared.clone(),
@@ -3024,7 +3325,7 @@ impl MiningBackend for Coordinator {
             Self::probe(&self.build_job_probe).await;
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .with_context(|| issuance_authority.refusal_context())?;
+                .ok_or_else(|| WorkRetired(issuance_authority.refusal_context()))?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -3038,6 +3339,8 @@ impl MiningBackend for Coordinator {
         };
         build.await.map_err(|error| {
             tracing::warn!(%error,"job preparation deferred");
+            self.metrics
+                .record_job_preparation_deferral(job_deferral(&error));
             protocol_error("pool-closed", "current work temporarily unavailable")
         })
     }

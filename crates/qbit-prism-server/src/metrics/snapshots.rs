@@ -117,6 +117,18 @@ impl Metrics {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.set(Family::WorkRefreshStalled, vec![], age.as_secs_f64());
     }
+    /// #622: the age of the readiness proof admission reads, or unknown
+    /// (-1) while readiness is revoked or was never established. Distinct
+    /// from `publish_work_refresh_stalled`: a frontend whose rebuilds stall
+    /// while its polls find the published tip reads young here and old there.
+    pub fn publish_tip_poll_age(&self, age: Option<Duration>) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(
+            Family::TipPollAge,
+            vec![],
+            age.map_or(-1., |age| age.as_secs_f64()),
+        );
+    }
     /// Stratum delivery observations cannot overwrite the refresh owner's state.
     pub fn publish_delivery(&self, snapshot: DeliveryMetrics) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());

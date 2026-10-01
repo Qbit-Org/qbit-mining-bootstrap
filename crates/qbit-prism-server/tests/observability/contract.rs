@@ -157,6 +157,7 @@ pub fn expected(populated: bool) -> Census {
         "node_observation_age_seconds",
         "work_refresh_stalled_seconds",
         "landing_malloc_trim_resident_bytes",
+        "tip_poll_age_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -194,6 +195,15 @@ pub fn expected(populated: bool) -> Census {
         "block_offer_standby_wait_total",
         "counter",
         &labels("outcome", "confirmed,absent,lagging,failed"),
+        &[],
+    );
+    result.family(
+        "job_preparation_deferrals_total",
+        "counter",
+        &labels(
+            "reason",
+            "tip_polling_stale,tip_polling_unavailable,new_tip_pending,work_retired,fee_floor,other",
+        ),
         &[],
     );
     result.family(

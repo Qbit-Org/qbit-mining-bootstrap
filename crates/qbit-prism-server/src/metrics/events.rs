@@ -285,6 +285,17 @@ impl Metrics {
                 Labels::One(("cause", cause.as_str())),
             );
     }
+    /// Exactly once per deferred job preparation, with the reason its log
+    /// line names (#622).
+    pub fn record_job_preparation_deferral(&self, reason: JobDeferral) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::JobPreparationDeferrals,
+                Labels::One(("reason", reason.as_str())),
+            );
+    }
     /// Exactly one observation at the actual first-offer boundary. A/#266
     /// owns timestamp transport and recovery semantics across processes.
     pub fn observe_first_offer(&self, elapsed: Duration) {
