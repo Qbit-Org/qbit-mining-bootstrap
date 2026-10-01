@@ -10,9 +10,9 @@
 //! seed blocks until branch B's own blocks are paid, since its balance
 //! comparison needs every own share in the window (`deep_reorg`); its reorg
 //! runs under the whole load. Scenarios 1, 2 and 4 run at 2,000 sessions,
-//! D1's session count, as does scenario 5's soak; scenario 7 at the real-node wallet cap of
-//! 2,000 payees (#487 decision 7), whose workers are its load, waits on #604
-//! and #622 and runs in no lane yet.
+//! D1's session count, as does scenario 5's soak; scenario 7 at the real-node
+//! wallet cap of 2,000 payees (#487 decision 7), whose workers are its load,
+//! waits on #621 and #622 and runs in no lane yet.
 //!
 //! #553 adds three scenarios, with the pass criteria set here:
 //! - two frontends on two nodes that briefly disagree about the tip;
@@ -463,60 +463,46 @@ async fn weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_f
     .await
 }
 
-/// #604's queueing grows with the sessions already open, so a first job
-/// missing this early is some other failure (a wedged server, a difficulty
-/// regression), not #604.
-const WALLET_CAP_OPENED_FIRST: usize = 100;
-
-/// The `<n> of <m> sessions opened` count in the wallet case's error.
-fn sessions_opened(error: &str) -> Option<usize> {
-    let (before, _) = error.split_once(" sessions opened")?;
-    let words: Vec<&str> = before.split_whitespace().rev().take(3).collect();
-    match words[..] {
-        [_, "of", opened] => opened.parse().ok(),
-        _ => None,
-    }
-}
-
 /// #521 scenario 7 at the real-node wallet cap (#487 decision 7), expected
-/// to fail on #604 until it is fixed. Its ~3,000 worker sessions, about
+/// to fail on #621 until it is fixed. Its ~3,000 worker sessions, about
 /// 1,500 per frontend, are the load, and the fixture opens them one at a
-/// time. At the fixture's 1 s reanchor (and at 2 s and 5 s) each new
-/// session's first job queues behind every connected session's same-tip
-/// rebuild, so opening grows with the square of the sessions and some worker
-/// never gets its first job within the fixture's 20 s (#604; before #598's
-/// fix, #598's starvation fails it the same way, sooner). At the production
+/// time. Since #604's rebuild lane every session opens, but at the fixture's
+/// 1 s reanchor each debug frontend builds far fewer jobs per second than it
+/// has sessions, so every session always has a rebuild queued, and a session
+/// answers a submit only after its queued rebuild completes, which outlasts
+/// the fixture's 30 s wait for a submit's reply (#621). At the production
 /// 60 s every economic assertion passes, but the fixture's rounds rely on a
 /// fast reanchor to put each round into its block's window, so the
-/// scenario's own degeneracy check fails there. The case passes while the
-/// first-job starvation holds; once #604 is fixed it runs the scenario
-/// unchanged and says so, and then the expectation goes.
+/// scenario's own degeneracy check fails there. The case passes while
+/// submits wait behind rebuilds; once #621 is fixed it runs the scenario
+/// unchanged and says so, and then the expectation goes. A worker that never
+/// gets its first job is #604 again, and fails the case. On a slower host
+/// the rounds can instead outlast the fixture's mock-clock horizon (qbitd's
+/// mock time is set about 24 minutes ahead; past it the template ages beyond
+/// 120 s and a share is refused because the current chain state is
+/// unavailable), which also fails the case: that is the fixture running out
+/// of time, not a new finding.
 ///
 /// In no lane: that holds in debug, but in release (the weekly job's build)
-/// every session opens and a later round's new tip reaches some worker
-/// late, with `tip polling stale` deferrals (#622). Run it by hand until
-/// both are fixed.
+/// a later round's new tip reaches some worker late, with `tip polling
+/// stale` deferrals (#622). Run it by hand until both are fixed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "#553 L4, by hand: #521 scenario 7 at 2,000 wallets, #604's expected failure (#622 in release)"]
-async fn wallets_2000_share_to_spend_starves_first_jobs_until_604_is_fixed() -> Result<()> {
+#[ignore = "#553 L4, by hand: #521 scenario 7 at 2,000 wallets, #621's expected failure (#622 in release)"]
+async fn wallets_2000_share_to_spend_waits_on_submit_acks_until_621_is_fixed() -> Result<()> {
     gate::required_inputs(
         gate::site!(),
         &[gate::Input::QbitdBin, gate::Input::DatabaseUrl],
     )?;
     match weighted_case(&WALLET_CAP).await {
-        Err(error)
-            if format!("{error:#}").contains("never received work")
-                && sessions_opened(&format!("{error:#}"))
-                    .is_some_and(|opened| opened >= WALLET_CAP_OPENED_FIRST) =>
-        {
-            eprintln!("#604 reproduced at 2,000 wallets: {error:#}");
+        Err(error) if format!("{error:#}").contains("got no reply to a submit") => {
+            eprintln!("#621 reproduced at 2,000 wallets: {error:#}");
             Ok(())
         }
         Err(error) => {
-            Err(error.context("the 2,000-wallet case failed for a reason other than #604"))
+            Err(error.context("the 2,000-wallet case failed for a reason other than #621"))
         }
         Ok(()) => bail!(
-            "#604 looks fixed: #521 scenario 7 passed at 2,000 wallets; drop this expectation and, \
+            "#621 looks fixed: #521 scenario 7 passed at 2,000 wallets; drop this expectation and, \
              once #622 is fixed too, list the case weekly"
         ),
     }
@@ -925,18 +911,4 @@ async fn nightly_external_tips_at_target_spacing_reach_every_session_on_both_fro
 async fn weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends() -> Result<()>
 {
     external_tips("external-tips-45m", 2_700, WEEKLY_RATE).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_wallet_case_error_names_how_many_sessions_opened() {
-        let error = "wallet-cap-2000: 1234 of 3000 sessions opened: a.w0 never received work at \
-                     difficulty 0.1: deadline has elapsed";
-        assert_eq!(sessions_opened(error), Some(1234));
-        assert_eq!(sessions_opened("a.w0 never received work"), None);
-        assert_eq!(sessions_opened("0 of 3000 sessions opened: x"), Some(0));
-    }
 }

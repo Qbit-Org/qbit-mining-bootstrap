@@ -7,7 +7,7 @@ matrix for a selection:
 - `nightly` (the nightly schedule's selection): every preset whose schedule
   is `nightly`;
 - `weekly` (the weekly schedule's selection): every preset whose schedule is
-  `weekly`, the long soak (#575);
+  `weekly`, the long soak (#575) and the long fault set (#554);
 - `all`: every `nightly` and `manual` preset (not the weekly soak, which
   takes most of a runner's six hours);
 - otherwise a comma-separated list of preset names, any schedule. A name

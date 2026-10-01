@@ -238,6 +238,7 @@ qbit-prism-server::issued_job_dependency::pruned_dependency_returns_missing_with
 qbit-prism-server::issued_job_dependency::repair_preserves_original_revision_and_payload_under_a_new_current_revision
 qbit-prism-server::issued_job_dependency::wrong_current_revision_rejects_before_renewal_or_repair
 qbit-prism-server::jsonb_ceiling_gate::jsonb_ceiling_ratchet_at_reduced_sizes
+qbit-prism-server::landing_malloc_trim::each_landing_trim_returns_the_landing_frontend_to_its_resident_floor
 qbit-prism-server::landing_metrics::accepted_offer_waiting_for_build_capacity_is_reported_from_the_offer_reservation
 qbit-prism-server::landing_metrics::active_proof_confirmation_and_maturity_bind_the_same_committed_revision
 qbit-prism-server::landing_metrics::actual_build_deadline_counts_once_and_later_notify_is_degraded
@@ -564,6 +565,7 @@ qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_bootstr
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::a_single_share_from_another_miner_takes_the_whole_coinbase
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share
+qbit-prism-server::qbit_prism_server::coordinator::first_job_lane_tests::a_first_job_is_not_queued_behind_a_rebuild_storm
 qbit-prism-server::qbit_prism_server::coordinator::issued_batcher::tests::postgres::active_cancellation_keeps_live_peers_and_reconciles_all_gone
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_initial_probe_sql_error_cancel_and_original_deadline
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_checkout_cancel_and_deadline_stay_unknown

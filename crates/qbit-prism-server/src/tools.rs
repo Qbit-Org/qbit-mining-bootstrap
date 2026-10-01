@@ -298,6 +298,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             config.ensure_pool_fee_settles_dust()?;
             crate::rollups::settings_from_env()?;
             crate::partitions::settings_from_env()?;
+            crate::memory::landing_trim_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
             crate::api::ApiConfig::from_env()?;
             crate::api::public_service::ServiceConfig::from_env()?;
@@ -711,6 +712,8 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
     // a frontend's startup (node genesis and chain, schema, halt guard,
     // cluster fingerprint), no heartbeat, nothing left behind on exit.
     let config = Config::from_env()?;
+    // It lands blocks as `run` does, so it trims after them as `run` does.
+    let landing_trim = crate::memory::landing_trim_from_env()?;
     let connected = tokio::time::timeout_at(
         deadline,
         Coordinator::new_tool(
@@ -728,6 +731,7 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
             ),
         ),
     };
+    coordinator.landing_trim.set_enabled(landing_trim);
     let outcome = apply_recovery(&coordinator, &plan.blocks, deadline, timeout_seconds).await;
     // A landing the deadline cut short may hold its connection until the
     // server abandons it, so the close is bounded as well.

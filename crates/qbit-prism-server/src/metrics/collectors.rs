@@ -8,23 +8,7 @@ use tokio::sync::watch;
 /// Read from one procfs process directory; the explicit path also permits
 /// deterministic tests of the production parser and failure behavior.
 pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
-    let status = std::fs::read_to_string(proc_path.join("status"))?;
-    let field = |name: &str, unit: Option<&str>| -> Result<u64> {
-        let line = status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .context("missing procfs field")?;
-        let mut words = line.split_whitespace();
-        let value: u64 = words.next().context("missing procfs value")?.parse()?;
-        anyhow::ensure!(
-            words.next() == unit && words.next().is_none(),
-            "unexpected procfs field units"
-        );
-        Ok(value)
-    };
-    let resident_bytes = field("VmRSS:", Some("kB"))?
-        .checked_mul(1024)
-        .context("procfs RSS overflow")?;
+    let resident_bytes = resident_bytes(proc_path)?;
     // The process reads its own descriptor directory, which it may even when
     // it is not dumpable and no other process of its user may (#575).
     let open_fds = std::fs::read_dir(proc_path.join("fd"))
@@ -34,6 +18,23 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
         resident_bytes,
         open_fds,
     })
+}
+
+/// The resident set (`VmRSS`) of one procfs process directory, in bytes;
+/// also read around each post-landing trim (#600).
+pub fn resident_bytes(proc_path: &Path) -> Result<u64> {
+    let status = std::fs::read_to_string(proc_path.join("status"))?;
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .context("missing procfs field")?;
+    let mut words = line.split_whitespace();
+    let value: u64 = words.next().context("missing procfs value")?.parse()?;
+    anyhow::ensure!(
+        words.next() == Some("kB") && words.next().is_none(),
+        "unexpected procfs field units"
+    );
+    value.checked_mul(1024).context("procfs RSS overflow")
 }
 
 /// One bounded read-only MVCC snapshot over unfinished candidate metadata:

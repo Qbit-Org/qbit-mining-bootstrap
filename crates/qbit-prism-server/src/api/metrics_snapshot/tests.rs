@@ -520,6 +520,12 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
             metrics.observe_refresh(*trigger, *acquisition, Duration::from_millis(40));
         }
     }
+    // So is the post-landing trim histogram (#600).
+    metrics.observe_landing_trim(&crate::memory::Trim {
+        elapsed: Duration::from_millis(40),
+        resident_before: Some(2 << 30),
+        resident_after: Some(1 << 30),
+    });
     for (age, expected_state) in [
         (None, "unavailable"),
         (Some(0), "fresh"),

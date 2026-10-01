@@ -35,6 +35,11 @@ and the database collector's `qbit_prism_block_candidate_oldest_unacknowledged_s
 and `qbit_prism_block_candidate_oldest_landing_failed_seconds`. Block identities remain inside the bounded observation state;
 there is no frontend, worker, block, height or job label. The real offer/delivery
 privacy assertion is `landing_metrics::lost_offer_reply_starts_at_active_proof_and_is_not_a_work_build_timeout`.
+#600's post-landing `malloc_trim` adds three unlabeled families: the
+`qbit_prism_landing_malloc_trim_released_bytes_total` counter (zero at startup),
+the `qbit_prism_landing_malloc_trim_resident_bytes` gauge (-1 at startup) and
+the `qbit_prism_landing_malloc_trim_seconds` histogram, declared at startup and
+sampled from the first trim: 2 startup series and 16 populated ones.
 Adjacent node/rollup additions are outside this branch's census and must be
 combined explicitly when integrating another metrics change.
 

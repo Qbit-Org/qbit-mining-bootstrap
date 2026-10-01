@@ -279,6 +279,9 @@ pub struct Coordinator {
     /// Attempts between their offer reservation and its recorded answer,
     /// which a graceful shutdown lets finish (#578).
     offer_sections: offer_shutdown::OfferSections,
+    /// Returns a landing's freed heap to the kernel once its rebuilt window
+    /// is released (#600); on by default, `PRISM_LANDING_MALLOC_TRIM_ENABLED`.
+    pub landing_trim: Arc<crate::memory::LandingTrim>,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -471,29 +474,48 @@ fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
 /// on a runtime worker would stall candidate-lease heartbeats and share
 /// processing, so every path, early returns included, hands it to a blocking
 /// thread instead.
-struct OffRuntime<T: Send + 'static>(Option<T>);
+struct OffRuntime<T: Send + 'static> {
+    value: Option<T>,
+    then: Option<Box<dyn FnOnce() + Send>>,
+}
 
 impl<T: Send + 'static> OffRuntime<T> {
     fn new(value: T) -> Self {
-        Self(Some(value))
+        Self {
+            value: Some(value),
+            then: None,
+        }
+    }
+
+    /// Run `then` on the same blocking thread once the value is dropped.
+    fn then(mut self, then: impl FnOnce() + Send + 'static) -> Self {
+        self.then = Some(Box::new(then));
+        self
     }
 }
 
 impl<T: Send + 'static> std::ops::Deref for OffRuntime<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.0.as_ref().expect("owned until dropped")
+        self.value.as_ref().expect("owned until dropped")
     }
 }
 
 impl<T: Send + 'static> Drop for OffRuntime<T> {
     fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
+        if let Some(value) = self.value.take() {
+            let then = self.then.take();
+            let release = move || {
+                drop(value);
+                if let Some(then) = then {
+                    then();
+                }
+            };
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    runtime.spawn_blocking(move || drop(value));
+                    runtime.spawn_blocking(release);
                 }
-                Err(_) => drop(value),
+                Err(_) => release(),
             }
         }
     }
@@ -809,6 +831,7 @@ impl Coordinator {
             #[cfg(test)]
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
+            landing_trim: Default::default(),
         }))
     }
 
@@ -2129,8 +2152,12 @@ impl Coordinator {
             Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
         };
         // The rebuilt window is released off the runtime once the landing
-        // returns, whichever way it went.
-        let rebuilt = OffRuntime::new(claim.clone().with_parts(parts));
+        // returns, whichever way it went. The same blocking thread, holding
+        // no lock and no transaction, then trims (#600), so glibc returns the
+        // heap the landing freed instead of keeping it.
+        let (trimmer, metrics) = (self.landing_trim.clone(), self.metrics.clone());
+        let rebuilt = OffRuntime::new(claim.clone().with_parts(parts))
+            .then(move || trimmer.after_landing(&metrics));
         let revision = self.observe_candidate(claim).await?.revision;
         match self
             .ledger
@@ -2752,6 +2779,11 @@ impl MiningBackend for Coordinator {
     async fn observed_tip_hint(&self) -> Option<crate::stratum::RetentionTip> {
         self.observed_tip.read().await.retention_hint()
     }
+    async fn published_work_hint(&self) -> Option<(String, i64)> {
+        let prepared = self.prepared.read().await.clone()?;
+        let parent = prepared.template["previousblockhash"].as_str()?.to_owned();
+        Some((parent, prepared.snapshot.payout_revision))
+    }
     type Context = JobContext;
 
     async fn health_ready(&self) -> bool {
@@ -3277,6 +3309,9 @@ mod clocked_revision_tests;
 
 #[cfg(test)]
 mod d2_bootstrap_tests;
+
+#[cfg(test)]
+mod first_job_lane_tests;
 
 #[cfg(test)]
 mod d2_test_support;

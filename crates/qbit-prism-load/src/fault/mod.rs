@@ -20,7 +20,11 @@
 //! against #585's shutdown and lease behaviour; `test/e2e-scenarios.toml`
 //! names them.
 
+pub mod backlog;
 pub mod database;
+pub mod disk;
+pub mod endpoint;
+pub mod failover;
 pub mod frontend;
 pub mod plan;
 pub mod read_tier;
@@ -38,7 +42,10 @@ use crate::{
     run::Collected,
 };
 use anyhow::Result;
+use backlog::CandidateBacklog;
 use database::{Exhauster, Exhaustion, LockHolder};
+use disk::WalDiskFull;
+use failover::{Failover, FailoverControl};
 use frontend::{FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain};
 use plan::{FaultKind, FaultPlan, Scheduled};
 use rpc_relay::RpcFaultRelay;
@@ -46,7 +53,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{atomic::AtomicU64, Arc, Mutex},
     time::{Duration, Instant},
@@ -87,6 +94,11 @@ pub struct FaultTools {
     pub lease_wait_seconds: u64,
     pub storm_fraction: f64,
     pub seed: u64,
+    /// The managed cluster and the writer endpoint, for the database
+    /// failover and the full WAL volume; `None` against a `--database-url`.
+    pub failover: Option<Arc<FailoverControl>>,
+    pub cut_seconds: u64,
+    pub backlog: usize,
 }
 
 /// A spawned task whose result the driver polls without awaiting.
@@ -96,6 +108,16 @@ pub struct Spawned<T> {
 }
 
 impl<T: Send + 'static> Spawned<T> {
+    /// Wait for the task, whatever it has reached: for a cleanup that must
+    /// see it finished. A task that panicked or was cancelled yields none.
+    pub async fn join(self) -> Option<T> {
+        match (self.value, self.task) {
+            (Some(value), _) => Some(value),
+            (None, Some(task)) => task.await.ok(),
+            (None, None) => None,
+        }
+    }
+
     pub fn spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
         Self {
             task: Some(tokio::spawn(future)),
@@ -196,6 +218,9 @@ enum Action {
     SigtermDrain(Box<SigtermDrain>),
     RollingRestart(Box<RollingRestart>),
     ReconnectStorm(ReconnectStorm),
+    Failover(Box<Failover>),
+    WalDiskFull(Box<WalDiskFull>),
+    CandidateBacklog(Box<CandidateBacklog>),
 }
 
 impl Action {
@@ -203,16 +228,17 @@ impl Action {
     /// they do not go on loading every frontend's `/metrics` through the
     /// faults that follow.
     fn stop_sampling(&mut self) {
-        if let Self::SettlementLock {
-            stall: Some(stall), ..
-        } = self
-        {
-            stall.stop();
+        match self {
+            Self::SettlementLock {
+                stall: Some(stall), ..
+            } => stall.stop(),
+            Self::WalDiskFull(full) => full.stop_sampling(),
+            _ => {}
         }
     }
 
-    fn new(kind: FaultKind, tools: &FaultTools) -> Self {
-        match kind {
+    fn new(kind: FaultKind, tools: &FaultTools) -> Result<Self> {
+        Ok(match kind {
             FaultKind::SlowDatabase => Self::SlowDatabase {
                 applied: false,
                 observed: None,
@@ -237,7 +263,20 @@ impl Action {
             FaultKind::SigtermDrain => Self::SigtermDrain(Box::default()),
             FaultKind::RollingRestart => Self::RollingRestart(Box::default()),
             FaultKind::ReconnectStorm => Self::ReconnectStorm(ReconnectStorm::new()),
-        }
+            FaultKind::PrimaryKill => {
+                Self::Failover(Box::new(Failover::new(failover::Mode::Async, tools)?))
+            }
+            FaultKind::PrimarySwitch => {
+                Self::Failover(Box::new(Failover::new(failover::Mode::Fenced, tools)?))
+            }
+            FaultKind::BlockFailover => {
+                Self::Failover(Box::new(Failover::new(failover::Mode::Block, tools)?))
+            }
+            FaultKind::WalDiskFull => Self::WalDiskFull(Box::new(WalDiskFull::new(tools)?)),
+            FaultKind::CandidateBacklog => {
+                Self::CandidateBacklog(Box::new(CandidateBacklog::new(tools.backlog)))
+            }
+        })
     }
 }
 
@@ -305,17 +344,18 @@ impl FaultDriver {
         self.current.is_none() && self.next >= self.schedule.len()
     }
 
-    /// The frontend a fault has taken down on purpose, which the loop's
+    /// The frontends a fault has taken down on purpose, which the loop's
     /// exit check must not read as a crash.
-    pub fn planned_outage(&self) -> Option<usize> {
+    pub fn planned_outages(&self) -> Vec<usize> {
         match &self.current {
             Some((run, _)) => match &run.action {
-                Action::SigtermDrain(drain) => drain.outage(),
-                Action::RollingRestart(rolling) => rolling.outage(),
-                Action::FrontendSigkill(kill) => kill.outage(),
-                _ => None,
+                Action::SigtermDrain(drain) => drain.outage().into_iter().collect(),
+                Action::RollingRestart(rolling) => rolling.outage().into_iter().collect(),
+                Action::FrontendSigkill(kill) => kill.outage().into_iter().collect(),
+                Action::CandidateBacklog(backlog) => backlog.outages(),
+                _ => Vec::new(),
             },
-            None => None,
+            None => Vec::new(),
         }
     }
 
@@ -368,7 +408,7 @@ impl FaultDriver {
                         return Ok(());
                     }
                     run.inject_start = Some(Instant::now());
-                    run.action = Action::new(run.kind, tools);
+                    run.action = Action::new(run.kind, tools)?;
                     *stage = Stage::Injecting;
                 }
                 Stage::Injecting => {
@@ -403,7 +443,7 @@ impl FaultDriver {
                     };
                 }
                 Stage::Recovering { until } => {
-                    let settled = settle(run, tools)?;
+                    let settled = settle(run, env, tools)?;
                     if Instant::now() < *until || !settled {
                         return Ok(());
                     }
@@ -429,10 +469,15 @@ impl FaultDriver {
                     exhauster: Some(exhauster),
                     ..
                 } => exhauster.stop(),
+                Action::WalDiskFull(full) => full.abandon(),
+                Action::Failover(failover) => failover.abandon(&self.tools),
+                Action::CandidateBacklog(backlog) => backlog.abandon(env, &self.tools),
                 _ => {}
             }
             run.action.stop_sampling();
             self.tools.relay.disarm_all();
+            self.tools.relay.release_held();
+            self.tools.relay.set_refusing(false);
             run.problems
                 .push("the phase ended before this fault finished its recovery window".into());
             self.runs.push(run);
@@ -454,6 +499,55 @@ impl FaultDriver {
             });
             self.next += 1;
         }
+    }
+
+    /// The shares whose fate a database fault's verdict explains, which the
+    /// reconciliation excuses as that fault's own: every acknowledged share a
+    /// failover's verdict proves lies in the replication gap (each listed in
+    /// its row), and every share answered `ledger-outcome-unknown` while the
+    /// primary was going or down, which is the honest answer to a commit
+    /// whose reply was lost with it. Any other loss is still a durability
+    /// finding.
+    pub fn excused_shares(
+        &self,
+        submits: &[SubmitRecord],
+        committed: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut excused = BTreeSet::new();
+        let mut windows = Vec::new();
+        for run in &self.runs {
+            match &run.action {
+                Action::Failover(failover) => {
+                    if let Some(from) = run.baseline_start {
+                        excused.extend(failover.excused(submits, committed, from));
+                    }
+                    windows.extend(failover.outage());
+                }
+                Action::WalDiskFull(full) => {
+                    if let Some(down) = full.fill_started_at() {
+                        windows.push((
+                            down,
+                            full.up_at.unwrap_or_else(Instant::now) + failover::SERVE_BOUND,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for record in submits {
+            if let (Outcome::Rejected(rejection), Some(answered)) =
+                (&record.outcome, record.responded)
+            {
+                if crate::classify::is_outcome_unknown(rejection)
+                    && windows
+                        .iter()
+                        .any(|(from, to)| answered >= *from && answered <= *to)
+                {
+                    excused.insert(record.share_id.clone());
+                }
+            }
+        }
+        excused
     }
 
     /// The indeterminate shares every SIGKILL's census found, which the
@@ -584,6 +678,27 @@ fn inject(
         Action::FrontendSigkill(kill) => kill.poll(env, tools),
         Action::SigtermDrain(drain) => drain.poll(env, tools),
         Action::RollingRestart(rolling) => rolling.poll(env, tools),
+        Action::Failover(failover) => {
+            let done = failover.poll(env, tools)?;
+            if done {
+                run.injected_at = failover.killed_at;
+            }
+            Ok(done)
+        }
+        Action::WalDiskFull(full) => {
+            let done = full.poll_inject(env)?;
+            if done {
+                run.injected_at = full.down_at.or(full.filled_at);
+            }
+            Ok(done)
+        }
+        Action::CandidateBacklog(backlog) => {
+            let done = backlog.poll(env, tools)?;
+            if done {
+                run.injected_at = backlog.signalled_at;
+            }
+            Ok(done)
+        }
         Action::ReconnectStorm(storm) => {
             storm.start(env, tools.storm_fraction, tools.seed, run.ordinal);
             run.injected_at = storm.departed_at;
@@ -593,6 +708,9 @@ fn inject(
 }
 
 fn hold(run: &mut FaultRun, env: &mut FaultEnv<'_>) {
+    if let Action::WalDiskFull(full) = &mut run.action {
+        full.poll_hold();
+    }
     if let Action::SettlementLock {
         mint_at,
         minted,
@@ -649,9 +767,22 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
             let scrape = acquires_after.get_or_insert_with(|| Spawned::spawn(scrape_acquires(env)));
             Ok(scrape.poll().is_some())
         }
-        // An action is over once the frontend serves again.
-        Action::FrontendSigkill(_) | Action::SigtermDrain(_) | Action::RollingRestart(_) => {
+        // An action is over once the frontend serves again: for a failover,
+        // once the endpoint has moved and a new standby streams; for the
+        // backlog, once every frontend is back and the relay healed.
+        Action::FrontendSigkill(_)
+        | Action::SigtermDrain(_)
+        | Action::RollingRestart(_)
+        | Action::Failover(_)
+        | Action::CandidateBacklog(_) => {
             run.removed_at = Some(Instant::now());
+            Ok(true)
+        }
+        Action::WalDiskFull(full) => {
+            if !full.poll_remove(env)? {
+                return Ok(false);
+            }
+            run.removed_at = Some(full.up_at.unwrap_or_else(Instant::now));
             Ok(true)
         }
         Action::ReconnectStorm(storm) => {
@@ -670,10 +801,13 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
 }
 
 /// Anything a fault still waits for once its recovery window has passed:
-/// the SIGKILL's landing through the candidate lease.
-fn settle(run: &mut FaultRun, tools: &FaultTools) -> Result<bool> {
+/// the SIGKILL's landing through the candidate lease, a failover's census of
+/// the new primary and its block's landing, the backlog's settling.
+fn settle(run: &mut FaultRun, env: &FaultEnv<'_>, tools: &FaultTools) -> Result<bool> {
     match &mut run.action {
         Action::FrontendSigkill(kill) => kill.poll_landing(tools),
+        Action::Failover(failover) => failover.poll_settle(env, tools),
+        Action::CandidateBacklog(backlog) => Ok(backlog.poll_settle(env, tools)),
         _ => Ok(true),
     }
 }
@@ -851,6 +985,44 @@ mod tests {
         let tier = row("read tier throughout the fault phase");
         assert_eq!(tier.pass, Some(false));
         assert!(tier.observed.contains("public-api exited"));
+    }
+
+    #[test]
+    fn a_failover_gap_is_gated_in_its_fault_row_not_as_a_missing_share() {
+        let report = |missing: u64, in_gap: u64| {
+            json!({
+                "durability_findings": [],
+                "phases": [{"name": crate::fault::PHASE, "reconciliation": {
+                    "missing": missing, "unexpected": 0,
+                    crate::run::MISSING_IN_A_FAILOVER_GAP: in_gap,
+                }}],
+            })
+        };
+        let budgets = crate::gate::Budgets {
+            phases: None,
+            max_shortfall: 0,
+            max_rejected_valid_shares: None,
+            max_unanswered_submits: None,
+            tip_last_notify_p99_ms: None,
+            d1_verdict_table: false,
+            churn_tip_last_notify_p99_ms: None,
+            new_session_first_job_p99_ms: None,
+        };
+        let row = |missing, in_gap| {
+            crate::gate::evaluate(&report(missing, in_gap), Some(0), &budgets)
+                .into_iter()
+                .find(|check| {
+                    check.name == "reconciliation: acknowledged shares missing from PostgreSQL"
+                })
+                .expect("the missing-share row")
+        };
+        let gap_only = row(150, 150);
+        assert_eq!(gap_only.pass, Some(true));
+        assert!(gap_only
+            .observed
+            .contains("150 in a failover's replication gap"));
+        assert_eq!(row(151, 150).pass, Some(false), "a loss outside the gap");
+        assert_eq!(row(1, 0).pass, Some(false));
     }
 
     #[test]

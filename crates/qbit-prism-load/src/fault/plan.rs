@@ -26,6 +26,10 @@
 //! - `storm`: the fraction of sessions a reconnect storm drops (default 0.5).
 //! - `lease-wait`: seconds the SIGKILL fault waits for the killed holder's
 //!   found block to land through the candidate lease (default 180).
+//! - `cut`: seconds `primary-kill` keeps replication cut, with the primary
+//!   still acknowledging, before the primary goes (default 3).
+//! - `backlog`: found blocks `candidate-backlog` holds back before the
+//!   restart (default 4).
 //!
 //! EP-VALIDATION: everything is checked here, at the entry boundary, with the
 //! offending text in the error.
@@ -59,9 +63,23 @@ pub enum FaultKind {
     RollingRestart,
     /// A fraction of the sessions drop abruptly and return within seconds.
     ReconnectStorm,
+    /// The primary lost after replication was cut, the asynchronous standby
+    /// promoted and the writer endpoint moved to it (D3's loss policy).
+    PrimaryKill,
+    /// The planned switch: writers fenced, the standby caught up, then the
+    /// primary stopped and the standby promoted. Nothing may be lost.
+    PrimarySwitch,
+    /// A found block's `submitblock` held while replication is cut and the
+    /// primary lost, then let through; the block must land once (#585).
+    BlockFailover,
+    /// The primary's WAL volume filled until PostgreSQL stops, then freed.
+    WalDiskFull,
+    /// Every frontend restarted over a backlog of found blocks the node
+    /// refused while warming up.
+    CandidateBacklog,
 }
 
-pub const ALL: [FaultKind; 7] = [
+pub const ALL: [FaultKind; 12] = [
     FaultKind::SlowDatabase,
     FaultKind::PoolExhaustion,
     FaultKind::SettlementLock,
@@ -69,6 +87,11 @@ pub const ALL: [FaultKind; 7] = [
     FaultKind::SigtermDrain,
     FaultKind::RollingRestart,
     FaultKind::ReconnectStorm,
+    FaultKind::PrimaryKill,
+    FaultKind::PrimarySwitch,
+    FaultKind::BlockFailover,
+    FaultKind::WalDiskFull,
+    FaultKind::CandidateBacklog,
 ];
 
 impl FaultKind {
@@ -81,6 +104,11 @@ impl FaultKind {
             Self::SigtermDrain => "sigterm-drain",
             Self::RollingRestart => "rolling-restart",
             Self::ReconnectStorm => "reconnect-storm",
+            Self::PrimaryKill => "primary-kill",
+            Self::PrimarySwitch => "primary-switch",
+            Self::BlockFailover => "block-failover",
+            Self::WalDiskFull => "wal-disk-full",
+            Self::CandidateBacklog => "candidate-backlog",
         }
     }
 
@@ -100,7 +128,22 @@ impl FaultKind {
     pub fn is_action(self) -> bool {
         matches!(
             self,
-            Self::FrontendSigkill | Self::SigtermDrain | Self::RollingRestart
+            Self::FrontendSigkill
+                | Self::SigtermDrain
+                | Self::RollingRestart
+                | Self::PrimaryKill
+                | Self::PrimarySwitch
+                | Self::BlockFailover
+                | Self::CandidateBacklog
+        )
+    }
+
+    /// Faults that fail the database over to its standby, which needs an
+    /// asynchronous standby, the writer endpoint and the replication link.
+    pub fn is_failover(self) -> bool {
+        matches!(
+            self,
+            Self::PrimaryKill | Self::PrimarySwitch | Self::BlockFailover
         )
     }
 
@@ -112,7 +155,7 @@ impl FaultKind {
     /// Faults that act on the database server itself, which only a cluster
     /// the harness manages may be subjected to.
     pub fn needs_managed_cluster(self) -> bool {
-        matches!(self, Self::PoolExhaustion)
+        matches!(self, Self::PoolExhaustion | Self::WalDiskFull) || self.is_failover()
     }
 }
 
@@ -139,6 +182,8 @@ pub struct FaultPlan {
     pub read_tier: bool,
     pub storm_fraction: f64,
     pub lease_wait_seconds: u64,
+    pub cut_seconds: u64,
+    pub backlog: usize,
 }
 
 /// One fault as drawn: the kind and the gap that precedes its baseline.
@@ -151,6 +196,16 @@ pub struct Scheduled {
 /// Time the phase allows an action fault beyond its planned windows: the
 /// drain (the server's 30 s task join), the relaunch and its readiness wait.
 pub const ACTION_ALLOWANCE_SECONDS: u64 = 90;
+/// Beyond that, for a failover: the barrier, the stop, the promotion, the
+/// rebuilt standby's base backup and streaming, and for a block the offer
+/// and its landing watch.
+pub const FAILOVER_ALLOWANCE_SECONDS: u64 = 360;
+/// For the full WAL volume: the fill, the wait for PostgreSQL to stop, and
+/// its restart and crash recovery.
+pub const WAL_DISK_ALLOWANCE_SECONDS: u64 = 240;
+/// For the backlog restart: building the backlog, both drains, and every
+/// row settling after the heal.
+pub const BACKLOG_ALLOWANCE_SECONDS: u64 = 300;
 
 impl FaultPlan {
     pub fn parse(spec: &str) -> Result<Self> {
@@ -175,6 +230,8 @@ impl FaultPlan {
             read_tier: true,
             storm_fraction: 0.5,
             lease_wait_seconds: 180,
+            cut_seconds: 3,
+            backlog: 4,
         };
         let mut count_given = false;
         for option in sections {
@@ -245,9 +302,17 @@ impl FaultPlan {
                     plan.storm_fraction = fraction;
                 }
                 "lease-wait" => plan.lease_wait_seconds = number("lease-wait")?,
+                "cut" => plan.cut_seconds = number("cut")?,
+                "backlog" => {
+                    plan.backlog = number("backlog")? as usize;
+                    ensure!(
+                        (1..=20).contains(&plan.backlog),
+                        "--faults {spec:?}: backlog={value} must be 1 to 20"
+                    );
+                }
                 other => bail!(
                     "--faults {spec:?}: unknown key {other:?}; use order, seed, count, baseline, \
-                     hold, recovery, gap, read-tier, storm or lease-wait"
+                     hold, recovery, gap, read-tier, storm, lease-wait, cut or backlog"
                 ),
             }
         }
@@ -318,6 +383,15 @@ impl FaultPlan {
                 if scheduled.kind == FaultKind::FrontendSigkill {
                     seconds += self.lease_wait_seconds;
                 }
+                if scheduled.kind.is_failover() {
+                    seconds += FAILOVER_ALLOWANCE_SECONDS + self.cut_seconds;
+                }
+                if scheduled.kind == FaultKind::WalDiskFull {
+                    seconds += WAL_DISK_ALLOWANCE_SECONDS;
+                }
+                if scheduled.kind == FaultKind::CandidateBacklog {
+                    seconds += BACKLOG_ALLOWANCE_SECONDS;
+                }
                 seconds
             })
             .sum::<u64>()
@@ -343,6 +417,48 @@ impl FaultPlan {
         Ok(())
     }
 
+    /// Whether any listed fault fails the database over.
+    pub fn has_failover(&self) -> bool {
+        self.listed.iter().any(|kind| kind.is_failover())
+    }
+
+    /// Whether the plan fills the primary's WAL volume.
+    pub fn has_wal_disk_full(&self) -> bool {
+        self.listed.contains(&FaultKind::WalDiskFull)
+    }
+
+    /// Refuse a plan the cluster's replication cannot carry: a failover
+    /// promotes the asynchronous standby D3 runs with, and a full WAL volume
+    /// is the first primary's, which a failover replaces.
+    pub fn check_replication(&self, replication: &str) -> Result<()> {
+        if self.has_failover() {
+            ensure!(
+                replication == "async",
+                "--faults: a failover ({}) promotes D3's asynchronous standby, so it needs \
+                 --replication async, not {replication}",
+                self.listed
+                    .iter()
+                    .filter(|kind| kind.is_failover())
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if self.has_wal_disk_full() && self.has_failover() {
+            let schedule = self.schedule();
+            let first_failover = schedule.iter().position(|s| s.kind.is_failover());
+            let last_fill = schedule
+                .iter()
+                .rposition(|s| s.kind == FaultKind::WalDiskFull);
+            ensure!(
+                self.order == Order::Listed && last_fill < first_failover,
+                "--faults: wal-disk-full fills the first primary's WAL volume, so it must run \
+                 before every failover, in a listed plan"
+            );
+        }
+        Ok(())
+    }
+
     pub fn report(&self) -> Value {
         json!({
             "spec": self.spec,
@@ -357,6 +473,8 @@ impl FaultPlan {
             "read_tier": self.read_tier,
             "storm_fraction": self.storm_fraction,
             "lease_wait_seconds": self.lease_wait_seconds,
+            "cut_seconds": self.cut_seconds,
+            "backlog": self.backlog,
             "schedule": self.schedule().iter().map(|scheduled| json!({
                 "fault": scheduled.kind.name(),
                 "gap_seconds": scheduled.gap_seconds,
@@ -412,6 +530,7 @@ mod tests {
             ("slow-database;recovery=2", "recovery at least 4 s"),
             ("slow-database;hold", "is not key=value"),
             ("slow-database;speed=2", "unknown key \"speed\""),
+            ("candidate-backlog;backlog=0", "backlog=0 must be 1 to 20"),
         ] {
             let error = format!("{:#}", FaultPlan::parse(spec).unwrap_err());
             assert!(error.contains(fragment), "{spec:?}: {error}");
@@ -438,6 +557,45 @@ mod tests {
     }
 
     #[test]
+    fn a_failover_needs_an_async_standby_and_follows_any_wal_fill() {
+        let failover = FaultPlan::parse("primary-kill;cut=5").unwrap();
+        assert_eq!(failover.cut_seconds, 5);
+        assert!(failover.check_against(1, false).is_err(), "managed only");
+        assert!(failover.check_replication("async").is_ok());
+        let error = format!("{:#}", failover.check_replication("sync").unwrap_err());
+        assert!(error.contains("--replication async"), "{error}");
+        assert!(FaultPlan::parse("wal-disk-full,primary-switch")
+            .unwrap()
+            .check_replication("async")
+            .is_ok());
+        for spec in [
+            "primary-switch,wal-disk-full",
+            "wal-disk-full,block-failover;order=random;count=4",
+        ] {
+            let error = format!(
+                "{:#}",
+                FaultPlan::parse(spec)
+                    .unwrap()
+                    .check_replication("async")
+                    .unwrap_err()
+            );
+            assert!(error.contains("before every failover"), "{spec}: {error}");
+        }
+        let all = FaultPlan::parse(
+            "primary-kill,primary-switch,block-failover,wal-disk-full,candidate-backlog",
+        )
+        .unwrap();
+        assert!(all
+            .listed
+            .iter()
+            .all(|kind| kind.needs_managed_cluster() || *kind == FaultKind::CandidateBacklog));
+        assert!(all
+            .listed
+            .iter()
+            .all(|kind| kind.is_action() != (*kind == FaultKind::WalDiskFull)));
+    }
+
+    #[test]
     fn the_phase_bound_covers_every_window_and_allowance() {
         let plan =
             FaultPlan::parse("frontend-sigkill;baseline=5;hold=10;recovery=20;lease-wait=150")
@@ -450,6 +608,20 @@ mod tests {
         assert_eq!(
             rolling.phase_seconds_bound(4),
             5 + 10 + 20 + 4 * ACTION_ALLOWANCE_SECONDS + 30
+        );
+        let failover = FaultPlan::parse(
+            "primary-kill,wal-disk-full,candidate-backlog;baseline=5;hold=10;recovery=20;cut=4",
+        )
+        .unwrap();
+        assert_eq!(
+            failover.phase_seconds_bound(2),
+            3 * (5 + 10 + 20)
+                + 2 * ACTION_ALLOWANCE_SECONDS
+                + FAILOVER_ALLOWANCE_SECONDS
+                + 4
+                + WAL_DISK_ALLOWANCE_SECONDS
+                + BACKLOG_ALLOWANCE_SECONDS
+                + 30
         );
     }
 
