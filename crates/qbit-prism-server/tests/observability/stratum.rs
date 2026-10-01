@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub(super) struct Gate {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
 }
 impl Gate {
     pub(super) async fn wait(&self) {
@@ -317,6 +317,61 @@ async fn pending_initial_work_moves_and_cancellation_does_not_fabricate_share_ev
         0.
     );
     assert!(!metrics.runtime().snapshot().stalled());
+}
+
+/// #621: a request that changes what the session's job is built from waits
+/// for the delivery in flight, and so does everything sent after it; that
+/// wait is observed once, when the request is handled. A health probe ahead
+/// of it is answered during the delivery and never observed.
+#[tokio::test]
+async fn a_difficulty_request_waits_for_the_delivery_in_flight_and_its_wait_is_observed() {
+    let metrics = Arc::new(Metrics::default());
+    let (address, backend, refresh, shutdown, task) =
+        start_with_metrics(StratumConfig::default(), metrics.clone()).await;
+    let waits = "qbit_prism_stratum_request_delivery_wait_seconds_count";
+    // A network target the requested share difficulty stays below.
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let mut client = Client::connect(address).await;
+    client.login("miner.held").await;
+    let built_at = client.difficulty;
+    let submit = client.solved_share(32, "miner.held", 0);
+    let gate = Arc::new(Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    // One write, so the session has the later frames once it reads the probe
+    // and holds the difficulty request before this test can see the answer.
+    let frames = [
+        json!({"id":30,"method":"mining.get_health","params":[]}),
+        json!({"id":31,"method":"mining.suggest_difficulty","params":[0.001]}),
+        submit,
+    ];
+    client
+        .writer
+        .write_all(frames.map(|frame| format!("{frame}\n")).concat().as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(client.read().await["id"], 30);
+    assert_eq!(sample(&metrics, waits), 0.);
+    gate.release.notify_one();
+    // The held rebuild, at the difficulty it was built at, then the request
+    // it held, then that request's own work, and only then the submit.
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    assert_eq!(client.difficulty, built_at);
+    assert_eq!(client.read().await["method"], "mining.notify");
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 31, "{answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(sample(&metrics, waits), 1.);
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    assert_eq!(client.difficulty, 0.001);
+    assert_eq!(client.read().await["method"], "mining.notify");
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 32, "{answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(sample(&metrics, waits), 1.);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]

@@ -99,6 +99,7 @@ impl Metrics {
             Family::Blocks,
             Family::Delivered,
             Family::DeliveryFailed,
+            Family::DeliveryCancelled,
             Family::Stale,
             Family::Duplicate,
             Family::LowDifficulty,
@@ -112,6 +113,7 @@ impl Metrics {
             Family::AcceptedUnlanded,
             Family::RevisionWorkTimeouts,
             Family::LandingTrimReleased,
+            Family::RequestDeliveryWait,
         ] {
             registry.register(family, vec![], 0.);
         }

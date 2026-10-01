@@ -228,6 +228,30 @@ impl Connection {
     }
 }
 
+// #621: a share answered while a retarget's delivery is in flight still counts
+// for vardiff when that delivery fails and the retarget is undone.
+#[tokio::test]
+async fn a_failed_retarget_delivery_keeps_the_shares_answered_while_it_was_in_flight() {
+    let mut client = Connection::new(30.0, 8).await;
+    let job = client.deliver().await;
+    // An idle miner's retarget: no share in its window, a step down.
+    client.session.vardiff.config.retarget_seconds = 1e-9;
+    client.session.vardiff.config.initial_enabled = false;
+    client.session.difficulty = 1.0;
+    client.session.retarget();
+    assert!(client.session.pending_retarget.is_some());
+    client.session.delivery_in_flight = true;
+    assert_eq!(client.submit(&job, 0).await["result"], true);
+    client.session.delivery_in_flight = false;
+    client.session.restore_retarget();
+    assert_eq!(client.session.difficulty, 1.0);
+    client.session.vardiff.retarget(client.session.difficulty);
+    assert!(
+        client.session.vardiff.proposed_share_backed,
+        "the share answered during the failed delivery was dropped"
+    );
+}
+
 #[tokio::test]
 async fn failed_replacement_keeps_retired_job_until_actual_delivery_then_expires() {
     let mut client = Connection::new(3.0, 64).await;

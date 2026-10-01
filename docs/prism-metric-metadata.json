@@ -117,6 +117,15 @@
         "qbit_prism_stratum_oldest_pending_initial_job_seconds"
       ]
     },
+    "stratum_request_delivery_wait_seconds": {
+      "status": "Default histogram ladder. One observation per waiting request, when its session handles it, whether the delivery it waited for was announced or failed; none when the session ends first. A delivery is the admission, build and persistence of the session's next job and its announcement. A frame that is not a JSON object is answered at once and never waits. A submit queued behind a waiting request is read only after it, and `share_ack_seconds` starts at that read, so this family, not the ACK histogram, carries that wait. Registered at startup: every bucket, `_sum` and `_count` reads 0 until the first wait. No rule of its own."
+    },
+    "job_delivery_cancellations_total": {
+      "status": "Process-local counter, 0 at startup. A delivery is counted once, at its end, in exactly one of `job_delivery_successes_total`, `job_delivery_failures_total` and this family (#621). Counted here: a delivery still being admitted, built or persisted, or built but not yet announced, when its session ends, which since #621 a session notices while a delivery is in flight. A delivery whose announcement write fails still counts as a failure. No rule of its own."
+    },
+    "job_delivery_failures_total": {
+      "status": "A build, admission or persistence error or deadline, or a failed announcement write. A delivery its session abandons before the announcement counts in `job_delivery_cancellations_total` instead (#621)."
+    },
     "stratum_current_tip_coverage_gap_seconds": {
       "replaces": [
         "qbit_prism_stratum_current_tip_coverage_gap_seconds"

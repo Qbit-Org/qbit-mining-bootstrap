@@ -35,6 +35,8 @@ struct Backend {
     sessions: AtomicU32,
     jobs: AtomicU64,
     persist_gate: Mutex<Option<Arc<PersistGate>>>,
+    /// Holds the next `submit` the same way (#621).
+    submit_gate: Mutex<Option<Arc<PersistGate>>>,
     /// The published tip, as a number, and payout revision.
     tip: AtomicU64,
     revision: AtomicU64,
@@ -144,7 +146,12 @@ impl MiningBackend for Backend {
         _submission: Submission,
         _stale_grace: StaleGrace,
     ) -> Result<(), StratumError> {
-        Err(StratumError::internal("not used"))
+        let gate = self.submit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        Err(StratumError::internal("not credited by this test"))
     }
 }
 
@@ -345,6 +352,56 @@ async fn a_rebuild_keeps_its_lane_permit_until_its_job_is_persisted() {
     gate.release.notify_one();
     client.job().await;
     assert_eq!(harness.config.rebuild_job_limit.available_permits(), 4);
+    let _ = harness.shutdown.send(true);
+    harness.sessions.abort_all();
+}
+
+/// #621: a rebuild releases its lane permit once its job is persisted, not
+/// when the job is announced, even though a submit the session is answering
+/// meanwhile delays the announcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuild_releases_its_lane_permit_while_a_submit_delays_its_announcement() {
+    let mut harness = Harness::new(4, 5.0);
+    let mut client = harness.connect();
+    client.open("miner-a.rig").await;
+    client.job().await;
+    let persist = Arc::new(PersistGate::default());
+    *harness.backend.persist_gate.lock().unwrap() = Some(persist.clone());
+    harness.refresh.send_modify(|_| {});
+    timeout(Duration::from_secs(2), persist.entered.notified())
+        .await
+        .expect("the rebuild never reached persistence");
+    assert_eq!(harness.config.rebuild_job_limit.available_permits(), 3);
+    let submit = Arc::new(PersistGate::default());
+    *harness.backend.submit_gate.lock().unwrap() = Some(submit.clone());
+    client
+        .send(
+            10,
+            "mining.submit",
+            json!([
+                "miner-a.rig",
+                "job-resumed",
+                "00".repeat(8),
+                "00000000",
+                "00000000"
+            ]),
+        )
+        .await;
+    timeout(Duration::from_secs(2), submit.entered.notified())
+        .await
+        .expect("the submit never reached the backend");
+    persist.release.notify_one();
+    let lane = harness.config.rebuild_job_limit.clone();
+    timeout(Duration::from_secs(5), async {
+        while lane.available_permits() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the lane permit waited for the announcement");
+    submit.release.notify_one();
+    assert!(!client.response(10).await["error"].is_null());
+    client.job().await;
     let _ = harness.shutdown.send(true);
     harness.sessions.abort_all();
 }

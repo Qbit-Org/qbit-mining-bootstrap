@@ -109,6 +109,7 @@ pub fn expected(populated: bool) -> Census {
         "blocks_total",
         "job_delivery_successes_total",
         "job_delivery_failures_total",
+        "job_delivery_cancellations_total",
         "stale_shares_total",
         "duplicate_shares_total",
         "low_difficulty_shares_total",
@@ -235,6 +236,13 @@ pub fn expected(populated: bool) -> Census {
     );
     result.family(
         "ctv_fanout_broadcaster_chunk_seconds",
+        "histogram",
+        &unlabelled,
+        SECONDS,
+    );
+    // #621: a request that waited for its session's own job delivery.
+    result.family(
+        "stratum_request_delivery_wait_seconds",
         "histogram",
         &unlabelled,
         SECONDS,

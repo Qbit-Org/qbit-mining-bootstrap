@@ -95,6 +95,18 @@ impl Metrics {
             self.landing_acks.record(received_at, elapsed);
         }
     }
+    /// #621: a Stratum request waited `elapsed`, from its complete frame, for
+    /// its session's own job delivery in flight to end.
+    pub fn observe_request_delivery_wait(&self, elapsed: Duration) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(
+                Family::RequestDeliveryWait,
+                Labels::Empty,
+                elapsed.as_secs_f64(),
+            );
+    }
     /// Record stale-grace credit only after durable acceptance.
     pub fn record_grace_credit(&self) {
         self.inner
