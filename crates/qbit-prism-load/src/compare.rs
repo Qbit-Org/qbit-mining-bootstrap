@@ -2485,6 +2485,8 @@ pub fn compare(
             let changed: std::collections::BTreeSet<&str> =
                 changes.iter().filter_map(|c| c["hash"].as_str()).collect();
             let report = run.report.as_ref();
+            // Each driven record names its tip; one without a hash cannot be
+            // matched to a change and is a gap, never skipped.
             let listed = |pointer: &str, key: &'static str| {
                 report
                     .and_then(|r| r.pointer(pointer))
@@ -2492,18 +2494,22 @@ pub fn compare(
                     .into_iter()
                     .flatten()
                     .filter(move |entry| key != "block_hash" || entry["accepted"] == true)
-                    .filter_map(move |entry| entry[key].as_str())
+                    .map(move |entry| entry[key].as_str())
             };
             if let Some(missing) = listed("/time_to_usable_work/tips", "tip")
                 .chain(listed("/churn/tip_delivery/tips", "tip"))
                 .chain(listed("/node/submissions", "block_hash"))
-                .find(|hash| !changed.contains(hash))
+                .find(|hash| hash.is_none_or(|hash| !changed.contains(hash)))
             {
                 passed = false;
                 findings.push(format!(
-                    "**the runs did not drive the pinned workload**: {} reports no tip change for \
-                     the tip {missing} it drove, so the bits served after it cannot be checked",
-                    run.run.id
+                    "**the runs did not drive the pinned workload**: {} {}, so the bits served \
+                     after it cannot be checked",
+                    run.run.id,
+                    match missing {
+                        Some(hash) => format!("reports no tip change for the tip {hash} it drove"),
+                        None => "reports a tip it drove without its hash".to_owned(),
+                    }
                 ));
                 break 'bits;
             }

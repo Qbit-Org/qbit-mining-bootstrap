@@ -102,12 +102,23 @@ fn report(commit: &str, steady: Value, burst: Value) -> Value {
     for (pointer, value) in compare::expected_population(&d1_args()).unwrap() {
         set_pointer(&mut report, pointer, json!(value));
     }
-    // The fake node's tips, each followed by the pinned bits.
-    report["node"]["tip_changes"] = json!([
-        {"height": 100, "origin": "bootstrap", "next_template_bits": template_bits(&d1_args(), 101)},
-        {"height": 101, "origin": "external", "next_template_bits": template_bits(&d1_args(), 102)},
-    ]);
+    // The fake node's tips, the external ones it drove among them, each
+    // followed by the pinned bits.
+    report["node"]["tip_changes"] = tip_changes(&d1_args(), &["e01", "e02", "e03"]);
     report
+}
+
+/// A fake node's tip changes from height 100: the bootstrap tip, then
+/// `hashes` in order, each followed by `pinned`'s bits.
+fn tip_changes(pinned: &std::collections::BTreeMap<String, Value>, hashes: &[&str]) -> Value {
+    let mut changes = vec![json!({"hash": "b00", "height": 100, "origin": "bootstrap",
+                                  "next_template_bits": template_bits(pinned, 101)})];
+    for (offset, hash) in hashes.iter().enumerate() {
+        let height = 101 + offset as u64;
+        changes.push(json!({"hash": hash, "height": height,
+                            "next_template_bits": template_bits(pinned, height + 1)}));
+    }
+    Value::Array(changes)
 }
 
 /// The bits `pinned`'s fake node serves at `height`.
@@ -177,9 +188,9 @@ fn bare_report(commit: &str, steady: Value, burst: Value) -> Value {
             "seed": {"rows": 20000, "serialized_bytes": 11_674_595, "target_share_bytes": 581},
         },
         "time_to_usable_work": {"tips": [
-            {"all_sessions_milliseconds": 600.0},
-            {"all_sessions_milliseconds": 700.0},
-            {"all_sessions_milliseconds": 800.0},
+            {"tip": "e01", "all_sessions_milliseconds": 600.0},
+            {"tip": "e02", "all_sessions_milliseconds": 700.0},
+            {"tip": "e03", "all_sessions_milliseconds": 800.0},
         ]},
         "database": {"mode": "managed",
             "durability": {"fsync": "on", "full_page_writes": "on", "synchronous_commit": "on"},
@@ -968,10 +979,15 @@ fn a_fake_node_serving_other_bits_than_pinned_fails() {
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
             report["node"]["retarget_bits"] = json!(true);
-            report["node"]["tip_changes"] = json!([
-                {"height": 100, "next_template_bits": bits(101)},
-                {"height": 101, "next_template_bits": bits(102)},
-            ]);
+            let mut changes =
+                vec![json!({"hash": "b00", "height": 100, "next_template_bits": bits(101)})];
+            for (offset, hash) in ["e01", "e02", "e03"].into_iter().enumerate() {
+                let height = 101 + offset as u64;
+                changes.push(
+                    json!({"hash": hash, "height": height, "next_template_bits": bits(height + 1)}),
+                );
+            }
+            report["node"]["tip_changes"] = Value::Array(changes);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
@@ -998,6 +1014,25 @@ fn a_fake_node_serving_other_bits_than_pinned_fails() {
         result
             .markdown
             .contains("reports no tip change for the tip e01 it drove"),
+        "{}",
+        result.markdown
+    );
+    // A driven tip recorded without its hash cannot be matched, and fails.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let report = run.report.as_mut().unwrap();
+        report["node"]["tip_changes"] = tip_changes(&d1_args(), &["e01", "e02", "e03"]);
+        report["time_to_usable_work"]["tips"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("tip");
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("reports a tip it drove without its hash"),
         "{}",
         result.markdown
     );
@@ -1073,9 +1108,13 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
             steady["started_at"] = json!(at(0.0));
             steady["ended_at"] = json!(at(300.004));
             report["node"]["submissions"] = json!([
-                {"accepted": accepted[0], "rejection": null, "received_at": at(seconds[0])},
-                {"accepted": accepted[1], "rejection": "parent mismatch", "received_at": at(seconds[1])},
+                {"block_hash": "p01", "accepted": accepted[0], "rejection": null,
+                 "received_at": at(seconds[0])},
+                {"block_hash": "p02", "accepted": accepted[1], "rejection": "parent mismatch",
+                 "received_at": at(seconds[1])},
             ]);
+            report["node"]["tip_changes"] =
+                tip_changes(&pinned, &["e01", "e02", "e03", "p01", "p02"]);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
@@ -1269,7 +1308,14 @@ fn churn_runs(
             "rentals_departed": departed,
             "storms": storms,
         });
-        report["churn"]["tip_delivery"] = json!({"tips": plan["tips_at_seconds"]});
+        let churn_tips: Vec<String> = (0..plan["tips_at_seconds"].as_array().unwrap().len())
+            .map(|index| format!("c{index:02}"))
+            .collect();
+        report["churn"]["tip_delivery"] =
+            json!({"tips": churn_tips.iter().map(|tip| json!({"tip": tip})).collect::<Vec<_>>()});
+        let mut driven = vec!["e01", "e02", "e03"];
+        driven.extend(churn_tips.iter().map(String::as_str));
+        report["node"]["tip_changes"] = tip_changes(pinned, &driven);
     }
     runs
 }
