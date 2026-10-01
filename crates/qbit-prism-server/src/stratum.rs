@@ -1917,6 +1917,19 @@ async fn session<B: MiningBackend>(
     serve_connection(reader, writer, backend, config, refresh, shutdown, metrics).await
 }
 
+/// Whether the session breached a per-session budget. The breach was
+/// recorded and answered; the session closes after the response.
+fn budget_breached<C>(session: &Session<C>) -> bool {
+    let Some(reason) = session.budget_exceeded else {
+        return false;
+    };
+    tracing::warn!(
+        reason = reason.as_str(),
+        "Stratum session disconnected by a per-session budget"
+    );
+    true
+}
+
 /// One Stratum connection's request loop over any byte stream (#575).
 /// `run_listener` calls it with an accepted socket's halves; the fuzz targets
 /// and property tests call it over an in-memory pipe, so the line framing and
@@ -1999,6 +2012,11 @@ pub async fn serve_connection<B: MiningBackend>(
                 }
             }
         }
+        // A breach closes the session right after its answer, before any
+        // work that finished meanwhile is announced (#621).
+        if budget_breached(&session) {
+            break;
+        }
         if let Some(prepared) = finished.take() {
             session.delivery_in_flight = false;
             match prepared {
@@ -2037,12 +2055,8 @@ pub async fn serve_connection<B: MiningBackend>(
                 .await?;
             }
         }
-        if let Some(reason) = session.budget_exceeded {
-            // The breach was recorded and answered; close after the response.
-            tracing::warn!(
-                reason = reason.as_str(),
-                "Stratum session disconnected by a per-session budget"
-            );
+        // A held request handled above may breach a budget too.
+        if budget_breached(&session) {
             break;
         }
         if session.retry_job && delivery.is_terminated() && !delivery_failed {

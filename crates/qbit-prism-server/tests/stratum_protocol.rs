@@ -1162,6 +1162,50 @@ async fn a_delivery_abandoned_by_its_session_is_a_cancellation_not_a_failure() {
     assert_eq!(snapshot.pending_builds, 0);
 }
 
+// #621 review: a session that breaches a per-session budget closes right
+// after its answer, as before, even when its delivery finished while that
+// answer was written: the job is not announced, and the delivery counts as
+// a cancellation.
+#[tokio::test]
+async fn a_budget_breach_closes_the_session_before_a_finished_delivery_is_announced() {
+    let config = StratumConfig {
+        max_malformed_frames_per_interval: 1,
+        ..Default::default()
+    };
+    let stats = config.stats.clone();
+    let (backend, refresh, _shutdown, hold, mut client_writer, mut lines, task) =
+        held_writer_session(config, "miner.breach").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    client_writer.write_all(b"first junk\n").await.unwrap();
+    assert!(next_frame(&mut lines).await["error"].is_array());
+    // The breaching frame's answer is held while the delivery finishes.
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer.write_all(b"second junk\n").await.unwrap();
+    hold.held.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind a held write");
+    hold.release();
+    assert!(next_frame(&mut lines).await["error"].is_array());
+    let after = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, None, "the session announced work after its breach");
+    task.await.unwrap().unwrap();
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_successes, 1, "the first job only");
+    assert_eq!(snapshot.job_delivery_cancellations, 1);
+}
+
 // The boundary of the test above: a delivery whose announcement write fails
 // still counts as a failed delivery, as it did before #621.
 #[tokio::test]
