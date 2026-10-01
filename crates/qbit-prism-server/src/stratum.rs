@@ -5,12 +5,14 @@ use crate::{
     vardiff::{password_difficulties, Vardiff, VardiffConfig},
 };
 use anyhow::{ensure, Context, Result};
+use futures_util::future::{Fuse, FusedFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     net::IpAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -853,6 +855,9 @@ struct Session<C> {
     retained: retained_jobs::RetainedJobs<C>,
     tip_work_delivered: Option<(String, Instant)>,
     retry_job: bool,
+    /// A job delivery is being built and persisted while the session keeps
+    /// answering submits (#621).
+    delivery_in_flight: bool,
     authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     observation: SessionObservation,
     pending_retarget: Option<(f64, Vardiff)>,
@@ -886,6 +891,7 @@ impl<C> Session<C> {
             retained: retained_jobs::RetainedJobs::default(),
             tip_work_delivered: None,
             retry_job: false,
+            delivery_in_flight: false,
             authorization_permit: None,
             observation,
             pending_retarget: None,
@@ -952,7 +958,10 @@ impl<C> Session<C> {
     }
 
     fn retarget(&mut self) {
-        if self.pending_retarget.is_some() {
+        // A delivery in flight was built at the current difficulty, so a
+        // retarget now would be announced with that job (#621). It waits for
+        // the announcement; the next delivery or timer tick retargets.
+        if self.pending_retarget.is_some() || self.delivery_in_flight {
             return;
         }
         let previous = self.vardiff.clone();
@@ -1083,11 +1092,11 @@ async fn result(
     write_json(writer, json!({"id":id,"result":value,"error":null}), config).await
 }
 
-/// Whether `prior`, the session's newest live job for its current worker, is
-/// on the published parent and payout revision (#604). An unknown
-/// publication counts nothing as current. An admission hint only.
-async fn holds_current_work<B: MiningBackend>(backend: &B, prior: Option<&Job>) -> bool {
-    let Some(prior) = prior else {
+/// Whether `prior`, the parent and payout revision of the session's newest
+/// live job for its current worker, is the published work (#604). An
+/// unknown publication counts nothing as current. An admission hint only.
+async fn holds_current_work<B: MiningBackend>(backend: &B, prior: Option<&(String, i64)>) -> bool {
+    let Some((prior_parent, prior_revision)) = prior else {
         return false;
     };
     backend
@@ -1095,27 +1104,109 @@ async fn holds_current_work<B: MiningBackend>(backend: &B, prior: Option<&Job>) 
         .await
         .is_some_and(|(parent, revision)| {
             // Jobs carry the template's hash lowercased; the hint may not.
-            prior.previousblockhash.eq_ignore_ascii_case(&parent)
-                && prior.payout_revision == revision
+            prior_parent.eq_ignore_ascii_case(&parent) && *prior_revision == revision
         })
 }
 
-async fn deliver_job<B: MiningBackend>(
+/// What a job delivery is built from, read from the session as it starts.
+/// Building and persisting the job borrow nothing else from the session, so
+/// the session keeps answering submits meanwhile (#621). The requests it
+/// answers then cannot change any of these: see [`answered_during_delivery`].
+struct DeliveryInputs {
+    worker: Worker,
+    extranonce1: String,
+    difficulty: f64,
+    miner_version_mask: Option<u32>,
+    /// The parent and payout revision of the session's newest live job for
+    /// this worker, owned, for the rebuild lane's hint (#604). A job resumed
+    /// after a reconnect is retired and is not current work.
+    prior: Option<(String, i64)>,
+}
+
+impl DeliveryInputs {
+    fn of<C>(session: &Session<C>) -> Option<Self> {
+        let worker = session.worker.clone()?;
+        let prior = session
+            .jobs
+            .back()
+            .filter(|prior| prior.worker.username == worker.username && prior.retired_at.is_none())
+            .map(|prior| {
+                (
+                    prior.job.wire.previousblockhash.clone(),
+                    prior.job.wire.payout_revision,
+                )
+            });
+        Some(Self {
+            extranonce1: session.extranonce1.clone()?,
+            difficulty: session.difficulty,
+            miner_version_mask: session.miner_version_mask,
+            prior,
+            worker,
+        })
+    }
+}
+
+/// A built job, durable but not yet announced to the miner.
+struct PreparedJob<C> {
+    job: MiningJob<C>,
+    worker: Worker,
+    mask: u32,
+    observation: DeliveryObservation,
+}
+
+/// Requests a session answers while its job delivery is in flight (#621):
+/// none of them changes what that job is built from or how it is announced.
+/// A submit's own retarget waits for the delivery (`Session::retarget`).
+/// Every other request (subscribe, authorize, configure, suggest_difficulty,
+/// or a method this server does not know) waits for the delivery, and the
+/// session reads nothing after it until it is handled, so responses keep
+/// request order and those requests see the session exactly as before #621.
+fn answered_during_delivery(request: &Value) -> bool {
+    matches!(
+        request.get("method").and_then(Value::as_str),
+        Some("mining.submit" | "mining.get_health")
+    )
+}
+
+/// Handle `work`, a request answered during a delivery, while that delivery
+/// keeps being polled, so it never stalls behind the request (#621). A
+/// delivery that finishes meanwhile is kept in `finished` and announced
+/// after the request's answer.
+async fn alongside<T, D: FusedFuture>(
+    work: impl Future<Output = T>,
+    mut delivery: Pin<&mut D>,
+    finished: &mut Option<D::Output>,
+) -> T {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut work => return output,
+            prepared = delivery.as_mut(), if !delivery.is_terminated() => *finished = Some(prepared),
+        }
+    }
+}
+
+/// Admit, build and persist one job. The session loop polls this while it
+/// keeps answering submits (#621) and announces the job with
+/// [`announce_job`] once it is durable. `refresh` is this delivery's own
+/// receiver, for the rebuild lane's re-check (#604).
+async fn prepare_job<B: MiningBackend>(
     backend: &B,
-    session: &mut Session<B::Context>,
-    writer: &mut (impl AsyncWrite + Unpin),
+    inputs: DeliveryInputs,
     config: &StratumConfig,
     metrics: &crate::metrics::Metrics,
     mut refresh: watch::Receiver<u64>,
-) -> Result<()> {
-    let Some(extranonce1) = session.extranonce1.as_deref() else {
-        return Ok(());
-    };
-    let Some(worker) = session.worker.as_ref().cloned() else {
-        return Ok(());
-    };
-    let worker = &worker;
-    let mut observation = DeliveryObservation::new(config.stats.clone());
+) -> std::result::Result<PreparedJob<B::Context>, StratumError> {
+    let DeliveryInputs {
+        worker,
+        extranonce1,
+        difficulty,
+        miner_version_mask,
+        prior,
+    } = inputs;
+    let prior = prior.as_ref();
+    let observation = DeliveryObservation::new(config.stats.clone());
     // #604: a session that holds current work (its newest job, for this
     // worker, is on the published parent and payout revision) can keep
     // mining meanwhile, so its rebuild (a same-tip republication, a
@@ -1125,12 +1216,6 @@ async fn deliver_job<B: MiningBackend>(
     // session without current work (a first job, a new worker, a tip change
     // or a payout revision landing) waits for those, not for every session's
     // rebuild. It takes only the shared initial-job admission, as before.
-    let prior = session
-        .jobs
-        .back()
-        // A job resumed after a reconnect is retired and is not current work.
-        .filter(|prior| prior.worker.username == worker.username && prior.retired_at.is_none())
-        .map(|prior| &prior.job.wire);
     let build = async {
         let lane = if holds_current_work(backend, prior).await {
             match config.rebuild_job_limit.try_acquire() {
@@ -1165,45 +1250,30 @@ async fn deliver_job<B: MiningBackend>(
             .await
             .map_err(|_| StratumError::internal("pool is shutting down"))?;
         backend
-            .build_job(
-                worker,
-                extranonce1,
-                session.difficulty,
-                config.minimum_difficulty,
-            )
+            .build_job(&worker, &extranonce1, difficulty, config.minimum_difficulty)
             .await
             .map(|job| (job, lane))
     };
     let revision_build = metrics.revision_work_build();
-    let (mut job, lane) = match timeout(
+    let (job, lane) = match timeout(
         Duration::from_secs_f64(config.initial_job_timeout_seconds),
         build,
     )
     .await
     {
-        Ok(Ok(built)) => built,
-        Ok(Err(error)) => {
-            session.retry_job = true;
-            return Err(error.into());
-        }
+        Ok(built) => built?,
         Err(_) => {
             revision_build.deadline_hit();
-            session.retry_job = true;
-            return Err(StratumError::backend("initial job delivery timed out").into());
+            return Err(StratumError::backend("initial job delivery timed out"));
         }
     };
-    let work_invalidated = session.jobs.back().is_none_or(|prior| {
-        prior.job.wire.previousblockhash != job.wire.previousblockhash
-            || prior.job.wire.payout_revision != job.wire.payout_revision
-    });
-    job.wire.clean_jobs = work_invalidated;
-    let mask = session.miner_version_mask.map_or(0, |miner| {
+    let mask = miner_version_mask.map_or(0, |miner| {
         miner & config.version_rolling_mask & job.wire.version_mask
     });
     match timeout(
         Duration::from_secs_f64(config.initial_job_timeout_seconds),
         backend.persist_issued_job(
-            worker,
+            &worker,
             &job,
             mask,
             Duration::from_secs_f64(config.job_retention_seconds.max(config.stale_grace_seconds)),
@@ -1211,18 +1281,68 @@ async fn deliver_job<B: MiningBackend>(
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+        Ok(persisted) => persisted?,
+        Err(_) => return Err(StratumError::backend("job persistence timed out")),
+    }
+    // The job is durable. Neither a slow miner's socket nor a submit the
+    // session answers before announcing it (#621) may hold the lane.
+    drop(lane);
+    Ok(PreparedJob {
+        job,
+        worker,
+        mask,
+        observation,
+    })
+}
+
+/// Build, persist and announce one job in turn, as the session loop did
+/// before #621; the in-crate session tests drive a delivery this way.
+#[cfg(test)]
+async fn deliver_job<B: MiningBackend>(
+    backend: &B,
+    session: &mut Session<B::Context>,
+    writer: &mut (impl AsyncWrite + Unpin),
+    config: &StratumConfig,
+    metrics: &crate::metrics::Metrics,
+    refresh: watch::Receiver<u64>,
+) -> Result<()> {
+    let Some(inputs) = DeliveryInputs::of(session) else {
+        return Ok(());
+    };
+    session.retry_job = false;
+    match prepare_job(backend, inputs, config, metrics, refresh).await {
+        Ok(prepared) => announce_job(backend, session, writer, config, metrics, prepared).await,
+        Err(error) => {
             session.retry_job = true;
-            return Err(error.into());
-        }
-        Err(_) => {
-            session.retry_job = true;
-            return Err(StratumError::backend("job persistence timed out").into());
+            Err(error.into())
         }
     }
-    // The job is durable; a slow miner's socket must not hold the lane.
-    drop(lane);
+}
+
+/// Announce a prepared job: its version mask and difficulty, then the work,
+/// and retire what it replaces.
+async fn announce_job<B: MiningBackend>(
+    backend: &B,
+    session: &mut Session<B::Context>,
+    writer: &mut (impl AsyncWrite + Unpin),
+    config: &StratumConfig,
+    metrics: &crate::metrics::Metrics,
+    prepared: PreparedJob<B::Context>,
+) -> Result<()> {
+    let PreparedJob {
+        mut job,
+        worker,
+        mask,
+        mut observation,
+    } = prepared;
+    let worker = &worker;
+    // Against the work the miner holds now: a submit answered while this job
+    // was built may have resumed or pruned some (#621).
+    let work_invalidated = session.jobs.back().is_none_or(|prior| {
+        prior.job.wire.previousblockhash != job.wire.previousblockhash
+            || prior.job.wire.payout_revision != job.wire.payout_revision
+    });
+    job.wire.clean_jobs = work_invalidated;
     if session.miner_version_mask.is_some() && mask != session.advertised_version_mask {
         write_json(
             writer,
@@ -1278,7 +1398,8 @@ async fn deliver_job<B: MiningBackend>(
         version_mask: mask,
         retired_at: None,
     });
-    session.retry_job = false;
+    // `retry_job` was consumed when this delivery started: a publication or
+    // retarget seen since asks for the next one.
     observation.success = true;
     if let Some((difficulty, evidence, downward_only)) = hint {
         remember_difficulty(
@@ -1687,6 +1808,11 @@ async fn request<B: MiningBackend>(
                     .submit(&issued.worker, &issued.job, submission, grace)
                     .await?;
                 session.vardiff.accepted(proved_difficulty);
+                // Also in the state a failed retarget delivery restores, so a
+                // share answered while it is in flight (#621) counts either way.
+                if let Some((_, previous)) = &mut session.pending_retarget {
+                    previous.accepted(proved_difficulty);
+                }
                 session.last_accepted_share = Some((share_id.clone(), proved_difficulty));
                 config
                     .stats
@@ -1788,25 +1914,46 @@ pub async fn serve_connection<B: MiningBackend>(
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // An unauthenticated peer must not retain admission indefinitely.
     let connected = Instant::now();
+    // The session's job delivery in flight (#621): built and persisted while
+    // the loop below keeps answering submits, then announced from it.
+    let delivery = Fuse::terminated();
+    tokio::pin!(delivery);
+    // That delivery once it finished, until it is announced.
+    let mut finished = None;
+    // A request that waits for that delivery (see `answered_during_delivery`)
+    // and when its frame completed. Nothing after it is read until it is
+    // handled.
+    let mut held: Option<(Value, tokio::time::Instant)> = None;
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // A failed delivery is retried after the next event, the timer at the
+        // latest, never in the pass that saw it fail.
+        let mut delivery_failed = false;
         let remaining = config.max_message_bytes + 1 - buffer.len();
         let mut bounded_reader = (&mut reader).take(remaining as u64);
+        // Reads come last (#621). Every other branch is ready at most once per
+        // tick, publication or delivery and returns promptly, so none starves
+        // a pending request, and a backlog of requests cannot hold off a
+        // finished delivery, a new publication or the unauthenticated-peer
+        // deadline.
         tokio::select! {
+            biased;
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+            prepared = &mut delivery, if !delivery.is_terminated() => finished = Some(prepared),
             changed = refresh.changed() => {
                 if changed.is_err() { break; }
                 session.retry_job = session.worker.is_some() && session.extranonce1.is_some();
             }
             _ = timer.tick() => {
-                if session.jobs.is_empty() && session.retained.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
+                // A delivery in flight ends at its own deadlines first.
+                if delivery.is_terminated() && session.jobs.is_empty() && session.retained.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
                 let observed_tip = backend.observed_tip_hint().await;
                 session.prune_jobs(&config, observed_tip.as_ref());
                 session.retarget();
             }
-            read = bounded_reader.read_until(b'\n',&mut buffer) => {
+            read = bounded_reader.read_until(b'\n',&mut buffer), if held.is_none() => {
                 if read? == 0 { break; }
                 if buffer.len() > config.max_message_bytes {
                     write_json(&mut writer,StratumError::malformed("Stratum message exceeds size limit").response(Value::Null),&config).await?;
@@ -1816,12 +1963,51 @@ pub async fn serve_connection<B: MiningBackend>(
                 let received_at = tokio::time::Instant::now();
                 let frame = std::mem::take(&mut buffer);
                 match serde_json::from_slice::<Value>(&frame) {
-                    Ok(value) if value.is_object() => request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics).await?,
+                    Ok(value) if value.is_object() && !delivery.is_terminated() && !answered_during_delivery(&value) => held = Some((value, received_at)),
+                    Ok(value) if value.is_object() => alongside(request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics), delivery.as_mut(), &mut finished).await?,
                     _ => {
                         write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?;
                         session.charge(crate::metrics::ConnectionRefusalReason::MalformedFrameBudget,&metrics);
                     }
                 }
+            }
+        }
+        if let Some(prepared) = finished.take() {
+            session.delivery_in_flight = false;
+            match prepared {
+                Ok(prepared) => {
+                    announce_job(
+                        backend.as_ref(),
+                        &mut session,
+                        &mut writer,
+                        &config,
+                        &metrics,
+                        prepared,
+                    )
+                    .await?
+                }
+                Err(_) => {
+                    // Template/RPC trouble is retried on the timer while existing
+                    // work remains usable. Do not disconnect a healthy miner.
+                    session.restore_retarget();
+                    session.retry_job = true;
+                    delivery_failed = true;
+                }
+            }
+        }
+        if delivery.is_terminated() {
+            if let Some((value, received_at)) = held.take() {
+                metrics.observe_request_delivery_wait(received_at.elapsed());
+                request(
+                    backend.as_ref(),
+                    &mut session,
+                    &mut writer,
+                    &config,
+                    value,
+                    received_at,
+                    &metrics,
+                )
+                .await?;
             }
         }
         if let Some(reason) = session.budget_exceeded {
@@ -1832,23 +2018,17 @@ pub async fn serve_connection<B: MiningBackend>(
             );
             break;
         }
-        if session.retry_job {
-            if let Err(error) = deliver_job(
-                backend.as_ref(),
-                &mut session,
-                &mut writer,
-                &config,
-                &metrics,
-                refresh.clone(),
-            )
-            .await
-            {
-                session.restore_retarget();
-                if error.downcast_ref::<StratumError>().is_none() {
-                    return Err(error);
-                }
-                // Template/RPC trouble is retried on the timer while existing
-                // work remains usable. Do not disconnect a healthy miner.
+        if session.retry_job && delivery.is_terminated() && !delivery_failed {
+            // A retarget that waited for the delivery just announced rides
+            // this one, so back-to-back deliveries never starve vardiff.
+            session.retarget();
+            if let Some(inputs) = DeliveryInputs::of(&session) {
+                session.retry_job = false;
+                session.delivery_in_flight = true;
+                delivery.set(
+                    prepare_job(backend.as_ref(), inputs, &config, &metrics, refresh.clone())
+                        .fuse(),
+                );
             }
         }
     }

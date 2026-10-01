@@ -239,6 +239,13 @@ pub fn expected(populated: bool) -> Census {
         &unlabelled,
         SECONDS,
     );
+    // #621: a request that waited for its session's own job delivery.
+    result.family(
+        "stratum_request_delivery_wait_seconds",
+        "histogram",
+        &unlabelled,
+        SECONDS,
+    );
     result.family(
         "share_ack_seconds",
         "histogram",

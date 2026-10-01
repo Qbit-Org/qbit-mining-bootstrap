@@ -117,6 +117,9 @@
         "qbit_prism_stratum_oldest_pending_initial_job_seconds"
       ]
     },
+    "stratum_request_delivery_wait_seconds": {
+      "status": "Default histogram ladder. One observation per waiting request, when its session handles it, whether the delivery it waited for was announced or failed; none when the session ends first. A delivery is the admission, build and persistence of the session's next job and its announcement. A submit queued behind a waiting request is read only after it, and `share_ack_seconds` starts at that read, so this family, not the ACK histogram, carries that wait. Zero series from start; no rule of its own."
+    },
     "stratum_current_tip_coverage_gap_seconds": {
       "replaces": [
         "qbit_prism_stratum_current_tip_coverage_gap_seconds"

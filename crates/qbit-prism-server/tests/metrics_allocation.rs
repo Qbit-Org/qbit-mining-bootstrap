@@ -73,6 +73,7 @@ fn observe_all(metrics: &Metrics, elapsed: Duration) {
         }
     }
     metrics.observe_first_offer(elapsed);
+    metrics.observe_request_delivery_wait(elapsed);
 }
 
 /// #602's hooks: the Stratum ACK path, which outside a landing window adds
@@ -177,10 +178,10 @@ fn concurrent_events_preserve_every_count_and_sum_without_allocating() {
     }
     let body = metrics.render();
     let histogram_count = body.lines().filter(|line| line.contains("_count")).count();
-    // Eleven exercised event series plus two idle CTV, three idle landing
-    // and two idle landing-window ACK histograms (#602). Runtime suites own
-    // their observations.
-    assert_eq!(histogram_count, 18);
+    // Twelve exercised event series (#621's request delivery wait included)
+    // plus two idle CTV, three idle landing and two idle landing-window ACK
+    // histograms (#602). Runtime suites own their observations.
+    assert_eq!(histogram_count, 19);
     for line in body.lines().filter(|line| line.contains("_count")) {
         let (key, count) = line.rsplit_once(' ').unwrap();
         if key.starts_with("qbit_prism_ctv_fanout_broadcaster_")

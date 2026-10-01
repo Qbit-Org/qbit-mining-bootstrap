@@ -897,6 +897,153 @@ async fn superseded_same_parent_work_is_dropped_not_grace_credited_after_a_flip(
     task.await.unwrap();
 }
 
+// #621: a session answers a submit while its own job rebuild is held inside
+// the build, and announces the rebuilt job only once it is persisted, after
+// that answer. Before the fix the session read nothing until the rebuild
+// returned, so the answer never came while the build was held.
+#[tokio::test]
+async fn a_submit_is_answered_while_the_sessions_own_rebuild_is_held() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.rebuild").await;
+    let current = client.notify["params"][0].clone();
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    client
+        .send(client.solved_submit(20, "miner.rebuild", 0))
+        .await;
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 20, "answered before the rebuild: {answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(client.request_health(21).await["result"]["ready"], false);
+    assert_eq!(backend.stored.lock().unwrap().len(), 1, "nothing persisted");
+    gate.release.notify_one();
+    // Difficulty precedes the work it applies to, and the work is durable.
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    let notify = client.read().await;
+    assert_eq!(notify["method"], "mining.notify");
+    let rebuilt = notify["params"][0].as_str().unwrap();
+    assert_ne!(notify["params"][0], current);
+    assert!(backend.stored.lock().unwrap().contains_key(rebuilt));
+    assert_eq!(notify["params"][8], false, "same tip and revision");
+    client.notify = notify;
+    client
+        .send(client.solved_submit(22, "miner.rebuild", 50_000))
+        .await;
+    assert_eq!(client.response(22).await["result"], true);
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.rebuild", "miner.rebuild"]
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #621: the session keeps building and persisting its job while it handles a
+// submit, and announces that job only after the submit's answer.
+#[tokio::test]
+async fn a_rebuild_keeps_moving_while_a_submit_is_handled() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.overlap").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    let submit = Arc::new(observability::Gate::default());
+    *backend.submit_gate.lock().unwrap() = Some(submit.clone());
+    client
+        .send(client.solved_submit(20, "miner.overlap", 0))
+        .await;
+    submit.entered.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind the submit");
+    submit.release.notify_one();
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 20, "{answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    assert_eq!(client.read().await["method"], "mining.notify");
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #621: a publication the session sees while its rebuild is held is not lost
+// when that older delivery finishes: the session delivers again after it.
+#[tokio::test]
+async fn a_publication_seen_during_a_held_rebuild_is_delivered_after_it() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.republish").await;
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    let built = backend.jobs.load(Ordering::Relaxed);
+    backend.payout_revision.store(1, Ordering::Relaxed);
+    refresh.send(2).unwrap();
+    // The session takes a publication before a request, so this answer means
+    // it has seen the one above while its rebuild was still held.
+    client.request_health(20).await;
+    gate.release.notify_one();
+    client.next_job().await;
+    assert_eq!(client.notify["params"][8], true, "the held rebuild");
+    client.next_job().await;
+    assert_eq!(client.notify["params"][8], false, "the delivery after it");
+    assert_eq!(backend.jobs.load(Ordering::Relaxed), built + 2);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #621: shares answered during a held rebuild do not retarget under it (that
+// job keeps the difficulty it was built at), and the retarget they earn rides
+// the very next delivery, so back-to-back rebuilds cannot starve vardiff.
+#[tokio::test]
+async fn a_retarget_earned_during_a_held_rebuild_rides_the_next_delivery() {
+    let mut config = StratumConfig {
+        startup_difficulty: 1e-8,
+        ..Default::default()
+    };
+    config.vardiff.minimum = 1e-8;
+    config.vardiff.initial_min_shares = 2;
+    config.vardiff.initial_min_seconds = 1e-9;
+    let (address, backend, refresh, shutdown, task) = start(config).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let mut client = Client::connect(address).await;
+    client.login("miner.retarget").await;
+    let start_difficulty = client.difficulty;
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    for id in [20, 21] {
+        let share = client.solved_share(id, "miner.retarget", id as u32 * 100_000);
+        client.send(share).await;
+        assert_eq!(client.response(id).await["result"], true);
+    }
+    refresh.send(2).unwrap();
+    client.request_health(22).await;
+    gate.release.notify_one();
+    client.next_job().await;
+    assert_eq!(client.difficulty, start_difficulty, "the held rebuild");
+    client.next_job().await;
+    assert!(
+        client.difficulty >= start_difficulty * 4.0,
+        "the delivery right after it carries the retarget: {}",
+        client.difficulty
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
 // This runs against an in-memory backend, so it proves only that the frame is
 // forwarded: the credited amount and its timing are covered by
 // `coordinator::d2_below_target_tests` (decision D2b).

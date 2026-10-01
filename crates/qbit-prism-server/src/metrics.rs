@@ -112,6 +112,7 @@ impl Metrics {
             Family::AcceptedUnlanded,
             Family::RevisionWorkTimeouts,
             Family::LandingTrimReleased,
+            Family::RequestDeliveryWait,
         ] {
             registry.register(family, vec![], 0.);
         }
