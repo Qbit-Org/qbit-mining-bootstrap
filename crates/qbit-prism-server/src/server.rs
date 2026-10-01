@@ -373,6 +373,7 @@ async fn publish_health(
             );
             registry.publish_delivery(stats.delivery_metrics());
             registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
+            registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
             state.publish_metrics(registry.render())?;
             Ok(health)
         })

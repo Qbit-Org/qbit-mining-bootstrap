@@ -6,9 +6,9 @@ use qbit_prism_server::{
     api::router,
     metrics::{
         AckResult, BlockAckPath, CaptureDecision, Collector, ConnectionRefusalReason,
-        DatabaseMetrics, DeliveryMetrics, LockKind, Metrics, NodeObservation, OrderLockHolder,
-        Outcome, ProcessMetrics, RefreshAcquisition, RefreshTrigger, RejectReason, StaleJobCause,
-        StandbyWaitOutcome, TaskKind, WindowAcquisition,
+        DatabaseMetrics, DeliveryMetrics, JobDeferral, LockKind, Metrics, NodeObservation,
+        OrderLockHolder, Outcome, ProcessMetrics, RefreshAcquisition, RefreshTrigger, RejectReason,
+        StaleJobCause, StandbyWaitOutcome, TaskKind, WindowAcquisition,
     },
     stratum::StratumStats,
 };
@@ -29,8 +29,9 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 77);
-    assert_eq!(startup_census.series.len(), 305);
+    assert_eq!(startup_census.families.len(), 79);
+    assert_eq!(startup_census.series.len(), 312);
+    assert_eq!(sample(&startup, "qbit_prism_tip_poll_age_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
     assert_eq!(
         sample(&startup, "qbit_prism_node_observation_age_seconds"),
@@ -72,6 +73,9 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         for cause in StaleJobCause::ALL {
             metrics.record_stale_job_rejection(*cause);
         }
+        for reason in JobDeferral::ALL {
+            metrics.record_job_preparation_deferral(*reason);
+        }
         for decision in CaptureDecision::ALL {
             metrics.record_capture_decision(*decision);
         }
@@ -111,6 +115,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         snapshot.authorized_with_current_work = iteration as usize / 2;
         metrics.publish_stratum(&snapshot, iteration % 2 == 0, 2, iteration);
         let known = iteration % 3 == 0;
+        metrics.publish_tip_poll_age(known.then_some(elapsed));
         metrics.publish_delivery(DeliveryMetrics {
             pending_initial_jobs: known.then_some(iteration),
             oldest_initial_job: known.then_some(elapsed),
@@ -155,8 +160,12 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 77);
-        assert_eq!(populated.series.len(), 956);
+        assert_eq!(populated.families.len(), 79);
+        assert_eq!(populated.series.len(), 963);
+        assert_eq!(
+            sample(&body, "qbit_prism_tip_poll_age_seconds"),
+            if known { elapsed.as_secs_f64() } else { -1. }
+        );
         assert_eq!(
             sample(&body, "qbit_prism_node_peers"),
             if known {

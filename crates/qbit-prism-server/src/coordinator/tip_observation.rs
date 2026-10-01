@@ -9,6 +9,19 @@ pub(super) fn tip_hash(value: &Value) -> Option<&str> {
         .filter(|hash| hash.len() == 64 && hex::decode(hash).is_ok())
 }
 
+/// Why tip authority refused work before any economic check. The text is
+/// the log line operators already read; the type lets job preparation count
+/// the reason without matching it (#622).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(super) enum TipRefusal {
+    #[error("tip polling stale")]
+    PollingStale,
+    #[error("tip polling unavailable")]
+    PollingUnavailable,
+    #[error("new tip work is pending")]
+    NewTipPending,
+}
+
 pub(super) struct SubmitAdmission {
     pub current: Arc<Prepared>,
     pub tip: TipView,
@@ -220,7 +233,7 @@ impl PublishedLease {
                 view.readiness
                     .last_poll
                     .is_some_and(|poll| poll.elapsed() < config.health_timeout),
-                "tip polling stale"
+                TipRefusal::PollingStale
             );
         }
         Ok(match tip {
@@ -405,6 +418,17 @@ impl TipState {
         self.current
             .as_ref()
             .is_some_and(|tip| tip.hash != hash && tip.observed_at > since)
+    }
+
+    /// Whether the poll that reserved `sequence` and found `hash` still
+    /// describes the published tip: the newest observation is that poll or a
+    /// later one on the same tip. A poll answering after a newer observation
+    /// found another tip proves nothing now (#622).
+    pub(super) fn polled_published(&self, hash: &str, sequence: u64) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|tip| tip.hash == hash && tip.sequence >= sequence)
+            && self.published.as_ref().is_some_and(|tip| tip.hash == hash)
     }
 
     pub(super) fn reserve(&mut self) -> u64 {
@@ -752,7 +776,7 @@ impl Coordinator {
         let leased = authority
             .as_ref()
             .is_some_and(|tip| tip.hash == parent && tip.share_lease);
-        let last_poll = readiness.last_poll.context("tip polling unavailable")?;
+        let last_poll = readiness.last_poll.ok_or(TipRefusal::PollingUnavailable)?;
         if leased
             && !published_work
                 .as_deref()
@@ -773,17 +797,17 @@ impl Coordinator {
             ensure!(
                 current_parent.is_some()
                     && (current_parent == selected.as_deref() || current_leased),
-                "new tip work is pending"
+                TipRefusal::NewTipPending
             );
             ensure!(
                 last_poll.elapsed() < self.config.health_timeout || current_leased,
-                "tip polling stale"
+                TipRefusal::PollingStale
             );
             return Ok(Err(WorkRefusal::Superseded));
         }
         ensure!(
             last_poll.elapsed() < self.config.health_timeout || leased,
-            "tip polling stale"
+            TipRefusal::PollingStale
         );
         let published_tip = selected.publication_stamp();
         let deadline = leased

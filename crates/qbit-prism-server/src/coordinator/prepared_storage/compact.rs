@@ -131,9 +131,19 @@ impl CompactPublicationGuard<'_> {
             &self.captured.original.template,
             self.template_max_age,
         )?;
+        // A block-wait floor read may have raised the live relay floor while
+        // this work was built (#622): never publish a fee admission would
+        // refuse at once.
+        if let (Some(fee), Some(floor)) = (
+            self.captured.original.fee,
+            self.view.readiness.ctv_fee_floor,
+        ) {
+            crate::coordinator::validate_fee_floor(fee, floor)?;
+        }
         self.view.tip.publish(&self.captured.record.parent_hash)?;
         *self.view.prepared = Some(self.captured.original.clone());
         self.view.readiness.last_poll = Some(Instant::now());
+        self.view.readiness.poll_renews = true;
         self.refresh.send_replace(self.captured.original.generation);
         Ok(())
     }

@@ -29,6 +29,7 @@ mod refresh_window;
 mod resume_inputs;
 mod runtime_recovery;
 pub(crate) mod stale_causes;
+pub(crate) mod tip_poll;
 mod work_store;
 
 pub(super) fn hash(byte: u8) -> String {
@@ -220,6 +221,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
 
 pub(crate) struct Node {
     pub tip: String,
+    /// `getmempoolinfo`'s answer, when a case moves the relay floor.
+    pub mempool: Option<Value>,
     pub template: Option<Value>,
     pub parents: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -255,7 +258,11 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
             "getblockchaininfo" => {
                 json!({"chain":"regtest","initialblockdownload":false,"blocks":100,"headers":100,"bestblockhash":node.tip,"chainwork":"01"})
             }
-            "getmempoolinfo" => json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001}),
+            "estimatesmartfee" => json!({"feerate":0.001,"blocks":2}),
+            "getmempoolinfo" => node
+                .mempool
+                .clone()
+                .unwrap_or_else(|| json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001})),
             _ => panic!("unexpected node RPC {method}"),
         };
         (result, node.fail.as_deref() == Some(method), gate)
@@ -301,6 +308,7 @@ impl Fixture {
     ) -> Self {
         let node = Arc::new(StdMutex::new(Node {
             tip: hash(1),
+            mempool: None,
             template: None,
             parents: [(hash(1), hash(0)), (hash(2), hash(1)), (hash(3), hash(2))].into(),
             calls: vec![],
