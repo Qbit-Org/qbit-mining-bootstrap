@@ -576,6 +576,7 @@ qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::accepted_
 qbit-prism-server::qbit_prism_server::coordinator::d2_bootstrap_tests::an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share
 qbit-prism-server::qbit_prism_server::coordinator::first_job_lane_tests::a_first_job_is_not_queued_behind_a_rebuild_storm
 qbit-prism-server::qbit_prism_server::coordinator::issued_batcher::tests::postgres::active_cancellation_keeps_live_peers_and_reconciles_all_gone
+qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::a_failed_window_probe_is_unknown_never_stale_and_enqueues_nothing
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_initial_probe_sql_error_cancel_and_original_deadline
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_checkout_cancel_and_deadline_stay_unknown
 qbit-prism-server::qbit_prism_server::coordinator::miner_submit::acquire_tests::block_only_poll_missing_and_sql_error_stay_unknown
@@ -640,6 +641,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::po
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
+qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::a_snapshot_reads_its_writer_timeline_in_the_transaction_that_reads_its_rows
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancellation_and_sql_timeout_release_probe_connection
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancelled_hash_keeps_build_admission_until_blocking_cleanup_finishes
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::failed_guard_precedes_locked_share_history
