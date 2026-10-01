@@ -60,6 +60,11 @@ use tokio::{sync::watch, task::JoinHandle};
 #[path = "live_pg_offer_standby.rs"]
 mod offer_standby;
 
+/// #474 B: the async promotion with live Stratum miners whose sessions and
+/// frontends survive it; it reuses this module's pair and relays.
+#[path = "live_pg_async_live_miners.rs"]
+mod async_live_miners;
+
 /// The dedicated standby's `application_name` and physical slot.
 const STANDBY: &str = "prism_standby_1";
 
