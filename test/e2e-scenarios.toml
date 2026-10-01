@@ -509,8 +509,9 @@ title = "#474 B: async promotion while miners and frontend caches survive"
 owner = "#474"
 lanes = ["pr"]
 criteria = "Set by #474: exact offered, ACKed, rejected and unknown share identities reconciled against the promoted ledger under D3."
-runs = false
-reason = "Not built; #521 scenario 3 covers a found block mid-landing, not live miners through promotion."
+runs = true
+tests = ["qbit-prism-server::live_regtest::pg_failover_tests::async_live_miners::async_promotion_with_live_miners_accounts_for_every_share_and_lands_a_block"]
+notes = "Four scripted miners on two frontends through a replication cut and a fence with a COMMIT held in flight; every ACKed-but-missing share named, sessions and kept work survive the promotion, and a post-promotion block pays a full read of the promoted window. The block on a job issued inside the gap is #619's opt-in case (ignored until fixed)."
 
 [[scenario]]
 id = "r474-c-lost-node-replies"
