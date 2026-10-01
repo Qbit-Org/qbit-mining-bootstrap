@@ -144,6 +144,16 @@ def load_legacy(path: Path = LEGACY_FLAGS) -> dict[str, dict[str, Any]]:
     return flags
 
 
+def load_report_fields(path: Path = LEGACY_FLAGS) -> dict[str, dict[str, Any]]:
+    """The side-report fields added after the oldest comparable build, each
+    with the commit that introduced it."""
+    fields = json.loads(path.read_text(encoding="utf-8")).get("report_fields", {})
+    for field, rule in fields.items():
+        if not re.fullmatch(r"[0-9a-f]{40}", str(rule.get("introduced", ""))) or not rule.get("why"):
+            raise DriverError(f"{path}: report field {field} needs introduced (a full commit) and why")
+    return fields
+
+
 def descends_from(commit: str, ancestor: str) -> bool:
     """Whether `commit` has `ancestor` in its history; a history that cannot
     be read (a shallow clone, an unknown commit) is refused, not guessed."""
@@ -619,9 +629,9 @@ def reap_orphans(keep: int | None = None) -> None:
 
 def sweep_descendants(grace_seconds: float = 60.0, poll_seconds: float = 0.2) -> None:
     """Stop every process still below the driver, whatever its session:
-    SIGTERM, then SIGKILL after `grace_seconds`, reaping each. Runs only
-    once a run's harness is gone, when nothing below the driver belongs to
-    anything but that run."""
+    SIGTERM, then SIGKILL after `grace_seconds`, reaping each, and return
+    only once none is left. Runs only once a run's harness is gone, when
+    nothing below the driver belongs to anything but that run."""
     me = os.getpid()
     live = lambda: [pid for pid in descendants(me) if _alive(pid)]  # noqa: E731
     for pid in live():
@@ -630,11 +640,19 @@ def sweep_descendants(grace_seconds: float = 60.0, poll_seconds: float = 0.2) ->
     deadline = time.monotonic() + grace_seconds
     while live() and time.monotonic() < deadline:
         time.sleep(poll_seconds)
-    killed_by = time.monotonic() + 10.0
-    while (remaining := live()) and time.monotonic() < killed_by:
+    # A process in uninterruptible I/O outlives SIGKILL until the I/O
+    # returns. The driver waits for it however long that takes, still
+    # holding the benchmark lock, and says so, rather than start the next
+    # run or free the host while it is alive.
+    warned = time.monotonic()
+    while remaining := live():
         for pid in remaining:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+        if time.monotonic() - warned >= 10.0:
+            print(f"waiting for {', '.join(map(str, remaining))} to exit after SIGKILL; the benchmark "
+                  "lock stays held until it does", file=sys.stderr, flush=True)
+            warned = time.monotonic()
         time.sleep(poll_seconds)
 
 
@@ -913,6 +931,7 @@ def run_series(
     previous: dict[str, Any] | None,
 ) -> int:
     builds = []
+    report_fields = load_report_fields()
     # The command lines as they run; only redacted copies are printed or
     # written to the manifest.
     commands: dict[str, list[str]] = {}
@@ -924,6 +943,12 @@ def run_series(
             lambda introduced, commit=build["commit"]: descends_from(commit, introduced),
         )
         build["argv"] = [redact_url_secrets(word) for word in commands[label]]
+        # The report fields this build's harness is too old to write; the
+        # comparator requires every other one.
+        build["predates_report_fields"] = sorted(
+            field for field, rule in report_fields.items()
+            if not descends_from(build["commit"], rule["introduced"])
+        )
         builds.append(build)
     if previous:
         for old, new in zip(previous["builds"], builds):

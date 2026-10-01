@@ -30,7 +30,9 @@ The driver, `scripts/prism_load_ab.py`:
    outright, whatever lock file it names. After each run the driver, a child subreaper, stops
    anything the run left below it, including the servers and PostgreSQL that
    leave the harness's process group with `setsid()`, and it does the same
-   for an interrupted build before releasing the locks. A host where the
+   for an interrupted build before releasing the locks. A process that
+   outlives SIGKILL (stuck in uninterruptible I/O) is waited out, with the
+   locks still held, before anything else runs. A host where the
    driver cannot become a subreaper is refused, dry runs included.
 3. **Records `pg_test_fsync`.** It runs `-s 5` on the filesystem the harness
    builds its clusters on, once before the series and once after.

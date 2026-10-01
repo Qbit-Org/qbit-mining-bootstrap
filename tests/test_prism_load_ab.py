@@ -694,6 +694,7 @@ Compare file sync methods using two 8kB writes:
                       "args": {"--database-url": url}}
             comparison = subprocess.CompletedProcess([], 0, stdout="", stderr="")
             with mock.patch.object(ab, "prepare_build", build), \
+                    mock.patch.object(ab, "descends_from", lambda commit, ancestor: False), \
                     mock.patch.object(ab, "help_flags", lambda harness: frozenset(["--database-url"])), \
                     mock.patch.object(ab, "record_fsync", lambda *args: {"fdatasync_usecs_per_op": 288.0}), \
                     mock.patch.object(ab, "wait_for_quiet", lambda *args: 0.1), \
@@ -707,6 +708,11 @@ Compare file sync methods using two 8kB writes:
         self.assertNotIn("hunter2", manifest)
         self.assertNotIn("hunter2", log.getvalue())
         self.assertIn("postgresql://alex:<redacted>@db.example/qbit", manifest)
+        # Builds whose history predates a report field are recorded as such.
+        self.assertEqual(
+            [build["predates_report_fields"] for build in json.loads(manifest)["builds"]],
+            [["mem_available_unread_checks"]] * 2,
+        )
 
     def test_a_resume_whose_rebuilt_binaries_differ_is_refused(self) -> None:
         def build(label, ref, out, skip_build):
@@ -724,9 +730,31 @@ Compare file sync methods using two 8kB writes:
                 for label in ab.LABELS
             ], "runs": [], "pg_test_fsync": {}}
             with mock.patch.object(ab, "prepare_build", build), \
+                    mock.patch.object(ab, "descends_from", lambda commit, ancestor: True), \
                     mock.patch.object(ab, "help_flags", lambda harness: frozenset()), \
                     self.assertRaisesRegex(ab.DriverError, "not the ones its recorded runs used"):
                 ab.run_series(options, out, preset, {}, frozenset(), out / "manifest.json", previous)
+
+    def test_the_sweep_waits_out_a_descendant_that_outlives_sigkill(self) -> None:
+        # A process in uninterruptible I/O survives SIGKILL for a while: here
+        # 30 of the fake clock's seconds, three times the old give-up window.
+        clock = {"now": 0.0}
+        alive_until = 30.0
+
+        def monotonic() -> float:
+            clock["now"] += 1.0
+            return clock["now"]
+
+        survivor = 999_999
+        with mock.patch.object(ab, "descendants", lambda root: [survivor] if clock["now"] < alive_until else []), \
+                mock.patch.object(ab, "_alive", lambda pid: True), \
+                mock.patch.object(ab.os, "kill", lambda pid, sig: None), \
+                mock.patch.object(ab.time, "monotonic", monotonic), \
+                mock.patch.object(ab.time, "sleep", lambda seconds: None), \
+                contextlib.redirect_stderr(io.StringIO()) as log:
+            ab.sweep_descendants(grace_seconds=1.0)
+        self.assertGreaterEqual(clock["now"], alive_until)
+        self.assertIn(f"waiting for {survivor} to exit after SIGKILL", log.getvalue())
 
     def test_a_named_preset_resolves_to_the_checked_in_file(self) -> None:
         self.assertEqual(ab.preset_path("throughput-20k-window-1fe"), ab.PRESETS / "throughput-20k-window-1fe.json")

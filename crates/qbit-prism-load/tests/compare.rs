@@ -84,6 +84,7 @@ fn plain_phase(
         "database_delay_observed_select1_median_milliseconds": 0.2,
         "reconciliation": {"missing": 0, "unexpected": 0},
         "min_mem_available_kib": 30_000 * 1024,
+        "mem_available_unread_checks": 0,
         "in_artifact": true,
         "database_delay_milliseconds_configured": 0,
         "scheduled_blocks": 0,
@@ -227,7 +228,8 @@ fn manifest(fdatasync_usecs: f64) -> Manifest {
             "after": {"fdatasync_usecs_per_op": fdatasync_usecs},
         },
         "builds": [
-            {"label": "base", "ref": "5d0042f6", "commit": BASE, "dropped_legacy_flags": ["--seed"]},
+            {"label": "base", "ref": "5d0042f6", "commit": BASE, "dropped_legacy_flags": ["--seed"],
+             "predates_report_fields": ["mem_available_unread_checks"]},
             {"label": "candidate", "ref": "3.x.x", "commit": CANDIDATE},
         ],
         "runs": runs,
@@ -1113,16 +1115,33 @@ fn a_run_that_fell_under_the_pinned_memory_floor_fails() {
         "{}",
         result.markdown
     );
-    // None counted is a floor held, and a harness older than the count is
-    // held to its readings alone.
-    let mut runs = loaded(&manifest, |_, _| met_steady());
-    for run in &mut runs {
-        run.report.as_mut().unwrap()["phases"][0]["mem_available_unread_checks"] = json!(0);
-    }
+    // A harness the driver found older than the count is held to its
+    // readings alone; a newer one must carry the count.
+    let without_count = |build: &str| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in runs.iter_mut().filter(|r| r.run.build == build) {
+            for phase in run.report.as_mut().unwrap()["phases"]
+                .as_array_mut()
+                .unwrap()
+            {
+                phase
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("mem_available_unread_checks");
+            }
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap()
+    };
+    let result = without_count("base");
+    assert!(result.passed, "{}", result.markdown);
+    let result = without_count("candidate");
+    assert!(!result.passed);
     assert!(
-        compare::compare(&manifest, &runs, &d1_budgets(), &d1_args())
-            .unwrap()
-            .passed
+        result
+            .markdown
+            .contains("does not count the MemAvailable checks it could not read in `steady_state`"),
+        "{}",
+        result.markdown
     );
 }
 

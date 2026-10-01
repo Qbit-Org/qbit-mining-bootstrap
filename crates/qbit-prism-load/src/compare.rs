@@ -69,6 +69,11 @@ pub struct Build {
     pub commit: String,
     #[serde(default)]
     pub dropped_legacy_flags: Vec<String>,
+    /// The side-report fields this build's harness is too old to write, as
+    /// the driver found from its history (`legacy-flags.json`'s
+    /// `report_fields`); a report from any other build must carry them.
+    #[serde(default)]
+    pub predates_report_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2292,8 +2297,9 @@ pub fn compare(
     // show that (`phases[].min_mem_available_kib`, in every harness since #271).
     // Nor can a floor check that could not read MemAvailable: a phase that
     // counts one (`mem_available_unread_checks`, since #514) went unguarded
-    // for a while, whatever its other readings said. A harness older than
-    // #514 counts none, and is held to its readings alone.
+    // for a while, whatever its other readings said. Every phase of a build
+    // newer than #514 must carry the count; a harness the driver found to
+    // predate it counts none, and is held to its readings alone.
     if let Some(floor_mib) = pinned
         .get("--min-mem-available-mib")
         .and_then(Value::as_u64)
@@ -2318,6 +2324,30 @@ pub fn compare(
                 .iter()
                 .filter_map(|p| p["mem_available_unread_checks"].as_u64())
                 .sum();
+            let counts_unread = !manifest
+                .builds
+                .iter()
+                .find(|b| b.label == run.run.build)
+                .is_some_and(|b| {
+                    b.predates_report_fields
+                        .iter()
+                        .any(|f| f == "mem_available_unread_checks")
+                });
+            let uncounted = phases
+                .iter()
+                .find(|p| p["mem_available_unread_checks"].as_u64().is_none())
+                .filter(|_| counts_unread);
+            if let Some(phase) = uncounted {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not hold the pinned memory floor**: {} does not count the \
+                     MemAvailable checks it could not read in `{}`, though its harness is newer \
+                     than the count (#514)",
+                    run.run.id,
+                    phase["name"].as_str().unwrap_or("?")
+                ));
+                break;
+            }
             if unread > 0 {
                 passed = false;
                 findings.push(format!(

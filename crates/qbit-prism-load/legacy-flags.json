@@ -1,6 +1,6 @@
 {
   "schema": "qbit.prism.load-legacy-flags.v1",
-  "description": "Result flags added to qbit-prism-load after the oldest build the A/B driver (scripts/prism_load_ab.py) compares, #271's base 5d0042f6. A build whose harness lacks one of these flags ran the workload its rule describes; the driver leaves the flag off that build's command line only when the preset's value satisfies the rule, and refuses the pair otherwise, so an older build never runs a different workload under the preset's name. A flag an older harness lacks with no rule here is refused too. tests/legacy_flags.rs holds every `equals` to the current harness's default. `introduced` is the commit that added the flag: a build descending from it lacks the flag only because its harness lost it, and is refused rather than treated as older.",
+  "description": "Result flags added to qbit-prism-load after the oldest build the A/B driver (scripts/prism_load_ab.py) compares, #271's base 5d0042f6. A build whose harness lacks one of these flags ran the workload its rule describes; the driver leaves the flag off that build's command line only when the preset's value satisfies the rule, and refuses the pair otherwise, so an older build never runs a different workload under the preset's name. A flag an older harness lacks with no rule here is refused too. tests/legacy_flags.rs holds every `equals` to the current harness's default. `introduced` is the commit that added the flag: a build descending from it lacks the flag only because its harness lost it, and is refused rather than treated as older. `report_fields` names side-report fields added after that base, each with the commit that added it: the driver records which of them a build predates, and a report from a build that does not predate one must carry it.",
   "flags": {
     "--arrival": {
       "equals": "smooth",
@@ -121,6 +121,12 @@
       "equals": "1e7fffff",
       "introduced": "0c8842e4e62ab2922701acd76272546580984b3e",
       "why": "Before the flag the fake node served these bits."
+    }
+  },
+  "report_fields": {
+    "mem_available_unread_checks": {
+      "introduced": "8c3e0ac11440803738c66f98851c4719536e54ff",
+      "why": "Before #514 a phase did not count the MemAvailable checks it could not read, so a report without the count is an older harness's, not a newer one's that dropped it."
     }
   }
 }
