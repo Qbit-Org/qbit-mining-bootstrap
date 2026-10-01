@@ -19,7 +19,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
 | L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz`, `evidence` | `nightly`, `dispatch` | running; trend rows and a report-only regression rule with provisional thresholds (#551); repeats not yet (#549) |
 | L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
-| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#621, #622) |
+| L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
 | L6 shipped images | `prism-load-nightly.yml`'s `shipped-images` job | `L6` | running |
 
@@ -299,8 +299,33 @@ debug). Weekly, at 400 shares/s: scenario 4's other four cases, scenario 5's
 PostgreSQL 16, and that every listed id executed.
 
 **Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #621 in
-debug and #622 in release and runs only by hand until both are fixed. Fault
-injection under load is #554.
+debug and #622 in release and runs only by hand until both are fixed.
+
+**Faults under load (#554)** run in the load harness's `faults` phase
+(`crates/qbit-prism-load/README.md`, "Faults under load"), one fault at a
+time while the sessions keep mining, each held to its criteria in the
+manifest:
+
+- per PR, `faults-pr-smoke` (`qbit-prism-load::faults`): a SIGTERM drain with
+  an offer in flight and a `SETTLEMENT_LOCK` holder, on the fake node;
+- nightly, `faults-short-real-node`: every fault but the full WAL volume, on
+  the real node with 500 sessions: the slow database, pool exhaustion, the
+  lock holder, the frontend SIGKILL, the drain, the rolling restart, the
+  reconnect storm, the restart over a candidate backlog, the primary lost
+  with its async standby promoted, the fenced switch and a found block across
+  a failover;
+- weekly, on the Saturday selection beside the soak, `faults-long-real-node`:
+  every fault, the full WAL volume included, with 2,000 sessions on a 16 vCPU
+  runner;
+- on dispatch, `faults-failover-fake-node`: the five database and landing
+  faults on the fake node.
+
+They prove D3's loss policy under load (only acknowledged shares in the
+replication gap are lost, each listed), that the frontends serve the promoted
+primary within 30 s without a restart, that a block mid-landing lands once
+across a failover, and that a full WAL volume acknowledges nothing it cannot
+keep. They do not prove a real network partition: the relays and endpoints
+stand in for one.
 
 ## L5: soak and chaos
 

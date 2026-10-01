@@ -782,17 +782,41 @@ last fault has recovered. The faults:
 | `sigterm-drain` | a scheduled block's `submitblock` is held 500 ms and the offering frontend gets SIGTERM as it arrives | the shutdown logs that it waits for the offer and no budget ALERT, exits 0 within 35 s, the block reaches the node once, and `accepted` is recorded before the exit (#578, #585) |
 | `rolling-restart` | each frontend in turn gets SIGTERM, its sessions move to the other, it is relaunched; then the sessions are rebalanced | every exit is 0 within 35 s; every moved session has work within 30 s |
 | `reconnect-storm` | `storm` of the sessions drop abruptly and return within 5 s | every stormed session has work within 10 s of its return |
+| `primary-kill` | a barrier shows the standby flushed the primary's position; replication is cut for `cut` s while the primary keeps acknowledging; the primary is stopped immediately, the standby promoted and the writer endpoint moved to it; a new standby is built | the cut left WAL the standby never received; every acknowledged share the new primary lacks is listed, none was acknowledged before the barrier, each is absent from what the standby had (promotion kept all of that); every frontend accepts a share on the new primary within 30 s, without a restart; the new standby streams |
+| `primary-switch` | the writer endpoint is fenced, the standby replays through the old primary's flush position, then the primary is stopped and the standby promoted | nothing acknowledged is lost; frontends and standby as above |
+| `block-failover` | the relay holds a found block's `submitblock`; as it arrives a barrier shows the standby holds the primary's flushed WAL, replication is cut and the primary stopped; the call goes to the node within 800 ms of its arrival; the standby is promoted | the block's reservation is on the promoted primary (#529's standby wait is on in these runs); it reaches the node once and lands within 30 s of the promotion, outcome `unknown` or `accepted` (#585); losses as for `primary-kill` |
+| `wal-disk-full` | the primary's `pg_wal`, on a fuse2fs volume for the whole run (#575's injector), is filled until PostgreSQL PANICs; for `hold` s it is filled again whenever PostgreSQL's crash recovery finds room (it deletes the segments it no longer needs) and accepts connections; then the volume is freed and PostgreSQL started again if it exited | nothing acknowledged is lost, and nothing absent from PostgreSQL is acknowledged inside the intervals its own log shows it down (each PANIC to the next "ready to accept connections", 250 ms grace); every frontend accepts again within 30 s without a restart; every `/metrics` shows `qbit_prism_collector_available{collector="database"} == 0` (#575's paging condition); a PostgreSQL that cannot be brought back ends the run with its log |
+| `candidate-backlog` | the relay answers every `submitblock` with qbitd's warmup error (#526) while `backlog` found blocks pile up; every frontend is stopped and relaunched; the relay heals | every exit 0 within 35 s; every backlog row terminal after the heal (a lost race orphaned after the fault mints six blocks), none sent to the node twice, none missing, and one landed through a single offer |
 
 Throughout the phase (`read-tier=on`, the default) a separate `public-api`
 process on the standby (the primary without one) is polled at 5 requests a
 second and every frontend's `/metrics` every 5 s: at least 99% 2xx and a p99
 within 1 s for the public API, every live frontend's `/metrics` within 1 s.
 A `pool-exhaustion` window is left out of the public API's figures only when
-it reads the primary, whose slots that fault takes.
+it reads the primary, whose slots that fault takes. A replica-mode public API
+refuses, by design, while its standby cannot show it is current, so the
+`wal-disk-full` and failover windows are left out until it answers again,
+which each of those faults requires within 30 s of its removal.
+
+The database faults need the managed cluster. A plan with a failover asks it
+for an async standby that streams through a replication link the harness can
+cut, puts every writer (the frontends, through the delay proxy, and the
+harness's own side pool) behind a writer endpoint and the public reader behind
+a read endpoint, and gives the frontends `PRISM_OFFER_STANDBY_APPLICATION_NAME`
+(#529) for the whole run, as a pool with a failover standby runs, so every
+found block's offer in such a run first waits (at most 250 ms) for the
+standby's flush. A promotion moves the endpoints; nothing is restarted. The
+acknowledged shares a failover's verdict proves lie in the replication gap
+(D3's loss policy) are excused from the run's durability finding and listed in
+its row, as are commits answered `ledger-outcome-unknown` while the primary
+was going; any other loss is still exit 4. `wal-disk-full` must run before
+every failover, since a promotion replaces the primary whose WAL is on the
+volume.
 
 Keys: `order=listed|random`, `seed`, `count` (random draws), `baseline`,
 `hold`, `recovery`, `gap=<s>|<min>..<max>`, `read-tier=on|off`,
-`storm=<fraction>`, `lease-wait=<s>`. A random order is seeded and the drawn
+`storm=<fraction>`, `lease-wait=<s>`, `cut=<s>` (default 3), `backlog=<n>`
+(default 4). A random order is seeded and the drawn
 sequence is in the report, so #556's soak can fire one fault every few
 minutes and replay a failure. Only a run with a fault phase puts the fault
 relay (one port per frontend) between the frontends and the node.
@@ -803,9 +827,12 @@ The verdict is the side report's `faults` block: one row per fault with its
 windows, the shares offered in each, its evidence and its checks. A fault
 that misses a criterion exits 9, and the gate shows one row per fault.
 `faults-pr-smoke` (per PR, `tests/faults.rs`: `sigterm-drain` and
-`settlement-lock` on the fake node) and `faults-short-real-node` (nightly,
-all seven on the real node with 500 sessions) are the checked-in plans;
-`test/e2e-scenarios.toml` names each fault with its criteria.
+`settlement-lock` on the fake node), `faults-short-real-node` (nightly, every
+fault but `wal-disk-full` on the real node with 500 sessions),
+`faults-long-real-node` (weekly on #588's Saturday selection: every fault with
+2,000 sessions, about 60 minutes) and `faults-failover-fake-node` (dispatch:
+the five database and landing faults on the fake node) are the checked-in
+plans; `test/e2e-scenarios.toml` names each fault with its criteria.
 
 ## Presets and the nightly run
 

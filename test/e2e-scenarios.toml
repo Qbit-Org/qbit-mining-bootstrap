@@ -668,113 +668,115 @@ reason = "The presets run nightly or on dispatch; the reduced weekly L3 does not
 id = "fault-sigterm-drain-offer-in-flight"
 title = "SIGTERM of a frontend while a found block's submitblock is in flight"
 owner = "#554"
-lanes = ["nightly", "pr"]
+lanes = ["nightly", "pr", "weekly"]
 criteria = "The shutdown logs that it waits for the offer and no budget ALERT, the frontend exits 0 within 35 s, the block reaches the node exactly once, the node's accepted is recorded on the candidate before the process exits (#578, #585), and the frontend serves again after its relaunch."
 runs = true
 tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
-presets = ["faults-pr-smoke", "faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
 notes = "Per PR on the fake node with one frontend; nightly on the real node with two frontends and 500 sessions."
 
 [[scenario]]
 id = "fault-settlement-lock-holder"
 title = "A long SETTLEMENT_LOCK holder while the sessions keep mining, with a tip minted during the hold"
 owner = "#554"
-lanes = ["nightly", "pr"]
+lanes = ["nightly", "pr", "weekly"]
 criteria = "No share waits on the holder (answer p99 over the whole hold within --ack-p99-limit-ms); shares on retained work are accepted (at least 90%) until the refresh has been stalled for PRISM_SUBMIT_TIP_MAX_AGE_SECONDS, after which the server's refusals are counted; no session gets work on the new tip before the release, and every session has it within 10 s of the release. The share-ACK p50, p99 and max over the hold are recorded."
 runs = true
 tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
-presets = ["faults-pr-smoke", "faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-slow-database"
 title = "The frontends' database path delayed by the proxy under load"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "The delay is shown on the frontends' URL (SELECT 1 at least twice the one-way delay); every answer stays truthful (no loss, no divergence); no frontend exits; the second half of the recovery window offers the full rate with ACK p99 within max(--ack-p99-limit-ms, twice the baseline's)."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-connection-exhaustion"
 title = "PostgreSQL at max_connections with the frontends' idle backends terminated"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "PostgreSQL refuses a connection for want of a slot (53300) and at least one frontend backend is terminated into the full server; no loss and no divergence; no frontend exits; full rate and normal ACK p99 in the second half of the recovery window. The frontends' pool-acquire outcomes are recorded."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-frontend-sigkill-holding-a-block"
 title = "SIGKILL of the frontend holding a found block the node has accepted, before its answer is recorded"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "The node accepted the block and the frontend is killed inside its 1 s submitblock deadline; its in-flight shares are censused and re-offered and credited once; the block reached the node exactly once and lands without a second offer. The time until it lands is reported, not gated: the dead holder's claim waits for the 120 s candidate lease, which is #529's option-A gap that #585 left open."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-rolling-restart"
 title = "SIGTERM and relaunch of each frontend in turn, its sessions moved to the one serving"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "Each frontend exits 0 within 35 s, every moved session has work on the serving frontend within 30 s, no committed share goes unanswered, and the full rate returns after the rebalance."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-reconnect-storm-under-load"
 title = "Half the sessions drop abruptly and return within 5 s, on the real node"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "Every stormed session has work again within 10 s of its return; the abandoned submits are the storm's, never a divergence; full rate afterwards."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 notes = "The fake-node rental-churn shapes (load-rental-churn) run nightly beside it."
 
 [[scenario]]
 id = "read-tier-independence"
 title = "The public API and every /metrics scraped at a realistic rate throughout the faults"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "A separate public-api process on the standby, polled at 5 requests a second, answers at least 99% 2xx with p99 at most 1 s over each fault and the whole phase (excluding a PostgreSQL at max_connections only when the public API reads the primary, whose slots that takes); every live frontend's /metrics answers within 1 s (#189's class, #469)."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-primary-kill-under-load"
-title = "PostgreSQL primary killed under mining load with async promotion (#474 B and #521 scenario 3 at load)"
+title = "PostgreSQL primary lost under mining load with async promotion, and the fenced switch (#474 B and #521 scenario 3 at load)"
 owner = "#554"
-lanes = ["L4"]
-criteria = "Under D3: every acknowledged share missing on the promoted primary is listed by id and lies after the standby's last flushed position; none before the replication cut; frontends serve on the new primary within 30 s without a restart. A fenced switch loses nothing."
-runs = false
-reason = "#554's second PR, weekly, on #588's schedule."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "Under D3 (primary-kill): a barrier shows the standby flushed the primary's position, replication is cut and the primary keeps acknowledging, then it is stopped immediately and the standby promoted; every acknowledged share missing on the promoted primary is listed by id, none was acknowledged before the barrier, each is absent from what the standby had received (promotion kept all of that), and the cut left WAL the standby never received; every frontend accepts a share on the new primary within 30 s of the promotion without a restart; a new standby streams afterwards. The fenced switch (primary-switch: writers fenced, the standby replayed through the old primary's flush position) loses nothing."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
+notes = "Every writer reaches the primary through a writer endpoint the fault moves after the promotion; the proven gap losses are excused from the run's durability finding, any other loss is not."
 
 [[scenario]]
 id = "fault-block-mid-landing-failover-under-load"
 title = "A found block mid-landing across an async failover, under load"
 owner = "#554"
-lanes = ["L4"]
-criteria = "The block lands exactly once within 30 s of the promotion with outcome unknown or accepted (#585); with the #529 standby wait on, its row survives a replication cut at submitblock; gap-lost candidates are counted and reconciled against the chain."
-runs = false
-reason = "#554's second PR, weekly, on #588's schedule."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "The block's submitblock is held at the relay while replication is cut and the primary stopped, then let through; with #529's standby wait on, its reservation is on the promoted primary; it reaches the node exactly once and lands within 30 s of the promotion with outcome unknown or accepted (#585); blocks forwarded around the failover whose rows the gap took are counted with the node's answer."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-wal-disk-full-under-load"
-title = "The WAL volume fills under load, then space is freed and PostgreSQL restarts"
+title = "The WAL volume fills under load, then space is freed and PostgreSQL returns"
 owner = "#554"
-lanes = ["L4"]
-criteria = "No acknowledged share lost and none acknowledged while PostgreSQL is down; the frontends reconnect without a restart; #575's alert condition shows in /metrics."
-runs = false
-reason = "#554's second PR, weekly, on #575's DiskFullInjector."
+lanes = ["dispatch", "weekly"]
+criteria = "PostgreSQL PANICs on the full WAL volume (#575's DiskFullInjector), which is filled again for the hold whenever its crash recovery finds room; no acknowledged share is lost and none is acknowledged inside the intervals PostgreSQL's own log shows it down; every frontend accepts shares again within 30 s without a restart; every frontend's /metrics shows #575's paging condition (qbit_prism_collector_available{collector=\"database\"} == 0) during the outage; a PostgreSQL that cannot be brought back ends the run with its log."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node"]
+notes = "Needs fuse2fs, fuse3 and /dev/fuse on the runner; the primary's pg_wal is on the volume for the whole run."
 
 [[scenario]]
 id = "fault-restart-with-candidate-backlog"
 title = "Both frontends restarted over a pending candidate backlog (#187's class)"
 owner = "#554"
-lanes = ["L4"]
-criteria = "Every backlog row reaches a terminal state, none is offered twice, and the count before equals the count settled after."
-runs = false
-reason = "#554's second PR, weekly."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "While the node answers submitblock with its warmup error (#526), found blocks build a backlog of unfinished candidates; every frontend exits 0 within 35 s and is relaunched; once the node heals, every backlog row reaches a terminal state (a lost race is orphaned once the fault mints the winner's confirmations), none reaches the node twice, one lands through a single offer, and every row counted before the restart is there after it."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "soak-weekly-one-lifetime"
