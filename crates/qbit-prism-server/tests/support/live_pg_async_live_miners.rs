@@ -878,6 +878,31 @@ async fn promotion(
     let answer = gap_miner.submit_solved(gap_share.0, gap_share.1).await;
     after.push(("kept on a job issued in the gap", answer));
 
+    // The block on the gap-issued job, submitted while the tip is still the
+    // one its job builds on: its coinbase was built from the lost window, so
+    // it must be refused as stale authority, or land paying only shares the
+    // promoted ledger holds (#619; submitted only in that opt-in case).
+    let stale_block = match gap_block_disposition {
+        GapBlock::Kept => None,
+        GapBlock::Submitted => Some(gap_miner.submit_solved(gap_block.0, gap_block.1).await),
+    };
+    let stale_paid = match stale_block.as_ref().map(|block| (block, &block.answer)) {
+        None => None,
+        Some((stale_block, Answer::Accepted)) => {
+            landed(f, &stale_block.hash).await.with_context(|| {
+                format!("the block on the gap-issued job (window through share {gap_window:?}, standby through {replicated}) was accepted")
+            })?;
+            Some(paid_shares(f, &stale_block.hash).await?)
+        }
+        Some((_, answer)) => {
+            ensure!(
+                matches!(answer.reason_id(), Some("stale-job" | "unknown-job")),
+                "the block on the gap-issued job was answered {answer}"
+            );
+            None
+        }
+    };
+
     // A real block on work whose window the promoted ledger holds, by a new
     // session. A frontend can still issue new jobs from a window it prepared
     // inside the gap (#619): the range's sequence numbers now belong to other
@@ -1040,29 +1065,6 @@ async fn promotion(
         duplicate.answer
     );
 
-    // The block on the gap-issued job: its coinbase was built from the lost
-    // window, so it must be refused as stale, or land paying only shares the
-    // promoted ledger holds (#619; submitted only in that opt-in case).
-    let stale_block = match gap_block_disposition {
-        GapBlock::Kept => None,
-        GapBlock::Submitted => Some(gap_miner.submit_solved(gap_block.0, gap_block.1).await),
-    };
-    let stale_paid = match stale_block.as_ref().map(|block| (block, &block.answer)) {
-        None => None,
-        Some((stale_block, Answer::Accepted)) => {
-            landed(f, &stale_block.hash).await.with_context(|| {
-                format!("the block on the gap-issued job (window through share {gap_window:?}, standby through {replicated}) was accepted")
-            })?;
-            Some(paid_shares(f, &stale_block.hash).await?)
-        }
-        Some((_, answer)) => {
-            ensure!(
-                matches!(answer.reason_id(), Some("stale-job" | "unknown-job")),
-                "the block on the gap-issued job was answered {answer}"
-            );
-            None
-        }
-    };
     if let (Some(stale_block), Some(stale_paid)) = (&stale_block, &stale_paid) {
         let window = expected_window(f, &stale_block.share_id).await?;
         ensure!(
