@@ -1240,6 +1240,32 @@ async fn off_runtime_releases_its_value_on_a_blocking_thread() -> Result<()> {
     Ok(())
 }
 
+/// #600: the post-landing trim runs on the releasing blocking thread, and
+/// only after the value is gone, so it can return the value's memory.
+#[tokio::test(flavor = "current_thread")]
+async fn off_runtime_runs_its_follow_up_after_the_drop_on_the_same_blocking_thread() -> Result<()> {
+    let runtime_thread = std::thread::current().id();
+    let (sender, mut dropped) = tokio::sync::oneshot::channel();
+    let (followed, receiver) = tokio::sync::oneshot::channel();
+    let probe = Probe(Some(sender));
+    drop(OffRuntime::new(probe).then(move || {
+        // Whether the value's drop has already reported, read from inside
+        // the follow-up: a drop after it would report too late to be seen.
+        let _ = followed.send((std::thread::current().id(), dropped.try_recv().ok()));
+    }));
+    let (thread, dropped_on) = tokio::time::timeout(Duration::from_secs(2), receiver).await??;
+    ensure!(
+        thread != runtime_thread,
+        "followed up on the runtime thread"
+    );
+    let dropped_on = dropped_on.context("follow-up ran before the drop")?;
+    ensure!(
+        dropped_on == thread,
+        "dropped and followed up on different threads"
+    );
+    Ok(())
+}
+
 /// Every check `prepare_candidate` makes is a definite rejection, never an
 /// unknown outcome.
 ///

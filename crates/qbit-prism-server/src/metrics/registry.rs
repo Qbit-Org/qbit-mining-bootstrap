@@ -113,6 +113,9 @@ families! {
     OrderLockHold: Histogram, "database_order_lock_hold_seconds", "ORDER_LOCK hold from the grant of the lock to the end of the transaction holding it, by holder, in seconds (#602).";
     ShareAckLandingWindow: Histogram, "share_ack_landing_window_seconds", "The share_ack_seconds observations whose submission arrived within 30 seconds after a pool block acceptance this frontend observed, by outcome (#602); steady state is share_ack_seconds minus this family.";
     SlowLandingWindows: Gauge, "share_ack_slow_landing_windows", "Consecutive most recent closed landing windows on this frontend whose share acknowledgement p99 exceeded the bound in seconds (#602); -1 before a landing window holding an acknowledgement has closed.";
+    LandingTrimSeconds: Histogram, "landing_malloc_trim_seconds", "Duration of each malloc_trim(0) this frontend ran after a block landing released its rebuilt window (#600), in seconds; glibc builds only, none while PRISM_LANDING_MALLOC_TRIM_ENABLED=0.";
+    LandingTrimReleased: Counter, "landing_malloc_trim_released_bytes_total", "Resident bytes this frontend's post-landing malloc_trim calls returned to the kernel (#600): the process resident set just before each trim minus just after it, never negative; allocation on other threads during a trim can hide part of its release.";
+    LandingTrimResident: Gauge, "landing_malloc_trim_resident_bytes", "Process resident bytes right after this frontend's latest post-landing trim, its resident floor after the landing, or -1 before the first trim or when procfs could not be read.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -229,7 +232,7 @@ impl Registry {
         // These owner-dependent families have no samples at startup. Reserve
         // their closed keys now so even the first event needs no allocation.
         match family {
-            Family::FirstOffer | Family::RollupLag => {
+            Family::FirstOffer | Family::RollupLag | Family::LandingTrimSeconds => {
                 self.samples
                     .insert((family, Labels::Empty), Sample::Pending);
             }

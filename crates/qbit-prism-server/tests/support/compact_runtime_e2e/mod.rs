@@ -25,7 +25,7 @@ mod fake_qbitd;
 pub mod socket;
 #[allow(dead_code)]
 #[path = "../window_fixture.rs"]
-mod window_fixture;
+pub mod window_fixture;
 
 pub const SHARES: u64 = 16;
 pub const MASK: u32 = 0x0000_e000;
