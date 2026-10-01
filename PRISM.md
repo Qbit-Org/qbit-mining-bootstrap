@@ -290,7 +290,10 @@ worker pool per frontend process (default: three quarters of the cores, at most
 4, which is where the refresh stops getting faster and retained memory is
 lowest; `0` runs the builder serially; up to 64); a refresh adds two lane
 threads and two digest threads to that while it builds, and every frontend on
-a host has its own pool. The former Python batch-writer, writer-lease, subprocess,
+a host has its own pool. After each block it lands, a frontend returns the heap
+the landing freed to the kernel (`PRISM_LANDING_MALLOC_TRIM_ENABLED`, default `1`;
+see [landing memory per frontend](docs/prism-storage-sizing.md#landing-memory-per-frontend)
+for the memory limit to set). The former Python batch-writer, writer-lease, subprocess,
 and incremental-refresh scheduler settings no longer configure the runtime.
 
 ## Validation and further reading

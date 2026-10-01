@@ -19,6 +19,7 @@ pub async fn run(config: Config) -> Result<()> {
     config.ensure_pool_fee_settles_dust()?;
     let rollup_settings = crate::rollups::settings_from_env()?;
     let partition_settings = crate::partitions::settings_from_env()?;
+    let landing_trim = crate::memory::landing_trim_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
     // Validate and bind both Stratum listeners before coordinator startup can
@@ -50,6 +51,12 @@ pub async fn run(config: Config) -> Result<()> {
     };
     let registry = Arc::new(metrics::Metrics::default());
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    coordinator.landing_trim.set_enabled(landing_trim);
+    tracing::info!(
+        enabled = landing_trim,
+        supported = crate::memory::SUPPORTED,
+        "post-landing malloc_trim (#600)"
+    );
     // The share ledger has no DEFAULT partition, so an append whose sequence
     // value has run past the last attached bound is refused (#144). Attaching
     // the lead is a precondition of serving, not a background convenience: an

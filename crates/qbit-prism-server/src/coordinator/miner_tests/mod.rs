@@ -358,6 +358,7 @@ impl Fixture {
             offer_reserved_probe: Default::default(),
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
+            landing_trim: Default::default(),
         });
         let fixture = Self {
             coordinator,

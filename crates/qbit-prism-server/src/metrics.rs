@@ -110,6 +110,7 @@ impl Metrics {
             Family::RevisionWorkUnknown,
             Family::AcceptedUnlanded,
             Family::RevisionWorkTimeouts,
+            Family::LandingTrimReleased,
         ] {
             registry.register(family, vec![], 0.);
         }
@@ -131,6 +132,7 @@ impl Metrics {
             Family::NodePeers,
             Family::NodeIbd,
             Family::NodeObservationAge,
+            Family::LandingTrimResident,
         ] {
             registry.register(family, vec![], -1.);
         }
@@ -208,6 +210,7 @@ impl Metrics {
             Family::OrderLockHold,
             Family::RefreshSeconds,
             Family::RollupLag,
+            Family::LandingTrimSeconds,
         ] {
             registry.declare(family);
         }
