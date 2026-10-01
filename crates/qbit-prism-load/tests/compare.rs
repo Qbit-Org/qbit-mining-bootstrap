@@ -983,6 +983,24 @@ fn a_fake_node_serving_other_bits_than_pinned_fails() {
         "{}",
         result.markdown
     );
+    // A tip it drove that no tip change records: its bits went unshown.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        let report = run.report.as_mut().unwrap();
+        report["node"]["tip_changes"] = json!([
+            {"hash": "b00", "height": 100, "next_template_bits": template_bits(&pinned, 101)},
+        ]);
+        report["time_to_usable_work"]["tips"][0]["tip"] = json!("e01");
+    }
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("reports no tip change for the tip e01 it drove"),
+        "{}",
+        result.markdown
+    );
     // The retarget marker on, the constant base bits served.
     let base = pinned["--template-bits"].as_str().unwrap().to_owned();
     let result = served(&|_| base.clone());

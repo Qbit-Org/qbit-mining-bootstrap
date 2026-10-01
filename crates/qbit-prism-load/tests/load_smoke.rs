@@ -458,6 +458,23 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         .context("template bits")?
         .to_owned();
     let retarget = loaded.args["--retarget-bits"] == true;
+    // ... every tip the run drove among them.
+    let changed: Vec<&str> = report["node"]["tip_changes"]
+        .as_array()
+        .context("tip changes")?
+        .iter()
+        .filter_map(|change| change["hash"].as_str())
+        .collect();
+    for pointer in ["/time_to_usable_work/tips", "/churn/tip_delivery/tips"] {
+        for tip in report
+            .pointer(pointer)
+            .and_then(|tips| tips.as_array())
+            .context("driven tips")?
+        {
+            let hash = tip["tip"].as_str().context("tip hash")?;
+            assert!(changed.contains(&hash), "{pointer}: {hash}");
+        }
+    }
     for change in report["node"]["tip_changes"]
         .as_array()
         .context("tip changes")?

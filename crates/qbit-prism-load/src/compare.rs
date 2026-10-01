@@ -2478,6 +2478,35 @@ pub fn compare(
                 ));
                 break;
             };
+            // Every tip the run drove is among the changes: the external
+            // tips it measured, the churn phase's, and the own blocks the
+            // node accepted. A report that keeps only the bootstrap tip shows
+            // nothing of the bits served after any of them.
+            let changed: std::collections::BTreeSet<&str> =
+                changes.iter().filter_map(|c| c["hash"].as_str()).collect();
+            let report = run.report.as_ref();
+            let listed = |pointer: &str, key: &'static str| {
+                report
+                    .and_then(|r| r.pointer(pointer))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(move |entry| key != "block_hash" || entry["accepted"] == true)
+                    .filter_map(move |entry| entry[key].as_str())
+            };
+            if let Some(missing) = listed("/time_to_usable_work/tips", "tip")
+                .chain(listed("/churn/tip_delivery/tips", "tip"))
+                .chain(listed("/node/submissions", "block_hash"))
+                .find(|hash| !changed.contains(hash))
+            {
+                passed = false;
+                findings.push(format!(
+                    "**the runs did not drive the pinned workload**: {} reports no tip change for \
+                     the tip {missing} it drove, so the bits served after it cannot be checked",
+                    run.run.id
+                ));
+                break 'bits;
+            }
             for change in changes {
                 let served = change["next_template_bits"].as_str();
                 let wanted = change["height"].as_u64().map(served_after).transpose()?;
