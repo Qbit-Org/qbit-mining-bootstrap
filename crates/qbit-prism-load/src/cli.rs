@@ -406,6 +406,7 @@ impl Args {
     pub fn validate(&self) -> Result<()> {
         if let Some(plan) = self.fault_plan()? {
             plan.check_against(self.frontends, self.database_url.is_none())?;
+            plan.check_replication(&self.replication)?;
             // A soak's phases come from its looped presets, never this
             // flag's, so its fault verdict would silently be missing.
             ensure!(

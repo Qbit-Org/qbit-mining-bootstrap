@@ -170,6 +170,24 @@ impl FaultDriver {
                         public_exclusions.push((from, to + Duration::from_secs(5)));
                     }
                 }
+                Action::WalDiskFull(_) | Action::Failover(_) => {
+                    // A public reader that requires a replica refuses, by
+                    // design, while its standby has no stream to prove it
+                    // current (the primary down, the link cut) or has been
+                    // promoted; and one on the primary is refused with it.
+                    // Excused from the fault's start until it answers again,
+                    // for at most PUBLIC_RETURN after the fault's removal;
+                    // the fault's row says how long that took.
+                    if let (Some(from), Some(to)) = (run.inject_start, run.removed_at) {
+                        let back = public_back(inputs.read_tier, to);
+                        public_exclusions.push((from, back.unwrap_or(to + PUBLIC_RETURN)));
+                    }
+                }
+                Action::CandidateBacklog(backlog) => {
+                    for (index, from, to) in backlog.outage_windows(end) {
+                        outages.push((inputs.instance_ids[index].clone(), from, to));
+                    }
+                }
                 _ => {}
             }
         }
@@ -746,6 +764,23 @@ impl FaultDriver {
                     ),
                 });
             }
+            Action::Failover(failover) => {
+                let (new_checks, row_evidence) =
+                    self.evaluate_failover(failover, baseline_start, inputs);
+                checks.extend(new_checks);
+                evidence = row_evidence;
+            }
+            Action::WalDiskFull(full) => {
+                let (new_checks, row_evidence) =
+                    evaluate_wal_disk_full(full, baseline_start, end, inputs, origin);
+                checks.extend(new_checks);
+                evidence = row_evidence;
+            }
+            Action::CandidateBacklog(backlog) => {
+                let (new_checks, row_evidence) = self.evaluate_backlog(backlog, origin);
+                checks.extend(new_checks);
+                evidence = row_evidence;
+            }
         }
         let read_tier = inputs.read_tier.map(|samples| {
             read_tier::summarize(samples, inject_start, end, outages, public_exclusions)
@@ -759,6 +794,23 @@ impl FaultDriver {
                     verdict["public_api"]["pass"], verdict["frontend_metrics"]["pass"]
                 ),
             ));
+        }
+        if matches!(run.action, Action::WalDiskFull(_) | Action::Failover(_)) {
+            if let Some(samples) = inputs.read_tier {
+                let back = public_back(Some(samples), removed);
+                checks.push(check(
+                    "the public API answered again within 30 s of the fault's removal",
+                    back.is_some(),
+                    match back {
+                        Some(at) => format!(
+                            "first 2xx {:.2} s after the removal (it refuses, by design, while its \
+                             replica cannot show it is current)",
+                            at.saturating_duration_since(removed).as_secs_f64()
+                        ),
+                        None => format!("no 2xx within {PUBLIC_RETURN:?} of the removal"),
+                    },
+                ));
+            }
         }
         let pass = checks.iter().all(|check| check.pass);
         let row = json!({
@@ -781,5 +833,534 @@ impl FaultDriver {
             "pass": pass,
         });
         (row, pass)
+    }
+}
+
+/// How soon after a database fault's removal the public API must answer
+/// again: its standby's stream reconnects within PostgreSQL's 5 s
+/// `wal_retrieve_retry_interval`, and its readiness probe follows.
+pub const PUBLIC_RETURN: Duration = Duration::from_secs(30);
+
+/// The first 2xx public answer at or after `after`, within
+/// [`PUBLIC_RETURN`].
+fn public_back(samples: Option<&[read_tier::ReadSample]>, after: Instant) -> Option<Instant> {
+    samples?
+        .iter()
+        .filter(|sample| {
+            sample.target == "public-api"
+                && sample.path != "/metrics"
+                && sample.ok()
+                && sample.at >= after
+                && sample.at <= after + PUBLIC_RETURN
+        })
+        .map(|sample| sample.at)
+        .min()
+}
+
+/// Each frontend's first accepted share answered after `after`, and whether
+/// it came within `bound` of `since`.
+fn served_again(
+    inputs: &EvalInputs<'_>,
+    frontends: usize,
+    after: Instant,
+    since: Instant,
+    bound: Duration,
+) -> (bool, Vec<Value>) {
+    let mut all = frontends > 0;
+    let mut rows = Vec::new();
+    for index in 0..frontends {
+        let first = inputs
+            .submits
+            .iter()
+            .filter(|record| {
+                record.frontend == index
+                    && matches!(record.outcome, Outcome::Accepted)
+                    && record.responded.is_some_and(|at| at > after)
+            })
+            .filter_map(|record| record.responded)
+            .min();
+        let seconds = first.map(|at| at.saturating_duration_since(since).as_secs_f64());
+        let within = first.is_some_and(|at| at.saturating_duration_since(since) <= bound);
+        all &= within;
+        rows.push(json!({
+            "frontend": inputs.instance_ids.get(index),
+            "first_accepted_share_after_seconds": seconds,
+        }));
+    }
+    (all, rows)
+}
+
+/// A database or landing fault's own steps all ran: a step it could not
+/// carry out is a failed check, not a note in its evidence.
+fn injector_steps(problems: &[String]) -> Check {
+    check(
+        "the injector carried out every step",
+        problems.is_empty(),
+        if problems.is_empty() {
+            "every step ran".to_owned()
+        } else {
+            problems.join("; ")
+        },
+    )
+}
+
+/// Whether every frontend kept its process: the same pid before and after,
+/// and each known.
+fn same_processes(before: &[Option<u32>], after: &[Option<u32>]) -> bool {
+    !before.is_empty() && before == after && before.iter().all(Option::is_some)
+}
+
+impl FaultDriver {
+    fn evaluate_failover(
+        &self,
+        failover: &failover::Failover,
+        from: Instant,
+        inputs: &EvalInputs<'_>,
+    ) -> (Vec<Check>, Value) {
+        use failover::Mode;
+        let mut checks = Vec::new();
+        let origin = self.started;
+        let acknowledged = failover.acknowledged(inputs.submits, from);
+        let lost = failover.lost(inputs.submits, inputs.committed, from);
+        checks.push(check(
+            "the standby was promoted and the writer endpoint moved to it",
+            failover.promoted_at.is_some() && failover.moved_at.is_some(),
+            format!(
+                "promoted: {}; endpoint moved: {}",
+                failover.promoted_at.is_some(),
+                failover.moved_at.is_some()
+            ),
+        ));
+        let (served, first_shares) = match (failover.promoted_at, failover.moved_at) {
+            (Some(promoted), Some(moved)) => served_again(
+                inputs,
+                inputs.instance_ids.len(),
+                moved,
+                promoted,
+                failover::SERVE_BOUND,
+            ),
+            _ => (false, Vec::new()),
+        };
+        let kept = same_processes(&failover.pids_before, &failover.pids_after);
+        checks.push(check(
+            "every frontend served on the new primary within 30 s of the promotion, without a \
+             restart",
+            served && kept,
+            format!(
+                "first accepted share per frontend after the promotion: {first_shares:?}; same \
+                 processes: {kept}"
+            ),
+        ));
+        checks.push(check(
+            "a new standby streams from the new primary",
+            failover.rebuilt_at.is_some(),
+            match failover.rebuilt_at {
+                Some(at) => format!(
+                    "streaming {:.1} s after the promotion",
+                    failover.promoted_at.map_or(0.0, |promoted| at
+                        .saturating_duration_since(promoted)
+                        .as_secs_f64())
+                ),
+                None => "no standby was rebuilt".into(),
+            },
+        ));
+        let before_barrier: Vec<&str> = lost
+            .iter()
+            .filter(|record| {
+                failover
+                    .barrier_at
+                    .zip(record.responded)
+                    .is_none_or(|(barrier, answered)| answered <= barrier)
+            })
+            .map(|record| record.share_id.as_str())
+            .collect();
+        match failover.mode {
+            Mode::Fenced => {
+                checks.push(check(
+                    "the fenced switch lost no acknowledged share",
+                    lost.is_empty() && failover.gap_bytes.is_some_and(|gap| gap <= 0),
+                    format!(
+                        "{} of {} acknowledged shares missing on the new primary; the standby \
+                         was {:?} WAL bytes behind the fenced primary at promotion",
+                        lost.len(),
+                        acknowledged.len(),
+                        failover.gap_bytes
+                    ),
+                ));
+            }
+            Mode::Async | Mode::Block => {
+                checks.push(check(
+                    "no share acknowledged before the barrier was lost",
+                    failover.barrier_at.is_some() && before_barrier.is_empty(),
+                    format!(
+                        "{} lost shares were acknowledged before the standby was shown to hold \
+                         the primary's flushed WAL: {:?}",
+                        before_barrier.len(),
+                        before_barrier.iter().take(20).collect::<Vec<_>>()
+                    ),
+                ));
+                let outside: Vec<&str> = lost
+                    .iter()
+                    .filter(|record| !failover.in_gap(record))
+                    .map(|record| record.share_id.as_str())
+                    .collect();
+                checks.push(check(
+                    "every lost share lies after the standby's last received position",
+                    outside.is_empty(),
+                    format!(
+                        "{} of {} lost shares were acknowledged after the barrier and absent \
+                         from the standby when it was promoted (each listed in the evidence); \
+                         outside the gap: {:?}",
+                        lost.len() - outside.len(),
+                        lost.len(),
+                        outside.iter().take(20).collect::<Vec<_>>()
+                    ),
+                ));
+                let dropped: Vec<&String> = failover
+                    .frozen_present
+                    .iter()
+                    .filter(|share| !inputs.committed.contains(*share))
+                    .collect();
+                checks.push(check(
+                    "promotion kept every share the standby held",
+                    failover.frozen_read && dropped.is_empty(),
+                    if failover.frozen_read {
+                        format!(
+                            "{} of the {} acknowledged shares the standby held before promotion \
+                             are missing from the new primary",
+                            dropped.len(),
+                            failover.frozen_present.len()
+                        )
+                    } else {
+                        "the standby could not be read before promotion, so what it held is \
+                         unknown and no loss is shown to lie in the gap"
+                            .into()
+                    },
+                ));
+            }
+        }
+        if failover.mode == Mode::Async {
+            checks.push(check(
+                "the replication cut left an unreplicated interval",
+                failover.gap_bytes.is_some_and(|gap| gap > 0) && !lost.is_empty(),
+                format!(
+                    "{:?} WAL bytes the standby never received; {} acknowledged shares lost with \
+                     them",
+                    failover.gap_bytes,
+                    lost.len()
+                ),
+            ));
+        }
+        if failover.mode == Mode::Block {
+            checks.push(check(
+                "a found block's submitblock was held when replication was cut",
+                failover.seen.is_some(),
+                match &failover.seen {
+                    Some(seen) => format!("{} held at the relay", seen.block_hash),
+                    None => "no submitblock reached the relay".into(),
+                },
+            ));
+            checks.push(check(
+                "its reservation was on the promoted primary",
+                matches!(&failover.row_at_promotion, Some(Some(_))),
+                format!(
+                    "row on the new primary at the promotion: {:?} (#529's standby wait keeps \
+                     the reservation on the standby before the call)",
+                    failover.row_at_promotion
+                ),
+            ));
+            let sent = failover.seen.as_ref().map(|seen| {
+                self.tools
+                    .relay
+                    .submits()
+                    .iter()
+                    .filter(|submit| {
+                        submit.block_hash == seen.block_hash && submit.forwarded_at.is_some()
+                    })
+                    .count()
+            });
+            checks.push(check(
+                "the block reached the node exactly once",
+                sent == Some(1),
+                format!("forwarded {sent:?} times"),
+            ));
+            let landed_after = failover
+                .landed
+                .as_ref()
+                .zip(failover.promoted_at)
+                .map(|((landed, _), promoted)| landed.saturating_duration_since(promoted));
+            let outcome = failover
+                .landed
+                .as_ref()
+                .and_then(|(_, row)| row.offer_outcome.clone());
+            checks.push(check(
+                "the block landed within 30 s of the promotion, its outcome unknown or accepted",
+                landed_after.is_some_and(|after| after <= failover::SERVE_BOUND)
+                    && matches!(outcome.as_deref(), Some("unknown") | Some("accepted")),
+                format!(
+                    "landed {:?} s after the promotion with outcome {outcome:?}; last row {:?}",
+                    landed_after.map(|after| after.as_secs_f64()),
+                    failover.last_row
+                ),
+            ));
+        }
+        checks.push(injector_steps(&failover.problems));
+        let evidence = failover.evidence(origin, &lost, acknowledged.len());
+        (checks, evidence)
+    }
+
+    fn evaluate_backlog(
+        &self,
+        backlog: &backlog::CandidateBacklog,
+        origin: Instant,
+    ) -> (Vec<Check>, Value) {
+        let mut checks = Vec::new();
+        let unfinished_before = backlog
+            .before
+            .values()
+            .filter(|state| !backlog::terminal(state))
+            .count();
+        checks.push(check(
+            "a backlog of found blocks was pending when the frontends stopped",
+            unfinished_before >= self.tools.backlog,
+            format!(
+                "{unfinished_before} unfinished candidates of {} refused blocks (target {})",
+                backlog.before.len(),
+                self.tools.backlog
+            ),
+        ));
+        let clean = !backlog.exits.is_empty()
+            && backlog.exits.iter().all(|exit| {
+                exit.success == Some(true)
+                    && !exit.forced_kill
+                    && exit.after_sigterm_seconds.is_some_and(|s| s <= 35.0)
+            });
+        checks.push(check(
+            "every frontend exited 0 within the shutdown bound",
+            clean,
+            format!("{} exits", backlog.exits.len()),
+        ));
+        let not_terminal: Vec<(&String, Option<&String>)> = backlog
+            .before
+            .keys()
+            .map(|hash| (hash, backlog.after.get(hash)))
+            .filter(|(_, state)| !state.is_some_and(|state| backlog::terminal(state)))
+            .collect();
+        checks.push(check(
+            "every backlog row reached a terminal state after the heal",
+            backlog.settled_at.is_some() && not_terminal.is_empty(),
+            format!("not terminal: {not_terminal:?}"),
+        ));
+        let submits = self.tools.relay.submits();
+        let twice: Vec<&String> = backlog
+            .before
+            .keys()
+            .filter(|hash| {
+                submits
+                    .iter()
+                    .filter(|submit| &submit.block_hash == *hash && submit.forwarded_at.is_some())
+                    .count()
+                    > 1
+            })
+            .collect();
+        checks.push(check(
+            "no backlog block reached the node twice",
+            twice.is_empty(),
+            format!("forwarded more than once: {twice:?}"),
+        ));
+        checks.push(check(
+            "every row counted before the restart was settled after it",
+            !backlog.before.is_empty()
+                && backlog
+                    .before
+                    .keys()
+                    .all(|hash| backlog.after.contains_key(hash)),
+            format!(
+                "{} rows before the restart, {} of them read after the heal",
+                backlog.before.len(),
+                backlog
+                    .before
+                    .keys()
+                    .filter(|hash| backlog.after.contains_key(*hash))
+                    .count()
+            ),
+        ));
+        checks.push(injector_steps(&backlog.problems));
+        (checks, backlog.evidence(origin))
+    }
+}
+
+fn evaluate_wal_disk_full(
+    full: &disk::WalDiskFull,
+    from: Instant,
+    end: Instant,
+    inputs: &EvalInputs<'_>,
+    origin: Instant,
+) -> (Vec<Check>, Value) {
+    let mut checks = Vec::new();
+    checks.push(check(
+        "PostgreSQL stopped on the full WAL volume",
+        full.down_at.is_some() && full.ballast_bytes.is_some(),
+        format!(
+            "ballast {:?} bytes; down {:?} s after the fill",
+            full.ballast_bytes,
+            full.filled_at
+                .zip(full.down_at)
+                .map(|(filled, down)| down.saturating_duration_since(filled).as_secs_f64())
+        ),
+    ));
+    let acknowledged: Vec<&SubmitRecord> = inputs
+        .submits
+        .iter()
+        .filter(|record| {
+            !record.reoffer
+                && matches!(record.outcome, Outcome::Accepted)
+                && record.responded.is_some_and(|at| at >= from && at < end)
+        })
+        .collect();
+    let lost: Vec<&str> = acknowledged
+        .iter()
+        .filter(|record| !inputs.committed.contains(&record.share_id))
+        .map(|record| record.share_id.as_str())
+        .collect();
+    checks.push(check(
+        "no acknowledged share was lost",
+        lost.is_empty(),
+        format!(
+            "{} of {} shares acknowledged around the fault missing from PostgreSQL: {:?}",
+            lost.len(),
+            acknowledged.len(),
+            lost.iter().take(20).collect::<Vec<_>>()
+        ),
+    ));
+    // PostgreSQL's own record of when it was down; an answer within the
+    // grace of a PANIC may be for a commit made just before it.
+    let intervals = &full.down_intervals;
+    let acked_down: Vec<&str> = acknowledged
+        .iter()
+        .filter(|record| {
+            record.responded.is_some_and(|at| {
+                intervals
+                    .iter()
+                    .any(|(from, to)| at >= *from + disk::ANSWER_GRACE && at < *to)
+            })
+        })
+        .map(|record| record.share_id.as_str())
+        .collect();
+    let down_seconds: f64 = intervals
+        .iter()
+        .map(|(from, to)| to.saturating_duration_since(*from).as_secs_f64())
+        .sum();
+    checks.push(check(
+        "no share was acknowledged while PostgreSQL was down",
+        !intervals.is_empty() && acked_down.is_empty(),
+        format!(
+            "{} shares acknowledged inside the {} intervals ({down_seconds:.1} s) PostgreSQL's log \
+             shows it down, from {} ms after each PANIC: {:?}",
+            acked_down.len(),
+            intervals.len(),
+            disk::ANSWER_GRACE.as_millis(),
+            acked_down.iter().take(20).collect::<Vec<_>>()
+        ),
+    ));
+    let down_window = full.down_at.zip(full.up_at);
+    let (served, first_shares) = match full.up_at {
+        Some(up) => served_again(
+            inputs,
+            inputs.instance_ids.len(),
+            up,
+            up,
+            failover::SERVE_BOUND,
+        ),
+        None => (false, Vec::new()),
+    };
+    let kept = same_processes(&full.pids_before, &full.pids_after);
+    checks.push(check(
+        "every frontend accepted shares again within 30 s, without a restart",
+        served && kept,
+        format!(
+            "first accepted share per frontend after PostgreSQL returned: {first_shares:?}; same \
+             processes: {kept}"
+        ),
+    ));
+    let samples = full.collector_samples();
+    // The collector runs every 10 s, so its gauge can lag the outage by a
+    // cycle: read from the fill to one cycle after PostgreSQL's return.
+    let shown: Vec<(String, bool)> = inputs
+        .instance_ids
+        .iter()
+        .map(|instance| {
+            let seen = down_window.is_some_and(|(down, up)| {
+                samples.iter().any(|(name, at, value)| {
+                    name == instance
+                        && *at >= down
+                        && *at < up + disk::COLLECTOR_LAG
+                        && *value == Some(0.0)
+                })
+            });
+            (instance.clone(), seen)
+        })
+        .collect();
+    checks.push(check(
+        "every frontend's /metrics showed the database collector unavailable (#575's paging \
+         condition)",
+        !shown.is_empty() && shown.iter().all(|(_, seen)| *seen),
+        format!(
+            "qbit_prism_collector_available{{collector=\"database\"}} == 0 during the outage: \
+             {shown:?}"
+        ),
+    ));
+    checks.push(injector_steps(&full.problems));
+    let mut evidence = full.evidence(origin);
+    evidence["acknowledged_while_down"] = json!(acked_down.len());
+    evidence["collector_unavailable_shown"] = json!(shown
+        .iter()
+        .map(|(instance, seen)| json!({"frontend": instance, "shown": seen}))
+        .collect::<Vec<_>>());
+    evidence["first_accepted_after_return"] = json!(first_shares);
+    (checks, evidence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(at: Instant, target: &str, status: Option<u16>) -> read_tier::ReadSample {
+        read_tier::ReadSample {
+            target: target.into(),
+            path: "/public/v1/blocks".into(),
+            at,
+            millis: 1.0,
+            status,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn the_public_api_is_back_at_its_first_2xx_within_the_bound() {
+        let removed = Instant::now();
+        let seconds = |s: u64| removed + Duration::from_secs(s);
+        let samples = vec![
+            sample(seconds(1), "public-api", Some(503)),
+            sample(seconds(2), "load-fe-0", Some(200)),
+            sample(seconds(3), "public-api", Some(200)),
+            sample(seconds(4), "public-api", Some(200)),
+        ];
+        assert_eq!(public_back(Some(&samples), removed), Some(seconds(3)));
+        let late = vec![sample(
+            removed + PUBLIC_RETURN + Duration::from_secs(1),
+            "public-api",
+            Some(200),
+        )];
+        assert_eq!(public_back(Some(&late), removed), None);
+        assert_eq!(public_back(None, removed), None);
+    }
+
+    #[test]
+    fn a_frontend_that_changed_process_did_not_serve_without_a_restart() {
+        assert!(same_processes(&[Some(1), Some(2)], &[Some(1), Some(2)]));
+        assert!(!same_processes(&[Some(1), Some(2)], &[Some(1), Some(3)]));
+        assert!(!same_processes(&[Some(1), None], &[Some(1), None]));
+        assert!(!same_processes(&[], &[]));
     }
 }

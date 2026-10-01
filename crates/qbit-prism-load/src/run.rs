@@ -1063,19 +1063,79 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
     // --- PostgreSQL -------------------------------------------------------
     let replication = Replication::parse(&args.replication)?;
     let max_connections = args.frontends as u32 * args.db_max_connections + 32;
-    let mut managed: Option<ManagedPostgres> = None;
+    // A fault plan that fails the database over, or fills its WAL volume,
+    // asks the managed cluster for the replication link and the volume
+    // (#554); every other run's cluster is the one it always had.
+    let fault_plan = args.fault_plan()?;
+    let topology = cluster::FaultTopology {
+        replication_link: fault_plan.as_ref().is_some_and(|plan| plan.has_failover()),
+        wal_volume_mib: fault_plan
+            .as_ref()
+            .filter(|plan| plan.has_wal_disk_full())
+            .map(|_| crate::fault::disk::WAL_VOLUME_MIB),
+    };
+    let mut managed: Option<crate::fault::failover::Cluster> = None;
+    let mut managed_standby: Option<String> = None;
+    let mut failover: Option<Arc<crate::fault::failover::FailoverControl>> = None;
     let direct_url = match &args.database_url {
         Some(url) => url.clone(),
         None => {
             let bin_dir = pg_bin_dir.context("the PostgreSQL bin directory was not resolved")?;
-            let cluster =
-                ManagedPostgres::start(bin_dir, replication, max_connections, args.keep_artifacts)
-                    .await?;
-            let url = cluster.primary_url.clone();
+            let cluster = ManagedPostgres::start_with_topology(
+                bin_dir,
+                replication,
+                max_connections,
+                args.keep_artifacts,
+                cluster::SynchronousMethod::First,
+                topology,
+            )
+            .await?;
+            let mut url = cluster.primary_url.clone();
+            // Every writer, the harness's side pool included, reaches the
+            // primary through the writer endpoint, so a promotion moves one
+            // address and restarts nothing.
+            let writer = if topology.replication_link {
+                let endpoint = crate::fault::endpoint::Endpoint::open(cluster.primary_port).await?;
+                url = rewrite_host(&url, &format!("127.0.0.1:{}", endpoint.port()))?;
+                Some(Arc::new(endpoint))
+            } else {
+                None
+            };
+            // The public reader reaches the standby through a read endpoint
+            // the same way, moved to each standby a failover rebuilds.
+            let reader = match (topology.replication_link, cluster.standby_port) {
+                (true, Some(port)) => Some(Arc::new(
+                    crate::fault::endpoint::Endpoint::open(port).await?,
+                )),
+                _ => None,
+            };
+            let mut standby_url = cluster.standby_url.clone();
+            if let (Some(reader), Some(url)) = (&reader, &standby_url) {
+                standby_url = Some(rewrite_host(url, &format!("127.0.0.1:{}", reader.port()))?);
+            }
+            managed_standby = standby_url;
+            let cluster = Arc::new(std::sync::Mutex::new(cluster));
+            if fault_plan.is_some() {
+                failover = Some(Arc::new(crate::fault::failover::FailoverControl {
+                    cluster: cluster.clone(),
+                    writer,
+                    reader,
+                }));
+            }
             managed = Some(cluster);
             url
         }
     };
+    let pg_stat_statements = managed
+        .as_ref()
+        .and_then(|cluster| {
+            cluster
+                .lock()
+                .expect("cluster lock")
+                .pg_stat_statements
+                .clone()
+        })
+        .unwrap_or_else(|| "unknown (external database)".into());
     let result = run_inner(
         &args,
         RunContext {
@@ -1103,18 +1163,20 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
             log_dir,
             stale_outputs_removed,
             declared_replication: replication,
-            managed_standby: managed.as_ref().and_then(|m| m.standby_url.clone()),
-            pg_stat_statements: managed
-                .as_ref()
-                .and_then(|m| m.pg_stat_statements.clone())
-                .unwrap_or_else(|| "unknown (external database)".into()),
+            managed_standby,
+            pg_stat_statements,
             soak,
+            failover: failover.clone(),
         },
     )
     .await;
     // Cleanup runs on every exit path.
-    if let Some(mut cluster) = managed {
-        cluster.stop();
+    drop(failover);
+    if let Some(cluster) = managed {
+        cluster
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
     drop(fake_node);
     if let Some(real) = node.qbitd() {
@@ -1206,6 +1268,9 @@ struct RunContext {
     pg_stat_statements: String,
     /// `--plan soak`'s phases and spec (#575).
     soak: Option<crate::soak_driver::SoakPlan>,
+    /// The managed cluster and the writer endpoint, for the database faults
+    /// (#554); `None` without a fault plan or against `--database-url`.
+    failover: Option<Arc<crate::fault::failover::FailoverControl>>,
 }
 
 async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
@@ -1364,6 +1429,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         }
         if let Some(relay) = &fault_relay {
             environment.insert("QBIT_RPC_URL".into(), relay.url(index).to_owned());
+        }
+        if fault_plan.as_ref().is_some_and(|plan| plan.has_failover()) {
+            // #529's wait for the failover standby before a found block's
+            // offer, as a production pool with a standby runs it; the
+            // failover faults hold the pool to what it promises.
+            environment.insert(
+                "PRISM_OFFER_STANDBY_APPLICATION_NAME".into(),
+                cluster::STANDBY_NAME.into(),
+            );
         }
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
         // Frontend 1 first: concurrent first-boot migrations wait inside a
@@ -1759,6 +1833,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                         lease_wait_seconds: fault_plan.lease_wait_seconds,
                         storm_fraction: fault_plan.storm_fraction,
                         seed: fault_plan.seed,
+                        failover: ctx.failover.clone(),
+                        cut_seconds: fault_plan.cut_seconds,
+                        backlog: fault_plan.backlog,
                     },
                 ));
             }
@@ -2359,6 +2436,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 .iter()
                 .map(|record| record.share_id.clone())
                 .collect(),
+            fault_excused: match (&fault_driver, phase.plan.kind == crate::fault::PHASE) {
+                (Some(driver), true) => driver.excused_shares(&collected.submits, &committed),
+                _ => BTreeSet::new(),
+            },
         })
         .collect();
     let gaps = classify_gaps(
@@ -2690,6 +2771,29 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // other report keeps exactly the keys it always had.
     if let Some(report) = faults_report {
         side_report["faults"] = report;
+        // The acknowledged shares a failover's verdict proves lie in the
+        // replication gap are listed in its row and excused from the
+        // durability finding; the phase's reconciliation says how many of
+        // its missing shares they are, so the gate can tell them apart.
+        if let Some(phases) = side_report["phases"].as_array_mut() {
+            for phase in phases {
+                let name = phase["name"].as_str().unwrap_or_default().to_owned();
+                let excused = driven
+                    .iter()
+                    .find(|driven| driven.name == name)
+                    .map(|driven| &driven.fault_excused);
+                let missing = phase_reconciliations
+                    .iter()
+                    .find(|(phase, _)| *phase == name)
+                    .map(|(_, rec)| &rec.missing);
+                if let (Some(excused), Some(missing), true) =
+                    (excused, missing, phase["reconciliation"].is_object())
+                {
+                    phase["reconciliation"][MISSING_IN_A_FAULT_GAP] =
+                        json!(missing.intersection(excused).count());
+                }
+            }
+        }
     }
     // Real-node keys are added only to a real-node run's report, so a
     // fake-node report keeps exactly the keys it always had (#547).
@@ -3222,9 +3326,10 @@ pub async fn drive_phase_with_population(
             // A frontend a fault took down on purpose is not a crash.
             let planned = faults
                 .as_ref()
-                .and_then(|(driver, _)| driver.planned_outage());
+                .map(|(driver, _)| driver.planned_outages())
+                .unwrap_or_default();
             for child in frontends.iter_mut() {
-                if planned == Some(child.spec.index) {
+                if planned.contains(&child.spec.index) {
                     continue;
                 }
                 if let Some(status) = child.exited() {
@@ -4680,6 +4785,10 @@ pub struct GapReport {
     pub no_response_commits: Vec<Value>,
 }
 
+/// The key of a fault phase's reconciliation that counts its missing shares
+/// a failover's verdict proves lie in the replication gap (#554).
+pub const MISSING_IN_A_FAULT_GAP: &str = "missing_in_a_failover_gap";
+
 /// The kind a committed row that no phase offered is reported under.
 pub const OUTSIDE_PHASES_KIND: &str = "committed share that no phase offered";
 
@@ -4718,6 +4827,11 @@ pub fn outside_phases_finding(rows: &[String]) -> Option<Value> {
 pub struct DrivenPhase {
     pub name: String,
     pub kill_indeterminate: BTreeSet<String>,
+    /// The shares a database fault's verdict explains (#554): acknowledged
+    /// shares it proves lie in a failover's replication gap, each listed in
+    /// its row, and commits the server honestly answered
+    /// `ledger-outcome-unknown` while the primary was going or down.
+    pub fault_excused: BTreeSet<String>,
 }
 
 /// `phases` is every phase the run drove.
@@ -4740,6 +4854,7 @@ pub fn classify_gaps(
     for DrivenPhase {
         name: phase_name,
         kill_indeterminate,
+        fault_excused,
     } in phases
     {
         // The mid-flight kill destroys the answers to the submits outstanding
@@ -4757,12 +4872,17 @@ pub fn classify_gaps(
         else {
             continue;
         };
-        if !reconciliation.missing.is_empty() {
+        let missing: Vec<&String> = reconciliation
+            .missing
+            .iter()
+            .filter(|share| !fault_excused.contains(*share))
+            .collect();
+        if !missing.is_empty() {
             findings.push(json!({
                 "phase": phase_name,
                 "kind": "acknowledged share missing from PostgreSQL",
-                "count": reconciliation.missing.len(),
-                "sample": reconciliation.missing.iter().take(20).collect::<Vec<_>>(),
+                "count": missing.len(),
+                "sample": missing.iter().take(20).collect::<Vec<_>>(),
             }));
         }
         let Some((_, rows)) = attribution
@@ -4780,6 +4900,10 @@ pub fn classify_gaps(
                 _ => None,
             });
             match classify_committed_gap(record) {
+                // A commit whose answer was lost with the primary: the
+                // server said it could not tell, and the fault's row counts
+                // it.
+                GapKind::UnknownOutcomeCommitted if fault_excused.contains(share) => {}
                 kind @ (GapKind::AckCommitDivergence | GapKind::UnknownOutcomeCommitted) => {
                     let detail = json!({
                         "share_id": share,
