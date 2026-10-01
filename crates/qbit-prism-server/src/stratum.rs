@@ -99,7 +99,7 @@ pub trait MiningBackend: Send + Sync + 'static {
     /// The published work's parent and payout revision, an admission hint
     /// only (#604): a session whose newest job matches it holds current work
     /// and rebuilds through the rebuild lane. `None` when unknown, which
-    /// counts any issued job as current.
+    /// sends every delivery to the shared admission, as before #604.
     fn published_work_hint(&self) -> impl Future<Output = Option<(String, i64)>> + Send {
         async { None }
     }
@@ -251,9 +251,16 @@ impl Default for StratumConfig {
 /// waits for about this many rebuilds, so a larger lane is slower for it.
 /// The lane also bounds how many rebuilds share one issued-job batch
 /// transaction, so while commits are slow, rebuilds complete at about the
-/// lane per commit.
-pub fn rebuild_lane_permits(initial: usize) -> usize {
-    (initial / 4).max(1)
+/// lane per commit. Revisit the quarter if
+/// `qbit_prism_stratum_rebuild_lane_waiters` stays high while first jobs
+/// are not queueing, which would mean the lane, not first-job admission, is
+/// the bottleneck.
+pub const fn rebuild_lane_permits(initial: usize) -> usize {
+    if initial < 4 {
+        1
+    } else {
+        initial / 4
+    }
 }
 
 /// The global Stratum admission ceiling, kept with the capacity it was created
@@ -1076,12 +1083,30 @@ async fn result(
     write_json(writer, json!({"id":id,"result":value,"error":null}), config).await
 }
 
+/// Whether `prior`, the session's newest live job for its current worker, is
+/// on the published parent and payout revision (#604). An unknown
+/// publication counts nothing as current. An admission hint only.
+async fn holds_current_work<B: MiningBackend>(backend: &B, prior: Option<&Job>) -> bool {
+    let Some(prior) = prior else {
+        return false;
+    };
+    backend
+        .published_work_hint()
+        .await
+        .is_some_and(|(parent, revision)| {
+            // Jobs carry the template's hash lowercased; the hint may not.
+            prior.previousblockhash.eq_ignore_ascii_case(&parent)
+                && prior.payout_revision == revision
+        })
+}
+
 async fn deliver_job<B: MiningBackend>(
     backend: &B,
     session: &mut Session<B::Context>,
     writer: &mut (impl AsyncWrite + Unpin),
     config: &StratumConfig,
     metrics: &crate::metrics::Metrics,
+    mut refresh: watch::Receiver<u64>,
 ) -> Result<()> {
     let Some(extranonce1) = session.extranonce1.as_deref() else {
         return Ok(());
@@ -1100,29 +1125,37 @@ async fn deliver_job<B: MiningBackend>(
     // session without current work (a first job, a new worker, a tip change
     // or a payout revision landing) waits for those, not for every session's
     // rebuild. It takes only the shared initial-job admission, as before.
-    let holds_current_work = match session.jobs.back() {
-        Some(prior) if prior.worker.username == worker.username => backend
-            .published_work_hint()
-            .await
-            .is_none_or(|(parent, revision)| {
-                prior.job.wire.previousblockhash == parent
-                    && prior.job.wire.payout_revision == revision
-            }),
-        _ => false,
-    };
+    let prior = session
+        .jobs
+        .back()
+        // A job resumed after a reconnect is retired and is not current work.
+        .filter(|prior| prior.worker.username == worker.username && prior.retired_at.is_none())
+        .map(|prior| &prior.job.wire);
     let build = async {
-        let lane = if holds_current_work {
-            Some(match config.rebuild_job_limit.try_acquire() {
-                Ok(permit) => permit,
+        let lane = if holds_current_work(backend, prior).await {
+            match config.rebuild_job_limit.try_acquire() {
+                Ok(permit) => Some(permit),
                 Err(_) => {
                     let _waiting = RebuildLaneWait::new(config.stats.clone());
-                    config
-                        .rebuild_job_limit
-                        .acquire()
-                        .await
-                        .map_err(|_| StratumError::internal("pool is shutting down"))?
+                    // A publication that supersedes the work while it waits
+                    // (a new tip, a payout revision landing) sends it to the
+                    // shared admission instead. The acquire stays pinned, so
+                    // a same-tip publication keeps its place in the lane.
+                    let acquire = config.rebuild_job_limit.acquire();
+                    tokio::pin!(acquire);
+                    loop {
+                        tokio::select! {
+                            permit = &mut acquire => break Some(permit
+                                .map_err(|_| StratumError::internal("pool is shutting down"))?),
+                            changed = refresh.changed() => {
+                                if changed.is_err() || !holds_current_work(backend, prior).await {
+                                    break None;
+                                }
+                            }
+                        }
+                    }
                 }
-            })
+            }
         } else {
             None
         };
@@ -1806,6 +1839,7 @@ pub async fn serve_connection<B: MiningBackend>(
                 &mut writer,
                 &config,
                 &metrics,
+                refresh.clone(),
             )
             .await
             {

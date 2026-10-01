@@ -37,12 +37,13 @@ use tokio::task::JoinSet;
 const STORM_SESSIONS: usize = 1024;
 /// Sessions opened one at a time while the storm runs.
 const NEW_SESSIONS: usize = 8;
-/// A first job may be overtaken by at most this many storm deliveries. The
-/// rebuild lane at the default 128 initial-job permits is 32, so a first job
-/// waits for about 32 rebuilds admitted ahead of it and their persistence,
-/// however many sessions rebuild; first come, first served puts it behind
-/// nearly every storm session.
-const OVERTAKEN_BOUND: u64 = STORM_SESSIONS as u64 / 8;
+/// A first job may be overtaken by at most this many storm deliveries: three
+/// lanes. The rebuild lane at the default 128 initial-job permits is 32, so a
+/// first job waits for about 32 rebuilds admitted ahead of it and their
+/// persistence, however many sessions rebuild; first come, first served puts
+/// it behind nearly every storm session, and a lane released before
+/// persistence behind about four lanes.
+const OVERTAKEN_BOUND: u64 = 3 * crate::stratum::rebuild_lane_permits(128) as u64;
 const HEIGHT: u64 = 100;
 const TIP: &str = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
