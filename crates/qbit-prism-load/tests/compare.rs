@@ -1242,10 +1242,13 @@ fn churn_runs(
             })
             .collect();
         let dropped: u64 = storms.iter().map(|s| s["dropped"].as_u64().unwrap()).sum();
+        // Every storm drop and every departure closed a connected session.
+        let departed = plan["rentals_departing_in_phase"].as_u64().unwrap();
         report["churn"]["realised"] = json!({
+            "abrupt_closes": dropped + departed,
             "reconnects_completed": dropped,
             "rentals_spawned": plan["rental_sessions"],
-            "rentals_departed": plan["rentals_departing_in_phase"],
+            "rentals_departed": departed,
             "storms": storms,
         });
         report["churn"]["tip_delivery"] = json!({"tips": plan["tips_at_seconds"]});
@@ -1277,12 +1280,27 @@ fn a_churn_phase_that_spawned_fewer_rentals_than_planned_fails() {
         let why = if pointer.ends_with("/dropped") {
             "not the plan's 0.3 of them"
         } else if pointer.ends_with("/reconnects_completed") {
-            "reconnects after its storms dropped"
+            "completed 0 reconnects, short of the"
         } else {
             "the preset's churn plan holds"
         };
         assert!(result.markdown.contains(why), "{pointer}");
     }
+    // Departures of rentals no storm touched do not stand in for stormed
+    // sessions that never came back: every closed session is accounted for.
+    let mut runs = churn_runs(&manifest, &pinned);
+    let realised = &mut runs[1].report.as_mut().unwrap()["churn"]["realised"];
+    let missing = realised["rentals_departed"].as_u64().unwrap();
+    assert!(missing > 0, "the plan has departures");
+    realised["reconnects_completed"] =
+        json!(realised["reconnects_completed"].as_u64().unwrap() - missing.min(1));
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains("churn closes owe once"),
+        "{}",
+        result.markdown
+    );
 }
 
 #[test]

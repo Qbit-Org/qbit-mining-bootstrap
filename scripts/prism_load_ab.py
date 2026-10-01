@@ -333,7 +333,16 @@ def record_fsync(pg_bin: Path, tmpdir: Path, out: Path, seconds: int) -> dict[st
         probe.unlink()
     out.write_text(f"# pg_test_fsync on {tmpdir}\n{result.stdout}{result.stderr}", encoding="utf-8")
     parsed = parse_pg_test_fsync(result.stdout) if result.returncode == 0 else None
-    return {"file": out.name, "exit_code": result.returncode, **(parsed or {})}
+    # A probe that failed, or printed no one-write fdatasync figure, leaves
+    # the series unplaced against the reference host: the host is broken,
+    # not the build, so the series stops as bad input with the probe's own
+    # output kept beside it.
+    if parsed is None:
+        raise DriverError(
+            f"pg_test_fsync on {tmpdir} exited {result.returncode} without a one-8 kB-write fdatasync "
+            f"figure; see {out}"
+        )
+    return {"file": out.name, "exit_code": result.returncode, **parsed}
 
 
 @contextlib.contextmanager

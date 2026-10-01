@@ -368,6 +368,20 @@ Compare file sync methods using two 8kB writes:
             with self.assertRaisesRegex(ab.DriverError, "running"):
                 ab.record_fsync(Path(directory), Path(directory), Path(directory) / "f.txt", 1)
 
+    def test_a_failed_flush_probe_stops_the_series_as_bad_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            probe = folder / "pg_test_fsync"
+            for script, why in [
+                ("echo 'could not open output file' >&2; exit 1", "exited 1"),
+                ("echo '5 seconds per test'; exit 0", "exited 0 without"),
+            ]:
+                probe.write_text(f"#!/bin/sh\n{script}\n")
+                probe.chmod(0o755)
+                with self.subTest(why=why), self.assertRaisesRegex(ab.DriverError, why):
+                    ab.record_fsync(folder, folder, folder / "fsync.txt", 1)
+                self.assertTrue((folder / "fsync.txt").exists(), "the probe's output is kept")
+
     def test_a_series_written_while_waiting_for_the_lock_needs_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             @contextlib.contextmanager

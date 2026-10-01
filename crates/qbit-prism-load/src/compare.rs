@@ -1259,24 +1259,28 @@ fn churn_unrealised(
                 )));
             }
         }
-        // The stormed sessions came back: every one reconnects after its
-        // delay, except a stormed rental whose planned departure came
-        // first, so the completed reconnects are at least the drops less
-        // the departures.
-        let dropped: u64 = churn
-            .and_then(|c| c.pointer("/realised/storms"))
-            .and_then(Value::as_array)
-            .map_or(0, |storms| {
-                storms.iter().filter_map(|s| s["dropped"].as_u64()).sum()
-            });
-        let departed = count("/realised/rentals_departed").unwrap_or(0);
+        // The stormed sessions came back. Every churn close of a connected
+        // session (`abrupt_closes`) is a storm drop, owed a reconnect, or a
+        // rental's departure, owed none; a stormed rental whose departure
+        // comes before its reconnect departs while disconnected and closes
+        // nothing more. So the reconnects owed are exactly the churn closes
+        // less the departures, however the storms and departures overlap
+        // (all three counts are in every harness with a churn phase).
+        let closes = count("/realised/abrupt_closes");
+        let departed = count("/realised/rentals_departed");
         let reconnected = count("/realised/reconnects_completed");
-        if !reconnected.is_some_and(|n| n + departed >= dropped) {
+        let owed = closes.zip(departed).map(|(c, d)| c.saturating_sub(d));
+        if !reconnected.zip(owed).is_some_and(|(n, owed)| n >= owed) {
+            let figure =
+                |n: Option<u64>| n.map_or("an unreported number of".into(), |n| n.to_string());
             return Ok(Some(format!(
-                "**the runs did not drive the pinned workload**: {} completed {} reconnects \
-                 after its storms dropped {dropped} sessions ({departed} rentals departed)",
+                "**the runs did not drive the pinned workload**: {} completed {} reconnects, \
+                 short of the {} its {} churn closes owe once {} departing rentals are set aside",
                 run.run.id,
-                reconnected.map_or("an unreported number of".into(), |n| n.to_string())
+                figure(reconnected),
+                figure(owed),
+                figure(closes),
+                figure(departed)
             )));
         }
         // Each storm dropped what its fraction of the sessions then connected

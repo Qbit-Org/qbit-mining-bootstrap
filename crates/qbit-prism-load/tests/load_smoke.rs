@@ -362,6 +362,12 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         .as_u64()
         .context("reconnects")?;
     assert!(reconnected + departed >= dropped, "{churn}");
+    // Exactly: every churn close is a storm drop owed a reconnect or a
+    // departure owed none.
+    let closes = churn["realised"]["abrupt_closes"]
+        .as_u64()
+        .context("abrupt closes")?;
+    assert!(reconnected + departed >= closes, "{churn}");
     assert_eq!(
         report["database"]["replication"]["agreed_with_declared"], true,
         "the replication premise"

@@ -35,7 +35,9 @@ The driver, `scripts/prism_load_ab.py`:
    locks still held, before anything else runs. A host where the
    driver cannot become a subreaper is refused, dry runs included.
 3. **Records `pg_test_fsync`.** It runs `-s 5` on the filesystem the harness
-   builds its clusters on, once before the series and once after.
+   builds its clusters on, once before the series and once after. A probe
+   that fails, or prints no one-write fdatasync figure, stops the series as
+   bad input (exit 2), with the probe's output kept.
 4. **Alternates the order.** Odd repeats run the base first and even
    repeats the candidate first.
 5. **Gates each run on load.** Before each run it waits a 60 s cooldown and
