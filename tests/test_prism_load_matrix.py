@@ -25,16 +25,21 @@ class CheckedInPresets(unittest.TestCase):
         self.assertNotIn("mainnet-shape-2600-addresses", names)
         self.assertNotIn("pr-smoke", names)
 
-    def test_the_weekly_schedule_runs_only_the_long_soak(self) -> None:
+    def test_the_weekly_schedule_runs_the_long_soak_and_the_long_fault_set(self) -> None:
         entries = matrix.select(self.presets, "weekly")
-        self.assertEqual([entry["preset"] for entry in entries], ["soak-weekly"])
-        # Under the six-hour job limit, with the soak's own minutes inside it.
-        [entry] = entries
-        self.assertLess(entry["timeout_minutes"], 360)
-        self.assertLess(self.presets["soak-weekly"]["soak"]["minutes"], entry["timeout_minutes"])
+        self.assertEqual(
+            [entry["preset"] for entry in entries], ["faults-long-real-node", "soak-weekly"]
+        )
+        # Each under the six-hour job limit, with the soak's own minutes inside it.
+        for entry in entries:
+            self.assertLess(entry["timeout_minutes"], 360)
+        soak = next(entry for entry in entries if entry["preset"] == "soak-weekly")
+        self.assertLess(self.presets["soak-weekly"]["soak"]["minutes"], soak["timeout_minutes"])
         nightly = [entry["preset"] for entry in matrix.select(self.presets, "nightly")]
-        self.assertNotIn("soak-weekly", nightly)
-        self.assertNotIn("soak-weekly", [entry["preset"] for entry in matrix.select(self.presets, "all")])
+        everything = [entry["preset"] for entry in matrix.select(self.presets, "all")]
+        for name in ("soak-weekly", "faults-long-real-node"):
+            self.assertNotIn(name, nightly)
+            self.assertNotIn(name, everything)
 
     def test_all_adds_the_manual_presets(self) -> None:
         names = [entry["preset"] for entry in matrix.select(self.presets, "all")]

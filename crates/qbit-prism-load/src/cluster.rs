@@ -469,7 +469,42 @@ pub struct ManagedPostgres {
     root: TempRoot,
     primary: Cluster,
     standby: Option<Cluster>,
+    /// What a fault run asked of the cluster (#554); the default otherwise.
+    topology: FaultTopology,
+    user: String,
+    /// The options the primary was started with, for a restart.
+    primary_options: String,
+    max_connections: i32,
+    /// The standby's replication link, when the topology asks for one.
+    link: Option<crate::fault::endpoint::Endpoint>,
+    /// The fuse2fs volume holding the primary's `pg_wal`, when asked for.
+    /// Declared after the clusters, so it is unmounted after they stop.
+    wal_volume: Option<crate::fault::disk::DiskFullInjector>,
+    /// Whether the current primary's `pg_wal` is on `wal_volume`: a
+    /// promotion makes the standby, whose WAL is not, the primary.
+    wal_on_volume: bool,
+    /// Standbys built after a promotion, for their directory names.
+    rebuilds: u32,
 }
+
+/// What a fault run needs of the managed cluster (#554).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FaultTopology {
+    /// The standby streams through an endpoint the harness can fence, so a
+    /// fault can cut replication while the primary keeps committing.
+    pub replication_link: bool,
+    /// The primary's `pg_wal` on a fuse2fs volume of this many MiB, so a
+    /// fault can fill it (#575's DiskFullInjector).
+    pub wal_volume_mib: Option<u64>,
+}
+
+/// The WAL settings a primary on the fault volume runs with: 1 MiB segments
+/// that are never recycled, so a full volume refuses the next segment within
+/// a megabyte of WAL, and a small `max_wal_size`, so normal running fits the
+/// volume with room to spare. Its log is stamped in UTC, so the fault reads
+/// from it when the server went down and came back.
+pub const WAL_VOLUME_SETTINGS: &str =
+    "-c wal_recycle=off -c min_wal_size=4MB -c max_wal_size=128MB -c log_timezone=UTC";
 
 fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?
@@ -592,25 +627,71 @@ impl ManagedPostgres {
         keep_artifacts: bool,
         synchronous_method: SynchronousMethod,
     ) -> Result<Self> {
+        Self::start_with_topology(
+            bin_dir,
+            replication,
+            max_connections,
+            keep_artifacts,
+            synchronous_method,
+            FaultTopology::default(),
+        )
+        .await
+    }
+
+    /// [`start_with_method`](Self::start_with_method), with what a fault run
+    /// needs of the cluster (#554): the standby's replication link through
+    /// an endpoint, and the primary's `pg_wal` on a volume the harness can
+    /// fill. The default topology is exactly the cluster every other run
+    /// gets.
+    pub async fn start_with_topology(
+        bin_dir: PathBuf,
+        replication: Replication,
+        max_connections: u32,
+        keep_artifacts: bool,
+        synchronous_method: SynchronousMethod,
+        topology: FaultTopology,
+    ) -> Result<Self> {
         let root = TempRoot::create(keep_artifacts)?;
         let user = current_user()?;
-        let mut primary = Cluster {
+        let primary = Cluster {
             bin: bin_dir.clone(),
             data: root.path().join("primary"),
             log: root.path().join("primary.log"),
             running: false,
         };
+        let wal_volume = match topology.wal_volume_mib {
+            Some(mib) => Some(
+                crate::fault::disk::DiskFullInjector::mount(mib)
+                    .context("mounting the WAL volume (needs fuse2fs, fuse3 and /dev/fuse)")?,
+            ),
+            None => None,
+        };
+        let mut initdb: Vec<String> = [
+            "-D",
+            primary.data.to_str().context("non-UTF-8 data path")?,
+            "-A",
+            "trust",
+            "--no-locale",
+            "-E",
+            "UTF8",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        if let Some(volume) = &wal_volume {
+            initdb.push("-X".into());
+            initdb.push(
+                volume
+                    .volume()
+                    .join("pg_wal")
+                    .to_str()
+                    .context("non-UTF-8 WAL volume path")?
+                    .to_owned(),
+            );
+            initdb.push("--wal-segsize=1".into());
+        }
         primary.run(
             "initdb",
-            &[
-                "-D",
-                primary.data.to_str().context("non-UTF-8 data path")?,
-                "-A",
-                "trust",
-                "--no-locale",
-                "-E",
-                "UTF8",
-            ],
+            &initdb.iter().map(String::as_str).collect::<Vec<_>>(),
         )?;
         let primary_port = free_port()?;
         let preload = pkglibdir(&bin_dir)
@@ -627,10 +708,13 @@ impl ManagedPostgres {
         if preload.is_some() {
             options.push_str(" -c shared_preload_libraries=pg_stat_statements");
         }
-        primary.start(&options)?;
-        let primary_url = format!("postgresql://{user}@127.0.0.1:{primary_port}/postgres");
+        if wal_volume.is_some() {
+            options.push(' ');
+            options.push_str(WAL_VOLUME_SETTINGS);
+        }
+        let wal_on_volume = wal_volume.is_some();
         let mut managed = Self {
-            primary_url,
+            primary_url: format!("postgresql://{user}@127.0.0.1:{primary_port}/postgres"),
             primary_port,
             standby_url: None,
             standby_port: None,
@@ -641,7 +725,16 @@ impl ManagedPostgres {
             root,
             primary,
             standby: None,
+            topology,
+            user: user.clone(),
+            primary_options: options.clone(),
+            max_connections: max_connections as i32,
+            link: None,
+            wal_volume,
+            wal_on_volume,
+            rebuilds: 0,
         };
+        managed.primary.start(&options)?;
         if managed.pg_stat_statements.is_none() {
             managed.pg_stat_statements = Some("unavailable".to_owned());
         }
@@ -670,9 +763,12 @@ impl ManagedPostgres {
             log: self.root.path().join("standby.log"),
             running: false,
         };
+        if self.topology.replication_link {
+            self.link = Some(crate::fault::endpoint::Endpoint::open(self.primary_port).await?);
+        }
         let conninfo = format!(
             "host=127.0.0.1 port={} user={user} application_name={STANDBY_NAME}",
-            self.primary_port
+            self.replication_port()
         );
         standby.run(
             "pg_basebackup",
@@ -704,11 +800,8 @@ impl ManagedPostgres {
             sqlx::query_scalar("SELECT current_setting('max_connections')::int")
                 .fetch_one(&admin)
                 .await?;
-        standby.start(&format!(
-            "-h 127.0.0.1 -p {standby_port} -k {root} -c hot_standby=on -c fsync=on \
-             -c full_page_writes=on -c max_connections={max_connections} -c max_wal_senders=10",
-            root = self.root.path().display()
-        ))?;
+        self.max_connections = max_connections;
+        standby.start(&self.standby_options(standby_port))?;
         self.standby = Some(standby);
         self.standby_port = Some(standby_port);
         self.standby_url = Some(format!(
@@ -764,6 +857,230 @@ impl ManagedPostgres {
         Ok(())
     }
 
+    fn standby_options(&self, port: u16) -> String {
+        format!(
+            "-h 127.0.0.1 -p {port} -k {root} -c hot_standby=on -c fsync=on \
+             -c full_page_writes=on -c max_connections={} -c max_wal_senders=10",
+            self.max_connections,
+            root = self.root.path().display()
+        )
+    }
+
+    /// The port the standby's `primary_conninfo` names: the replication
+    /// link's, when there is one, else the primary's own.
+    fn replication_port(&self) -> u16 {
+        self.link
+            .as_ref()
+            .map_or(self.primary_port, crate::fault::endpoint::Endpoint::port)
+    }
+
+    /// The topology the cluster was started with.
+    pub fn topology(&self) -> FaultTopology {
+        self.topology
+    }
+
+    /// The primary's own URL, never an endpoint in front of it.
+    pub fn primary_url(&self) -> &str {
+        &self.primary_url
+    }
+
+    /// Cut the standby's replication link: the walreceiver's connection is
+    /// closed and its reconnects are refused until the link is moved.
+    pub fn cut_replication(&self) -> Result<()> {
+        self.link
+            .as_ref()
+            .context("the cluster was started without a replication link")?
+            .fence();
+        Ok(())
+    }
+
+    /// Reconnect the standby's replication link to the primary, after a cut
+    /// the fault did not get to follow with a failover.
+    pub fn heal_replication(&self) {
+        if let Some(link) = &self.link {
+            link.route_to(self.primary_port);
+        }
+    }
+
+    /// The loss of the primary: an immediate shutdown, which writes no
+    /// checkpoint and sends nothing more to the standby.
+    pub fn kill_primary(&mut self) -> Result<()> {
+        ensure!(self.primary.running, "the primary is not running");
+        self.primary
+            .control(&["-m", "immediate", "-w", "-t", "60", "stop"])
+            .context("stopping the primary immediately")?;
+        self.primary.running = false;
+        Ok(())
+    }
+
+    /// The planned switch's stop: a fast shutdown, whose walsenders ship all
+    /// WAL through the shutdown checkpoint before the server exits.
+    pub fn stop_primary_cleanly(&mut self) -> Result<()> {
+        ensure!(self.primary.running, "the primary is not running");
+        self.primary
+            .control(&["-m", "fast", "-w", "-t", "60", "stop"])
+            .context("stopping the primary")?;
+        self.primary.running = false;
+        Ok(())
+    }
+
+    /// Promote the standby (`pg_ctl promote` waits until it leaves recovery)
+    /// and make it the primary. The old primary's data directory is removed
+    /// unless artifacts are kept: it has diverged and must be rebuilt.
+    pub fn promote_standby(&mut self) -> Result<()> {
+        ensure!(!self.primary.running, "the old primary is still running");
+        let standby = self
+            .standby
+            .take()
+            .context("there is no standby to promote")?;
+        let promoted = standby.control(&["-w", "-t", "60", "promote"]);
+        if let Err(error) = promoted {
+            let tail = log_tail(&standby.log, START_FAILURE_LOG_LINES).unwrap_or_default();
+            self.standby = Some(standby);
+            bail!("promoting the standby: {error:#}\n{tail}");
+        }
+        let old = std::mem::replace(&mut self.primary, standby);
+        self.primary_port = self
+            .standby_port
+            .take()
+            .context("the standby had no port")?;
+        // A restart of the new primary starts it as it runs now.
+        self.primary_options = self.standby_options(self.primary_port);
+        self.primary_url = self.standby_url.take().context("the standby had no URL")?;
+        self.wal_on_volume = false;
+        if !self.root.keep {
+            let _ = std::fs::remove_dir_all(&old.data);
+        }
+        Ok(())
+    }
+
+    /// Build a new standby of the current primary, as the operator rebuilds
+    /// the old one after a failover: a base backup under the same
+    /// `application_name` and slot name, streaming through the replication
+    /// link (moved to the new primary) when there is one. The caller waits
+    /// for it to stream.
+    pub fn rebuild_standby(&mut self) -> Result<()> {
+        ensure!(self.standby.is_none(), "a standby already exists");
+        self.rebuilds += 1;
+        let port = free_port()?;
+        let mut standby = Cluster {
+            bin: self.bin_dir.clone(),
+            data: self.root.path().join(format!("standby-{}", self.rebuilds)),
+            log: self
+                .root
+                .path()
+                .join(format!("standby-{}.log", self.rebuilds)),
+            running: false,
+        };
+        let backup = |create: bool| -> Result<String> {
+            let source = format!(
+                "host=127.0.0.1 port={} user={} application_name={STANDBY_NAME}",
+                self.primary_port, self.user
+            );
+            let mut args = vec![
+                "-D",
+                standby.data.to_str().context("non-UTF-8 data path")?,
+                "-d",
+                &source,
+                "-X",
+                "stream",
+                "-S",
+                STANDBY_SLOT,
+                "-c",
+                "fast",
+            ];
+            if create {
+                args.push("-C");
+            }
+            standby.run("pg_basebackup", &args)
+        };
+        // A promoted standby has no replication slots of its own, so the
+        // slot is created with the backup; one left by an earlier rebuild of
+        // this primary is reused.
+        if let Err(error) = backup(true) {
+            if !format!("{error:#}").contains("already exists") {
+                return Err(error);
+            }
+            let _ = std::fs::remove_dir_all(&standby.data);
+            backup(false)?;
+        }
+        if let Some(link) = &self.link {
+            link.route_to(self.primary_port);
+        }
+        let conninfo = format!(
+            "host=127.0.0.1 port={} user={} application_name={STANDBY_NAME}",
+            self.replication_port(),
+            self.user
+        );
+        std::fs::write(standby.data.join("standby.signal"), "").context("write standby.signal")?;
+        let auto = standby.data.join("postgresql.auto.conf");
+        let mut contents = std::fs::read_to_string(&auto).unwrap_or_default();
+        contents.push_str(&format!(
+            "\nprimary_conninfo = '{conninfo}'\nprimary_slot_name = '{STANDBY_SLOT}'\n\
+             hot_standby = on\n"
+        ));
+        std::fs::write(&auto, contents).context("write standby recovery configuration")?;
+        standby.start(&self.standby_options(port))?;
+        self.standby = Some(standby);
+        self.standby_port = Some(port);
+        self.standby_url = Some(format!(
+            "postgresql://{}@127.0.0.1:{port}/postgres",
+            self.user
+        ));
+        Ok(())
+    }
+
+    /// Whether the primary's postmaster is running (`pg_ctl status`).
+    pub fn primary_running(&self) -> bool {
+        Command::new(self.bin_dir.join("pg_ctl"))
+            .arg("-D")
+            .arg(&self.primary.data)
+            .arg("status")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Start the primary again with the options it first had, as its
+    /// supervisor would after it stopped; bounded by `pg_ctl`'s own wait,
+    /// and failing with the end of its log.
+    pub fn restart_primary(&mut self) -> Result<()> {
+        self.primary.running = false;
+        let options = self.primary_options.clone();
+        self.primary.start(&options)
+    }
+
+    /// The primary's log file.
+    pub fn primary_log_path(&self) -> PathBuf {
+        self.primary.log.clone()
+    }
+
+    /// The last lines of the primary's log, for a failure's reason.
+    pub fn primary_log_tail(&self) -> Option<String> {
+        log_tail(&self.primary.log, START_FAILURE_LOG_LINES)
+    }
+
+    /// Whether the current primary's `pg_wal` is on the fault volume.
+    pub fn wal_on_volume(&self) -> bool {
+        self.wal_on_volume && self.wal_volume.is_some()
+    }
+
+    /// Fill the WAL volume to `ENOSPC`; the bytes the ballast took.
+    pub fn fill_wal_volume(&self) -> Result<u64> {
+        ensure!(
+            self.wal_on_volume(),
+            "the primary's WAL is not on the fault volume"
+        );
+        self.wal_volume.as_ref().context("no WAL volume")?.start()
+    }
+
+    /// Free the WAL volume: the operator deleting what filled it.
+    pub fn free_wal_volume(&self) -> Result<()> {
+        match &self.wal_volume {
+            Some(volume) => volume.stop(),
+            None => Ok(()),
+        }
+    }
+
     /// Stop both clusters and, unless artifacts are kept, remove the data
     /// directories. Safe to call more than once.
     pub fn stop(&mut self) {
@@ -771,6 +1088,9 @@ impl ManagedPostgres {
             standby.stop();
         }
         self.primary.stop();
+        // A primary that stopped by itself (a PANIC on a full WAL volume)
+        // leaves nothing to stop; the ballast goes, so the volume unmounts.
+        let _ = self.free_wal_volume();
         // The root itself goes when `TempRoot` drops, which is after this
         // returns, so the data directory is never removed under a live server.
     }

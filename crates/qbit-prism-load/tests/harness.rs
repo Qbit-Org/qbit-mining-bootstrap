@@ -3483,6 +3483,7 @@ fn driven(name: &str, kill_indeterminate: &[&str]) -> run::DrivenPhase {
             .iter()
             .map(|id| (*id).to_owned())
             .collect(),
+        fault_excused: Default::default(),
     }
 }
 
@@ -10571,4 +10572,69 @@ fn process_cpu_seconds_covers_cpu_the_process_really_spent() {
         spent <= ceiling,
         "process CPU rose by {spent} s, more than {cores} cores could spend in the time ({ceiling} s)"
     );
+}
+
+/// #554: a database failover's verdict proves which acknowledged shares lie
+/// in the replication gap, and which commits were answered
+/// `ledger-outcome-unknown` while the primary was going. Only those are
+/// excused from the durability finding and the divergence bucket; a share
+/// the database lost for any other reason in the same phase is still exit 4.
+#[test]
+fn a_failover_excuses_only_the_losses_its_verdict_proves() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{classify_gaps, DrivenPhase};
+    use std::collections::BTreeSet;
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    let with = |id: &str, outcome: Outcome| client::SubmitRecord {
+        share_id: id.to_owned(),
+        ..submit_record("faults", outcome)
+    };
+    let unknown = || {
+        Outcome::Rejected(rejection(
+            20,
+            Some(qbit_prism_load::classify::LEDGER_OUTCOME_UNKNOWN),
+            "ledger outcome unknown",
+        ))
+    };
+    let records = vec![
+        with("kept", Outcome::Accepted),
+        with("in-gap", Outcome::Accepted),
+        with("lost", Outcome::Accepted),
+        with("unknown-committed", unknown()),
+    ];
+    let committed = set(&["kept", "unknown-committed"]);
+    let (offered, acknowledged) = run::offered_and_acknowledged(&records, "faults");
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution =
+        digest::attribute_unexpected(&committed, &[("faults".to_owned(), &reconciliation)]);
+    let gaps = |excused: &[&str]| {
+        classify_gaps(
+            &[DrivenPhase {
+                name: "faults".into(),
+                kill_indeterminate: BTreeSet::new(),
+                fault_excused: set(excused),
+            }],
+            &[("faults".to_owned(), reconciliation.clone())],
+            &attribution,
+            &records,
+            15.0,
+        )
+    };
+    // Nothing excused: both losses are findings, and the unknown commit is
+    // in its bucket.
+    let plain = gaps(&[]);
+    assert_eq!(plain.findings[0]["count"], json!(2), "{}", plain.findings);
+    assert_eq!(plain.unknown_outcome_commits.len(), 1);
+    // The fault's proven gap and its unknown answer are excused; `lost`,
+    // which the verdict did not prove, is still a finding.
+    let excused = gaps(&["in-gap", "unknown-committed"]);
+    assert_eq!(
+        excused.findings[0]["count"],
+        json!(1),
+        "{}",
+        excused.findings
+    );
+    assert_eq!(excused.findings[0]["sample"], json!(["lost"]));
+    assert!(excused.unknown_outcome_commits.is_empty());
 }
