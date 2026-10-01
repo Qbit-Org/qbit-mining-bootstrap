@@ -4,12 +4,16 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import shlex
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
-from scripts.run_rust_test_shard import COMPACT_SCALE, IGNORED, main, shard_commands, workspace_targets
+from scripts.run_rust_test_shard import (
+    COMPACT_SCALE, DURATION_SECONDS, IGNORED, main, shard_commands, typical_seconds, workspace_targets,
+)
 
 
 NATIVE_SCRIPT = Path(__file__).resolve().parents[1] / "test" / "prism-native-tests.sh"
@@ -69,6 +73,34 @@ class RustTestShardTests(unittest.TestCase):
             package["targets"].reverse()
         self.assertEqual(shards, [shard_commands(metadata, i, 4) for i in range(4)])
 
+    def test_heavy_targets_spread_across_shards_and_loads_stay_balanced(self):
+        # Round-robin over the sorted list put the server lib,
+        # compact_runtime_scale and live_regtest on one shard (#647).
+        metadata = fixture_metadata()
+        server = metadata["packages"][0]["targets"]
+        for package, kind, name in DURATION_SECONDS:
+            if {"kind": [kind], "name": name} not in server:
+                server.append({"kind": [kind], "name": name})
+        for index in range(40):
+            server.append({"kind": ["test"], "name": f"light_{index:02}"})
+        targets = workspace_targets(metadata)
+        count = 4
+        owners = {}
+        for index in range(count):
+            for command in shard_commands(metadata, index, count):
+                if "--ignored" in command:
+                    continue
+                package, kind = command[4], command[5][2:]
+                name = command[6] if kind != "lib" else next(
+                    target[2] for target in targets if target[:2] == (package, "lib")
+                )
+                owners[package, kind, name] = index
+        self.assertCountEqual(owners, targets)
+        heaviest = sorted(DURATION_SECONDS, key=typical_seconds, reverse=True)[:count]
+        self.assertEqual(len({owners[target] for target in heaviest}), count)
+        loads = [sum(typical_seconds(target) for target in targets if owners[target] == index) for index in range(count)]
+        self.assertLessEqual(max(loads), max(DURATION_SECONDS.values()) + max(typical_seconds(target) for target in targets if target not in DURATION_SECONDS))
+
     def test_local_database_mode_selects_the_same_ignored_contracts(self):
         script = NATIVE_SCRIPT.read_text(encoding="utf-8").replace("\\\n", " ")
         database = script.split("\n  database)\n", 1)[1].split("\n    ;;", 1)[0]
@@ -104,6 +136,26 @@ class RustTestShardTests(unittest.TestCase):
                 )
                 for call in run.call_args_list:
                     self.assertTrue(call.kwargs["check"])
+
+    def test_job_summary_records_each_command_duration_even_on_failure(self):
+        metadata = fixture_metadata()
+        commands = shard_commands(metadata, 2, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary.md"
+            with (
+                mock.patch.dict("os.environ", {"GITHUB_STEP_SUMMARY": str(summary)}),
+                mock.patch("scripts.run_rust_test_shard.subprocess.check_output", return_value=json.dumps(metadata)),
+                mock.patch("scripts.run_rust_test_shard.subprocess.run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                run.side_effect = [None, subprocess.CalledProcessError(101, ["cargo"])]
+                self.assertEqual(main(["--shard-index", "2", "--shard-count", "4"]), 101)
+                self.assertEqual(main(["--shard-index", "2", "--shard-count", "4", "--dry-run"]), 0)
+            lines = summary.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:2], ["| Command | Seconds |", "| --- | ---: |"])
+        self.assertEqual(len(lines), 4)
+        for line, command in zip(lines[2:], commands):
+            self.assertRegex(line, rf"^\| `{re.escape(shlex.join(command))}` \| \d+ \|$")
 
     def test_cargo_failure_stops_shard_and_preserves_nonzero_status(self):
         for phase in ["metadata", "tests"]:

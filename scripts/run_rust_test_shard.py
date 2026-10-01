@@ -3,15 +3,18 @@
 
 Keep each test binary intact so its fixtures and process-wide locks retain
 Cargo's normal semantics. Discover targets from Cargo so new suites join CI.
+Balance shards by each target's typical duration, longest first.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +33,22 @@ IGNORED = {
     COMPACT_SCALE: ["--test-threads=1"],
     ("qbit-prism-server", "test", "issued_job_dependency"): ["--test-threads=2"],
 }
+# Typical seconds per target, build included, from the PostgreSQL shard logs
+# of 2026-10-01 (#647). Round-robin put the first three on one shard, which
+# then ran into the job's cap. Every other target averages about 20 s.
+# Re-measure from the job summary's per-command table when shards drift.
+DURATION_SECONDS = {
+    ("qbit-prism-server", "test", "live_regtest"): 700,
+    ("qbit-prism-server", "lib", "qbit_prism_server"): 330,
+    ("qbit-prism-server", "test", "candidate_storm_restart"): 270,
+    COMPACT_SCALE: 240,
+    ("qbit-prism-server", "test", "ledger_postgres"): 210,
+}
+DEFAULT_DURATION_SECONDS = 20
+
+
+def typical_seconds(target: tuple[str, str, str]) -> int:
+    return DURATION_SECONDS.get(target, DEFAULT_DURATION_SECONDS)
 
 
 def workspace_targets(metadata: dict) -> list[tuple[str, str, str]]:
@@ -50,7 +69,13 @@ def workspace_targets(metadata: dict) -> list[tuple[str, str, str]]:
 def shard_commands(metadata: dict, index: int, count: int) -> list[list[str]]:
     if count < 1 or not 0 <= index < count:
         raise ValueError("require shard-count > 0 and 0 <= shard-index < shard-count")
-    targets = workspace_targets(metadata)[index::count]
+    loads = [0] * count
+    shards: list[list[tuple[str, str, str]]] = [[] for _ in range(count)]
+    for target in sorted(workspace_targets(metadata), key=lambda target: (-typical_seconds(target), target)):
+        lightest = min(range(count), key=lambda shard: (loads[shard], shard))
+        loads[lightest] += typical_seconds(target)
+        shards[lightest].append(target)
+    targets = sorted(shards[index])
     if not targets:
         raise ValueError("shard contains no targets; reduce shard-count")
     commands = []
@@ -77,10 +102,21 @@ def main(argv: list[str] | None = None) -> int:
             cwd=ROOT, text=True,
         ))
         commands = shard_commands(metadata, args.shard_index, args.shard_count)
+        summary = None if args.dry_run else os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write("| Command | Seconds |\n| --- | ---: |\n")
         for command in commands:
             print(shlex.join(command), flush=True)
             if not args.dry_run:
-                subprocess.run(command, cwd=ROOT, check=True)
+                started = time.monotonic()
+                try:
+                    subprocess.run(command, cwd=ROOT, check=True)
+                finally:
+                    if summary:
+                        # Per-command durations are the data for the next re-balance.
+                        with open(summary, "a", encoding="utf-8") as handle:
+                            handle.write(f"| `{shlex.join(command)}` | {time.monotonic() - started:.0f} |\n")
     except ValueError as error:
         parser.error(str(error))
     except subprocess.CalledProcessError as error:
