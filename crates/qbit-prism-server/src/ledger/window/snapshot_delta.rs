@@ -102,6 +102,8 @@ pub(crate) struct SnapshotCapture {
     pub snapshot: Snapshot,
     pub leaf: Option<LeafWitness>,
     pub acquisition: AcquisitionReport,
+    /// The writer timeline the window's rows were read on (#619).
+    pub timeline: super::WriterTimeline,
 }
 
 impl std::ops::Deref for SnapshotCapture {

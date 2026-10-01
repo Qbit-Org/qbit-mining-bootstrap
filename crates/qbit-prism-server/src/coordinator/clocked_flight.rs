@@ -115,6 +115,7 @@ mod tests {
                 Ok(ClockedRevision {
                     now_ms: value,
                     payout_revision: value,
+                    timeline: crate::ledger::WriterTimeline::new(1),
                 })
             }
             .boxed()
@@ -197,6 +198,7 @@ mod tests {
                 Ok(ClockedRevision {
                     now_ms: value,
                     payout_revision: value,
+                    timeline: crate::ledger::WriterTimeline::new(1),
                 })
             }
             .boxed()

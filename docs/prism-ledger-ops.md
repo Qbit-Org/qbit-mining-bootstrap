@@ -1684,6 +1684,86 @@ candidate row. The HA reference's
 [found-block section](prism-ha-reference-architecture.md#found-blocks-a-bounded-standby-flush-before-the-offer-529)
 has the measurements and the accepted-loss statement.
 
+### Work from a lost replication gap (#619)
+
+An asynchronous promotion can also lose the end of the share history that
+work was read from: shares credited in the gap, after the standby's last
+received WAL. The promoted sequence then hands their `share_seq` values out
+again to other shares. Every frontend tags the work it prepares with the
+writer timeline its window was read on (PostgreSQL increments it at every
+promotion), and every check below revalidates on the primary that would hold
+the result:
+
+- **Refresh.** A changed timeline replaces published work at the next poll,
+  even on an unchanged template, revision and balances. The rebuild is
+  counted under `qbit_prism_refresh_seconds{trigger="writer_timeline"}` and
+  logged as `refresh published` with `trigger=writer_timeline`.
+- **Issuance and resume.** Work read on another timeline, or reconstructed
+  from a stored record, is issued only while the primary holds its window's
+  last row as the window's own row. Until the refresh rebuilds, a new session
+  is sent no job: nothing is answered on the wire, and the session retries its
+  build on its timer and at the next publication. The frontend logs `job
+  preparation deferred` (or `job persistence deferred`) with `window_not_held:
+  the work's window is not held by this primary after a writer timeline change
+  (#619)`. A prepared record is never written back, by the repair or by
+  `save_compact_prepared`, unless its window is held.
+- **Found blocks.** The candidate enqueue, in the transaction that would write
+  the candidate, refuses a block whose window this primary does not hold. The
+  miner is answered `stale-job`, the share the proof carried is not credited,
+  `qbit_prism_stale_job_rejections_total{cause="window_not_held"}` counts it
+  and a WARN names the block: `block refused stale-job before its offer: this
+  primary does not hold the window its coinbase pays, which a promotion lost or
+  reissued (#619)`. Nothing is enqueued or offered. The ledger counts the
+  refusal itself, so one that finishes after the miner's acknowledgement
+  deadline is counted too; that miner was answered `ledger-outcome-unknown`.
+  A block whose window replicated, including on work prepared before a planned
+  switchover or on a job resumed after the promotion, lands as before.
+
+**Precondition: synchronized database clocks.** The check compares the window's
+last row with the window's anchor by time: the row must be accepted and issued
+no later than the anchor. A share reissued after the promotion is stamped with
+the promoted host's clock, so it fails the check only while that clock does not
+lag the old primary's by more than the time from the last gap work to the first
+reissued share, a few seconds. Keep every database host NTP-synchronized. If the
+promoted host's clock lags further, a block on gap work can pass the check, be
+offered, and end in `reconciliation` with a window digest mismatch, as before
+#619; reconcile it as below.
+
+A refused block is a lost reward, like a block found in the gap and never
+offered. Record each WARN's hash with the failover's reconciliation. The design
+note [`prism-async-promotion-gap-blocks.md`](prism-async-promotion-gap-blocks.md)
+has the analysis and the options that were weighed.
+
+**A candidate already in `reconciliation` after a promotion.** A block offered
+before this check existed, or by a frontend still running an older release
+during a rolling upgrade, can be on chain while its window is not held. Its
+landing fails with a `last_error` that starts `window not held by this
+primary` (older releases: `window range incomplete: … read 0`; under the clock
+precondition above: a window digest mismatch). The row is retried read-only and never offered again, and
+`abandon` refuses it, because it is not `pending`. Treat it as an
+accounting-loss reconciliation, as
+[promotion step 6](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint)
+does for a block on chain with no candidate:
+
+1. Confirm the block is on the node's active chain (`getblockheader <hash>`,
+   `confirmations` of at least 1) and record its coinbase.
+2. Record the divergence. The coinbase paid the lost window and the as-issued
+   prior balances, which the promoted ledger still carries, so the next
+   landings pay those balances again, up to the block's positive as-issued
+   float. The block's accruals (gross it carried for accounts below the payout
+   floor) are never credited.
+3. **With CTV settlement on,** the coinbase's covenant outputs can only be
+   spent by fanout transactions built from the lost window, and there is no
+   pool spend key. No tool rebuilds a fanout from exported rows today, and
+   `candidates recover` cannot land a window the primary does not hold, so
+   recovering those outputs needs engineering work; record the block for it.
+   What the operator can do now is keep that recovery possible: do not
+   rewind the fenced old primary, rebuild it from the new primary or start it
+   as a writer until the window's rows (the candidate's
+   `window_first_share_seq..window_last_share_seq`, on the old timeline) have
+   been copied out of an isolated copy of its data directory. Without those
+   rows the covenant amount stays unspendable.
+
 SIGTERM closes listener admission and asks tasks to drain before the database
 pool closes. The native server bounds shutdown drain to 30 seconds; unfinished
 candidate/CTV intents remain in PostgreSQL and become reclaimable after their

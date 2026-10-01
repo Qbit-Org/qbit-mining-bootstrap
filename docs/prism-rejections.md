@@ -167,11 +167,11 @@ round trips never return to the delivery path.
 ## Stale-job causes
 
 Every `stale-job` rejection keeps its wire reason, numeric code 21 and message.
-`qbit_prism_stale_job_rejections_total{cause}` records which of the four
+`qbit_prism_stale_job_rejections_total{cause}` records which of the five
 decisions below refused the share, once, at that decision. The share observation
 counts the same rejection once as `reason_id="stale-job"`. Lease admission,
 lease revalidation and commit-gate refusals use that coarse reason without a
-label in this four-cause series; its sum is not a total of all stale responses.
+label in this five-cause series; its sum is not a total of all stale responses.
 `unknown-job` has no cause series. Stale-grace credit is an accepted
 share, counted by `qbit_prism_grace_credited_shares_total`, not a cause.
 
@@ -185,6 +185,7 @@ a cause, and backend-unavailable answers are never stale-job causes.
 | `fee_floor` | The coordinator found the job's CTV fanout fee below the live relay floor, or the floor unavailable. Message `job CTV fee is below the current relay floor`. | Node relay policy and mempool minimum fee, then whether replacement work reached miners: `qbit_prism_authorized_missing_current_work` and `qbit_prism_stratum_current_tip_coverage_gap_seconds`. |
 | `parent_grace` | The job's parent is not the published tip, and stale grace was unavailable, expired, or the job's parent is not the new tip's immediate parent. Block-only work (#478) is counted here after a tip change without any grace check, and so is a capture abandoned before its offer because its parent is no longer the tip. Message `stale job`. | Tip freshness and delivery: `qbit_prism_stratum_semantic_current_work_ratio`, `qbit_prism_authorized_missing_current_work`, `qbit_prism_stratum_current_tip_coverage_gap_seconds`, `qbit_prism_job_delivery_failures_total` and `qbit_prism_grace_credited_shares_total`. |
 | `payout_revision` | The parent is current, but either the job's payout snapshot or the current published payout snapshot disagrees with the durable payout revision, and no share-lease exception applies. Since #478 a block-bearing proof from ordinary work on the active tip is captured instead and is not counted here. Counted here: block-only work, which a same-parent payout replacement retired (its plain shares, and the share of a block captured from it), and a capture abandoned before its offer by the overpay ceiling or with capture off. Message `stale job`. | Payout revision changes and replacement delivery: `qbit_prism_pending_job_builds`, `qbit_prism_job_delivery_successes_total`, `qbit_prism_job_delivery_failures_total` and the coverage series above. |
+| `window_not_held` | A block-bearing proof passed every check above, but the candidate enqueue, in the transaction that would write the candidate, found that the current primary does not hold the window its coinbase pays: the window's last row is absent or is another share credited after the window's anchor (#619). After an asynchronous promotion that lost the end of the replication gap, a session can still hold a job on work read from the lost history. The block is never enqueued or offered, and the share it carried is not credited. Message `stale job`; a WARN names the block and #619. The ledger counts the refusal itself, so one that finishes after the miner's acknowledgement deadline (the miner then saw `ledger-outcome-unknown`) is counted too. | A database promotion: the refresh logs and `qbit_prism_refresh_seconds{trigger="writer_timeline"}`, then the HA reference's promotion steps. See [the #619 design note](prism-async-promotion-gap-blocks.md). |
 
 The native registry has no per-worker, evicted-job, job-build or tip-refresh
 histograms; `docs/prism-native-metrics.md` is the complete inventory.

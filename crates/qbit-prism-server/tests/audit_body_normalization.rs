@@ -31,7 +31,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     audit_canonical_bytes, Candidate, CandidateClaim, Ledger, ShareRange, SignerKeys, Snapshot,
-    WindowRef,
+    WindowNotHeld, WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde::Deserialize;

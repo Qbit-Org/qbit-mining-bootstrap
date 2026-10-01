@@ -555,6 +555,21 @@ impl Coordinator {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(self.stale_job(cause))
             }
+            // The enqueue refused the block before COMMIT: this primary does
+            // not hold the window its coinbase pays (#619). The job's
+            // authority is stale, not the ledger failing, so the answer is
+            // `stale-job`; nothing was written or offered. The ledger counted
+            // `window_not_held` at the refusal itself, so a refusal that
+            // finishes after this answer's deadline is counted too; it is not
+            // counted again here.
+            SaveOutcome::Failed(error)
+                if error
+                    .downcast_ref::<crate::ledger::WindowNotHeld>()
+                    .is_some() =>
+            {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(protocol_error("stale-job", "stale job"))
+            }
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 if error.downcast_ref::<CommitGateClosed>().is_some() {

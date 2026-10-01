@@ -201,7 +201,7 @@ pub fn expected(populated: bool) -> Census {
         "counter",
         &labels(
             "cause",
-            "resume_expired,fee_floor,parent_grace,payout_revision",
+            "resume_expired,fee_floor,parent_grace,payout_revision,window_not_held",
         ),
         &[],
     );
@@ -310,7 +310,15 @@ pub fn expected(populated: bool) -> Census {
         HOLD_SECONDS,
     );
     let refreshes: Vec<_> = [
-        "initial", "tip", "revision", "balances", "reanchor", "shares", "template", "fee",
+        "initial",
+        "tip",
+        "revision",
+        "balances",
+        "reanchor",
+        "shares",
+        "template",
+        "fee",
+        "writer_timeline",
     ]
     .into_iter()
     .flat_map(|trigger| {

@@ -196,17 +196,11 @@ impl Ledger {
                 tx.rollback().await?;
                 return Ok(IssuedJobSave::PreparedMissing);
             };
-            if let Some(range) = repair.record.window.shares {
-                ensure!(
-                    probe_share_rows(
-                        &mut tx,
-                        range.first_share_seq as i64,
-                        range.last_share_seq as i64
-                    )
-                    .await?,
-                    "prepared share endpoint missing"
-                );
-            }
+            // The repair writes this frontend's in-memory work back. After an
+            // asynchronous promotion that work can name a window the promoted
+            // history lost (#619), so its rows are checked as the window's
+            // own, never only for existence.
+            prepared::require_window_held(&mut tx, &repair.record.window).await?;
             prepared::put_template(&mut tx, &repair.template).await?;
             put_balances(&mut tx, repair).await?;
             let record = &repair.record;

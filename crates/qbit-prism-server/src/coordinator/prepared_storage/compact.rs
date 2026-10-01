@@ -233,6 +233,7 @@ pub(in crate::coordinator) fn assemble_captured(
     original_expires_at_ms: i64,
     created: Instant,
     build_proof: Option<CompactBuildProof>,
+    timeline: Option<crate::ledger::WriterTimeline>,
 ) -> Result<CapturedCompactPrepared> {
     ensure!(
         record.template_sha256 == template.sha256(),
@@ -265,6 +266,7 @@ pub(in crate::coordinator) fn assemble_captured(
         generation: record.generation,
         created,
         parent_of_tip: record.parent_of_tip.clone(),
+        timeline,
     });
     Ok(CapturedCompactPrepared {
         original,
@@ -467,6 +469,7 @@ impl Coordinator {
                     source.original_expires_at_ms,
                     Instant::now(),
                     Some(source.proof),
+                    Some(source.window.timeline),
                 )?;
                 // The refresh loop alone retains the original accepted rows
                 // until invalidation; the counted shares leave with admission.

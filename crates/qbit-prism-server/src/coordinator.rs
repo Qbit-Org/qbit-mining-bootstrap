@@ -150,6 +150,11 @@ pub struct Prepared {
     pub generation: u64,
     pub created: Instant,
     pub parent_of_tip: String,
+    /// The writer timeline `window`'s rows were read on, or `None` when the
+    /// work was reconstructed from a stored record and its window was not
+    /// re-read on a known timeline. Work used on any other timeline must
+    /// prove its window is still held first (#619). Runtime-only.
+    pub timeline: Option<crate::ledger::WriterTimeline>,
 }
 
 #[cfg(test)]
@@ -439,6 +444,22 @@ pub enum RecoveryStop {
     /// The operator's one deadline expired.
     #[error("the recovery deadline expired")]
     Deadline,
+}
+
+/// The reason a claim gives for a window this primary does not hold
+/// ([`crate::ledger::WindowHolding::NotHeld`]): its last row is absent or is
+/// another share, so the read failure is lost or reissued history, never
+/// pruning or corruption. The block cannot land here; it is on chain, and
+/// the HA reference's runbook reconciles it as an accounting loss (#619).
+fn window_not_held_reason(window: &WindowRef, error: &WindowError) -> String {
+    let range = window.shares.map_or_else(
+        || "empty".to_owned(),
+        |range| format!("{}..={}", range.first_share_seq, range.last_share_seq),
+    );
+    format!(
+        "window not held by this primary: {error}; its last row is absent or is another share credited after anchor {}, so window {range}'s rows were lost or reissued by an asynchronous promotion, not pruned or corrupt (#619: the block cannot land here; reconcile it as an accounting loss)",
+        window.anchor_ms
+    )
 }
 
 /// Map a window read error to the claim's action. A database error is not
@@ -1175,6 +1196,7 @@ impl Coordinator {
             refresh_trigger(
                 current_prepared.as_deref(),
                 parent,
+                probe.timeline,
                 probe.payout_state.payout_revision,
                 probe.payout_state.prior_balances_digest,
                 probe.accepted_share_seq,
@@ -1189,10 +1211,15 @@ impl Coordinator {
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
             // reads the latest shares. Empty-to-first-share remains immediate.
+            // A new writer timeline does replace it: a promotion can lose the
+            // window's rows while revision, balances and template stay equal
+            // (#619). Issuance re-checks the timeline at every admission, so a
+            // promotion after this probe is caught there.
             if cached_window.as_ref().is_some_and(|window| {
                 window.reference == current.window
                     && window.within_reanchor_interval(self.config.snapshot_interval)
-            }) && current.fee == fee
+            }) && current.timeline == Some(probe.timeline)
+                && current.fee == fee
                 && current.fingerprint == fingerprint
                 && current.snapshot.payout_revision == state.payout_revision
                 && current.window.prior_balances_digest == state.prior_balances_digest
@@ -1272,6 +1299,7 @@ impl Coordinator {
                 network,
                 probe.accepted_share_seq,
                 probe.payout_state,
+                probe.timeline,
                 self.config.snapshot_interval,
             )
         } else {
@@ -1340,6 +1368,7 @@ impl Coordinator {
             refresh_trigger(
                 current.as_deref(),
                 parent,
+                admitted.0.timeline,
                 admitted.0.snapshot.payout_revision,
                 admitted.0.reference.prior_balances_digest,
                 admitted.0.snapshot.share_seq,
@@ -1349,6 +1378,7 @@ impl Coordinator {
         });
         let equivalent = current.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
+                && current.timeline == Some(admitted.0.timeline)
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
                 && current.window.prior_balances_digest
@@ -2055,6 +2085,30 @@ impl Coordinator {
         let rebuild = async {
             let window = match self.read_window(&candidate.window, balances).await {
                 Ok(window) => window,
+                Err(
+                    error @ (WindowError::Incomplete { .. }
+                    | WindowError::SnapshotDigestMismatch { .. }),
+                ) => {
+                    // Tell a window this primary no longer holds, after a
+                    // promotion lost or reissued its rows (#619), from
+                    // pruning or corruption. A failed probe leaves the
+                    // original classification: unknown is never "not held".
+                    let holding = match self.ledger.acquire().await {
+                        Ok(mut connection) => {
+                            crate::ledger::probe_window_holding(&mut connection, &candidate.window)
+                                .await
+                                .ok()
+                        }
+                        Err(_) => None,
+                    };
+                    if holding == Some(crate::ledger::WindowHolding::NotHeld) {
+                        return Ok(Err(RebuildFailure::Retry(window_not_held_reason(
+                            &candidate.window,
+                            &error,
+                        ))));
+                    }
+                    return classify_window_error(error).map(Err);
+                }
                 Err(error) => return classify_window_error(error).map(Err),
             };
             // No await between here and the hand-off: the window moves into
@@ -2949,7 +3003,7 @@ impl MiningBackend for Coordinator {
             drop(initial);
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .context("payout snapshot stale")?;
+                .with_context(|| issuance_authority.refusal_context())?;
             self.ensure_job_fee_current(prepared.fee).await?;
             let (base, bundle, bootstrap_share) = self
                 .materialize_wire(
@@ -2970,7 +3024,7 @@ impl MiningBackend for Coordinator {
             Self::probe(&self.build_job_probe).await;
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .context("payout snapshot stale")?;
+                .with_context(|| issuance_authority.refusal_context())?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -3062,7 +3116,7 @@ impl MiningBackend for Coordinator {
                     &stored.prepared_key,
                     &metadata.record,
                 );
-                let Some(mut issuance_authority) = self
+                let Ok(mut issuance_authority) = self
                     .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
                     .await?
                 else {
@@ -3344,9 +3398,11 @@ mod offer_not_executed_tests;
 /// on a same-template poll and the admitted window's on a new template. A
 /// missing cached window with published work is labelled `reanchor`. A
 /// label for the refresh metric and log, never a decision input.
+#[allow(clippy::too_many_arguments)]
 fn refresh_trigger(
     current: Option<&Prepared>,
     parent: &str,
+    timeline: crate::ledger::WriterTimeline,
     payout_revision: i64,
     prior_balances_digest: [u8; 32],
     share_seq: u64,
@@ -3357,6 +3413,7 @@ fn refresh_trigger(
         return RefreshTrigger::Initial;
     };
     classify_refresh(RefreshChanges {
+        writer_timeline: current.timeline != Some(timeline),
         tip: current.template["previousblockhash"].as_str() != Some(parent),
         revision: current.snapshot.payout_revision != payout_revision,
         balances: current.window.prior_balances_digest != prior_balances_digest,
@@ -3369,6 +3426,7 @@ fn refresh_trigger(
 /// Which of the published work's inputs a refresh found changed.
 #[derive(Clone, Copy, Debug, Default)]
 struct RefreshChanges {
+    writer_timeline: bool,
     tip: bool,
     revision: bool,
     balances: bool,
@@ -3381,7 +3439,11 @@ struct RefreshChanges {
 /// everything else: a changed fingerprint, an aged template, or a cached
 /// window that no longer matches the published reference.
 fn classify_refresh(changes: RefreshChanges) -> RefreshTrigger {
-    if changes.tip {
+    // A promotion invalidates the published window whatever else moved with
+    // it, so it is named first (#619).
+    if changes.writer_timeline {
+        RefreshTrigger::WriterTimeline
+    } else if changes.tip {
         RefreshTrigger::Tip
     } else if changes.revision {
         RefreshTrigger::Revision

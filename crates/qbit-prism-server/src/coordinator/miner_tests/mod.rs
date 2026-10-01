@@ -529,6 +529,7 @@ impl Fixture {
             self.store.database_now() + 86_400_000,
             Instant::now(),
             None,
+            Some(crate::ledger::WriterTimeline::new(1)),
         )
         .unwrap();
         let prepared = captured.original;

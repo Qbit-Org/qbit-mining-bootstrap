@@ -50,6 +50,30 @@ pub struct IssuanceAuthority {
     expires_at_ms: Option<i64>,
     /// Set only for freshly built work (#598).
     same_tip: Option<Arc<SameTipIssue>>,
+    /// Why the last revalidation refused this work, when it did.
+    refusal: Option<WorkRefusal>,
+}
+
+/// Why admission refused work, so a deferral names its real cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkRefusal {
+    /// Superseded publication, payout, tip, lease or deadline.
+    Superseded,
+    /// Prepared on another writer timeline, or reconstructed from a stored
+    /// record, and this primary does not hold its window (#619): the
+    /// issuance counterpart of the enqueue's `window_not_held`.
+    WindowNotHeld,
+}
+
+impl WorkRefusal {
+    pub(super) fn context(self) -> &'static str {
+        match self {
+            Self::Superseded => "payout snapshot stale",
+            Self::WindowNotHeld => {
+                "window_not_held: the work's window is not held by this primary after a writer timeline change (#619)"
+            }
+        }
+    }
 }
 
 /// Fresh work may outlive a later publication on the same published tip
@@ -100,7 +124,14 @@ impl IssuanceAuthority {
                 tip,
                 fee: prepared.fee,
             })),
+            refusal: None,
         })
+    }
+
+    /// What a deferral says when revalidation refused this work: the cause
+    /// the last refusal recorded, or the generic stale payout snapshot.
+    pub(super) fn refusal_context(&self) -> &'static str {
+        self.refusal.unwrap_or(WorkRefusal::Superseded).context()
     }
 
     pub(super) fn absolute_expiry(&self) -> Option<i64> {
@@ -201,6 +232,11 @@ impl PublishedLease {
 
 /// Immutable publication identity, including reconstructed copies of the same
 /// dependency. A same-parent/revision payout alone cannot borrow its lease.
+///
+/// `timeline` is not part of that identity, and `matches` ignores it: it
+/// records the writer timeline the window was read on, when known, so
+/// admission can demand proof that the window is still held once the
+/// timeline has moved (#619).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PreparedIdentity {
     key: String,
@@ -209,6 +245,7 @@ pub(super) struct PreparedIdentity {
     window: WindowRef,
     revision: i64,
     parent: Option<String>,
+    timeline: Option<crate::ledger::WriterTimeline>,
 }
 
 impl PreparedIdentity {
@@ -231,6 +268,7 @@ impl PreparedIdentity {
             parent: prepared.template["previousblockhash"]
                 .as_str()
                 .map(str::to_owned),
+            timeline: None,
         }
     }
 
@@ -244,6 +282,7 @@ impl PreparedIdentity {
             parent: prepared.template["previousblockhash"]
                 .as_str()
                 .map(str::to_owned),
+            timeline: prepared.timeline,
         }
     }
 
@@ -257,6 +296,8 @@ impl PreparedIdentity {
             window: record.window,
             revision: record.payout_revision,
             parent: Some(record.parent_hash.clone()),
+            // A stored record: its window is proven again where it is used.
+            timeline: None,
         }
     }
 }
@@ -529,7 +570,7 @@ impl Coordinator {
         identity: PreparedIdentity,
         readiness_epoch: u64,
         expires_at_ms: Option<i64>,
-    ) -> Result<Option<IssuanceAuthority>> {
+    ) -> Result<std::result::Result<IssuanceAuthority, WorkRefusal>> {
         let view = self.authority_view().await;
         ensure!(
             view.readiness.generation == readiness_epoch,
@@ -545,11 +586,18 @@ impl Coordinator {
             deadline: None,
             expires_at_ms,
             same_tip: None,
+            refusal: None,
         };
-        Ok(self
-            .revalidate_issuance_authority(&mut proof, expires_at_ms)
-            .await?
-            .map(|_| proof))
+        // A refusal keeps its cause, so a deferral names it (#619).
+        Ok(
+            match self
+                .revalidate_issuance_authority(&mut proof, expires_at_ms)
+                .await?
+            {
+                Some(_) => Ok(proof),
+                None => Err(proof.refusal.unwrap_or(WorkRefusal::Superseded)),
+            },
+        )
     }
 
     /// Preserve the first selected lease and deadline across every build,
@@ -559,15 +607,20 @@ impl Coordinator {
         proof: &mut IssuanceAuthority,
         expires_at_ms: Option<i64>,
     ) -> Result<Option<i64>> {
+        proof.refusal = None;
         let expires_at_ms = match (proof.expires_at_ms, expires_at_ms) {
             (Some(original), Some(next)) => Some(original.min(next)),
             (original, next) => original.or(next),
         };
-        let Some(current) = self
+        let current = match self
             .work_authority_in_epoch(&proof.identity, expires_at_ms, proof.readiness_epoch)
             .await?
-        else {
-            return Ok(None);
+        {
+            Ok(current) => current,
+            Err(refusal) => {
+                proof.refusal = Some(refusal);
+                return Ok(None);
+            }
         };
         let view = self.authority_view().await;
         ensure!(
@@ -635,6 +688,7 @@ impl Coordinator {
         Ok(self
             .work_authority_in_epoch(identity, expires_at_ms, readiness_epoch)
             .await?
+            .ok()
             .map(|authority| authority.revision))
     }
 
@@ -643,7 +697,7 @@ impl Coordinator {
         identity: &PreparedIdentity,
         expires_at_ms: Option<i64>,
         readiness_epoch: u64,
-    ) -> Result<Option<WorkAuthority>> {
+    ) -> Result<std::result::Result<WorkAuthority, WorkRefusal>> {
         // One shared read, started after this request, supplies both the
         // clock and the revision: the expired-clock branch still returns
         // before the revision is used, and a database failure still precedes
@@ -654,13 +708,32 @@ impl Coordinator {
             Some(expires) => {
                 let clock = AbsoluteDeadline::from_database(read.now_ms, requested_at, expires)?;
                 if !clock.live() {
-                    return Ok(None);
+                    return Ok(Err(WorkRefusal::Superseded));
                 }
                 Some(clock)
             }
             None => None,
         };
         let revision = read.payout_revision;
+        // Work read on another writer timeline, or reconstructed from a stored
+        // record, is admitted only while this primary still holds its window
+        // (#619). Within one timeline rows are immutable and the same read
+        // carries the timeline, so fresh work costs no extra round trip.
+        if identity.timeline != Some(read.timeline)
+            && !self.work_ledger.window_held(&identity.window).await?
+        {
+            // Debug here: the caller's deferral WARN names the cause (see
+            // `WorkRefusal::context`), and the refresh that replaces the work
+            // is logged and counted under trigger `writer_timeline`.
+            tracing::debug!(
+                prepared_key = identity.key.as_str(),
+                window_last_share_seq = identity.window.shares.map(|range| range.last_share_seq),
+                prepared_timeline = identity.timeline.map(|timeline| timeline.to_string()),
+                current_timeline = %read.timeline,
+                "work refused: prepared on another writer timeline and its window is not held by this primary (#619)"
+            );
+            return Ok(Err(WorkRefusal::WindowNotHeld));
+        }
         // Match publication lock order: prepared -> observed tip. A lease
         // belongs to the published payout, never an older same-parent payout.
         let view = self.authority_view().await;
@@ -685,7 +758,7 @@ impl Coordinator {
                 .as_deref()
                 .is_some_and(|p| identity.matches(p))
         {
-            return Ok(None);
+            return Ok(Err(WorkRefusal::Superseded));
         }
         if selected.as_deref() != Some(parent) && !leased {
             // Preserve the unavailable-current-publication contract. A miss
@@ -706,7 +779,7 @@ impl Coordinator {
                 last_poll.elapsed() < self.config.health_timeout || current_leased,
                 "tip polling stale"
             );
-            return Ok(None);
+            return Ok(Err(WorkRefusal::Superseded));
         }
         ensure!(
             last_poll.elapsed() < self.config.health_timeout || leased,
@@ -738,11 +811,11 @@ impl Coordinator {
             })
         };
         if clock.is_some_and(|clock| !clock.live()) {
-            return Ok(None);
+            return Ok(Err(WorkRefusal::Superseded));
         }
         // A known superseded payout is an unknown/retired resumable job,
         // not a failed database lookup. Keep that outcome distinct.
-        Ok(admitted)
+        Ok(admitted.ok_or(WorkRefusal::Superseded))
     }
 
     async fn prove_published_lease(

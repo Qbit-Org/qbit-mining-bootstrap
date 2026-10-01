@@ -105,7 +105,8 @@ labels!(WindowAcquisition {
 // What invalidated the published work and made a refresh rebuild it.
 labels!(RefreshTrigger {
     Initial => "initial", Tip => "tip", Revision => "revision", Balances => "balances",
-    Reanchor => "reanchor", Shares => "shares", Template => "template", Fee => "fee"
+    Reanchor => "reanchor", Shares => "shares", Template => "template", Fee => "fee",
+    WriterTimeline => "writer_timeline"
 });
 // Where the rebuilt work's window came from: the delta path, the full scan,
 // or the cached window the previous refresh captured.
@@ -113,7 +114,8 @@ labels!(RefreshAcquisition { Delta => "delta", Full => "full", Cached => "cached
 // The stale-job decision that refused a share. The wire reason stays `stale-job`.
 labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",
-    ParentGrace => "parent_grace", PayoutRevision => "payout_revision"
+    ParentGrace => "parent_grace", PayoutRevision => "payout_revision",
+    WindowNotHeld => "window_not_held"
 });
 // #478: what the offer did with a pending block on the current tip whose
 // payout revision was superseded.

@@ -942,6 +942,13 @@ impl Ledger {
         // strictly greater than this anchor. Release the ordering barrier
         // before scanning a potentially large payout window.
         let mut tx = self.begin().await?;
+        // The tag names the writer whose history the rows below are read
+        // from, so it is read in this transaction, never the anchor's (#619).
+        // A pooled connection can still reach a fenced old primary while the
+        // anchor ran on the promoted one, or the reverse; either way the tag
+        // matches the rows, and a tag that is not the current writer's makes
+        // the work prove its window before it is used.
+        let timeline = WriterTimeline::read(&mut tx).await?;
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
         // Without a retired window there is nothing to advance from; the
         // report still says so, because how often that happens is part of
@@ -978,6 +985,7 @@ impl Ledger {
                                 snapshot,
                                 leaf: Some(leaf),
                                 acquisition: report,
+                                timeline,
                             })
                         })
                         .await;
@@ -1060,6 +1068,7 @@ impl Ledger {
                     snapshot,
                     leaf,
                     acquisition: report,
+                    timeline,
                 })
             })
             .await
@@ -1127,24 +1136,20 @@ const WINDOW_PAGE_ROWS: i64 = 4096;
 /// Does every named share row exist? One statement and two primary-key
 /// lookups, on the caller's connection or transaction.
 ///
-/// Two callers share it, and both need it inside a transaction of their own:
+/// [`Ledger::read_window`] probes both endpoints of a range inside its
+/// `REPEATABLE READ READ ONLY` snapshot, so a pruned range becomes a typed
+/// [`WindowError::Incomplete`] in one round trip, before any page is read,
+/// mapped or hashed. The candidate enqueue and the prepared-record writes use
+/// [`probe_window_holding`] instead, which also checks that the last row is
+/// the window's own (#619).
 ///
-/// * [`Ledger::read_window`] probes both endpoints of a range inside its
-///   `REPEATABLE READ READ ONLY` snapshot, so a pruned range becomes a typed
-///   [`WindowError::Incomplete`] in one round trip, before any page is read,
-///   mapped or hashed;
-/// * the candidate enqueue probes a non-empty window's `first_share_seq`
-///   alone, under `ORDER_LOCK` and in the transaction that writes the
-///   candidate, by passing that sequence as **both** bounds. Retention only
-///   ever removes a prefix, so the presence of the first row means the whole
-///   range is present, and the committed row then holds the retention floor.
-///   The same probe backs the `save_job` reservation check.
-///
-/// Share rows are immutable, so a row that is absent was pruned and a row that
-/// is present can never later stop matching the window predicate. This is
-/// deliberately an existence test on `share_seq` only, not the window
-/// predicate: it is a retention probe, never a substitute for the per-page
-/// count and digest checks.
+/// On one writer timeline share rows are immutable, so a row that is absent
+/// was pruned and a row that is present can never later stop matching the
+/// window predicate. This is deliberately an existence test on `share_seq`
+/// only, not the window predicate: it is a retention probe, never a
+/// substitute for the per-page count and digest checks. Across an
+/// asynchronous promotion a `share_seq` can name another share (#619), which
+/// only [`probe_window_holding`] detects.
 pub async fn probe_share_rows(
     connection: &mut sqlx::PgConnection,
     first_share_seq: i64,
@@ -1154,6 +1159,136 @@ pub async fn probe_share_rows(
         "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1) AND EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2)",
     ).bind(first_share_seq).bind(last_share_seq).fetch_one(&mut *connection).await?)
 }
+
+/// The primary's WAL insertion timeline, the expression #466's leaf witness
+/// reads. PostgreSQL increments it at every promotion, so it names the
+/// writer a frontend's work was read from. Runtime-only: never serialized or
+/// persisted. Under D3's single standby it tells successive writers apart; it
+/// is not a global identity for sibling physical copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterTimeline(u32);
+
+/// Select-list expression for [`WriterTimeline`]: the timeline field of the
+/// WAL file name at the current insert position. It fails during recovery,
+/// so every reader keeps it behind a `NOT pg_is_in_recovery()` guard or a
+/// writable check.
+pub(crate) const WRITER_TIMELINE_SQL: &str = "left(pg_walfile_name(pg_current_wal_lsn()),8)";
+
+impl WriterTimeline {
+    /// A fixture timeline for in-memory test ledgers.
+    #[cfg(test)]
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Parse the eight hex digits [`WRITER_TIMELINE_SQL`] returns.
+    pub(crate) fn parse(hex: &str) -> Result<Self> {
+        ensure!(
+            hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid writer timeline {hex:?}"
+        );
+        Ok(Self(u32::from_str_radix(hex, 16)?))
+    }
+
+    /// Read the timeline on the caller's connection or transaction. A failed
+    /// statement stays a database error; only an unparsable answer is a
+    /// decode error.
+    pub(crate) async fn read(connection: &mut sqlx::PgConnection) -> Result<Self, WindowError> {
+        let hex: String = sqlx::query_scalar(&format!("SELECT {WRITER_TIMELINE_SQL}"))
+            .fetch_one(&mut *connection)
+            .await?;
+        Self::parse(&hex).map_err(WindowError::Decode)
+    }
+}
+
+impl std::fmt::Display for WriterTimeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08X}", self.0)
+    }
+}
+
+/// What the current primary holds of a window reference's rows (#619).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowHolding {
+    /// The window's last row is its own, and its first row is present. An
+    /// empty window is always held.
+    Held,
+    /// The last row is its own, but the first row is gone: retention removed
+    /// a prefix of the range.
+    PrefixPruned,
+    /// The last row is absent, or is another share that does not match the
+    /// window's own predicate: this primary does not hold the history the
+    /// window was read from.
+    NotHeld,
+}
+
+/// Does this primary hold `window`'s rows as the rows it was read from? One
+/// statement and two primary-key lookups, on the caller's connection or
+/// transaction.
+///
+/// Every native ledger writer appends under `ORDER_LOCK`, so `share_seq`
+/// order is commit order, and a physical standby replays a prefix of the
+/// WAL. A promoted primary therefore holds every row of a window exactly when
+/// it holds the window's **last** row as the same share. Losing the end of
+/// that prefix lets the promoted sequence hand the lost numbers out again, to
+/// shares credited after the window's anchor. So the last row must exist and
+/// satisfy the window's own predicate (`accepted`, accepted and issued by the
+/// anchor), the predicate #466's leaf witness applies to an endpoint.
+/// Retention only removes a prefix, never the newest row of work young
+/// enough to be mined, so a missing first row alone is
+/// [`WindowHolding::PrefixPruned`].
+///
+/// A reissued row can only match the predicate if the promoted host's clock
+/// runs behind the old primary's by more than the time from the anchor to
+/// its reissue. The landing's count and digest stay the proof either way.
+pub async fn probe_window_holding(
+    connection: &mut sqlx::PgConnection,
+    window: &WindowRef,
+) -> Result<WindowHolding, WindowError> {
+    let Some(range) = window.shares else {
+        return Ok(WindowHolding::Held);
+    };
+    let (first, last) = range.bounds()?;
+    let (first_present, last_held): (bool, bool) = sqlx::query_as(&format!(
+        "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1),\
+         EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2 AND {})",
+        super::audit::anchored_eligibility_sql(3)
+    ))
+    .bind(first)
+    .bind(last)
+    .bind(window.anchor_ms)
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(match (last_held, first_present) {
+        (false, _) => WindowHolding::NotHeld,
+        (true, false) => WindowHolding::PrefixPruned,
+        (true, true) => WindowHolding::Held,
+    })
+}
+
+/// A block candidate refused before its enqueue: the primary that would hold
+/// it does not hold its window ([`WindowHolding::NotHeld`]). Its coinbase pays
+/// a window no landing here could rebuild or audit, so it is never offered
+/// (#619). The transaction is rolled back with the share it carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowNotHeld {
+    pub block_hash: String,
+    pub first_share_seq: u64,
+    pub last_share_seq: u64,
+    pub anchor_ms: i64,
+}
+
+impl std::fmt::Display for WindowNotHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block {} refused before its offer: this primary does not hold its window {}..={} (anchor {}); the last row is absent or is another share, as after an asynchronous promotion lost the end of the history the work was read from (#619)",
+            self.block_hash, self.first_share_seq, self.last_share_seq, self.anchor_ms
+        )
+    }
+}
+
+impl std::error::Error for WindowNotHeld {}
 
 /// Read `first..=last` under the payout-window predicate, in ascending keyset
 /// pages of at most 4096 rows, on the caller's connection or transaction.

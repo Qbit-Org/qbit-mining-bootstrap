@@ -273,6 +273,9 @@ impl Metrics {
     }
     /// Exactly once, at the stale-job branch that refused the share. The coarse
     /// `stale-job` reason is still counted separately by the share observation.
+    /// `window_not_held` is recorded by the ledger at the candidate enqueue's
+    /// refusal (#619), so it also counts a refusal whose miner was already
+    /// answered `ledger-outcome-unknown`.
     pub fn record_stale_job_rejection(&self, cause: StaleJobCause) {
         self.inner
             .lock()

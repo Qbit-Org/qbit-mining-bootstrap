@@ -1,17 +1,20 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
 use crate::ledger::{
-    BlockingDrop, ChainObservationState, ChainTransition, CompactBatchAttempt, CompactDependency,
-    CompactIssuedJob, CompactPrepared, CompactRepair, IssuedJobSave, PayoutState, PoolBlock,
-    PreparedTemplate, ReadAdmission, RefreshProbe, StoredCompactPrepared,
+    probe_window_holding, BlockingDrop, ChainObservationState, ChainTransition,
+    CompactBatchAttempt, CompactDependency, CompactIssuedJob, CompactPrepared, CompactRepair,
+    IssuedJobSave, PayoutState, PoolBlock, PreparedTemplate, ReadAdmission, RefreshProbe,
+    StoredCompactPrepared, WindowHolding, WriterTimeline, WRITER_TIMELINE_SQL,
 };
 use futures_util::future::BoxFuture;
 
-/// One statement's view of the database clock and the current payout revision.
+/// One statement's view of the database clock, the current payout revision
+/// and the writer timeline (#619).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ClockedRevision {
     pub now_ms: i64,
     pub payout_revision: i64,
+    pub timeline: WriterTimeline,
 }
 
 pub(super) trait WorkLedger: Send + Sync {
@@ -26,6 +29,11 @@ pub(super) trait WorkLedger: Send + Sync {
     /// PostgreSQL round trips per boundary for two values of one snapshot.
     fn clocked_payout_revision(&self) -> BoxFuture<'_, Result<ClockedRevision>>;
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>>;
+    /// Whether this primary holds `window`'s rows as the rows it was read
+    /// from ([`crate::ledger::probe_window_holding`]): admission for work
+    /// prepared on another writer timeline (#619).
+    fn window_held<'a>(&'a self, window: &'a WindowRef)
+        -> BoxFuture<'a, Result<bool, WindowError>>;
     fn refresh_probe(
         &self,
         completion: ReadAdmission,
@@ -130,15 +138,27 @@ impl WorkLedger for Ledger {
         Box::pin(async move {
             // Same row guards as `Ledger::payout_revision`: a halted, recovering
             // or read-only cluster yields no row and fails the same way.
-            let (now_ms, payout_revision): (i64, i64) = sqlx::query_as(
-                "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint, payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'",
+            // The timeline rides in the same statement, behind the same
+            // recovery guard, at no extra round trip.
+            let (now_ms, payout_revision, timeline): (i64, i64, String) = sqlx::query_as(
+                &format!("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint, payout_revision, {WRITER_TIMELINE_SQL} FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'"),
             )
             .fetch_one(&mut *self.acquire().await?)
             .await?;
             Ok(ClockedRevision {
                 now_ms,
                 payout_revision,
+                timeline: WriterTimeline::parse(&timeline)?,
             })
+        })
+    }
+    fn window_held<'a>(
+        &'a self,
+        window: &'a WindowRef,
+    ) -> BoxFuture<'a, Result<bool, WindowError>> {
+        Box::pin(async move {
+            let mut connection = self.acquire().await?;
+            Ok(probe_window_holding(&mut connection, window).await? != WindowHolding::NotHeld)
         })
     }
     fn chain_observation_state(&self) -> BoxFuture<'_, Result<ChainObservationState>> {

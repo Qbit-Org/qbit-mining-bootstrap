@@ -108,6 +108,13 @@ where
         old.close().await;
         let side = PgPool::connect(&database.url).await?;
         pools.push(side.clone());
+        // The candidate's window names share 1 at the fixture snapshot's
+        // anchor (100,000 ms). The enqueue checks that this database holds
+        // the window's last row (#619), so the row is here, and the sequence
+        // moves past it.
+        sqlx::raw_sql("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) VALUES(1,'checkout-window:1','checkout-miner','checkout-miner',decode(repeat('ab',32),'hex'),1000000,1000000,100,'checkout-window',to_timestamp(1),1,to_timestamp(1),true,'coordinator-acquire',0); SELECT setval('qbit_share_ledger_share_seq_seq',1)")
+            .execute(&side)
+            .await?;
         let mut plain =
             Ledger::connect(&database.url, "coordinator-no-metrics".into(), 2, false).await?;
         // Both fixture writers use the unmeasured side pool. Complete writes
@@ -483,6 +490,41 @@ async fn first_poll<'a>(
     };
     assert_eq!(counts(h.metrics()), (before.0 + 3., before.1));
     Ok(connection)
+}
+
+/// #619: a window holding probe that fails is never a refusal. The probe's
+/// I/O error leaves the enqueue's outcome unknown to the client, so the proof
+/// is answered unknown, never `stale-job`; nothing is enqueued or offered; and
+/// `window_not_held` is not counted.
+#[tokio::test]
+async fn a_failed_window_probe_is_unknown_never_stale_and_enqueues_nothing() -> Result<()> {
+    with_database(|h| {
+        Box::pin(async move {
+            crate::ledger::candidate_faults::inject(
+                &h.candidate.block_hash,
+                crate::ledger::candidate_faults::Fault::WindowProbeIoError,
+            );
+            let outcome = h.persist(TokioInstant::now()).await;
+            assert!(
+                matches!(outcome, SaveOutcome::Unknown { .. }),
+                "a failed probe must leave the outcome unknown: {outcome:?}"
+            );
+            outbox_rows(h, 0).await?;
+            let refused = h.metrics().render().lines().find_map(|line| {
+                line.strip_prefix(
+                    "qbit_prism_stale_job_rejections_total{cause=\"window_not_held\"} ",
+                )
+                .map(str::to_owned)
+            });
+            assert_eq!(
+                refused.as_deref(),
+                Some("0"),
+                "a probe failure was counted as a refusal"
+            );
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[tokio::test]
