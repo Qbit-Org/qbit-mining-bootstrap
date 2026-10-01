@@ -16,7 +16,8 @@
 //! keeping the recorded shape (five fields, or six with version bits). It is
 //! a share that is not a block unless the session's share difficulty is at
 //! the network's, as a large `mining.suggest_difficulty` makes it on regtest.
-//! Each transcript starts once the server serves the node's tip; a re-solved
+//! Each transcript starts once every block found earlier has settled and the
+//! server serves the node's tip at the cluster's payout revision; a re-solved
 //! submit refused as `stale-job` or `unknown-job` (its job superseded in
 //! flight) is solved again on newer work, up to three times. A
 //! submit the recorded pool refused is sent as recorded. Timestamps order the
@@ -36,7 +37,7 @@
 //! holds is sent live. Every accepted replayed share is in the ledger.
 use super::share_client::{is_hex, reason_id, start_share_only_servers, StratumSession, ANSWER};
 use super::*;
-use qbit_prism_server::codec::parse_u32_hex;
+use qbit_prism_server::{codec::parse_u32_hex, ledger::CandidateState};
 use std::{collections::BTreeSet, path::Path};
 
 /// The corpus, relative to this package.
@@ -288,9 +289,25 @@ fn superseded(answer: &Value) -> bool {
 }
 
 /// Until the server is ready on the node's current tip, so a transcript
-/// starts on current work: a block a previous transcript landed is built on.
+/// starts on current work: a block a previous transcript found is built on.
+/// The block lands after its submit is answered, and its landing and the
+/// server's observation of it each move the payout revision. So wait until
+/// no candidate is still on its way to the node and the server's work is at
+/// the cluster's payout revision: a share whose revision moves between its
+/// check and its commit is refused as `ledger-confirmation-failed`
+/// ("payout revision changed before share commit"), which a recorded
+/// accepted submit must not meet.
 async fn current(fixture: &Fixture) -> Result<()> {
-    until("server 0 on the node's tip", 30, || async {
+    until("server 0 on the node's tip and revision", 30, || async {
+        let landing: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
+            CandidateState::UNFINISHED_SQL
+        ))
+        .fetch_one(&fixture.pool)
+        .await?;
+        if landing > 0 {
+            return Ok(false);
+        }
         let tip = fixture.rpc("getbestblockhash", json!([])).await?;
         let health: Value = fixture
             .client
@@ -299,7 +316,13 @@ async fn current(fixture: &Fixture) -> Result<()> {
             .await?
             .json()
             .await?;
-        Ok(health["ok"] == true && health["observed_tip"] == tip)
+        let revision: i64 =
+            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
+                .fetch_one(&fixture.pool)
+                .await?;
+        Ok(health["ok"] == true
+            && health["observed_tip"] == tip
+            && health["payout_state_generation"] == revision)
     })
     .await
 }

@@ -6,10 +6,13 @@
 //! own function. The servers run with [`load_server_env`], so the load's
 //! shares can miss the regtest block target. The load adds its own checks
 //! (see `live_session_load.rs`) and reports #481's time to usable work per
-//! frontend. Scenarios 1, 2 and 4 run at 2,000 sessions, D1's session count,
-//! as does scenario 5's soak; scenario 7 at the real-node wallet cap of
-//! 2,000 payees (#487 decision 7), whose workers are its load, waits on #621
-//! and #622 and runs in no lane yet.
+//! frontend. Scenario 2 pauses the load's shares, not its sessions, from its
+//! seed blocks until branch B's own blocks are paid, since its balance
+//! comparison needs every own share in the window (`deep_reorg`); its reorg
+//! runs under the whole load. Scenarios 1, 2 and 4 run at 2,000 sessions,
+//! D1's session count, as does scenario 5's soak; scenario 7 at the real-node
+//! wallet cap of 2,000 payees (#487 decision 7), whose workers are its load,
+//! waits on #621 and #622 and runs in no lane yet.
 //!
 //! #553 adds three scenarios, with the pass criteria set here:
 //! - two frontends on two nodes that briefly disagree about the tip;
@@ -37,7 +40,8 @@ use super::session_load::{
 };
 use super::two_node_tests::{
     assert_no_duplicate_headers, chain_state, credits, deep_reorg, finish, lost_race, node_a_best,
-    node_a_mine, own_block, server_ready, start_frontend, PeerNode, READY_GATE,
+    node_a_mine, own_block, server_ready, start_frontend, LoadShares, PeerNode, LOAD_SHARES,
+    READY_GATE,
 };
 use super::weighted_recipients_tests::{weighted_case, Scenario};
 use super::*;
@@ -154,6 +158,31 @@ impl Drop for ReadyGateGuard {
     fn drop(&mut self) {
         if let Ok(mut gate) = READY_GATE.lock() {
             *gate = None;
+        }
+    }
+}
+
+/// While alive, #521 scenario 2 can pause the load's shares around its own
+/// blocks (see `deep_reorg`): a load share weighs about half an own block on
+/// regtest.
+struct LoadSharesGuard;
+
+impl LoadSharesGuard {
+    fn install(load: &SessionLoad) -> Result<Self> {
+        *LOAD_SHARES
+            .lock()
+            .map_err(|_| anyhow::anyhow!("load shares poisoned"))? = Some(LoadShares {
+            pause: load.share_pause(),
+            answered: load.answered(),
+        });
+        Ok(Self)
+    }
+}
+
+impl Drop for LoadSharesGuard {
+    fn drop(&mut self) {
+        if let Ok(mut shares) = LOAD_SHARES.lock() {
+            *shares = None;
         }
     }
 }
@@ -287,6 +316,7 @@ async fn nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_
         .await?;
         let report = under_load(fixture, plan, async |fixture, load| {
             let _gate = ReadyGateGuard::install(load)?;
+            let _shares = LoadSharesGuard::install(load)?;
             deep_reorg(fixture, peer).await?;
             closing_tip(fixture).await
         })

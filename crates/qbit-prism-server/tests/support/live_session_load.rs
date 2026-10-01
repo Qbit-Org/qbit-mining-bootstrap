@@ -8,11 +8,17 @@
 //! changes which own blocks a scenario has. The servers run with
 //! [`load_server_env`]: #575's share-only settings, which make such a share
 //! possible on regtest, room for every session, and the production reanchor.
-//! A load share
-//! weighs about 2^-32 of a difficulty-1 share, so the payout window and every
-//! scenario's economics are unchanged. What the load does exercise is the
-//! share append under `ORDER_LOCK`, the database pool, and the notify fan-out
-//! to every session on every tip.
+//! A load share is credited at about 2^-32, the easiest share target there
+//! is, but regtest's block difficulty is only about 2^-31, which is what an
+//! own block's block-only proof is credited at. So a load share weighs about
+//! half an own block, ~15 of them fill the payout window (8x the network
+//! difficulty), and the load takes most of every own block's reward. A
+//! scenario whose assertions depend on which own shares are in the window
+//! pauses the load's shares around its own blocks
+//! ([`SessionLoad::share_pause`]); the sessions stay connected and keep
+//! taking work. What the load does exercise is the share append under
+//! `ORDER_LOCK`, the database pool, and the notify fan-out to every session on
+//! every tip.
 //!
 //! The load records what each session was told and what it was answered. It
 //! stamps every tip of every watched node with a `waitfornewblock` long-poll
@@ -228,6 +234,12 @@ struct Shared {
     unreachable: Mutex<Vec<(usize, Instant, Instant)>>,
     /// Sessions holding work right now.
     connected: AtomicUsize,
+    /// While set, sessions offer no shares ([`SessionLoad::share_pause`]).
+    paused: AtomicBool,
+    /// The open pause's start and the closed pauses' total.
+    pauses: Mutex<(Option<Instant>, Duration)>,
+    /// Sessions waiting for a share's answer right now.
+    unanswered: AtomicUsize,
 }
 
 impl Shared {
@@ -267,6 +279,9 @@ impl SessionLoad {
             tips: Mutex::new(Vec::new()),
             unreachable: Mutex::new(Vec::new()),
             connected: AtomicUsize::new(0),
+            paused: AtomicBool::new(false),
+            pauses: Mutex::new((None, Duration::ZERO)),
+            unanswered: AtomicUsize::new(0),
             plan,
         });
         let (stop, stopped) = watch::channel(false);
@@ -329,10 +344,41 @@ impl SessionLoad {
         .with_context(|| format!("{} of them hold work", self.connected()))
     }
 
+    /// A switch that pauses (`true`) or resumes (`false`) every session's
+    /// share offers, which outlives this borrow. A paused session stays
+    /// connected and keeps taking work, so the delivery check still holds
+    /// it to every tip; only its shares stop.
+    pub(super) fn share_pause(&self) -> Arc<dyn Fn(bool) + Send + Sync> {
+        let shared = self.shared.clone();
+        Arc::new(move |paused| {
+            shared.paused.store(paused, Ordering::SeqCst);
+            let mut pauses = shared.pauses.lock().expect("pauses");
+            match (paused, pauses.0) {
+                (true, None) => pauses.0 = Some(Instant::now()),
+                (false, Some(since)) => *pauses = (None, pauses.1 + since.elapsed()),
+                _ => {}
+            }
+        })
+    }
+
+    /// Whether no session waits for a share's answer, as a check that
+    /// outlives this borrow: after a pause, every share offered before it has
+    /// its answer, has run out its answer bound ([`ANSWER_BOUND`]), or lost
+    /// its connection. A share answered `ledger-outcome-unknown` or lost may
+    /// still commit, so a caller that needs the ledger still waits for it.
+    pub(super) fn answered(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = self.shared.clone();
+        Arc::new(move || shared.unanswered.load(Ordering::SeqCst) == 0)
+    }
+
     /// Stop offering shares, wait for outstanding answers, close every
     /// session and return what the load saw.
     pub(super) async fn stop(self) -> LoadRecord {
-        let offered_seconds = self.started.elapsed().as_secs_f64();
+        let paused = {
+            let pauses = self.shared.pauses.lock().expect("pauses");
+            pauses.1 + pauses.0.map_or(Duration::ZERO, |since| since.elapsed())
+        };
+        let offered_seconds = (self.started.elapsed() - paused).as_secs_f64();
         let _ = self.stop.send(true);
         let mut sessions = Vec::with_capacity(self.sessions.len());
         for handle in self.sessions {
@@ -355,6 +401,7 @@ impl SessionLoad {
             started: self.started,
             ended,
             offered_seconds,
+            paused_seconds: paused.as_secs_f64(),
             health,
             health_stats,
             tips,
@@ -669,6 +716,10 @@ async fn run_session(
             }
             continue;
         };
+        // Whether `unanswered` counts this session: while it waits for an
+        // answer, and from before it checks the pause to the end of a submit,
+        // so a pause never misses a share already on its way.
+        let mut counted = current.outstanding.is_some();
         let wait = if stopping.is_some() {
             DRAIN_BOUND
         } else {
@@ -693,7 +744,11 @@ async fn run_session(
                         current.outstanding = None;
                     }
                 }
-                if current.outstanding.is_none() {
+                if current.outstanding.is_none() && !counted {
+                    shared.unanswered.fetch_add(1, Ordering::SeqCst);
+                    counted = true;
+                }
+                if current.outstanding.is_none() && !shared.paused.load(Ordering::SeqCst) {
                     submit(current, &username, &mut log)
                         .await
                         .err()
@@ -709,6 +764,18 @@ async fn run_session(
         };
         if let Some(why) = failure {
             close(&shared, &mut live, &mut log, &why);
+        }
+        match (
+            counted,
+            live.as_ref().is_some_and(|live| live.outstanding.is_some()),
+        ) {
+            (false, true) => {
+                shared.unanswered.fetch_add(1, Ordering::SeqCst);
+            }
+            (true, false) => {
+                shared.unanswered.fetch_sub(1, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
     if live.is_some() {
@@ -807,7 +874,9 @@ pub(super) struct LoadRecord {
     plan: LoadPlan,
     started: Instant,
     ended: Instant,
+    /// Seconds the load offered shares: its run, less its pauses.
     offered_seconds: f64,
+    paused_seconds: f64,
     health: Vec<(Instant, usize, bool)>,
     health_stats: Vec<(Duration, usize)>,
     tips: Vec<TipStamp>,
@@ -1265,6 +1334,7 @@ impl LoadRecord {
             "sessions": self.plan.sessions,
             "offered_rate": self.plan.rate,
             "seconds": round(self.offered_seconds),
+            "paused_seconds": round(self.paused_seconds),
             "offered": (self.plan.rate * self.offered_seconds).floor(),
             "shares": match &counts {
                 Ok(counts) => json!({
@@ -1359,6 +1429,7 @@ mod tests {
             started: start,
             ended: at(start, 100.0),
             offered_seconds: 100.0,
+            paused_seconds: 0.0,
             health: vec![(start, 0, true), (start, 1, true)],
             health_stats: vec![(Duration::ZERO, 0); 2],
             unreachable: Vec::new(),
