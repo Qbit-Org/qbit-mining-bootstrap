@@ -298,7 +298,7 @@ debug). Weekly, at 400 shares/s: scenario 4's other four cases, scenario 5's
 **Proves:** each listed scenario's own assertions on a real regtest node and
 PostgreSQL 16, and that every listed id executed.
 
-**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #604 in
+**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #621 in
 debug and #622 in release and runs only by hand until both are fixed.
 
 **Faults under load (#554)** run in the load harness's `faults` phase

@@ -132,6 +132,7 @@ pub fn expected(populated: bool) -> Census {
         "authorized_missing_current_work",
         "stratum_pending_initial_jobs",
         "stratum_oldest_pending_initial_job_seconds",
+        "stratum_rebuild_lane_waiters",
         "stratum_current_tip_coverage_gap_seconds",
         "stratum_semantic_current_work_ratio",
         "block_candidates_pending",

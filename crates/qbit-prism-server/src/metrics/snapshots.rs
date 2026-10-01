@@ -84,6 +84,7 @@ impl Metrics {
             (Family::Connections, snapshot.connections as f64),
             (Family::Authorized, snapshot.authorized as f64),
             (Family::Builds, snapshot.pending_builds as f64),
+            (Family::RebuildWaiters, snapshot.rebuild_lane_waiters as f64),
             (
                 Family::Covered,
                 snapshot.authorized_with_current_work as f64,

@@ -539,7 +539,7 @@ owner = "#553"
 lanes = ["L4"]
 criteria = "#521 scenario 7's assertions unchanged at 2,000 payees (two fanout chunks per block): attribution, coinbase, CTV outputs and carry-forward balances match an independent PPLNS recomputation, and the fanouts reach the wallets and are spent (decision 7)."
 runs = false
-reason = "Blocked by #604 and #622. In debug the fixture opens about 1,500 worker sessions per frontend one at a time, and at its 1 s reanchor each first job queues behind every connected session's same-tip rebuild, so some worker never gets work (#604). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_starves_first_jobs_until_604_is_fixed reproduces #604 by hand."
+reason = "Blocked by #621 and #622. In debug, since #604, the fixture opens all of its about 1,500 worker sessions per frontend, but at its 1 s reanchor every session always has a job rebuild queued, and a session answers a submit only after that rebuild completes, so some submit gets no reply within the fixture's 30 s (#621). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_waits_on_submit_acks_until_621_is_fixed reproduces #621 by hand."
 
 [[scenario]]
 id = "chain-events-under-load"
