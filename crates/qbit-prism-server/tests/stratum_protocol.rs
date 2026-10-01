@@ -1206,6 +1206,41 @@ async fn a_budget_breach_closes_the_session_before_a_finished_delivery_is_announ
     assert_eq!(snapshot.job_delivery_cancellations, 1);
 }
 
+// #621 review: a session that closes on an oversized frame abandons its
+// delivery before it writes the rejection, so a peer that is not reading
+// cannot hold the delivery's admission permit through that write.
+#[tokio::test]
+async fn an_oversized_frame_abandons_the_delivery_before_its_rejection_is_written() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let admission = config.initial_job_limit.clone();
+    let permits = admission.available_permits();
+    let max_message_bytes = config.max_message_bytes;
+    let (backend, refresh, _shutdown, hold, mut client_writer, _lines, task) =
+        held_writer_session(config, "miner.oversized").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    assert_eq!(admission.available_permits(), permits - 1);
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer
+        .write_all(&vec![b'a'; max_message_bytes + 1])
+        .await
+        .unwrap();
+    hold.held.notified().await;
+    assert_eq!(
+        admission.available_permits(),
+        permits,
+        "the delivery kept its admission permit through the held rejection"
+    );
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.pending_builds, 0);
+    assert_eq!(snapshot.job_delivery_cancellations, 1);
+    hold.release();
+    task.await.unwrap().unwrap();
+}
+
 // The boundary of the test above: a delivery whose announcement write fails
 // still counts as a failed delivery, as it did before #621.
 #[tokio::test]

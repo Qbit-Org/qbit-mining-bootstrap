@@ -1964,6 +1964,9 @@ pub async fn serve_connection<B: MiningBackend>(
     // and when its frame completed. Nothing after it is read until it is
     // handled.
     let mut held: Option<(Value, tokio::time::Instant)> = None;
+    // A frame over the size limit ends the session; its rejection is the
+    // session's last write.
+    let mut oversized = false;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1995,10 +1998,7 @@ pub async fn serve_connection<B: MiningBackend>(
             }
             read = bounded_reader.read_until(b'\n',&mut buffer), if held.is_none() => {
                 if read? == 0 { break; }
-                if buffer.len() > config.max_message_bytes {
-                    write_json(&mut writer,StratumError::malformed("Stratum message exceeds size limit").response(Value::Null),&config).await?;
-                    break;
-                }
+                if buffer.len() > config.max_message_bytes { oversized = true; break; }
                 if buffer.last() != Some(&b'\n') { continue; }
                 let received_at = tokio::time::Instant::now();
                 let frame = std::mem::take(&mut buffer);
@@ -2072,6 +2072,19 @@ pub async fn serve_connection<B: MiningBackend>(
                 );
             }
         }
+    }
+    // The session is ending: abandon a delivery still in flight before the
+    // last writes, so a peer that is not reading cannot hold its admission
+    // or lane permit through them (#621).
+    delivery.set(Fuse::terminated());
+    drop(finished);
+    if oversized {
+        write_json(
+            &mut writer,
+            StratumError::malformed("Stratum message exceeds size limit").response(Value::Null),
+            &config,
+        )
+        .await?;
     }
     writer.shutdown().await?;
     Ok(())
