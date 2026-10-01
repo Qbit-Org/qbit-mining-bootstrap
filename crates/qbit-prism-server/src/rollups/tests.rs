@@ -1,5 +1,5 @@
 use super::*;
-use crate::ledger::Ledger;
+use crate::{ledger::Ledger, ledger_test_database::FixtureDatabase};
 use anyhow::Context;
 use futures_util::{future::LocalBoxFuture, FutureExt};
 use sqlx::postgres::PgPoolOptions;
@@ -34,8 +34,11 @@ fn family(metrics: &Metrics) -> Vec<String> {
         .collect()
 }
 
-// Each case owns its schema and all its pools, including during setup. Cleanup
-// runs after errors and assertion panics; none of these tests share metrics.
+// Each case owns its database, schema and all its pools, including during
+// setup. Migration takes a database-wide advisory lock under the ledger's 5 s
+// lock_timeout, so cases sharing one database queued on each other's
+// migrations and timed out under load (#603). Cleanup runs after errors and
+// assertion panics; none of these tests share metrics.
 async fn with_database<F>(case: F) -> Result<()>
 where
     F: for<'a> FnOnce(&'a PgPool, &'a PgPool, &'a str) -> LocalBoxFuture<'a, Result<()>>,
@@ -44,18 +47,18 @@ where
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
-    let schema = format!("prism_rollup_acquire_{}", uuid::Uuid::new_v4().simple());
-    let admin = PgPool::connect(&raw).await?;
+    let database = FixtureDatabase::open(&raw, "prism_rollup_acquire_").await?;
+    // The cases find the rollup's session in the cluster-wide
+    // pg_stat_activity by this name, which is unique per fixture.
+    let application = database.schema.clone();
     let mut pools = Vec::new();
     let result = AssertUnwindSafe(async {
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&raw)?;
+        let mut url = url::Url::parse(&database.url)?;
         url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"))
-            .append_pair("application_name", &schema);
-        let ledger = Ledger::connect(url.as_str(), "rollup-test".into(), 2, true).await?;
+            .append_pair("application_name", &application);
+        let ledger = Ledger::connect(url.as_str(), "rollup-test".into(), 2, true)
+            .await
+            .context("connecting and migrating the rollup fixture ledger")?;
         pools.push(ledger.pool.clone());
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -63,23 +66,21 @@ where
             .connect(url.as_str())
             .await?;
         pools.push(pool.clone());
-        case(&pool, &ledger.pool, &schema).await
+        case(&pool, &ledger.pool, &application).await
     })
     .catch_unwind()
     .await;
     for pool in pools {
         pool.close().await;
     }
-    let cleanup = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&admin)
-        .await;
-    admin.close().await;
-    if let Err(error) = &cleanup {
-        eprintln!("rollup checkout fixture cleanup failed: {error}");
-    }
     match result {
-        Ok(result) => result.and(cleanup.map(|_| ()).map_err(Into::into)),
-        Err(panic) => resume_unwind(panic),
+        Ok(result) => database.close(result).await,
+        Err(panic) => {
+            if let Err(error) = database.close(Ok(())).await {
+                eprintln!("rollup checkout fixture cleanup failed: {error:#}");
+            }
+            resume_unwind(panic)
+        }
     }
 }
 
