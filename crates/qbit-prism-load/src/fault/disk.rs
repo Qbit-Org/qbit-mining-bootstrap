@@ -486,8 +486,10 @@ impl WalDiskFull {
                 return;
             }
         };
+        // From the fill's start: PostgreSQL can PANIC while the ballast is
+        // still being written.
         let (anchor, wall) = self.anchor;
-        let since = self.filled_at.unwrap_or(anchor);
+        let since = anchor;
         let end = self.up_at.unwrap_or_else(Instant::now);
         self.down_intervals = down_intervals(&text, anchor, wall, since, end);
     }
@@ -510,6 +512,11 @@ impl WalDiskFull {
             Some(sampler) => sampler.samples(),
             None => self.collector.clone(),
         }
+    }
+
+    /// When the fill began, the start of every window the fault answers for.
+    pub fn fill_started_at(&self) -> Option<Instant> {
+        (!matches!(self.stage, Stage::Start)).then_some(self.anchor.0)
     }
 
     pub fn evidence(&self, origin: Instant) -> Value {

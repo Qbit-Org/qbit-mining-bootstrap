@@ -774,7 +774,7 @@ id = "fault-restart-with-candidate-backlog"
 title = "Both frontends restarted over a pending candidate backlog (#187's class)"
 owner = "#554"
 lanes = ["dispatch", "nightly", "weekly"]
-criteria = "While the node answers submitblock with its warmup error (#526), found blocks build a backlog of unfinished candidates; every frontend exits 0 within 35 s and is relaunched; once the node heals, every backlog row reaches a terminal state, none reaches the node twice, and every row counted before the restart is there after it."
+criteria = "While the node answers submitblock with its warmup error (#526), found blocks build a backlog of unfinished candidates; every frontend exits 0 within 35 s and is relaunched; once the node heals, every backlog row reaches a terminal state (a lost race is orphaned once the fault mints the winner's confirmations), none reaches the node twice, one lands through a single offer, and every row counted before the restart is there after it."
 runs = true
 presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
 

@@ -257,7 +257,7 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         };
         missing = add(missing, "missing");
         unexpected = add(unexpected, "unexpected");
-        in_a_gap += phase["reconciliation"][crate::run::MISSING_IN_A_FAULT_GAP]
+        in_a_gap += phase["reconciliation"][crate::run::MISSING_IN_A_FAILOVER_GAP]
             .as_u64()
             .unwrap_or(0);
     }

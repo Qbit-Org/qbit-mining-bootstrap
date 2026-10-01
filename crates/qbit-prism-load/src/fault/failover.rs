@@ -69,6 +69,13 @@ pub struct FailoverControl {
 /// How soon after the promotion each frontend must accept a share on the
 /// new primary, and a found block mid-landing must land (#585).
 pub const SERVE_BOUND: Duration = Duration::from_secs(30);
+/// The longest the relay holds the found block's call in `block-failover`:
+/// below the offering frontend's 1 s `submitblock` deadline, so the call is
+/// forwarded while the frontend still waits on it.
+const HOLD_BOUND: Duration = Duration::from_millis(800);
+/// How far before the fault the standby's frozen set reaches: past any
+/// baseline window, so every share the verdict checks was asked about.
+const FROZEN_LOOKBACK: Duration = Duration::from_secs(600);
 /// How long the standby may take to show it flushed the barrier, or to
 /// settle after the cut.
 const STANDBY_WAIT: Duration = Duration::from_secs(15);
@@ -459,7 +466,8 @@ impl Failover {
             .submits
             .iter()
             .filter(|record| {
-                matches!(record.outcome, Outcome::Accepted)
+                !record.reoffer
+                    && matches!(record.outcome, Outcome::Accepted)
                     && record.responded.is_some_and(|at| at >= from)
             })
             .map(|record| record.share_id.clone())
@@ -470,18 +478,53 @@ impl Failover {
     /// standby streams: the fault's injection and removal are one action.
     pub fn poll(&mut self, env: &mut FaultEnv<'_>, tools: &FaultTools) -> Result<bool> {
         self.poll_row_after_promotion();
+        // The held call goes on within HOLD_BOUND of its arrival, however
+        // long the barrier and the stop take, inside the offering frontend's
+        // 1 s submitblock deadline. An answer it records before the cut
+        // reaches the standby; one after it is lost with the old primary.
+        // Either way the block lands once.
+        if self.mode == Mode::Block
+            && self.released_at.is_none()
+            && self
+                .seen
+                .as_ref()
+                .is_some_and(|seen| seen.at.elapsed() >= HOLD_BOUND)
+        {
+            tools.relay.release_held();
+            self.released_at = Some(Instant::now());
+        }
         loop {
             match &mut self.stage {
                 Stage::Start => {
                     self.started_at = Some(Instant::now());
                     self.pids_before = env.frontends.iter().map(|child| child.pid()).collect();
                     let (primary, standby) = self.urls()?;
-                    self.stage = if self.mode == Mode::Fenced {
-                        self.writer.fence();
-                        self.fenced_at = Some(Instant::now());
-                        Stage::Fencing(Spawned::spawn(fence_and_catch_up(primary, standby)))
-                    } else {
-                        Stage::Barrier(Spawned::spawn(barrier(primary, standby)))
+                    self.stage = match self.mode {
+                        Mode::Fenced => {
+                            self.writer.fence();
+                            self.fenced_at = Some(Instant::now());
+                            Stage::Fencing(Spawned::spawn(fence_and_catch_up(primary, standby)))
+                        }
+                        Mode::Async => Stage::Barrier(Spawned::spawn(barrier(primary, standby))),
+                        // The barrier waits for the held call, so it is the
+                        // moment just before the cut: shares acknowledged
+                        // while the block was being found are not the gap's.
+                        Mode::Block => {
+                            let receivers = (0..env.frontends.len())
+                                .map(|index| tools.relay.arm(index, Arm::Hold))
+                                .collect();
+                            if let Some(session) = env
+                                .sessions
+                                .iter()
+                                .find(|session| !session.paused.load(Ordering::Relaxed))
+                            {
+                                let _ = session.control.send(client::Control::ScheduledBlock);
+                            }
+                            Stage::AwaitingOffer {
+                                receivers,
+                                deadline: Instant::now() + super::frontend::OFFER_WAIT,
+                            }
+                        }
                     };
                     return Ok(false);
                 }
@@ -495,24 +538,7 @@ impl Failover {
                     };
                     self.barrier_at = Some(barrier.at);
                     self.barrier_lsn = Some(barrier.flush_lsn.clone());
-                    self.stage = if self.mode == Mode::Block {
-                        let receivers = (0..env.frontends.len())
-                            .map(|index| tools.relay.arm(index, Arm::Hold))
-                            .collect();
-                        if let Some(session) = env
-                            .sessions
-                            .iter()
-                            .find(|session| !session.paused.load(Ordering::Relaxed))
-                        {
-                            let _ = session.control.send(client::Control::ScheduledBlock);
-                        }
-                        Stage::AwaitingOffer {
-                            receivers,
-                            deadline: Instant::now() + super::frontend::OFFER_WAIT,
-                        }
-                    } else {
-                        Stage::Cut
-                    };
+                    self.stage = Stage::Cut;
                     continue;
                 }
                 Stage::AwaitingOffer {
@@ -534,8 +560,9 @@ impl Failover {
                         ));
                     }
                     self.seen = seen;
-                    self.stage = Stage::Cut;
-                    continue;
+                    let (primary, standby) = self.urls()?;
+                    self.stage = Stage::Barrier(Spawned::spawn(barrier(primary, standby)));
+                    return Ok(false);
                 }
                 Stage::Cut => {
                     self.cluster
@@ -598,15 +625,19 @@ impl Failover {
                         .primary_flush_lsn
                         .clone()
                         .or_else(|| self.fence_flush_lsn.clone());
-                    if self.mode == Mode::Block {
+                    if self.mode == Mode::Block && self.released_at.is_none() {
                         // The node gets the block now; the offering frontend
                         // cannot record its answer on a primary that is gone.
                         tools.relay.release_held();
                         self.released_at = Some(Instant::now());
                     }
                     let (_, standby) = self.urls()?;
+                    // What the standby holds of the shares acknowledged since
+                    // well before the fault: the verdict checks every share
+                    // acknowledged from the fault's baseline, at most its
+                    // `baseline` seconds before it started, against this.
                     let from = self.started_at.unwrap_or_else(Instant::now);
-                    let ids = Self::acknowledged_since(env, from - Duration::from_secs(120));
+                    let ids = Self::acknowledged_since(env, from - FROZEN_LOOKBACK);
                     self.stage = Stage::Freezing(Spawned::spawn(freeze(
                         standby,
                         self.primary_flush_lsn.clone(),
@@ -682,19 +713,75 @@ impl Failover {
     /// The phase ended mid-failover: let a held call go on, and leave the
     /// writers a primary to reach. A primary already lost is replaced by its
     /// standby, as the fault would have done.
+    ///
+    /// Whatever step is in flight is waited for first (a stop or a
+    /// promotion is never run twice), so the run's own end, which reads
+    /// PostgreSQL through the writer endpoint, finds a primary there. A cut
+    /// the fault never followed with a failover is healed. The standby is
+    /// not rebuilt: the run's replication premise then says so.
     pub fn abandon(&mut self, tools: &FaultTools) {
         tools.relay.release_held();
-        let mut cluster = self.cluster.lock().expect("cluster lock");
-        if self.killed_at.is_some() && self.promoted_at.is_none() {
-            if let Err(error) = cluster.promote_standby() {
-                self.problems.push(format!(
+        let stage = std::mem::replace(&mut self.stage, Stage::Done);
+        let (cluster, writer) = (self.cluster.clone(), self.writer.clone());
+        let finish = async move {
+            let mut problems = Vec::new();
+            let lost = match stage {
+                Stage::Killing(kill) => match kill.join().await {
+                    Some(Ok(_)) => true,
+                    other => {
+                        problems.push(format!(
+                            "the primary's stop at the phase's end: {:?}",
+                            other.map(|result| result.err().map(|e| format!("{e:#}")))
+                        ));
+                        false
+                    }
+                },
+                Stage::Freezing(_) => true,
+                Stage::Promoting(promote) => {
+                    let _ = promote.join().await;
+                    false
+                }
+                Stage::Rebuilding(rebuild) => {
+                    let _ = rebuild.join().await;
+                    false
+                }
+                Stage::Fencing(fence) => {
+                    let _ = fence.join().await;
+                    false
+                }
+                Stage::Cut | Stage::Gap { .. } => {
+                    cluster.lock().expect("cluster lock").heal_replication();
+                    false
+                }
+                _ => false,
+            };
+            let port = {
+                let cluster = cluster.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut cluster = cluster.lock().expect("cluster lock");
+                    if lost {
+                        cluster.promote_standby()?;
+                    }
+                    Ok::<u16, anyhow::Error>(cluster.primary_port)
+                })
+                .await
+            };
+            match port {
+                Ok(Ok(port)) => {
+                    if writer.is_fenced() || writer.upstream_port() != port {
+                        writer.route_to(port);
+                    }
+                }
+                Ok(Err(error)) => problems.push(format!(
                     "promoting the standby at the phase's end: {error:#}"
-                ));
+                )),
+                Err(error) => problems.push(format!("the phase-end promotion task: {error}")),
             }
-        }
-        if self.writer.is_fenced() || self.killed_at.is_some() {
-            self.writer.route_to(cluster.primary_port);
-        }
+            problems
+        };
+        let problems =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(finish));
+        self.problems.extend(problems);
     }
 
     fn poll_row_after_promotion(&mut self) {

@@ -1168,6 +1168,34 @@ impl FaultDriver {
             twice.is_empty(),
             format!("forwarded more than once: {twice:?}"),
         ));
+        // Settled is not enough: rows abandoned at the relaunch would settle
+        // too. The backlog's blocks share a parent, so one of them must
+        // land, through one offer.
+        let landed: Vec<&String> = backlog
+            .before
+            .keys()
+            .filter(|hash| backlog.after.get(*hash).map(String::as_str) == Some("submitted"))
+            .collect();
+        let landed_once = landed.iter().all(|hash| {
+            submits
+                .iter()
+                .filter(|submit| &submit.block_hash == *hash && submit.forwarded_at.is_some())
+                .count()
+                == 1
+        });
+        checks.push(check(
+            "a backlog block landed after the heal, offered once",
+            !landed.is_empty() && landed_once,
+            format!(
+                "{} backlog rows submitted (each forwarded once: {landed_once}); the rest: {:?}",
+                landed.len(),
+                backlog
+                    .after
+                    .iter()
+                    .filter(|(_, state)| state.as_str() != "submitted")
+                    .collect::<Vec<_>>()
+            ),
+        ));
         checks.push(check(
             "every row counted before the restart was settled after it",
             !backlog.before.is_empty()
@@ -1236,8 +1264,12 @@ fn evaluate_wal_disk_full(
     // PostgreSQL's own record of when it was down; an answer within the
     // grace of a PANIC may be for a commit made just before it.
     let intervals = &full.down_intervals;
+    // An answer read inside an interval for a share PostgreSQL holds is a
+    // commit made before the PANIC whose answer arrived late; one PostgreSQL
+    // does not hold was acknowledged with nothing durable behind it.
     let acked_down: Vec<&str> = acknowledged
         .iter()
+        .filter(|record| !inputs.committed.contains(&record.share_id))
         .filter(|record| {
             record.responded.is_some_and(|at| {
                 intervals
@@ -1255,8 +1287,9 @@ fn evaluate_wal_disk_full(
         "no share was acknowledged while PostgreSQL was down",
         !intervals.is_empty() && acked_down.is_empty(),
         format!(
-            "{} shares acknowledged inside the {} intervals ({down_seconds:.1} s) PostgreSQL's log \
-             shows it down, from {} ms after each PANIC: {:?}",
+            "{} shares acknowledged, and absent from PostgreSQL, inside the {} intervals \
+             ({down_seconds:.1} s) PostgreSQL's log shows it down, from {} ms after each PANIC: \
+             {:?}",
             acked_down.len(),
             intervals.len(),
             disk::ANSWER_GRACE.as_millis(),

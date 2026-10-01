@@ -108,6 +108,16 @@ pub struct Spawned<T> {
 }
 
 impl<T: Send + 'static> Spawned<T> {
+    /// Wait for the task, whatever it has reached: for a cleanup that must
+    /// see it finished. A task that panicked or was cancelled yields none.
+    pub async fn join(self) -> Option<T> {
+        match (self.value, self.task) {
+            (Some(value), _) => Some(value),
+            (None, Some(task)) => task.await.ok(),
+            (None, None) => None,
+        }
+    }
+
     pub fn spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
         Self {
             task: Some(tokio::spawn(future)),
@@ -514,7 +524,7 @@ impl FaultDriver {
                     windows.extend(failover.outage());
                 }
                 Action::WalDiskFull(full) => {
-                    if let Some(down) = full.filled_at {
+                    if let Some(down) = full.fill_started_at() {
                         windows.push((
                             down,
                             full.up_at.unwrap_or_else(Instant::now) + failover::SERVE_BOUND,
@@ -984,7 +994,7 @@ mod tests {
                 "durability_findings": [],
                 "phases": [{"name": crate::fault::PHASE, "reconciliation": {
                     "missing": missing, "unexpected": 0,
-                    crate::run::MISSING_IN_A_FAULT_GAP: in_gap,
+                    crate::run::MISSING_IN_A_FAILOVER_GAP: in_gap,
                 }}],
             })
         };

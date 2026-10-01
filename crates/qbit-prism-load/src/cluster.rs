@@ -894,6 +894,14 @@ impl ManagedPostgres {
         Ok(())
     }
 
+    /// Reconnect the standby's replication link to the primary, after a cut
+    /// the fault did not get to follow with a failover.
+    pub fn heal_replication(&self) {
+        if let Some(link) = &self.link {
+            link.route_to(self.primary_port);
+        }
+    }
+
     /// The loss of the primary: an immediate shutdown, which writes no
     /// checkpoint and sends nothing more to the standby.
     pub fn kill_primary(&mut self) -> Result<()> {

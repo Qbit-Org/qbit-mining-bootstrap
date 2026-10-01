@@ -2789,7 +2789,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 if let (Some(excused), Some(missing), true) =
                     (excused, missing, phase["reconciliation"].is_object())
                 {
-                    phase["reconciliation"][MISSING_IN_A_FAULT_GAP] =
+                    phase["reconciliation"][MISSING_IN_A_FAILOVER_GAP] =
                         json!(missing.intersection(excused).count());
                 }
             }
@@ -4787,7 +4787,7 @@ pub struct GapReport {
 
 /// The key of a fault phase's reconciliation that counts its missing shares
 /// a failover's verdict proves lie in the replication gap (#554).
-pub const MISSING_IN_A_FAULT_GAP: &str = "missing_in_a_failover_gap";
+pub const MISSING_IN_A_FAILOVER_GAP: &str = "missing_in_a_failover_gap";
 
 /// The kind a committed row that no phase offered is reported under.
 pub const OUTSIDE_PHASES_KIND: &str = "committed share that no phase offered";

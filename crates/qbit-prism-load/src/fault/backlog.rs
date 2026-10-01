@@ -489,3 +489,20 @@ impl CandidateBacklog {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unfinished_states_are_the_servers() {
+        let server = qbit_prism_server::ledger::CandidateState::UNFINISHED_SQL;
+        let listed: Vec<&str> = server
+            .trim_matches(|c| c == '(' || c == ')')
+            .split(',')
+            .map(|state| state.trim_matches('\''))
+            .collect();
+        assert_eq!(listed, UNFINISHED);
+        assert!(!terminal("pending") && terminal("submitted") && terminal("orphaned"));
+    }
+}
