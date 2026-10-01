@@ -116,6 +116,9 @@ type PreparedWindow = (Option<i64>, Option<i64>, Option<i64>, i64);
 /// anchor), the accepted rows in its range, and those the landing reads.
 type CandidateWindow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64, i64);
 
+/// The scripted miners submitting through the promotion.
+const MINERS: usize = 4;
+
 /// Where the procedure was when a submission was sent or answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
@@ -231,6 +234,17 @@ async fn mine(
         // Paced so the gap holds tens of shares, not thousands.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The miners that have kept work from `phase`.
+fn kept_by(book: &Mutex<Book>, phase: Phase) -> BTreeSet<usize> {
+    book.lock()
+        .unwrap()
+        .kept
+        .iter()
+        .filter(|work| work.kept == phase)
+        .map(|work| work.miner)
+        .collect()
 }
 
 /// Positive acknowledgements recorded so far that were sent in `phase` and
@@ -495,7 +509,7 @@ async fn promotion(
     let (phase, watcher) = watch::channel(Phase::BeforeCut);
     let book = Arc::new(Mutex::new(Book::default()));
     let mut miners = Vec::new();
-    for miner in 0..4 {
+    for miner in 0..MINERS {
         let username = format!("{}.b474-{miner}", address(f).await?);
         let client = ShareClient::connect(f.stratum[miner % 2], &username).await?;
         miners.push(tokio::spawn(mine(
@@ -507,9 +521,16 @@ async fn promotion(
     }
 
     // Before the cut: shares the standby replays.
-    until("shares on the primary before the cut", 30, || async {
-        Ok(shares(&primary, &schema).await?.len() >= 12)
-    })
+    // Every miner keeps work from each phase before the procedure leaves it.
+    let every_miner: BTreeSet<usize> = (0..MINERS).collect();
+    until(
+        "shares on the primary, and work kept by every miner, before the cut",
+        30,
+        || async {
+            Ok(shares(&primary, &schema).await?.len() >= 12
+                && kept_by(&book, Phase::BeforeCut) == every_miner)
+        },
+    )
     .await?;
     let pre_cut = shares(&primary, &schema).await?;
     until("standby replay of the pre-cut shares", 15, || async {
@@ -552,7 +573,8 @@ async fn promotion(
             .fetch_one(&primary)
             .await?;
             Ok(acknowledged(&book, Phase::Gap, &frozen) >= 8
-                && committed.is_some_and(|seq| seq >= resumes_after + 20))
+                && committed.is_some_and(|seq| seq >= resumes_after + 20)
+                && kept_by(&book, Phase::Gap) == every_miner)
         },
     )
     .await?;
@@ -830,6 +852,15 @@ async fn promotion(
         after.push(("fresh", fresh));
     }
     let kept = std::mem::take(&mut book.lock().unwrap().kept);
+    let mut each: Vec<(usize, Phase)> = kept.iter().map(|work| (work.miner, work.kept)).collect();
+    each.sort();
+    let expected: Vec<(usize, Phase)> = (0..MINERS)
+        .flat_map(|miner| [(miner, Phase::BeforeCut), (miner, Phase::Gap)])
+        .collect();
+    ensure!(
+        each == expected,
+        "kept work is not exactly one share per miner per phase: {each:?}"
+    );
     for work in kept {
         let label = match work.kept {
             Phase::BeforeCut => "kept before the cut",
@@ -1062,7 +1093,7 @@ async fn promotion(
             .count()
     };
     eprintln!(
-        "live async promotion with live miners: {} shares offered by 4 miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
+        "live async promotion with live miners: {} shares offered by {MINERS} miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
          {} in flight at the fence, answered {:?}; {} committed before the cut, {} lost in the gap ({gap_bytes} WAL bytes), of which {} acknowledged: {acked_missing:?} ({} of them answered before the cut flag: {acked_before_cut:?}); \
          the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, a surviving share replayed: {}; \
          the gap-issued block: {}; the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
