@@ -155,6 +155,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--session-hashrate-sigma` | 0 | Lognormal spread of hashrate between sessions (sigma of the log) |
 | `--session-difficulty` | `fixed` | `fixed`, or `vardiff:<max ratio>`: each session's share difficulty in proportion to its hashrate, asked for with `d=` in its Stratum password |
 | `--pool-fee-bps` | 0 | Launch every frontend with the pool fee on at this many basis points and a fee address of the run's own, as mainnet runs; dust below the payout floor is then swept to the fee rather than refusing the template (#525). Every server requires a fee (#535), so 0 still enables one: it pays nothing and adds no output until dust must be swept, where a fee-off run would have stalled, so runs measured fee-off before #535 reproduce at 0 |
+| `--ctv-settlement` | off | Settle payouts through CTV fanout, as mainnet does (#548): every frontend is launched with `PRISM_CTV_SETTLEMENT_ENABLED=1`, `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT=1000` and `PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000`, the values `tests/fixtures/mainnet-compose.env` pins, with `PRISM_CTV_BROADCASTER_ENABLED=0` and the settlement shape (`PRISM_MAX_DIRECT_COINBASE_OUTPUTS` and the rest) left at the server's defaults. A block with more payable recipients than the direct-output cap then builds fanout chunks. Off, every frontend settles directly in the coinbase, as every earlier run did. See [CTV settlement](#ctv-settlement-548) |
 | `--arrival` | `smooth` | `smooth`, or `bursty:cv1=<x>,cv60=<y>,max=<m>`: the offered rate varies per second and per minute around each phase's rate |
 | `--churn-seconds` | 0 | Length of the `churn` side phase; 0 runs none. See [Connection churn](#connection-churn-521) |
 | `--churn-rate` | the steady-state rate | Offered shares per second during `churn` |
@@ -650,6 +651,41 @@ concurrent sessions per second with their extremes, and:
 
 The run-wide `time_to_usable_work` stays over the run's own `--sessions`.
 
+## CTV settlement (#548)
+
+`--ctv-settlement` turns CTV fanout settlement on in every frontend, so a
+block whose payable recipients overflow the direct-output cap (12 by default)
+is settled as mainnet settles it: the largest liabilities in direct coinbase
+outputs, the rest through CTV fanout chunks of up to 1,000 recipients, each a
+covenant output in the coinbase. The fanouts are built and recorded but never
+broadcast. The fee policy is an explicit market rate, as mainnet's, so no
+frontend asks the node for `estimatesmartfee`; the fake node's
+`getmempoolinfo` relay floor is the same 1,000 bits per 1,000 weight, and
+the server's live regtest suite runs CTV against a real `qbitd` at this rate
+(`crates/qbit-prism-server/tests/live_regtest.rs`). A node whose floor is
+higher makes every frontend refuse to build work, logging that the fanout
+fee rate is below the connected node relay floor. Every checked-in preset
+pins the flag.
+
+The side report's `settlement` block says how each of the run's own blocks
+settled, flag on or off, from the rows the server's landing wrote in the
+same transaction as the block: `qbit_payout_carry_forward` (miner accounts,
+`onchain` or `accrued`) and the outputs of `qbit_ctv_fanout_artifacts`'
+manifests. For every block the node accepted and the server landed,
+`blocks[]` carries its `settlement_mode` and the miner recipients it paid
+directly (`direct_recipients`), through fanout (`fanout_recipients`) and
+carried forward (`carried_recipients`), with `fanout_chunks` and
+`fanout_outputs` (the pool fee is not a recipient; `fanout_outputs` exceeds
+`fanout_recipients` only when the fee itself went through a chunk); `totals`
+sums them, with `blocks_by_chain_state` (a block landed and later reorged
+still settled, so it is counted). A landed block with no fanout is a
+measured 0. A block the node accepted and the server never landed, or with
+any fanout chunk whose manifest lists no output the harness can read, is
+listed in `unmeasured_blocks` and counted nowhere; a run with no landed block has `totals: null` with
+`totals_unavailable_reason`, and a failed read leaves every count `null` with
+the error. Only a run that lands blocks of its own (`--scheduled-blocks`, or
+the dense cadence's landings) settles any payout.
+
 ## Real-node mode (#547)
 
 `--node qbitd` drives a real regtest `qbitd` instead of the in-process fake
@@ -1076,6 +1112,10 @@ reconciliation definition and results, rejections by `(code, reason_id,
 message)` per phase and frontend, reconnect statistics, time to usable work,
 the mid-flight-kill census, blocked-run records, the honest-value notes, the
 validator verdict and the exact `capacity-evidence` command line.
+
+The `settlement` block counts how each of the run's own landed blocks paid
+its recipients: directly, through CTV fanout or carried forward (see
+[CTV settlement](#ctv-settlement-548)).
 
 The `dense_cadence` key is added by `--cadence dense` and holds the gap
 pattern, the landing list, the bump list on both clocks, the per-landing and
@@ -1650,7 +1690,9 @@ generator and its entry validation, the attribution of synthetic rejections and
 bumps to landings (including the unattributed ones), the no-landing
 report, the entry refusal of a memory floor the host cannot measure, the
 `pg_stat_statements` library under either suffix, and the refusal of a cluster
-root too deep for PostgreSQL's socket. `tests/realism.rs` covers the realism
+root too deep for PostgreSQL's socket, the CTV keys `--ctv-settlement` sets
+against mainnet's and the server's reader, and the `settlement` block's
+unmeasured, failed and zero cases. `tests/realism.rs` covers the realism
 flags' parsing and refusals, the default population's byte-for-byte legacy
 shape, the generated skew, windows and bursts, every checked-in preset's
 completeness and validity, #473's cells and rule, and the gate and its
@@ -1661,7 +1703,8 @@ binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
 skip without them: the quorum-standby detection in `tests/quorum_replication.rs`,
 in `tests/harness.rs` a cluster that fails to start, whose error has to
 carry PostgreSQL's own reason, the per-PR smoke run in
-`tests/load_smoke.rs`, and, also needing `QBITD_BIN`, the per-PR real-node
+`tests/load_smoke.rs`, the CTV settlement run in `tests/ctv_settlement.rs`
+(#548), and, also needing `QBITD_BIN`, the per-PR real-node
 smoke run in `tests/real_node.rs`, and the per-PR fault smoke run in
 `tests/faults.rs`. `tests/real_node.rs` also holds
 `fake_node_mode_is_unchanged`, which needs nothing: the fake node's answers to

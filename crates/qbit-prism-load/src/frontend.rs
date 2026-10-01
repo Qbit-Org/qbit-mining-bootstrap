@@ -157,6 +157,7 @@ pub fn frontend_environment(
     set("PRISM_BLOCKWAIT_ENABLED", "1".into());
     set("PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS", "60".into());
     set("PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS", "15".into());
+    // CTV settlement is turned on by `apply_ctv_settlement` (#548).
     set("PRISM_CTV_SETTLEMENT_ENABLED", "0".into());
     set("PRISM_CTV_BROADCASTER_ENABLED", "0".into());
     // The pool fee needs the run's own address: `apply_pool_fee`.
@@ -177,6 +178,33 @@ pub fn apply_pool_fee(env: &mut BTreeMap<String, String>, bps: u16, address: &st
     env.insert("PRISM_POOL_FEE_ENABLED".into(), "1".into());
     env.insert("PRISM_POOL_FEE_BPS".into(), bps.to_string());
     env.insert("PRISM_POOL_FEE_ADDRESS".into(), address.into());
+}
+
+/// The CTV fanout fee policy every `--ctv-settlement` frontend runs, as
+/// `tests/fixtures/mainnet-compose.env` pins it: an explicit market rate, so
+/// no frontend depends on `estimatesmartfee` (which a regtest node cannot
+/// answer), at the 1.2x premium. The rate is what the fake node's
+/// `getmempoolinfo` relay floor is, so the server's floor check passes.
+pub const CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT: u64 = 1000;
+pub const CTV_FANOUT_FEE_PREMIUM_BPS: u64 = 12_000;
+
+/// Turn CTV settlement on in a frontend environment (#548): the keys
+/// `config.rs` reads for it, set to what mainnet runs, with the broadcaster
+/// still off (`frontend_environment` sets `PRISM_CTV_BROADCASTER_ENABLED=0`),
+/// so fanouts are built and recorded but never broadcast. The settlement
+/// shape (`PRISM_MAX_DIRECT_COINBASE_OUTPUTS` and the rest) is left to the
+/// server's defaults, as mainnet leaves it. A frontend launched without this
+/// keeps `PRISM_CTV_SETTLEMENT_ENABLED=0` and no fee keys, exactly as before.
+pub fn apply_ctv_settlement(env: &mut BTreeMap<String, String>) {
+    env.insert("PRISM_CTV_SETTLEMENT_ENABLED".into(), "1".into());
+    env.insert(
+        "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT".into(),
+        CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT.to_string(),
+    );
+    env.insert(
+        "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS".into(),
+        CTV_FANOUT_FEE_PREMIUM_BPS.to_string(),
+    );
 }
 
 /// The run's pool fee address: the run's own address with a suffix no

@@ -725,18 +725,23 @@ pub fn shared_environment(
 }
 
 /// The exact environment one frontend is launched with: the shared and
-/// per-frontend keys, the pool fee, and for a real node its chain (#547).
-/// The one composition `run_inner` launches with, so what is recorded is
-/// what ran (EP-CONFIG).
+/// per-frontend keys, the pool fee, CTV settlement when `--ctv-settlement`
+/// asks for it (#548), and for a real node its chain (#547). The one
+/// composition `run_inner` launches with, so what is recorded is what ran
+/// (EP-CONFIG).
 pub fn launch_environment(
     shared: &SharedEnvironment,
     spec: &FrontendSpec,
     pool_fee_bps: u16,
     pool_fee_address: &str,
+    ctv_settlement: bool,
     node: NodeMode,
 ) -> BTreeMap<String, String> {
     let mut environment = frontend::frontend_environment(shared, spec);
     frontend::apply_pool_fee(&mut environment, pool_fee_bps, pool_fee_address);
+    if ctv_settlement {
+        frontend::apply_ctv_settlement(&mut environment);
+    }
     if node == NodeMode::Qbitd {
         // The server checks this against the node's `getblockchaininfo`.
         environment.insert("QBIT_CHAIN".into(), "regtest".into());
@@ -1417,6 +1422,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             &spec,
             args.pool_fee_bps,
             &ctx.pool_fee_address,
+            args.ctv_settlement,
             args.node_mode()?,
         );
         if let Some(soak) = &ctx.soak {
@@ -2457,6 +2463,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     } = gaps;
     let node_submissions = ctx.node.submissions();
     let tip_changes = ctx.node.tip_changes();
+    // How each of the run's own blocks settled (#548), from the landing rows
+    // the server wrote; the frontends have stopped, so none is still landing.
+    let accepted_blocks: Vec<String> = node_submissions
+        .iter()
+        .filter(|submission| submission.accepted)
+        .map(|submission| submission.block_hash.clone())
+        .collect();
+    let settlement = crate::settlement::report(
+        args.ctv_settlement,
+        &accepted_blocks,
+        crate::settlement::read(&side, &accepted_blocks).await,
+    );
     // The fault phase's verdict (#554), from the same records the
     // reconciliation read.
     let fault_mints = ctx
@@ -2684,6 +2702,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             _ => Value::Null,
         },
         "node": node_block,
+        "settlement": settlement,
         "premise": premise_block(
             premise_contradiction.as_deref(),
             &collected.difficulty_mismatches,
