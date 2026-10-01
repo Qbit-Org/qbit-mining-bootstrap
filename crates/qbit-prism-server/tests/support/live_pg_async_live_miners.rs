@@ -27,8 +27,9 @@
 //! committed anywhere; the old writer committed nothing after the fence
 //! but the COMMITs it had already received.
 //!
-//! After the endpoint moves, the same sessions submit new shares and the
-//! work each miner kept from before the cut and from inside the gap
+//! After the endpoint moves, the same sessions submit shares on their
+//! current jobs and the work each miner kept from before the cut and from
+//! inside the gap
 //! (including a session opened inside the gap, whose job was issued there):
 //! kept work is either resumed under its original authority or refused
 //! truthfully as stale. A real block on work whose window the promoted
@@ -38,8 +39,10 @@
 //! promotion lost and no history a frontend cached before it. Then the lost
 //! acknowledged shares are replayed. Each answer must match the promoted
 //! ledger: accepted means credited exactly once, and a truthful stale
-//! refusal means not credited. A surviving share replayed is a duplicate. A block solved on the gap-issued job
-//! commits to the lost window; submitting it is #619's opt-in case below,
+//! refusal means not credited. A surviving share replayed is a duplicate.
+//! Once the final block has moved the tip, every surviving session receives
+//! work for it and a share on that work is credited exactly once. A block
+//! solved on the gap-issued job commits to the lost window; submitting it is #619's opt-in case below,
 //! which asserts it is refused as stale or lands paying only promoted rows
 //! (today it is offered and never lands), so here it is kept.
 //! #466's replaced-history regression
@@ -840,16 +843,17 @@ async fn promotion(
         });
     }
 
-    // The same sessions: new work, kept work, and replays.
+    // The same sessions: their current jobs, kept work, and replays. No new
+    // work is pushed to them until the tip moves; that is checked at the end.
     let mut after = Vec::new();
     for (miner, session) in sessions.iter_mut().enumerate() {
-        let fresh = session.submit(Proof::Share).await?;
+        let current = session.submit(Proof::Share).await?;
         ensure!(
-            fresh.answer.accepted(),
-            "miner {miner}'s surviving session was answered {}",
-            fresh.answer
+            current.answer.accepted(),
+            "miner {miner}'s surviving session was answered {} on its current job",
+            current.answer
         );
-        after.push(("fresh", fresh));
+        after.push(("on its current job", current));
     }
     let kept = std::mem::take(&mut book.lock().unwrap().kept);
     let mut each: Vec<(usize, Phase)> = kept.iter().map(|work| (work.miner, work.kept)).collect();
@@ -1069,6 +1073,38 @@ async fn promotion(
         );
     }
 
+    // Work issued after the promotion reaches the surviving sessions: the
+    // final block moved the tip, each session is notified of work on it,
+    // and a share on that work is accepted and credited exactly once.
+    let tip = f.rpc("getbestblockhash", json!([])).await?;
+    let tip = tip.as_str().context("tip missing")?.to_owned();
+    let mut on_new_tip = 0;
+    for (miner, session) in sessions.iter_mut().enumerate() {
+        session
+            .work_on(&tip, Duration::from_secs(30))
+            .await
+            .with_context(|| {
+                format!("miner {miner}'s surviving session got no work on the new tip {tip}")
+            })?;
+        let share = session.submit(Proof::Share).await?;
+        ensure!(
+            share.answer.accepted(),
+            "miner {miner}'s share on work for the new tip was answered {}",
+            share.answer
+        );
+        let credits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_id=$1",
+        )
+        .bind(&share.share_id)
+        .fetch_one(&f.pool)
+        .await?;
+        ensure!(
+            credits == 1,
+            "miner {miner}'s share on the new tip is credited {credits} time(s)"
+        );
+        on_new_tip += 1;
+    }
+
     f.quiesce().await?;
     let (rows, ids, seqs, headers): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*),count(DISTINCT share_id),count(DISTINCT share_seq),(SELECT count(*) FROM qbit_prism_share_hashes h JOIN qbit_share_ledger l USING(share_id) WHERE l.accepted AND h.header_hash=right(l.share_id,64)) FROM qbit_share_ledger WHERE accepted",
@@ -1095,7 +1131,7 @@ async fn promotion(
     eprintln!(
         "live async promotion with live miners: {} shares offered by {MINERS} miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
          {} in flight at the fence, answered {:?}; {} committed before the cut, {} lost in the gap ({gap_bytes} WAL bytes), of which {} acknowledged: {acked_missing:?} ({} of them answered before the cut flag: {acked_before_cut:?}); \
-         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, a surviving share replayed: {}; \
+         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip, a surviving share replayed: {}; \
          the gap-issued block: {}; the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
         records.len(),
         count(|outcome| *outcome == Outcome::Acknowledged),
