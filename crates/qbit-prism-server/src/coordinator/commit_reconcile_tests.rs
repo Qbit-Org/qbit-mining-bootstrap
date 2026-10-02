@@ -956,21 +956,43 @@ async fn commit_reconcile_block_only_poll_errors_are_retried_then_unknown() -> R
     let outcome = async {
         let proof = fixture.proof(true).await?;
         let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        // Every disposition poll calls the probe floor. Once this candidate
+        // is committed, each call fails as a lock timeout would and counts
+        // itself. The duplicate probe before the enqueue calls it too, finds
+        // no candidate and passes through. The database orders the failures
+        // after the enqueue's COMMIT, so no wall-clock wait decides whether
+        // the polls fail before the bound.
+        sqlx::raw_sql(&format!(
+            r#"
+            CREATE SEQUENCE commit_reconcile_poll_faults;
+            ALTER FUNCTION qbit_prism_share_probe_floor() RENAME TO commit_reconcile_probe_floor;
+            CREATE FUNCTION qbit_prism_share_probe_floor() RETURNS bigint LANGUAGE plpgsql STABLE AS $$
+            BEGIN
+                IF EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash='{block_hash}') THEN
+                    PERFORM nextval('commit_reconcile_poll_faults');
+                    RAISE EXCEPTION 'injected disposition poll failure'
+                        USING ERRCODE = 'lock_not_available';
+                END IF;
+                RETURN commit_reconcile_probe_floor();
+            END $$;
+            "#
+        ))
+        .execute(&fixture.side)
+        .await?;
         let started = TokioInstant::now();
         let (submitted, log) = fixture.submit(proof);
-        until("the pending candidate", || async {
-            Ok(fixture.outbox_state(&block_hash).await?.as_deref() == Some("pending"))
-        })
-        .await?;
-        // Every later disposition poll now waits out the ledger's 5 s
-        // lock_timeout and fails.
-        let mut lock = fixture.side.begin().await?;
-        sqlx::query("LOCK TABLE qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut *lock)
-            .await?;
         let answer = answer(submitted).await?;
         let answered = started.elapsed();
-        lock.rollback().await?;
+        let (faults, polled): (i64, bool) =
+            sqlx::query_as("SELECT last_value, is_called FROM commit_reconcile_poll_faults")
+                .fetch_one(&fixture.side)
+                .await?;
+        sqlx::raw_sql(
+            "DROP FUNCTION qbit_prism_share_probe_floor(); \
+             ALTER FUNCTION commit_reconcile_probe_floor() RENAME TO qbit_prism_share_probe_floor;",
+        )
+        .execute(&fixture.side)
+        .await?;
         ensure!(
             reason(&answer).as_deref() == Some("ledger-outcome-unknown"),
             "failed disposition polls were answered {:?}",
@@ -979,6 +1001,11 @@ async fn commit_reconcile_block_only_poll_errors_are_retried_then_unknown() -> R
         ensure!(
             answered >= Duration::from_secs(8),
             "answered after {answered:?}, before the block-only bound"
+        );
+        ensure!(
+            polled && faults >= 2,
+            "a failed disposition poll was not retried: {} failed",
+            if polled { faults } else { 0 }
         );
         let text = log.text();
         ensure!(

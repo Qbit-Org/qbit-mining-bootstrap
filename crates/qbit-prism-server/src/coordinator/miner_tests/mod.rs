@@ -190,6 +190,7 @@ impl SharedLog {
     }
 
     pub fn dispatch(&self) -> tracing::Dispatch {
+        Undecided::install();
         tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
@@ -217,6 +218,81 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// The global default under every [`SharedLog`] (#649). It records nothing,
+/// and answers every callsite `sometimes`, so no thread can cache `never`.
+///
+/// `tracing` caches one interest per callsite for the whole process. While a
+/// single dispatcher is registered, a callsite's first hit asks only the
+/// hitting thread's default. A test without a subscriber that reaches a
+/// callsite first, on its own thread, while one `SharedLog` is live, therefore
+/// caches `never` for it, and that `SharedLog` silently loses the event. With
+/// this default registered there are always two dispatchers, and it is the
+/// default of any thread without its own, so the cache can only hold
+/// `sometimes` or better and each event asks the current dispatcher.
+struct Undecided;
+
+impl Undecided {
+    fn install() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            // Only `main` sets a global default; a test binary never does.
+            let _ = tracing::subscriber::set_global_default(Undecided);
+        });
+    }
+}
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    // The live dispatchers' own hints set the global maximum level.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// #649: a callsite first reached on a thread without a subscriber, while
+/// this `SharedLog` is the only one registered, is still captured.
+#[test]
+fn shared_log_captures_a_callsite_first_reached_without_a_subscriber() {
+    fn emit() {
+        tracing::warn!("shared-log #649 probe");
+    }
+    let log = SharedLog::default();
+    let dispatch = log.dispatch();
+    std::thread::spawn(emit)
+        .join()
+        .expect("the probe thread panicked");
+    tracing::dispatcher::with_default(&dispatch, emit);
+    assert!(
+        log.text().contains("shared-log #649 probe"),
+        "the SharedLog lost an event whose callsite was first reached elsewhere:\n{}",
+        log.text()
+    );
 }
 
 pub(crate) struct Node {
