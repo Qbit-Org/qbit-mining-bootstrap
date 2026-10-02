@@ -127,6 +127,20 @@ async fn a_ctv_run_pays_the_direct_overflow_through_fanout_and_counts_the_split(
     assert_eq!(settlement["ctv_settlement"], true, "{settlement}");
     let accepted = settlement["accepted_blocks"].as_u64().context("accepted")?;
     assert!(accepted >= 1, "the scheduled block landed: {settlement}");
+    // The block was ordered against the warm-up's tip (#638): settled by the
+    // node's answer, with the tip minted after it.
+    let warm_up = report["phases"]
+        .as_array()
+        .context("phases")?
+        .iter()
+        .find(|phase| phase["name"] == "warm_up")
+        .context("the warm-up phase")?;
+    let ordered = &warm_up["scheduled_blocks_ordered_against_tips"];
+    assert_eq!(
+        ordered[0]["settled"], "the node answered its submitblock",
+        "{ordered}"
+    );
+    assert_eq!(warm_up["external_tips_unminted"], 0, "{ordered}");
     assert_eq!(settlement["measured_blocks"], accepted, "{settlement}");
     assert_eq!(settlement["unmeasured_blocks"], serde_json::json!([]));
     for block in settlement["blocks"].as_array().context("blocks")? {

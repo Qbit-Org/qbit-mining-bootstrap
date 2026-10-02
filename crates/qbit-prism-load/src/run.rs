@@ -614,6 +614,10 @@ struct PhaseRun {
     /// [`PhaseOutcome::mem_available_unread_checks`].
     mem_available_unread_checks: u64,
     scheduled_blocks: usize,
+    /// See [`PhaseOutcome::ordered_landings`] and
+    /// [`PhaseOutcome::tips_unminted`].
+    ordered_landings: Vec<OrderedLanding>,
+    tips_unminted: usize,
     frontend_restarts: usize,
     /// Every drained restart this phase completed, with its timings and the
     /// scrapes bracketing the counter reset.
@@ -1990,6 +1994,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             min_mem_available_kib: outcome.min_mem_available_kib,
             mem_available_unread_checks: outcome.mem_available_unread_checks,
             scheduled_blocks: outcome.scheduled_blocks,
+            ordered_landings: outcome.ordered_landings,
+            tips_unminted: outcome.tips_unminted,
             frontend_restarts: outcome.frontend_restarts,
             restart_records: outcome.restart_records,
             mid_flight_indeterminate: outcome.indeterminate,
@@ -2890,6 +2896,12 @@ pub struct PhaseOutcome {
     pub dense_landings: Vec<Landing>,
     /// Schedule slots the landing budget could not pay for.
     pub slots_over_budget: usize,
+    /// The scheduled blocks of a phase that also mints external tips, each
+    /// ordered against the tips (#638); empty in every other phase.
+    pub ordered_landings: Vec<OrderedLanding>,
+    /// Warm-up tips the phase ended without minting, because a landing
+    /// they were held behind never settled. Zero when every tip went out.
+    pub tips_unminted: usize,
     /// When the phase stopped scheduling: its deadline, or the abort. This
     /// is the end of the measured window -- `duration_millis`, the lock and
     /// process windows and the rates' denominator -- and it is stamped
@@ -2984,6 +2996,123 @@ impl OfferPicker {
         }
         self.redirected += 1;
         offer_round_robin(sessions, cursor, limit, phase)
+    }
+}
+
+/// One scheduled block in a phase that also mints external tips: the tips
+/// plan's warm-up (#638). The two used to be placed on the wall clock alone,
+/// so a block whose search and submit outlasted the gap to the next tip lost
+/// its height to that tip, and the run landed no own block. Now the block is
+/// sent only once its session holds work on the node's settled tip, and no
+/// tip is minted from the moment the block is due until it has settled: the
+/// node answered its `submitblock`, the server refused it, or the session
+/// could not send it. Offsets are seconds into the phase; `None` is "not by
+/// the phase's end", never zero (EP-OBSERVABILITY).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OrderedLanding {
+    pub session: usize,
+    pub due_seconds: f64,
+    pub sent_seconds: Option<f64>,
+    pub settled_seconds: Option<f64>,
+    /// The display hash of the block the session submitted, once known.
+    pub block_hash: Option<String>,
+    /// How it settled; `None` while it was still outstanding.
+    pub settled: Option<String>,
+}
+
+/// A scheduled block sent and not yet settled, with where its records start.
+struct OutstandingLanding {
+    record: usize,
+    session: usize,
+    sent: Instant,
+    submits_from: usize,
+    failures_from: usize,
+}
+
+/// Whether the session a scheduled block goes to, the first, has its newest
+/// job on the node's settled tip. With no session nothing is sent, so
+/// nothing waits.
+fn holds_work_on_settled_tip(
+    sessions: &[SessionHandle],
+    node: &dyn crate::node::ExternalMint,
+    collected: &Mutex<Collected>,
+) -> bool {
+    let Some(session) = sessions.first() else {
+        return true;
+    };
+    let Some(tip) = node.settled_tip() else {
+        return false;
+    };
+    collected
+        .lock()
+        .expect("collected")
+        .tips
+        .iter()
+        .rev()
+        .find(|sighting| sighting.session == session.index)
+        .is_some_and(|sighting| sighting.tip == tip)
+}
+
+/// How an outstanding landing settled, with its block's hash when the
+/// session submitted one; `None` while it is still outstanding. The records
+/// are the landing's own: its session's, from after it was sent (EP-STATE).
+fn landing_settlement(
+    collected: &Collected,
+    node: &dyn crate::node::ExternalMint,
+    landing: &OutstandingLanding,
+) -> Option<(Option<String>, String)> {
+    if let Some(failure) = collected.failures[landing.failures_from.min(collected.failures.len())..]
+        .iter()
+        .find(|failure| {
+            failure.kind == FailureKind::ScheduledBlock
+                && failure.session == landing.session
+                && failure.at >= landing.sent
+        })
+    {
+        return Some((
+            None,
+            format!("the session could not build or send it: {}", failure.error),
+        ));
+    }
+    let record = collected.submits[landing.submits_from.min(collected.submits.len())..]
+        .iter()
+        .find(|record| {
+            record.scheduled_block
+                && !record.reoffer
+                && record.session == landing.session
+                && record.sent >= landing.sent
+        })?;
+    let hash = hex::decode(&record.header_hex)
+        .ok()
+        .filter(|header| header.len() == 80)
+        .map(|header| {
+            qbit_prism_server::codec::hash_display(&qbit_prism_server::codec::double_sha256(
+                &header,
+            ))
+        });
+    match (&record.outcome, hash) {
+        (_, Some(hash)) if node.block_answered(&hash) => {
+            Some((Some(hash), "the node answered its submitblock".into()))
+        }
+        // Only a refusal that proves the block never entered the ledger
+        // settles it: a block candidate's append is never refused, so one
+        // answered `ledger-outcome-unknown` or `ledger-confirmation-failed`
+        // can still be offered (EP-ERRORS).
+        (Outcome::Rejected(rejection), hash)
+            if matches!(
+                rejection.reason_id.as_deref(),
+                Some("stale-job" | "low-difficulty")
+            ) =>
+        {
+            Some((
+                hash,
+                format!("the server refused it: {}", rejection.message),
+            ))
+        }
+        // Accepted by the server, refused with an outcome still open, or
+        // unanswered: the block may yet reach the node, so the tips stay
+        // held.
+        _ => None,
     }
 }
 
@@ -3090,6 +3219,8 @@ pub async fn drive_phase_with_population(
         dense_offsets: Vec::new(),
         dense_landings: Vec::new(),
         slots_over_budget: 0,
+        ordered_landings: Vec::new(),
+        tips_unminted: 0,
         ended: started,
         ended_wall: chrono::Utc::now(),
         per_second: PerSecond::default(),
@@ -3139,6 +3270,9 @@ pub async fn drive_phase_with_population(
         Vec::new()
     };
     let mut tip_cursor = 0usize;
+    // A phase with both orders its landings against its tips (#638).
+    let order_landings = !block_times.is_empty() && !tip_times.is_empty();
+    let mut landing: Option<OutstandingLanding> = None;
     let mut kill_done = !plan.mid_flight_kill;
     // The mid-flight kill in flight, if any: polled from this loop and
     // never awaited, for the same reason the drained restart is. Awaiting
@@ -3235,11 +3369,54 @@ pub async fn drive_phase_with_population(
                 }
             }
         }
-        if block_cursor < block_times.len() && seconds >= block_times[block_cursor] {
+        if let Some(outstanding) = &landing {
+            let settled = {
+                let collected = collected.lock().expect("collected");
+                landing_settlement(&collected, node_state, outstanding)
+            };
+            if let Some((hash, how)) = settled {
+                let record = &mut outcome.ordered_landings[outstanding.record];
+                record.settled_seconds = Some(started.elapsed().as_secs_f64());
+                record.block_hash = hash;
+                record.settled = Some(how);
+                landing = None;
+            }
+        }
+        let block_due = block_cursor < block_times.len() && seconds >= block_times[block_cursor];
+        // Ordered, a block waits for the one before it to settle and for its
+        // session to hold work on the node's settled tip, so it is never
+        // mined on a parent a tip still on its way replaces.
+        let block_ready = block_due
+            && (!order_landings
+                || (landing.is_none()
+                    && holds_work_on_settled_tip(sessions, node_state, collected)));
+        if block_ready {
             block_cursor += 1;
             *remaining_blocks = remaining_blocks.saturating_sub(1);
             outcome.scheduled_blocks += 1;
             if let Some(session) = sessions.first() {
+                if order_landings {
+                    let (submits_from, failures_from) = {
+                        let collected = collected.lock().expect("collected");
+                        (collected.submits.len(), collected.failures.len())
+                    };
+                    let sent = Instant::now();
+                    landing = Some(OutstandingLanding {
+                        record: outcome.ordered_landings.len(),
+                        session: session.index,
+                        sent,
+                        submits_from,
+                        failures_from,
+                    });
+                    outcome.ordered_landings.push(OrderedLanding {
+                        session: session.index,
+                        due_seconds: block_times[block_cursor - 1],
+                        sent_seconds: Some(sent.saturating_duration_since(started).as_secs_f64()),
+                        settled_seconds: None,
+                        block_hash: None,
+                        settled: None,
+                    });
+                }
                 let _ = session.control.send(client::Control::ScheduledBlock);
             }
         }
@@ -3266,7 +3443,10 @@ pub async fn drive_phase_with_population(
                 });
             }
         }
-        if tip_cursor < tip_times.len() && seconds >= tip_times[tip_cursor] {
+        // Ordered, no tip is minted from the moment a block is due until it
+        // has settled: a tip minted meanwhile can take the block's height.
+        let tips_held = order_landings && (block_due || landing.is_some());
+        if !tips_held && tip_cursor < tip_times.len() && seconds >= tip_times[tip_cursor] {
             tip_cursor += 1;
             *remaining_tips = remaining_tips.saturating_sub(1);
             if let Some(tip) = node_state.mint_external(crate::node::MintPurpose::WarmUp) {
@@ -3375,6 +3555,22 @@ pub async fn drive_phase_with_population(
     outcome.ended = Instant::now();
     outcome.ended_wall = chrono::Utc::now();
     outcome.offers_redirected = offers.redirected;
+    // What the ordering left undone is reported, not dropped: a block still
+    // held at the deadline, and the tips held behind a landing that never
+    // settled (EP-ERRORS).
+    if order_landings {
+        for &due in &block_times[block_cursor..] {
+            outcome.ordered_landings.push(OrderedLanding {
+                session: sessions.first().map_or(0, |session| session.index),
+                due_seconds: due,
+                sent_seconds: None,
+                settled_seconds: None,
+                block_hash: None,
+                settled: None,
+            });
+        }
+        outcome.tips_unminted = tip_times.len() - tip_cursor;
+    }
     // A restart or a kill still in flight at the phase boundary is seen
     // through, so its sessions are retargeted -- and, for the kill, its
     // re-offers sent -- before the next phase offers to them. Their own
@@ -4711,6 +4907,8 @@ fn phase_report(
         "min_mem_available_kib": phase.min_mem_available_kib,
         "mem_available_unread_checks": phase.mem_available_unread_checks,
         "scheduled_blocks": phase.scheduled_blocks,
+        "scheduled_blocks_ordered_against_tips": phase.ordered_landings,
+        "external_tips_unminted": phase.tips_unminted,
         "frontend_restarts": phase.frontend_restarts,
         "drained_restarts": phase.restart_records.iter().map(|record| json!({
             "frontend": record.index,

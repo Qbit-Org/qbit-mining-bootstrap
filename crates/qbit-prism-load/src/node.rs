@@ -65,11 +65,45 @@ pub trait ExternalMint: Send + Sync {
     /// peer and returns `None`: the tip reaches the pool node later, and the
     /// report takes it from there.
     fn mint_external(&self, purpose: MintPurpose) -> Option<TipChange>;
+
+    /// The node's tip once every mint asked of it is on that tip, and `None`
+    /// while one is still on its way. A scheduled block mined before then
+    /// could be on a parent the next block replaces (#638).
+    fn settled_tip(&self) -> Option<String>;
+
+    /// Whether the node has finished with `block_hash`, the display hash of
+    /// a block a session submitted: it answered a `submitblock` for it, and
+    /// an accepted one is on its chain. A tip minted before then can take the
+    /// block's height first (#638).
+    fn block_answered(&self, block_hash: &str) -> bool;
 }
 
 impl ExternalMint for NodeState {
     fn mint_external(&self, _purpose: MintPurpose) -> Option<TipChange> {
         Some(self.mint_external_block())
+    }
+
+    /// The fake node mints in place, so its tip is always settled.
+    fn settled_tip(&self) -> Option<String> {
+        Some(self.tip().0)
+    }
+
+    fn block_answered(&self, block_hash: &str) -> bool {
+        // The submission is recorded before an accepted block becomes the
+        // tip, so an accepted one is answered only once it is on the chain.
+        let accepted = match self
+            .submissions()
+            .iter()
+            .find(|record| record.block_hash == block_hash)
+        {
+            None => return false,
+            Some(record) => record.accepted,
+        };
+        !accepted
+            || self
+                .tip_changes()
+                .iter()
+                .any(|change| change.hash == block_hash)
     }
 }
 

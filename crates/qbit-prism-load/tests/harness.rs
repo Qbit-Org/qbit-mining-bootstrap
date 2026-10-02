@@ -10891,3 +10891,350 @@ fn the_settlement_block_keeps_unmeasured_apart_from_zero() {
         "the error is redacted: {reason}"
     );
 }
+
+/// What a stand-in session does in [`ordered_tips_run`]: how long its newest
+/// job trails the node's tip, how long its scheduled block's search takes,
+/// what the server answers, and whether and how long after that it offers
+/// the block to the node.
+#[derive(Clone)]
+struct StandIn {
+    notify_delay: std::time::Duration,
+    search: std::time::Duration,
+    answer: client::Outcome,
+    offer: Option<std::time::Duration>,
+}
+
+impl StandIn {
+    fn accepted(
+        notify_delay: std::time::Duration,
+        search: std::time::Duration,
+        offer: std::time::Duration,
+    ) -> Self {
+        Self {
+            notify_delay,
+            search,
+            answer: client::Outcome::Accepted,
+            offer: Some(offer),
+        }
+    }
+}
+
+/// The tips plan's warm-up (#638) over a fake node, 6 s long: tips due at
+/// 1.2, 2.4 and 3.6 s and the one scheduled block at 3 s. Session 0 has no
+/// task behind it; a stand-in plays it from the outside. It sights each tip
+/// `notify_delay` after the node takes it, the way a job reaches a session,
+/// and answers `ScheduledBlock` the way the client and the server do: it
+/// mines on its newest sighted tip for `search`, records the server's
+/// `answer`, and `offer` later, if at all, submits the block to the node.
+/// Every delay is injected, so whichever of block and tip is first is fixed
+/// by the timings, not by the host.
+async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<NodeState>, usize)> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{Args, PhasePlan};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    let args = Args::parse_from([
+        "qbit-prism-load",
+        "--plan",
+        "tips",
+        "--external-tips",
+        "3",
+        "--scheduled-blocks",
+        "1",
+        "--min-mem-available-mib",
+        "0",
+    ]);
+    let plan = PhasePlan {
+        name: "warm_up".into(),
+        kind: "warm_up".into(),
+        seconds: 6,
+        rate: 0.0,
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+        restart_frontend: false,
+    };
+    let node = Arc::new(NodeState::new(window::TEMPLATE_BITS, "pload1"));
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let (session, mut control, _work) = queued_session(0, 0, 0, 1);
+
+    // The session's jobs: each tip the node takes is sighted `notify_delay`
+    // later.
+    let notify_delay = stand_in.notify_delay;
+    let notify = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                let (tip, _) = node.tip();
+                if tip != last {
+                    last = tip.clone();
+                    let collected = collected.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(notify_delay).await;
+                        collected.lock().unwrap().tips.push(client::TipSighting {
+                            session: 0,
+                            frontend: 0,
+                            tip,
+                            at: Instant::now(),
+                        });
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    // The session's scheduled block, and the server's offer of it.
+    let blocks = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut nonce = 0u32;
+            while let Some(message) = control.recv().await {
+                let client::Control::ScheduledBlock = message else {
+                    continue;
+                };
+                let parent = collected
+                    .lock()
+                    .unwrap()
+                    .tips
+                    .iter()
+                    .rev()
+                    .find(|sighting| sighting.session == 0)
+                    .map(|sighting| sighting.tip.clone())
+                    .expect("the session holds a job");
+                tokio::time::sleep(stand_in.search).await;
+                nonce += 1;
+                let mut prev = hex::decode(&parent).unwrap();
+                prev.reverse();
+                let header = client::assemble_header(
+                    0x2000_0000,
+                    &prev,
+                    &[9u8; 32],
+                    1_800_000_000,
+                    codec::parse_u32_hex(window::TEMPLATE_BITS).unwrap(),
+                    nonce,
+                );
+                let sent = Instant::now();
+                collected
+                    .lock()
+                    .unwrap()
+                    .submits
+                    .push(client::SubmitRecord {
+                        share_id: format!("pload1abc.s00000:block{nonce}"),
+                        session: 0,
+                        frontend: 0,
+                        phase: "warm_up".into(),
+                        job_id: format!("job-{parent}"),
+                        sent,
+                        responded: Some(sent),
+                        latency_millis: Some(0.0),
+                        outcome: stand_in.answer.clone(),
+                        scheduled_block: true,
+                        reoffer: false,
+                        fence: 0,
+                        header_hex: hex::encode(&header),
+                        extranonce2_hex: String::new(),
+                        ntime_hex: String::new(),
+                        nonce_hex: format!("{nonce:08x}"),
+                    });
+                let Some(offer) = stand_in.offer else {
+                    continue;
+                };
+                tokio::time::sleep(offer).await;
+                let block = format!("{}01{}", hex::encode(&header), "00".repeat(64));
+                node.handle(&json!({"jsonrpc": "1.0", "id": 1, "method": "submitblock",
+                    "params": [block]}))
+                    .await;
+            }
+        })
+    };
+    // The session holds work on the starting tip before the phase begins.
+    tokio::time::sleep(notify_delay + std::time::Duration::from_millis(50)).await;
+
+    let mut external_tips = Vec::new();
+    let (mut remaining_blocks, mut remaining_tips) = (1usize, 3usize);
+    let outcome = run::drive_phase(
+        &args,
+        &plan,
+        std::slice::from_ref(&session),
+        &mut [],
+        &[],
+        &*node,
+        &mut external_tips,
+        &mut remaining_blocks,
+        &mut remaining_tips,
+        &collected,
+        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    )
+    .await?;
+    notify.abort();
+    blocks.abort();
+    Ok((outcome, node, remaining_tips))
+}
+
+/// The chain above the starting tip, by origin, and every submission's
+/// verdict.
+fn ordered_chain(node: &NodeState) -> (Vec<node::TipOrigin>, Vec<(bool, Option<String>)>) {
+    (
+        node.tip_changes()
+            .iter()
+            .map(|change| change.origin)
+            .filter(|origin| *origin != node::TipOrigin::Bootstrap)
+            .collect(),
+        node.submissions()
+            .iter()
+            .map(|record| (record.accepted, record.rejection.clone()))
+            .collect(),
+    )
+}
+
+/// #638: the one scheduled block of the tips plan was sent at 15 s and the
+/// third tip minted at 18 s whatever had become of the block, so a search
+/// and offer that outlasted the gap lost the block's height to the tip and
+/// the run landed no own block. Here the block takes 1.5 s to find and its
+/// offer 0.3 s more, past the third tip's 3.6 s slot. The tip is held until
+/// the node has answered the block's `submitblock`, so the block lands on
+/// the second tip and the third tip is minted on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_warm_up_tip_waits_for_the_scheduled_block_the_node_has_not_answered() -> Result<()>
+{
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn::accepted(
+        Duration::from_millis(20),
+        Duration::from_millis(1500),
+        Duration::from_millis(300),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "the block reached the node on the tip it was mined on: {:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(
+        chain,
+        vec![External, External, Pool, External],
+        "the third tip was minted on top of the pool block"
+    );
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    let landing = &outcome.ordered_landings[..];
+    assert_eq!(landing.len(), 1, "{landing:?}");
+    assert_eq!(
+        landing[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    let (sent, settled) = (
+        landing[0].sent_seconds.expect("sent"),
+        landing[0].settled_seconds.expect("settled"),
+    );
+    assert!(
+        settled - sent >= 1.7 && settled > 3.6,
+        "settled once the injected search and offer were over, after the tip's slot: {landing:?}"
+    );
+    Ok(())
+}
+
+/// The other side of #638's race: the block was sent on the wall clock
+/// whether or not its session had a job on the tip minted just before, so a
+/// slow notify had it mined on a parent that tip had already replaced. Here
+/// every job reaches the session 1 s after its tip, so at the block's 3 s
+/// slot the session still mines on the first tip. The block is held until
+/// the session holds work on the second, and lands on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scheduled_block_waits_until_its_session_holds_work_on_the_settled_tip() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn::accepted(
+        Duration::from_millis(1000),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "the block was mined on the tip the node held: {:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    let sent = outcome.ordered_landings[0].sent_seconds.expect("sent");
+    assert!(
+        sent >= 3.4,
+        "sent once the second tip's job had reached the session: {:?}",
+        outcome.ordered_landings
+    );
+    Ok(())
+}
+
+/// A block candidate's append is never refused, so the server can answer it
+/// `ledger-outcome-unknown` at its deadline and still offer it afterwards.
+/// That answer is not the block's verdict: the tip stays held until the node
+/// has answered the offer that came 1.5 s later, past the tip's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_refused_with_its_outcome_unknown_still_holds_the_next_tip() -> Result<()>
+{
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 20,
+            reason_id: Some("ledger-outcome-unknown".into()),
+            message: "share outcome is not yet known".into(),
+        }),
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A `stale-job` refusal is the block's verdict: nothing entered the ledger
+/// and nothing will reach the node, so the tips go out without waiting for
+/// an offer that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_the_server_refused_as_stale_releases_the_next_tip() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 21,
+            reason_id: Some("stale-job".into()),
+            message: "stale job".into(),
+        }),
+        offer: None,
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::External;
+    assert_eq!(verdicts, vec![]);
+    assert_eq!(chain, vec![External, External, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    let landing = &outcome.ordered_landings[0];
+    assert_eq!(
+        landing.settled.as_deref(),
+        Some("the server refused it: stale job")
+    );
+    assert!(landing.block_hash.is_some(), "{landing:?}");
+    Ok(())
+}

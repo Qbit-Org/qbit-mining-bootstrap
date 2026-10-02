@@ -1380,6 +1380,56 @@ impl crate::node::ExternalMint for Qbitd {
         });
         None
     }
+
+    /// A's tip as its watcher saw it, once every mint asked of B and every
+    /// block A accepted from the relay is among the tips the watcher saw:
+    /// before then, the tip a frontend serves work on is about to change.
+    fn settled_tip(&self) -> Option<String> {
+        // A mint that failed is never seen and does not hold the tip; one
+        // still in the channel or on B does.
+        let minted: Vec<String> = {
+            let mints = self.shared.mints.lock().expect("mints");
+            if (mints.len() as u64) < self.shared.requested.load(Ordering::SeqCst) {
+                return None;
+            }
+            mints.iter().filter_map(|mint| mint.hash.clone()).collect()
+        };
+        let accepted: Vec<String> = self
+            .relay
+            .log
+            .lock()
+            .expect("relay log")
+            .submissions
+            .iter()
+            .filter(|submission| submission.accepted)
+            .map(|submission| submission.block_hash.clone())
+            .collect();
+        let tips = self.shared.tips.lock().expect("tips");
+        let seen: HashSet<&str> = tips.iter().map(|tip| tip.hash.as_str()).collect();
+        if minted
+            .iter()
+            .chain(&accepted)
+            .any(|hash| !seen.contains(hash.as_str()))
+        {
+            return None;
+        }
+        Some(
+            tips.last()
+                .map_or_else(|| self.ramp_tip.0.clone(), |tip| tip.hash.clone()),
+        )
+    }
+
+    /// The relay records a `submitblock` once A has answered it, and A's
+    /// answer to an accepted block comes after A connected it.
+    fn block_answered(&self, block_hash: &str) -> bool {
+        self.relay
+            .log
+            .lock()
+            .expect("relay log")
+            .submissions
+            .iter()
+            .any(|submission| submission.block_hash == block_hash)
+    }
 }
 
 fn latency_summary(samples: &[f64]) -> Value {
