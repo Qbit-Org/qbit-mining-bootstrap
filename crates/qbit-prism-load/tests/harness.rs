@@ -11238,3 +11238,92 @@ async fn a_scheduled_block_the_server_refused_as_stale_releases_the_next_tip() -
     assert!(landing.block_hash.is_some(), "{landing:?}");
     Ok(())
 }
+
+/// A session whose task has already stopped never receives its scheduled
+/// block and reports no failure for it. The refused send is the block's
+/// verdict, so the tips after it are still minted rather than held to the
+/// phase's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_its_session_never_received_releases_the_next_tip() -> Result<()> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{Args, PhasePlan};
+    use std::sync::Mutex;
+    let args = Args::parse_from([
+        "qbit-prism-load",
+        "--plan",
+        "tips",
+        "--external-tips",
+        "3",
+        "--scheduled-blocks",
+        "1",
+        "--min-mem-available-mib",
+        "0",
+    ]);
+    let plan = PhasePlan {
+        name: "warm_up".into(),
+        kind: "warm_up".into(),
+        seconds: 3,
+        rate: 0.0,
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+        restart_frontend: false,
+    };
+    let node = NodeState::new(window::TEMPLATE_BITS, "pload1");
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    // The session's control receiver is gone, as it is once its task ends.
+    let (session, control, _work) = queued_session(0, 0, 0, 1);
+    drop(control);
+    // Its last job was on each tip as soon as the node took it.
+    let sighting = |tip: String| client::TipSighting {
+        session: 0,
+        frontend: 0,
+        tip,
+        at: std::time::Instant::now(),
+    };
+    collected.lock().unwrap().tips.push(sighting(node.tip().0));
+    let node = Arc::new(node);
+    let notify = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut last = node.tip().0;
+            loop {
+                let (tip, _) = node.tip();
+                if tip != last {
+                    last = tip.clone();
+                    collected.lock().unwrap().tips.push(sighting(tip));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let mut external_tips = Vec::new();
+    let (mut remaining_blocks, mut remaining_tips) = (1usize, 3usize);
+    let outcome = run::drive_phase(
+        &args,
+        &plan,
+        std::slice::from_ref(&session),
+        &mut [],
+        &[],
+        &*node,
+        &mut external_tips,
+        &mut remaining_blocks,
+        &mut remaining_tips,
+        &collected,
+        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    )
+    .await?;
+    notify.abort();
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::External;
+    assert_eq!(verdicts, vec![]);
+    assert_eq!(chain, vec![External, External, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the session's task had stopped, so it was never sent")
+    );
+    Ok(())
+}

@@ -3401,23 +3401,36 @@ pub async fn drive_phase_with_population(
                         (collected.submits.len(), collected.failures.len())
                     };
                     let sent = Instant::now();
-                    landing = Some(OutstandingLanding {
-                        record: outcome.ordered_landings.len(),
-                        session: session.index,
-                        sent,
-                        submits_from,
-                        failures_from,
-                    });
+                    let sent_seconds = sent.saturating_duration_since(started).as_secs_f64();
+                    // A session whose task has gone never receives the block
+                    // and reports no failure for it, so a refused send is
+                    // the landing's verdict: it never left the harness.
+                    let refused = session
+                        .control
+                        .send(client::Control::ScheduledBlock)
+                        .is_err();
                     outcome.ordered_landings.push(OrderedLanding {
                         session: session.index,
                         due_seconds: block_times[block_cursor - 1],
-                        sent_seconds: Some(sent.saturating_duration_since(started).as_secs_f64()),
-                        settled_seconds: None,
+                        sent_seconds: Some(sent_seconds),
+                        settled_seconds: refused.then_some(sent_seconds),
                         block_hash: None,
-                        settled: None,
+                        settled: refused.then(|| {
+                            "the session's task had stopped, so it was never sent".to_owned()
+                        }),
                     });
+                    if !refused {
+                        landing = Some(OutstandingLanding {
+                            record: outcome.ordered_landings.len() - 1,
+                            session: session.index,
+                            sent,
+                            submits_from,
+                            failures_from,
+                        });
+                    }
+                } else {
+                    let _ = session.control.send(client::Control::ScheduledBlock);
                 }
-                let _ = session.control.send(client::Control::ScheduledBlock);
             }
         }
         if landing_cursor < landing_offsets.len() && seconds >= landing_offsets[landing_cursor] {
