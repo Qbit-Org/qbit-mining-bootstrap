@@ -1409,7 +1409,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let mut frontends: Vec<Frontend> = Vec::new();
     let mut blocked: Vec<BlockedLog> = Vec::new();
     for index in 0..args.frontends {
-        let instance_id = format!("load-fe-{index}");
+        let instance_id = frontend_instance_id(index);
         let spec = FrontendSpec {
             index,
             database_url: with_application_name(&proxied_url, &instance_id),
@@ -3021,6 +3021,20 @@ pub async fn drive_phase(
     .await
 }
 
+/// The instance id the harness gives its `index`-th frontend, which names
+/// it in the side report.
+pub fn frontend_instance_id(index: usize) -> String {
+    format!("load-fe-{index}")
+}
+
+/// When the scheduled blocks of a phase that holds `count` of them are sent,
+/// in seconds from the phase's start: evenly spaced through its `seconds`.
+pub fn scheduled_block_offsets(seconds: f64, count: usize) -> Vec<f64> {
+    (0..count)
+        .map(|index| seconds * (index as f64 + 1.0) / (count as f64 + 1.0))
+        .collect()
+}
+
 /// Whether `plan` is the phase that holds the run's scheduled blocks: the
 /// tips plan's warm-up is its only phase, and every other plan lands them in
 /// `steady_state` (#547). The rule is on the phase's kind, so a soak's
@@ -3105,7 +3119,8 @@ pub async fn drive_phase_with_population(
     } else {
         None
     };
-    let restart_at = (plan.reconnects && plan.restart_frontend && args.frontends >= 2)
+    let restart_at = plan
+        .restarts_a_frontend(args.frontends)
         .then(|| duration.as_secs_f64() / 3.0);
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;
@@ -3122,10 +3137,7 @@ pub async fn drive_phase_with_population(
     let dense_run = args.cadence()?.is_dense();
     let block_times: Vec<f64> =
         if holds_scheduled_blocks(args, plan)? && !dense_run && *remaining_blocks > 0 {
-            let count = *remaining_blocks;
-            (0..count)
-                .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
-                .collect()
+            scheduled_block_offsets(duration.as_secs_f64(), *remaining_blocks)
         } else {
             Vec::new()
         };

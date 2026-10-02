@@ -18,7 +18,7 @@
 
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use qbit_prism_load::{cli::Args, gate, preset, run};
+use qbit_prism_load::{cli::Args, compare, gate, preset, run};
 use qbit_prism_test_gate as test_gate;
 use std::path::PathBuf;
 
@@ -114,6 +114,7 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     let (expanded, loaded) = preset::expand_command_line(std::mem::take(&mut argv))?;
     let loaded = loaded.context("the pr-smoke preset")?;
     let args = Args::try_parse_from(expanded)?;
+    let (seed_rows, seed_bytes) = (args.seed_share_count(), args.seed_share_bytes as f64);
     let exit = run::execute_with_preset(args, Some(loaded.clone())).await?;
     let ran = started.elapsed() - built;
 
@@ -133,6 +134,373 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
     assert_eq!(
         key_sets, golden,
         "the fake-node side report's keys moved from what origin/3.x.x wrote"
+    );
+
+    // The A/B comparator (#511) holds every run to what the preset pins, as
+    // a side report states it; a real report must read exactly so, or every
+    // comparison would fail on a rendering difference.
+    for setting in compare::expected_settings(&loaded.args)? {
+        let reported = report.pointer(setting.pointer);
+        assert!(
+            reported.is_some_and(|value| compare::same_json(value, &setting.value)),
+            "{}: reported {reported:?}, expected {}",
+            setting.pointer,
+            setting.value
+        );
+    }
+    // So must the population its seed draws, and each phase's offers the
+    // arrival clock it pins.
+    for (pointer, expected) in compare::expected_population(&loaded.args)? {
+        let reported = report
+            .pointer(pointer)
+            .and_then(|value| value.as_f64())
+            .context(pointer)?;
+        assert!(
+            (reported - expected).abs()
+                <= expected.abs() * compare::POPULATION_TOLERANCE + f64::EPSILON,
+            "{pointer}: reported {reported}, drawn {expected}"
+        );
+    }
+    for planned in compare::expected_arrival(&loaded.args)? {
+        let arrival = &report["phases"]
+            .as_array()
+            .context("phases")?
+            .iter()
+            .find(|phase| phase["name"] == planned.phase.as_str())
+            .with_context(|| format!("{} is not reported", planned.phase))?["arrival"];
+        for (window, expected, key) in [
+            (1, planned.cv_1s, "offered_per_second_cv_1s"),
+            (60, planned.cv_60s, "offered_per_second_cv_60s"),
+        ] {
+            match (arrival[key].as_f64(), expected) {
+                (Some(value), Some(expected)) => assert!(
+                    (value - expected).abs() <= planned.tolerance(window),
+                    "{} {key}: offered {value}, clock {expected}",
+                    planned.phase
+                ),
+                (None, None) => {}
+                (value, expected) => {
+                    panic!("{} {key}: {value:?} against {expected:?}", planned.phase)
+                }
+            }
+        }
+        let trace = arrival["offered_per_second"]
+            .as_array()
+            .context("offered_per_second")?
+            .iter()
+            .map(|count| count.as_u64().context("a count"))
+            .collect::<Result<Vec<u64>>>()?;
+        assert_eq!(
+            planned.trace_departure(&trace),
+            None,
+            "{} ran off its clock: {trace:?} against {:?}",
+            planned.phase,
+            planned.offers
+        );
+        assert_eq!(
+            arrival["offer_placement"]
+                .as_str()
+                .map(|placement| placement.starts_with("weighted")),
+            Some(planned.weighted),
+            "{}",
+            planned.phase
+        );
+    }
+    for (flag, pointer) in compare::PINNED_REPORT_FIELDS {
+        let pinned = &loaded.args[*flag];
+        let reported = report.pointer(pointer);
+        assert!(
+            reported.is_some_and(|value| compare::same_json(value, pinned)),
+            "{pointer}: reported {reported:?}, pinned {flag} {pinned}"
+        );
+    }
+    let reported: Vec<&str> = report["phases"]
+        .as_array()
+        .context("phases")?
+        .iter()
+        .filter_map(|phase| phase["name"].as_str())
+        .collect();
+    for plan in compare::expected_phases(&loaded.args)? {
+        let phase = report["phases"]
+            .as_array()
+            .context("phases")?
+            .iter()
+            .find(|phase| phase["name"] == plan.name.as_str())
+            .with_context(|| format!("{} is not in {reported:?}", plan.name))?;
+        assert_eq!(
+            phase["target_rate_shares_per_second"].as_f64(),
+            Some(plan.rate),
+            "{}",
+            plan.name
+        );
+        let duration = phase["duration_seconds"].as_f64().context("duration")?;
+        let seconds = plan.seconds as f64;
+        assert!(
+            (duration - seconds).abs() <= seconds * compare::DURATION_TOLERANCE,
+            "{} ran {duration} s against a planned {seconds} s",
+            plan.name
+        );
+        assert_eq!(
+            phase["in_artifact"].as_bool(),
+            Some(plan.in_artifact),
+            "{}",
+            plan.name
+        );
+        // The comparator holds the samplers to the pinned intervals.
+        let lock_ms = loaded.args["--lock-sample-interval-ms"]
+            .as_f64()
+            .context("lock interval")?;
+        let process_ms = loaded.args["--process-sample-interval-ms"]
+            .as_f64()
+            .context("process interval")?;
+        assert_eq!(
+            phase["order_lock"]["sample_interval_milliseconds"].as_f64(),
+            Some(lock_ms),
+            "{}",
+            plan.name
+        );
+        for process in phase["processes"].as_array().context("processes")? {
+            let seconds = process["sample_interval_seconds"]
+                .as_f64()
+                .context("interval")?;
+            assert!(
+                (seconds * 1000.0 - process_ms).abs() < 1e-6,
+                "{}",
+                plan.name
+            );
+        }
+        // ... on every launched frontend, one record each.
+        let ids = |list: &serde_json::Value| -> Result<Vec<String>> {
+            let mut ids = list
+                .as_array()
+                .context("a list")?
+                .iter()
+                .map(|entry| {
+                    entry["instance_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("instance_id")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ids.sort_unstable();
+            Ok(ids)
+        };
+        assert_eq!(
+            ids(&phase["processes"])?,
+            ids(&report["frontend_environment"])?,
+            "{}",
+            plan.name
+        );
+        // ... each having sampled, with no reason it could not.
+        let summaries = std::iter::once(&phase["order_lock"])
+            .chain(phase["processes"].as_array().context("processes")?);
+        for summary in summaries {
+            assert!(summary["samples"].as_u64() > Some(0), "{}", plan.name);
+            assert!(summary["unavailable_reason"].is_null(), "{}", plan.name);
+        }
+        // A delayed phase's delay was seen to be paid.
+        if plan.database_delay_ms > 0 {
+            let observed = phase["database_delay_observed_select1_median_milliseconds"]
+                .as_f64()
+                .context("observed delay")?;
+            run::check_delay_observed(plan.database_delay_ms, observed)?;
+        }
+        // The comparator holds the lowest reading to the preset's memory
+        // floor, and treats an unread one as a failure.
+        assert!(
+            phase["min_mem_available_kib"].as_u64().is_some(),
+            "{} read no MemAvailable",
+            plan.name
+        );
+        assert_eq!(
+            phase["mem_available_unread_checks"].as_u64(),
+            Some(0),
+            "{} missed MemAvailable readings",
+            plan.name
+        );
+        assert_eq!(
+            phase["database_delay_milliseconds_configured"].as_u64(),
+            Some(plan.database_delay_ms),
+            "{}",
+            plan.name
+        );
+        let frontends = loaded.args["--frontends"]
+            .as_u64()
+            .context("pinned frontends")?;
+        assert_eq!(
+            phase["frontend_restarts"].as_u64(),
+            Some(plan.frontend_restarts(frontends as usize)),
+            "{}",
+            plan.name
+        );
+    }
+    // The churn plan the comparator expects is the one the run carried out.
+    let churn = &report["churn"];
+    assert_eq!(
+        churn["realised"]["rentals_spawned"], churn["plan"]["rental_sessions"],
+        "{churn}"
+    );
+    assert_eq!(
+        churn["realised"]["storms"].as_array().map(Vec::len),
+        churn["plan"]["storms"].as_array().map(Vec::len),
+        "{churn}"
+    );
+    assert_eq!(
+        churn["realised"]["rentals_departed"], churn["plan"]["rentals_departing_in_phase"],
+        "{churn}"
+    );
+    let dropped: u64 = churn["realised"]["storms"]
+        .as_array()
+        .context("storms")?
+        .iter()
+        .filter_map(|s| s["dropped"].as_u64())
+        .sum();
+    let departed = churn["realised"]["rentals_departed"]
+        .as_u64()
+        .context("departed")?;
+    let reconnected = churn["realised"]["reconnects_completed"]
+        .as_u64()
+        .context("reconnects")?;
+    assert!(reconnected + departed >= dropped, "{churn}");
+    // Exactly: every churn close is a storm drop owed a reconnect or a
+    // departure owed none.
+    let closes = churn["realised"]["abrupt_closes"]
+        .as_u64()
+        .context("abrupt closes")?;
+    assert!(reconnected + departed >= closes, "{churn}");
+    assert_eq!(
+        report["database"]["replication"]["agreed_with_declared"], true,
+        "the replication premise"
+    );
+    let replication = &report["database"]["replication"];
+    for observed in ["observed", "observed_after_load"] {
+        assert_eq!(replication[observed], replication["declared"], "{observed}");
+    }
+    assert_eq!(report["database"]["mode"], "managed");
+    for storm in churn["realised"]["storms"].as_array().context("storms")? {
+        let connected = storm["connected"].as_f64().context("connected")?;
+        let fraction = storm["fraction"].as_f64().context("fraction")?;
+        assert_eq!(
+            storm["dropped"].as_f64(),
+            Some((fraction * connected).round().min(connected)),
+            "{storm}"
+        );
+        assert!(storm["dropped"].as_u64() > Some(0), "{storm}");
+    }
+    assert_eq!(
+        churn["tip_delivery"]["tips"].as_array().map(Vec::len),
+        churn["plan"]["tips_at_seconds"].as_array().map(Vec::len),
+        "{churn}"
+    );
+    for (flag, pointer) in compare::PINNED_REPORT_COUNTS {
+        let pinned = loaded.args[*flag].as_u64().context("a pinned count")?;
+        let listed = report
+            .pointer(pointer)
+            .and_then(|v| v.as_array())
+            .map(Vec::len);
+        assert_eq!(listed, Some(pinned as usize), "{pointer} for {flag}");
+    }
+    for frontend in report["frontend_environment"]
+        .as_array()
+        .context("frontend environment")?
+    {
+        for (flag, key) in compare::PINNED_FRONTEND_ENV {
+            let pinned = loaded.args[*flag]
+                .as_f64()
+                .context("numeric server setting")?;
+            let launched: f64 = frontend["environment"][key]
+                .as_str()
+                .context("launched setting")?
+                .parse()?;
+            assert_eq!(launched, pinned, "{key} for {flag}");
+        }
+        // The pool fee every frontend ran is the pinned one.
+        assert_eq!(frontend["environment"]["PRISM_POOL_FEE_ENABLED"], "1");
+        assert_eq!(
+            frontend["environment"]["PRISM_POOL_FEE_BPS"],
+            loaded.args["--pool-fee-bps"].to_string().as_str()
+        );
+    }
+    // The seeded ledger holds the preset's rows, retarget history included,
+    // padded to the pinned share size.
+    let seed = &report["window"]["seed"];
+    assert_eq!(seed["rows"].as_u64(), Some(seed_rows), "{seed}");
+    let average = seed["serialized_bytes"]
+        .as_f64()
+        .context("serialized bytes")?
+        / seed_rows as f64;
+    assert!(
+        (average - seed_bytes).abs() <= seed_bytes * compare::SEED_SHARE_BYTES_TOLERANCE,
+        "{seed}"
+    );
+    // Each launched frontend under the name the harness gives it, once.
+    let mut names: Vec<&str> = report["frontend_environment"]
+        .as_array()
+        .context("frontend environment")?
+        .iter()
+        .filter_map(|frontend| frontend["instance_id"].as_str())
+        .collect();
+    names.sort_unstable();
+    let frontends = loaded.args["--frontends"].as_u64().context("frontends")? as usize;
+    assert_eq!(
+        names,
+        (0..frontends)
+            .map(run::frontend_instance_id)
+            .collect::<Vec<_>>()
+    );
+    // Durable, and every tip followed by the bits the pinned template and
+    // retarget settings call for.
+    for key in ["fsync", "full_page_writes", "synchronous_commit"] {
+        assert_eq!(report["database"]["durability"][key], "on", "{key}");
+    }
+    let base = loaded.args["--template-bits"]
+        .as_str()
+        .context("template bits")?
+        .to_owned();
+    let retarget = loaded.args["--retarget-bits"] == true;
+    // ... every tip the run drove among them.
+    let changed: Vec<&str> = report["node"]["tip_changes"]
+        .as_array()
+        .context("tip changes")?
+        .iter()
+        .filter_map(|change| change["hash"].as_str())
+        .collect();
+    for pointer in ["/time_to_usable_work/tips", "/churn/tip_delivery/tips"] {
+        for tip in report
+            .pointer(pointer)
+            .and_then(|tips| tips.as_array())
+            .context("driven tips")?
+        {
+            let hash = tip["tip"].as_str().context("tip hash")?;
+            assert!(changed.contains(&hash), "{pointer}: {hash}");
+        }
+    }
+    for change in report["node"]["tip_changes"]
+        .as_array()
+        .context("tip changes")?
+    {
+        let height = change["height"].as_u64().context("height")?;
+        let wanted = if retarget {
+            qbit_prism_load::node::retarget_bits(&base, height + 1)?
+        } else {
+            base.clone()
+        };
+        assert_eq!(
+            change["next_template_bits"].as_str(),
+            Some(wanted.as_str()),
+            "{change}"
+        );
+    }
+    // Every pinned session connected at least once.
+    assert!(
+        report["client"]["connects"].as_u64()
+            >= Some(
+                loaded.args["--sessions"]
+                    .as_u64()
+                    .context("pinned sessions")?
+            ),
+        "{}",
+        report["client"]
     );
 
     // The run is the preset's, and the skew it asked for is the skew it drove.
