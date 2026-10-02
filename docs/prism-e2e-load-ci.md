@@ -361,6 +361,16 @@ builds the images with `docker compose build` and brings up `compose.yaml` +
 
 **Does not prove:** anything about capacity. The load is a few miners.
 
+**Reading a failure:** an error outside the checks leaves the checks after it
+`not reached`. The job summary and `l6-report.json` (`failed_phase`) name the
+phase it stopped in: `node`, `stack`, `resume`, `load`, `quiesce`, `ledger` or
+`blocks`. A qbitd RPC that times out names its method. In the `node` phase,
+qbitd's `createwallet` takes about 25-30 s on the runner, which is mostly the
+create-time P2MR keys. If the call outlasts its 30 s client timeout, the lane
+waits for `listwallets` to show the wallet instead of failing (#637).
+`createwallet` plus that wait is bounded at 300 s. The report's `wallet`
+records which way the wallet arrived and how long it took.
+
 ## Dispatching a run
 
 Dispatch runs the default branch's copy of the workflow. `ref` picks the
