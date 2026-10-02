@@ -487,17 +487,56 @@ fn strength(mode: &str) -> u8 {
 // Operator commands.
 // ---------------------------------------------------------------------------
 
-/// Ports for one frontend's listeners.
-struct Ports {
-    stratum: u16,
-    highdiff: u16,
-    api: u16,
+/// Ports for one frontend's listeners, each held by a bound listener from
+/// its pick until just before the frontend spawns (#639). A dropped
+/// ephemeral bind can be picked again for another of the three, or handed
+/// to another socket while `check-config`, `migrate` and `import-audits` run;
+/// the frontend then fails to bind it.
+pub(crate) struct Ports {
+    pub(crate) stratum: u16,
+    pub(crate) highdiff: u16,
+    pub(crate) api: u16,
+    held: Vec<std::net::TcpListener>,
 }
 
-fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port())
+impl Ports {
+    pub(crate) fn reserve() -> Result<Self> {
+        let mut held = Vec::with_capacity(3);
+        let mut port = || -> Result<u16> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            held.push(listener);
+            Ok(port)
+        };
+        let (stratum, highdiff, api) = (port()?, port()?, port()?);
+        Ok(Self {
+            stratum,
+            highdiff,
+            api,
+            held,
+        })
+    }
+
+    /// Closes the reservations so the frontend can bind them; called
+    /// immediately before it spawns.
+    pub(crate) fn release(&mut self) {
+        self.held.clear();
+    }
+
+    pub(crate) fn held(&self) -> usize {
+        self.held.len()
+    }
+}
+
+/// Names each port, so a bind failure shows which listener collided.
+impl std::fmt::Display for Ports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Stratum 127.0.0.1:{}, high-diff 127.0.0.1:{}, audit 127.0.0.1:{}",
+            self.stratum, self.highdiff, self.api
+        )
+    }
 }
 
 /// The environment of the rehearsal's frontend and of every operator
@@ -940,11 +979,7 @@ pub async fn rehearse(
             Default::default()
         }
     };
-    let ports = Ports {
-        stratum: free_port()?,
-        highdiff: free_port()?,
-        api: free_port()?,
-    };
+    let mut ports = Ports::reserve()?;
     let mut env = command_env(&target.tool_url()?, &options.node, &node, &ports);
     env.extend(options.extra_env.iter().cloned());
     // The import verifies history against the trusted key. A lab run's test
@@ -1063,7 +1098,7 @@ pub async fn rehearse(
         // mature blocks the source left immature: their pending balance then
         // moves, legitimately.
         let exact_pending = !matches!(options.node, NodeChoice::Operator { .. });
-        frontend(report, &env, &ports, &before.balances, exact_pending).await?;
+        frontend(report, &env, &mut ports, &before.balances, exact_pending).await?;
         // What the frontend's startup and reconciliation left of history.
         let after_run = table_facts(&target.pool).await?;
         let unchanged = |facts: &BTreeMap<String, String>| {
@@ -1127,18 +1162,20 @@ impl Drop for Frontend {
 async fn frontend(
     report: &mut Report,
     env: &[(String, String)],
-    ports: &Ports,
+    ports: &mut Ports,
     before: &Balances,
     exact_pending: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let log = tempfile::NamedTempFile::new()?;
-    let child = server_command(env)
+    let mut command = server_command(env);
+    command
         .arg("run")
         .stdin(Stdio::null())
         .stdout(log.reopen()?)
-        .stderr(log.reopen()?)
-        .spawn()?;
+        .stderr(log.reopen()?);
+    ports.release();
+    let child = command.spawn()?;
     let mut frontend = Frontend(child);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1153,7 +1190,7 @@ async fn frontend(
         }
         if let Some(status) = frontend.0.try_wait()? {
             bail!(
-                "the frontend exited with {status} before readiness: {}",
+                "the frontend ({ports}) exited with {status} before readiness: {}",
                 tail(log.path())
             );
         }
@@ -1169,7 +1206,7 @@ async fn frontend(
         if ready {
             "healthz 200".to_owned()
         } else {
-            tail(log.path())
+            format!("{ports}: {}", tail(log.path()))
         },
     );
     if !ready {
@@ -1365,12 +1402,14 @@ impl PrivateCluster {
         let password = uuid::Uuid::new_v4().simple().to_string();
         let password_file = data.path().join("password");
         std::fs::write(&password_file, &password)?;
+        // Held until `pg_ctl start`, so initdb's run cannot lose it (#639).
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
         let mut cluster = Self {
             pg_bin,
             data,
             password,
             running: false,
-            port: free_port()?,
+            port: reservation.local_addr()?.port(),
         };
         let status = std::process::Command::new(cluster.pg_bin.join("initdb"))
             .args([
@@ -1390,6 +1429,7 @@ impl PrivateCluster {
         ensure!(status.success(), "initdb failed");
         // Marked first, so a start that fails half way is still stopped.
         cluster.running = true;
+        drop(reservation);
         let status = std::process::Command::new(cluster.pg_bin.join("pg_ctl"))
             .arg("-D")
             .arg(cluster.data.path().join("data"))
@@ -1405,7 +1445,8 @@ impl PrivateCluster {
             .status()?;
         ensure!(
             status.success(),
-            "pg_ctl start failed: {}",
+            "pg_ctl start on 127.0.0.1:{} failed: {}",
+            cluster.port,
             std::fs::read_to_string(cluster.data.path().join("postgres.log")).unwrap_or_default()
         );
         Ok(cluster)

@@ -378,3 +378,39 @@ async fn generate_mainnet_shaped_dump() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
+
+/// #639: the frontend's three ports stay bound by the rehearsal from their
+/// pick until the frontend spawns, so none can be picked twice or taken by
+/// another socket while the operator commands run. The competing bind stands
+/// in for whatever took the audit port on CI; with the listeners dropped at
+/// the pick, it succeeds.
+#[test]
+fn frontend_ports_stay_held_until_the_frontend_spawns() -> Result<()> {
+    let mut ports = rehearsal::Ports::reserve()?;
+    let picked = [ports.stratum, ports.highdiff, ports.api];
+    ensure!(
+        picked
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == 3,
+        "a port was picked twice: {ports}"
+    );
+    ensure!(
+        ports.held() == 3,
+        "{} of 3 ports held: {ports}",
+        ports.held()
+    );
+    for port in picked {
+        ensure!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "another socket bound 127.0.0.1:{port} before the frontend spawned ({ports})"
+        );
+    }
+    // A released port goes back to the host, where a concurrent test or
+    // process can bind it at once; so the release is checked on the
+    // reservation, not by binding the port again.
+    ports.release();
+    ensure!(ports.held() == 0, "a port is still held after release");
+    Ok(())
+}
