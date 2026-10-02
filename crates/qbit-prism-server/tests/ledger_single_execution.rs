@@ -1681,8 +1681,11 @@ async fn restored_authority_body(db: &Database) -> Result<()> {
         Some("confirmed")
     );
 
-    // The expired lease stays invalid for every operation, and the prepared
-    // block does not move.
+    // The lease is past its database expiry, yet that alone ends nothing
+    // (#581): the claim ends when another frontend has watched it go
+    // unrenewed for its whole lease and taken the row. Only that newly
+    // acquired claim finishes it, and the old one is invalid for every
+    // operation from then on, without moving the prepared block.
     let before = outbox(&fixture, &hash).await?;
     assert_eq!(before.state, "pending");
     assert_eq!(
@@ -1690,6 +1693,10 @@ async fn restored_authority_body(db: &Database) -> Result<()> {
         Some(claim.claim_token.as_str())
     );
     assert!(!before.claim_live);
+    let fresh = wait_for(Duration::from_secs(10), || b.claim_candidate(120)).await?;
+    assert_eq!(fresh.candidate.block_hash, hash);
+    assert_ne!(fresh.claim_token, claim.claim_token);
+    assert_eq!(outbox(&fixture, &hash).await?.attempt_count, 2);
     let row = outbox_row(&fixture, &hash).await?;
     assert!(a.renew_candidate_claim(&claim, 60).await.is_err());
     assert!(a.land_candidate(&claim, &key).await.is_err());
@@ -1702,24 +1709,13 @@ async fn restored_authority_body(db: &Database) -> Result<()> {
     assert_eq!(
         outbox_row(&fixture, &hash).await?,
         row,
-        "an expired lease changed the row"
+        "a taken-over lease changed the row"
     );
     assert_eq!(
         chain_state(&fixture, &hash).await?.as_deref(),
         Some("prepared")
     );
     assert_eq!(stored_revision(&fixture).await?, revision);
-
-    // Only a newly acquired claim finishes it, and the old one stays dead
-    // even then.
-    let fresh = wait_for(Duration::from_secs(10), || b.claim_candidate(120)).await?;
-    assert_eq!(fresh.candidate.block_hash, hash);
-    assert_ne!(fresh.claim_token, claim.claim_token);
-    assert_eq!(outbox(&fixture, &hash).await?.attempt_count, 2);
-    assert!(a
-        .finish_candidate_at_revision(&claim, true, None, revision)
-        .await
-        .is_err());
     b.finish_candidate_at_revision(&fresh, true, None, revision)
         .await?;
     assert_eq!(outbox(&fixture, &hash).await?.state, "submitted");

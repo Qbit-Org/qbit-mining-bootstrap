@@ -1498,3 +1498,29 @@ async fn lease_failed_observation_is_an_error_and_absolute_expiry_remains_a_miss
         .unwrap()
         .is_none());
 }
+
+/// #581: a submit on a replacement lease whose payout state the database
+/// cannot read (a held SETTLEMENT_LOCK, a full pool, PostgreSQL down) is
+/// refused as the database's failure, not the node's, and nothing is
+/// recorded.
+#[tokio::test]
+async fn a_lease_proof_the_database_cannot_read_is_refused_as_the_databases() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f).await;
+    persist(&f, &job).await.unwrap();
+    f.detect(2).await;
+    f.store.revision.store(7, Ordering::SeqCst);
+    f.store
+        .compact
+        .states
+        .lock()
+        .unwrap()
+        .push_back(Err(WindowError::Database(sqlx::Error::PoolTimedOut)));
+    assert_error(
+        f.submit(&job, false).await.unwrap_err(),
+        "backend-database-unavailable",
+        "current payout state is unavailable",
+    );
+    assert!(f.store.records.lock().unwrap().is_empty());
+}

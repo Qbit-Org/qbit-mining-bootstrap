@@ -55,7 +55,7 @@
       "replaces": [
         "qbit_prism_accepted_shares_total"
       ],
-      "status": "Process-local counter; legacy canonical ledger count was persistent."
+      "status": "Process-local counter; legacy canonical ledger count was persistent. Read from the Stratum listeners at scrape time and overlaid on cached metric bodies (#581), so the share-refusal rules see acceptances stop while the health publisher, and with it the cached body, waits on an unavailable database."
     },
     "share_ack_seconds": {
       "replaces": [
@@ -85,7 +85,7 @@
       "labels": {
         "reason_id": "RejectReason"
       },
-      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response."
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, backend-database-unavailable the ledger database (#581): a refusal on a path that reads both names whichever failed. Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
     },
     "stale_shares_total": {
       "replaces": [

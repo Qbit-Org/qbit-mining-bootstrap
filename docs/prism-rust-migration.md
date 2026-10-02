@@ -564,6 +564,15 @@ Migration 020 adds the payout-divergence evidence of #478 block capture
 its report function (`qbit_prism_payout_divergence_report()`). It is additive
 and declares no capability. See
 [block capture and payout divergence](prism-ledger-ops.md#block-capture-and-payout-divergence-478).
+Migration 021 adds `claim_renewals` and `claim_lease_seconds` to the
+candidate outbox, a partial index over its claimed rows, and declares
+`candidate_claim_observed_lease = 1`: a claim is taken over only once the
+taker has watched it go unrenewed for its lease on its own monotonic clock,
+so a database clock step no longer ends or stretches a lease (#581). A
+pre-021 binary takes claims over by the database clock, so 021 is applied
+offline exactly as 018 is, and the capability refuses older binaries at
+later connects. See
+[candidate claim leases and database clock steps](prism-ledger-ops.md#candidate-claim-leases-and-database-clock-steps-021-581).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -1481,7 +1490,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `020`), 013's concurrent index builds, and 017's
+(`001` and native `002` to `021`), 013's concurrent index builds, and 017's
 prepare, validate and swap. The transaction holds the cutover locks, ACCESS
 EXCLUSIVE on `qbit_share_ledger` among them, for its whole length; the report
 also lists the statements `migrate` spent the most sampled time in.

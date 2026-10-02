@@ -368,7 +368,7 @@ id = "b575-5-postgres-disk-full"
 title = "#575 item 5: PostgreSQL's data volume fills under mining and is freed"
 owner = "#575"
 lanes = ["nightly"]
-criteria = "Every acknowledged share is durable; the full state is refused explicitly and a paging rule's condition holds for its `for` on every server; once space is freed the same server processes accept shares and land a block with clean carry integrity."
+criteria = "Every acknowledged share is durable; the full state is refused explicitly, and PrismDatabaseUnavailable and at least one more rule hold for their `for` on every server (#581); once space is freed the same server processes accept shares and land a block with clean carry integrity."
 runs = true
 tests = ["qbit-prism-server::live_regtest::disk_exhaustion_tests::postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_freed"]
 
@@ -377,7 +377,7 @@ id = "b575-5-wall-clock-jumps"
 title = "#575 item 5: server and database wall clocks jump minutes and hours, including mid-landing"
 owner = "#575"
 lanes = ["nightly"]
-criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; the one outbox row #581 tracks is the only unfinished one."
+criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; every outbox row finishes, and neither block held across a database clock step is taken over (#581)."
 runs = true
 tests = ["qbit-prism-server::live_regtest::clock_jump_tests::wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_once"]
 

@@ -82,6 +82,7 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
         // gate. Neither that reason nor its generic gate-closed message
         // proves stale work: deadline, lock and readiness failures stay here.
         "backend-rpc-unavailable"
+        | "backend-database-unavailable"
         | "ledger-confirmation-failed"
         | "ledger-outcome-unknown"
         | "internal-error" => RejectionClass::Backend,
@@ -186,7 +187,7 @@ pub enum LandingCost {
     /// session's job list, which the rebuild's `clean_jobs` notify retires.
     UnknownJob,
     /// Recognised, and not the landing's: a backend refusal
-    /// (`backend-rpc-unavailable`, `ledger-confirmation-failed`,
+    /// (`backend-rpc-unavailable`, `backend-database-unavailable`, `ledger-confirmation-failed`,
     /// `ledger-outcome-unknown`, `internal-error`), a fee-floor `stale-job`,
     /// `pool-closed`, the reason-less unknown-job budget refusal
     /// ([`UNKNOWN_JOB_BUDGET`]), or a harness-bug class. Reported beside the landing's

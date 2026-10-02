@@ -509,8 +509,12 @@ impl Fixture {
     }
 
     async fn expire(&self, block_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-            .bind(block_hash).execute(&self.coordinator.ledger.pool).await?;
+        crate::ledger::revoke_candidate_claims(
+            &self.coordinator.ledger.pool,
+            Some(block_hash),
+            true,
+        )
+        .await?;
         Ok(())
     }
 

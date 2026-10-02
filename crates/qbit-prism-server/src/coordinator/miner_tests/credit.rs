@@ -211,9 +211,11 @@ async fn unhealthy_node_and_failed_revision_are_backend_unavailable_not_stale() 
     fixture.observe(1, true).await;
     fixture.observe(2, true).await;
     fixture.store.fail_revision.store(true, Ordering::SeqCst);
+    // #581: the payout revision is a database read, so its failure names
+    // the database, never the node.
     assert_error(
         fixture.submit(&job, true).await.unwrap_err(),
-        "backend-rpc-unavailable",
+        "backend-database-unavailable",
         "current payout state is unavailable",
     );
     fixture.coordinator.invalidate_readiness().await;
@@ -223,4 +225,46 @@ async fn unhealthy_node_and_failed_revision_are_backend_unavailable_not_stale() 
         "current chain state is unavailable",
     );
     assert!(fixture.store.records.lock().unwrap().is_empty());
+}
+
+/// #581: readiness is renewed only by a refresh, and a refresh reads the
+/// database, so during a database outage or a stall past the health timeout
+/// readiness ages out. The stale-readiness refusal then names the database
+/// the latest refresh failed on, and the node once a refresh fails on the
+/// node instead.
+#[tokio::test]
+async fn stale_readiness_names_the_dependency_the_latest_refresh_failed_on() {
+    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    let job = fixture.job(1, 0, "original.worker");
+    fixture.observe(1, true).await;
+    fixture.store.fail_revision.store(true, Ordering::SeqCst);
+    assert!(fixture.coordinator.refresh_once().await.is_err());
+    age_readiness_past_the_health_timeout(&fixture).await;
+    assert_error(
+        fixture.submit(&job, true).await.unwrap_err(),
+        "backend-database-unavailable",
+        "current chain state is unavailable",
+    );
+
+    // The database recovers and the node fails the next refresh instead.
+    fixture.store.fail_revision.store(false, Ordering::SeqCst);
+    fixture.node.lock().unwrap().fail = Some("getblocktemplate".into());
+    assert!(fixture.coordinator.refresh_once().await.is_err());
+    age_readiness_past_the_health_timeout(&fixture).await;
+    assert_error(
+        fixture.submit(&job, true).await.unwrap_err(),
+        "backend-rpc-unavailable",
+        "current chain state is unavailable",
+    );
+    assert!(fixture.store.records.lock().unwrap().is_empty());
+}
+
+/// The readiness proof as old as the health timeout and a second more: the
+/// age failing refreshes leave it at.
+async fn age_readiness_past_the_health_timeout(fixture: &Fixture) {
+    let health_timeout = fixture.coordinator.config.health_timeout;
+    let mut readiness = fixture.coordinator.readiness.write().await;
+    if let Some(last_poll) = readiness.last_poll.as_mut() {
+        *last_poll -= health_timeout + Duration::from_secs(1);
+    }
 }

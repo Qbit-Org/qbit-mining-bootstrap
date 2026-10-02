@@ -27,7 +27,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// after its last change, so a start refuses the database until that has
 /// completed.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -67,6 +67,11 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // 018: every accepted chain update advances a durable epoch. Older
     // writers must be stopped before migration, not just refused at restart.
     ("chain_observation_epoch", 1),
+    // 021: a claim is taken over only after its taker has timed its lease on
+    // its own monotonic clock (#581). An older binary takes over by the
+    // database clock, so it must be stopped before migration and refused at
+    // every connect after it.
+    ("candidate_claim_observed_lease", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -603,7 +608,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}, then start or migrate again");
+        let lease_remedy = if versions.contains(&21) {
+            " and restore candidate_claim_observed_lease = 1 from migrations/021_candidate_claim_observed_lease.sql after verifying its claim_renewals and claim_lease_seconds columns are present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}{lease_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -636,6 +646,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
             "database is at schema migration 18 but does not declare chain_observation_epoch = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup including its durable chain_epoch and migration 018 capability; never reset the epoch or resume an older writer; nothing was changed"
         );
     }
+    if versions.contains(&21) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "candidate_claim_observed_lease" && *value == 1),
+            "database is at schema migration 21 but does not declare candidate_claim_observed_lease = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 021's claim columns and capability; never resume a pre-021 frontend beside a post-021 one; nothing was changed"
+        );
+    }
     Ok(())
 }
 
@@ -656,6 +672,7 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
         && !versions.contains(&12)
         && !versions.contains(&15)
         && !versions.contains(&18)
+        && !versions.contains(&21)
     {
         return Ok(());
     }
@@ -2143,6 +2160,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         20,
         include_str!("../../migrations/020_payout_divergences.sql"),
     ),
+    (
+        21,
+        include_str!("../../migrations/021_candidate_claim_observed_lease.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3137,6 +3158,19 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(20)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&21) {
+        // #581: a pre-021 frontend takes claims over by the database clock
+        // and never writes the claim columns a post-021 taker times, so the
+        // two must never run together. The capability refuses future
+        // connects; every earlier instance must already be stopped.
+        refuse_unquiesced_instances(tx, 21).await?;
+        sqlx::raw_sql(native_migration(21))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(21)")
             .execute(&mut **tx)
             .await?;
     }

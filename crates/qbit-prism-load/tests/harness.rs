@@ -3065,6 +3065,14 @@ fn the_rejection_classifier_separates_harness_bugs_from_expected_races() {
         (
             rejection(
                 20,
+                Some("backend-database-unavailable"),
+                "current payout state is unavailable",
+            ),
+            RejectionClass::Backend,
+        ),
+        (
+            rejection(
+                20,
                 Some("ledger-confirmation-failed"),
                 "share was not confirmed by the database",
             ),

@@ -30,12 +30,14 @@ mod candidates;
 #[cfg(test)]
 pub(crate) use candidates::faults as candidate_faults;
 use candidates::prepare_candidate_observed;
+pub use candidates::revoke_candidate_claims;
 pub use candidates::{
     adoption_evidence, authenticate_landed_audit, build_claim_parts,
     coinbase_witness_reserved_value, header_bits_hex, Candidate, CandidateClaim, CandidateCtv,
     CandidateState, ClaimLifecycle, ClaimParts, LandedAudit, OfferOutcome, OfferRecord,
-    RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys, ADOPTED_OFFER_REPLY_PREFIX,
-    LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX, ORPHANED_STATE, SIDE_CHAIN_REPLIES,
+    RecoveryClaim, RecoveryReader, RecoveryRow, RecoveryTakeover, SignerKeys,
+    ADOPTED_OFFER_REPLY_PREFIX, LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX,
+    ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
 mod connect;
 pub(crate) use connect::shielded_begin;
@@ -112,6 +114,10 @@ pub struct Ledger {
     /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
     /// SHARE` in its own transaction and compares it against this.
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The candidate claims this frontend has watched, each timed on its own
+    /// monotonic clock (#581). Shared across clones: one process, one clock
+    /// per claim.
+    claim_observer: std::sync::Arc<candidates::ClaimObserver>,
     #[cfg(test)]
     pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
     #[cfg(test)]

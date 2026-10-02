@@ -89,11 +89,12 @@ const DRAIN_BOUND: Duration = Duration::from_secs(30);
 /// (`qbit_prism_load::classify`'s expected and backend classes). Any other,
 /// such as `duplicate-share`, `low-difficulty`, `unauthorized-worker` or an
 /// `invalid-*`, fails the load, as does one nobody classified yet.
-const EXPECTED_REASONS: [&str; 6] = [
+const EXPECTED_REASONS: [&str; 7] = [
     "stale-job",
     "unknown-job",
     "pool-closed",
     "backend-rpc-unavailable",
+    "backend-database-unavailable",
     "ledger-confirmation-failed",
     "internal-error",
 ];
@@ -1673,7 +1674,12 @@ mod tests {
 
     #[test]
     fn only_refusals_a_correct_miner_can_earn_are_expected() {
-        for reason in ["stale-job", "unknown-job", "backend-rpc-unavailable"] {
+        for reason in [
+            "stale-job",
+            "unknown-job",
+            "backend-rpc-unavailable",
+            "backend-database-unavailable",
+        ] {
             assert!(expected_refusal(reason), "{reason}");
         }
         for reason in [

@@ -637,6 +637,8 @@ async fn resumed_compact_work_authenticates_retained_share_rows() -> Result<()> 
                 Err(error) => error,
                 Ok(_) => anyhow::bail!("resume trusted cached data after retained row corruption"),
             };
+            // #581: corrupt stored data is not the database being
+            // unavailable, so the refusal keeps the older backend label.
             ensure!(
                 error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
                 "retained share corruption lost backend error"
@@ -845,8 +847,9 @@ async fn unknown_issued_commit_is_observed_and_reconciled_without_reissuing() ->
                 "unknown commit was not observed on the PostgreSQL wire"
             );
             if let Err(error) = result {
+                // #581: a lost COMMIT reply is the database's failure.
                 ensure!(
-                    error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
+                    error.reason_id.as_deref() == Some("backend-database-unavailable"),
                     "commit transport error was misclassified"
                 );
             }
@@ -1030,6 +1033,46 @@ async fn superseding_publication_during_completed_commit_wait_refuses_old_delive
                 "new current-tip work did not resume after the refusal"
             );
             Ok(())
+        })
+    })
+    .await
+}
+
+/// #581, from #554's fault phase: a database stall that is not an outage, an
+/// outside transaction holding the cluster row past the lock timeout, refuses
+/// a resume as the database's failure, `backend-database-unavailable`, never
+/// as the node's `backend-rpc-unavailable`. The lock is held from a second
+/// connection; nothing is loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_stall_refuses_a_resume_as_the_databases() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = worker("alice");
+            let original = f.issue(&worker, Duration::from_secs(60)).await?;
+            let mut blocker = f.pool().begin().await?;
+            sqlx::raw_sql("LOCK TABLE qbit_prism_cluster IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker)
+                .await?;
+            let refused = timeout(
+                Duration::from_secs(30),
+                f.b.resume_job(&worker, &original.wire.job_id),
+            )
+            .await;
+            blocker.rollback().await?;
+            let error = match refused.context("the stalled resume was never answered")? {
+                Err(error) => error,
+                Ok(_) => anyhow::bail!("a stalled database resumed work or reported a miss"),
+            };
+            ensure!(
+                error.reason_id.as_deref() == Some("backend-database-unavailable"),
+                "a database stall was attributed elsewhere: {error:?}"
+            );
+            let resumed =
+                f.b.resume_job(&worker, &original.wire.job_id)
+                    .await?
+                    .context("the work did not resume once the stall cleared")?;
+            same_job(&original, &resumed)
         })
     })
     .await

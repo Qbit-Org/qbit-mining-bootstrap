@@ -394,6 +394,15 @@ struct ReadinessState {
     /// cluster on a heavier chain clears it, because this node's tip, even
     /// when it is still the published one, is then no longer current.
     poll_renews: bool,
+    /// Whether the latest template refresh failed on the ledger database
+    /// (#581). A guarded tip poll (#622) renews readiness only while the
+    /// published work is current, and only a refresh, which reads the
+    /// database, makes new work current. So readiness that has aged out
+    /// while this holds aged out because refreshes kept failing on the
+    /// database, not on the node, and a submit refused for it says so. A
+    /// node that fails stops the polls too, but the next refresh then fails
+    /// on the node and clears this, as does any refresh that succeeds.
+    refresh_failed_on_database: bool,
 }
 
 impl ReadinessState {
@@ -616,6 +625,33 @@ fn protocol_error(reason: &'static str, message: &str) -> StratumError {
         _ => 20,
     };
     StratumError::new(code, message, reason)
+}
+
+/// The reason id of a refusal whose cause lies with the ledger database, not
+/// the node (#581): a lock, a full connection pool, a stalled or failed
+/// statement, PostgreSQL down. Kept apart from `backend-rpc-unavailable` so
+/// the reason-labelled rejection counters and alerts name the right
+/// dependency.
+const DATABASE_UNAVAILABLE: &str = "backend-database-unavailable";
+
+/// Refuse a submission or session whose backend dependency failed, naming
+/// that dependency: `backend-database-unavailable` when a ledger statement
+/// failed (a SQLx error anywhere in the chain, which every statement's
+/// failure carries, `WindowError::Database` and a halted or read-only
+/// cluster's empty row included), otherwise `backend-rpc-unavailable`.
+/// Corrupt or changed stored data and a failed blocking task are not the
+/// database being unavailable and keep the older label. The error itself is
+/// passed on unchanged, so its logs and downcasts read as before.
+fn backend_refusal(error: &anyhow::Error, message: &str) -> StratumError {
+    let database = error.chain().any(|cause| cause.is::<sqlx::Error>());
+    protocol_error(
+        if database {
+            DATABASE_UNAVAILABLE
+        } else {
+            "backend-rpc-unavailable"
+        },
+        message,
+    )
 }
 
 fn template_parent_height(candidate_height: u64) -> Result<u64> {
@@ -1241,6 +1277,11 @@ impl Coordinator {
     pub async fn refresh_once(&self) -> Result<()> {
         let observation = self.metrics.revision_work_refresh();
         let result = self.refresh_once_inner().await;
+        let on_database = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
+        self.readiness.write().await.refresh_failed_on_database = on_database;
         if result.is_ok() {
             observation.succeeded();
             *self
@@ -1984,8 +2025,11 @@ impl Coordinator {
         let initially_renewed = tokio::time::Instant::now();
         self.renew_candidate(claim, lease).await?;
         track(initially_renewed + Duration::from_secs(lease.seconds as u64));
+        // #581: whether the token still holds the row. Its remaining lease
+        // is this heartbeat's own `valid_until`, never the database clock's
+        // `claim_expires_at`, which a clock step moves.
         let live_token_query = format!(
-            "SELECT CASE WHEN state IN {} AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            "SELECT state IN {} AND claim_token IS NOT DISTINCT FROM $2 FROM qbit_block_candidate_outbox WHERE block_hash=$1",
             CandidateState::UNFINISHED_SQL
         );
         let heartbeat = async {
@@ -2025,29 +2069,30 @@ impl Coordinator {
                             return Err(error);
                         }
                         // A brief terminal UPDATE can conflict with renewal.
-                        // Continue only after a read proves the exact token is
-                        // still live, and never run beyond that database expiry.
+                        // Continue only after a read proves the exact token
+                        // still holds the row, and never beyond the lease the
+                        // last successful renewal started: nothing renewed
+                        // it since, and every observer times it from there.
                         let observed = tokio::time::Instant::now();
                         let budget = lease
                             .timeout
                             .min(valid_until.saturating_duration_since(observed));
-                        let remaining = tokio::time::timeout(budget, async {
-                            sqlx::query_scalar::<_, Option<i64>>(&live_token_query)
+                        let held = tokio::time::timeout(budget, async {
+                            sqlx::query_scalar::<_, bool>(&live_token_query)
                                 .bind(&claim.candidate.block_hash)
                                 .bind(&claim.claim_token)
                                 .fetch_optional(&mut *self.ledger.acquire().await?)
                                 .await
                         })
                         .await;
-                        let Ok(Ok(Some(Some(remaining)))) = remaining else {
+                        let Ok(Ok(Some(true))) = held else {
                             return Err(error);
                         };
-                        if remaining <= 0 {
+                        let remaining =
+                            valid_until.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
                             return Err(error);
                         }
-                        let remaining = Duration::from_millis(remaining as u64);
-                        valid_until = observed + remaining;
-                        track(valid_until);
                         delay = lease
                             .interval
                             .min((remaining / 2).max(Duration::from_millis(1)));
@@ -2089,12 +2134,17 @@ impl Coordinator {
         &self,
         block_hash: &str,
         deadline: tokio::time::Instant,
+        takeover: crate::ledger::RecoveryTakeover,
     ) -> Result<RecoveryClaim> {
         let token = uuid::Uuid::new_v4().to_string();
         let result = match tokio::time::timeout_at(
             deadline,
-            self.ledger
-                .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds, &token),
+            self.ledger.claim_candidate_for_recovery(
+                block_hash,
+                CANDIDATE_LEASE.seconds,
+                &token,
+                takeover,
+            ),
         )
         .await
         {
@@ -2135,9 +2185,10 @@ impl Coordinator {
     ///
     /// Every stop, the deadline included, attempts a bounded claim release.
     /// A confirmed release leaves the row recoverable with its reason: its
-    /// state (a row adopted into `reconciliation` stays there), evidence and
-    /// schedule are untouched, and an audit that landed is reused by the next
-    /// attempt. A [`RecoveryStop`] names why; node and database errors
+    /// state (a row adopted into `reconciliation` stays there) and evidence
+    /// are untouched, its schedule is kept within the row's own backoff
+    /// (#581; a parked row stays parked), and an audit that landed is reused
+    /// by the next attempt. A [`RecoveryStop`] names why; node and database errors
     /// propagate as themselves. Unconfirmed cleanup is a failure that names
     /// the original stop without asserting the row's current disposition.
     pub async fn recover_candidate(
@@ -3187,7 +3238,7 @@ impl MiningBackend for Coordinator {
             if error.is::<crate::ledger::SessionAllocationExhausted>() {
                 protocol_error("session-allocation-exhausted", &error.to_string())
             } else {
-                protocol_error("backend-rpc-unavailable", "database unavailable")
+                protocol_error(DATABASE_UNAVAILABLE, "database unavailable")
             }
         })
     }
@@ -3355,7 +3406,7 @@ impl MiningBackend for Coordinator {
         let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
             tracing::warn!(%error,"job persistence deferred");
-            protocol_error("backend-rpc-unavailable", "job persistence unavailable")
+            backend_refusal(&error, "job persistence unavailable")
         })
     }
 
@@ -3536,7 +3587,7 @@ impl MiningBackend for Coordinator {
         };
         resume.await.map_err(|error| {
             tracing::warn!(%error,"job resume unavailable");
-            protocol_error("backend-rpc-unavailable", "job resume unavailable")
+            backend_refusal(&error, "job resume unavailable")
         })
     }
 
