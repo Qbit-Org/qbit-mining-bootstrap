@@ -76,6 +76,12 @@ pub trait ExternalMint: Send + Sync {
     /// an accepted one is on its chain. A tip minted before then can take the
     /// block's height first (#638).
     fn block_answered(&self, block_hash: &str) -> bool;
+
+    /// Hold, or release, the mints the node asks for on its own (a real
+    /// node's keepalives) while a scheduled block is due or outstanding, so
+    /// none is asked for between [`ExternalMint::settled_tip`] and the
+    /// block's verdict (#638). A node that mints only when asked has none.
+    fn hold_keepalives(&self, _held: bool) {}
 }
 
 impl ExternalMint for NodeState {

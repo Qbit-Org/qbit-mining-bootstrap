@@ -10901,6 +10901,9 @@ struct StandIn {
     notify_delay: std::time::Duration,
     search: std::time::Duration,
     answer: client::Outcome,
+    /// Also report the submit's write as failed, as `client::offer` does
+    /// when the socket write errors after the line may have left.
+    write_failed: bool,
     offer: Option<std::time::Duration>,
 }
 
@@ -10914,6 +10917,7 @@ impl StandIn {
             notify_delay,
             search,
             answer: client::Outcome::Accepted,
+            write_failed: false,
             offer: Some(offer),
         }
     }
@@ -11039,6 +11043,20 @@ async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<N
                         ntime_hex: String::new(),
                         nonce_hex: format!("{nonce:08x}"),
                     });
+                if stand_in.write_failed {
+                    collected
+                        .lock()
+                        .unwrap()
+                        .failures
+                        .push(client::ClientFailure {
+                            session: 0,
+                            phase: "warm_up".into(),
+                            kind: client::FailureKind::ScheduledBlock,
+                            recorded: true,
+                            error: "write failed: broken pipe".into(),
+                            at: Instant::now(),
+                        });
+                }
                 let Some(offer) = stand_in.offer else {
                     continue;
                 };
@@ -11188,6 +11206,7 @@ async fn a_scheduled_block_refused_with_its_outcome_unknown_still_holds_the_next
             reason_id: Some("ledger-outcome-unknown".into()),
             message: "share outcome is not yet known".into(),
         }),
+        write_failed: false,
         offer: Some(Duration::from_millis(1500)),
     })
     .await?;
@@ -11222,6 +11241,7 @@ async fn a_scheduled_block_the_server_refused_as_stale_releases_the_next_tip() -
             reason_id: Some("stale-job".into()),
             message: "stale job".into(),
         }),
+        write_failed: false,
         offer: None,
     })
     .await?;
@@ -11324,6 +11344,41 @@ async fn a_scheduled_block_its_session_never_received_releases_the_next_tip() ->
     assert_eq!(
         outcome.ordered_landings[0].settled.as_deref(),
         Some("the session's task had stopped, so it was never sent")
+    );
+    Ok(())
+}
+
+/// A scheduled block whose submit write failed is reported twice, as a
+/// no-response submit and as a recorded client failure, and the write can
+/// fail after the line reached the server. The recorded failure is not the
+/// block's verdict: the tip stays held until the node has answered the offer
+/// that came 1.5 s later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_whose_write_failed_still_holds_the_next_tip() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::NoResponse {
+            reason: "write failed: broken pipe".into(),
+        },
+        write_failed: true,
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
     );
     Ok(())
 }

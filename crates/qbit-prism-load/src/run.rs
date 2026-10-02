@@ -3064,7 +3064,11 @@ fn landing_settlement(
     if let Some(failure) = collected.failures[landing.failures_from.min(collected.failures.len())..]
         .iter()
         .find(|failure| {
+            // A recorded failure is a write that failed, possibly after
+            // the line reached the server: its submit record says
+            // no-response, and the node's verdict settles it (EP-ERRORS).
             failure.kind == FailureKind::ScheduledBlock
+                && !failure.recorded
                 && failure.session == landing.session
                 && failure.at >= landing.sent
         })
@@ -3273,6 +3277,7 @@ pub async fn drive_phase_with_population(
     // A phase with both orders its landings against its tips (#638).
     let order_landings = !block_times.is_empty() && !tip_times.is_empty();
     let mut landing: Option<OutstandingLanding> = None;
+    let mut keepalives_held = false;
     let mut kill_done = !plan.mid_flight_kill;
     // The mid-flight kill in flight, if any: polled from this loop and
     // never awaited, for the same reason the drained restart is. Awaiting
@@ -3383,6 +3388,13 @@ pub async fn drive_phase_with_population(
             }
         }
         let block_due = block_cursor < block_times.len() && seconds >= block_times[block_cursor];
+        // The node's own mints are held over the same span as the tips, and
+        // before the settled tip is read below, so none can slip in between.
+        let hold = order_landings && (block_due || landing.is_some());
+        if hold != keepalives_held {
+            node_state.hold_keepalives(hold);
+            keepalives_held = hold;
+        }
         // Ordered, a block waits for the one before it to settle and for its
         // session to hold work on the node's settled tip, so it is never
         // mined on a parent a tip still on its way replaces.
@@ -3571,6 +3583,9 @@ pub async fn drive_phase_with_population(
     // What the ordering left undone is reported, not dropped: a block still
     // held at the deadline, and the tips held behind a landing that never
     // settled (EP-ERRORS).
+    if keepalives_held {
+        node_state.hold_keepalives(false);
+    }
     if order_landings {
         for &due in &block_times[block_cursor..] {
             outcome.ordered_landings.push(OrderedLanding {
