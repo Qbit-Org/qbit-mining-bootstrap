@@ -3421,8 +3421,18 @@ impl MiningBackend for Coordinator {
     ) -> Result<(), StratumError> {
         let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
-            tracing::warn!(%error,"job persistence deferred");
-            backend_refusal(&error, "job persistence unavailable")
+            tracing::warn!(error = format!("{error:#}"), "job persistence deferred");
+            // #581: an expiry is the database's, whichever of the deadline
+            // and the statement it cut short failed first; decided here, by
+            // the deadline, never by the race.
+            if error
+                .downcast_ref::<prepared_storage::IssuedPersistenceExpired>()
+                .is_some()
+            {
+                protocol_error(DATABASE_UNAVAILABLE, "job persistence unavailable")
+            } else {
+                backend_refusal(&error, "job persistence unavailable")
+            }
         })
     }
 

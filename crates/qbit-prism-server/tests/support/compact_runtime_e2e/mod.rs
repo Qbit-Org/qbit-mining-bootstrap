@@ -271,6 +271,18 @@ impl Fixture {
         }).await.context("no runtime SQL lock waiter observed")?
     }
 
+    /// Cancel the runtime statement queued behind `blocker`, the way a
+    /// failed statement ends a wait before any deadline does.
+    pub async fn cancel_cluster_waiter(&self, blocker: i32) -> Result<()> {
+        let cancelled: i64 = sqlx::query_scalar("SELECT count(*) FILTER (WHERE pg_cancel_backend(pid)) FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'SELECT config_fingerprint%' AND datname=current_database()")
+            .bind(blocker).fetch_one(&self.admin).await?;
+        ensure!(
+            cancelled == 1,
+            "cancelled {cancelled} runtime SQL lock waiters, not one"
+        );
+        Ok(())
+    }
+
     pub async fn wait_for_share_read_waiter(&self) -> Result<()> {
         timeout(Duration::from_secs(5), async {
             loop {
