@@ -81,6 +81,7 @@ labels!(RejectReason {
     UnknownJob => "unknown-job", InvalidExtranonce => "invalid-extranonce",
     InvalidNtimeOrNonce => "invalid-ntime-or-nonce",
     BackendRpcUnavailable => "backend-rpc-unavailable",
+    BackendDatabaseUnavailable => "backend-database-unavailable",
     InternalError => "internal-error", PoolClosed => "pool-closed",
     LedgerConfirmationFailed => "ledger-confirmation-failed",
     LedgerOutcomeUnknown => "ledger-outcome-unknown", Unrecognised => "unrecognised"

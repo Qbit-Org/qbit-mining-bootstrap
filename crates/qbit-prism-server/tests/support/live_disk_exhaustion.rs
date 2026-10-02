@@ -22,12 +22,14 @@
 //!   reasons `PrismShareAppendFailures` counts, and that rule's input rises;
 //!   no share refused as `ledger-confirmation-failed` (the ledger did not
 //!   record it) is credited; no submission waited past the answer bound;
-//! - a paging rule fires on every server: its condition, mirrored from
-//!   `docs/prism-native-alert-rules.json`, holds on every scrape for its
-//!   `for`. With PostgreSQL down that is
-//!   `PrismBlockCandidateMetricsUnavailable`; the share-refusal rules and
-//!   `PrismMetricsSnapshotStale` flap with the snapshot's freshness
-//!   (#581);
+//! - the outage pages on every server through its own rule and at least one
+//!   more: each condition, mirrored from `docs/prism-native-alert-rules.json`,
+//!   holds on every scrape for its `for`. Since #581 that is
+//!   `PrismDatabaseUnavailable` on the live database collector, beside the
+//!   share-refusal rules, whose counters are rendered at scrape time and no
+//!   longer gated on the snapshot's freshness, and
+//!   `PrismBlockCandidateMetricsUnavailable`; only `PrismMetricsSnapshotStale`
+//!   still flaps with the snapshot's freshness;
 //! - once space is freed, both original server processes accept shares again
 //!   within a bound, a block found afterwards lands on the node, and the
 //!   carry-forward integrity report is clean.
@@ -55,9 +57,10 @@ const STEADY_SHARES: usize = 10;
 const STEADY_BOUND: Duration = Duration::from_secs(120);
 /// How long the fill may take to be refused on both servers.
 const FILL_BOUND: Duration = Duration::from_secs(180);
-/// How long the full state may last once both servers refuse, waiting for a
-/// paging rule to fire on each: its 3-minute `for`, plus time for
-/// PostgreSQL to go down after the first refusal.
+/// How long the full state may last once both servers refuse, waiting for
+/// the outage's rules to fire on each (see [`outage_paged`]): their
+/// 3-minute `for` at most, plus time for PostgreSQL to go down after the
+/// first refusal.
 const FULL_BOUND: Duration = Duration::from_secs(360);
 
 const REJECTIONS: &str = "qbit_prism_rejections_total";
@@ -273,8 +276,8 @@ async fn exhaust(
     );
     let verdict = Verdict::of(&scrapes, &[0, 1], mirrors);
     ensure!(
-        verdict.every_server_paged(),
-        "no paging rule fires on every server for the full state:\n{}\n{}",
+        outage_paged(&verdict),
+        "the outage did not page on every server through PrismDatabaseUnavailable and at least one more rule (#581):\n{}\n{}",
         verdict.report,
         gates(&scrapes)
     );
@@ -424,7 +427,7 @@ async fn full(
                 Some(at) => {
                     at.elapsed() >= FULL_BOUND
                         || (round % 20 == 0
-                            && Verdict::of(&scrapes, &[0, 1], mirrors).every_server_paged())
+                            && outage_paged(&Verdict::of(&scrapes, &[0, 1], mirrors)))
                 }
             };
             if done {
@@ -449,11 +452,24 @@ async fn full(
     Ok((miners, scrapes))
 }
 
+/// Whether the outage paged on every server through its own rule and at
+/// least one more. Before #581 only `PrismBlockCandidateMetricsUnavailable`
+/// held: the metrics snapshot is published by the health probe, which still
+/// publishes when it fails, so its freshness flapped and every rule gated on
+/// a fresh snapshot flapped with it.
+fn outage_paged(verdict: &Verdict) -> bool {
+    verdict
+        .fired
+        .values()
+        .all(|rules| rules.contains("PrismDatabaseUnavailable") && rules.len() >= 2)
+}
+
 /// The rules that can page for this state, mirrored. With PostgreSQL down,
-/// only `PrismBlockCandidateMetricsUnavailable` holds: the metrics snapshot
-/// is published by the health probe, which still publishes when it fails, so
-/// its freshness flaps and every rule gated on a fresh snapshot flaps with
-/// it (#581).
+/// `PrismDatabaseUnavailable` holds on the database collector, which is live
+/// at scrape time, as does `PrismBlockCandidateMetricsUnavailable`; the
+/// share-refusal rules read the live share counters and are no longer gated
+/// on the snapshot (#581); `PrismMetricsSnapshotStale` still flaps with the
+/// snapshot's freshness.
 fn paging_mirrors(reasons: &BTreeSet<String>) -> Result<Vec<Mirror>> {
     fn increase(base: &Scrape, s: &Scrape, reason: &str) -> f64 {
         let count = |scrape: &Scrape| {
@@ -469,25 +485,30 @@ fn paging_mirrors(reasons: &BTreeSet<String>) -> Result<Vec<Mirror>> {
     Ok(vec![
         Mirror::new(
             "PrismShareAppendFailures",
-            &[REJECTIONS, "> bool 0", "qbit_prism_metrics_snapshot_stale"],
-            move |base, s| {
-                reasons.iter().any(|reason| increase(base, s, reason) > 0.0) && s.gate_open()
-            },
+            &[REJECTIONS, "> bool 0"],
+            move |base, s| reasons.iter().any(|reason| increase(base, s, reason) > 0.0),
         )?,
         Mirror::new(
             "PrismRejectRatioByReasonHigh",
-            &["> bool 0.05", ">= 100", "qbit_prism_metrics_snapshot_stale"],
+            &["> bool 0.05", ">= 100"],
             |base, s| {
                 let total = (s.sum(ACCEPTED) - base.sum(ACCEPTED))
                     + (s.sum(REJECTIONS) - base.sum(REJECTIONS));
                 total >= 100.0
-                    && s.gate_open()
                     && s.by_label(REJECTIONS, "reason_id")
                         .keys()
                         .any(|reason| increase(base, s, reason) / total > 0.05)
             },
         )?,
         snapshot_stale()?,
+        Mirror::new(
+            "PrismDatabaseUnavailable",
+            &["collector=\"database\"} == bool 0", "up{"],
+            // A scrape that answered is the rule's `up == 1`.
+            |_, s| {
+                s.labelled("qbit_prism_collector_available", "collector", "database") == Some(0.0)
+            },
+        )?,
         Mirror::new(
             "PrismBlockCandidateMetricsUnavailable",
             &["collector=\"database\"} == bool 0"],

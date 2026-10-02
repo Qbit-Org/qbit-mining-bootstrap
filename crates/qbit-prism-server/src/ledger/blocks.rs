@@ -360,7 +360,7 @@ impl Ledger {
         // offer. A recovered reservation whose call's answer was never
         // recorded lands with an `unknown` outcome, as reconciliation and
         // the orphan disposition record it (#529); a pending row keeps none.
-        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=CASE WHEN state IN {} THEN COALESCE(offer_outcome,'unknown') ELSE offer_outcome END,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2", CandidateState::OFFERED_SQL))
+        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=CASE WHEN state IN {} THEN COALESCE(offer_outcome,'unknown') ELSE offer_outcome END,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE block_hash=$1 AND claim_token=$2", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
         // Shared by ordinary processing and operator recovery. Arm only at the
         // actual COMMIT attempt, after all proven precommit failures are past.
@@ -457,7 +457,7 @@ impl Ledger {
         // lifecycle left it, with an `unknown` outcome for a reservation
         // whose call was lost. An offer-state row has no `body_id` under
         // 011's payload rule, so there is no body to release.
-        let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
+        let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(ORPHANED_STATE).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(settled == 1, CandidateState::OFFERED_CLAIM_LOST);
         let orphan = self
@@ -879,7 +879,9 @@ async fn require_claim(
     .bind(&claim.candidate.block_hash)
     .fetch_optional(&mut **tx)
     .await?;
-    let row: Option<(bool, String)> = sqlx::query_as(&format!("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state IN {},state FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL))
+    // #581: the token is the fence. Whether the lease is still live is the
+    // holder's own monotonic deadline, never the database clock.
+    let row: Option<(bool, String)> = sqlx::query_as(&format!("SELECT COALESCE(claim_token=$2,false) AND state IN {},state FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL))
         .bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&mut **tx).await?;
     match row {
         Some((true, state)) => CandidateState::parse(&state),

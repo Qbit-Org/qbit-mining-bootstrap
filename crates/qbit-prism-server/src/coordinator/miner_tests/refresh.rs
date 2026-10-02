@@ -200,6 +200,7 @@ async fn resume_stale_payout_returns_unknown_while_revision_outage_remains_unava
         .unwrap()
         .is_none());
     fixture.store.fail_revision.store(true, Ordering::SeqCst);
+    // #581: the outage is the database's, and the refusal says so.
     assert_error(
         fixture
             .coordinator
@@ -207,7 +208,7 @@ async fn resume_stale_payout_returns_unknown_while_revision_outage_remains_unava
             .await
             .err()
             .unwrap(),
-        "backend-rpc-unavailable",
+        "backend-database-unavailable",
         "job resume unavailable",
     );
 }

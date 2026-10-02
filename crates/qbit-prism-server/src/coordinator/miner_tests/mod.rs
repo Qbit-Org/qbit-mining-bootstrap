@@ -159,7 +159,10 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            ensure!(!self.fail_revision.load(Ordering::SeqCst), "unavailable");
+            // A database read's failure, as the real ledger reports it.
+            if self.fail_revision.load(Ordering::SeqCst) {
+                return Err(sqlx::Error::PoolClosed.into());
+            }
             Ok(revision)
         })
     }

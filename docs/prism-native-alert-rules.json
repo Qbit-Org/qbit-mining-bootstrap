@@ -231,7 +231,7 @@
       "uid": "qbit-prism-reject-ratio",
       "title": "PrismRejectRatioByReasonHigh",
       "role": "run",
-      "expr": "(((sum by (job, instance, network, reason_id) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) / on(job, instance, network) group_left() (sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])))) > bool 0.05) and on(job, instance, network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "expr": "(((sum by (job, instance, network, reason_id) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) / on(job, instance, network) group_left() (sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])))) > bool 0.05) and on(job, instance, network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) >= 100))",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -242,17 +242,16 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismRejectRatioByReasonHigh",
-      "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
+      "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable (the node), backend-database-unavailable (the ledger database, #581), stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Not gated on a fresh metrics snapshot: qbit_prism_rejections_total and qbit_prism_accepted_shares_total are rendered at scrape time since #581, so a database outage that stalls the health publisher does not freeze them. Provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
+      "basis": "Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions, both counters live at scrape time (#581). Provisional, measure in #291.",
       "producer_refs": [
-        "crates/qbit-prism-server/src/metrics/registry.rs#L50",
-        "crates/qbit-prism-server/src/metrics/registry.rs#L56",
-        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
-        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
-        "crates/qbit-prism-server/src/metrics/labels.rs#L25",
-        "crates/qbit-prism-server/src/metrics.rs#L39"
+        "crates/qbit-prism-server/src/metrics/registry.rs#L54",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L60",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L155",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L78",
+        "crates/qbit-prism-server/src/metrics.rs#L252"
       ]
     },
     {
@@ -284,7 +283,7 @@
       "uid": "qbit-prism-share-append-failures",
       "title": "PrismShareAppendFailures",
       "role": "run",
-      "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0)",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -295,16 +294,14 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismShareAppendFailures",
-      "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
+      "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id. Not gated on a fresh metrics snapshot (#581): qbit_prism_rejections_total is rendered at scrape time, so the rule holds through a database outage that stalls the health publisher instead of flapping with the snapshot's freshness.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Any ledger rejection whose confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown) preserves the deployed low-volume total-write-failure coverage; measure alert volume in #291.",
+      "basis": "Any ledger rejection whose confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown) preserves the deployed low-volume total-write-failure coverage; its input is live at scrape time since #581; measure alert volume in #291.",
       "producer_refs": [
-        "crates/qbit-prism-server/src/metrics/registry.rs#L56",
-        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
-        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
-        "crates/qbit-prism-server/src/metrics/labels.rs#L25",
-        "crates/qbit-prism-server/src/metrics.rs#L39"
+        "crates/qbit-prism-server/src/metrics/registry.rs#L60",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L155",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L78"
       ]
     },
     {
@@ -692,6 +689,33 @@
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",
         "crates/qbit-prism-server/src/metrics/labels.rs#L18",
         "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-database-unavailable",
+      "title": "PrismDatabaseUnavailable",
+      "role": "run",
+      "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == bool 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "2m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismDatabaseUnavailable",
+      "description": "This frontend has had no complete successful observation of its ledger database for two minutes: the database collector, which reads PostgreSQL every 10 seconds through this frontend's own connection pool, in a read-only transaction with a 3-second deadline that includes the pool acquire and a 500 ms lock timeout, failed, was cancelled, or last succeeded more than 30 seconds ago. That covers PostgreSQL down or unreachable, and also a pool saturated, or a lock blocking the collector's reads, for two minutes. While it holds, the frontend refuses the shares and sessions it cannot record, mostly as backend-database-unavailable or ledger-confirmation-failed (#581), so every miner on it is stalled. Pages on exactly this state and says so: before #581 a PostgreSQL outage held only PrismBlockCandidateMetricsUnavailable, a warning titled for block-candidate metrics. Not this rule's: a database that still serves reads but refuses writes (a read-only standby or demoted primary, or a cluster halted by its fatal state) and a stall shorter than two minutes; both show as backend-database-unavailable refusals in PrismRejectRatioByReasonHigh. Collector state is live at scrape time and not gated on a fresh metrics snapshot, whose freshness flaps while the health publisher waits on the database. Gated on a successful scrape; a missing endpoint, no data and evaluation errors are OK because PrismMetricsEndpointDown and PrismMetricsNoData own them. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Database collector unavailable (failure, cancellation, or no success for COLLECTOR_STALE_AFTER = 30 s, collected every 10 s) for two minutes, from #581's disk-exhaustion run, where the collector held unavailable through a 200 s outage while every snapshot-gated rule flapped; provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L82",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L71",
+        "crates/qbit-prism-server/src/metrics.rs#L23",
+        "crates/qbit-prism-server/src/metrics/collectors.rs#L123"
       ]
     },
     {

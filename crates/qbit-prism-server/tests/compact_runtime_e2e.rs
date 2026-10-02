@@ -637,6 +637,8 @@ async fn resumed_compact_work_authenticates_retained_share_rows() -> Result<()> 
                 Err(error) => error,
                 Ok(_) => anyhow::bail!("resume trusted cached data after retained row corruption"),
             };
+            // #581: corrupt stored data is not the database being
+            // unavailable, so the refusal keeps the older backend label.
             ensure!(
                 error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
                 "retained share corruption lost backend error"
@@ -699,62 +701,75 @@ async fn cancelled_issued_save_releases_sql_resources_without_publishing() -> Re
     .await
 }
 
+/// An issued persistence that fails while queued on a database lock is
+/// refused as the database's (#581), whichever ends the wait first: a
+/// statement that fails well inside the deadline, or the deadline elapsing
+/// (where the deadline and the statement its shortened `statement_timeout`
+/// cancels race, and both must give the same label). The unit fixture
+/// forces the deadline firing while the statement still waits; here both
+/// waits are real.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issued_expiry_during_sql_wait_does_not_publish_or_renew_original_identity() -> Result<()> {
     run(qbit_prism_test_gate::site!(), |f| {
         Box::pin(async move {
             f.refresh(true).await?;
             let worker = f.a.authorize("alice.rig").await?;
-            let job =
-                f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
+            for statement_fails_first in [true, false] {
+                let job =
+                    f.a.build_job(&worker, "1a2b3c4d", support::DIFFICULTY, 0.0)
+                        .await?;
+                let before = f.payload(&job.context.prepared.storage_key).await?;
+                let mut lock = f.pool().begin().await?;
+                sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+                    .execute(&mut *lock)
                     .await?;
-            let before = f.payload(&job.context.prepared.storage_key).await?;
-            let mut lock = f.pool().begin().await?;
-            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
-                .execute(&mut *lock)
-                .await?;
-            let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *lock)
-                .await?;
-            let a = f.a.clone();
-            let issued = job.clone();
-            let owner = worker.clone();
-            let mut pending = tokio::spawn(async move {
-                a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(1))
-                    .await
-            });
-            let observed = f.wait_for_cluster_waiter(blocker).await;
-            if observed.is_ok() {
-                sleep(Duration::from_millis(1100)).await;
+                let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *lock)
+                    .await?;
+                let a = f.a.clone();
+                let issued = job.clone();
+                let owner = worker.clone();
+                let mut pending = tokio::spawn(async move {
+                    a.persist_issued_job(&owner, &issued, MASK, Duration::from_secs(1))
+                        .await
+                });
+                let mut observed = f.wait_for_cluster_waiter(blocker).await;
+                if observed.is_ok() {
+                    if statement_fails_first {
+                        observed = f.cancel_cluster_waiter(blocker).await;
+                    } else {
+                        sleep(Duration::from_millis(1100)).await;
+                    }
+                }
+                lock.rollback().await?;
+                let completion = timeout(Duration::from_secs(5), &mut pending).await;
+                if completion.is_err() {
+                    pending.abort();
+                    let _ = pending.await;
+                    anyhow::bail!("expired persistence did not finish after releasing its SQL wait");
+                }
+                observed?;
+                let error = completion??
+                    .err()
+                    .context("expired issued operation published work")?;
+                ensure!(
+                    error.reason_id.as_deref() == Some("backend-database-unavailable"),
+                    "persistence that failed on the database (statement first: {statement_fails_first}) lost its truthful error: {error:?}"
+                );
+                ensure!(
+                    f.a.ledger.job(&job.wire.job_id).await?.is_none(),
+                    "issued operation renewed its deadline after waiting"
+                );
+                ensure!(
+                    f.payload(&job.context.prepared.storage_key).await? == before,
+                    "expired wait changed original reservation identity"
+                );
+                let next = f.issue(&worker, Duration::from_secs(30)).await?;
+                ensure!(
+                    f.b.resume_job(&worker, &next.wire.job_id).await?.is_some(),
+                    "runtime did not recover after expired persistence"
+                );
             }
-            lock.rollback().await?;
-            let completion = timeout(Duration::from_secs(5), &mut pending).await;
-            if completion.is_err() {
-                pending.abort();
-                let _ = pending.await;
-                anyhow::bail!("expired persistence did not finish after releasing its SQL wait");
-            }
-            observed?;
-            let error = completion??
-                .err()
-                .context("expired issued operation published work")?;
-            ensure!(
-                error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
-                "expired persistence lost its truthful error"
-            );
-            ensure!(
-                f.a.ledger.job(&job.wire.job_id).await?.is_none(),
-                "issued operation renewed its deadline after waiting"
-            );
-            ensure!(
-                f.payload(&job.context.prepared.storage_key).await? == before,
-                "expired wait changed original reservation identity"
-            );
-            let next = f.issue(&worker, Duration::from_secs(30)).await?;
-            ensure!(
-                f.b.resume_job(&worker, &next.wire.job_id).await?.is_some(),
-                "runtime did not recover after expired persistence"
-            );
             Ok(())
         })
     })
@@ -845,8 +860,9 @@ async fn unknown_issued_commit_is_observed_and_reconciled_without_reissuing() ->
                 "unknown commit was not observed on the PostgreSQL wire"
             );
             if let Err(error) = result {
+                // #581: a lost COMMIT reply is the database's failure.
                 ensure!(
-                    error.reason_id.as_deref() == Some("backend-rpc-unavailable"),
+                    error.reason_id.as_deref() == Some("backend-database-unavailable"),
                     "commit transport error was misclassified"
                 );
             }
@@ -1030,6 +1046,46 @@ async fn superseding_publication_during_completed_commit_wait_refuses_old_delive
                 "new current-tip work did not resume after the refusal"
             );
             Ok(())
+        })
+    })
+    .await
+}
+
+/// #581, from #554's fault phase: a database stall that is not an outage, an
+/// outside transaction holding the cluster row past the lock timeout, refuses
+/// a resume as the database's failure, `backend-database-unavailable`, never
+/// as the node's `backend-rpc-unavailable`. The lock is held from a second
+/// connection; nothing is loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_stall_refuses_a_resume_as_the_databases() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let worker = worker("alice");
+            let original = f.issue(&worker, Duration::from_secs(60)).await?;
+            let mut blocker = f.pool().begin().await?;
+            sqlx::raw_sql("LOCK TABLE qbit_prism_cluster IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker)
+                .await?;
+            let refused = timeout(
+                Duration::from_secs(30),
+                f.b.resume_job(&worker, &original.wire.job_id),
+            )
+            .await;
+            blocker.rollback().await?;
+            let error = match refused.context("the stalled resume was never answered")? {
+                Err(error) => error,
+                Ok(_) => anyhow::bail!("a stalled database resumed work or reported a miss"),
+            };
+            ensure!(
+                error.reason_id.as_deref() == Some("backend-database-unavailable"),
+                "a database stall was attributed elsewhere: {error:?}"
+            );
+            let resumed =
+                f.b.resume_job(&worker, &original.wire.job_id)
+                    .await?
+                    .context("the work did not resume once the stall cleared")?;
+            same_job(&original, &resumed)
         })
     })
     .await

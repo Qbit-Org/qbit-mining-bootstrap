@@ -1498,3 +1498,96 @@ async fn lease_failed_observation_is_an_error_and_absolute_expiry_remains_a_miss
         .unwrap()
         .is_none());
 }
+
+/// #581: a submit on a replacement lease whose payout state the database
+/// cannot read (a held SETTLEMENT_LOCK, a full pool, PostgreSQL down) is
+/// refused as the database's failure, not the node's, and nothing is
+/// recorded.
+#[tokio::test]
+async fn a_lease_proof_the_database_cannot_read_is_refused_as_the_databases() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(&f).await;
+    persist(&f, &job).await.unwrap();
+    f.detect(2).await;
+    f.store.revision.store(7, Ordering::SeqCst);
+    f.store
+        .compact
+        .states
+        .lock()
+        .unwrap()
+        .push_back(Err(WindowError::Database(sqlx::Error::PoolTimedOut)));
+    assert_error(
+        f.submit(&job, false).await.unwrap_err(),
+        "backend-database-unavailable",
+        "current payout state is unavailable",
+    );
+    assert!(f.store.records.lock().unwrap().is_empty());
+}
+
+/// #581: issued persistence waits on the ledger alone, so one that fails on
+/// the database is refused as the database's whichever comes first: a
+/// statement that fails before the deadline, or the deadline elapsing while
+/// the save still waits on its statement, which fails only afterwards. The
+/// label is decided by the persistence's own deadline, never by that race
+/// (CI on #646 saw the deadline's arm labelled the node's).
+#[tokio::test]
+async fn issued_persistence_that_fails_on_the_database_is_the_databases_whichever_comes_first() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    f.coordinator.refresh_once().await.unwrap();
+
+    // The statement fails well inside the deadline.
+    let job = issued(&f).await;
+    f.store
+        .compact
+        .issued_saves
+        .lock()
+        .unwrap()
+        .push_back(Err(sqlx::Error::PoolTimedOut.into()));
+    assert_error(
+        persist(&f, &job).await.unwrap_err(),
+        "backend-database-unavailable",
+        "job persistence unavailable",
+    );
+
+    // The deadline elapses while the save still waits on its statement.
+    let job = issued(&f).await;
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let pending = tokio::spawn({
+        let coordinator = f.coordinator.clone();
+        let job = job.clone();
+        async move {
+            coordinator
+                .persist_issued_job(
+                    &job.context.worker,
+                    &job,
+                    0x1fffe000,
+                    Duration::from_secs(1),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let refused = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    // The statement the deadline cut short fails only afterwards.
+    f.store
+        .compact
+        .issued_saves
+        .lock()
+        .unwrap()
+        .push_back(Err(sqlx::Error::PoolTimedOut.into()));
+    gate.release.notify_one();
+    assert_error(
+        refused,
+        "backend-database-unavailable",
+        "job persistence unavailable",
+    );
+    assert!(!f.store.jobs.lock().unwrap().contains_key(&job.wire.job_id));
+}

@@ -927,12 +927,7 @@ impl Coordinator {
             let (current, tip, lease) = self
                 .prove_published_lease(identity, published_tip, readiness_epoch, deadline)
                 .await
-                .map_err(|_| {
-                    protocol_error(
-                        "backend-rpc-unavailable",
-                        "current payout state is unavailable",
-                    )
-                })?
+                .map_err(|error| backend_refusal(&error, "current payout state is unavailable"))?
                 .ok_or_else(|| protocol_error("stale-job", "stale job"))?;
             return Ok(SubmitAdmission {
                 current,

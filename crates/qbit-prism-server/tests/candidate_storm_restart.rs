@@ -783,12 +783,19 @@ async fn release_all_but(ledger: &Ledger, keep: &str) -> Result<u64> {
 /// it, and waiting it out would make every scenario here two minutes longer
 /// without proving anything the fence does not.
 async fn expire_claim(ledger: &Ledger, block_hash: &str, claim_token: Option<&str>) -> Result<()> {
-    let expired = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1 AND claim_token=$2 AND claim_expires_at>clock_timestamp()")
-        .bind(block_hash)
-        .bind(claim_token)
-        .execute(&ledger.pool)
-        .await?
-        .rows_affected();
+    let held: bool = sqlx::query_scalar(
+        "SELECT COALESCE(claim_token=$2,false) FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+    )
+    .bind(block_hash)
+    .bind(claim_token)
+    .fetch_one(&ledger.pool)
+    .await?;
+    ensure!(held, "the dead owner's lease was not the one expired");
+    // The dead owner renews nothing, so its claim cannot move on between the
+    // check and the revocation (#581's hook).
+    let expired =
+        qbit_prism_server::ledger::revoke_candidate_claims(&ledger.pool, Some(block_hash), false)
+            .await?;
     ensure!(
         expired == 1,
         "the dead owner's lease was not the one expired"
@@ -1796,18 +1803,15 @@ const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 /// groups, in order:
 ///
 /// - `Ledger::claim_candidate`, 5: `BEGIN`; the writer fence (`fatal_error`
-///   and the legacy writer lease); the due-work probe, which allocates one
-///   sequence slot; **one** claiming lane statement; `COMMIT`. `claim_candidate`
-///   runs the fresh lane too on most slots, so five rather than six is a
-///   property of which claim takes this row: the fresh lane selects only a
-///   `pending`, never-attempted row, and this row is neither, so on every slot
-///   where the fresh lane runs it takes one of the un-attempted siblings
-///   instead. The recovered row is therefore claimed by a claim whose fresh
-///   lane did not run at all, and that is the same claim at both
-///   cardinalities.
+///   and the legacy writer lease); the claim survey (#581), which reads the
+///   dead owner's revoked claim; the takeover, a compare and set on the
+///   version the survey read, which this row is the first due one to meet;
+///   `COMMIT`. A takeover runs before, and instead of, the due-work probe and
+///   the claim lanes, so it allocates no sequence slot and is the same claim
+///   at both cardinalities.
 /// - `Coordinator::process_candidate`'s opening `Ledger::renew_candidate_claim`,
 ///   5: `BEGIN`; the writer fence; the row lock (`FOR NO KEY UPDATE`); the
-///   renewing `UPDATE` of `claim_expires_at`; `COMMIT`. The 30-second renewal
+///   renewing `UPDATE` of the claim's version; `COMMIT`. The 30-second renewal
 ///   tick does not fire inside a recovery this short.
 /// - the landed-audit read, 1, outside any transaction.
 /// - the window read, 7: `BEGIN`; the repeatable-read read-only declaration;
@@ -1824,7 +1828,7 @@ const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 ///   sequence probes.
 /// - `Ledger::land_candidate_at_revision`, 16: `BEGIN`; the settlement
 ///   advisory lock; the writer fence; the claim's row lock (`FOR KEY SHARE`)
-///   and its token/expiry/state fence; the revision fence; the existing-audit
+///   and its token/state fence; the revision fence; the existing-audit
 ///   digest read; the payout-revision read; the prior balances; the
 ///   `qbit_pool_blocks` insert; the share count; and the four set-based
 ///   inserts of the audit snapshot, the bundle, the payout entries and the

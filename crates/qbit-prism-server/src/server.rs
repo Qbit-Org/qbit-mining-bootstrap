@@ -50,6 +50,13 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let registry = Arc::new(metrics::Metrics::default());
+    // #581: the accepted-share counter is rendered at scrape time, beside the
+    // event-driven rejection counter, so the share-refusal rules see an
+    // outage that stalls the health publisher.
+    registry.read_accepted_shares_at_scrape({
+        let stats = stats.clone();
+        move || stats.accepted_submissions()
+    });
     let coordinator = Coordinator::new(config, registry.clone()).await?;
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(

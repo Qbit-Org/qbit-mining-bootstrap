@@ -11,6 +11,10 @@ use qbit_prism::{
 use serde_json::json;
 use std::sync::Arc;
 
+#[path = "candidates/claim_observer.rs"]
+mod claim_observer;
+pub use claim_observer::{ClaimObserver, ClaimVersion};
+
 /// The public keys the building frontend signed with. The seeds stay local;
 /// these are stored so a claim can refuse to rebuild under other keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,13 +750,37 @@ impl Ledger {
         let token = Uuid::new_v4().to_string();
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
+        // #581: time every claim on this process's clock, and take over the
+        // first one it has watched unrenewed for its whole lease, before
+        // any new work. A takeover consumes no scheduling slot.
+        let claims = self.survey_claims(&mut tx).await?;
+        let now = tokio::time::Instant::now();
+        let mut row = None;
+        for claim in claims
+            .iter()
+            .filter(|claim| claim.due && self.claim_observer.expired(claim, now))
+        {
+            row = take_over_claim(&mut tx, claim, &token, &self.instance_id, lease_seconds).await?;
+            if row.is_some() {
+                tracing::warn!(
+                    block = %claim.block_hash,
+                    holder = claim.instance_id.as_deref().unwrap_or("unknown"),
+                    lease_seconds = claim.lease().as_secs(),
+                    "took over a candidate claim this frontend watched go unrenewed for its whole lease"
+                );
+                break;
+            }
+        }
         // Empty polling does not use a scheduling slot. A racing SKIP LOCKED
         // selection can still leave a gap; this weighting is deliberately an
         // approximate service ratio rather than a global serialization point.
-        let slot: Option<i64> = sqlx::query_scalar(&Self::due_work_probe_sql())
-            .fetch_optional(&mut *tx)
-            .await?;
-        let mut row = None;
+        let slot: Option<i64> = if row.is_some() {
+            None
+        } else {
+            sqlx::query_scalar(&Self::due_work_probe_sql())
+                .fetch_optional(&mut *tx)
+                .await?
+        };
         if let Some(slot) = slot {
             if slot % 8 != 0 {
                 row = claim_candidate_lane(&mut tx, true, &token, &self.instance_id, lease_seconds)
@@ -928,7 +956,10 @@ impl Ledger {
     }
 
     /// Keep a live processing attempt owned while it waits for build capacity
-    /// or performs expensive verification. Expired tokens never revive.
+    /// or performs expensive verification. Fenced on the token alone (#581):
+    /// a token past its database-clock expiry renews, because the lease is
+    /// the caller's own monotonic deadline; a token another frontend took
+    /// over never does.
     pub async fn renew_candidate_claim(
         &self,
         claim: &CandidateClaim,
@@ -940,13 +971,18 @@ impl Ledger {
         );
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
-        // Evaluate expiry after obtaining the row lock: a blocked UPDATE can
-        // otherwise have matched a live token before waiting past its expiry.
-        // NO KEY UPDATE is compatible with the processing transaction's KEY
-        // SHARE lock, so audit persistence cannot block its own heartbeat.
+        // Take the row lock first, so the token is compared once any
+        // takeover that was waiting has committed. NO KEY UPDATE is
+        // compatible with the processing transaction's KEY SHARE lock, so
+        // audit persistence cannot block its own heartbeat.
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let updated = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+$3*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::UNFINISHED_SQL))
+        // #581: fenced on the token alone. Whether the lease is still live is
+        // the caller's own monotonic deadline (`with_tracked_heartbeat`),
+        // never the database clock; a takeover replaces the token. The
+        // renewal count makes this a new version, which every observer times
+        // afresh.
+        let updated = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=claim_renewals+1,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(lease_seconds).execute(&mut *tx).await?.rows_affected();
         ensure!(updated == 1, "candidate claim was lost or expired");
         tx.commit().await?;
@@ -979,7 +1015,7 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let result = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+(CASE WHEN state='reconciliation' THEN LEAST(3600,10*attempt_count) ELSE LEAST(60,attempt_count) END)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::UNFINISHED_SQL))
+        let result = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,last_error=$3,next_attempt_at=clock_timestamp()+(CASE WHEN state='reconciliation' THEN LEAST(3600,10*attempt_count) ELSE LEAST(60,attempt_count) END)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(error).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Ok(false);
@@ -1001,7 +1037,7 @@ impl Ledger {
         writable(&mut tx).await?;
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let recorded = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offered',offered_at_ms=$3,offer_outcome=$4,offer_reply=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND claim_expires_at>clock_timestamp()")
+        let recorded = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offered',offered_at_ms=$3,offer_outcome=$4,offer_reply=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved'")
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(offered_at_ms).bind(outcome.as_str()).bind(reply).execute(&mut *tx).await?.rows_affected();
         ensure!(
             recorded == 1,
@@ -1039,7 +1075,7 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let released = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL,last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL AND claim_expires_at>clock_timestamp()")
+        let released = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL,last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL")
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(
             released == 1,
@@ -1071,7 +1107,7 @@ impl Ledger {
         writable(&mut tx).await?;
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let adopted = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,offer_outcome='unknown',offer_reply=$4,last_error=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+        let adopted = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,offer_outcome='unknown',offer_reply=$4,last_error=$5,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).bind(evidence).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(
             adopted == 1,
@@ -1094,7 +1130,7 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let moved = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
+        let moved = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state='reconciliation',offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,next_attempt_at=clock_timestamp()+LEAST(3600,10*attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(moved == 1, CandidateState::OFFERED_CLAIM_LOST);
         tx.commit().await?;
@@ -1518,7 +1554,7 @@ impl Ledger {
         // An ordered LIMIT 1 derived query lets the existing unfinished index
         // serve polls with large retained history. LIMIT 1 also bounds the
         // outer nextval to one call; both advancing clock predicates remain.
-        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') FROM (SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) ORDER BY next_attempt_at,created_at,block_hash LIMIT 1) AS due", CandidateState::UNFINISHED_SQL)
+        format!("SELECT nextval('qbit_prism_candidate_dispatch_sequence') FROM (SELECT 1 FROM qbit_block_candidate_outbox WHERE state IN {} AND next_attempt_at<=clock_timestamp() AND claim_token IS NULL ORDER BY next_attempt_at,created_at,block_hash LIMIT 1) AS due", CandidateState::UNFINISHED_SQL)
     }
 
     /// The row selection of one claim lane, exactly as
@@ -1541,7 +1577,7 @@ impl Ledger {
                 "ORDER BY next_attempt_at,created_at,block_hash",
             )
         };
-        format!("SELECT block_hash FROM qbit_block_candidate_outbox WHERE state IN {states} AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1")
+        format!("SELECT block_hash FROM qbit_block_candidate_outbox WHERE state IN {states} AND next_attempt_at<=clock_timestamp() AND claim_token IS NULL {ordering} FOR UPDATE SKIP LOCKED LIMIT 1")
     }
 }
 
@@ -1637,7 +1673,23 @@ impl Ledger {
     /// between a check and a write. When the predicate refuses, the
     /// diagnosis below runs read-only in the same transaction, for the
     /// operator's message and exit status alone.
-    pub async fn abandon_candidate(&self, block_hash: &str, reason: &str) -> Result<Value> {
+    ///
+    /// A claim is over as the recovery claim decides it (#581). With
+    /// [`RecoveryTakeover::Observed`], only once this process has watched
+    /// its version go unrenewed for the claim's whole lease: the call that
+    /// first sees a version is refused `claimed` with the time left in
+    /// `lease_remaining_ms`, and a call once that much time has passed
+    /// abandons the row by compare and set on that version. A holder's
+    /// writes are fenced on its token alone, so a `claim_expires_at` the
+    /// database clock has passed does not say the holder stopped, and a
+    /// forward step would otherwise abandon a row its live holder is about
+    /// to offer. [`RecoveryTakeover::DatabaseClock`] is the pre-021 rule.
+    pub async fn abandon_candidate(
+        &self,
+        block_hash: &str,
+        reason: &str,
+        takeover: RecoveryTakeover,
+    ) -> Result<Value> {
         let mut tx = self.begin().await?;
         // Landing keeps FOR KEY SHARE so its owner can renew the lease. That
         // row lock also permits this non-key UPDATE after the lease expires.
@@ -1655,12 +1707,52 @@ impl Ledger {
         let claim_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
-        let abandoned: Option<String> = sqlx::query_scalar(
-            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=$3) AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash")
-            .bind(block_hash).bind(reason).bind(claim_at).fetch_optional(&mut *tx).await?;
+        // #581: the holder's claim, timed on this process's clock. Only the
+        // version watched for its whole lease is taken; until then the
+        // statement abandons an unclaimed row alone.
+        let taken = match takeover {
+            RecoveryTakeover::Observed => self
+                .watch_recovery_claim(&mut tx, block_hash)
+                .await?
+                .filter(|held| held.left.is_zero())
+                .map(|held| held.claim),
+            RecoveryTakeover::DatabaseClock => None,
+        };
+        let claimable = match takeover {
+            RecoveryTakeover::Observed => {
+                "(o.claim_token IS NULL OR (o.claim_token=$3 AND o.claim_renewals=$4))"
+            }
+            RecoveryTakeover::DatabaseClock => {
+                "(o.claim_expires_at IS NULL OR o.claim_expires_at<=$3)"
+            }
+        };
+        let query = format!(
+            "UPDATE qbit_block_candidate_outbox o SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$2,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE o.block_hash=$1 AND o.state='pending' AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') AND {claimable} AND NOT EXISTS(SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=o.block_hash) RETURNING o.block_hash"
+        );
+        let statement = sqlx::query_scalar(&query).bind(block_hash).bind(reason);
+        let statement = match takeover {
+            RecoveryTakeover::Observed => statement
+                .bind(taken.as_ref().map(|claim| claim.token.clone()))
+                .bind(taken.as_ref().map(|claim| claim.renewals)),
+            RecoveryTakeover::DatabaseClock => statement.bind(claim_at),
+        };
+        let abandoned: Option<String> = statement.fetch_optional(&mut *tx).await?;
         let outcome = match abandoned {
             Some(hash) => json!({"outcome":"abandoned","block_hash":hash}),
-            None => diagnose_abandon_refusal(&mut tx, block_hash, claim_at).await?,
+            None => {
+                let mut refusal = diagnose_abandon_refusal(&mut tx, block_hash, claim_at).await?;
+                // A claim not yet watched for its whole lease, or one the
+                // compare and set lost to (a renewal, or a frontend's
+                // takeover), is timed, so the refusal says how long this
+                // command must watch it, not when the database clock thinks
+                // it ends.
+                if takeover == RecoveryTakeover::Observed && refusal["outcome"] == "claimed" {
+                    if let Some(held) = self.watch_recovery_claim(&mut tx, block_hash).await? {
+                        refusal = held.refusal();
+                    }
+                }
+                refusal
+            }
         };
         tx.commit().await?;
         Ok(outcome)
@@ -1730,7 +1822,10 @@ async fn diagnose_abandon_refusal(
         // a claim expires by itself, and a document this release cannot
         // replay never becomes replayable by waiting.
         "pending" if !facts.native => json!({"outcome": "legacy_candidate"}),
-        "pending" if facts.claim_live => facts.claimed(),
+        // A holder whose database expiry has passed is still a holder to an
+        // observed takeover (#581) until this command has watched it for its
+        // whole lease.
+        "pending" if facts.claim_live || facts.claim_instance_id.is_some() => facts.claimed(),
         // Unfinished business, never "nothing to do": the row is pending,
         // unclaimed and unlanded, so the statement should have taken it, and
         // something changed it under this transaction.
@@ -1931,6 +2026,21 @@ pub enum RecoveryClaim {
     Refused(Value),
 }
 
+/// How the two operator commands that take a claimed row, the recovery
+/// claim and `candidates abandon`, decide that another holder's claim is
+/// over (#581).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTakeover {
+    /// Only once this process has itself watched the claim go unrenewed for
+    /// its whole lease, on its own monotonic clock, as a frontend does. The
+    /// default.
+    Observed,
+    /// Once `claim_expires_at` is before the database clock: the pre-021
+    /// rule, wrong by the size of any database clock step (a forward step
+    /// takes a live holder's row). `--unsafe-database-clock-expiry`.
+    DatabaseClock,
+}
+
 /// The bound on the reason a recovery attempt records in `last_error`, in
 /// bytes: the same bound a parked row's reason has.
 fn bounded_reason(reason: &str) -> String {
@@ -1959,6 +2069,15 @@ impl Ledger {
     /// `next_attempt_at`: a parked row is exactly the operator work this
     /// command exists for, and its schedule is left as it is.
     ///
+    /// Another holder's claim is over, with [`RecoveryTakeover::Observed`],
+    /// only once this process has watched its version go unrenewed for the
+    /// claim's whole lease (#581): the first call starts the clock and is
+    /// refused `claimed` with the time left in `lease_remaining_ms`, and a
+    /// call once that much time has passed takes the row over by compare and
+    /// set on that version. [`RecoveryTakeover::DatabaseClock`] is the
+    /// pre-021 rule, `claim_expires_at` before the database clock, for an
+    /// operator who knows the holder is gone and the clock has not stepped.
+    ///
     /// The claimed row is decoded and authenticated as the lane does it. A
     /// row that fails is not parked: its claim is released with the reason,
     /// and the refusal reports it, because the operator asked for this row
@@ -1970,6 +2089,7 @@ impl Ledger {
         block_hash: &str,
         lease_seconds: i64,
         token: &str,
+        takeover: RecoveryTakeover,
     ) -> Result<RecoveryClaim> {
         ensure!(
             (1..=600).contains(&lease_seconds),
@@ -1982,19 +2102,53 @@ impl Ledger {
         let claim_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
-        let row = sqlx::query(&format!(
-            "UPDATE qbit_block_candidate_outbox o SET claim_token=$2,claim_instance_id=$3,claim_expires_at=clock_timestamp()+$4*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() WHERE o.block_hash=$1 AND o.state IN {} AND (o.claim_expires_at IS NULL OR o.claim_expires_at<=$5) AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') RETURNING {CLAIMED_COLUMNS}",
+        // #581: the holder's claim, timed on this process's clock. Only the
+        // version watched for its whole lease is taken over.
+        let mut taken: Option<ClaimVersion> = None;
+        if takeover == RecoveryTakeover::Observed {
+            if let Some(held) = self.watch_recovery_claim(&mut tx, block_hash).await? {
+                if !held.left.is_zero() {
+                    tx.commit().await?;
+                    return Ok(RecoveryClaim::Refused(held.refusal()));
+                }
+                taken = Some(held.claim);
+            }
+        }
+        let claimable = match takeover {
+            RecoveryTakeover::Observed => {
+                "(o.claim_token IS NULL OR (o.claim_token=$5 AND o.claim_renewals=$6))"
+            }
+            RecoveryTakeover::DatabaseClock => {
+                "(o.claim_expires_at IS NULL OR o.claim_expires_at<=$5)"
+            }
+        };
+        let query = format!(
+            "UPDATE qbit_block_candidate_outbox o SET claim_token=$2,claim_instance_id=$3,claim_expires_at=clock_timestamp()+$4*interval '1 second',claim_lease_seconds=$4::integer,claim_renewals=0,attempt_count=attempt_count+1,updated_at=clock_timestamp() WHERE o.block_hash=$1 AND o.state IN {} AND {claimable} AND o.storage_version=1 AND o.candidate ?& ARRAY['payout_revision','block_hash'] AND (o.candidate ? 'bundle' OR o.candidate ? 'window') RETURNING {CLAIMED_COLUMNS}",
             CandidateState::UNFINISHED_SQL
-        ))
-        .bind(block_hash)
-        .bind(token)
-        .bind(&self.instance_id)
-        .bind(lease_seconds)
-        .bind(claim_at)
-        .fetch_optional(&mut *tx)
-        .await?;
+        );
+        let statement = sqlx::query(&query)
+            .bind(block_hash)
+            .bind(token)
+            .bind(&self.instance_id)
+            .bind(lease_seconds);
+        let statement = match takeover {
+            RecoveryTakeover::Observed => statement
+                .bind(taken.as_ref().map(|claim| claim.token.clone()))
+                .bind(taken.as_ref().map(|claim| claim.renewals)),
+            RecoveryTakeover::DatabaseClock => statement.bind(claim_at),
+        };
+        let row = statement.fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
-            let refusal = diagnose_recovery_refusal(&mut tx, block_hash, claim_at).await?;
+            let mut refusal = diagnose_recovery_refusal(&mut tx, block_hash, claim_at).await?;
+            // A claim the compare and set lost to (a renewal, or another
+            // taker) is a new version: time it, so the refusal says how long
+            // this command must watch it, not when the database clock thinks
+            // it ends.
+            if takeover == RecoveryTakeover::Observed && refusal["outcome"] == "claimed" {
+                if let Some(held) = self.watch_recovery_claim(&mut tx, block_hash).await? {
+                    refusal = held.refusal();
+                }
+            }
             tx.commit().await?;
             return Ok(RecoveryClaim::Refused(refusal));
         };
@@ -2022,7 +2176,10 @@ impl Ledger {
     /// reason in `last_error`, leaving everything else as it is: the state
     /// (a row adopted into `reconciliation` stays there), the document, the
     /// block bytes, the window columns, the offer record and, unlike
-    /// `retry_candidate`, the schedule, so a parked row stays parked. Fenced
+    /// `retry_candidate`, the schedule, so a parked row stays parked. The
+    /// one exception (#581): a schedule further ahead than the row's own
+    /// backoff, which a backward database clock step leaves, is pulled in to
+    /// that backoff. Fenced
     /// on the token: a claim that a terminal commit has already cleared, or
     /// that a later owner replaced, is not touched, and `false` says so.
     ///
@@ -2049,10 +2206,73 @@ impl Ledger {
         writable(&mut tx).await?;
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(block_hash).fetch_optional(&mut *tx).await?;
-        let released = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
+        // #581: the schedule is kept, but never further ahead than the row's
+        // own backoff: a schedule written before a backward clock step would
+        // otherwise wait out the step once this write's `updated_at` hides
+        // the step from every claim poll. A parked row stays parked.
+        let released = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,last_error=$3,next_attempt_at=CASE WHEN next_attempt_at='infinity'::timestamptz THEN next_attempt_at ELSE LEAST(next_attempt_at,clock_timestamp()+{BACKOFF_BOUND_SQL}) END,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::UNFINISHED_SQL))
             .bind(block_hash).bind(token).bind(&reason).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(released == 1)
+    }
+}
+
+/// A claim the operator recovery command or `candidates abandon` found on
+/// its row (#581), as this process times it.
+struct WatchedRecoveryClaim {
+    claim: ClaimVersion,
+    left: std::time::Duration,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl WatchedRecoveryClaim {
+    /// The `claimed` refusal, with how long the command must still watch the
+    /// claim and the version it watches.
+    fn refusal(&self) -> Value {
+        json!({
+            "outcome": "claimed",
+            "claim_instance_id": self.claim.instance_id,
+            "claim_expires_at": self.expires_at.map_or(Value::Null, |at| json!(at.to_rfc3339())),
+            "lease_remaining_ms": u64::try_from(self.left.as_millis()).unwrap_or(u64::MAX),
+            "claim_version": format!("{}#{}", self.claim.token, self.claim.renewals),
+        })
+    }
+}
+
+impl Ledger {
+    /// Read the claim on `block_hash`, if any, and time it on this process's
+    /// clock from the reply that showed it.
+    async fn watch_recovery_claim(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        block_hash: &str,
+    ) -> Result<Option<WatchedRecoveryClaim>> {
+        let held = sqlx::query(&format!("SELECT o.claim_token,o.claim_renewals,o.claim_lease_seconds,o.claim_instance_id,o.claim_expires_at FROM qbit_block_candidate_outbox o WHERE o.block_hash=$1 AND o.state IN {} AND o.claim_token IS NOT NULL", CandidateState::UNFINISHED_SQL))
+            .bind(block_hash)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let replied = tokio::time::Instant::now();
+        let Some(held) = held else {
+            return Ok(None);
+        };
+        let claim = ClaimVersion {
+            block_hash: block_hash.to_owned(),
+            token: held.try_get("claim_token")?,
+            renewals: held.try_get("claim_renewals")?,
+            lease_seconds: held.try_get("claim_lease_seconds")?,
+            instance_id: held.try_get("claim_instance_id")?,
+            due: true,
+        };
+        self.claim_observer.watch(&claim, replied);
+        let left = self
+            .claim_observer
+            .remaining(&claim, tokio::time::Instant::now())
+            .unwrap_or_else(|| claim.lease());
+        Ok(Some(WatchedRecoveryClaim {
+            claim,
+            left,
+            expires_at: held.try_get("claim_expires_at")?,
+        }))
     }
 }
 
@@ -2079,7 +2299,10 @@ async fn diagnose_recovery_refusal(
         // a document this release cannot replay never becomes replayable by
         // waiting.
         _ if !facts.native => json!({"outcome": "legacy_candidate"}),
-        _ if facts.claim_live => facts.claimed(),
+        // A holder whose database expiry has passed is still a holder to
+        // an observed takeover (#581), which changed no row because the
+        // version moved on since it was timed.
+        _ if facts.claim_live || facts.claim_instance_id.is_some() => facts.claimed(),
         other => bail!(
             "candidate {block_hash} is {other} and unclaimed but the recovery claim changed no row; re-read the row before retrying"
         ),
@@ -2092,6 +2315,147 @@ async fn diagnose_recovery_refusal(
 /// recovery claim, so a decode never meets a projection it did not expect.
 const CLAIMED_COLUMNS: &str = "o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256,o.state,o.proof_observed_at_ms,o.offer_reserved_by,o.offered_at_ms,o.offer_outcome,o.offer_reply";
 
+/// Revoke candidate claims (#581): end the lease of `block_hash`'s claim, or
+/// of every claim with `None`, as if its holder had stopped renewing it a
+/// whole lease ago. `claim_lease_seconds` becomes 0, so the next frontend to
+/// read the claim takes it over at once, by compare and set on the version
+/// it read, and `claim_expires_at` moves into the past so the database
+/// clock's estimate agrees. The token stays: the holder may still renew or
+/// write until a takeover replaces it. With `due_now` the row's retry
+/// schedule is due at once as well.
+///
+/// The one hook the lease tests use where waiting out a real lease is not
+/// deterministic. An operator may run the same statement only once the
+/// holder is known to be gone.
+pub async fn revoke_candidate_claims<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    block_hash: Option<&str>,
+    due_now: bool,
+) -> Result<u64> {
+    Ok(sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_lease_seconds=CASE WHEN claim_token IS NULL THEN NULL ELSE 0 END,claim_expires_at=CASE WHEN claim_expires_at IS NULL THEN NULL ELSE LEAST(claim_expires_at,clock_timestamp()-interval '1 second') END,next_attempt_at=CASE WHEN $2 THEN clock_timestamp() ELSE next_attempt_at END WHERE $1::text IS NULL OR block_hash=$1")
+        .bind(block_hash)
+        .bind(due_now)
+        .execute(executor)
+        .await?
+        .rows_affected())
+}
+
+/// Whether an unclaimed row's retry schedule was written before the
+/// database clock stepped back (#581). Every statement that schedules a
+/// retry writes `updated_at` from the same clock, so a row whose last write
+/// is later than the clock now proves the step: its deadline is due at once
+/// instead of waiting out the step. A backward step therefore delays a retry
+/// by less than its own backoff, never by the step; a forward step only
+/// makes it due early, which paces nothing a retry needs. A parked row
+/// (`infinity`) is never due.
+const STEPPED_SQL: &str =
+    "(o.next_attempt_at<>'infinity'::timestamptz AND o.updated_at>clock_timestamp())";
+
+/// Whether a claimed row may be taken over once its lease is over (#581):
+/// whatever its schedule, unless it is parked for the operator. A claimed
+/// row's `next_attempt_at` is the one it had when it was claimed, on the
+/// clock of that moment, and nothing rewrites it while the claim lasts,
+/// while every renewal rewrites `updated_at`: after a backward step and one
+/// renewal neither says the row is due, though the claim's holder died. The
+/// lanes claim only due rows, so only a recovery claim of a row still in
+/// backoff is taken over early, and its retry runs no sooner than that
+/// recovery could have.
+const TAKEOVER_SQL: &str = "(o.next_attempt_at<>'infinity'::timestamptz)";
+
+/// A retry's own backoff, as the statement that scheduled it computed it
+/// (`release_candidate_claim`, `release_unsent_offer`, `reconcile_candidate`):
+/// `min(3600, 10 * attempt_count)` seconds for a reconciliation row,
+/// `min(60, attempt_count)` for any other. A claim only raises
+/// `attempt_count`, so a schedule written without a clock step is never
+/// further than this ahead of the clock.
+const BACKOFF_BOUND_SQL: &str = "(CASE WHEN state='reconciliation' THEN LEAST(3600,10*attempt_count) ELSE LEAST(60,attempt_count) END)*interval '1 second'";
+
+impl Ledger {
+    /// The statement every claim poll opens with (#581), in one round trip:
+    /// it reschedules, as due now, every unclaimed unfinished row whose
+    /// schedule `STEPPED_SQL` shows the clock stepped back over, so the
+    /// dispatch probe and the claim lanes keep comparing `next_attempt_at`
+    /// with the clock as they always have; and it reads every claimed
+    /// unfinished row's version for [`ClaimObserver`], with whether
+    /// `TAKEOVER_SQL` lets it be taken over. Rows
+    /// another transaction holds are skipped and rescheduled by a later poll.
+    /// `statement_timestamp()` is stable, so its bound lets the unfinished
+    /// index serve the reschedule as a range over rows still in backoff,
+    /// rather than every unfinished row on every poll. Always one row: a
+    /// `NULL` hash when nothing is claimed.
+    pub fn claim_survey_sql() -> String {
+        let unfinished = CandidateState::UNFINISHED_SQL;
+        format!(
+            "WITH stepped AS (SELECT o.block_hash FROM qbit_block_candidate_outbox o WHERE o.state IN {unfinished} AND o.claim_token IS NULL AND o.next_attempt_at>statement_timestamp() AND o.next_attempt_at>clock_timestamp() AND {STEPPED_SQL} FOR UPDATE SKIP LOCKED), \
+             made_due AS (UPDATE qbit_block_candidate_outbox o SET next_attempt_at=clock_timestamp(),updated_at=clock_timestamp() FROM stepped WHERE o.block_hash=stepped.block_hash RETURNING o.block_hash) \
+             SELECT (SELECT count(*) FROM made_due) AS made_due,o.block_hash,o.claim_token,o.claim_renewals,o.claim_lease_seconds,o.claim_instance_id,{TAKEOVER_SQL} AS due \
+             FROM (SELECT 1) AS one LEFT JOIN qbit_block_candidate_outbox o ON o.claim_token IS NOT NULL AND o.state IN {unfinished} \
+             ORDER BY o.block_hash"
+        )
+    }
+
+    /// Run [`Ledger::claim_survey_sql`] in `tx` and hand its claims to this
+    /// process's observer, timed from the instant the reply arrived.
+    async fn survey_claims(&self, tx: &mut Transaction<'_, Postgres>) -> Result<Vec<ClaimVersion>> {
+        let rows = sqlx::query(&Self::claim_survey_sql())
+            .fetch_all(&mut **tx)
+            .await?;
+        let replied = tokio::time::Instant::now();
+        let made_due: i64 = rows
+            .first()
+            .map(|row| row.try_get("made_due"))
+            .transpose()?
+            .unwrap_or(0);
+        if made_due > 0 {
+            tracing::warn!(
+                rows = made_due,
+                "candidate retries were last written later than the database clock reads now, so the clock stepped back; they are due now"
+            );
+        }
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(block_hash) = row.try_get::<Option<String>, _>("block_hash")? else {
+                continue;
+            };
+            claims.push(ClaimVersion {
+                block_hash,
+                token: row.try_get("claim_token")?,
+                renewals: row.try_get("claim_renewals")?,
+                lease_seconds: row.try_get("claim_lease_seconds")?,
+                instance_id: row.try_get("claim_instance_id")?,
+                due: row.try_get("due")?,
+            });
+        }
+        self.claim_observer.survey(&claims, replied);
+        Ok(claims)
+    }
+}
+
+/// Take over a claim this process has watched go unrenewed for its whole
+/// lease: a compare and set on the version it timed, which any renewal,
+/// release or other takeover since has changed. `FOR UPDATE SKIP LOCKED`
+/// conflicts with the holder's `KEY SHARE` while its landing transaction is
+/// open, as the lanes' selection does, so a landing is never taken over
+/// mid-commit; the next poll tries again.
+async fn take_over_claim(
+    tx: &mut Transaction<'_, Postgres>,
+    claim: &ClaimVersion,
+    token: &str,
+    instance_id: &str,
+    lease_seconds: i64,
+) -> Result<Option<PgRow>> {
+    let query = format!("WITH next AS (SELECT o.block_hash FROM qbit_block_candidate_outbox o WHERE o.block_hash=$4 AND o.claim_token=$5 AND o.claim_renewals=$6 AND o.state IN {} AND {TAKEOVER_SQL} FOR UPDATE SKIP LOCKED) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=0,attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING {CLAIMED_COLUMNS}", CandidateState::UNFINISHED_SQL);
+    Ok(sqlx::query(&query)
+        .bind(token)
+        .bind(instance_id)
+        .bind(lease_seconds)
+        .bind(&claim.block_hash)
+        .bind(&claim.token)
+        .bind(claim.renewals)
+        .fetch_optional(&mut **tx)
+        .await?)
+}
+
 async fn claim_candidate_lane(
     tx: &mut Transaction<'_, Postgres>,
     fresh: bool,
@@ -2099,7 +2463,7 @@ async fn claim_candidate_lane(
     instance_id: &str,
     lease_seconds: i64,
 ) -> Result<Option<PgRow>> {
-    let query = format!("WITH next AS ({}) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING {CLAIMED_COLUMNS}", Ledger::claim_lane_sql(fresh));
+    let query = format!("WITH next AS ({}) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=0,attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING {CLAIMED_COLUMNS}", Ledger::claim_lane_sql(fresh));
     Ok(sqlx::query(&query)
         .bind(token)
         .bind(instance_id)
@@ -2126,7 +2490,7 @@ async fn park_candidate(
     state: &str,
     reason: &str,
 ) -> Result<()> {
-    let parked = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state=$4 AND state IN {}", CandidateState::UNFINISHED_SQL))
+    let parked = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state=$4 AND state IN {}", CandidateState::UNFINISHED_SQL))
         .bind(block_hash).bind(token).bind(reason).bind(state).execute(&mut **tx).await?.rows_affected();
     ensure!(parked == 1, "candidate to park was not held by this claim");
     Ok(())

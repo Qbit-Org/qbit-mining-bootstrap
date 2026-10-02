@@ -6,6 +6,19 @@ use crate::ledger::{CompactRepair, IssuedJobSave};
 
 pub(super) mod compact;
 
+/// An issued job's persistence that failed after its own deadline had
+/// elapsed (#581). Persistence waits on the ledger alone (its clock and
+/// revision reads, the batch transaction and the row locks it queues on, and
+/// the compact repair it writes), so an expiry is the database not
+/// answering in time, however it surfaced: the deadline firing first, or the
+/// statement the shortened `statement_timeout` cancelled failing first.
+/// Attached as context by [`Coordinator::save_issued_record`], the one place
+/// that knows the deadline, so the refusal's label never depends on which
+/// of the two completed first.
+#[derive(Debug, thiserror::Error)]
+#[error("issued job persistence outlived its deadline")]
+pub(super) struct IssuedPersistenceExpired;
+
 /// One issue operation retains its original identity, epoch, bytes and expiry
 /// across dependency repair and every storage wait. A lease selected by any
 /// attempt stays bound to that exact publication through final delivery.
@@ -74,14 +87,27 @@ impl Coordinator {
             deadline: AbsoluteDeadline::from_database(now_ms, requested_at, expires_at_ms)?,
             authority,
         };
-        if self.save_with_dependency(&mut issued, None).await? == IssuedJobSave::Saved {
+        let saved = self.save_issued(&mut issued).await;
+        saved.map_err(|error| {
+            if issued.deadline.live() {
+                error
+            } else {
+                error.context(IssuedPersistenceExpired)
+            }
+        })
+    }
+
+    /// [`Self::save_issued_record`]'s storage, once the deadline is fixed.
+    async fn save_issued(&self, issued: &mut IssuedPersistence<'_>) -> Result<()> {
+        let job = issued.job;
+        if self.save_with_dependency(issued, None).await? == IssuedJobSave::Saved {
             return Ok(());
         }
         let prepared = &job.context.prepared;
         // Followers retry compact persistence after the first repair completes.
         // The guard also lives through actual blocking work if its waiter dies.
         let repair = prepared.repair.clone().lock_owned().await;
-        if self.save_with_dependency(&mut issued, None).await? == IssuedJobSave::Saved {
+        if self.save_with_dependency(issued, None).await? == IssuedJobSave::Saved {
             return Ok(());
         }
         let permit = self.build_slots.clone().acquire_owned().await?;
@@ -113,7 +139,7 @@ impl Coordinator {
         // Both admission and the transaction's current revision are checked
         // again after waiting. The original child deadline/payload stay fixed.
         ensure!(
-            self.save_with_dependency(&mut issued, Some(&serialized.0))
+            self.save_with_dependency(issued, Some(&serialized.0))
                 .await?
                 == IssuedJobSave::Saved,
             "prepared dependency repair did not save issued work"

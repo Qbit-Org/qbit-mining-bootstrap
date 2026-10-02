@@ -3502,5 +3502,108 @@
     "alerts": {
       "PrismPoolResubmissionRejectRatioHigh": []
     }
+  },
+  {
+    "name": "#581 a PostgreSQL outage pages on the database rule through a stale snapshot",
+    "series": {
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "1x60 0x540",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x60 1x15 0x15 1x15 0x15 1x480",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismDatabaseUnavailable": 1,
+      "PrismBlockCandidateMetricsUnavailable": 1
+    },
+    "alerts": {
+      "PrismDatabaseUnavailable": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet",
+          "collector": "database"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#581 the database rule dwells two minutes before it pages",
+    "series": {
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "1x270 0x330",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismDatabaseUnavailable": 1
+    },
+    "alerts": {
+      "PrismDatabaseUnavailable": []
+    }
+  },
+  {
+    "name": "#581 an available database collector does not page",
+    "series": {
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismDatabaseUnavailable": 0
+    },
+    "alerts": {
+      "PrismDatabaseUnavailable": []
+    }
+  },
+  {
+    "name": "#581 a failed scrape leaves the database rule to the endpoint rules",
+    "series": {
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": "0x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismDatabaseUnavailable": null
+    },
+    "alerts": {
+      "PrismDatabaseUnavailable": []
+    }
+  },
+  {
+    "name": "#581 ledger write failures stay visible through a stale snapshot",
+    "series": {
+      "qbit_prism_rejections_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",reason_id=\"ledger-confirmation-failed\"}": "0+0x300 1+1x59",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "expect": {
+      "PrismShareAppendFailures": 1
+    }
+  },
+  {
+    "name": "#581 database refusals carry their own reason through a stale snapshot",
+    "series": {
+      "qbit_prism_accepted_shares_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+10x600",
+      "qbit_prism_rejections_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",reason_id=\"backend-database-unavailable\"}": "0+5x600",
+      "qbit_prism_rejections_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",reason_id=\"backend-rpc-unavailable\"}": "0x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "10m",
+    "expect": {
+      "PrismRejectRatioByReasonHigh": 1
+    },
+    "alerts": {
+      "PrismRejectRatioByReasonHigh": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet",
+          "reason_id": "backend-database-unavailable"
+        }
+      ]
+    }
   }
 ]

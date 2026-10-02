@@ -366,6 +366,12 @@ pub struct StratumStatsSnapshot {
 }
 
 impl StratumStats {
+    /// Shares the listeners have accepted, as `snapshot` reports them; read
+    /// at every metrics scrape (#581).
+    pub fn accepted_submissions(&self) -> u64 {
+        self.accepted_submissions.load(Ordering::Relaxed)
+    }
+
     pub fn delivery_metrics(&self) -> crate::metrics::DeliveryMetrics {
         let jobs = self.initial_jobs.lock().unwrap();
         crate::metrics::DeliveryMetrics {

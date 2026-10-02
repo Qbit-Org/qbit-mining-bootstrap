@@ -23,7 +23,9 @@
 //!    retrying, and `PrismWorkRefreshStalledCritical` must fire. Corrected,
 //!    it serves again;
 //! 3. the database two hours ahead while server 0's block is held
-//!    mid-landing, so every live claim looks expired;
+//!    mid-landing, so the database clock calls every live claim expired;
+//!    since #581 no frontend takes a claim over by the database clock, so
+//!    the holder keeps it;
 //! 4. the database back to the real clock (two hours back) while server 1's
 //!    block is held mid-landing;
 //! 5. every clock real again.
@@ -34,9 +36,10 @@
 //! every accepted block was offered exactly once and landed once, as one
 //! confirmed pool block on the node's chain whose coinbase matches its audit
 //! bundle; and the carry-forward integrity report is clean. Every outbox row
-//! is `submitted`, except the one documented current behaviour (#581):
-//! phase 3's held block, recovered as an unknown offer while held, stays in
-//! reconciliation after phase 4, its retry two hours out.
+//! is `submitted` (#581): neither held block is taken over across its
+//! database step, so each records its own one offer as accepted, rather
+//! than phase 3's block being recovered as an unknown offer and stranded in
+//! reconciliation with a retry two hours out, as it was before #581.
 use super::alert_rules::{sample, scrape, snapshot_stale, Mirror, Verdict};
 use super::host_tools::program;
 use super::private_postgres::{ClusterOptions, PrivateCluster};
@@ -246,8 +249,9 @@ enum Served {
 }
 
 /// Refusals of ordinary shares that the phase after the database clock
-/// steps back may show (seen once in four runs; #581); every other phase
-/// must accept every share.
+/// steps back may show (seen once in four runs before #581, beside the
+/// stranded outbox row #581 fixed; nothing here has shown that they are
+/// gone, so they stay allowed); every other phase must accept every share.
 const REFUSED_AFTER_STEP_BACK: [&str; 2] = ["stale-job", "ledger-confirmation-failed"];
 
 /// Mine `PHASE_SHARES` shares and one block on `server`, on the current
@@ -638,8 +642,9 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
     for (label, hash) in &run.blocks {
         // A row the server released into reconciliation (a post-offer step
         // that lost a race, say) finishes on its retry, 10 s per attempt
-        // later; quiesce does not wait for that. Only #581's row, below,
-        // stays unfinished, its retry two hours out.
+        // later; quiesce does not wait for that. Since #581 a retry the
+        // database clock's step back left two hours out is due at once, so
+        // every row finishes.
         let rows = || async {
             Ok::<_, anyhow::Error>(
                 sqlx::query_as::<_, (String, i32, Option<String>)>(
@@ -655,9 +660,7 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             120,
             || async {
                 let rows = rows().await?;
-                Ok(rows.len() == 1
-                    && (rows[0].0 == "submitted"
-                        || (label == HELD_FORWARD && rows[0].2.as_deref() == Some("unknown"))))
+                Ok(rows.len() == 1 && rows[0].0 == "submitted")
             },
         )
         .await?;
@@ -675,14 +678,15 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             landed == ["confirmed"],
             "{label}: block {hash} pool-block rows {landed:?}"
         );
-        if !(rows.len() == 1 && rows[0].0 == "submitted") {
-            // #581: the held block whose claim the +2 h database jump
-            // expired is recovered as an unknown offer before it is on the
-            // chain, and parked in reconciliation with a retry at the
-            // database's +2 h clock. Once that clock steps back the retry is
-            // two hours away, so the row stays in reconciliation although
-            // the block landed once and its pool block is confirmed. Only
-            // that row may be left so, and only in that state.
+        ensure!(
+            rows.len() == 1 && rows[0].0 == "submitted",
+            "{label}: block {hash} outbox rows {rows:?}"
+        );
+        if label == HELD_FORWARD || label == HELD_BACK {
+            // #581: the held block's holder kept its claim across the
+            // database step and recorded its one offer itself. Before #581
+            // the +2 h step handed phase 3's live claim to a second frontend,
+            // which recovered the reservation as an unknown offer.
             let (outcome,): (Option<String>,) = sqlx::query_as(
                 "SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
             )
@@ -690,17 +694,10 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             .fetch_one(&f.pool)
             .await?;
             ensure!(
-                label == HELD_FORWARD
-                    && rows.len() == 1
-                    && rows[0].0 == "reconciliation"
-                    && outcome.as_deref() == Some("unknown")
-                    && proxy.offers(hash) == 1,
-                "{label}: block {hash} outbox rows {rows:?}, offer outcome {outcome:?}, {} submitblock call(s)",
+                outcome.as_deref() == Some("accepted") && proxy.offers(hash) == 1,
+                "{label}: block {hash} offer outcome {outcome:?}, {} submitblock call(s): its claim was taken over across the database step",
                 proxy.offers(hash)
             );
-            run.notes.push(format!(
-                "{label}: block {hash} landed once and is confirmed, its outbox row left in reconciliation (#581)"
-            ));
         }
         let block = f.rpc("getblock", json!([hash, 2])).await?;
         ensure!(

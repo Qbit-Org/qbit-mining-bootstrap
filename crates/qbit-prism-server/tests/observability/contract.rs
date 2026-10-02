@@ -161,7 +161,7 @@ pub fn expected(populated: bool) -> Census {
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
-    result.family("rejections_total", "counter", &labels("reason_id", "stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised"), &[]);
+    result.family("rejections_total", "counter", &labels("reason_id", "stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,backend-database-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised"), &[]);
     result.family(
         "accepted_block_to_revision_work_seconds",
         "histogram",

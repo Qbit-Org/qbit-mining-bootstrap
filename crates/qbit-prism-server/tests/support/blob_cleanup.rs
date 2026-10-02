@@ -219,14 +219,16 @@ async fn candidate_claim_expiry_retains_balances_until_terminal_outcome() -> Res
             db.ledger.enqueue_candidate(candidate.clone()).await?;
             let claim = db.ledger.claim_candidate(60).await?.unwrap();
             expire(db).await?;
-            sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'")
-                .execute(&db.ledger.pool).await?;
+            qbit_prism_server::ledger::revoke_candidate_claims(&db.ledger.pool, None, false).await?;
             let mut cursor = BlobPruneCursor::default();
             ensure!(sweep(db, &mut cursor).await? == JobPruneResult { jobs: 1, templates: 1, balances: 0 });
+            // Reclaim and finish through the real terminal API: the takeover
+            // ends the old claim (#581), so the old token cannot finish. A
+            // submitted fixture supplies the confirmed block row that API
+            // requires.
+            let reclaimed = db.ledger.claim_candidate(60).await?.unwrap();
             ensure!(db.ledger.finish_candidate(&claim, submitted, None).await.is_err());
-            // Reclaim and finish through the real terminal API. A submitted
-            // fixture supplies the confirmed block row required by that API.
-            let claim = db.ledger.claim_candidate(60).await?.unwrap();
+            let claim = reclaimed;
             if submitted {
                 sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES($1,101,repeat('ab',32),repeat('cd',32),repeat('ef',32),'confirmed')")
                     .bind(&candidate.block_hash).execute(&db.ledger.pool).await?;

@@ -73,7 +73,12 @@ pub struct Metrics {
     rollup_caught_up: Mutex<Option<Instant>>,
     /// Share acknowledgements around pool block landings (#602).
     landing_acks: landing_acks::LandingAcks,
+    /// The Stratum listeners' accepted-share counter, read at every scrape
+    /// once the server attaches it (#581).
+    accepted_shares: std::sync::OnceLock<AcceptedShares>,
 }
+
+type AcceptedShares = Box<dyn Fn() -> u64 + Send + Sync>;
 impl Default for Metrics {
     fn default() -> Self {
         Self::new(Arc::new(runtime::RuntimeMonitor::default()))
@@ -251,13 +256,24 @@ impl Metrics {
             node: Mutex::new(NodeState::default()),
             rollup_caught_up: Mutex::new(None),
             landing_acks: landing_acks::LandingAcks::default(),
+            accepted_shares: std::sync::OnceLock::new(),
         }
+    }
+    /// Render `qbit_prism_accepted_shares_total` from `read` at every scrape
+    /// (#581), as `qbit_prism_rejections_total` is rendered from its events:
+    /// both stay current while a stalled health publisher leaves the cached
+    /// body stale. The first attachment wins.
+    pub fn read_accepted_shares_at_scrape(&self, read: impl Fn() -> u64 + Send + Sync + 'static) {
+        let _ = self.accepted_shares.set(Box::new(read));
     }
     pub fn runtime(&self) -> Arc<runtime::RuntimeMonitor> {
         self.runtime.clone()
     }
     /// Registry rendering does not query the database, node, or filesystem.
-    /// Runtime/freshness are appended at HTTP request time by the snapshot owner.
+    /// Runtime/freshness are appended at HTTP request time by the snapshot owner,
+    /// and the live families (`Family::is_live`: collector measurements, pool
+    /// waits, landing and node ages, and since #581 the accepted and rejected
+    /// share counters) are overlaid on the cached body at every scrape.
     pub fn render(&self) -> String {
         self.current_registry().render()
     }
@@ -278,6 +294,9 @@ impl Metrics {
         let stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let collections = self.collections.lock().unwrap_or_else(|e| e.into_inner());
         let mut registry = stored.clone();
+        if let Some(read) = self.accepted_shares.get() {
+            registry.set(Family::Accepted, vec![], read() as f64);
+        }
         registry.set(Family::RevisionWorkPending, Labels::Empty, landing.age());
         registry.set(
             Family::RevisionWorkUnknown,

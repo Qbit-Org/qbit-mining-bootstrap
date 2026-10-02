@@ -92,7 +92,7 @@ async fn submit_reason_normalization_is_bounded_and_preserves_tcp_errors() {
         );
         assert_eq!(
             observed_labels.len(),
-            14,
+            15,
             "free-form reasons must not create series"
         );
         assert_eq!(

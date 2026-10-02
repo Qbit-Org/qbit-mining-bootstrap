@@ -353,7 +353,7 @@ impl Ledger {
         let candidate = &claim.candidate;
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
             .bind(&candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).execute(&mut *tx).await?.rows_affected();
         ensure!(
             reserved == 1,

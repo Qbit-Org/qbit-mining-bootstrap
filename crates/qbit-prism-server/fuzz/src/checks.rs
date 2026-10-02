@@ -16,6 +16,7 @@ pub const DOCUMENTED_REASONS: &[&str] = &[
     "invalid-extranonce",
     "invalid-ntime-or-nonce",
     "backend-rpc-unavailable",
+    "backend-database-unavailable",
     "internal-error",
     "pool-closed",
     "ledger-confirmation-failed",

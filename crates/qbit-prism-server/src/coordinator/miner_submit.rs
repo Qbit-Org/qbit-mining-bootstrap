@@ -319,7 +319,7 @@ impl Coordinator {
         // the coordinator, before any await. Recorded on the candidate row
         // at enqueue; a clock before the epoch leaves it unknown.
         let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
-        let (last_poll, readiness_generation) = {
+        let (last_poll, readiness_generation, stale_readiness_reason) = {
             let readiness = self.readiness.read().await;
             let last_poll = readiness.last_poll.ok_or_else(|| {
                 protocol_error(
@@ -327,7 +327,15 @@ impl Coordinator {
                     "current chain state is unavailable",
                 )
             })?;
-            (last_poll, readiness.generation)
+            // #581: readiness ages out when neither a refresh nor a guarded
+            // tip poll (#622) renews it; the reason names the dependency the
+            // latest refresh failed on.
+            let reason = if readiness.refresh_failed_on_database {
+                DATABASE_UNAVAILABLE
+            } else {
+                "backend-rpc-unavailable"
+            };
+            (last_poll, readiness.generation, reason)
         };
         let context = &job.context;
         self.ensure_job_fee_current(context.prepared.fee)
@@ -347,7 +355,7 @@ impl Coordinator {
             && !selected.share_lease
         {
             return Err(protocol_error(
-                "backend-rpc-unavailable",
+                stale_readiness_reason,
                 "current chain state is unavailable",
             ));
         }
@@ -359,10 +367,7 @@ impl Coordinator {
                 .ok_or_else(|| protocol_error("stale-job", "stale job"))?
         } else {
             self.submit_ledger.payout_revision().await.map_err(|_| {
-                protocol_error(
-                    "backend-rpc-unavailable",
-                    "current payout state is unavailable",
-                )
+                protocol_error(DATABASE_UNAVAILABLE, "current payout state is unavailable")
             })?
         };
         let parent_stale = selected.hash != job.wire.previousblockhash;

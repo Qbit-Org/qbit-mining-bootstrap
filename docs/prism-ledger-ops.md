@@ -238,8 +238,8 @@ one of the three that reads the node, and is described after the other two.
 
 ```sh
 qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
-qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>"
-qbit-prism-server candidates recover --block-hash <64 lowercase hex> [--block-hash <hash> ...] [--apply] [--timeout-seconds <1..3600, default 600>]
+qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>" [--unsafe-database-clock-expiry]
+qbit-prism-server candidates recover --block-hash <64 lowercase hex> [--block-hash <hash> ...] [--apply] [--timeout-seconds <1..3600, default 600>] [--unsafe-database-clock-expiry]
 ```
 
 `list` prints unfinished rows up to the selected limit — `pending`, `offer_reserved`, `offered`
@@ -265,7 +265,7 @@ b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1  pending       
 | `height` | `candidate->'found_block'->>'block_height'`, extracted server-side. `-` (text) or `null` (`--json`) when the document holds no readable height — an unknown-`storage_version` row, for example. Never `0`. |
 | `attempts` | `attempt_count`: how many claims the row has taken, not how many offers were made. |
 | `next_attempt` | `next_attempt_at`, or `parked` when it is `infinity`. |
-| `claim` | `<claim_instance_id> until <claim_expires_at>` for a live claim, `expired` for a claim past its expiry (the row is workable again), `-` for none. `--json` keeps the stale holder and expiry. |
+| `claim` | `<claim_instance_id> until <claim_expires_at>` for a claim the database clock still calls live, `expired` for one past that expiry, `-` for none. The expiry is the database clock's estimate only: a frontend takes a claimed row over once it has watched the claim go unrenewed for its whole lease (see [Candidate claim leases and database clock steps](#candidate-claim-leases-and-database-clock-steps-021-581)). `--json` keeps the stale holder and expiry. |
 | `sv` | `storage_version`. Anything other than `1` is a row this server cannot decode. |
 | `last_error` | Why the last attempt stopped. Truncated in text mode only, and marked `…(truncated)` when it is; `--json` prints it whole. |
 
@@ -327,7 +327,7 @@ there stays as evidence that the row had been parked.
 | 2 | No such row. | `no candidate row for <hash>` |
 | 3 | Offered to the node; never abandonable. | `candidate <hash> is in state <state>; it was offered to the node and is never abandoned. Its block may already have been submitted. Leave it to reconciliation` |
 | 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned\|orphaned>; nothing to do` |
-| 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 5 | Held by a live claim: one that changed while the command watched it, or, with `--unsafe-database-clock-expiry`, one the database clock calls live. | `candidate <hash> is held by <instance>, whose claim changed while this command watched it (the holder renewed it, or a frontend took the row over), so it is live (database clock estimate: until <expiry>); retry once the holder has released it`, or with the flag `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version and directs legacy rows to the pinned `2.x.x` drain, newer formats to a compatible release. |
 | 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | `candidate <hash> holds a pre-migration 2.x.x document at storage_version 1; evidence preserved. This release cannot replay it, and abandoning it would discard the block the legacy drain still owes: drain it with the pinned 2.x.x image, never an operator abandon` |
@@ -335,10 +335,26 @@ there stays as evidence that the row had been parked.
 Codes 3, 6, 7 and 8 protect offer, accounting, storage-format and legacy-era
 evidence. Code 4
 is kept distinct from code 2 so that re-running a successful abandon reads as
-"nothing to do" rather than as a lost row. An **expired** claim is not a live
-claim, so a supported row whose owner died is abandonable without waiting;
-code 5 reflects whether the claim was live at one database timestamp captured
-after acquiring the settlement lock. The UPDATE and refusal diagnosis share that
+"nothing to do" rather than as a lost row.
+
+A claim is over for `abandon` as it is for a frontend (#581): only once the
+command has itself watched it go unrenewed for its whole lease, on its own
+monotonic clock. A holder's writes are fenced on its token alone, so a
+`claim_expires_at` the database clock has passed does not mean the holder
+stopped, and after a forward step it would otherwise abandon a block its live
+holder is about to offer. On a claimed row the command prints `candidate
+<hash> is claimed by <instance>; waiting <N> s for the claim to go unrenewed
+for its whole lease`, waits once (up to one lease: 120 s, or 600 s for a claim
+taken before 021, and 0 s for a revoked one), and abandons the row by compare
+and set on the version it watched. A claim that changed meanwhile, renewed or
+taken over, is live, and its refusal (exit 5) is the answer.
+`--unsafe-database-clock-expiry` restores the pre-021 rule instead: an
+**expired** claim, `claim_expires_at` before the database clock, is not a live
+claim, so a supported row whose owner died is abandonable without waiting.
+That is wrong by the size of any database clock step, so use it only when the
+holder is known to be gone and the clock has not stepped. Under that rule code
+5 reflects whether the claim was live at one database timestamp captured after
+acquiring the settlement lock. The UPDATE and refusal diagnosis share that
 timestamp, so expiry between them still reports a claim refusal rather than an
 internal consistency error; a fresh invocation can abandon the now-expired row. Unsupported versions report
 code 7, and an unreplayable version-1 document code 8, both ahead of claim
@@ -455,7 +471,17 @@ Then, for each planned block in height order:
    ordinary lease heartbeat renews the claim while the work runs. The claim
    statement's `WHERE` is the safety property — an unfinished state, no live
    claim, `storage_version = 1` and a document this release wrote, the same
-   shape test `abandon` uses. A row parked with `next_attempt_at =
+   shape test `abandon` uses. Another holder's claim is over only once this
+   command has itself watched it go unrenewed for its whole lease, as a
+   frontend does (#581): it prints `candidate <hash> is claimed by <instance>;
+   waiting <N> s for the claim to go unrenewed for its whole lease`, waits
+   once when the deadline leaves room, and takes the row over by compare and
+   set on the version it watched. A holder that renews meanwhile is live, and
+   its refusal (exit 5) is the answer. `--unsafe-database-clock-expiry`
+   restores the pre-021 rule instead, `claim_expires_at` before the database
+   clock; it is wrong by the size of any database clock step (a forward step
+   takes a live holder's row), so use it only when the holder is known to be
+   gone and the database clock has not stepped. A row parked with `next_attempt_at =
    'infinity'` is claimable here, because a parked row is operator work,
    but its schedule is left untouched.
 3. It decodes and authenticates the row exactly as the claim lane does
@@ -516,7 +542,7 @@ Codes shared with `abandon` keep their meaning.
 | 1 | Configuration, database or node failure, including unconfirmed claim cleanup, a halted cluster, a live legacy Python writer lease, a node that is unreachable or not caught up, and an allowlist the command refuses (a duplicate, more than 32 or a malformed hash). | The underlying error, as for every other command. |
 | 2 | A listed hash has no outbox row. | `no candidate row for <hash>` |
 | 4 | A listed row is terminal and cannot be recovered. | `candidate <hash> is already abandoned; its evidence was released and it cannot be recovered`, `candidate <hash> is already orphaned; its candidate payload was released and its accounting remains in the ledger. Leave chain changes to reconciliation`, or `candidate <hash> is submitted but its accounting is not proven complete (<what is missing>); inspect qbit_pool_blocks and qbit_pool_audit_bundles before retrying` |
-| 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance>, whose claim this command must watch go unrenewed for <N> more seconds of its lease (database clock estimate: until <expiry>); the deadline leaves no room for that, or the holder renewed while this command waited and is live. Retry with a longer --timeout-seconds, or once the holder has released it`; with `--unsafe-database-clock-expiry`, `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version, as for `abandon`. |
 | 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | As for `abandon`, ending in `drain it with the pinned 2.x.x image` |
 | 9 | Not on the active chain: the node does not hold the block at its height. Nothing to recover; `recover` never offers. | `candidate <hash> is not on the active chain (<node detail>); nothing to recover. recover never offers a block: a block the node never accepted stays with the coordinator (or, while pending, may be abandoned); a block a reorg removed stays in reconciliation` |
@@ -606,8 +632,10 @@ error returns a row to `pending` or abandons it. Only when that settlement
 itself cannot be written does the error propagate, and the row keeps its
 reservation or offer record for the next claim.
 
-**Recovery.** Every unfinished state is claimable once its lease expires, on
-any frontend, and counts toward the candidate backlog and retention. A
+**Recovery.** Every unfinished state is claimable once its lease is over, on
+any frontend (a frontend that has watched the claim go unrenewed for its
+whole lease takes it over, #581), and counts toward the candidate backlog and
+retention. A
 recovered `offer_reserved` row is delivery unknown: the call may or may not
 have been made, so it is never offered again even when the node reports the
 block unknown; it lands its audit and waits in `reconciliation` for the chain.
@@ -826,6 +854,112 @@ PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
 socket write or a missing RPC reply: an offered block is confirmed only by a
 fresh active-chain observation.
+
+## Candidate claim leases and database clock steps (021, #581)
+
+Every outbox deadline used to be the database clock: `next_attempt_at`
+(`clock_timestamp()` + backoff) and `claim_expires_at` (`clock_timestamp()` +
+lease), compared with `clock_timestamp()` by the claim lanes and by every
+write the holder made. A database clock step moved all of them by the step.
+Forward, a live claim looked expired at once, another frontend took the row
+while the holder was still offering its block, and the holder's next write
+was refused. Backward, a dead holder's row waited lease + step, and a retry
+waited backoff + step (the #586 clock-jump test's stranded reconciliation
+row, two hours). Since 021 neither decision reads the database clock's
+estimate of a lease, and a retry the clock stepped back over is due at once.
+
+**Leases.** A claim's version is (`claim_token`, `claim_renewals`): a claim
+writes renewals 0, every renewal adds one. Its lease is
+`claim_lease_seconds`, written by the claim and by every renewal (1 to 600,
+120 for the submit loop and for `candidates recover`).
+
+- Every claim poll (`Ledger::claim_survey_sql`) reads the version and lease
+  of every claimed unfinished row, and the frontend starts its own monotonic
+  clock for a version the first time a reply shows it. That reply arrives
+  after the commit that wrote the version, which comes after the instant the
+  holder started the renewal its own lease is measured from, so the holder's
+  lease always ends first, whatever either wall clock or the database clock
+  reads.
+- A frontend takes a claimed row over only once it has watched the same
+  version for the whole lease, and only by compare and set on that version
+  (`FOR UPDATE SKIP LOCKED`, so a landing transaction holding the row is
+  never taken mid-commit). Any renewal, release or other takeover since
+  changes the version, and the takeover changes nothing. A takeover runs
+  before the dispatch probe and the claim lanes and takes no scheduling slot;
+  the lanes and the probe serve unclaimed rows only.
+- A claimed row is taken over whatever its `next_attempt_at`, unless it is
+  parked (`infinity`). Its schedule is the one it was claimed with, on the
+  clock of that moment, and nothing rewrites it while the claim lasts, while
+  every renewal rewrites `updated_at`: after a backward step and one renewal,
+  neither says the row is due, and a dead holder's row would otherwise wait
+  out the step. The lanes claim only due rows, so only a `candidates recover`
+  claim of a row still in backoff can be taken over before its backoff ends.
+- The holder's writes are fenced on its token alone. Its lease is its own
+  monotonic deadline (`with_tracked_heartbeat`: the start of its last
+  successful renewal plus the lease), which stops its work before any
+  observer's clock can end the lease. A renewal that times out on lock
+  contention only proves the token still holds the row; it never extends the
+  deadline.
+- `claim_expires_at` is still written, as the database clock's estimate of
+  the lease's end, for `candidates list` and the operator. No decision reads
+  it, except `candidates abandon` and `candidates recover` with
+  `--unsafe-database-clock-expiry`.
+
+What this costs: a frontend that starts while a dead holder's claim is in the
+table times it from its own first reply, so that takeover comes up to one
+lease (120 s) later than the claim's true end, never earlier. A claim taken
+before 021, which recorded no lease, is timed as the 600-second maximum.
+Monotonic clocks are not wall clocks: a holder whose host was suspended past
+its lease resumes believing its lease is live, exactly as before 021, and
+its token fence and the offer-before-landing lifecycle (a recovered
+`offer_reserved` row is never offered again) keep that safe.
+
+**Retries.** Every statement that schedules a retry writes `updated_at` from
+the same database clock as `next_attempt_at`. A row whose last write is later
+than the clock now proves the clock stepped back since, so its deadline is
+due at once: each claim poll reschedules such unclaimed rows to the clock (and
+logs `candidate retries were last written later than the database clock reads
+now, so the clock stepped back`). `candidates recover`'s release keeps the
+row's schedule, which its claim's own write may have hidden a step from, but
+never further ahead than the row's own backoff (`min(60, attempt_count)`
+seconds, `min(3600, 10 * attempt_count)` in reconciliation). A backward step
+therefore delays a retry by less than its own backoff, never by the step. A
+forward step makes a retry due early by up to its backoff; retries are pacing,
+not a safety property. A row parked for the operator (`next_attempt_at =
+'infinity'`) is never made due. A deadline set far ahead without a later
+`updated_at` (a test or operator hold) stays held by the claim polls, but a
+`candidates recover` release pulls it in to the row's own backoff.
+
+**Revoking a claim.** `ledger::revoke_candidate_claims` sets
+`claim_lease_seconds = 0` (and moves `claim_expires_at` into the past), so the
+next frontend to read the claim takes it over at once. The holder's token
+stays until then. The lease tests use it where waiting out a real lease is not
+deterministic. An operator may run the same statement only once the holder is
+known to be gone (its process stopped, or its host down for good):
+
+```sql
+UPDATE qbit_block_candidate_outbox
+SET claim_lease_seconds = 0,
+    claim_expires_at = LEAST(claim_expires_at, clock_timestamp() - interval '1 second')
+WHERE block_hash = '<hash>' AND claim_token IS NOT NULL;
+```
+
+**Upgrade (offline, per D5).** 021 adds the two columns, the
+`qbit_block_candidate_outbox_claimed_idx` partial index the claim poll reads
+claimed rows through, and the `candidate_claim_observed_lease = 1`
+capability. A pre-021 frontend takes claims over by the database clock and
+never writes the columns a post-021 frontend times, so the two must never
+run together. As for 018: stop every earlier frontend and one-shot tool,
+disable automatic restarts, and let every `qbit_prism_instances` row report
+`stopped` or `drained`; the migrator refuses any other instance before
+applying 021 and holds the registration lock through the commit. The
+capability refuses older binaries at every later connect; it cannot evict one
+that is already running. Start only post-021 binaries after the commit.
+Removing the capability or the columns is not a supported downgrade.
+
+**Not changed.** CTV fanout claims (`qbit_ctv_fanout_artifacts.claim_expires_at`,
+`next_broadcast_attempt_at`) still compare with the database clock, so a
+step stretches or shortens them as it did candidate claims before 021.
 
 ## Chain observation epoch upgrade (018)
 

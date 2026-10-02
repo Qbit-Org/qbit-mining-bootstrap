@@ -7,10 +7,12 @@ authorization before subscription consume no session sequence value. Repeated
 or pipelined subscriptions return the same eight-character lowercase hex value.
 The backend allocator and wire width are unchanged.
 
-A failed allocation returns `backend-rpc-unavailable` and leaves the connection
-unsubscribed. An immediate failure can be retried on that connection. A timeout
-returns the same category with `session allocation timed out`; a sequence value
-already consumed before the timeout is not published or reused.
+A failed allocation returns `backend-database-unavailable` (`database
+unavailable`, #581) and leaves the connection unsubscribed. An immediate
+failure can be retried on that connection. A timeout returns
+`backend-rpc-unavailable` with `session allocation timed out`, because the
+session cannot tell which dependency stalled; a sequence value already
+consumed before the timeout is not published or reused.
 
 The initial-job lifetime now begins during connection setup, before the later
 subscription allocation. The base runtime began that lifetime after eager

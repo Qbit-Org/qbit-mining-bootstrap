@@ -3,7 +3,7 @@ use crate::{
     coordinator::{Coordinator, RecoveryStop},
     ledger::{
         audit_completeness, live_instances, unavailable_live_instances, AuditCompleteness,
-        LiveInstancesReport, RecoveryClaim, RecoveryReader, RecoveryRow,
+        LiveInstancesReport, RecoveryClaim, RecoveryReader, RecoveryRow, RecoveryTakeover,
     },
     rpc::{Rpc, RpcReplyError},
 };
@@ -231,6 +231,11 @@ enum CandidatesCommand {
         block_hash: String,
         #[arg(long)]
         reason: String,
+        /// Abandon a claimed row once the database clock passes its claim_expires_at, instead of
+        /// after watching the claim go unrenewed for its whole lease. UNSAFE during or after a
+        /// database clock step: a forward step abandons a row its live holder is landing (#581).
+        #[arg(long)]
+        unsafe_database_clock_expiry: bool,
     },
     /// Land already-accepted blocks for an explicit allowlist of candidates, never offering one.
     Recover {
@@ -243,6 +248,11 @@ enum CandidatesCommand {
         /// One deadline, in seconds, for the whole operation: the plan, every node call and each landing.
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
+        /// Take over another holder's claim once the database clock passes its claim_expires_at,
+        /// instead of after watching it go unrenewed for its whole lease. UNSAFE during or after a
+        /// database clock step: a forward step takes a live holder's row (#581).
+        #[arg(long)]
+        unsafe_database_clock_expiry: bool,
     },
 }
 
@@ -588,7 +598,11 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
             }
             Ok(())
         }
-        CandidatesCommand::Abandon { block_hash, reason } => {
+        CandidatesCommand::Abandon {
+            block_hash,
+            reason,
+            unsafe_database_clock_expiry,
+        } => {
             // Both inputs are checked before any connection is opened, in the
             // formats the row itself uses: `candidate_sha256 ~
             // '^[0-9a-f]{64}$'` for the hash, and `fatal-state clear`'s rule
@@ -611,7 +625,25 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
                 None,
             )
             .await?;
-            let outcome = ledger.abandon_candidate(&block_hash, &reason).await;
+            let takeover = takeover_rule(unsafe_database_clock_expiry);
+            // #581: a claim is over once this command has watched it go
+            // unrenewed for its whole lease. It waits that out, once per
+            // version; a claim that changes meanwhile is live, and its
+            // refusal is the answer.
+            let mut waited_for: Option<String> = None;
+            let outcome = loop {
+                let outcome = ledger
+                    .abandon_candidate(&block_hash, &reason, takeover)
+                    .await;
+                let Ok(refused) = &outcome else {
+                    break outcome;
+                };
+                let Some(left) = observed_claim_wait(refused, &block_hash, &mut waited_for, None)
+                else {
+                    break outcome;
+                };
+                tokio::time::sleep(left).await;
+            };
             // Closed before the outcome is inspected, so a refusal releases
             // the pool exactly as a success does.
             ledger.pool.close().await;
@@ -627,8 +659,56 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
             block_hash,
             apply,
             timeout_seconds,
-        } => recover(block_hash, apply, timeout_seconds).await,
+            unsafe_database_clock_expiry,
+        } => {
+            let takeover = takeover_rule(unsafe_database_clock_expiry);
+            recover(block_hash, apply, timeout_seconds, takeover).await
+        }
     }
+}
+
+/// The takeover rule the two candidate commands that take a claimed row
+/// share (#581): an observed lease unless the operator names the unsafe one.
+fn takeover_rule(unsafe_database_clock_expiry: bool) -> RecoveryTakeover {
+    if unsafe_database_clock_expiry {
+        RecoveryTakeover::DatabaseClock
+    } else {
+        RecoveryTakeover::Observed
+    }
+}
+
+/// How long a candidate command waits before it retries a refusal of a claim
+/// it times on its own clock (#581), or `None` when the refusal is the
+/// answer: no timed claim, a claim whose version changed while the command
+/// waited (the holder renewed, or a frontend took the row over, so it is
+/// live), or a wait `deadline` leaves no room for. Announces the first wait.
+fn observed_claim_wait(
+    outcome: &Value,
+    hash: &str,
+    waited_for: &mut Option<String>,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<Duration> {
+    let (Some(left), Some(version)) = (
+        outcome["lease_remaining_ms"].as_u64(),
+        outcome["claim_version"].as_str(),
+    ) else {
+        return None;
+    };
+    let left = Duration::from_millis(left);
+    let renewed = waited_for.as_deref().is_some_and(|seen| seen != version);
+    let no_room = deadline.is_some_and(|deadline| tokio::time::Instant::now() + left >= deadline);
+    if renewed || no_room {
+        return None;
+    }
+    if waited_for.is_none() {
+        println!(
+            "candidate {hash} is claimed by {}; waiting {:.0} s for the claim to go unrenewed for its whole lease",
+            outcome["claim_instance_id"].as_str().unwrap_or("unknown"),
+            left.as_secs_f64().ceil()
+        );
+    }
+    *waited_for = Some(version.to_owned());
+    Some(left)
 }
 
 /// Print a candidate command's diagnostic and exit with its status.
@@ -648,7 +728,12 @@ fn refuse(code: i32, message: String) -> ! {
 /// connects as a one-shot tool, exactly as `self-check` and `broadcast-ctv`
 /// do, and drives the coordinator's own landing for each planned block in
 /// height order, stopping at the first that cannot be finished.
-async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Result<()> {
+async fn recover(
+    hashes: Vec<String>,
+    apply: bool,
+    timeout_seconds: u64,
+    takeover: RecoveryTakeover,
+) -> Result<()> {
     ensure!(
         hashes.len() <= MAX_RECOVERY_BLOCKS,
         "--block-hash may be given at most {MAX_RECOVERY_BLOCKS} times; recover takes an explicit allowlist, never everything"
@@ -732,7 +817,14 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
         ),
     };
     coordinator.landing_trim.set_enabled(landing_trim);
-    let outcome = apply_recovery(&coordinator, &plan.blocks, deadline, timeout_seconds).await;
+    let outcome = apply_recovery(
+        &coordinator,
+        &plan.blocks,
+        deadline,
+        timeout_seconds,
+        takeover,
+    )
+    .await;
     // A landing the deadline cut short may hold its connection until the
     // server abandons it, so the close is bounded as well.
     let _ = tokio::time::timeout(Duration::from_secs(5), coordinator.ledger.pool.close()).await;
@@ -1050,6 +1142,7 @@ async fn apply_recovery(
     blocks: &[PlannedBlock],
     deadline: tokio::time::Instant,
     timeout_seconds: u64,
+    takeover: RecoveryTakeover,
 ) -> Result<(usize, usize), Stop> {
     let (mut recovered, mut verified) = (0, 0);
     for block in blocks {
@@ -1101,9 +1194,7 @@ async fn apply_recovery(
             "recovering {} at height {} from {}",
             block.hash, block.height, block.state
         );
-        let claimed = coordinator
-            .claim_candidate_for_recovery(&block.hash, deadline)
-            .await;
+        let claimed = claim_for_recovery(coordinator, &block.hash, deadline, takeover).await;
         let claim = match claimed {
             Err(error) if matches!(error.downcast_ref::<RecoveryStop>(), Some(RecoveryStop::Deadline)) => {
                 return Err(Stop::Exit(
@@ -1128,6 +1219,32 @@ async fn apply_recovery(
         recovered += 1;
     }
     Ok((recovered, verified))
+}
+
+/// Claim one row for recovery. Another holder's claim is taken over, by
+/// default, only after this process has watched it go unrenewed for its
+/// whole lease (#581): a `claimed` refusal that names the time left is
+/// waited out, once, when the deadline leaves room for it, and a holder that
+/// renews meanwhile is live, so its refusal is the answer.
+async fn claim_for_recovery(
+    coordinator: &Coordinator,
+    hash: &str,
+    deadline: tokio::time::Instant,
+    takeover: RecoveryTakeover,
+) -> Result<RecoveryClaim> {
+    let mut waited_for: Option<String> = None;
+    loop {
+        let claimed = coordinator
+            .claim_candidate_for_recovery(hash, deadline, takeover)
+            .await?;
+        let RecoveryClaim::Refused(outcome) = &claimed else {
+            return Ok(claimed);
+        };
+        let Some(left) = observed_claim_wait(outcome, hash, &mut waited_for, Some(deadline)) else {
+            return Ok(claimed);
+        };
+        tokio::time::sleep(left).await;
+    }
 }
 
 /// The exit status of a recovery that stopped after its claim. A typed stop
@@ -1172,11 +1289,20 @@ fn recover_refusal(outcome: &Value, hash: &str) -> Result<(i32, String)> {
         ),
         "claimed" => (
             5,
-            format!(
-                "candidate {hash} is held by {} until {}; retry after the claim expires",
-                field("claim_instance_id"),
-                field("claim_expires_at")
-            ),
+            match outcome["lease_remaining_ms"].as_u64() {
+                // #581: timed by this command, not the database clock.
+                Some(left) => format!(
+                    "candidate {hash} is held by {}, whose claim this command must watch go unrenewed for {} more seconds of its lease (database clock estimate: until {}); the deadline leaves no room for that, or the holder renewed while this command waited and is live. Retry with a longer --timeout-seconds, or once the holder has released it",
+                    field("claim_instance_id"),
+                    left.div_ceil(1000),
+                    field("claim_expires_at")
+                ),
+                None => format!(
+                    "candidate {hash} is held by {} until {}; retry after the claim expires",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                ),
+            },
         ),
         "unsupported_storage_version" => (
             7,
@@ -1249,11 +1375,21 @@ fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i3
         ),
         "claimed" => (
             5,
-            format!(
-                "candidate {block_hash} is held by {} until {}; retry after the claim expires",
-                field("claim_instance_id"),
-                field("claim_expires_at")
-            ),
+            if outcome["lease_remaining_ms"].is_u64() {
+                // #581: timed by this command, which waited and saw the
+                // claim change, not by the database clock.
+                format!(
+                    "candidate {block_hash} is held by {}, whose claim changed while this command watched it (the holder renewed it, or a frontend took the row over), so it is live (database clock estimate: until {}); retry once the holder has released it",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                )
+            } else {
+                format!(
+                    "candidate {block_hash} is held by {} until {}; retry after the claim expires",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                )
+            },
         ),
         "landed" => (
             6,
@@ -1773,6 +1909,84 @@ mod configuration_tests {
     /// The recover allowlist and deadline are checked where clap parses them
     /// and, for the bounds clap cannot express, at the top of `recover`.
     #[test]
+    fn abandon_waits_out_an_observed_lease_unless_named_unsafe() {
+        let hash = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "prism",
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &hash,
+                "--reason",
+                "superseded",
+            ];
+            args.extend_from_slice(extra);
+            let Some(Command::Candidates {
+                command:
+                    CandidatesCommand::Abandon {
+                        unsafe_database_clock_expiry,
+                        ..
+                    },
+            }) = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command");
+            };
+            takeover_rule(unsafe_database_clock_expiry)
+        };
+        assert_eq!(parse(&[]), RecoveryTakeover::Observed, "#581's default");
+        assert_eq!(
+            parse(&["--unsafe-database-clock-expiry"]),
+            RecoveryTakeover::DatabaseClock
+        );
+    }
+
+    #[test]
+    fn a_timed_claim_is_waited_out_once_per_version_and_never_past_a_deadline() {
+        let refusal = |version: &str| json!({"outcome": "claimed", "claim_instance_id": "a", "lease_remaining_ms": 1500, "claim_version": version});
+        let hash = "ab".repeat(32);
+        let mut waited_for = None;
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut waited_for, None),
+            Some(Duration::from_millis(1500))
+        );
+        // The same version again: time left is waited out again.
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut waited_for, None),
+            Some(Duration::from_millis(1500))
+        );
+        // A renewal since is a live holder: the refusal is the answer.
+        assert_eq!(
+            observed_claim_wait(&refusal("t#1"), &hash, &mut waited_for, None),
+            None
+        );
+        let soon = tokio::time::Instant::now() + Duration::from_millis(1000);
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut None, Some(soon)),
+            None,
+            "a wait the deadline cannot fit"
+        );
+        let untimed = json!({"outcome": "claimed", "claim_instance_id": "a", "claim_expires_at": "2026-01-01T00:00:00+00:00"});
+        assert_eq!(
+            observed_claim_wait(&untimed, &hash, &mut None, None),
+            None,
+            "the database clock's refusal is final"
+        );
+        let (code, message) = abandon_report(&refusal("t#1"), &hash, "superseded").unwrap();
+        assert_eq!(code, 5);
+        assert!(
+            message.contains("whose claim changed while this command watched it"),
+            "{message}"
+        );
+        let (code, message) = abandon_report(&untimed, &hash, "superseded").unwrap();
+        assert_eq!(code, 5);
+        assert!(
+            message.contains("retry after the claim expires"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn recover_arguments_are_bounded_at_the_entry() {
         let hash = "ab".repeat(32);
         let parsed = Cli::try_parse_from([
@@ -1786,6 +2000,7 @@ mod configuration_tests {
             "--apply",
             "--timeout-seconds",
             "3600",
+            "--unsafe-database-clock-expiry",
         ])
         .unwrap();
         let Some(Command::Candidates {
@@ -1794,6 +2009,7 @@ mod configuration_tests {
                     block_hash,
                     apply,
                     timeout_seconds,
+                    unsafe_database_clock_expiry,
                 },
         }) = parsed.command
         else {
@@ -1802,11 +2018,13 @@ mod configuration_tests {
         assert_eq!(block_hash, vec![hash.clone(), "cd".repeat(32)]);
         assert!(apply);
         assert_eq!(timeout_seconds, 3600);
+        assert!(unsafe_database_clock_expiry);
         let Some(Command::Candidates {
             command:
                 CandidatesCommand::Recover {
                     apply,
                     timeout_seconds,
+                    unsafe_database_clock_expiry,
                     ..
                 },
         }) = Cli::try_parse_from(["prism", "candidates", "recover", "--block-hash", &hash])
@@ -1817,6 +2035,10 @@ mod configuration_tests {
         };
         assert!(!apply, "plan-only by default");
         assert_eq!(timeout_seconds, 600, "the 2.x.x runner's default");
+        assert!(
+            !unsafe_database_clock_expiry,
+            "takeover waits out an observed lease by default (#581)"
+        );
         for (args, expected) in [
             (vec!["prism", "candidates", "recover"], "--block-hash"),
             (

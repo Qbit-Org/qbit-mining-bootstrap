@@ -80,6 +80,11 @@
       "owner": "runtime",
       "reason": "Lexical name collision with checkout/helper methods: CPU preparation, admission, runtime or command dispatch, rather than a fresh SQLx checkout at this call site."
     },
+    "claim-revocation": {
+      "class": "operator",
+      "owner": "candidate claim tests and operators",
+      "reason": "Generic Executor helper that revokes candidate claims (#581): the lease tests and an operator pass a pool or their own transaction; no run frontend call."
+    },
     "shielded-begin": {
       "class": "borrowed",
       "owner": "ledger",
@@ -196,6 +201,7 @@
     "ledger/candidates.rs::unfinished_states#1::fetch_all(& self . pool)": [1,"operator"],
     "ledger/candidates.rs::claim_candidate_for_recovery#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::release_recovery_token#1::self .begin()": [1,"ledger"],
+    "ledger/candidates.rs::revoke_candidate_claims#1::execute(executor)": [1,"claim-revocation"],
     "ledger/connect.rs::release#1::pool .acquire() [timer: self . metrics . as_deref ( )]": [1,"timer"],
     "ledger/connect.rs::drop#2::pool .acquire() [timer: metrics . as_deref ( )]": [1,"timer"],
     "ledger/connect.rs::begin#1::shielded_begin(self . acquire ( ) . await ?)": [1,"shielded-begin"],

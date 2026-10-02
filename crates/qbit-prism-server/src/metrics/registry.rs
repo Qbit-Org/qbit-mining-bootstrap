@@ -164,7 +164,12 @@ impl Family {
         self.is_collection()
             || matches!(
                 self,
-                Self::PoolAcquire
+                // #581: the share-refusal rules read these two, and they must
+                // see an outage while the health publisher, and so the
+                // cached body, is stalled behind the database.
+                Self::Accepted
+                    | Self::Rejections
+                    | Self::PoolAcquire
                     | Self::RevisionWork
                     | Self::RevisionWorkPending
                     | Self::RevisionWorkUnknown

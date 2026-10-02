@@ -75,14 +75,14 @@ impl Ledger {
             landed.join(", ")
         );
         let abandoned = sqlx::query(
-            "UPDATE qbit_block_candidate_outbox SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error='epoch-superseded',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE state='pending'")
+            "UPDATE qbit_block_candidate_outbox SET state='abandoned',candidate=NULL,block_bytes=NULL,window_anchor_ms=NULL,window_prior_balances_sha256=NULL,window_first_share_seq=NULL,window_last_share_seq=NULL,window_share_count=NULL,window_snapshot_sha256=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error='epoch-superseded',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE state='pending'")
             .execute(&mut *tx).await?.rows_affected();
         // Offered, reserved and reconciliation rows keep their as-issued
         // policy, keys, bytes and state. Fence old tokens and allow recovery
         // immediately after restart, without waiting for a departed owner.
         // Parked rows still require their existing operator recovery procedure.
         let retained = sqlx::query(
-            "UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,next_attempt_at=CASE WHEN next_attempt_at='infinity'::timestamptz THEN next_attempt_at ELSE clock_timestamp() END,updated_at=clock_timestamp() WHERE state IN ('offer_reserved','offered','reconciliation')")
+            "UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,next_attempt_at=CASE WHEN next_attempt_at='infinity'::timestamptz THEN next_attempt_at ELSE clock_timestamp() END,updated_at=clock_timestamp() WHERE state IN ('offer_reserved','offered','reconciliation')")
             .execute(&mut *tx).await?.rows_affected();
         let next_revision: i64 = sqlx::query_scalar(
             "UPDATE qbit_prism_cluster SET config_fingerprint=$1,payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision")

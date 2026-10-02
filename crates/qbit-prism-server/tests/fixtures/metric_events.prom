@@ -34,6 +34,7 @@ qbit_prism_share_ack_seconds_sum{result="rejected"} 60.166
 qbit_prism_share_ack_seconds_count{result="rejected"} 9
 # HELP qbit_prism_rejections_total Share rejections by canonical bounded reason ID.
 # TYPE qbit_prism_rejections_total counter
+qbit_prism_rejections_total{reason_id="backend-database-unavailable"} 1
 qbit_prism_rejections_total{reason_id="backend-rpc-unavailable"} 1
 qbit_prism_rejections_total{reason_id="duplicate-share"} 1
 qbit_prism_rejections_total{reason_id="internal-error"} 1
