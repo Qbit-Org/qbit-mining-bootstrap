@@ -10985,6 +10985,10 @@ async fn ordered_tips_run_holding(
         "1",
         "--min-mem-available-mib",
         "0",
+        // The boundary's wait for an outstanding landing is this plus the
+        // drain margin.
+        "--share-commit-timeout-seconds",
+        "1",
     ]);
     let plan = PhasePlan {
         name: "warm_up".into(),
@@ -11270,11 +11274,48 @@ async fn a_scheduled_block_refused_with_its_outcome_unknown_still_holds_the_next
     Ok(())
 }
 
-/// A `stale-job` refusal is the block's verdict: nothing entered the ledger
-/// and nothing will reach the node, so the tips go out without waiting for
-/// an offer that never comes.
+/// A block on block-only work, retired by a same-parent payout replacement,
+/// is answered `stale-job` and still captured and offered (#478). So the
+/// refusal is not the block's verdict: the tip stays held until the node
+/// has answered the offer that came 1.5 s later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_scheduled_block_the_server_refused_as_stale_releases_the_next_tip() -> Result<()> {
+async fn a_scheduled_block_captured_after_a_stale_job_refusal_still_holds_the_next_tip(
+) -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 21,
+            reason_id: Some("stale-job".into()),
+            message: "stale job".into(),
+        }),
+        write_failed: false,
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A refused block the node never sees is never settled: the tip held
+/// behind it is reported unminted and the landing unsettled, after the
+/// boundary's wait, rather than released on the server's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_block_the_node_never_sees_is_reported_unsettled() -> Result<()> {
     use std::time::Duration;
     let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
         notify_delay: Duration::from_millis(20),
@@ -11291,14 +11332,15 @@ async fn a_scheduled_block_the_server_refused_as_stale_releases_the_next_tip() -
     let (chain, verdicts) = ordered_chain(&node);
     use node::TipOrigin::External;
     assert_eq!(verdicts, vec![]);
-    assert_eq!(chain, vec![External, External, External]);
-    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(chain, vec![External, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (1, 1));
     let landing = &outcome.ordered_landings[0];
+    assert!(landing.sent_seconds.is_some(), "{landing:?}");
     assert_eq!(
-        landing.settled.as_deref(),
-        Some("the server refused it: stale job")
+        (landing.settled.as_deref(), landing.settled_seconds),
+        (None, None),
+        "{landing:?}"
     );
-    assert!(landing.block_hash.is_some(), "{landing:?}");
     Ok(())
 }
 

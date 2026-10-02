@@ -3005,8 +3005,7 @@ impl OfferPicker {
 /// its height to that tip, and the run landed no own block. Now the block is
 /// sent only once its session holds work on the node's settled tip, and no
 /// tip is minted from the moment the block is due until it has settled: the
-/// node answered its `submitblock`, the server refused it, or the session
-/// could not send it. Offsets are seconds into the phase; `None` is "not by
+/// node answered its `submitblock`, or the session could not send it. Offsets are seconds into the phase; `None` is "not by
 /// the phase's end", never zero (EP-OBSERVABILITY).
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct OrderedLanding {
@@ -3094,30 +3093,14 @@ fn landing_settlement(
                 &header,
             ))
         });
-    match (&record.outcome, hash) {
-        (_, Some(hash)) if node.block_answered(&hash) => {
-            Some((Some(hash), "the node answered its submitblock".into()))
-        }
-        // Only a refusal that proves the block never entered the ledger
-        // settles it: a block candidate's append is never refused, so one
-        // answered `ledger-outcome-unknown` or `ledger-confirmation-failed`
-        // can still be offered (EP-ERRORS).
-        (Outcome::Rejected(rejection), hash)
-            if matches!(
-                rejection.reason_id.as_deref(),
-                Some("stale-job" | "low-difficulty")
-            ) =>
-        {
-            Some((
-                hash,
-                format!("the server refused it: {}", rejection.message),
-            ))
-        }
-        // Accepted by the server, refused with an outcome still open, or
-        // unanswered: the block may yet reach the node, so the tips stay
-        // held.
-        _ => None,
-    }
+    // Only the node settles a block the session sent. The server's answer
+    // is not its verdict: a block candidate's append is never refused, so
+    // one answered `ledger-outcome-unknown` or `ledger-confirmation-failed`
+    // can still be offered, and a block on block-only work is answered
+    // `stale-job` and still captured and offered (#478) (EP-ERRORS).
+    let hash = hash?;
+    node.block_answered(&hash)
+        .then(|| (Some(hash), "the node answered its submitblock".into()))
 }
 
 impl OrderedLanding {
