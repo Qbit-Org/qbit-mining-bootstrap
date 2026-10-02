@@ -127,6 +127,14 @@ POSTGRES_DB = "qbit"
 COORDINATOR_IMAGE = "qbit-lab-prism-coordinator:local"
 REAL_MINER_IMAGE = "qbit-lab-real-miner:local"
 WALLET = "l6"
+# The client timeout on each qbitd RPC.
+RPC_TIMEOUT = 30.0
+# The bound on creating the lane's wallet, client timeout and wait included
+# (#637). qbitd takes 24.5-30 s on the lane's runner, nearly all of it
+# deriving the create-time P2MR keys, so a 30 s RPC races it; the lane waits
+# for the wallet instead. Ten times the usual cost still leaves the 45-minute
+# job most of what its cold build and the ten-minute scenario need.
+WALLET_SECONDS = 300.0
 DIFF1_TARGET = 0xFFFF << 208
 # An Ed25519 private key in PKCS#8 DER is this prefix and the 32-byte seed.
 ED25519_PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
@@ -147,6 +155,14 @@ ADDRESS = re.compile(r"^[a-z0-9]{8,120}$")
 
 class LaneFailure(RuntimeError):
     pass
+
+
+class RpcTimeout(LaneFailure):
+    """A qbitd RPC that did not answer within its client timeout.
+
+    Its outcome is unknown: the node carries on with the call after the
+    client gives up.
+    """
 
 
 def log(message: str) -> None:
@@ -427,18 +443,57 @@ class Rpc:
         credentials = base64.b64encode(f"{QBIT_RPC_USER}:{QBIT_RPC_PASSWORD}".encode()).decode()
         self.headers = {"Authorization": f"Basic {credentials}", "Content-Type": "application/json"}
 
-    def call(self, method: str, params: list | None = None, wallet: str | None = None):
+    def call(self, method: str, params: list | None = None, wallet: str | None = None,
+             timeout: float | None = None):
+        timeout = RPC_TIMEOUT if timeout is None else timeout
         url = f"http://127.0.0.1:{QBIT_RPC_PORT}/" + (f"wallet/{wallet}" if wallet else "")
         body = json.dumps({"jsonrpc": "1.0", "id": method, "method": method, "params": params or []})
         request = urllib.request.Request(url, data=body.encode(), headers=self.headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read())
         except urllib.error.HTTPError as error:
             payload = json.loads(error.read() or b"{}")
+        except urllib.error.URLError as error:
+            # A connect timeout arrives wrapped; a read timeout (below) bare.
+            if isinstance(error.reason, TimeoutError):
+                raise RpcTimeout(f"qbit RPC {method} timed out after {timeout:g}s") from error
+            raise
+        except TimeoutError as error:
+            raise RpcTimeout(f"qbit RPC {method} timed out after {timeout:g}s") from error
         if payload.get("error"):
             raise LaneFailure(f"qbit RPC {method} failed: {payload['error']}")
         return payload["result"]
+
+
+def create_wallet(rpc: Rpc, name: str, seconds: float = WALLET_SECONDS) -> dict:
+    """Create wallet `name` on the node and return once the node has it loaded (#637).
+
+    createwallet can outlast its client timeout, and the node finishes the
+    wallet after the client gives up, so a timeout is an unknown outcome:
+    the lane then waits for `listwallets` to show the wallet, which qbitd
+    does only once the wallet is created and loaded. It never issues
+    createwallet again, as the first one may already have made the wallet.
+    One deadline covers the call and the wait. Any other failure of the call
+    fails the lane. Returns how the wallet arrived, for the report.
+    """
+    started = time.monotonic()
+    deadline = started + seconds
+    try:
+        rpc.call("createwallet", [name], timeout=min(RPC_TIMEOUT, seconds))
+        return {"outcome": "created", "seconds": round(time.monotonic() - started, 1)}
+    except RpcTimeout as error:
+        log(f"{error}; the node finishes the wallet regardless, so waiting for listwallets to show {name!r}")
+
+    def loaded():
+        remaining = deadline - time.monotonic()
+        wallets = rpc.call("listwallets", timeout=max(0.1, min(RPC_TIMEOUT, remaining)))
+        if name not in wallets:
+            raise LaneFailure(f"listwallets shows {wallets}")
+        return True
+
+    until(f"the node to load wallet {name!r} after createwallet timed out", deadline - time.monotonic(), loaded)
+    return {"outcome": "loaded after createwallet timed out", "seconds": round(time.monotonic() - started, 1)}
 
 
 class Stratum:
@@ -518,6 +573,9 @@ class Lane:
     rpc: Rpc = field(default_factory=Rpc)
     report: dict = field(default_factory=dict)
     checks: dict[str, dict] = field(default_factory=dict)
+    # The phase under way, and when it began, so a failure can name it.
+    current_phase: str | None = field(default=None, init=False)
+    phase_started: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self.env_file = self.work / "lane.env"
@@ -548,16 +606,20 @@ class Lane:
         for problem in problems:
             log(f"FAIL {name}: {problem}")
 
+    def begin(self, name: str) -> float:
+        self.current_phase, self.phase_started = name, time.monotonic()
+        return self.phase_started
+
     def phase(self, name: str, started: float) -> None:
         self.report["phases"][name] = round(time.monotonic() - started, 1)
 
     # -- phases ---------------------------------------------------------
 
     def start(self) -> dict[str, str]:
-        started = time.monotonic()
+        started = self.begin("node")
         self.compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "qbitd")
         until("the qbitd RPC", 60, lambda: self.rpc.call("getblockchaininfo"))
-        self.rpc.call("createwallet", [WALLET])
+        self.report["wallet"] = create_wallet(self.rpc, WALLET)
         addresses = {
             role: self.rpc.call("getnewaddress", ["", "p2mr"], wallet=WALLET)
             for role in ("bootstrap", "cpuminer", "prism-miner", "resume", "thief")
@@ -570,7 +632,7 @@ class Lane:
                 raise LaneFailure(f"the node's {role} address {address!r} is not a bech32 string")
         self.rpc.call("generatetoaddress", [1, addresses["bootstrap"]])
         self.phase("node", started)
-        started = time.monotonic()
+        started = self.begin("stack")
         self.compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "420")
         self.phase("stack", started)
         self.report["addresses"] = addresses
@@ -615,6 +677,7 @@ class Lane:
 
     def check_resume(self, addresses: dict[str, str]) -> None:
         """#281 criterion 1: work issued on frontend 1, resumed on frontend 2."""
+        self.begin("resume")
         try:
             self._check_resume(addresses)
         except (LaneFailure, OSError, KeyError, ValueError) as error:
@@ -676,7 +739,7 @@ class Lane:
             log(f"FAIL cross-frontend-resume: {problem}")
 
     def load(self, addresses: dict[str, str]) -> dict[str, ClientTally]:
-        started = time.monotonic()
+        started = self.begin("load")
         network = f"{self.project}_default"
         seconds = str(self.load_seconds)
         clients = {
@@ -754,7 +817,7 @@ class Lane:
 
     def quiesce(self) -> int:
         """The ledger's accepted count once it holds still and both frontends report it."""
-        started = time.monotonic()
+        started = self.begin("quiesce")
 
         def settled():
             before = self.scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted")
@@ -769,6 +832,7 @@ class Lane:
         return count
 
     def check_ledger(self, addresses: dict[str, str], tallies: dict[str, ClientTally], accepted: int) -> None:
+        self.begin("ledger")
         rows = {role: self.scalar(f"SELECT count(*) FROM qbit_share_ledger WHERE accepted AND miner_id='{address}'")
                 for role, address in addresses.items()}
         credited = self.scalar("SELECT count(*) FROM qbit_prism_share_hashes")
@@ -811,6 +875,7 @@ class Lane:
         self.report["tallies"] = evidence["clients"]
 
     def check_blocks(self, addresses: dict[str, str]) -> None:
+        self.begin("blocks")
         rows = [line.split("|") for line in self.psql(
             "SELECT block_hash, block_height, solver_miner_id FROM qbit_pool_blocks "
             "WHERE chain_state='confirmed' ORDER BY block_height"
@@ -907,7 +972,7 @@ class Lane:
 
     def execute(self) -> bool:
         started = time.monotonic()
-        error = None
+        error = failed_phase = None
         try:
             addresses = self.start()
             self.check_resume(addresses)
@@ -917,7 +982,12 @@ class Lane:
             self.check_blocks(addresses)
         except (LaneFailure, subprocess.TimeoutExpired, OSError, KeyError, ValueError) as caught:
             error = f"{type(caught).__name__}: {caught}"
-            log(f"ERROR {error}")
+            failed_phase = self.current_phase
+            if failed_phase is not None:
+                # How long the failed phase ran, kept apart from the timings
+                # of phases that finished.
+                self.report["failed_phase_seconds"] = round(time.monotonic() - self.phase_started, 1)
+            log(f"ERROR in the {failed_phase} phase: {error}" if failed_phase else f"ERROR {error}")
         finally:
             try:
                 self.collect()
@@ -926,7 +996,7 @@ class Lane:
         self.phase("total", started)
         missing = [name for name in CHECKS if name not in self.checks]
         passed = error is None and not missing and all(c["passed"] for c in self.checks.values())
-        self.report.update(error=error, not_reached=missing, passed=passed)
+        self.report.update(error=error, failed_phase=failed_phase, not_reached=missing, passed=passed)
         (self.out / "l6-report.json").write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n",
                                                  encoding="utf-8")
         write_summary(self.report)
@@ -949,7 +1019,10 @@ def write_summary(report: dict) -> None:
     if report.get("tallies"):
         lines.append(f"Clients: `{json.dumps(report['tallies'], sort_keys=True)}`")
     if report.get("error"):
-        lines.append(f"Error: `{report['error']}`")
+        # Name the phase: the checks it never reached say nothing about why.
+        where = f" in the `{report['failed_phase']}` phase" if report.get("failed_phase") else ""
+        after = f" after {report['failed_phase_seconds']}s" if "failed_phase_seconds" in report else ""
+        lines.append(f"Error{where}{after}: `{report['error']}`")
     text = "\n".join(lines) + "\n"
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

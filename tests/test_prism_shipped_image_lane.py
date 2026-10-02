@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import shutil
 import sys
+import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -228,6 +234,180 @@ class Wiring(unittest.TestCase):
     def test_the_address_guard_refuses_sql_metacharacters(self) -> None:
         self.assertIsNotNone(lane.ADDRESS.match("qbrt1" + "q" * 58))
         self.assertIsNone(lane.ADDRESS.match("qbrt1q' OR '1'='1"))
+
+
+class FakeQbitd:
+    """Just enough of qbitd's JSON-RPC for the lane's node phase (#637).
+
+    createwallet is held until `release` is set: the node is still deriving
+    the wallet's keys. Holding it on an event, not a sleep, decides the race
+    with the client timeout. `on_listwallets` runs on each listwallets call
+    and may finish the wallet; listwallets shows a wallet only once it is
+    finished, as qbitd adds it to its list after creating and loading it.
+    """
+
+    ADDRESS = "qbrt1q" + "q" * 58
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.wallets: list[str] = []
+        self.release = threading.Event()
+        self.on_listwallets = lambda count: None
+        self.createwallet_error: dict | None = None
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                method, params = request["method"], request["params"]
+                fake.calls.append(method)
+                error = None
+                if method == "createwallet":
+                    # Bounded so a test that never releases cannot hang.
+                    fake.release.wait(timeout=60)
+                    error = fake.createwallet_error
+                    if error is None:
+                        fake.wallets.append(params[0])
+                    result = None if error else {"name": params[0]}
+                elif method == "listwallets":
+                    fake.on_listwallets(fake.calls.count("listwallets"))
+                    result = list(fake.wallets)
+                elif method == "getnewaddress":
+                    result = fake.ADDRESS
+                else:
+                    result = {"method": method}
+                body = json.dumps({"result": result, "error": error, "id": request["id"]}).encode()
+                try:
+                    self.send_response(500 if error else 200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # The client gave up on this call.
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def finish_wallet(self) -> None:
+        self.release.set()
+        # The held createwallet has added the wallet once it returns from the wait.
+        deadline = time.monotonic() + 10
+        while not self.wallets and self.createwallet_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def __enter__(self) -> "FakeQbitd":
+        self.thread.start()
+        self.port_patch = mock.patch.object(lane, "QBIT_RPC_PORT", self.server.server_address[1])
+        self.port_patch.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release.set()
+        self.port_patch.stop()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class WalletCreation(unittest.TestCase):
+    """#637: createwallet outlasting its client timeout must not fail the lane."""
+
+    def setUp(self) -> None:
+        # A short client timeout stands in for the lane's 30 s; create=True
+        # lets the same test run against the driver before the fix.
+        patch = mock.patch.object(lane, "RPC_TIMEOUT", 0.3, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.qbitd = FakeQbitd().__enter__()
+        self.addCleanup(self.qbitd.__exit__, None, None, None)
+
+    def test_a_node_phase_whose_createwallet_outlasts_the_client_timeout_waits_for_the_wallet(self) -> None:
+        # The node finishes the wallet after the client has given up, as in
+        # run 36786483193: still loading at the first poll, loaded by the second.
+        self.qbitd.on_listwallets = lambda count: count == 2 and self.qbitd.finish_wallet()
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / "lane.env").write_text("", encoding="utf-8")
+            driver = lane.Lane(work=Path(work), out=Path(work), project="p", load_seconds=1,
+                               cpuminer_threads=1, cpuminer_diff_multiplier=1.0,
+                               prism_miner_hashes_per_second=1)
+            with mock.patch.object(lane.Lane, "compose"):
+                addresses = driver.start()
+        self.assertEqual(addresses["bootstrap"], FakeQbitd.ADDRESS)
+        self.assertEqual(self.qbitd.calls.count("createwallet"), 1)
+        self.assertEqual(self.qbitd.calls.count("listwallets"), 2)
+        self.assertEqual(driver.report["wallet"]["outcome"], "loaded after createwallet timed out")
+        self.assertIn("node", driver.report["phases"])
+
+    def test_a_wallet_created_within_the_timeout_is_not_polled_for(self) -> None:
+        self.qbitd.release.set()
+        self.assertEqual(lane.create_wallet(lane.Rpc(), "l6", seconds=5)["outcome"], "created")
+        self.assertEqual(self.qbitd.calls, ["createwallet"])
+
+    def test_a_wallet_that_never_loads_fails_within_the_one_deadline(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(lane.LaneFailure) as caught:
+            lane.create_wallet(lane.Rpc(), "l6", seconds=1.5)
+        elapsed = time.monotonic() - started
+        self.assertIn("waiting for the node to load wallet 'l6' after createwallet timed out", str(caught.exception))
+        self.assertIn("listwallets shows []", str(caught.exception))
+        # The client timeout and the wait share the 1.5 s, plus at most one poll interval.
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual(self.qbitd.calls.count("createwallet"), 1)
+
+    def test_a_createwallet_error_fails_at_once_without_polling(self) -> None:
+        self.qbitd.createwallet_error = {"code": -4, "message": "Wallet file verification failed."}
+        self.qbitd.release.set()
+        with self.assertRaisesRegex(lane.LaneFailure, "qbit RPC createwallet failed: .*verification"):
+            lane.create_wallet(lane.Rpc(), "l6", seconds=5)
+        self.assertNotIn("listwallets", self.qbitd.calls)
+
+    def test_an_rpc_timeout_names_the_method(self) -> None:
+        with self.assertRaisesRegex(lane.RpcTimeout, r"^qbit RPC createwallet timed out after 0\.3s$"):
+            lane.Rpc().call("createwallet", ["l6"])
+
+
+class Summary(unittest.TestCase):
+    def report(self, **fields) -> dict:
+        return {"checks": {}, "phases": {"total": 44.1}, **fields}
+
+    def summary(self, report: dict) -> str:
+        with mock.patch("sys.stdout", io.StringIO()) as out, mock.patch.dict("os.environ", {}, clear=True):
+            lane.write_summary(report)
+        return out.getvalue()
+
+    def test_an_error_names_the_phase_it_stopped(self) -> None:
+        text = self.summary(self.report(error="RpcTimeout: qbit RPC listwallets timed out after 30s",
+                                        failed_phase="node", failed_phase_seconds=36.2))
+        self.assertIn("Error in the `node` phase after 36.2s: `RpcTimeout: qbit RPC listwallets timed out", text)
+        self.assertIn("| `ha-frontends-ready` | not reached |", text)
+
+    def test_an_error_before_any_phase_has_no_phase(self) -> None:
+        self.assertIn("Error: `OSError: x`", self.summary(self.report(error="OSError: x", failed_phase=None)))
+
+    def test_execute_records_the_phase_that_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / "lane.env").write_text("", encoding="utf-8")
+            driver = lane.Lane(work=Path(work), out=Path(work), project="p", load_seconds=1,
+                               cpuminer_threads=1, cpuminer_diff_multiplier=1.0,
+                               prism_miner_hashes_per_second=1)
+
+            def start() -> dict:
+                driver.begin("node")
+                raise lane.RpcTimeout("qbit RPC createwallet timed out after 30s")
+
+            with mock.patch.object(driver, "start", start), mock.patch.object(driver, "collect"), \
+                    mock.patch.object(driver, "down"), mock.patch("sys.stdout", io.StringIO()), \
+                    mock.patch.dict("os.environ", {}, clear=True):
+                self.assertFalse(driver.execute())
+            report = json.loads((Path(work) / "l6-report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["failed_phase"], "node")
+        self.assertEqual(report["error"], "RpcTimeout: qbit RPC createwallet timed out after 30s")
+        self.assertIn("failed_phase_seconds", report)
+        self.assertNotIn("node", report["phases"])
 
 
 class Triggers(unittest.TestCase):
