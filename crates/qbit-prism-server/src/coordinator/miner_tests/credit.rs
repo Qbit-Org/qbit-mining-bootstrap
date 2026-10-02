@@ -227,11 +227,11 @@ async fn unhealthy_node_and_failed_revision_are_backend_unavailable_not_stale() 
     assert!(fixture.store.records.lock().unwrap().is_empty());
 }
 
-/// #581: readiness is renewed only by a refresh, and a refresh reads the
-/// database, so during a database outage or a stall past the health timeout
-/// readiness ages out. The stale-readiness refusal then names the database
-/// the latest refresh failed on, and the node once a refresh fails on the
-/// node instead.
+/// #581: a refresh reads the database, and a guarded tip poll (#622) renews
+/// readiness only while the published work is current, so during a database
+/// outage or a stall past the health timeout readiness can age out. The
+/// stale-readiness refusal then names the database the latest refresh failed
+/// on, and the node once a refresh fails on the node instead.
 #[tokio::test]
 async fn stale_readiness_names_the_dependency_the_latest_refresh_failed_on() {
     let fixture = Fixture::new(Duration::from_secs(10)).await;
@@ -257,6 +257,52 @@ async fn stale_readiness_names_the_dependency_the_latest_refresh_failed_on() {
         "current chain state is unavailable",
     );
     assert!(fixture.store.records.lock().unwrap().is_empty());
+}
+
+/// #581: a refresh records whether it failed on the database before it
+/// releases the refresh lock, so the outcomes land in the order the
+/// refreshes ran and an older refresh that finishes late can never overwrite
+/// a newer one's (Codex on #646). The older refresh here fails on the
+/// database and is held from recording; the newer one cannot start until it
+/// has.
+#[tokio::test]
+async fn a_refresh_records_its_database_failure_before_the_next_refresh_runs() {
+    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    fixture.coordinator.refresh_once().await.unwrap();
+    fixture.store.fail_revision.store(true, Ordering::SeqCst);
+    let gate = Arc::new(Gate::default());
+    *fixture.store.revision_gate.lock().unwrap() = Some(gate.clone());
+    let older = tokio::spawn({
+        let coordinator = fixture.coordinator.clone();
+        async move { coordinator.refresh_once().await }
+    });
+    gate.entered.notified().await;
+    // Readiness held: the older refresh finishes its work and waits to
+    // record its outcome.
+    let readiness = fixture.coordinator.readiness.read().await;
+    gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        fixture.coordinator.refresh_lock.try_lock().is_err(),
+        "the refresh released its lock before recording its outcome"
+    );
+    fixture.store.fail_revision.store(false, Ordering::SeqCst);
+    let newer = tokio::spawn({
+        let coordinator = fixture.coordinator.clone();
+        async move { coordinator.refresh_once().await }
+    });
+    drop(readiness);
+    assert!(older.await.unwrap().is_err());
+    newer.await.unwrap().unwrap();
+    assert!(
+        !fixture
+            .coordinator
+            .readiness
+            .read()
+            .await
+            .refresh_failed_on_database,
+        "the older refresh's database failure overwrote the newer refresh's success"
+    );
 }
 
 /// The readiness proof as old as the health timeout and a second more: the

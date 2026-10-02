@@ -1277,11 +1277,6 @@ impl Coordinator {
     pub async fn refresh_once(&self) -> Result<()> {
         let observation = self.metrics.revision_work_refresh();
         let result = self.refresh_once_inner().await;
-        let on_database = result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
-        self.readiness.write().await.refresh_failed_on_database = on_database;
         if result.is_ok() {
             observation.succeeded();
             *self
@@ -1316,10 +1311,31 @@ impl Coordinator {
             .map(|since| since.as_millis())
             .unwrap_or_default();
         let mut refresh = self.refresh_lock.lock().await;
+        let result = self
+            .refresh_locked(&mut refresh, refresh_started, refresh_started_unix_ms)
+            .await;
+        // #581: recorded before the refresh lock is released, so outcomes
+        // land in the order the refreshes ran: an older refresh that finishes
+        // late can never overwrite a newer one's.
+        let on_database = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
+        self.readiness.write().await.refresh_failed_on_database = on_database;
+        result
+    }
+
+    /// [`Self::refresh_once_inner`]'s work, under the refresh lock.
+    async fn refresh_locked(
+        &self,
+        refresh: &mut RefreshState,
+        refresh_started: Instant,
+        refresh_started_unix_ms: u128,
+    ) -> Result<()> {
         let RefreshState {
             observation,
             cached_window,
-        } = &mut *refresh;
+        } = refresh;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
