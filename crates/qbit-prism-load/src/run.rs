@@ -3120,6 +3120,14 @@ fn landing_settlement(
     }
 }
 
+impl OrderedLanding {
+    fn settle(&mut self, started: Instant, hash: Option<String>, how: String) {
+        self.settled_seconds = Some(started.elapsed().as_secs_f64());
+        self.block_hash = hash;
+        self.settled = Some(how);
+    }
+}
+
 /// [`drive_phase_with_population`] with round-robin offers.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_phase(
@@ -3380,10 +3388,7 @@ pub async fn drive_phase_with_population(
                 landing_settlement(&collected, node_state, outstanding)
             };
             if let Some((hash, how)) = settled {
-                let record = &mut outcome.ordered_landings[outstanding.record];
-                record.settled_seconds = Some(started.elapsed().as_secs_f64());
-                record.block_hash = hash;
-                record.settled = Some(how);
+                outcome.ordered_landings[outstanding.record].settle(started, hash, how);
                 landing = None;
             }
         }
@@ -3583,6 +3588,29 @@ pub async fn drive_phase_with_population(
     // What the ordering left undone is reported, not dropped: a block still
     // held at the deadline, and the tips held behind a landing that never
     // settled (EP-ERRORS).
+    // A landing still outstanding at the deadline is seen through with the
+    // node's keepalives still held, within the drain limit. Released at the
+    // boundary, a keepalive due during teardown, or the next phase's tips,
+    // could take the block's height. Nothing is offered meanwhile; like the
+    // restart's wait below, this is boundary time, outside the measured
+    // window.
+    if let Some(outstanding) = landing.take().filter(|_| outcome.aborted.is_none()) {
+        let limit = Instant::now() + restart_drain_limit;
+        loop {
+            let settled = {
+                let collected = collected.lock().expect("collected");
+                landing_settlement(&collected, node_state, &outstanding)
+            };
+            if let Some((hash, how)) = settled {
+                outcome.ordered_landings[outstanding.record].settle(started, hash, how);
+                break;
+            }
+            if Instant::now() >= limit {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
     if keepalives_held {
         node_state.hold_keepalives(false);
     }

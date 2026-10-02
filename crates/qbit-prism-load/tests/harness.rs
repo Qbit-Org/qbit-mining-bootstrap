@@ -10933,6 +10933,44 @@ impl StandIn {
 /// Every delay is injected, so whichever of block and tip is first is fixed
 /// by the timings, not by the host.
 async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<NodeState>, usize)> {
+    let (outcome, node, remaining_tips, _) = ordered_tips_run_holding(stand_in).await?;
+    Ok((outcome, node, remaining_tips))
+}
+
+/// The fake node, recording every keepalive hold the scheduler sets and
+/// when: the fake node has no keepalives of its own to hold.
+struct HoldRecorder {
+    node: Arc<NodeState>,
+    holds: std::sync::Mutex<Vec<(bool, std::time::Instant)>>,
+}
+
+impl node::ExternalMint for HoldRecorder {
+    fn mint_external(&self, purpose: node::MintPurpose) -> Option<node::TipChange> {
+        self.node.mint_external(purpose)
+    }
+    fn settled_tip(&self) -> Option<String> {
+        self.node.settled_tip()
+    }
+    fn block_answered(&self, block_hash: &str) -> bool {
+        self.node.block_answered(block_hash)
+    }
+    fn hold_keepalives(&self, held: bool) {
+        self.holds
+            .lock()
+            .unwrap()
+            .push((held, std::time::Instant::now()));
+    }
+}
+
+/// [`ordered_tips_run`], also returning the keepalive holds it set.
+async fn ordered_tips_run_holding(
+    stand_in: StandIn,
+) -> Result<(
+    run::PhaseOutcome,
+    Arc<NodeState>,
+    usize,
+    Vec<(bool, std::time::Instant)>,
+)> {
     use clap::Parser;
     use qbit_prism_load::cli::{Args, PhasePlan};
     use std::sync::Mutex;
@@ -11073,13 +11111,17 @@ async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<N
 
     let mut external_tips = Vec::new();
     let (mut remaining_blocks, mut remaining_tips) = (1usize, 3usize);
+    let recorder = HoldRecorder {
+        node: node.clone(),
+        holds: Mutex::new(Vec::new()),
+    };
     let outcome = run::drive_phase(
         &args,
         &plan,
         std::slice::from_ref(&session),
         &mut [],
         &[],
-        &*node,
+        &recorder,
         &mut external_tips,
         &mut remaining_blocks,
         &mut remaining_tips,
@@ -11089,7 +11131,8 @@ async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<N
     .await?;
     notify.abort();
     blocks.abort();
-    Ok((outcome, node, remaining_tips))
+    let holds = recorder.holds.into_inner().unwrap();
+    Ok((outcome, node, remaining_tips, holds))
 }
 
 /// The chain above the starting tip, by origin, and every submission's
@@ -11379,6 +11422,56 @@ async fn a_scheduled_block_whose_write_failed_still_holds_the_next_tip() -> Resu
     assert_eq!(
         outcome.ordered_landings[0].settled.as_deref(),
         Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A scheduled block still outstanding at the phase's deadline: its search
+/// ends 0.5 s after the 6 s warm-up and the node answers 0.3 s later. The
+/// phase sees it through with the keepalives still held, so no keepalive
+/// due during teardown, nor the next phase's tips, can take its height. The
+/// hold is released only once the node has answered, and the third tip,
+/// held behind the block, is reported as unminted rather than minted late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landing_outstanding_at_the_deadline_keeps_the_keepalives_held_until_it_settles(
+) -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips, holds) = ordered_tips_run_holding(StandIn::accepted(
+        Duration::from_millis(20),
+        Duration::from_millis(3500),
+        Duration::from_millis(300),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (1, 1));
+    let landing = &outcome.ordered_landings[0];
+    assert_eq!(
+        landing.settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    assert!(
+        landing.settled_seconds.expect("settled") > 6.0,
+        "settled after the deadline: {landing:?}"
+    );
+    let landed = node
+        .tip_changes()
+        .iter()
+        .find(|change| change.origin == Pool)
+        .expect("the pool block")
+        .monotonic;
+    let flags: Vec<bool> = holds.iter().map(|(held, _)| *held).collect();
+    assert_eq!(flags, vec![true, false], "held once, released once");
+    assert!(
+        holds[1].1 >= landed,
+        "released only once the block was on the chain"
     );
     Ok(())
 }
