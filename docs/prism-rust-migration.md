@@ -887,11 +887,33 @@ dashboard queries found each block's solving share by suffix-matching every
 block's hash against the ledger on every request, and after a detach that
 lookup would silently blank a historical block's solver. The columns
 (`solver_miner_id`, `solver_share_id`, `solver_share_difficulty`,
-`solver_network_difficulty`) are added and backfilled here, written at landing
-from now on, and read by the queries. The backfill is one
+`solver_network_difficulty`) are added by 016, written at landing from now on,
+and read by the queries; for the blocks found before 016, the migrator fills
+them right after 016's file, in the same transaction. The backfill is one
 `accepted_block_suffix_idx` probe per block without a solver recorded, exactly
-the lookup those queries performed on every request, so its cost is
-proportional to the pool's block count and not to the share count.
+the lookup those queries performed on every request. The number of probes
+follows the pool's block count, not the share count, but each probe is two
+random reads (an index leaf and a heap page). On a cold cache their cost grows
+with the ledger.
+
+Until #672 the probes were one statement in 016's file, under the migration
+transaction's statement timeout. On a mainnet-shaped ledger with all 13,566
+blocks, read from a fresh restore on a quiet disk, that statement took:
+
+| Ledger | Warm cache | Cold cache |
+| --- | --- | --- |
+| 8.25M shares | 3.0 s | 6.7 s |
+| 16.5M shares | 7.4 s | 11.2 s |
+
+On a busy disk it took about 30 s, and the 15 s default refused it. The
+migrator now makes the same probes right after the file, in the same
+transaction, in statements of at most 128 blocks taken in `block_hash` order
+(`ledger/migration/block_solvers.rs`). The attribution and the locks are the
+single statement's. On the same ledgers the longest of those 107 statements
+took 71 to 592 ms. With a concurrent writer saturating the disk, the single
+statement took 14.0 s at 8.25M, one second short of the default, and the
+longest batched one took 0.47 s. No statement comes near the timeout whatever
+the cache, so `migrate` needs no statement timeout above the default for 016.
 
 ### Migration 017: the share ledger partition conversion, applied online
 
