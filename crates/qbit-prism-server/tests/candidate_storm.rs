@@ -638,6 +638,7 @@ fn config(database_url: String, rpc_url: String, instance: &str) -> Result<Confi
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(10),
         block_submit_timeout: Duration::from_secs(10),
+        block_submit_enabled: true,
         candidate_orphan_confirmations: 6,
         capture_overpay_ceiling_bps: 100,
         offer_standby: None,

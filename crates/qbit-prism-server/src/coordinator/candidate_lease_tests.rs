@@ -26,6 +26,9 @@ mod claim_release_tests;
 #[path = "offer_shutdown_tests.rs"]
 mod offer_shutdown_tests;
 
+#[path = "submit_disabled_tests.rs"]
+mod submit_disabled_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn landing_transaction_renews_across_expiries_and_terminal_contention_finishes_once(
 ) -> Result<()> {
@@ -217,6 +220,7 @@ impl Fixture {
             rpc_password: "test".into(),
             rpc_timeout: Duration::from_secs(5),
             block_submit_timeout: Duration::from_secs(1),
+            block_submit_enabled: true,
             poll_interval: Duration::from_secs(1),
             blockwait: false,
             build_workers: 1,

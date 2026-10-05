@@ -144,6 +144,7 @@ pub(super) fn test_config(
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(10),
         block_submit_timeout: Duration::from_secs(10),
+        block_submit_enabled: true,
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 1,
