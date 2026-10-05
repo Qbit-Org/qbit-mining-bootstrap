@@ -98,16 +98,21 @@ Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
 hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
-transaction, including carry-forward summary repair, except migrations 013 and
-017. Migration 013, the share ledger index trim, builds its indexes after the
+transaction, including carry-forward summary repair, except 002's share-hash
+backfill and migrations 013 and 017. On a ledger with rows, 002 maps the
+legacy shares' headers after the commit, in bounded batches, and records 2
+once every one is mapped
+([below](#migration-002s-share-hash-backfill-applied-online)).
+Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
 ([below](#migration-013-the-share-ledger-index-trim-applied-online)).
 Migration 017, the share ledger partition conversion, validates its bound and
 swaps the table after the commit on a dedicated connection
 ([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
-Both are applied inside the migration transaction where the ledger is empty,
-under the cutover locks that exclude writers, and each records its version only
-after its last change. The migration is
+Where the ledger is empty all three stay inside the migration transaction,
+under the cutover locks that exclude writers (002's backfill then has nothing
+to map); otherwise each records its version only after its last change. The
+migration is
 idempotent; a refusal due to an old active writer, an unsupported source
 schema, or unresolved legacy work must be resolved before admitting native
 traffic.
@@ -632,6 +637,132 @@ source and the halt refusal) and then write only the rows they repair, so a run
 leaves no `qbit_prism_instances` heartbeat for fatal-state recovery to refuse
 and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
 behave the same way.
+
+### Migration 002's share-hash backfill, applied online
+
+Migration 002 creates `qbit_prism_share_hashes`, the header authority the
+native append consults before it credits a share, and maps the header of every
+accepted `2.x.x` share whose ID ends in 64 hex digits. Where legacy
+worker-scoped IDs repeat a header, the earliest `share_seq` wins; case is
+folded; rejected rows and IDs without a hex header are not mapped. Until #582
+the mapping was one `INSERT ... SELECT DISTINCT ON` inside the migration
+transaction, under `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`. At the default 15 s
+it failed from about a million shares. Its cost per share rose with the ledger
+(37 µs at 1.03M shares, 78 µs at 4.13M), so the production ledger's 65.5M
+shares outgrew even the 600 s maximum.
+
+On a fresh deployment or an empty `2.x.x` source there is nothing to map, and
+2 is recorded in the migration transaction. On a `2.x.x` source with rows,
+002's file is still applied in the transaction, but 2 is not recorded there.
+The transaction also creates the backfill's cursor,
+`qbit_prism_share_hash_backfill`, one row covering every `share_seq` the ledger
+holds:
+
+| Column | Meaning |
+| --- | --- |
+| `next_seq` | every legacy share below it is mapped |
+| `end_seq` | the ledger held no row at or above it when the transaction committed |
+| `started_at`, `updated_at` | when the cursor was created and last advanced |
+
+After the commit, and before 013 and 017, `migrate` maps the legacy shares in
+batches of consecutive `share_seq`. Each batch is 002's statement restricted to
+its range: one statement, in a transaction that also advances the cursor. The
+first batch covers 10,000 `share_seq`; later ones double or halve toward half a
+second each, between 1,000 and 200,000. So every statement stays far inside the
+server's statement timeout whatever the ledger's size, and no setting has to be
+raised for `migrate`. The last transaction takes the migration lock and checks
+that the cursor has passed every row the ledger holds. It then drops the cursor
+table and records 2.
+
+The mapping is the single statement's, row for row. Batches run in ascending
+`share_seq`, so the earliest share of a repeated header is mapped by the batch
+that holds it. A later copy, in a later batch, meets `ON CONFLICT DO NOTHING`.
+The batches also skip the per-row foreign-key check the single statement paid:
+016 has dropped that key by the time they run.
+
+**Readiness: the server does not serve during the backfill.** Until 2 is
+recorded, every start refuses the database. That is this release's start and
+every earlier native build's, since each requires 2. The `2.x.x` writer is
+fenced by 002's lease trigger, which committed with the transaction. So no share
+can be appended, and none credited against a legacy header not yet mapped. The
+backfill is part of the cutover's outage, as 013's builds and 017's validation
+are on a populated ledger. A start, `self-check` and `import-audits` all refuse
+with:
+
+```
+database is not ready: migration 2's share-hash backfill has not finished (#582).
+qbit_prism_share_hashes maps the legacy shares below share_seq 30001 of the 4129153
+the ledger held at migration, and until every one is mapped a share could be
+credited twice. Run `qbit-prism-server migrate` to resume it from there; every
+start refuses the database until it has finished and recorded migration 2
+```
+
+They refuse the same way while the cursor table exists, even if 2 has been
+recorded by hand.
+
+**Progress.** No frontend runs while the backfill does, so there is no
+Prometheus series for it. `migrate` logs the backfill's start, a progress line
+every ten seconds (`next_seq`, `end_seq`, rows mapped, `share_seq` per second
+and the estimated seconds left) and its completion. Any session can read the
+cursor:
+
+```sql
+SELECT next_seq, end_seq,
+       round(100.0 * next_seq / greatest(end_seq, 1), 1) AS percent,
+       started_at, updated_at
+FROM qbit_prism_share_hash_backfill;
+```
+
+**Interrupting and resuming.** Each batch commits with its cursor, so an
+interrupted `migrate` loses only the batch in flight. That holds for a killed
+process, a lost connection, and a cancelled or timed-out statement. Run
+`migrate` again. The migration transaction finds 3 recorded without 2 and the
+cursor table present, so it applies nothing, and the backfill resumes at
+`next_seq`; 013 and 017 follow. A record with 3 and not 2 but no cursor table
+is still refused as an edited record.
+
+Resuming only goes forward. The migration transaction has committed, so the
+database is native, and the `2.x.x` writer cannot return to it. To go back,
+restore the pre-migration backup as in
+[Recovery and rollback](#recovery-and-rollback). No native share can have been
+acknowledged before 2 is recorded, so the whole backfill falls before the ACK
+boundary.
+
+**Refusals, and what each one means.**
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to migrate before any DDL: a table named qbit_prism_share_hash_backfill already exists, and migration 2 creates its share-hash backfill's progress table under that name. Nothing was changed. Check what it holds, then rename or move it aside and migrate again` | a `2.x.x` source holds a relation under the cursor's name; check what it holds, rename or move it aside, and migrate again |
+| `migration 2: backfilling qbit_prism_share_hashes for share_seq <a> to <b>; every earlier batch committed, so migrate again to resume from share_seq <a>` | the context on a failed batch statement: cancelled, timed out, or a lost connection. Migrate again |
+| `refusing to continue migration 2: its share-hash backfill's cursor moved from <a> to <b> under this run, which holds the runner lock; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
+| `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
+| `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
+
+**Plan for the backfill on a large ledger.** The backfill writes every legacy
+share's header once more. The mapping takes about 490 bytes per share with its
+two indexes (4.0 GB at 8.1M shares), so budget about 32 GB for the production
+ledger's 65.5M shares, plus the WAL that comes with it.
+
+Its rate depends more on PostgreSQL's memory and checkpoint settings than on
+anything in `migrate`. Both indexes take random inserts. Once they no longer
+fit in `shared_buffers`, frequent checkpoints make most inserts write a full
+page image. These measurements are from a mainnet-shaped ledger of 8.25M
+shares, on PostgreSQL 16 with `fsync` on, on a shared 16-core host:
+
+| Settings | Backfill | Rate | WAL |
+| --- | --- | --- | --- |
+| server defaults (128 MB `shared_buffers`, 1 GB `max_wal_size`) | 348 to 413 s | about 40,000 `share_seq`/s until the indexes outgrew the cache at about 5M shares, about 13,000/s after | 16 GB |
+| `shared_buffers = 4GB`, `max_wal_size = 32GB`, `checkpoint_timeout = 30min` | 251 s | a steady 30,000 to 40,000/s | 5.8 GB |
+
+The batch sort is not the cost: 64 MB of `work_mem` changed nothing.
+
+For 65.5M shares, expect roughly 35 to 40 minutes with settings like the
+second row, and 80 minutes or more at the defaults. So give the database the
+larger settings for the cutover window: `shared_buffers` a quarter of memory,
+`max_wal_size` in tens of gigabytes, a long `checkpoint_timeout`, and the disk
+for the WAL. Restore them afterwards if they are not the server's normal ones.
+`make prism-cutover-rehearsal` runs its private cluster at the defaults, so
+the time it reports for the backfill is the pessimistic one.
 
 ### Migration 013: the share ledger index trim, applied online
 
@@ -1284,6 +1415,13 @@ can lose its reply, and candidate/CTV work can progress before admission. Always
 compare the complete evidence and retain the latest database. Prefer forward
 repair or a compatible native image preserving all durable history.
 
+An interrupted `migrate` is before this boundary as long as migration 2 is not
+recorded. On a populated source, 2 is recorded only after
+[002's share-hash backfill](#migration-002s-share-hash-backfill-applied-online),
+and every start refuses the database until then, so no native share can have
+been acknowledged. Resume it with `migrate`, or restore the pre-migration
+backup, as for any other pre-ACK failure.
+
 1. **Establish isolation and retain evidence.** Stop every native frontend,
    public service, candidate worker and CTV broadcaster, and confirm no old
    Python writer is running. Block their network access to the restore. Keep
@@ -1490,9 +1628,10 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `021`), 013's concurrent index builds, and 017's
-prepare, validate and swap. The transaction holds the cutover locks, ACCESS
-EXCLUSIVE on `qbit_share_ledger` among them, for its whole length; the report
+(`001` and native `002` to `021`), 002's share-hash backfill, 013's concurrent
+index builds, and 017's prepare, validate and swap. The transaction holds the
+cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
+whole length; the backfill's batches hold only ACCESS SHARE on it. The report
 also lists the statements `migrate` spent the most sampled time in.
 
 **Rehearsing without a snapshot.** `make prism-cutover-rehearsal-dump
@@ -1541,10 +1680,8 @@ rows and 40 blocks, dumped with `pg_dump` and rehearsed as above, with a
 payout window larger than one 4,096-row page. The weekly
 `live_regtest` scenario
 `migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation`
-writes the mainnet shape at 1/32 of the rows (1/16 once #582 is fixed) over
-a real regtest chain. It
-cuts over with the same measured steps and checks, then mines and reconciles
-as the scenario above does. Until #582 is fixed, it runs `migrate` with a
-600 s statement timeout. It first checks that `migrate` at the default
-timeout still refuses the ledger in 002's share-hash backfill and changes
-nothing.
+writes the mainnet shape at 1/16 of the rows, about 4.1M, over a real regtest
+chain. It cuts over with the same measured steps and checks, at the server's
+default statement timeout, and requires 002's share-hash backfill to have run
+as its own measured step (#582); then it mines and reconciles as the scenario
+above does.

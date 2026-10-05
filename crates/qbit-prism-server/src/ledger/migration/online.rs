@@ -42,6 +42,13 @@
 //! already-built index that moved while a later build ran is caught there
 //! before the version is recorded. The next start plans afresh from what
 //! it finds and keeps that.
+//!
+//! The same entry point runs 002's share-hash backfill on a populated 2.x.x
+//! source (`share_hashes.rs`, #582). 002's file is applied in the migration
+//! transaction like any other; only the mapping of the legacy shares is
+//! left for after the commit, in batches, and that run records 2. It runs
+//! before 013 and 017, so every version is still recorded after the ones
+//! below it.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -53,6 +60,10 @@ pub(crate) enum OnlineMigration {
     Indexes(IndexMigration),
     /// The share ledger partition conversion (017, `partition.rs`).
     Partitions(super::partition::PartitionMigration),
+    /// 002's share-hash backfill on a populated 2.x.x source, in batches
+    /// (`share_hashes.rs`, #582). Its file is applied in the transaction;
+    /// only the backfill runs here, and it records 2.
+    ShareHashes,
 }
 
 impl OnlineMigration {
@@ -60,6 +71,7 @@ impl OnlineMigration {
         match self {
             OnlineMigration::Indexes(migration) => migration.version,
             OnlineMigration::Partitions(migration) => migration.version,
+            OnlineMigration::ShareHashes => 2,
         }
     }
 }
@@ -144,6 +156,7 @@ pub(crate) async fn apply_online_migration(
         OnlineMigration::Partitions(migration) => {
             super::partition::apply(&mut connection, migration, metrics).await
         }
+        OnlineMigration::ShareHashes => super::share_hashes::apply(&mut connection, metrics).await,
     };
     let closed = connection.close().await;
     outcome?;

@@ -321,6 +321,12 @@ fn classify(query: &str, previous: &str) -> String {
             "migrate: 013 concurrent indexes",
         ),
         ("drop index concurrently", "migrate: 013 concurrent indexes"),
+        // One batch of 002's backfill (#582); the migration transaction no
+        // longer sends this statement.
+        (
+            "insert into qbit_prism_share_hashes",
+            "migrate: 002 share-hash backfill",
+        ),
     ]
     .into_iter()
     .find(|(prefix, _)| query.starts_with(prefix))
