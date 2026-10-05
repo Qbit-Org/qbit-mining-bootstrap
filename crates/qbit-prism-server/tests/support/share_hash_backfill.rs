@@ -666,7 +666,9 @@ async fn a_resume_leaves_no_fence_when_an_earlier_runner_finishes_the_backfill()
 
 /// A fence whose cursor is gone, which only a hand-dropped cursor leaves,
 /// is refused by migrate before any DDL and, once 2 is recorded by hand
-/// too, by every start: recording 2 by hand unlocks nothing (#669).
+/// too, by every start: recording 2 by hand unlocks nothing (#669). At
+/// another value the name is a newer release's declaration, refused as
+/// that release's rather than as an orphan or as 3 without 2.
 #[tokio::test]
 async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -697,6 +699,26 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
     )?;
     assert_eq!(schema_versions(&pool).await?, pending);
     assert!(fence_declared(&pool).await?);
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='share_hash_backfill_pending'")
+        .execute(&pool)
+        .await?;
+    let error = db
+        .ledger("migrate-newer")
+        .await
+        .err()
+        .context("migrate accepted a newer release's share_hash_backfill_pending = 2")?
+        .to_string();
+    ensure!(
+        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+            && error.contains("upgrade the server")
+            && !error.contains("is gone")
+            && !error.contains("migration 3 is recorded and 2 is not"),
+        "{error}"
+    );
+    assert_eq!(schema_versions(&pool).await?, pending);
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='share_hash_backfill_pending'")
+        .execute(&pool)
+        .await?;
     // Recording 2 by hand as well lets nothing start: 013 and 017 never ran
     // behind the pending backfill, and migrate still names the fence.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
@@ -722,7 +744,9 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
 /// A fence declared on a database with every migration recorded and no
 /// cursor is refused at every start and every migrate: only the
 /// transaction that records 2 removes it, with the cursor, so it can only
-/// be left by hand, and legacy shares may be unmapped (#669).
+/// be left by hand, and legacy shares may be unmapped (#669). At another
+/// value the name is a newer release's declaration: refused as that
+/// release's, without the remedy that would delete it.
 #[tokio::test]
 async fn every_start_refuses_a_backfill_fence_on_a_migrated_database() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -747,6 +771,28 @@ async fn every_start_refuses_a_backfill_fence_on_a_migrated_database() -> Result
             .to_string();
         ensure!(
             error.contains("declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone"),
+            "{what}: {error}"
+        );
+    }
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='share_hash_backfill_pending'")
+        .execute(&pool)
+        .await?;
+    for (what, error) in [
+        (
+            "a start",
+            Ledger::connect(&db.url, "cold".into(), 8, false)
+                .await
+                .err(),
+        ),
+        ("migrate", db.ledger("migrate").await.err()),
+    ] {
+        let error = error
+            .with_context(|| format!("{what} accepted share_hash_backfill_pending = 2"))?
+            .to_string();
+        ensure!(
+            error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+                && error.contains("upgrade the server")
+                && !error.contains("is gone"),
             "{what}: {error}"
         );
     }

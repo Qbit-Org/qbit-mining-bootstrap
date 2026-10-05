@@ -2978,20 +2978,21 @@ pub(super) async fn migrate_schema(
         // `classify_source` refuses them on a 2.x.x source: otherwise 004,
         // 005 and 006, or 008 and 009, would alter a database a newer
         // release wrote and record their versions, and only the connect-time
-        // gate, after the commit, would refuse it. A record with 3 and not
-        // 2 is refused first: 004 to 009 must not run above a record every
-        // start refuses and no migrate repairs. The one exception is a
-        // populated 2.x.x source whose share-hash backfill has not finished,
-        // which records 2 last (#582): this run resumes it.
+        // gate, after the commit, would refuse it. They come before the
+        // record too, so a newer release's declaration, the backfill fence's
+        // name at another value included, is never read as this release's
+        // state (#669). A record with 3 and not 2 is refused next: 004 to
+        // 009 must not run above a record every start refuses and no migrate
+        // repairs. The one exception is a populated 2.x.x source whose
+        // share-hash backfill has not finished, which records 2 last (#582):
+        // this run resumes it.
         let backfill = share_hashes::progress(tx).await?;
         let inventory = inspect_source_schema(tx).await?;
+        refuse_newer_native_database(&versions, &inventory)?;
         if backfill.is_none() {
             // A fence without its cursor: the cursor was dropped by hand, and
             // "3 without 2" would only suggest recording 2 by hand (#669).
-            if inventory
-                .capability(share_hashes::PENDING_CAPABILITY)
-                .is_some()
-            {
+            if inventory.capability(share_hashes::PENDING_CAPABILITY) == Some(1) {
                 bail!(
                     "refusing to migrate a native database at schema migrations {} before any DDL: {}",
                     schema_version_list(&versions),
@@ -3003,7 +3004,6 @@ pub(super) async fn migrate_schema(
         // A database at 6 that no longer declares its capabilities is
         // refused before 008 or 009 run above it, as connect refuses it.
         refuse_undeclared_native_database(&versions, &inventory)?;
-        refuse_newer_native_database(&versions, &inventory)?;
         if versions.contains(&6) {
             // Startup reads this record after commit. Check it with the same
             // decoder before any later migration can be applied or recorded.
@@ -3462,7 +3462,7 @@ where
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|(name, _)| name == share_hashes::PENDING_CAPABILITY)
+        .any(|(name, value)| name == share_hashes::PENDING_CAPABILITY && *value == 1)
         && share_hashes::progress(&mut connection).await?.is_none()
     {
         bail!("{}", share_hashes::orphaned_fence_refusal());
