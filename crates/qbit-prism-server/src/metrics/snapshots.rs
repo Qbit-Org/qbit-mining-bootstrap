@@ -336,7 +336,7 @@ mod tests {
         let metrics = Metrics::default();
         let gauge =
             |metrics: &Metrics| sample(&metrics.render(), "qbit_prism_block_submission_enabled");
-        assert_eq!(gauge(&metrics), 1.);
+        assert_eq!(gauge(&metrics), -1., "unknown, never on, until published");
         metrics.publish_block_submission(false);
         assert_eq!(gauge(&metrics), 0.);
         metrics.publish_block_submission(true);

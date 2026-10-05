@@ -181,9 +181,11 @@ its node no found block and no transaction:
   connects. That broadcaster is PRISM's only sender of `sendrawtransaction`
   and `submitpackage`, and its only user of the CPFP wallet.
 
-Templates, readiness, share acceptance and the database writes continue as
-usual. The setting is read at startup and applies per frontend; it is not part
-of the cluster fingerprint. While it is `0`, `check-config` and `self-check`
+The frontend's node client also refuses, before sending, every call that would
+relay a block or a transaction. Templates, readiness, share acceptance and the
+database writes continue as usual. The setting is read at startup and applies
+per frontend; it is not part of the cluster fingerprint. `0`, `false`, `no`
+and `off` all turn it off. While it is `0`, `check-config` and `self-check`
 lead with a warning. See
 [the rehearsal procedure](prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals)
 for checking it on running frontends and for what to do with held blocks

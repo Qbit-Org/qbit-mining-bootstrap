@@ -313,16 +313,21 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 
 /// Why the one `submitblock` call provably did not run on the node, if it
 /// did not: its connection was never established, so no byte of it left this
-/// process (`rpc::RpcNotSentError`, #522), or the node answered it with
-/// `RPC_IN_WARMUP`, which qbitd returns before it dispatches any call
-/// (`rpc::RpcReplyError::in_warmup`, #526). Only a `submitblock` reply
-/// counts: a warmup answer to another call says nothing about this one.
-/// Every other result, any other error code, a transport failure after the
-/// connection existed or a timeout included, may have run and is `None`.
+/// process (`rpc::RpcNotSentError`, #522), the client refused to send it
+/// under `PRISM_BLOCK_SUBMIT_ENABLED` (`rpc::RpcRelayRefused`, #291), or the
+/// node answered it with `RPC_IN_WARMUP`, which qbitd returns before it
+/// dispatches any call (`rpc::RpcReplyError::in_warmup`, #526). Only a
+/// `submitblock` reply counts: a warmup answer to another call says nothing
+/// about this one. Every other result, any other error code, a transport
+/// failure after the connection existed or a timeout included, may have run
+/// and is `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
         return Some(not_sent.to_string());
+    }
+    if let Some(refused) = error.downcast_ref::<crate::rpc::RpcRelayRefused>() {
+        return Some(refused.to_string());
     }
     error
         .downcast_ref::<crate::rpc::RpcReplyError>()
@@ -824,6 +829,13 @@ impl Coordinator {
             config.rpc_password.clone(),
             config.rpc_timeout,
         )?;
+        // #291: whatever calls it, a held frontend's node client and every
+        // wallet client made from it refuse to relay a block or a transaction.
+        let rpc = if config.block_submit_enabled {
+            rpc
+        } else {
+            rpc.without_relay()
+        };
         if let Some(address) = &config.fee_address {
             let validation = rpc.call("validateaddress", json!([address])).await?;
             let script = validation["scriptPubKey"]
@@ -2559,6 +2571,14 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
+        // #291: a frontend with PRISM_BLOCK_SUBMIT_ENABLED off processes no
+        // claim. Its submit loop takes none; any other caller is refused here,
+        // before the probe, the reservation or a settlement, so the row stays
+        // as it is and its block never reaches the node.
+        self.config.require_block_submission(format_args!(
+            "block {} was not processed",
+            claim.candidate.block_hash
+        ))?;
         match claim.lifecycle.state {
             CandidateState::Pending => self.offer_candidate(claim, lease).await,
             // A reservation this or another frontend took and never recorded
@@ -2601,15 +2621,6 @@ impl Coordinator {
     /// confirmation all follow in the post-offer phase.
     async fn offer_candidate(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<()> {
         let candidate = &claim.candidate;
-        // #291: the submit loop of a frontend with PRISM_BLOCK_SUBMIT_ENABLED=0
-        // claims nothing. Any other caller is refused here, before the probe
-        // and the reservation, so the row stays `pending` and unoffered.
-        ensure!(
-            self.config.block_submit_enabled,
-            "{}; block {} was not offered",
-            crate::config::BLOCK_SUBMIT_DISABLED,
-            candidate.block_hash
-        );
         let parent = header_parent(&candidate.block_bytes)?;
         if !candidate.leased
             && (self.observed_tip.read().await.as_deref() != Some(parent.as_str())
@@ -3065,7 +3076,7 @@ impl Coordinator {
         self.submit_loop_with(CANDIDATE_LEASE, shutdown).await
     }
 
-    /// `PRISM_BLOCK_SUBMIT_ENABLED=0` (#291): claim nothing until shutdown.
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` off (#291): claim nothing until shutdown.
     /// Every unfinished row stays as it is, a found block `pending`, counted
     /// by the candidate gauges and left for a frontend with submission
     /// enabled; nothing reaches the node's `submitblock`.

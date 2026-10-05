@@ -325,21 +325,21 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
             );
+            // A held frontend makes no found-block offer, so nothing waits.
             if submission.enabled {
                 println!(
-                    "found blocks are offered to the node's submitblock \
-                     (PRISM_BLOCK_SUBMIT_ENABLED=1); the CTV fanout broadcaster is {}",
-                    submission.ctv_broadcaster.as_str()
+                    "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's \
+                     submitblock"
                 );
-            }
-            match &config.offer_standby {
-                Some(wait) => println!(
-                    "found-block offers wait up to {} ms for standby {}; self-check verifies the \
-                     role can read its position (pg_monitor)",
-                    wait.bound.as_millis(),
-                    wait.application_name
-                ),
-                None => println!("found-block offers do not wait for a failover standby"),
+                match &config.offer_standby {
+                    Some(wait) => println!(
+                        "found-block offers wait up to {} ms for standby {}; self-check verifies \
+                         the role can read its position (pg_monitor)",
+                        wait.bound.as_millis(),
+                        wait.application_name
+                    ),
+                    None => println!("found-block offers do not wait for a failover standby"),
+                }
             }
             Ok(())
         }
@@ -440,11 +440,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         Command::BroadcastCtv => {
             let config = Config::from_env()?;
             // #291: refused before the node or the database is reached.
-            ensure!(
-                config.block_submit_enabled,
-                "broadcast-ctv refused: {}",
-                config::BLOCK_SUBMIT_DISABLED
-            );
+            config.require_block_submission("broadcast-ctv refuses to run")?;
             let coordinator = Coordinator::new_tool(
                 config,
                 std::sync::Arc::new(crate::metrics::Metrics::default()),

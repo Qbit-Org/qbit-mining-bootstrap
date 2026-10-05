@@ -140,7 +140,7 @@ pub async fn run(config: Config) -> Result<()> {
             Ok(())
         }
     }));
-    // With PRISM_BLOCK_SUBMIT_ENABLED=0 (#291) this loop claims nothing and
+    // With PRISM_BLOCK_SUBMIT_ENABLED off (#291) this loop claims nothing and
     // waits for the shutdown: found blocks stay pending, never offered.
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();

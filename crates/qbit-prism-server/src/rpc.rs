@@ -88,6 +88,29 @@ impl RpcNotSentError {
     }
 }
 
+/// The calls that hand the node a block or a transaction to relay to the
+/// network. PRISM makes the first three; the wallet's own sends are listed
+/// so that no later caller can relay through one either (#291).
+pub const RELAY_METHODS: &[&str] = &[
+    "submitblock",
+    "sendrawtransaction",
+    "submitpackage",
+    "sendtoaddress",
+    "sendmany",
+    "send",
+    "sendall",
+    "bumpfee",
+];
+
+/// A [`RELAY_METHODS`] call that a client built [`Rpc::without_relay`]
+/// refused (#291). As with [`RpcNotSentError`], no byte of the request left
+/// this process.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("qbit RPC {method} refused before it was sent: block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED")]
+pub struct RpcRelayRefused {
+    pub method: String,
+}
+
 /// Reusable, deadline-bound HTTP connections. Mutating calls are never retried
 /// blindly: callers reconcile their durable outbox against chain state first.
 #[derive(Clone)]
@@ -97,6 +120,8 @@ pub struct Rpc {
     user: String,
     password: String,
     next_id: Arc<AtomicU64>,
+    /// Whether [`RELAY_METHODS`] calls are sent; inherited by wallet clients.
+    relay: bool,
 }
 
 impl Rpc {
@@ -147,7 +172,16 @@ impl Rpc {
             user,
             password,
             next_id: Arc::new(AtomicU64::new(1)),
+            relay: true,
         })
+    }
+
+    /// This client, and every wallet client made from it, refusing each
+    /// [`RELAY_METHODS`] call before it is sent: a frontend with
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` off talks to its node through one (#291).
+    pub fn without_relay(mut self) -> Self {
+        self.relay = false;
+        self
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -160,6 +194,12 @@ impl Rpc {
         params: Value,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        if !self.relay && RELAY_METHODS.contains(&method) {
+            return Err(RpcRelayRefused {
+                method: method.to_owned(),
+            }
+            .into());
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = self
             .client

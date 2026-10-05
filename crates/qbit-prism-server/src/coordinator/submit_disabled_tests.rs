@@ -1,9 +1,9 @@
 //! #291 on a real PostgreSQL: a frontend with `PRISM_BLOCK_SUBMIT_ENABLED=0`
 //! never sends a found block to the node. Its submit loop claims nothing, and
-//! an offer reached any other way is refused before the reservation, so the
-//! row stays `pending` and untouched. A frontend with submission enabled then
-//! offers the same row once and lands it, so the node's silence is the
-//! switch's doing and not the fixture's.
+//! a claim processed any other way is refused before the probe and the
+//! reservation, so the row stays `pending` and untouched. A frontend with
+//! submission enabled then offers the same row once and lands it, so the
+//! node's silence is the switch's doing and not the fixture's.
 use super::*;
 
 impl Fixture {
@@ -55,8 +55,8 @@ async fn dispatch_slots(fixture: &Fixture) -> Result<i64> {
     Ok(if called { last } else { 0 })
 }
 
-/// `process_candidate` takes any live claim, so the offer itself refuses
-/// under the kill switch, before the staleness probe and the reservation.
+/// `process_candidate` takes any live claim, so the claim's processing itself
+/// refuses under the kill switch, before the probe and the reservation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offer_on_a_frontend_with_block_submission_disabled_is_refused_before_its_reservation(
 ) -> Result<()> {
@@ -73,7 +73,7 @@ async fn an_offer_on_a_frontend_with_block_submission_disabled_is_refused_before
             .context("the held frontend processed a pending block")?
             .to_string();
         ensure!(
-            refused.contains("block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)")
+            refused.contains("block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED")
                 && refused.contains(&fixture.claim.candidate.block_hash),
             "{refused}"
         );

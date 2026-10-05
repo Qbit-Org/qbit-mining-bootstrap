@@ -39,8 +39,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     );
     assert_eq!(sample(&startup, "qbit_prism_runtime_lag_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_block_candidates_pending"), -1.);
-    // #291: the default configuration offers blocks until `run` says not to.
-    assert_eq!(sample(&startup, "qbit_prism_block_submission_enabled"), 1.);
+    // #291: unknown, never "on", until `run` publishes the setting.
+    assert_eq!(sample(&startup, "qbit_prism_block_submission_enabled"), -1.);
     assert_eq!(
         sample(
             &startup,

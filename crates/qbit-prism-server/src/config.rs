@@ -19,15 +19,16 @@ pub(crate) use policy_transition::transition_configs;
 pub const DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX: &str =
     "dfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfee";
 
-/// What `PRISM_BLOCK_SUBMIT_ENABLED=0` holds back, in the words the startup
-/// warning, `check-config` and `self-check` all use.
-pub const BLOCK_SUBMIT_DISABLED: &str = "block submission is disabled \
-    (PRISM_BLOCK_SUBMIT_ENABLED=0): found blocks stay pending in the candidate outbox \
-    and are never sent to the node's submitblock, and no CTV fanout is broadcast";
+/// What `PRISM_BLOCK_SUBMIT_ENABLED` off holds back, in the words the startup
+/// warning, `check-config`, `self-check` and every refusal use. It names the
+/// setting, not a value: `0`, `false`, `no` and `off` all turn it off.
+pub const BLOCK_SUBMIT_DISABLED: &str = "block submission is disabled by \
+    PRISM_BLOCK_SUBMIT_ENABLED: found blocks stay pending in the candidate outbox and \
+    are never sent to the node's submitblock, and no CTV fanout is broadcast";
 
-/// What `PRISM_BLOCK_SUBMIT_ENABLED=0` does to a configured CTV broadcaster.
-pub const CTV_BROADCASTER_HELD: &str = "PRISM_CTV_BROADCASTER_ENABLED=1 is held by \
-    PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start";
+/// What `PRISM_BLOCK_SUBMIT_ENABLED` off does to a configured CTV broadcaster.
+pub const CTV_BROADCASTER_HELD: &str = "PRISM_CTV_BROADCASTER_ENABLED is held by \
+    PRISM_BLOCK_SUBMIT_ENABLED: the CTV fanout broadcaster does not start";
 
 /// The CTV fanout broadcaster a frontend with this configuration runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -36,18 +37,8 @@ pub enum CtvBroadcaster {
     /// `PRISM_CTV_BROADCASTER_ENABLED` is off.
     Off,
     On,
-    /// Configured on, and held back by `PRISM_BLOCK_SUBMIT_ENABLED=0`.
+    /// Configured on, and held back by `PRISM_BLOCK_SUBMIT_ENABLED`.
     Held,
-}
-
-impl CtvBroadcaster {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::On => "on",
-            Self::Held => "held",
-        }
-    }
 }
 
 /// What a frontend with this configuration may send to its node: the lines
@@ -715,6 +706,13 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse `what` while `PRISM_BLOCK_SUBMIT_ENABLED` is off (#291): the one
+    /// rule every path that could hand the node a block or a fanout checks.
+    pub fn require_block_submission(&self, what: impl std::fmt::Display) -> Result<()> {
+        ensure!(self.block_submit_enabled, "{BLOCK_SUBMIT_DISABLED}; {what}");
+        Ok(())
+    }
+
     /// `PRISM_BLOCK_SUBMIT_ENABLED` and what it holds back (#291).
     pub fn block_submission(&self) -> BlockSubmission {
         BlockSubmission {
@@ -985,6 +983,15 @@ mod tests {
             held.fingerprint("genesis").unwrap(),
             automatic_ctv_config().fingerprint("genesis").unwrap(),
             "the kill switch is local: it must not split the pool"
+        );
+        automatic_ctv_config()
+            .require_block_submission("unreachable")
+            .unwrap();
+        assert_eq!(
+            held.require_block_submission("block 00 was not processed")
+                .unwrap_err()
+                .to_string(),
+            format!("{BLOCK_SUBMIT_DISABLED}; block 00 was not processed")
         );
     }
 

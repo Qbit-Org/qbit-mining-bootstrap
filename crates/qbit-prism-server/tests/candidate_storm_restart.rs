@@ -2541,9 +2541,9 @@ async fn held_submission(database: &FixtureDatabase, ledger: &Ledger) -> Result<
     );
     let log = std::fs::read_to_string(child.log.path())?;
     for held in [
-        "block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)",
+        "block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED",
         "the submit loop claims no candidate",
-        "PRISM_CTV_BROADCASTER_ENABLED=1 is held by PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start",
+        "PRISM_CTV_BROADCASTER_ENABLED is held by PRISM_BLOCK_SUBMIT_ENABLED: the CTV fanout broadcaster does not start",
     ] {
         ensure!(log.contains(held), "the held frontend never logged {held:?}:\n{log}");
     }

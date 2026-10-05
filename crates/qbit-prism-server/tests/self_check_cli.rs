@@ -141,7 +141,7 @@ async fn disabled_block_submission_is_reported_when_the_services_are_unavailable
         Duration::from_secs(8),
     )
     .await;
-    let disabled = "block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0): found blocks \
+    let disabled = "block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED: found blocks \
                     stay pending in the candidate outbox and are never sent to the node's \
                     submitblock, and no CTV fanout is broadcast";
     let mut expected = unavailable_report(

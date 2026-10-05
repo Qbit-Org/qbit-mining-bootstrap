@@ -373,7 +373,7 @@ async fn a_frontend_with_block_submission_disabled_claims_and_sends_no_fanout() 
                 ensure!(
                     refused
                         .to_string()
-                        .contains("block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)"),
+                        .contains("block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED"),
                     "{refused:#}"
                 );
                 ensure!(

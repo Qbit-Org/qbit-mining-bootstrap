@@ -124,19 +124,20 @@ async fn check_config_reports_the_block_submission_kill_switch_first() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        report.contains(
-            "found blocks are offered to the node's submitblock \
-             (PRISM_BLOCK_SUBMIT_ENABLED=1); the CTV fanout broadcaster is off"
-        ),
-        "{report}"
-    );
+    for line in [
+        "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's submitblock",
+        "found-block offers do not wait for a failover standby",
+    ] {
+        assert!(report.contains(line), "{line:?} missing from {report}");
+    }
     assert!(!report.contains("WARNING"), "{report}");
-    for production in [false, true] {
+    // Every spelling `flag` accepts turns it off, and the report names the
+    // setting rather than a value.
+    for (production, off) in [(false, "0"), (true, "off")] {
         let output = check(
             production,
             &[
-                ("PRISM_BLOCK_SUBMIT_ENABLED", "0"),
+                ("PRISM_BLOCK_SUBMIT_ENABLED", off),
                 ("PRISM_CTV_BROADCASTER_ENABLED", "1"),
             ],
         )
@@ -151,16 +152,18 @@ async fn check_config_reports_the_block_submission_kill_switch_first() {
         assert_eq!(
             lines,
             [
-                "WARNING: block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0): found \
+                "WARNING: block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED: found \
                  blocks stay pending in the candidate outbox and are never sent to the node's \
                  submitblock, and no CTV fanout is broadcast",
-                "WARNING: PRISM_CTV_BROADCASTER_ENABLED=1 is held by \
-                 PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start",
+                "WARNING: PRISM_CTV_BROADCASTER_ENABLED is held by PRISM_BLOCK_SUBMIT_ENABLED: \
+                 the CTV fanout broadcaster does not start",
                 "PRISM configuration valid; 2 runtime workers",
             ],
             "production={production}: {report}"
         );
+        // A held frontend makes no offer, so it reports none.
         assert!(!report.contains("found blocks are offered"), "{report}");
+        assert!(!report.contains("found-block offers"), "{report}");
     }
     rejects(
         false,
@@ -188,9 +191,8 @@ async fn broadcast_ctv_refuses_before_reaching_services_when_block_submission_is
     );
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
-        error.contains(
-            "broadcast-ctv refused: block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)"
-        ),
+        error.contains("block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED")
+            && error.contains("broadcast-ctv refuses to run"),
         "{error}"
     );
 }
