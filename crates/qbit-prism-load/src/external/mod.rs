@@ -757,6 +757,26 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     })
 }
 
+/// `path`'s file name in its directory's canonical path. The directory has
+/// to exist: the file is created in it.
+fn in_real_directory(path: &Path, flag: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .with_context(|| format!("{flag} {} names no file", path.display()))?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let directory = std::fs::canonicalize(directory).with_context(|| {
+        format!(
+            "{flag} {}: {} is not a directory that exists",
+            path.display(),
+            directory.display()
+        )
+    })?;
+    Ok(directory.join(name))
+}
+
 /// The output paths, checked before the load: `--out` is written only after
 /// it, so a path it cannot be written to is refused now rather than found
 /// after hours. The check writes a probe beside it and never touches the
@@ -769,7 +789,10 @@ fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
         args.out.display()
     );
     if let Some(log) = &args.share_log {
-        let same = std::path::absolute(log)? == std::path::absolute(&args.out)?
+        // Through each one's real directory, so `a/b/../x` and a symlinked
+        // directory are seen for the paths they are, whether or not the
+        // files exist yet; and through the files themselves when they do.
+        let same = in_real_directory(log, "--share-log")? == in_real_directory(&args.out, "--out")?
             || std::fs::canonicalize(log)
                 .ok()
                 .zip(std::fs::canonicalize(&args.out).ok())
@@ -873,12 +896,13 @@ async fn drive(
         }
         let now = Instant::now();
         let elapsed = now.duration_since(started);
-        if elapsed >= duration {
-            break;
-        }
+        // The window's last tick still mints what is due at its end, so a
+        // run makes every offer its rate and length promise, however late
+        // that tick comes.
+        let last = elapsed >= duration;
         // The clock decides how many offers were made; any no session can
         // take is shortfall, never a backlog.
-        let want = (elapsed.as_secs_f64() * args.rate).floor() as u64;
+        let want = (elapsed.min(duration).as_secs_f64() * args.rate).floor() as u64;
         let second = anchor.unix_second(now);
         // Once a scan finds no session free, the rest of this tick's offers
         // are shortfall without scanning again, so an outage costs one pass
@@ -896,6 +920,9 @@ async fn drive(
             } else {
                 offers.shortfall += 1;
             }
+        }
+        if last {
+            break;
         }
         if now >= next_sample {
             collector
@@ -931,7 +958,12 @@ async fn drive(
             next_progress += progress;
         }
     }
-    let ended = Instant::now();
+    // A window that ran its length ends where its offers were minted to,
+    // not where a late last tick noticed; one a shutdown cut short ends now.
+    let ended = match interrupted {
+        None => started + duration,
+        Some(_) => Instant::now(),
+    };
     let window = stats::Window {
         started_unix_ms: anchor.unix_ms(started),
         ended_unix_ms: anchor.unix_ms(ended),

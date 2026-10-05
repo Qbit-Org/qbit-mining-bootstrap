@@ -869,6 +869,37 @@ async fn sessions_without_a_connection_are_never_offered_work() -> Result<()> {
     Ok(())
 }
 
+/// A window mints every offer its rate and length promise, the one due at
+/// its very end included: at one offer a second for one second, one offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_makes_every_offer_its_rate_and_length_promise() -> Result<()> {
+    let target = fake_target(EASY).await;
+    let scratch = Scratch::new("boundary");
+    for (rate, seconds, offers) in [("1", "1", 1u64), ("3", "2", 6)] {
+        let out = scratch.path(&format!("stats-{rate}-{seconds}.json"));
+        let args = args(
+            &target.address,
+            &out,
+            &[
+                external::GUARD_FLAG,
+                "--sessions",
+                "2",
+                "--rate",
+                rate,
+                "--duration-seconds",
+                seconds,
+            ],
+        );
+        let outcome = external::run(&args, &Shutdown::never()).await?;
+        let summary = &outcome.document["summary"];
+        assert_eq!(summary["offers"]["minted"], json!(offers), "{summary:#}");
+        assert_eq!(summary["shares"]["accepted"], json!(offers), "{summary:#}");
+        let window = &outcome.document["processes"][0]["window"];
+        assert_eq!(window["seconds"].as_f64(), Some(seconds.parse::<f64>()?));
+    }
+    Ok(())
+}
+
 /// A session that comes back to a tip, as one can while the frontends
 /// behind a balancer disagree, is counted on it once, at its first
 /// sighting.
@@ -914,9 +945,12 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     let out_arg = out.display().to_string();
     let missing = scratch.path("no-such-directory/shares.jsonl");
     let missing = missing.display().to_string();
+    std::fs::create_dir(scratch.path("sub"))?;
+    let detour = scratch.path("sub/../stats.json").display().to_string();
     for (extra, needle) in [
         (vec!["--share-log", &out_arg], "same file"),
-        (vec!["--share-log", &missing], "share log"),
+        (vec!["--share-log", &detour], "same file"),
+        (vec!["--share-log", &missing], "no-such-directory"),
     ] {
         let mut flags = vec![external::GUARD_FLAG];
         flags.extend(extra.iter().copied());
@@ -932,13 +966,36 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
             "{extra:?}"
         );
     }
+    // Neither file exists yet, and the share log reaches the document's path
+    // through a detour: still the same file, and still refused.
+    let fresh = scratch.path("fresh.json");
+    let fresh_detour = scratch.path("sub/../fresh.json").display().to_string();
+    let args = args(
+        &target.address,
+        &fresh,
+        &[external::GUARD_FLAG, "--share-log", &fresh_detour],
+    );
+    let error = match external::run(&args, &Shutdown::never()).await {
+        Ok(_) => panic!("a share log aliasing a fresh --out ran"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("same file"), "{error}");
+    assert!(!fresh.exists());
     assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
     // Nothing is left behind by the check either.
     let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name())
         .collect();
-    assert_eq!(leftovers, vec![std::ffi::OsString::from("stats.json")]);
+    let mut leftovers = leftovers;
+    leftovers.sort();
+    assert_eq!(
+        leftovers,
+        vec![
+            std::ffi::OsString::from("stats.json"),
+            std::ffi::OsString::from("sub")
+        ]
+    );
     Ok(())
 }
 
