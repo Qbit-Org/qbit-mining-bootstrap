@@ -793,6 +793,73 @@ async fn a_run_that_ends_with_the_target_down_still_accounts_for_every_offer() -
     Ok(())
 }
 
+/// The binary itself: `external` and `external-merge` are read before the
+/// harness's own command line, the guard's refusal is exit 2 with its reason
+/// on stderr, and two runs' documents merge through the subcommand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_binary_runs_both_subcommands() -> Result<()> {
+    let binary = env!("CARGO_BIN_EXE_qbit-prism-load");
+    let target = fake_target(EASY).await;
+    let scratch = Scratch::new("binary");
+    let refused = tokio::process::Command::new(binary)
+        .args([
+            "external",
+            "--target",
+            &target.address,
+            "--address",
+            "pload1external",
+        ])
+        .output()
+        .await?;
+    assert_eq!(refused.status.code(), Some(run::EXIT_ERROR));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains(external::GUARD_FLAG), "{stderr}");
+    assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
+    let mut documents = Vec::new();
+    for label in ["vm-a", "vm-b"] {
+        let out = scratch.path(&format!("{label}.json"));
+        let status = tokio::process::Command::new(binary)
+            .args([
+                "external",
+                "--target",
+                &target.address,
+                external::GUARD_FLAG,
+                "--address",
+                "pload1external",
+                "--label",
+                label,
+                "--sessions",
+                "2",
+                "--rate",
+                "10",
+                "--duration-seconds",
+                "1",
+                "--progress-seconds",
+                "0",
+                "--out",
+            ])
+            .arg(&out)
+            .status()
+            .await?;
+        assert_eq!(status.code(), Some(run::EXIT_OK), "{label}");
+        documents.push(out);
+    }
+    let merged = scratch.path("merged.json");
+    let status = tokio::process::Command::new(binary)
+        .arg("external-merge")
+        .args(&documents)
+        .arg("--out")
+        .arg(&merged)
+        .status()
+        .await?;
+    assert_eq!(status.code(), Some(run::EXIT_OK));
+    let merged = read(&merged);
+    assert_eq!(merged["kind"], json!("merged"));
+    assert_eq!(merged["summary"]["labels"], json!(["vm-a", "vm-b"]));
+    assert!(merged["summary"]["shares"]["accepted"].as_u64().unwrap() >= 2);
+    Ok(())
+}
+
 /// A target nobody answers on is refused as blocked once the work timeout
 /// passes, and the document says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
