@@ -790,8 +790,9 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
     );
     assert_eq!(schema_versions(&pool).await?, pending);
     set_fence(&pool, 1).await?;
-    // Recording 2 by hand as well lets nothing start: 013, 017 and 024 never ran
-    // behind the pending backfill, and migrate still names the fence.
+    // Recording 2 by hand as well lets nothing start: 013, 017 and 024
+    // never ran behind the pending backfill, and migrate still names the
+    // fence.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
         .execute(&pool)
         .await?;
